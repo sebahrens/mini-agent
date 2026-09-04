@@ -6,9 +6,10 @@
 //! direct-process behavior but share executable pinning, environment
 //! hardening, bounded output, deadlines, and child cleanup.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -52,7 +53,8 @@ const REDIRECTING_ENV: &[&str] = &[
     "GIT_ATTR_NOSYSTEM",
 ];
 
-static PROCESS_GIT_MUTATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static PROCESS_GIT_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 /// Cached git environment variables. Built once per process lifetime.
 /// Assumes PATH and relevant environment variables do not change mid-session.
@@ -64,15 +66,22 @@ static CACHED_GIT_ENVIRONMENT: OnceLock<Vec<(OsString, OsString)>> = OnceLock::n
 #[cfg(not(test))]
 static CACHED_GIT_RUNNER: OnceLock<Result<GitRunner, String>> = OnceLock::new();
 
-/// Git's own index locks protect files, but one process-wide admission lock
-/// also prevents mini-agent worktree and structured-tool mutations from
-/// racing each other between their before/after audit snapshots.
-pub(crate) async fn acquire_process_git_mutation() -> OwnedMutexGuard<()> {
-    PROCESS_GIT_MUTATION_LOCK
-        .get_or_init(|| Arc::new(Mutex::new(())))
-        .clone()
-        .lock_owned()
-        .await
+/// Git's own index locks protect files. A process-local, canonical common-dir
+/// lock additionally keeps mini-agent worktree and structured-tool mutations
+/// for the same repository from racing between before/after snapshots without
+/// serializing independent repositories.
+fn repository_mutation_lock(repository_key: &Path) -> Arc<Mutex<()>> {
+    let locks = PROCESS_GIT_MUTATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(repository_key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(repository_key.to_path_buf(), Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Clone)]
@@ -332,6 +341,25 @@ impl GitRunner {
         command_result(operation, limits, output)
     }
 
+    pub(crate) async fn acquire_mutation(
+        &self,
+        repo_path: &Path,
+    ) -> Result<OwnedMutexGuard<()>, String> {
+        let output = self
+            .run(
+                repo_path,
+                "repository-identity",
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                QUERY_LIMITS,
+            )
+            .await
+            .map_err(|error| format!("cannot establish repository identity: {error}"))?;
+        let key = output_path(&output.stdout)
+            .canonicalize()
+            .map_err(|error| format!("failed to resolve common Git directory: {error}"))?;
+        Ok(repository_mutation_lock(&key).lock_owned().await)
+    }
+
     pub(crate) async fn run_with_input<I, S>(
         &self,
         repo_path: &Path,
@@ -551,6 +579,22 @@ fn identity_value(raw: &str) -> Option<String> {
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+fn output_path(bytes: &[u8]) -> PathBuf {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes[..end].to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes[..end]).into_owned())
     }
 }
 

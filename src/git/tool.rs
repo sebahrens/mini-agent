@@ -5,9 +5,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{ToolError, check_perm, check_perm_bound_path};
-use crate::git::runner::{
-    GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, acquire_process_git_mutation,
-};
+use crate::git::runner::{GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::{CommandOutput, CommandStatus, Sandbox};
@@ -319,7 +317,11 @@ impl GitTool {
         reject_irrelevant_fields(&args, false, false, false)?;
         require_paths(&args.paths, "stage")?;
         let paths = self.validate_paths(&args.paths, Some("git/stage")).await?;
-        let _mutation = acquire_process_git_mutation().await;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
         let before = self.status_snapshot().await?;
         self.ensure_no_external_filters(&paths).await?;
         let mut command = vec!["add".into(), "--".into()];
@@ -335,7 +337,11 @@ impl GitTool {
         let paths = self
             .validate_paths(&args.paths, Some("git/unstage"))
             .await?;
-        let _mutation = acquire_process_git_mutation().await;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
         let before = self.status_snapshot().await?;
         let head = self
             .run(
@@ -387,7 +393,11 @@ impl GitTool {
             ));
         }
         let coaching = self.permission("git/commit", message).await?;
-        let _mutation = acquire_process_git_mutation().await;
+        let _mutation = self
+            .runner
+            .acquire_mutation(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
         let before = self.status_snapshot().await?;
         let output = self
             .run_with_input(

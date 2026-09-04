@@ -18,8 +18,7 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 
 use crate::git::runner::{
-    GitRunner, LOCAL_MUTATION_LIMITS, NETWORK_LIMITS, QUERY_LIMITS, acquire_process_git_mutation,
-    command_failure,
+    GitRunner, LOCAL_MUTATION_LIMITS, NETWORK_LIMITS, QUERY_LIMITS, command_failure,
 };
 use crate::sandbox::{CommandLimits, CommandOutput};
 
@@ -218,15 +217,7 @@ async fn lock_process_workspace() -> OwnedMutexGuard<()> {
 }
 
 async fn acquire_repository(repo_path: &Path) -> Result<OwnedMutexGuard<()>, String> {
-    let output = run_query(
-        repo_path,
-        "repository-identity",
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .await
-    .map_err(|error| format!("cannot establish repository identity: {error}"))?;
-    let _key = canonical_path(&output_path(&output.stdout), "common Git directory")?;
-    Ok(acquire_process_git_mutation().await)
+    GitRunner::default().acquire_mutation(repo_path).await
 }
 
 fn trim_line(bytes: &[u8]) -> &[u8] {

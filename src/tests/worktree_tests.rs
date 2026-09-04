@@ -165,10 +165,13 @@ mod tests {
         });
     }
 
-    async fn acquire_released_mutation_lock(label: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn acquire_released_mutation_lock(
+        repo_path: &Path,
+        label: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         tokio::time::timeout(
             TEST_MUTATION_ADMISSION_TIMEOUT,
-            crate::git::runner::acquire_process_git_mutation(),
+            crate::git::runner::GitRunner::default().acquire_mutation(repo_path),
         )
         .await
         .unwrap_or_else(|_| {
@@ -177,6 +180,7 @@ mod tests {
                 TEST_MUTATION_ADMISSION_TIMEOUT
             )
         })
+        .unwrap_or_else(|error| panic!("{label} could not resolve repository identity: {error}"))
     }
 
     #[test]
@@ -1217,12 +1221,12 @@ mod tests {
             }
         };
         let (first_result, second_result, ()) = tokio::join!(
-            run_git_with_limits_for_test(
+            run_locked_git_with_limits_for_test(
                 first.path(),
                 &["delay"],
                 test_limits(Duration::from_secs(3)),
             ),
-            run_git_with_limits_for_test(
+            run_locked_git_with_limits_for_test(
                 second.path(),
                 &["delay"],
                 test_limits(Duration::from_secs(3)),
@@ -1270,6 +1274,50 @@ mod tests {
             started.elapsed() >= Duration::from_millis(1800),
             "same repository commands overlapped: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_worktree_mutations_share_the_common_repository_lock() {
+        let repo = TempRepo::new("linked worktree serialization");
+        let linked = repo.path().with_extension("linked");
+        git(
+            repo.path(),
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("linked-lock-test"),
+                linked.as_os_str(),
+            ],
+        );
+        configure_delay_alias(repo.path(), "delay", "1");
+        let started = Instant::now();
+
+        let (main, worktree) = tokio::join!(
+            run_locked_git_with_limits_for_test(
+                repo.path(),
+                &["delay"],
+                test_limits(Duration::from_secs(4)),
+            ),
+            run_locked_git_with_limits_for_test(
+                &linked,
+                &["delay"],
+                test_limits(Duration::from_secs(4)),
+            ),
+        );
+
+        main.expect("main worktree command");
+        worktree.expect("linked worktree command");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1800),
+            "linked worktree commands overlapped: {:?}",
+            started.elapsed()
+        );
+        git(
+            repo.path(),
+            ["worktree", "remove", "--force", linked.to_str().unwrap()],
         );
     }
 
@@ -1579,7 +1627,8 @@ mod tests {
         assert!(started.exists(), "post-checkout hook did not start");
         task.abort();
         let _ = task.await;
-        let admission = acquire_released_mutation_lock("dropped worktree create").await;
+        let admission =
+            acquire_released_mutation_lock(repo.path(), "dropped worktree create").await;
         run_git_with_limits_for_test(
             repo.path(),
             &["status", "--porcelain"],
@@ -1721,7 +1770,7 @@ mod tests {
         wait_for_mutation_marker(&started, || task.is_finished(), "delayed merge fetch").await;
         task.abort();
         let _ = task.await;
-        let admission = acquire_released_mutation_lock("caller-drop rollback").await;
+        let admission = acquire_released_mutation_lock(repo.path(), "caller-drop rollback").await;
         run_git_with_limits_for_test(
             repo.path(),
             &["status", "--porcelain"],
@@ -1793,7 +1842,8 @@ mod tests {
             .await;
         task.abort();
         let _ = task.await;
-        let admission = acquire_released_mutation_lock("commit cancellation rollback").await;
+        let admission =
+            acquire_released_mutation_lock(repo.path(), "commit cancellation rollback").await;
         run_git_with_limits_for_test(
             repo.path(),
             &["status", "--porcelain"],
@@ -2484,7 +2534,7 @@ mod tests {
         assert!(retained_conflict.contains("main\n"));
         assert!(retained_conflict.contains("feature\n"));
         assert!(has_merge_conflict(repo.path()).await);
-        let admission = acquire_released_mutation_lock("cancelled squash merge").await;
+        let admission = acquire_released_mutation_lock(repo.path(), "cancelled squash merge").await;
         drop(admission);
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
