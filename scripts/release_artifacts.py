@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -174,6 +175,25 @@ def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         raise ReleaseArtifactError(f"packaged executable failed to run: {error}") from error
 
 
+def _smoke_install_parent(
+    environment: Mapping[str, str] = os.environ,
+    platform_name: str = os.name,
+) -> Path | None:
+    if platform_name != "nt":
+        return None
+    value = environment.get("LOCALAPPDATA")
+    if not value:
+        raise ReleaseArtifactError(
+            "Windows archive smoke requires a local per-user installation root"
+        )
+    root = Path(value)
+    if not root.is_dir() or root.is_symlink():
+        raise ReleaseArtifactError(
+            "Windows archive smoke installation root is unavailable or unsafe"
+        )
+    return root
+
+
 def smoke_archive(
     archive: Path,
     executable_name: str,
@@ -185,7 +205,10 @@ def smoke_archive(
     if not SAFE_NAME.fullmatch(executable_name):
         raise ReleaseArtifactError("unsafe executable name")
     _validate_archive_members(archive, executable_name)
-    with tempfile.TemporaryDirectory(prefix="mini-agent-release-smoke-") as directory:
+    install_parent = _smoke_install_parent()
+    with tempfile.TemporaryDirectory(
+        prefix="mini-agent-release-smoke-", dir=install_parent
+    ) as directory:
         destination = Path(directory)
         _extract_regular_members(archive, destination)
         binary = destination / executable_name

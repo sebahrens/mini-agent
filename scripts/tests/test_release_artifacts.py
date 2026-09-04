@@ -39,6 +39,22 @@ class ReleaseArtifactManifestTests(unittest.TestCase):
         self.assertNotIn("cargo build", smoke_job)
         self.assertNotIn("cargo install", smoke_job)
 
+    def test_windows_smoke_uses_existing_local_per_user_install_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = RELEASE._smoke_install_parent(
+                {"LOCALAPPDATA": directory}, platform_name="nt"
+            )
+            self.assertEqual(root, Path(directory))
+
+        with self.assertRaisesRegex(
+            RELEASE.ReleaseArtifactError, "per-user installation root"
+        ):
+            RELEASE._smoke_install_parent({}, platform_name="nt")
+
+        self.assertIsNone(
+            RELEASE._smoke_install_parent({}, platform_name="posix")
+        )
+
     def fixture(self, directory: str) -> tuple[Path, Path, Path]:
         root = Path(directory) / "private"
         (root / "job-a").mkdir(parents=True)
