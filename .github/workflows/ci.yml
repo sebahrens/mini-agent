@@ -747,6 +747,7 @@ jobs:
           Copy-Item -LiteralPath $env:MINI_AGENT_LPAC_CARGO_INSTALL_EXE -Destination $protected -Force
           $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
           $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $restrictedPackagesSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-15-2-2')
           $none = [System.Security.AccessControl.InheritanceFlags]::None
           $propagation = [System.Security.AccessControl.PropagationFlags]::None
           $allow = [System.Security.AccessControl.AccessControlType]::Allow
@@ -774,6 +775,13 @@ jobs:
               $propagation,
               $allow
             )
+            $packageReadRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+              $restrictedPackagesSid,
+              [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+              $none,
+              $propagation,
+              $allow
+            )
             $deniedRights = [System.Security.AccessControl.FileSystemRights]::Write -bor
               [System.Security.AccessControl.FileSystemRights]::Delete -bor
               [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
@@ -791,6 +799,7 @@ jobs:
             )
             [void] $acl.AddAccessRule($systemRule)
             [void] $acl.AddAccessRule($readRule)
+            [void] $acl.AddAccessRule($packageReadRule)
             [void] $acl.AddAccessRule($denyRule)
             Set-Acl -LiteralPath $Path -AclObject $acl
           }

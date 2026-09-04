@@ -349,6 +349,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertNotIn("$env:CARGO_HOME = $installRoot", install_step)
         self.assertIn("MINI_AGENT_LPAC_CARGO_INSTALL_EXE", install_step)
 
+        protected_step = windows.split(
+            "name: Prepare the protected machine-wide negative control", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("S-1-15-2-2", protected_step)
+        self.assertIn("$packageReadRule", protected_step)
+        self.assertIn("FileSystemRights]::ReadAndExecute", protected_step)
+
         standard_user_step = windows.split(
             "name: Validate the complete gate from a separate standard-user installation",
             1,

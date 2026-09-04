@@ -9,9 +9,7 @@ use std::sync::OnceLock;
 
 #[cfg(test)]
 use std::process::Child;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -364,7 +362,9 @@ impl WorkerChild {
                         *status = Some(exited);
                         Ok(Some(exited))
                     }
-                    WAIT_FAILED => Err(contextual_last_error("poll JavaScript worker process")),
+                    windows_sys::Win32::Foundation::WAIT_FAILED => {
+                        Err(contextual_last_error("poll JavaScript worker process"))
+                    }
                     other => Err(io::Error::other(format!(
                         "unexpected JavaScript worker wait result {other}"
                     ))),
@@ -391,7 +391,9 @@ impl WorkerChild {
                         *status = Some(exited);
                         Ok(exited)
                     }
-                    WAIT_FAILED => Err(contextual_last_error("wait for JavaScript worker process")),
+                    windows_sys::Win32::Foundation::WAIT_FAILED => {
+                        Err(contextual_last_error("wait for JavaScript worker process"))
+                    }
                     other => Err(io::Error::other(format!(
                         "unexpected JavaScript worker wait result {other}"
                     ))),
