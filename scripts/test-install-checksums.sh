@@ -62,8 +62,12 @@ echo '#!/usr/bin/env bash' > "${FIXTURE}/${BINARY_NAME}"
 echo "echo \"mini-agent ${CARGO_VERSION}\"" >> "${FIXTURE}/${BINARY_NAME}"
 chmod +x "${FIXTURE}/${BINARY_NAME}"
 
-# Create the archive
-tar czf "${FIXTURE}/${ARCHIVE}" -C "$FIXTURE" "$BINARY_NAME"
+# Create the same exact four-file payload as the release workflow.
+python3 "${ROOT_DIR}/scripts/package-release-binary.py" \
+    --root "$ROOT_DIR" \
+    --binary "${FIXTURE}/${BINARY_NAME}" \
+    --archive "${FIXTURE}/${ARCHIVE}" \
+    --executable-name "$BINARY_NAME"
 GOOD_HASH=$(sha256sum "${FIXTURE}/${ARCHIVE}" | awk '{print $1}')
 
 # Create a valid SHA256SUMS

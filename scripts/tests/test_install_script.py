@@ -147,6 +147,18 @@ fi
             )
             self.assert_rejected_before_install(root, release, stub_bin, "has no entry")
 
+    def test_checksum_download_failure_fails_before_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (release / "SHA256SUMS").unlink()
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertFalse((root / "prefix/bin/mini-agent").exists())
+            self.assertFalse((root / "prefix").exists())
+
     def test_duplicate_checksum_entry_fails_before_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
