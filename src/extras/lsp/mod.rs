@@ -11,7 +11,7 @@ pub mod rpc;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 #[cfg(test)]
@@ -69,6 +69,32 @@ struct Inner {
     peak_bindings: Arc<AtomicUsize>,
     #[cfg(test)]
     test_synced_documents: Arc<std::sync::Mutex<HashMap<String, client::SyncedDocument>>>,
+}
+
+static LIVE_MANAGERS: OnceLock<Mutex<Vec<Weak<Inner>>>> = OnceLock::new();
+
+fn register_live_manager(inner: &Arc<Inner>) {
+    let registry = LIVE_MANAGERS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut managers = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    managers.retain(|manager| manager.strong_count() > 0);
+    managers.push(Arc::downgrade(inner));
+}
+
+/// Explicitly stop every language server owned by live agent tool sets.
+/// Application teardown calls this before those opaque tool sets are dropped.
+pub(crate) async fn shutdown_live_managers() {
+    let managers = LIVE_MANAGERS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(..)
+        .filter_map(|manager| manager.upgrade())
+        .collect::<Vec<_>>();
+    for inner in managers {
+        LspManager { inner }.shutdown().await;
+    }
 }
 
 /// A diagnostic-cache entry bound to the exact regular file that produced it.
@@ -129,21 +155,21 @@ impl LspManager {
             servers.len(),
             root.display()
         );
-        Self {
-            inner: Arc::new(Inner {
-                workspace,
-                servers,
-                clients: tokio::sync::Mutex::new(HashMap::new()),
-                diags: DiagStore::default(),
-                diag_notify: Arc::new(Notify::new()),
-                #[cfg(test)]
-                active_bindings: Arc::new(AtomicUsize::new(0)),
-                #[cfg(test)]
-                peak_bindings: Arc::new(AtomicUsize::new(0)),
-                #[cfg(test)]
-                test_synced_documents: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            }),
-        }
+        let inner = Arc::new(Inner {
+            workspace,
+            servers,
+            clients: tokio::sync::Mutex::new(HashMap::new()),
+            diags: DiagStore::default(),
+            diag_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            active_bindings: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            peak_bindings: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_synced_documents: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+        register_live_manager(&inner);
+        Self { inner }
     }
 
     pub fn resolve_path(&self, path: &Path) -> Result<PathBuf, String> {
@@ -182,6 +208,11 @@ impl LspManager {
         }
         let (name, cfg) = registry::server_for_path(&self.inner.servers, path)?;
         let mut clients = self.inner.clients.lock().await;
+        if self.inner.workspace.validate().is_err()
+            || !path.starts_with(self.inner.workspace.root())
+        {
+            return None;
+        }
         if let Some(cached) = clients.get(name)
             && !cached.is_stopped()
         {
@@ -260,7 +291,6 @@ impl LspManager {
 
     /// Stops and reaps every language-server process currently owned by this
     /// manager. A later edit may start fresh servers again.
-    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         let clients = {
             let mut clients = self.inner.clients.lock().await;

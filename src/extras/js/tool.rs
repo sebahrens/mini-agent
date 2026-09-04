@@ -556,6 +556,7 @@ async fn resolve_permission(
                 .send(AskRequest {
                     tool: CompactString::new(request.tool()),
                     input: request.key().to_string(),
+                    tool_call_id: crate::permission::ask::take_tool_call_id("js"),
                     suggested_pattern: None,
                     additional_allow_patterns: Vec::new(),
                     reply: reply_tx,

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use agent_client_protocol::on_receive_request;
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, RequestCancellation, Responder,
@@ -92,6 +93,10 @@ fn acp_capabilities() -> AgentCapabilities {
     AgentCapabilities::new().session_capabilities(
         SessionCapabilities::new().close(Some(SessionCloseCapabilities::new())),
     )
+}
+
+fn acp_protocol_version() -> ProtocolVersion {
+    ProtocolVersion::V1
 }
 
 struct SessionState {
@@ -675,13 +680,13 @@ fn receive_cancel(state: &AcpState, session_id: &SessionId) -> Option<u64> {
 // --- Request Handlers ---
 
 async fn handle_initialize(
-    req: InitializeRequest,
+    _req: InitializeRequest,
     responder: Responder<InitializeResponse>,
     _state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let caps = acp_capabilities();
 
-    let resp = InitializeResponse::new(req.protocol_version)
+    let resp = InitializeResponse::new(acp_protocol_version())
         .agent_capabilities(caps)
         .agent_info(Implementation::new(
             crate::product::PUBLIC_NAME,
@@ -963,7 +968,11 @@ async fn drive_permission_bridge(
             .as_deref()
             .unwrap_or(&ask.input)
             .to_string();
-        let tool_call_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+        let tool_call_id = ToolCallId::new(
+            ask.tool_call_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        );
         let tool_call = ToolCallUpdate::new(
             tool_call_id,
             ToolCallUpdateFields::new()
@@ -1190,6 +1199,12 @@ async fn run_prompt(
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
+    #[cfg(feature = "mcp")]
+    let mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
+        crate::startup::connect_headless_mcp(&state.cfg, &workspace).await
+    } else {
+        None
+    };
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     let Some(agent) = run_owned_pre_run(
         &control,
@@ -1210,7 +1225,7 @@ async fn run_prompt(
             #[cfg(feature = "skills")]
             skill_services,
             #[cfg(feature = "mcp")]
-            None::<&crate::extras::mcp::McpClientManager>,
+            mcp_manager.as_ref(),
         ),
     )
     .await
@@ -1227,7 +1242,7 @@ async fn run_prompt(
             prior_history,
             crate::retry::RetryConfig::default(),
             #[cfg(feature = "hooks")]
-            None,
+            None, // ACP is not loop mode; global lifecycle hooks remain active.
             Arc::clone(&work_scope),
         ),
     )
@@ -1236,7 +1251,7 @@ async fn run_prompt(
         let _ = respond_terminal(registration, responder, StopReason::Cancelled);
         return Ok(());
     };
-    relay_paused_runner(
+    let result = relay_paused_runner(
         prompt_text,
         session_id,
         history,
@@ -1246,7 +1261,12 @@ async fn run_prompt(
         paused_runner,
         registration,
     )
-    .await
+    .await;
+    #[cfg(feature = "mcp")]
+    if let Some(manager) = mcp_manager {
+        manager.shutdown().await;
+    }
+    result
 }
 
 async fn run_owned_pre_run<T>(
@@ -1782,6 +1802,11 @@ mod protocol_tests {
         ) -> Result<(), agent_client_protocol::Error> {
             connect_agent(self.0, client).await
         }
+    }
+
+    #[test]
+    fn initialize_always_advertises_the_implemented_v1_protocol() {
+        assert_eq!(acp_protocol_version(), ProtocolVersion::V1);
     }
 
     fn fixture_state(prompt_fixture: PromptFixture) -> Arc<AcpState> {

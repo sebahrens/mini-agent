@@ -582,7 +582,9 @@ gives up after 8 consecutive blocks without progress.
 Any handler can also signal via **exit code** instead of JSON: exit `0` means
 no objection, exit `2` blocks (for blockable events) with stderr as the
 reason, and any other exit code is a non-blocking error. Exit `2` combined
-with stdout JSON is a mixed-channel warning — the JSON is ignored.
+with stdout JSON is a mixed-channel warning — the JSON is ignored. For
+`PreToolUse`, an unexpected exit, timeout, policy-denied launch, or output-limit
+failure denies the tool call: a configured guard must fail closed.
 
 ### Trust model
 
@@ -1129,7 +1131,9 @@ with OAuth, restoring (and refreshing) the stored token. Each server's
 exceeds either budget is reported in a startup notice and skipped without
 delaying the others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 (default 120); on expiry zerostack cancels the request and returns a tool error
-the model can act on instead of stalling the turn.
+the model can act on instead of stalling the turn. Malformed JSON arguments are
+rejected rather than silently converted to an argument-less call. Text, image,
+and embedded resource data from one result share a hard 1 MiB cumulative bound.
 
 When two servers expose a tool with the same name, both are registered under
 `<server>__<tool>` (for example `alpha__search` and `beta__search`) and a
@@ -1300,6 +1304,11 @@ replacement racing after the check cannot redirect the operation because its
 filesystem access is already relative to the retained handle. Relative file
 operations walk held directory descriptors and reject symlink or reparse-point
 components and targets.
+
+ACP advertises protocol V1, connects MCP services for each tool-enabled prompt,
+and runs the same process-wide lifecycle and tool hooks as other frontends.
+Permission prompts reuse the corresponding ACP tool-call ID, so clients can
+attach the decision to the call they already rendered.
 
 Each new ACP session also owns an independent in-memory conversation history.
 Only completed turns are committed: the user prompt, correlated structured tool

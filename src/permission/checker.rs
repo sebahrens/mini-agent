@@ -318,7 +318,7 @@ impl PermissionChecker {
 
         let cached_resolved_cwd = resolve_path_allow_missing(Path::new(&working_dir));
 
-        Ok(PermissionChecker {
+        let checker = PermissionChecker {
             rules,
             default_action,
             ext_dir_rules,
@@ -337,7 +337,10 @@ impl PermissionChecker {
             pending_forced_ask: None,
             #[cfg(feature = "hooks")]
             pending_one_shot_allow: None,
-        })
+        };
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::set_active_permission_mode(mode);
+        Ok(checker)
     }
 
     /// Forces the next `check`/`check_path` call for `tool` to `Ask`,
@@ -933,6 +936,8 @@ impl PermissionChecker {
         tracing::debug!("perm mode changed: {:?} -> {:?}", self.mode, mode);
         self.mode = mode;
         self.user_mode = mode;
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::set_active_permission_mode(mode);
     }
 
     /// Apply a prompt `%%mode=` directive. Prompt content is data, not the
@@ -948,6 +953,8 @@ impl PermissionChecker {
             return false;
         }
         self.mode = mode;
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::set_active_permission_mode(mode);
         true
     }
 
@@ -965,6 +972,8 @@ impl PermissionChecker {
 
     pub fn restore_user_mode(&mut self) {
         self.mode = self.user_mode;
+        #[cfg(feature = "hooks")]
+        crate::extras::hooks::set_active_permission_mode(self.mode);
     }
 
     pub fn mode(&self) -> SecurityMode {

@@ -122,7 +122,7 @@ impl ValidatedExecutionRoot {
 enum ExecutionRootBinding {
     /// Unit-test and explicitly unbound dispatchers validate each supplied context.
     Unbound,
-    Valid(ValidatedExecutionRoot),
+    Valid(Box<ValidatedExecutionRoot>),
     /// A failed rebind must disable execution instead of retaining stale authority.
     Invalid(String),
 }
@@ -238,7 +238,7 @@ impl HookDispatcher {
         }
         let execution_root = match project_root.as_deref() {
             Some(root) => match ValidatedExecutionRoot::capture(root) {
-                Ok(root) => ExecutionRootBinding::Valid(root),
+                Ok(root) => ExecutionRootBinding::Valid(Box::new(root)),
                 Err(error) => ExecutionRootBinding::Invalid(error),
             },
             None => ExecutionRootBinding::Unbound,
@@ -273,7 +273,7 @@ impl HookDispatcher {
         );
         match ValidatedExecutionRoot::capture(workspace) {
             Ok(root) => {
-                state.binding = ExecutionRootBinding::Valid(root);
+                state.binding = ExecutionRootBinding::Valid(Box::new(root));
                 Ok(())
             }
             Err(error) => {
@@ -291,7 +291,7 @@ impl HookDispatcher {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = match &state.binding {
             ExecutionRootBinding::Unbound => ValidatedExecutionRoot::capture(Path::new(&ctx.cwd))?,
-            ExecutionRootBinding::Valid(root) => root.clone(),
+            ExecutionRootBinding::Valid(root) => root.as_ref().clone(),
             ExecutionRootBinding::Invalid(error) => return Err(error.clone()),
         };
         let lease = HookExecutionRootLease {
@@ -816,26 +816,28 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
             // Hook stderr is untrusted and may contain credentials or input
             // data. The bounded bytes remain available to the channel
             // contract, but audit logs record only the closed outcome.
-            tracing::warn!("hooks: hook exited {exit_code:?} (non-blocking)");
+            tracing::warn!("hooks: PreToolUse hook exited {exit_code:?}; denying tool call");
             PreDecisionPart {
-                verdict: Verdict::Defer,
-                reason: None,
+                verdict: Verdict::Deny,
+                reason: Some("PreToolUse hook failed; tool call denied".to_string()),
                 updated_input: None,
             }
         }
         ChannelResult::TimedOut => {
-            tracing::warn!("hooks: hook timed out");
+            tracing::warn!("hooks: PreToolUse hook timed out; denying tool call");
             PreDecisionPart {
-                verdict: Verdict::Defer,
-                reason: None,
+                verdict: Verdict::Deny,
+                reason: Some("PreToolUse hook timed out; tool call denied".to_string()),
                 updated_input: None,
             }
         }
         ChannelResult::OutputLimitExceeded => {
-            tracing::warn!("hooks: hook exceeded its output limit");
+            tracing::warn!("hooks: PreToolUse hook exceeded its output limit; denying tool call");
             PreDecisionPart {
-                verdict: Verdict::Defer,
-                reason: None,
+                verdict: Verdict::Deny,
+                reason: Some(
+                    "PreToolUse hook output exceeded its limit; tool call denied".to_string(),
+                ),
                 updated_input: None,
             }
         }

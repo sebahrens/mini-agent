@@ -223,12 +223,14 @@ async fn handle_ask_inner(
     input: &str,
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
+    correlation_tool: &str,
 ) -> Result<(), ToolError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     ask_tx
         .send(AskRequest {
             tool: CompactString::new(tool),
             input: input.to_string(),
+            tool_call_id: crate::permission::ask::take_tool_call_id(correlation_tool),
             suggested_pattern,
             additional_allow_patterns: additional_allow_patterns.clone(),
             reply: reply_tx,
@@ -274,7 +276,7 @@ pub async fn check_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, input_key, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, input_key, None, Vec::new(), tool).await?;
             Ok(None)
         }
     }
@@ -287,6 +289,7 @@ pub(crate) async fn check_mcp_perm(
     input_key: &str,
     trusted_identity: Option<TrustedMcpServer>,
     mcp_tool_name: &str,
+    correlation_tool: &str,
 ) -> Result<Option<String>, ToolError> {
     let Some(perm) = permission else {
         return Ok(None);
@@ -307,7 +310,16 @@ pub(crate) async fn check_mcp_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, "mcp_tool", input_key, None, Vec::new()).await?;
+            handle_ask_inner(
+                tx,
+                perm,
+                "mcp_tool",
+                input_key,
+                None,
+                Vec::new(),
+                correlation_tool,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -356,6 +368,7 @@ pub(crate) async fn check_perm_path_with_suggestion(
                 path,
                 suggested_pattern,
                 additional_allow_patterns,
+                tool,
             )
             .await?;
             Ok(None)
@@ -394,7 +407,7 @@ pub(crate) async fn check_perm_canonical_path(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, path, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, path, None, Vec::new(), tool).await?;
             Ok(None)
         }
     }
@@ -430,7 +443,7 @@ pub(crate) async fn check_perm_bound_path(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, logical, None, Vec::new()).await?;
+            handle_ask_inner(tx, perm, tool, logical, None, Vec::new(), tool).await?;
             Ok(None)
         }
     }

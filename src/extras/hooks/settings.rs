@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum HookTrust {
     /// Require the configured general workspace sandbox. Missing or invalid
@@ -12,7 +14,7 @@ pub(crate) enum HookTrust {
     Trusted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub(crate) struct HookHandler {
     #[serde(rename = "type")]
     pub kind: String,

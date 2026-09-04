@@ -914,15 +914,29 @@ async fn mcp_stdio_drop_and_reconnect_reap_process_trees() {
     }
     let workspace =
         std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
-    manager
+    let reconnect_error = manager
         .reconnect_in_binding("fixture", &second, &workspace)
+        .await
+        .expect_err("an exclusive replacement cannot initialize while the old server is live");
+    assert!(reconnect_error.to_string().contains("exclusive"));
+    assert_eq!(call_fixture_tool(&manager).await["args"][0], "first");
+
+    let third_lease = fixture.lease("reconnect-third");
+    let third = fixture.config(
+        fixture.executable.display().to_string(),
+        vec!["third".to_string()],
+        "normal",
+        &third_lease,
+    );
+    manager
+        .reconnect_in_binding("fixture", &third, &workspace)
         .await
         .unwrap();
     assert_process_reaped(first_pid).await;
-    assert_eq!(call_fixture_tool(&manager).await["args"][0], "second");
-    let second_pid = wait_for_pid(&second_lease).await;
+    assert_eq!(call_fixture_tool(&manager).await["args"][0], "third");
+    let third_pid = wait_for_pid(&third_lease).await;
     shutdown(manager).await;
-    assert_process_reaped(second_pid).await;
+    assert_process_reaped(third_pid).await;
 
     fixture.cleanup();
 }

@@ -66,6 +66,10 @@ fn hash_stable_for_identical_binding() {
     let hash1 = trust::hash_hook_binding(root, "PreToolUse", Some("Bash"), &h1);
     let hash2 = trust::hash_hook_binding(root, "PreToolUse", Some("Bash"), &h2);
     assert_eq!(hash1, hash2);
+    assert_eq!(
+        hash1, "d5df00cc29270670ed84842fffdfeb744cc602918f2f1e91d8fca15fb606e9e0",
+        "the persisted trust identity must not depend on Rust's default hasher"
+    );
 }
 
 #[test]

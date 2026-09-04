@@ -330,24 +330,21 @@ impl McpClientManager {
         workspace: &std::path::Path,
     ) -> anyhow::Result<()> {
         tracing::info!("MCP reconnecting server '{}'", name);
-        // Command servers commonly own an exclusive local resource. Stop and
-        // reap the old tree before initializing its replacement; otherwise the
-        // replacement can fail on a port, socket, lock, or PID-file collision.
-        // Remote HTTP transports keep transactional connect-before-replace
-        // behavior because they do not own a local service process.
-        if matches!(cfg, config::McpServerConfig::Command { .. })
-            && let Some(index) = self
-                .handles
-                .iter()
-                .position(|handle| handle.server_name == name)
-        {
-            let mut previous = self.handles.remove(index);
-            let _ = previous.running_service.close().await;
-        }
+        // Connect first. A failed replacement must leave the currently usable
+        // connection installed; callers can retry without restarting the app.
         let handle =
             client::McpClientHandle::connect_in(CompactString::new(name), cfg, workspace).await?;
-        self.handles.retain(|h| h.server_name != name);
+        let previous = self
+            .handles
+            .iter()
+            .position(|existing| existing.server_name == name)
+            .map(|index| self.handles.remove(index));
         self.handles.push(handle);
+        self.handles
+            .sort_unstable_by(|left, right| left.server_name.cmp(&right.server_name));
+        if let Some(mut previous) = previous {
+            let _ = previous.running_service.close().await;
+        }
         Ok(())
     }
 

@@ -590,6 +590,8 @@ impl<'a> App<'a> {
         if let Some(h) = self.event_handle {
             let _ = h.join();
         }
+        #[cfg(feature = "lsp")]
+        crate::extras::lsp::shutdown_live_managers().await;
         #[cfg(feature = "mcp")]
         if let Some(mgr) = self.ui.mcp_manager {
             mgr.shutdown().await;

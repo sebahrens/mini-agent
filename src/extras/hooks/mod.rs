@@ -66,6 +66,13 @@ pub struct LoopInfo {
 
 static PROCESS_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ACTIVE_WORKSPACE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static ACTIVE_PERMISSION_MODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_active_permission_mode(mode: crate::permission::SecurityMode) {
+    *ACTIVE_PERMISSION_MODE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(mode.to_string());
+}
 
 pub(crate) fn set_active_workspace(path: &std::path::Path) {
     let selected = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -165,10 +172,9 @@ pub(crate) async fn gate_user_prompt(
     }
 }
 
-/// Builds a `HookCtx` from process/session state for seams that don't have
-/// live access to the `PermissionChecker` (`permission_mode` is a
-/// placeholder; the safety-critical `PreToolUse`/`PostToolUse` path carries
-/// the real mode via `HookedTool` instead).
+/// Builds a `HookCtx` from process/session state for lifecycle seams that do
+/// not directly own the `PermissionChecker`. The checker updates the shared
+/// mode whenever startup, `/mode`, or a prompt directive changes it.
 pub(crate) fn best_effort_ctx() -> HookCtx {
     let (session_id, session_path) = session_context();
     let cwd = active_workspace().display().to_string();
@@ -176,7 +182,11 @@ pub(crate) fn best_effort_ctx() -> HookCtx {
         session_id,
         session_path,
         cwd,
-        permission_mode: "unknown".to_string(),
+        permission_mode: ACTIVE_PERMISSION_MODE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| "standard".to_string()),
     }
 }
 

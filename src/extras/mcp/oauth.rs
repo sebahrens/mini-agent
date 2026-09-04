@@ -1349,6 +1349,7 @@ pub struct LoginSession {
     pub auth_url: String,
     session: AuthorizationSession,
     redirect_port: u16,
+    expected_state: String,
 }
 
 /// Begin an interactive OAuth login: discover metadata, register/authorize, and
@@ -1378,10 +1379,20 @@ pub async fn begin_login(
             .await
             .map_err(|e| anyhow::anyhow!("OAuth authorization setup failed: {e}"))?;
 
+    let auth_url = session.get_authorization_url().to_string();
+    let expected_state = reqwest::Url::parse(&auth_url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.into_owned())
+        })
+        .ok_or_else(|| anyhow::anyhow!("OAuth authorization URL is missing state"))?;
     Ok(LoginSession {
-        auth_url: session.get_authorization_url().to_string(),
+        auth_url,
         session,
         redirect_port: settings.redirect_port(),
+        expected_state,
     })
 }
 
@@ -1391,8 +1402,11 @@ impl LoginSession {
     /// `timeout`.
     pub async fn wait_for_callback(self, timeout: Duration) -> anyhow::Result<()> {
         let port = self.redirect_port;
-        let captured =
-            tokio::task::spawn_blocking(move || listen_for_callback(port, timeout)).await??;
+        let expected_state = self.expected_state.clone();
+        let captured = tokio::task::spawn_blocking(move || {
+            listen_for_callback(port, timeout, &expected_state)
+        })
+        .await??;
 
         self.session
             .handle_callback(&captured.code, &captured.state)
@@ -1415,7 +1429,11 @@ fn authorization_complete_body() -> String {
 }
 
 /// Blocking single-request loopback HTTP listener for the OAuth redirect.
-fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedCode> {
+fn listen_for_callback(
+    port: u16,
+    timeout: Duration,
+    expected_state: &str,
+) -> anyhow::Result<CapturedCode> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port} for OAuth redirect: {e}"))?;
     listener.set_nonblocking(false).ok();
@@ -1432,9 +1450,23 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
         }
         match listener.accept() {
             Ok((mut stream, _addr)) => {
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                let request_line = read_request_line(&mut stream)?;
-                let (code, state) = parse_callback(&request_line)?;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                stream
+                    .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
+                    .ok();
+                let captured = read_request_line(&mut stream)
+                    .and_then(|request_line| matching_callback(&request_line, expected_state));
+                let Ok(captured) = captured else {
+                    let body = "Invalid or unrelated OAuth callback; waiting for authorization.";
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                };
                 let body = authorization_complete_body();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1443,7 +1475,7 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
-                return Ok(CapturedCode { code, state });
+                return Ok(captured);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1451,6 +1483,14 @@ fn listen_for_callback(port: u16, timeout: Duration) -> anyhow::Result<CapturedC
             Err(e) => return Err(anyhow::anyhow!("accept failed: {e}")),
         }
     }
+}
+
+fn matching_callback(request_line: &str, expected_state: &str) -> anyhow::Result<CapturedCode> {
+    let (code, state) = parse_callback(request_line)?;
+    if state != expected_state {
+        anyhow::bail!("OAuth callback state does not match the active login");
+    }
+    Ok(CapturedCode { code, state })
 }
 
 fn read_request_line(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
@@ -1532,10 +1572,61 @@ pub(crate) fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod product_identity_tests {
+    use std::io::Write as _;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn send_request(port: u16, request: &str) {
+        for _ in 0..100 {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+                stream.write_all(request.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("OAuth callback listener did not become ready");
+    }
+
     #[test]
     fn oauth_completion_uses_public_product_name() {
         let body = super::authorization_complete_body();
         assert!(body.contains(crate::product::PUBLIC_NAME));
         assert!(!body.contains(crate::product::LEGACY_APP_COMPONENT));
+    }
+
+    #[test]
+    fn callback_filter_rejects_stray_state_and_accepts_active_login() {
+        assert!(
+            super::matching_callback("GET /callback?code=wrong&state=stray HTTP/1.1", "expected")
+                .is_err()
+        );
+        let captured = super::matching_callback(
+            "GET /callback?code=right&state=expected HTTP/1.1",
+            "expected",
+        )
+        .unwrap();
+        assert_eq!(captured.code, "right");
+        assert_eq!(captured.state, "expected");
+    }
+
+    #[test]
+    fn callback_listener_ignores_stray_connection_before_valid_redirect() {
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let listener = std::thread::spawn(move || {
+            super::listen_for_callback(port, Duration::from_secs(3), "expected")
+        });
+        send_request(port, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        send_request(
+            port,
+            "GET /callback?code=right&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+
+        let captured = listener.join().unwrap().unwrap();
+        assert_eq!(captured.code, "right");
+        assert_eq!(captured.state, "expected");
     }
 }

@@ -1,6 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -20,12 +18,12 @@ pub(crate) fn hash_hook_binding(
     matcher: Option<&str>,
     handler: &HookHandler,
 ) -> String {
-    let mut hasher = DefaultHasher::new();
-    project_root.to_string_lossy().hash(&mut hasher);
-    event.hash(&mut hasher);
-    matcher.unwrap_or("").hash(&mut hasher);
-    handler.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let canonical = serde_json::to_vec(&(project_root.to_string_lossy(), event, matcher, handler))
+        .expect("serializing hook trust bindings cannot fail");
+    let mut hasher = Sha256::new();
+    hasher.update(b"mini-agent-hook-binding-v2\0");
+    hasher.update(canonical);
+    crate::hex::encode_lower(hasher.finalize())
 }
 
 fn default_trust_store_path(paths: &crate::paths::AppPaths) -> PathBuf {

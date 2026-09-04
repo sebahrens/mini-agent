@@ -1537,6 +1537,10 @@ where
                                 response.clear();
                                 response_len_at_stream_start = 0;
                                 append_tool_call(&mut interactions, &tool_call);
+                                crate::permission::ask::record_tool_call(
+                                    &tool_call.function.name,
+                                    &internal_call_id,
+                                );
                                 let _ = event_tx
                                     .send(AgentEvent::ToolCall {
                                         id: CompactString::from(internal_call_id),
@@ -1613,6 +1617,7 @@ where
                             tool_name,
                             output.len(),
                         );
+                        crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
                         let _ = event_tx
                             .send(AgentEvent::ToolResult {
                                 id: CompactString::from(internal_call_id),
@@ -1892,6 +1897,8 @@ where
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
 
+    let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
+
     let join = tokio::spawn(agent_future);
 
     (
@@ -2055,6 +2062,7 @@ where
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                     append_tool_call(&mut interactions, &tool_call);
+                    crate::permission::ask::record_tool_call(name, &internal_call_id);
                 }
                 Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
@@ -2078,6 +2086,7 @@ where
                     ) else {
                         continue;
                     };
+                    crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                     if pure_stdout && !output.is_empty() {
                         println!("◈ {} result:", name);
                         let lines: Vec<&str> = output.lines().collect();

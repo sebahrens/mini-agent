@@ -14,6 +14,10 @@ use crate::extras::mcp::config::TrustedMcpServer;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
+/// Hard ceiling for data accepted from one untrusted MCP `tools/call`
+/// response before it is handed to the model.
+const MAX_MCP_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug)]
 pub struct McpToolError(pub CompactString);
 
@@ -48,6 +52,25 @@ impl McpTool {
     }
 }
 
+fn parse_arguments(args: &str) -> Result<Option<JsonObject>, McpToolError> {
+    serde_json::from_str(args).map_err(|error| {
+        McpToolError(CompactString::new(format!(
+            "invalid MCP tool arguments: {error}"
+        )))
+    })
+}
+
+fn append_bounded(output: &mut String, value: &str) -> Result<(), McpToolError> {
+    if output.len().saturating_add(value.len()) > MAX_MCP_TOOL_RESULT_BYTES {
+        return Err(McpToolError(CompactString::new(format!(
+            "MCP tool result exceeded the {} byte limit",
+            MAX_MCP_TOOL_RESULT_BYTES
+        ))));
+    }
+    output.push_str(value);
+    Ok(())
+}
+
 impl ToolDyn for McpTool {
     fn name(&self) -> String {
         self.registered_name.to_string()
@@ -72,6 +95,7 @@ impl ToolDyn for McpTool {
         let peer = self.peer.clone();
         let permission = self.permission.clone();
         let ask_tx = self.ask_tx.clone();
+        let registered_name = self.registered_name.clone();
         let call_timeout = self.call_timeout;
 
         Box::pin(async move {
@@ -82,13 +106,15 @@ impl ToolDyn for McpTool {
                 &perm_key,
                 trusted_identity,
                 &tool_name,
+                &registered_name,
             )
             .await
             .map_err(|e| {
                 ToolError::ToolCallError(Box::new(McpToolError(CompactString::new(e.to_string()))))
             })?;
 
-            let arguments: Option<JsonObject> = serde_json::from_str(&args).unwrap_or_default();
+            let arguments = parse_arguments(&args)
+                .map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
             let params = arguments
                 .map(|a| CallToolRequestParams::new(tool_name.clone()).with_arguments(a))
                 .unwrap_or_else(|| CallToolRequestParams::new(tool_name.clone()));
@@ -109,15 +135,18 @@ impl ToolDyn for McpTool {
                 })?;
 
             if result.is_error.unwrap_or(false) {
-                let error_msg = result
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        ContentBlock::Text(t) => Some(t.text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut error_msg = String::new();
+                for text in result.content.iter().filter_map(|content| match content {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                }) {
+                    if !error_msg.is_empty() {
+                        append_bounded(&mut error_msg, "\n")
+                            .map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+                    }
+                    append_bounded(&mut error_msg, text)
+                        .map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+                }
                 let msg = if error_msg.is_empty() {
                     "MCP tool returned an error".to_string()
                 } else {
@@ -131,26 +160,54 @@ impl ToolDyn for McpTool {
             let mut content = String::new();
             for item in result.content {
                 match item {
-                    ContentBlock::Text(t) => content.push_str(&t.text),
-                    ContentBlock::Image(img) => {
-                        content.push_str(&format!("data:{};base64,{}", img.mime_type, img.data));
-                    }
+                    ContentBlock::Text(t) => append_bounded(&mut content, &t.text),
+                    ContentBlock::Image(img) => append_bounded(&mut content, "data:")
+                        .and_then(|()| append_bounded(&mut content, &img.mime_type))
+                        .and_then(|()| append_bounded(&mut content, ";base64,"))
+                        .and_then(|()| append_bounded(&mut content, &img.data)),
                     ContentBlock::Resource(r) => match &r.resource {
                         rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            content.push_str(text);
+                            append_bounded(&mut content, text)
                         }
                         rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
-                            content.push_str(blob);
+                            append_bounded(&mut content, blob)
                         }
-                        _ => {}
+                        _ => Ok(()),
                     },
-                    _ => {}
+                    _ => Ok(()),
                 }
+                .map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
             }
             if let Some(msg) = coaching {
                 content = format!("{}\n\n{}", msg, content);
             }
             Ok(content)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_arguments_are_rejected_instead_of_becoming_no_arguments() {
+        let error = parse_arguments("{broken").unwrap_err();
+        assert!(error.to_string().contains("invalid MCP tool arguments"));
+        assert_eq!(parse_arguments("null").unwrap(), None);
+        assert_eq!(
+            parse_arguments(r#"{"key":"value"}"#).unwrap().unwrap()["key"],
+            "value"
+        );
+    }
+
+    #[test]
+    fn cumulative_result_size_is_bounded() {
+        let mut accumulated = "a".repeat(MAX_MCP_TOOL_RESULT_BYTES - 1);
+        append_bounded(&mut accumulated, "b").unwrap();
+        assert_eq!(accumulated.len(), MAX_MCP_TOOL_RESULT_BYTES);
+        let error = append_bounded(&mut accumulated, "c").unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+        assert_eq!(accumulated.len(), MAX_MCP_TOOL_RESULT_BYTES);
     }
 }
