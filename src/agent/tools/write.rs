@@ -10,6 +10,16 @@ use crate::extras::lsp::LspManager;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
+fn create_error(path: &str, error: std::io::Error) -> ToolError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        ToolError::Msg(format!(
+            "File '{path}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed."
+        ))
+    } else {
+        error.into()
+    }
+}
+
 pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -163,7 +173,9 @@ impl Tool for WriteTool {
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
                     .await?;
-            workspace.create_relative_atomic(relative, args.content.as_bytes())?;
+            workspace
+                .create_relative_atomic(relative, args.content.as_bytes())
+                .map_err(|error| create_error(&expanded, error))?;
             self.read_tracker.untrack_read_path(&expanded);
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
             if let Some(msg) = coaching {
@@ -214,7 +226,9 @@ impl Tool for WriteTool {
             )
         })?)
         .await?;
-        crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent).await?;
+        crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent)
+            .await
+            .map_err(|error| create_error(&expanded, error))?;
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
@@ -280,6 +294,28 @@ mod tests {
         .expect("valid PlanWrite permission fixture");
         WriteTool::new(Some(Arc::new(Mutex::new(checker))), None, None)
             .with_workspace(workspace.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn workspace_write_reports_existing_files_as_an_actionable_tool_error() {
+        let temp = TempDir::new();
+        std::fs::write(temp.path().join("existing.txt"), "original").unwrap();
+        let error = WriteTool::new(None, None, None)
+            .with_workspace(temp.path())
+            .call(WriteArgs {
+                path: "existing.txt".into(),
+                content: "replacement".into(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already exists"), "{error}");
+        assert!(error.contains("Use edit"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("existing.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use rig::tool::Tool;
 use super::find_files::BoundDirectory;
 use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
+    combine_coaching,
 };
 
 pub struct GrepTool {
@@ -144,7 +145,7 @@ impl Tool for GrepTool {
             .await?;
             (bound, coaching)
         };
-        let _ = path_coaching;
+        let coaching = combine_coaching(coaching, path_coaching);
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args.include.as_ref().map(|g| {

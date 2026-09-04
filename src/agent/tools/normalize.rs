@@ -11,10 +11,10 @@ pub struct NormalizedText {
     pub text: String,
     /// `source_offsets[i]` is the source byte offset that produced normalized
     /// byte `i`. A tab's four spaces all map to the tab byte; a line's `\n`
-    /// maps to the source newline (or to the source length for a synthetic
-    /// terminator on an unterminated last line). `source_offsets[text.len()]`
-    /// is the source length, so the vector always has `text.len() + 1` entries
-    /// and is non-decreasing.
+    /// maps to the start of its source terminator (`\r` for CRLF, `\n` for LF),
+    /// or to the source length for a synthetic terminator on an unterminated last
+    /// line. `source_offsets[text.len()]` is the source length, so the vector
+    /// always has `text.len() + 1` entries and is non-decreasing.
     source_offsets: Vec<usize>,
 }
 
@@ -27,11 +27,15 @@ impl NormalizedText {
         let mut line_start = 0usize;
         while line_start < s.len() {
             let (line, newline_at, next_start) = match s[line_start..].find('\n') {
-                Some(rel) => (
-                    &s[line_start..line_start + rel],
-                    line_start + rel,
-                    line_start + rel + 1,
-                ),
+                Some(rel) => {
+                    let line = &s[line_start..line_start + rel];
+                    let newline_at = if line.ends_with('\r') {
+                        line_start + rel - 1
+                    } else {
+                        line_start + rel
+                    };
+                    (line, newline_at, line_start + rel + 1)
+                }
                 // Unterminated last line: `str::lines` still yields it, and the
                 // normalized form gets a synthetic terminator mapped to EOF.
                 None => (&s[line_start..], s.len(), s.len()),

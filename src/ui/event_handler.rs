@@ -2,7 +2,6 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 use rig::completion::Message;
 
-use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
 use crate::config::ResolvedShowToolDetails;
 use crate::event::AgentEvent;
@@ -152,40 +151,7 @@ pub async fn handle_agent_event(
             }
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             if name == "todo_write" {
-                let list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
-                if list.is_empty() {
-                    renderer.write_line("tasks cleared", Color::DarkGrey)?;
-                } else {
-                    let total = list.len();
-                    let completed = list.iter().filter(|t| t.status == "completed").count();
-                    renderer.write_line(
-                        &format!("tasks  {} done / {} total", completed, total),
-                        C_TOOL,
-                    )?;
-                    for item in list.iter() {
-                        let icon = match item.status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[>]",
-                            "cancelled" => "[-]",
-                            _ => "[ ]",
-                        };
-                        let status_color = match item.status.as_str() {
-                            "completed" => Color::Green,
-                            "in_progress" => C_TOOL,
-                            "cancelled" => Color::DarkGrey,
-                            _ => Color::DarkGrey,
-                        };
-                        let priority_mark = match item.priority.as_str() {
-                            "high" => "!!",
-                            "medium" => "! ",
-                            _ => "  ",
-                        };
-                        renderer.write_line(
-                            &format!("  {} {} {}", icon, priority_mark, item.content),
-                            status_color,
-                        )?;
-                    }
-                }
+                renderer.write_line(&sanitize_output(&output), C_TOOL)?;
             } else {
                 let show_details = ui
                     .cfg

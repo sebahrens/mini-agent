@@ -1,21 +1,7 @@
 use crate::agent::tools::WriteTodoList;
-use crate::agent::tools::todo::{TODO_LIST, TodoItem, TodoWriteArgs};
+use crate::agent::tools::todo::{TodoItem, TodoWriteArgs};
 use compact_str::CompactString;
 use rig::tool::Tool;
-use tokio::sync::{Mutex, MutexGuard};
-
-static TODO_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn lock_todo_tests() -> MutexGuard<'static, ()> {
-    TODO_TEST_LOCK.lock().await
-}
-
-fn reset_todo_list() {
-    let mut list = TODO_LIST
-        .lock()
-        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-    list.clear();
-}
 
 #[tokio::test]
 async fn definition_name() {
@@ -41,8 +27,6 @@ async fn definition_parameters_has_required_fields() {
 
 #[tokio::test]
 async fn call_with_empty_todos() {
-    let _guard = lock_todo_tests().await;
-    reset_todo_list();
     let tool = WriteTodoList::new(None, None);
     let args = TodoWriteArgs { todos: vec![] };
     let result = tool.call(args).await;
@@ -53,8 +37,6 @@ async fn call_with_empty_todos() {
 
 #[tokio::test]
 async fn call_formats_todo_items_with_icons() {
-    let _guard = lock_todo_tests().await;
-    reset_todo_list();
     let tool = WriteTodoList::new(None, None);
     let args = TodoWriteArgs {
         todos: vec![
@@ -101,61 +83,23 @@ async fn call_formats_todo_items_with_icons() {
 }
 
 #[tokio::test]
-async fn call_updates_global_todo_list() {
-    let _guard = lock_todo_tests().await;
-    reset_todo_list();
-    let tool = WriteTodoList::new(None, None);
-    let args = TodoWriteArgs {
-        todos: vec![
-            TodoItem {
-                content: "Task 1".to_string(),
+async fn independent_todo_tools_do_not_share_process_global_state() {
+    let first = WriteTodoList::new(None, None)
+        .call(TodoWriteArgs {
+            todos: vec![TodoItem {
+                content: "First session".to_string(),
                 status: CompactString::new("pending"),
                 priority: CompactString::new("high"),
-            },
-            TodoItem {
-                content: "Task 2".to_string(),
-                status: CompactString::new("pending"),
-                priority: CompactString::new("medium"),
-            },
-        ],
-    };
-    let _ = tool.call(args).await;
+            }],
+        })
+        .await
+        .unwrap();
+    let second = WriteTodoList::new(None, None)
+        .call(TodoWriteArgs { todos: vec![] })
+        .await
+        .unwrap();
 
-    let list = TODO_LIST
-        .lock()
-        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-    assert_eq!(list.len(), 2);
-    assert_eq!(list[0].content, "Task 1");
-    assert_eq!(list[1].content, "Task 2");
-}
-
-#[tokio::test]
-async fn call_overwrites_previous_list() {
-    let _guard = lock_todo_tests().await;
-    reset_todo_list();
-    let tool = WriteTodoList::new(None, None);
-
-    let args1 = TodoWriteArgs {
-        todos: vec![TodoItem {
-            content: "First".to_string(),
-            status: CompactString::new("pending"),
-            priority: CompactString::new("high"),
-        }],
-    };
-    let _ = tool.call(args1).await;
-
-    let args2 = TodoWriteArgs {
-        todos: vec![TodoItem {
-            content: "Second".to_string(),
-            status: CompactString::new("completed"),
-            priority: CompactString::new("low"),
-        }],
-    };
-    let _ = tool.call(args2).await;
-
-    let list = TODO_LIST
-        .lock()
-        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].content, "Second");
+    assert!(first.contains("First session"));
+    assert!(second.contains("cleared"));
+    assert!(!second.contains("First session"));
 }

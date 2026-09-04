@@ -562,7 +562,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
             ) {
                 Ok(tool) => base_tools.push(Box::new(tool)),
-                Err(error) => tracing::debug!(%error, "structured Git tool unavailable"),
+                Err(error) => tracing::warn!(%error, "structured Git tool unavailable"),
             }
         }
 

@@ -27,6 +27,18 @@ fn skip_other_dirs() {
 }
 
 #[test]
+fn permission_coaching_combines_pattern_and_path_messages() {
+    assert_eq!(
+        crate::agent::tools::combine_coaching(Some("pattern".into()), Some("path".into())),
+        Some("pattern\n\npath".into())
+    );
+    assert_eq!(
+        crate::agent::tools::combine_coaching(Some("same".into()), Some("same".into())),
+        Some("same".into())
+    );
+}
+
+#[test]
 fn track_read_returns_none_when_deny_disabled() {
     let tracker = ReadTracker::new(false);
     let result = tracker.track_read("test_path", 0, 10);
@@ -144,6 +156,58 @@ async fn concurrent_read_tools_with_different_settings_do_not_share_history() {
             .contains("already read")
     );
     assert!(second_allowing.is_ok());
+
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn repeated_read_is_allowed_after_an_external_file_change() {
+    let path = std::env::temp_dir().join(format!(
+        "mini-agent-read-tracker-external-change-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::write(&path, "before").await.unwrap();
+    let tool = ReadTool::new_with_tracker(None, None, None, 100, ReadTracker::new(true));
+    let args = || ReadArgs {
+        path: path.to_string_lossy().into_owned(),
+        offset: None,
+        limit: None,
+    };
+
+    assert!(tool.call(args()).await.is_ok());
+    assert!(tool.call(args()).await.is_err());
+    tokio::fs::write(&path, "after with a different length")
+        .await
+        .unwrap();
+    assert!(tool.call(args()).await.is_ok());
+
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+#[tokio::test]
+async fn failed_read_is_not_recorded_as_successful() {
+    let path = std::env::temp_dir().join(format!(
+        "mini-agent-read-tracker-failed-read-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    tokio::fs::write(&path, "too large").await.unwrap();
+    let tool = ReadTool::new_with_tracker(None, None, Some(1), 100, ReadTracker::new(true));
+    let args = || ReadArgs {
+        path: path.to_string_lossy().into_owned(),
+        offset: None,
+        limit: None,
+    };
+
+    for _ in 0..2 {
+        let error = tool.call(args()).await.unwrap_err().to_string();
+        assert!(
+            error.contains("File too large"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("already read"));
+    }
 
     let _ = tokio::fs::remove_file(path).await;
 }
@@ -276,7 +340,7 @@ async fn canonical_path_key_blocks_dot_alias_of_same_file() {
 }
 
 #[tokio::test]
-async fn edit_invalidates_only_the_owning_session_tracker() {
+async fn edit_file_version_change_invalidates_every_session_tracker() {
     let path = std::env::temp_dir().join(format!(
         "mini-agent-read-tracker-write-{}-{}",
         std::process::id(),
@@ -308,14 +372,7 @@ async fn edit_invalidates_only_the_owning_session_tracker() {
         .unwrap();
 
     assert!(owner_read.call(read_args()).await.is_ok());
-    assert!(
-        other_read
-            .call(read_args())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("already read")
-    );
+    assert!(other_read.call(read_args()).await.is_ok());
 
     let _ = tokio::fs::remove_file(path).await;
 }

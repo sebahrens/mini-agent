@@ -137,6 +137,43 @@ enum MatchResult {
     NotFound,
 }
 
+const MAX_FUZZY_DISTANCE_CELLS: u128 = 8_000_000;
+
+#[derive(Clone, Copy)]
+struct LineSpan<'a> {
+    start: usize,
+    content_end: usize,
+    full_end: usize,
+    text: &'a str,
+}
+
+fn line_spans(content: &str) -> Vec<LineSpan<'_>> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for line in content.split_inclusive('\n') {
+        let full_end = start + line.len();
+        let without_lf = line.strip_suffix('\n').unwrap_or(line);
+        let text = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        spans.push(LineSpan {
+            start,
+            content_end: start + text.len(),
+            full_end,
+            text,
+        });
+        start = full_end;
+    }
+    if start < content.len() {
+        let line = &content[start..];
+        spans.push(LineSpan {
+            start,
+            content_end: content.len(),
+            full_end: content.len(),
+            text: line.strip_suffix('\r').unwrap_or(line),
+        });
+    }
+    spans
+}
+
 fn find_best_match(content: &str, search: &str) -> MatchResult {
     // Step 1: exact match in original content
     if let Some(pos) = content.find(search) {
@@ -156,7 +193,8 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
 
     // Step 3: fuzzy line-level matching
     let search_lines: Vec<&str> = search.lines().collect();
-    let content_lines: Vec<&str> = content.lines().collect();
+    let spans = line_spans(content);
+    let content_lines: Vec<&str> = spans.iter().map(|span| span.text).collect();
 
     if search_lines.is_empty() || content_lines.len() < search_lines.len() {
         return MatchResult::NotFound;
@@ -167,16 +205,38 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
         .map(|l| normalize_whitespace(l))
         .collect();
     let search_norm_joined = search_norm_lines.join("\n");
+    let content_norm_lines: Vec<String> = content_lines
+        .iter()
+        .map(|line| normalize_whitespace(line))
+        .collect();
+
+    let window_size = search_lines.len();
+    let candidate_count = content_lines.len() - window_size + 1;
+    let search_chars = search_norm_joined.chars().count() as u128;
+    let line_chars: Vec<u128> = content_norm_lines
+        .iter()
+        .map(|line| line.chars().count() as u128)
+        .collect();
+    let mut window_chars =
+        line_chars[..window_size].iter().sum::<u128>() + window_size.saturating_sub(1) as u128;
+    let mut fuzzy_cells = 0u128;
+    for start in 0..candidate_count {
+        fuzzy_cells = fuzzy_cells.saturating_add(search_chars.saturating_mul(window_chars));
+        if fuzzy_cells > MAX_FUZZY_DISTANCE_CELLS {
+            return MatchResult::NotFound;
+        }
+        if start + window_size < line_chars.len() {
+            window_chars = window_chars
+                .saturating_sub(line_chars[start])
+                .saturating_add(line_chars[start + window_size]);
+        }
+    }
 
     let mut best_sim = 0.0f64;
     let mut best_start = 0usize;
 
     for start in 0..=content_lines.len() - search_lines.len() {
-        let window_norm: String = content_lines[start..start + search_lines.len()]
-            .iter()
-            .map(|l| normalize_whitespace(l))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let window_norm = content_norm_lines[start..start + search_lines.len()].join("\n");
         let sim = levenshtein_similarity(&search_norm_joined, &window_norm);
         if sim > best_sim {
             best_sim = sim;
@@ -188,19 +248,11 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     }
 
     if best_sim >= 0.85 {
-        let byte_start: usize = content_lines[..best_start]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum();
-        let byte_end = byte_start
-            + content_lines[best_start..best_start + search_lines.len()]
-                .iter()
-                .map(|l| l.len() + 1)
-                .sum::<usize>()
-                .saturating_sub(1);
+        let byte_start = spans[best_start].start;
+        let byte_end = spans[best_start + search_lines.len() - 1].content_end;
         MatchResult::FuzzyApply(byte_start, byte_end, best_sim)
     } else if best_sim >= 0.60 {
-        let preview: String = search_lines
+        let preview: String = content_lines[best_start..]
             .iter()
             .take(3)
             .copied()
@@ -327,7 +379,9 @@ async fn handle_similarity(
 
 fn parse_tagged_line(raw: &str) -> Option<(usize, String)> {
     let stripped = raw.trim_start_matches([' ', '\t']);
-    let (num_tag, _content) = stripped.split_once(' ')?;
+    let num_tag = stripped
+        .split_once(' ')
+        .map_or(stripped, |(num_tag, _content)| num_tag);
     let (num_str, tag) = num_tag.split_once('|')?;
     let line_num: usize = num_str.parse().ok()?;
     if tag.len() != 8 || !tag.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -384,31 +438,23 @@ fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<()
 }
 
 fn line_range_to_byte_range(
-    content_lines: &[&str],
+    spans: &[LineSpan<'_>],
     start_line: usize,
     end_line: usize,
+    delete_whole_lines: bool,
 ) -> (usize, usize) {
-    if content_lines.is_empty() || start_line == 0 || start_line > content_lines.len() {
+    if spans.is_empty() || start_line == 0 || start_line > spans.len() {
         return (0, 0);
     }
-    let end_line = end_line.min(content_lines.len());
-
-    // Byte position before start_line
-    let byte_start: usize = content_lines[..start_line.saturating_sub(1)]
-        .iter()
-        .map(|l| l.len() + 1)
-        .sum();
-
-    // The +1 per line accounts for newline separators; saturating_sub(1)
-    // removes the phantom newline from the last line in the range.
-    let byte_end = byte_start
-        + content_lines[start_line.saturating_sub(1)..end_line]
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-            .saturating_sub(1);
-
-    (byte_start, byte_end)
+    let end_line = end_line.min(spans.len());
+    let start = spans[start_line - 1].start;
+    let last = spans[end_line - 1];
+    let end = if delete_whole_lines {
+        last.full_end
+    } else {
+        last.content_end
+    };
+    (start, end)
 }
 
 async fn handle_hashedit(
@@ -418,7 +464,7 @@ async fn handle_hashedit(
     content: &str,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     // Validate file-level CRC
-    let actual_crc = crc32_hex(content.as_bytes());
+    let actual_crc = crc32_hex(content.replace("\r\n", "\n").as_bytes());
     if actual_crc != file_crc {
         return Err(ToolError::Msg(format!(
             "File CRC mismatch for '{}': expected {} but file now has {}. The file has changed since the read. Re-read and retry.",
@@ -426,7 +472,8 @@ async fn handle_hashedit(
         )));
     }
 
-    let content_lines: Vec<&str> = content.lines().collect();
+    let spans = line_spans(content);
+    let content_lines: Vec<&str> = spans.iter().map(|span| span.text).collect();
     let notes = Vec::new();
     let mut ranges = Vec::new();
 
@@ -449,7 +496,7 @@ async fn handle_hashedit(
                     .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
 
                 let (byte_start, byte_end) =
-                    line_range_to_byte_range(&content_lines, line_num, line_num);
+                    line_range_to_byte_range(&spans, line_num, line_num, op.text.is_empty());
                 ranges.push((byte_start, byte_end, op.text.clone()));
             }
             (None, Some(multi_lines)) => {
@@ -482,7 +529,7 @@ async fn handle_hashedit(
                 let start_line = entries[0].0;
                 let end_line = entries[entries.len() - 1].0;
                 let (byte_start, byte_end) =
-                    line_range_to_byte_range(&content_lines, start_line, end_line);
+                    line_range_to_byte_range(&spans, start_line, end_line, op.text.is_empty());
                 ranges.push((byte_start, byte_end, op.text.clone()));
             }
             (Some(_), Some(_)) => {
@@ -661,12 +708,11 @@ impl Tool for EditTool {
         };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
-        let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
         // Fail closed on invalid UTF-8: the whole file is rewritten, so a lossy
         // decode would replace every invalid byte (even in untouched regions)
         // with U+FFFD and silently corrupt e.g. Latin-1 files.
         let content = match String::from_utf8(bytes) {
-            Ok(text) => text.replace("\r\n", "\n"),
+            Ok(text) => text,
             Err(e) => {
                 return Err(ToolError::Msg(format!(
                     "Cannot edit '{}': file is not valid UTF-8 (invalid byte at offset {}). The edit tool only handles UTF-8 text; convert the file first or use bash for binary/legacy encodings.",
@@ -715,11 +761,7 @@ impl Tool for EditTool {
             modified.replace_range(*byte_start..*byte_end, replace);
         }
 
-        let output = if has_crlf {
-            modified.replace('\n', "\r\n")
-        } else {
-            modified
-        };
+        let output = modified;
 
         if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
             workspace.replace_relative_atomic(relative, output.as_bytes(), expected)?;

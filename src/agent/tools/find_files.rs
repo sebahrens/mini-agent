@@ -9,7 +9,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::{
     AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_bound_path,
-    check_perm_path, is_skip_dir,
+    check_perm_path, combine_coaching, is_skip_dir,
 };
 
 fn path_changed_error(path: &Path) -> std::io::Error {
@@ -133,6 +133,30 @@ mod bound_platform {
         }
     }
 
+    pub(super) fn is_link(directory: &File, name: &OsStr) -> bool {
+        let Ok(name) = CString::new(name.as_bytes()) else {
+            return false;
+        };
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `name` is NUL-terminated, the directory descriptor remains
+        // live, and fstatat initializes `metadata` on success without following
+        // the entry. This classifies a link but never opens its target.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return false;
+        }
+        // SAFETY: fstatat succeeded and initialized the value.
+        let metadata = unsafe { metadata.assume_init() };
+        metadata.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+
     pub(super) struct DirectoryReader {
         stream: DirectoryStreamGuard,
     }
@@ -172,6 +196,10 @@ mod bound_platform {
 
     pub(super) fn is_safe_entry(_metadata: &std::fs::Metadata) -> bool {
         true
+    }
+
+    pub(super) fn is_link_metadata(metadata: &std::fs::Metadata) -> bool {
+        metadata.file_type().is_symlink()
     }
 }
 
@@ -400,6 +428,14 @@ mod bound_platform {
     pub(super) fn is_safe_entry(metadata: &std::fs::Metadata) -> bool {
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
+
+    pub(super) fn is_link(_directory: &File, _name: &OsStr) -> bool {
+        false
+    }
+
+    pub(super) fn is_link_metadata(metadata: &std::fs::Metadata) -> bool {
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -438,6 +474,14 @@ mod bound_platform {
     }
 
     pub(super) fn is_safe_entry(_metadata: &std::fs::Metadata) -> bool {
+        false
+    }
+
+    pub(super) fn is_link(_directory: &File, _name: &OsStr) -> bool {
+        false
+    }
+
+    pub(super) fn is_link_metadata(_metadata: &std::fs::Metadata) -> bool {
         false
     }
 }
@@ -520,9 +564,35 @@ impl BoundDirectory {
         for name in bound_platform::read_directory(&self.root)? {
             let child = match bound_platform::open_child(&self.root, &name) {
                 Ok(child) => child,
+                Err(_) if bound_platform::is_link(&self.root, &name) => {
+                    let path = self.approved_root.join(&name);
+                    if !is_ignored(&matchers, &path, false) {
+                        entries.push(BoundListEntry {
+                            file_name: name,
+                            is_directory: false,
+                            is_link: true,
+                            size: 0,
+                            child_count: 0,
+                        });
+                    }
+                    continue;
+                }
                 Err(_) => continue,
             };
             let metadata = match child.metadata() {
+                Ok(metadata) if bound_platform::is_link_metadata(&metadata) => {
+                    let path = self.approved_root.join(&name);
+                    if !is_ignored(&matchers, &path, false) {
+                        entries.push(BoundListEntry {
+                            file_name: name,
+                            is_directory: false,
+                            is_link: true,
+                            size: 0,
+                            child_count: 0,
+                        });
+                    }
+                    continue;
+                }
                 Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
                 _ => continue,
             };
@@ -543,7 +613,9 @@ impl BoundDirectory {
             };
             entries.push(BoundListEntry {
                 file_name: name,
-                metadata,
+                is_directory,
+                is_link: false,
+                size: metadata.len(),
                 child_count,
             });
         }
@@ -553,7 +625,9 @@ impl BoundDirectory {
 
 pub(super) struct BoundListEntry {
     pub(super) file_name: OsString,
-    pub(super) metadata: std::fs::Metadata,
+    pub(super) is_directory: bool,
+    pub(super) is_link: bool,
+    pub(super) size: u64,
     pub(super) child_count: u64,
 }
 
@@ -852,7 +926,7 @@ impl Tool for FindFilesTool {
             .await?;
             (bound, coaching)
         };
-        let _ = path_coaching;
+        let coaching = combine_coaching(coaching, path_coaching);
 
         let walker = bound_directory.walker()?;
 

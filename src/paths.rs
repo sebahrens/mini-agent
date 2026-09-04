@@ -140,7 +140,10 @@ impl WorkspaceBinding {
             #[cfg(unix)]
             {
                 use cap_std::fs::OpenOptionsExt;
-                options.mode(0o600);
+                // Workspace files follow ordinary creation semantics: the
+                // caller's umask narrows 0666. Private application state uses
+                // the separate restrictive atomic-write helpers in `fs`.
+                options.mode(0o666);
             }
             let mut file = parent.open_with(&temp, &options)?;
             file.write_all(content)?;
@@ -670,19 +673,22 @@ mod workspace_binding_tests {
     }
 
     #[test]
-    fn capability_atomic_writes_create_private_and_preserve_existing_mode() {
+    fn capability_atomic_writes_respect_umask_and_preserve_existing_mode() {
         let root = temp_root("atomic-mode");
         let binding = WorkspaceBinding::capture(&root).unwrap();
 
         binding
             .create_relative_atomic(std::path::Path::new("created.txt"), b"created")
             .unwrap();
+        let control = root.join("control.txt");
+        std::fs::write(&control, "control").unwrap();
         let created_mode = std::fs::metadata(root.join("created.txt"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(created_mode, 0o600);
+        let control_mode = std::fs::metadata(control).unwrap().permissions().mode() & 0o777;
+        assert_eq!(created_mode, control_mode);
 
         let existing = root.join("existing.sh");
         std::fs::write(&existing, "old").unwrap();

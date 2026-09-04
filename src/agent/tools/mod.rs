@@ -70,7 +70,30 @@ pub(crate) fn validate_workspace_binding(
 #[derive(Clone, Debug)]
 pub(crate) struct ReadTracker {
     deny_repeated_reads: bool,
-    tracked: std::sync::Arc<Mutex<Vec<(String, usize, usize)>>>,
+    tracked: std::sync::Arc<Mutex<Vec<TrackedRead>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadVersion {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ReadVersion {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrackedRead {
+    path: String,
+    offset: usize,
+    limit: usize,
+    version: ReadVersion,
 }
 
 impl Default for ReadTracker {
@@ -87,14 +110,24 @@ impl ReadTracker {
         }
     }
 
-    pub(crate) fn track_read(&self, path: &str, offset: usize, limit: usize) -> Option<String> {
+    pub(crate) fn check_read(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+    ) -> Option<String> {
         if !self.deny_repeated_reads {
             return None;
         }
-        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (path.to_string(), offset, limit);
-        if !tracked.contains(&key) {
-            tracked.push(key);
+        let version = ReadVersion::from_metadata(metadata);
+        let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        if !tracked.iter().any(|entry| {
+            entry.path == path
+                && entry.offset == offset
+                && entry.limit == limit
+                && entry.version == version
+        }) {
             return None;
         }
         let end = offset + limit;
@@ -105,9 +138,49 @@ impl ReadTracker {
         ))
     }
 
+    pub(crate) fn record_read(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        metadata: &std::fs::Metadata,
+    ) {
+        if !self.deny_repeated_reads {
+            return;
+        }
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        tracked
+            .retain(|entry| entry.path != path || entry.offset != offset || entry.limit != limit);
+        tracked.push(TrackedRead {
+            path: path.to_string(),
+            offset,
+            limit,
+            version: ReadVersion::from_metadata(metadata),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track_read(&self, path: &str, offset: usize, limit: usize) -> Option<String> {
+        let metadata = std::fs::metadata(".").expect("test process has a current directory");
+        let blocked = self.check_read(path, offset, limit, &metadata);
+        if blocked.is_none() {
+            self.record_read(path, offset, limit, &metadata);
+        }
+        blocked
+    }
+
     pub(crate) fn untrack_read_path(&self, path: &str) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
-        tracked.retain(|(tracked_path, _, _)| tracked_path != path);
+        tracked.retain(|entry| entry.path != path);
+    }
+}
+
+pub(crate) fn combine_coaching(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) if first == second => Some(first),
+        (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 

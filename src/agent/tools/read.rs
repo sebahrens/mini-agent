@@ -159,16 +159,16 @@ impl Tool for ReadTool {
             .as_deref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
+        let metadata = file.metadata().await?;
 
         if let Some(msg) = self
             .read_tracker
-            .track_read(&permission_path, offset, limit)
+            .check_read(&permission_path, offset, limit, &metadata)
         {
             tracing::debug!("tool read blocked (repeated): path={}", path);
             return Err(ToolError::Msg(msg));
         }
 
-        let metadata = file.metadata().await?;
         let file_size = metadata.len();
         if file_size > self.max_text_file_size {
             tracing::warn!(
@@ -274,6 +274,8 @@ impl Tool for ReadTool {
             total_lines,
             end - start,
         );
+        self.read_tracker
+            .record_read(&permission_path, offset, limit, &metadata);
         Ok(info)
     }
 }

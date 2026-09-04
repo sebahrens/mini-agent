@@ -313,6 +313,27 @@ impl GitTool {
         Ok(())
     }
 
+    async fn expand_stage_paths(&self, paths: &[String]) -> Result<Vec<String>, ToolError> {
+        let mut args = vec![
+            "ls-files".into(),
+            "-z".into(),
+            "--cached".into(),
+            "--others".into(),
+            "--exclude-standard".into(),
+            "--".into(),
+        ];
+        args.extend(paths.iter().cloned());
+        let output = self
+            .run("expand-stage-paths", args, QUERY_LIMITS, false)
+            .await?;
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect())
+    }
+
     async fn stage(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
         reject_irrelevant_fields(&args, false, false, false)?;
         require_paths(&args.paths, "stage")?;
@@ -323,7 +344,8 @@ impl GitTool {
             .await
             .map_err(ToolError::Msg)?;
         let before = self.status_snapshot().await?;
-        self.ensure_no_external_filters(&paths).await?;
+        let expanded_paths = self.expand_stage_paths(&paths).await?;
+        self.ensure_no_external_filters(&expanded_paths).await?;
         let mut command = vec!["add".into(), "--".into()];
         command.extend(paths);
         let output = self.run_mutation("stage", command).await?;
@@ -420,6 +442,12 @@ impl GitTool {
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
         match args.operation {
             GitOperation::Status => {
+                reject_irrelevant_fields(&args, false, false, false)?;
+                if !args.paths.is_empty() {
+                    return Err(ToolError::Msg(
+                        "paths are not supported by Git status".to_string(),
+                    ));
+                }
                 let coaching = self.permission("git/status", "workspace").await?;
                 let mut value = self.status_snapshot().await?;
                 value["operation"] = serde_json::json!("status");
@@ -427,6 +455,7 @@ impl GitTool {
                 Ok(value)
             }
             GitOperation::Diff => {
+                reject_irrelevant_fields(&args, false, true, false)?;
                 let paths = self.validate_paths(&args.paths, None).await?;
                 let identity = serde_json::to_string(&serde_json::json!({
                     "revision": args.revision,
@@ -453,6 +482,7 @@ impl GitTool {
                 )
             }
             GitOperation::Log => {
+                reject_irrelevant_fields(&args, false, true, true)?;
                 let paths = self.validate_paths(&args.paths, None).await?;
                 let count = args.max_count.unwrap_or(20).clamp(1, 100);
                 if let Some(revision) = args.revision.as_deref() {
@@ -504,6 +534,7 @@ impl GitTool {
                 }))
             }
             GitOperation::Show => {
+                reject_irrelevant_fields(&args, false, true, false)?;
                 let revision = args
                     .revision
                     .as_deref()
@@ -961,6 +992,41 @@ mod tests {
 
         assert!(error.to_string().contains("external transform"));
         assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stage_expands_directory_operands_before_checking_attributes() {
+        let repo = TestRepo::new();
+        std::fs::create_dir(repo.path().join("nested")).unwrap();
+        repo.write(".gitattributes", "nested/filtered.txt filter=external\n");
+        repo.write("nested/filtered.txt", "content\n");
+
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Stage, &["nested"], None))
+            .await
+            .expect_err("directory staging must inspect each affected file");
+
+        assert!(error.to_string().contains("external transform"));
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_operations_reject_fields_they_do_not_use() {
+        let repo = TestRepo::new();
+        let mut status = args(GitOperation::Status, &["ignored.txt"], None);
+        status.revision = Some("HEAD".into());
+        let error = repo.tool().call(status).await.unwrap_err().to_string();
+        assert!(error.contains("revision") || error.contains("paths"));
+
+        let mut diff = args(GitOperation::Diff, &[], Some("ignored"));
+        diff.max_count = Some(2);
+        assert!(repo.tool().call(diff).await.is_err());
+
+        let mut show = args(GitOperation::Show, &[], None);
+        show.revision = Some("HEAD".into());
+        show.max_count = Some(2);
+        assert!(repo.tool().call(show).await.is_err());
     }
 
     #[cfg(unix)]

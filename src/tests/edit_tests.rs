@@ -295,7 +295,7 @@ async fn test_hash_delete_via_empty_text() {
     .unwrap();
 
     let content = std::fs::read_to_string(tmp.path()).unwrap();
-    assert_eq!(content, "keep me\n\nkeep me too\n");
+    assert_eq!(content, "keep me\nkeep me too\n");
 }
 
 #[tokio::test]
@@ -743,6 +743,70 @@ async fn test_hash_adjacent_edits_are_allowed() {
         std::fs::read_to_string(tmp.path()).unwrap(),
         "A\nB\nline3\n"
     );
+}
+
+#[tokio::test]
+async fn test_similarity_edit_preserves_mixed_line_endings() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("mixed_endings.txt");
+    std::fs::write(tmp.path(), b"one\r\ntwo\nthree\r\n").unwrap();
+
+    sim_edit(&tmp, "two", "changed").await.unwrap();
+
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"one\r\nchanged\nthree\r\n"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_delete_line.txt");
+    let original = "one\r\ntwo\nthree\r\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let normalized = original.replace("\r\n", "\n");
+    let file_crc = crc32_hex(normalized.as_bytes());
+    let tag_without_trailing_space = format!("2|{}", crc32_hex(b"two"));
+
+    edit::EditTool::new(None, None)
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: None,
+            file_crc: Some(file_crc),
+            edits: Some(vec![EditOp {
+                line: Some(tag_without_trailing_space),
+                lines: None,
+                text: String::new(),
+            }]),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(tmp.path()).unwrap(), b"one\r\nthree\r\n");
+}
+
+#[tokio::test]
+async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("bounded_fuzzy.txt");
+    let content = (0..20_000)
+        .map(|index| format!("content line {index:05} with enough padding to be expensive"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(tmp.path(), content).unwrap();
+    let search = (0..40)
+        .map(|index| format!("missing line {index:05} with enough padding to be expensive"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sim_edit(&tmp, &search, "replacement"),
+    )
+    .await
+    .expect("fuzzy fallback exceeded its work budget");
+    assert!(result.unwrap_err().contains("not found"));
 }
 
 // ── Non-UTF-8 files must fail closed ────────────────────────────────────

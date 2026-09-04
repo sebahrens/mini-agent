@@ -137,16 +137,16 @@ impl Tool for ListDirTool {
 
         for entry in bound_directory.list_entries()? {
             let name = entry.file_name.to_string_lossy().to_string();
-            let kind = if entry.metadata.is_dir() {
+            let kind = if entry.is_directory {
                 format!("dir({})", entry.child_count)
-            } else if entry.metadata.is_symlink() {
+            } else if entry.is_link {
                 "link".to_string()
             } else {
                 "file".to_string()
             };
 
-            let size = if entry.metadata.is_file() {
-                format_size(entry.metadata.len())
+            let size = if !entry.is_directory && !entry.is_link {
+                format_size(entry.size)
             } else {
                 String::new()
             };
@@ -224,6 +224,26 @@ mod tests {
     use crate::permission::ask::UserDecision;
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfigs, SecurityMode};
+
+    #[tokio::test]
+    async fn descriptor_bound_listing_reports_symlinks_without_following_them() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-link-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("target.txt"), "target").unwrap();
+        std::os::unix::fs::symlink("target.txt", temp.join("link.txt")).unwrap();
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&temp)
+            .call(ListDirArgs { path: None })
+            .await
+            .unwrap();
+
+        assert!(listing.contains("[link]  link.txt"), "{listing}");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
 
     #[tokio::test]
     async fn descriptor_bound_listing_ignores_an_aba_swap_during_permission_wait() {
