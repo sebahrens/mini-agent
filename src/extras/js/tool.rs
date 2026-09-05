@@ -28,8 +28,9 @@ use crate::extras::js::host::{
     AllowConfig, FileEffectService, ParentHostEffectService, SpawnEffectService,
 };
 use crate::extras::js::protocol::{
-    ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticStage, InvocationId, JsErrorCode, RunStep,
-    ScriptRole, StepOutcome, StepResult,
+    ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage, InvocationId,
+    JsErrorCode, JsExceptionClass, RunStep, ScriptRole, StepOutcome, StepResult,
+    source_position_is_valid,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::{
@@ -937,7 +938,8 @@ impl Tool for JsTool {
         let broker = broker.with_skill_call_authority(skill_call_authority);
         #[cfg(feature = "skills")]
         let capability_denials = broker.capability_denial_tracker();
-        let run_step = RunStep::new(args.code).with_model_grant(model_grant_id);
+        let model_source = args.code;
+        let run_step = RunStep::new(model_source.clone()).with_model_grant(model_grant_id);
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
             run_step.with_proposal_grant(grant_id)
@@ -982,7 +984,7 @@ impl Tool for JsTool {
             Err(error) => return Err(worker_tool_error(error)),
         };
         cancel_on_drop.disarm();
-        validate_step_result_bounds(&response)?;
+        validate_step_result_bounds(&response, &model_source)?;
 
         #[cfg(feature = "skills")]
         dispatch_skill_telemetry(
@@ -1193,7 +1195,7 @@ const MAX_CONSOLE_RECORDS: usize = 256;
 const MAX_CONSOLE_BYTES: usize = 256 * 1024;
 const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 
-fn validate_step_result_bounds(result: &StepResult) -> Result<(), ToolError> {
+fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Result<(), ToolError> {
     let violation = || worker_tool_error(WorkerError::Protocol);
     if let StepOutcome::Value(value) = &result.outcome
         && value.len() > MAX_RESULT_BYTES
@@ -1213,7 +1215,67 @@ fn validate_step_result_bounds(result: &StepResult) -> Result<(), ToolError> {
             return Err(violation());
         }
     }
+    validate_step_diagnostic(result, model_source).map_err(|()| violation())?;
     Ok(())
+}
+
+fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(), ()> {
+    let Some(diagnostic) = &result.diagnostic else {
+        return matches!(result.outcome, StepOutcome::Value(_) | StepOutcome::Void)
+            .then_some(())
+            .ok_or(());
+    };
+    if matches!(result.outcome, StepOutcome::Value(_) | StepOutcome::Void) {
+        return Err(());
+    }
+    let location = match (diagnostic.line, diagnostic.column) {
+        (None, None) => None,
+        (Some(line), Some(column))
+            if diagnostic.script_role == ScriptRole::Model
+                && diagnostic.exception_class.is_some()
+                && source_position_is_valid(model_source, line, column) =>
+        {
+            Some((line, column))
+        }
+        _ => return Err(()),
+    };
+    if location.is_some() && diagnostic.script_role != ScriptRole::Model {
+        return Err(());
+    }
+
+    let valid = match result.outcome {
+        StepOutcome::Error(JsErrorCode::Syntax) => {
+            diagnostic.class == DiagnosticClass::Syntax
+                && diagnostic.script_role == ScriptRole::Model
+                && diagnostic.exception_class == Some(JsExceptionClass::SyntaxError)
+        }
+        StepOutcome::Error(JsErrorCode::StackLimit) => {
+            diagnostic.class == DiagnosticClass::ResourceLimit
+                && diagnostic.script_role == ScriptRole::Model
+                && diagnostic.exception_class == Some(JsExceptionClass::RangeError)
+        }
+        StepOutcome::Error(JsErrorCode::Exception) => {
+            diagnostic.class == DiagnosticClass::Exception
+                && (diagnostic.script_role != ScriptRole::Model
+                    || diagnostic.exception_class.is_some())
+        }
+        StepOutcome::Error(JsErrorCode::JobLimit | JsErrorCode::EffectLimit) => {
+            diagnostic.class == DiagnosticClass::ResourceLimit
+                && diagnostic.exception_class.is_none()
+        }
+        StepOutcome::Error(JsErrorCode::InvalidResult) => {
+            diagnostic.class == DiagnosticClass::Contract && diagnostic.exception_class.is_none()
+        }
+        StepOutcome::Error(JsErrorCode::Internal) => {
+            diagnostic.class == DiagnosticClass::Internal && diagnostic.exception_class.is_none()
+        }
+        StepOutcome::Timeout | StepOutcome::OutOfMemory => {
+            diagnostic.class == DiagnosticClass::ResourceLimit
+                && diagnostic.exception_class.is_none()
+        }
+        StepOutcome::Value(_) | StepOutcome::Void => false,
+    };
+    valid.then_some(()).ok_or(())
 }
 
 /// Renders the model-visible text for a bounded step result: console records
@@ -1235,9 +1297,10 @@ fn render_step_result(result: &StepResult) -> String {
             }
             text
         }
-        StepOutcome::Error(code) => {
-            render_failure(&format!("JS error: {}", js_error_code(*code)), result)
-        }
+        StepOutcome::Error(code) => render_failure(
+            &js_error_headline(*code, result.diagnostic.as_ref()),
+            result,
+        ),
         StepOutcome::Timeout => {
             render_failure("JS error: execution timed out (30s limit exceeded)", result)
         }
@@ -1250,6 +1313,9 @@ fn render_step_result(result: &StepResult) -> String {
 fn render_failure(headline: &str, result: &StepResult) -> String {
     let mut text = String::from(headline);
     if let Some(diagnostic) = &result.diagnostic {
+        if let (Some(line), Some(column)) = (diagnostic.line, diagnostic.column) {
+            text.push_str(&format!(" at {line}:{column}"));
+        }
         text.push_str(" (");
         render_diagnostic(diagnostic, &mut text);
         text.push(')');
@@ -1260,6 +1326,33 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
         text.pop();
     }
     text
+}
+
+fn js_error_headline(code: JsErrorCode, diagnostic: Option<&Diagnostic>) -> String {
+    let Some(exception_class) = diagnostic.and_then(|diagnostic| diagnostic.exception_class) else {
+        return format!("JS error: {}", js_error_code(code));
+    };
+    if code == JsErrorCode::StackLimit {
+        return format!(
+            "JS {}: stack limit exceeded",
+            js_exception_class_name(exception_class)
+        );
+    }
+    if exception_class == JsExceptionClass::Other {
+        return "JS exception".into();
+    }
+    format!("JS {}", js_exception_class_name(exception_class))
+}
+
+fn js_exception_class_name(class: JsExceptionClass) -> &'static str {
+    match class {
+        JsExceptionClass::SyntaxError => "SyntaxError",
+        JsExceptionClass::TypeError => "TypeError",
+        JsExceptionClass::ReferenceError => "ReferenceError",
+        JsExceptionClass::RangeError => "RangeError",
+        JsExceptionClass::InternalError => "InternalError",
+        JsExceptionClass::Other => "exception",
+    }
 }
 
 fn render_console(records: &[ConsoleRecord], text: &mut String) {
@@ -1943,6 +2036,9 @@ mod step_result_rendering {
             class: DiagnosticClass::Exception,
             stage,
             script_role: ScriptRole::Model,
+            exception_class: None,
+            line: None,
+            column: None,
         }
     }
 
@@ -2020,6 +2116,43 @@ mod step_result_rendering {
     }
 
     #[test]
+    fn closed_exception_classes_and_locations_render_exactly() {
+        let type_error = step(
+            StepOutcome::Error(JsErrorCode::Exception),
+            Vec::new(),
+            Some(Diagnostic {
+                class: DiagnosticClass::Exception,
+                stage: DiagnosticStage::Evaluation,
+                script_role: ScriptRole::Model,
+                exception_class: Some(JsExceptionClass::TypeError),
+                line: Some(12),
+                column: Some(7),
+            }),
+        );
+        assert_eq!(
+            render_step_result(&type_error),
+            "JS TypeError at 12:7 (stage: evaluation; script: model)"
+        );
+
+        let stack_limit = step(
+            StepOutcome::Error(JsErrorCode::StackLimit),
+            Vec::new(),
+            Some(Diagnostic {
+                class: DiagnosticClass::ResourceLimit,
+                stage: DiagnosticStage::Evaluation,
+                script_role: ScriptRole::Model,
+                exception_class: Some(JsExceptionClass::RangeError),
+                line: Some(3),
+                column: Some(2),
+            }),
+        );
+        assert_eq!(
+            render_step_result(&stack_limit),
+            "JS RangeError: stack limit exceeded at 3:2 (stage: evaluation; script: model)"
+        );
+    }
+
+    #[test]
     fn worker_payloads_within_bounds_are_accepted() {
         let result = step(
             StepOutcome::Value("v".repeat(MAX_RESULT_BYTES)),
@@ -2033,7 +2166,7 @@ mod step_result_rendering {
                 .collect(),
             None,
         );
-        assert!(validate_step_result_bounds(&result).is_ok());
+        assert!(validate_step_result_bounds(&result, "").is_ok());
     }
 
     #[test]
@@ -2045,7 +2178,7 @@ mod step_result_rendering {
             None,
         );
         assert_eq!(
-            validate_step_result_bounds(&oversize_value)
+            validate_step_result_bounds(&oversize_value, "")
                 .unwrap_err()
                 .to_string(),
             protocol
@@ -2058,7 +2191,7 @@ mod step_result_rendering {
             None,
         );
         assert_eq!(
-            validate_step_result_bounds(&too_many_records)
+            validate_step_result_bounds(&too_many_records, "")
                 .unwrap_err()
                 .to_string(),
             protocol
@@ -2072,7 +2205,7 @@ mod step_result_rendering {
             None,
         );
         assert_eq!(
-            validate_step_result_bounds(&oversize_record)
+            validate_step_result_bounds(&oversize_record, "")
                 .unwrap_err()
                 .to_string(),
             protocol
@@ -2085,10 +2218,67 @@ mod step_result_rendering {
             None,
         );
         assert_eq!(
-            validate_step_result_bounds(&oversize_total)
+            validate_step_result_bounds(&oversize_total, "")
                 .unwrap_err()
                 .to_string(),
             protocol
         );
+    }
+
+    #[test]
+    fn parent_rejects_malformed_exception_metadata() {
+        let source = "first();\nsecond();";
+        let valid = step(
+            StepOutcome::Error(JsErrorCode::Exception),
+            Vec::new(),
+            Some(Diagnostic {
+                class: DiagnosticClass::Exception,
+                stage: DiagnosticStage::Evaluation,
+                script_role: ScriptRole::Model,
+                exception_class: Some(JsExceptionClass::TypeError),
+                line: Some(2),
+                column: Some(3),
+            }),
+        );
+        assert!(validate_step_result_bounds(&valid, source).is_ok());
+
+        for invalid in [
+            step(
+                StepOutcome::Error(JsErrorCode::Exception),
+                Vec::new(),
+                Some(Diagnostic {
+                    column: None,
+                    ..valid.diagnostic.clone().unwrap()
+                }),
+            ),
+            step(
+                StepOutcome::Error(JsErrorCode::Exception),
+                Vec::new(),
+                Some(Diagnostic {
+                    line: Some(99),
+                    column: Some(99),
+                    ..valid.diagnostic.clone().unwrap()
+                }),
+            ),
+            step(
+                StepOutcome::Error(JsErrorCode::Exception),
+                Vec::new(),
+                Some(Diagnostic {
+                    script_role: ScriptRole::SkillSource,
+                    ..valid.diagnostic.clone().unwrap()
+                }),
+            ),
+            step(
+                StepOutcome::Error(JsErrorCode::Syntax),
+                Vec::new(),
+                Some(Diagnostic {
+                    class: DiagnosticClass::Syntax,
+                    exception_class: Some(JsExceptionClass::TypeError),
+                    ..valid.diagnostic.clone().unwrap()
+                }),
+            ),
+        ] {
+            assert!(validate_step_result_bounds(&invalid, source).is_err());
+        }
     }
 }

@@ -455,7 +455,8 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("read call failed");
     assert!(
-        read_result.starts_with("JS error: exception"),
+        read_result.starts_with("JS TypeError at ")
+            && read_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {read_result}"
     );
 
@@ -466,7 +467,8 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("write call failed");
     assert!(
-        write_result.starts_with("JS error: exception"),
+        write_result.starts_with("JS TypeError at ")
+            && write_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {write_result}"
     );
     assert!(
@@ -482,7 +484,8 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("spawn call failed");
     assert!(
-        spawn_result.starts_with("JS error: exception"),
+        spawn_result.starts_with("JS TypeError at ")
+            && spawn_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {spawn_result}"
     );
     assert!(!path.exists(), "denied spawn created {}", path.display());
@@ -515,12 +518,11 @@ async fn test_exception_is_a_source_free_closed_error() {
         .await
         .expect("exception call failed");
 
-    assert!(
-        result.starts_with("JS error: exception"),
-        "unexpected: {result}"
+    assert_eq!(
+        result,
+        "JS exception at 1:10 (stage: evaluation; script: model)"
     );
     assert!(!result.contains("test exception"));
-    assert!(!result.contains("at "));
 }
 
 #[tokio::test]

@@ -142,7 +142,7 @@ async fn production_and_verifier_make_identical_loader_decisions_for_differentia
             })
             .await
             .unwrap();
-        let production_accepted = !production.starts_with("JS error:");
+        let production_accepted = production == "true";
         assert_eq!(
             verifier_accepted, production_accepted,
             "loader decision diverged for {name}: production={production:?}"
@@ -615,7 +615,8 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
         .await
         .unwrap();
     assert!(
-        agent_error.starts_with("JS error: exception"),
+        agent_error.starts_with("JS exception at ")
+            && agent_error.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {agent_error}"
     );
     assert!(!agent_error.contains("agent.js"));
@@ -635,10 +636,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         })
         .await
         .unwrap();
-    assert!(
-        denied.starts_with("JS error: exception"),
-        "unexpected: {denied}"
-    );
+    assert_eq!(denied, "JS exception (stage: evaluation; script: model)");
 
     let allowed_manifest = CapabilityManifest::new(
         CapabilityTier::ReadOnly,
@@ -815,10 +813,7 @@ async fn selected_skills_have_private_bindings_and_cannot_export_executable_valu
         })
         .await
         .unwrap();
-    assert!(
-        denied.starts_with("JS error: exception"),
-        "unexpected: {denied}"
-    );
+    assert_eq!(denied, "JS exception (stage: evaluation; script: model)");
 }
 
 #[tokio::test]

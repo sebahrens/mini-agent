@@ -171,10 +171,11 @@ Rust compiler version. Ordinary local and packaged builds therefore reject a sam
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
 
-Protocol version 4 retains the version 3 launch binding and adds the closed step-level
-`effect_limit` error used when generated code attempts a 257th parent-brokered effect. Version 3
-removed response fields that never had production data: fetch response headers/truncation and
-diagnostic line/column positions. The parent generates a fresh non-nil UUID
+Protocol version 4 retains the version 3 launch binding, adds the closed step-level `effect_limit`
+error used when generated code attempts a 257th parent-brokered effect, and reintroduces diagnostic
+line/column positions only for the model script. Version 3 removed response fields that never had
+production data: fetch response headers/truncation and the then-unused diagnostic positions. The
+parent generates a fresh non-nil UUID
 challenge when it constructs that launch's protocol state, sends it in `ParentHello`, and accepts
 `WorkerReady` only when the worker echoes the exact challenge. The worker records only the
 challenge received in its one accepted `ParentHello` and may send `WorkerReady` only with that
@@ -849,8 +850,11 @@ Every production failure uses a closed sanitized diagnostic contract. `class` is
 `cancelled`, `out_of_memory`, `pending_job_limit`, `protocol`, `containment`, `audit`, or
 `internal`. `code` comes from a versioned parent/worker allow-list; a worker-provided unknown code
 is a protocol fault. Optional corrective metadata is limited to closed, source-free `stage` and
-`script_role` enums. It contains no filename, function name, property/key name, target, ordinal,
-effect result, or other source-derived string.
+`script_role` enums, the closed exception class `SyntaxError`, `TypeError`, `ReferenceError`,
+`RangeError`, `InternalError`, or `other`, and a paired positive integer line/column validated
+against the exact model script. Stored-skill and verifier diagnostics never carry positions. The
+metadata contains no filename, function name, property/key name, target, ordinal, effect result,
+or other source-derived string.
 
 Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
 explicitly allowlisted `syntax`, `exception`, and `invalid_result` JavaScript errors may leave the
@@ -898,14 +902,17 @@ deadline across permission, DNS, connect, response headers, and body; cancellati
 dispatch is ambiguous. These rules do not extend cancellation to MCP, LSP, or the general agent
 loop and do not promise exactly-once execution.
 
-If QuickJS cannot be classified without trusting exception-controlled text, the worker returns the
-generic `javascript_exception` or `promise_rejection` code. Arbitrary exception `name`, message,
-stack, thrown value, source line/snippet, cause, aggregate members, effect result, console-derived
-text, prompt, argument, file/fetch content, and secret never cross the production worker protocol
-as a diagnostic and never enter model output, stderr, logs, audit, telemetry, evaluation reports,
-or repair records. The worker discards those values after deriving the closed class and validated
-source-free location. Parent-generated fixed templates may render the stable code and safe metadata
-for correction, but must not interpolate worker-controlled text.
+If QuickJS cannot be classified without invoking exception-controlled accessors, the worker returns
+the closed `other` exception class. A trusted bootstrap inspector captures engine intrinsics before
+model or skill code runs, compares native error prototype identities, and parses only a bounded own
+data `stack` value for the fixed model-script marker. The parent rejects unpaired, zero, non-model,
+or out-of-bounds positions before rendering. Arbitrary exception `name`, message, stack, thrown
+value, source line/snippet, cause, aggregate members, effect result, console-derived text, prompt,
+argument, file/fetch content, and secret never cross the production worker protocol as a diagnostic
+and never enter model output, stderr, logs, audit, telemetry, evaluation reports, or repair records.
+The worker discards those values after deriving the closed class and validated source-free location.
+Parent-generated fixed templates may render the stable code and safe metadata for correction, but
+must not interpolate worker-controlled text.
 
 The system fails closed at every trust boundary:
 

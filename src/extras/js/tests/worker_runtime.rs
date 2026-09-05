@@ -9,11 +9,11 @@ use crate::extras::js::protocol::ArtifactInput;
 use crate::extras::js::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, DiagnosticClass, DiagnosticStage,
     EffectError, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
-    GrantId, InvocationId, JsErrorCode, LaunchChallenge, ParentFrame, ParentHello, ParentProtocol,
-    ParentWireFrame, ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole,
-    StepOutcome, StepResult, VerificationCase, VerificationCaseResult, VerificationResult,
-    VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady, WorkerWireFrame,
-    read_frame, write_frame,
+    GrantId, InvocationId, JsErrorCode, JsExceptionClass, LaunchChallenge, ParentFrame,
+    ParentHello, ParentProtocol, ParentWireFrame, ProtocolFault, ProtocolFaultCode, ProtocolStage,
+    RunStep, ScriptRole, StepOutcome, StepResult, VerificationCase, VerificationCaseResult,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerReady,
+    WorkerWireFrame, read_frame, write_frame,
 };
 use crate::extras::js::supervisor::{
     EffectFuture, InvocationEffectHandler, JsWorkerSupervisor, WorkerError,
@@ -299,6 +299,20 @@ fn assert_closed_error(
     assert_eq!(diagnostic.script_role, ScriptRole::Model);
 }
 
+fn assert_closed_exception(
+    result: &StepResult,
+    code: JsErrorCode,
+    class: DiagnosticClass,
+    exception_class: JsExceptionClass,
+    location: Option<(u32, u32)>,
+) {
+    assert_closed_error(result, code, class, DiagnosticStage::Evaluation);
+    let diagnostic = result.diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.exception_class, Some(exception_class));
+    assert_eq!(diagnostic.line.zip(diagnostic.column), location);
+    assert_eq!(diagnostic.line.is_some(), diagnostic.column.is_some());
+}
+
 #[tokio::test]
 async fn worker_runtime_allows_exactly_the_effect_limit() {
     let supervisor =
@@ -484,7 +498,7 @@ fn worker_runtime_rejects_module_loading_and_recovers() {
         10_000,
     );
 
-    for index in [0, 2, 4] {
+    for index in [0, 2] {
         assert_closed_error(
             &results[index],
             JsErrorCode::Exception,
@@ -492,13 +506,20 @@ fn worker_runtime_rejects_module_loading_and_recovers() {
             DiagnosticStage::Evaluation,
         );
     }
+    assert_closed_exception(
+        &results[4],
+        JsErrorCode::Syntax,
+        DiagnosticClass::Syntax,
+        JsExceptionClass::SyntaxError,
+        Some((1, 1)),
+    );
     for index in [1, 3, 5] {
         assert_eq!(results[index].outcome, StepOutcome::Value("42".into()));
     }
 }
 
 #[test]
-fn worker_runtime_redacts_syntax_throw_rejection_and_stack_then_recovers() {
+fn worker_runtime_classifies_and_redacts_exceptions_then_recovers() {
     const SECRET: &str = "A08_EXCEPTION_SECRET_MUST_NOT_LEAK";
     let results = run_steps(
         &[
@@ -532,20 +553,71 @@ fn worker_runtime_redacts_syntax_throw_rejection_and_stack_then_recovers() {
         10_000,
         10_000,
     );
-    assert_closed_error(
+    assert_closed_exception(
         &results[0],
-        JsErrorCode::Exception,
-        DiagnosticClass::Exception,
-        DiagnosticStage::Evaluation,
+        JsErrorCode::Syntax,
+        DiagnosticClass::Syntax,
+        JsExceptionClass::SyntaxError,
+        Some((1, 9)),
     );
-    for index in [2, 4, 6, 8, 10, 12, 14, 16, 18] {
-        assert_closed_error(
+    for (index, location) in [(2, (1, 1)), (4, (1, 1))] {
+        assert_closed_exception(
             &results[index],
-            JsErrorCode::Exception,
-            DiagnosticClass::Exception,
-            DiagnosticStage::Evaluation,
+            JsErrorCode::Syntax,
+            DiagnosticClass::Syntax,
+            JsExceptionClass::SyntaxError,
+            Some(location),
         );
     }
+    assert_closed_exception(
+        &results[6],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::Other,
+        Some((1, 10)),
+    );
+    assert_closed_exception(
+        &results[8],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::Other,
+        None,
+    );
+    assert_closed_exception(
+        &results[10],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::Other,
+        Some((3, 33)),
+    );
+    assert_closed_exception(
+        &results[12],
+        JsErrorCode::Syntax,
+        DiagnosticClass::Syntax,
+        JsExceptionClass::SyntaxError,
+        Some((1, 22)),
+    );
+    assert_closed_exception(
+        &results[14],
+        JsErrorCode::StackLimit,
+        DiagnosticClass::ResourceLimit,
+        JsExceptionClass::RangeError,
+        Some((1, 22)),
+    );
+    assert_closed_exception(
+        &results[16],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::InternalError,
+        Some((1, 22)),
+    );
+    assert_closed_exception(
+        &results[18],
+        JsErrorCode::StackLimit,
+        DiagnosticClass::ResourceLimit,
+        JsExceptionClass::RangeError,
+        Some((1, 27)),
+    );
     assert!(
         results[10].console.is_empty(),
         "classifier invoked an error accessor"
@@ -555,6 +627,93 @@ fn worker_runtime_redacts_syntax_throw_rejection_and_stack_then_recovers() {
     }
     let encoded = serde_json::to_string(&results).unwrap();
     assert!(!encoded.contains(SECRET));
+}
+
+#[test]
+fn worker_runtime_reports_only_valid_model_exception_locations() {
+    const SECRET: &str = "MODEL_EXCEPTION_LOCATION_SECRET_MUST_NOT_LEAK";
+    let results = run_steps(
+        &[
+            "const value = null;\nvalue.missing()",
+            "const present = 1;\nmissing_name + present",
+            "Promise.reject(new TypeError('MODEL_EXCEPTION_LOCATION_SECRET_MUST_NOT_LEAK'))",
+            "(()=>{const error=new TypeError(); Object.defineProperty(error,'stack',{value:'    at forged (mini-agent-model.js:999:999)'}); throw error;})()",
+            "(()=>{const error=new ReferenceError(); Object.defineProperty(error,'stack',{get(){console.error('STACK_ACCESSOR_RAN'); return 'mini-agent-model.js:1:1';}}); throw error;})()",
+        ],
+        10_000,
+        10_000,
+    );
+    assert_closed_exception(
+        &results[0],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::TypeError,
+        Some((2, 1)),
+    );
+    assert_closed_exception(
+        &results[1],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::ReferenceError,
+        Some((2, 1)),
+    );
+    assert_closed_exception(
+        &results[2],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::TypeError,
+        Some((1, 19)),
+    );
+    assert_closed_exception(
+        &results[3],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::TypeError,
+        None,
+    );
+    assert_closed_exception(
+        &results[4],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::ReferenceError,
+        None,
+    );
+    assert!(!serde_json::to_string(&results).unwrap().contains(SECRET));
+    assert!(
+        results[4].console.is_empty(),
+        "classifier invoked stack accessor"
+    );
+}
+
+#[test]
+fn worker_runtime_exception_inspector_uses_captured_intrinsics_and_bounded_stack_data() {
+    let poisoned_intrinsics = "(()=>{const error=new TypeError(); Error.isError=()=>false; Object.getPrototypeOf=()=>{throw 1}; Object.getOwnPropertyDescriptor=()=>{throw 2}; String.prototype.indexOf=()=>{throw 3}; String.prototype.charCodeAt=()=>{throw 4}; throw error;})()";
+    let oversized_stack = "(()=>{const error=new TypeError(); Object.defineProperty(error,'stack',{value:'x'.repeat(16385)+' mini-agent-model.js:1:1'}); throw error;})()";
+    let results = run_steps(
+        &[poisoned_intrinsics, oversized_stack, "40 + 2"],
+        10_000,
+        10_000,
+    );
+
+    assert_closed_error(
+        &results[0],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        DiagnosticStage::Evaluation,
+    );
+    let poisoned = results[0].diagnostic.as_ref().unwrap();
+    assert_eq!(poisoned.exception_class, Some(JsExceptionClass::TypeError));
+    assert_eq!(poisoned.line, Some(1));
+    assert!(poisoned.column.is_some());
+
+    assert_closed_exception(
+        &results[1],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::TypeError,
+        None,
+    );
+    assert_eq!(results[2].outcome, StepOutcome::Value("42".into()));
 }
 
 #[test]
@@ -735,6 +894,36 @@ fn worker_runtime_verification_reloads_production_realm_for_every_case() {
             .iter()
             .all(|case| case.transcript.is_empty())
     );
+}
+
+#[test]
+fn worker_runtime_verification_never_reports_source_positions() {
+    const SECRET: &str = "VERIFICATION_EXCEPTION_SECRET_MUST_NOT_LEAK";
+    let results = verification_results(
+        vec![verify_artifact(
+            2,
+            "source-free-verification-diagnostics",
+            "function answer(_cap) { return 42; }",
+            vec!["throw new TypeError('VERIFICATION_EXCEPTION_SECRET_MUST_NOT_LEAK')".into()],
+            vec![("held-out-reference", "missing_verification_name")],
+        )],
+        10_000,
+        10_000,
+    );
+
+    assert!(!results[0].passed);
+    assert_eq!(results[0].cases.len(), 2);
+    for (case, expected_class) in results[0].cases.iter().zip([
+        JsExceptionClass::TypeError,
+        JsExceptionClass::ReferenceError,
+    ]) {
+        let diagnostic = case.diagnostic.as_ref().expect("failed case diagnostic");
+        assert_eq!(diagnostic.class, DiagnosticClass::Exception);
+        assert_eq!(diagnostic.exception_class, Some(expected_class));
+        assert_eq!(diagnostic.line, None);
+        assert_eq!(diagnostic.column, None);
+    }
+    assert!(!serde_json::to_string(&results).unwrap().contains(SECRET));
 }
 
 #[cfg(feature = "skills")]
@@ -2651,6 +2840,42 @@ fn worker_supervisor_real_verification_resource_terminal_recycles_generation() {
     runtime.block_on(supervisor.shutdown_for_test()).unwrap();
 }
 
+#[tokio::test]
+async fn worker_supervisor_real_stack_limit_recycles_generation() {
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TestWorkerLauncher::internal_worker_process_with_limits(10_000, 10_000),
+        Duration::from_secs(2),
+    );
+    let result = supervisor
+        .execute(
+            RunStep::new("function recurse(){ return recurse(); } recurse()".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_closed_exception(
+        &result,
+        JsErrorCode::StackLimit,
+        DiagnosticClass::ResourceLimit,
+        JsExceptionClass::RangeError,
+        Some((1, 27)),
+    );
+    assert_eq!(supervisor.generation_for_test().await, None);
+
+    let next = supervisor
+        .execute(
+            RunStep::new("42".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(supervisor.generation_for_test().await, Some(2));
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
 #[test]
 fn worker_supervisor_verification_internal_terminal_recycles_generation() {
     let supervisor = scripted_supervisor(0);
@@ -2663,6 +2888,31 @@ fn worker_supervisor_verification_internal_terminal_recycles_generation() {
             .as_ref()
             .is_some_and(|diagnostic| diagnostic.class == DiagnosticClass::Internal)
     }));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
+    let next = runtime
+        .block_on(supervisor.execute(
+            RunStep::new("success".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ))
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("success".into()));
+    assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
+    runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+}
+
+#[test]
+fn worker_supervisor_rejects_verifier_source_positions_and_recovers() {
+    let supervisor = scripted_supervisor(0);
+    assert_eq!(
+        supervisor.verify_blocking(verification_with_source("__verification_positions__")),
+        Err(WorkerError::Protocol)
+    );
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3072,6 +3322,8 @@ fn run_scripted_supervisor_worker() -> ! {
             ParentFrame::VerifyArtifact(verification) => {
                 let invocation = request.invocation_id.clone().unwrap();
                 let internal = verification.artifact.source == "__verification_internal__";
+                let positions = verification.artifact.source == "__verification_positions__";
+                let failed = internal || positions;
                 let mut cases = verification
                     .artifact
                     .tests
@@ -3079,11 +3331,18 @@ fn run_scripted_supervisor_worker() -> ! {
                     .enumerate()
                     .map(|(index, _)| VerificationCaseResult {
                         case_id: format!("embedded-{index}"),
-                        passed: !internal,
-                        diagnostic: internal.then_some(crate::extras::js::protocol::Diagnostic {
-                            class: DiagnosticClass::Internal,
+                        passed: !failed,
+                        diagnostic: failed.then_some(crate::extras::js::protocol::Diagnostic {
+                            class: if internal {
+                                DiagnosticClass::Internal
+                            } else {
+                                DiagnosticClass::Exception
+                            },
                             stage: DiagnosticStage::Verification,
                             script_role: ScriptRole::EmbeddedTest,
+                            exception_class: positions.then_some(JsExceptionClass::TypeError),
+                            line: positions.then_some(1),
+                            column: positions.then_some(1),
                         }),
                         #[cfg(feature = "skills")]
                         transcript: Default::default(),
@@ -3095,14 +3354,19 @@ fn run_scripted_supervisor_worker() -> ! {
                         .iter()
                         .map(|case| VerificationCaseResult {
                             case_id: case.case_id.clone(),
-                            passed: !internal,
-                            diagnostic: internal.then_some(
-                                crate::extras::js::protocol::Diagnostic {
-                                    class: DiagnosticClass::Internal,
-                                    stage: DiagnosticStage::Verification,
-                                    script_role: ScriptRole::HeldOutTest,
+                            passed: !failed,
+                            diagnostic: failed.then_some(crate::extras::js::protocol::Diagnostic {
+                                class: if internal {
+                                    DiagnosticClass::Internal
+                                } else {
+                                    DiagnosticClass::Exception
                                 },
-                            ),
+                                stage: DiagnosticStage::Verification,
+                                script_role: ScriptRole::HeldOutTest,
+                                exception_class: positions.then_some(JsExceptionClass::TypeError),
+                                line: positions.then_some(1),
+                                column: positions.then_some(1),
+                            }),
                             #[cfg(feature = "skills")]
                             transcript: Default::default(),
                         }),
@@ -3112,7 +3376,7 @@ fn run_scripted_supervisor_worker() -> ! {
                     invocation,
                     request.sequence + 1,
                     WorkerFrame::VerificationResult(VerificationResult {
-                        passed: !internal,
+                        passed: !failed,
                         cases,
                         loader_version: 1,
                     }),

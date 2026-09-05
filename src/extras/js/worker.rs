@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rquickjs::context::EvalOptions;
 #[cfg(feature = "sandbox")]
 use rquickjs::prelude::Opt;
 use rquickjs::promise::PromiseState;
@@ -22,10 +23,10 @@ use rquickjs::{
 use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
     DiagnosticStage, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
-    JsErrorCode, ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault, ProtocolFaultCode,
-    ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult, VerificationCaseResult,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame,
-    read_frame, write_frame,
+    JsErrorCode, JsExceptionClass, ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault,
+    ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
+    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
+    WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid, write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -620,6 +621,94 @@ const STRING_GATE_SOURCE: &str = r#"
 })()
 "#;
 
+const MODEL_SCRIPT_NAME: &str = "mini-agent-model.js";
+const EXCEPTION_INSPECTOR_SOURCE: &str = r#"
+(() => {
+    const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
+    const charCodeAt = uncurryThis(String.prototype.charCodeAt);
+    const indexOf = uncurryThis(String.prototype.indexOf);
+    const isError = Error.isError;
+    const getPrototypeOf = Object.getPrototypeOf;
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    const syntaxPrototype = SyntaxError.prototype;
+    const typePrototype = TypeError.prototype;
+    const referencePrototype = ReferenceError.prototype;
+    const rangePrototype = RangeError.prototype;
+    const internalPrototype = InternalError.prototype;
+    const modelMarker = "mini-agent-model.js:";
+    const maxStackCharacters = 16384;
+
+    function ownData(object, key) {
+        const descriptor = getOwnPropertyDescriptor(object, key);
+        if (!descriptor || !("value" in descriptor)) return undefined;
+        return descriptor.value;
+    }
+
+    function decimal(text, start, end) {
+        if (start === end) return 0;
+        let value = 0;
+        for (let index = start; index < end; index += 1) {
+            const digit = charCodeAt(text, index) - 48;
+            if (digit < 0 || digit > 9) return 0;
+            value = value * 10 + digit;
+            if (value > 4294967295) return 0;
+        }
+        return value;
+    }
+
+    function modelLocation(stack) {
+        if (typeof stack !== "string" || stack.length > maxStackCharacters) return [0, 0];
+        let searchFrom = 0;
+        while (searchFrom < stack.length) {
+            const marker = indexOf(stack, modelMarker, searchFrom);
+            if (marker < 0) return [0, 0];
+            const before = marker === 0 ? 0 : charCodeAt(stack, marker - 1);
+            if (marker !== 0 && before !== 32 && before !== 40) {
+                searchFrom = marker + modelMarker.length;
+                continue;
+            }
+            const lineStart = marker + modelMarker.length;
+            const separator = indexOf(stack, ":", lineStart);
+            if (separator < 0) return [0, 0];
+            let end = separator + 1;
+            while (end < stack.length) {
+                const code = charCodeAt(stack, end);
+                if (code < 48 || code > 57) break;
+                end += 1;
+            }
+            const terminator = end === stack.length ? 0 : charCodeAt(stack, end);
+            if (terminator !== 0 && terminator !== 10 && terminator !== 13 && terminator !== 41) {
+                searchFrom = marker + modelMarker.length;
+                continue;
+            }
+            const line = decimal(stack, lineStart, separator);
+            const column = decimal(stack, separator + 1, end);
+            if (line !== 0 && column !== 0) return [line, column];
+            searchFrom = marker + modelMarker.length;
+        }
+        return [0, 0];
+    }
+
+    return value => {
+        // Error.isError is an engine class check and does not run Proxy traps or user getters.
+        if (!isError(value)) return [5, false, 0, 0];
+        const prototype = getPrototypeOf(value);
+        let kind = 5;
+        if (prototype === syntaxPrototype) kind = 0;
+        else if (prototype === typePrototype) kind = 1;
+        else if (prototype === referencePrototype) kind = 2;
+        else if (prototype === rangePrototype) kind = 3;
+        else if (prototype === internalPrototype) kind = 4;
+
+        const message = ownData(value, "message");
+        const stackLimit =
+            kind === 3 && message === "Maximum call stack size exceeded";
+        const location = modelLocation(ownData(value, "stack"));
+        return [kind, stackLimit, location[0], location[1]];
+    };
+})()
+"#;
+
 pub(super) const STRICT_CLONE_SOURCE: &str = r#"
 (() => {
     const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
@@ -754,7 +843,8 @@ static TRUSTED_BOOTSTRAP_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 fn trusted_bootstrap_source() -> String {
     format!(
         "export const strictClone = {STRICT_CLONE_SOURCE};\n\
-         export const stringGate = {STRING_GATE_SOURCE};"
+         export const stringGate = {STRING_GATE_SOURCE};\n\
+         export const exceptionInspector = {EXCEPTION_INSPECTOR_SOURCE};"
     )
 }
 
@@ -785,7 +875,11 @@ fn trusted_bootstrap_bytecode() -> Option<&'static [u8]> {
 fn load_trusted_bootstrap_functions(
     context: &Context,
     bytecode: &[u8],
-) -> rquickjs::Result<(Persistent<Function<'static>>, Persistent<Function<'static>>)> {
+) -> rquickjs::Result<(
+    Persistent<Function<'static>>,
+    Persistent<Function<'static>>,
+    Persistent<Function<'static>>,
+)> {
     context.with(|ctx| {
         // SAFETY: these bytes are compiled once in this process from the two
         // trusted constants above, with the same linked QuickJS ABI, and are
@@ -795,9 +889,11 @@ fn load_trusted_bootstrap_functions(
         evaluation.finish::<()>()?;
         let clone = module.get::<_, Function>("strictClone")?;
         let string_gate = module.get::<_, Function>("stringGate")?;
+        let exception_inspector = module.get::<_, Function>("exceptionInspector")?;
         Ok((
             Persistent::save(&ctx, clone),
             Persistent::save(&ctx, string_gate),
+            Persistent::save(&ctx, exception_inspector),
         ))
     })
 }
@@ -831,6 +927,7 @@ mod trusted_bootstrap_bytecode_tests {
             evaluation.finish::<()>()?;
             let _: Function = module.get("strictClone")?;
             let _: Function = module.get("stringGate")?;
+            let _: Function = module.get("exceptionInspector")?;
             Ok(())
         })
     }
@@ -861,7 +958,7 @@ mod trusted_bootstrap_bytecode_tests {
             let deadline = Instant::now() + STEP_TIMEOUT;
             runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
             let context = Context::full(&runtime).expect("create fresh context");
-            let (clone, string_gate) =
+            let (clone, string_gate, exception_inspector) =
                 load_trusted_bootstrap_functions(&context, &bytecode).expect("load bytecode");
 
             context.with(|ctx| {
@@ -870,11 +967,18 @@ mod trusted_bootstrap_bytecode_tests {
                     .clone()
                     .restore(&ctx)
                     .expect("restore string gate");
+                let exception_inspector = exception_inspector
+                    .clone()
+                    .restore(&ctx)
+                    .expect("restore exception inspector");
                 let value: Object = ctx.eval(format!("({expected})")).expect("create value");
                 let encoded: String = clone.call((value,)).expect("clone value");
                 assert_eq!(encoded, expected);
                 let gated: String = string_gate.call((expected,)).expect("gate string");
                 assert_eq!(gated, expected);
+                let metadata: rquickjs::prelude::List<(u8, bool, u32, u32)> =
+                    exception_inspector.call((42,)).expect("inspect primitive");
+                assert_eq!(metadata.0, (5, false, 0, 0));
             });
         }
     }
@@ -1015,6 +1119,31 @@ impl ClosedFailure {
             diagnostic: diagnostic(DiagnosticClass::ResourceLimit, stage, role),
         }
     }
+
+    fn javascript_exception(
+        inspected: InspectedException,
+        stage: DiagnosticStage,
+        role: ScriptRole,
+    ) -> Self {
+        let (code, class) = if inspected.stack_limit {
+            (JsErrorCode::StackLimit, DiagnosticClass::ResourceLimit)
+        } else if inspected.class == JsExceptionClass::SyntaxError {
+            (JsErrorCode::Syntax, DiagnosticClass::Syntax)
+        } else {
+            (JsErrorCode::Exception, DiagnosticClass::Exception)
+        };
+        Self {
+            outcome: StepOutcome::Error(code),
+            diagnostic: Diagnostic {
+                class,
+                stage,
+                script_role: role,
+                exception_class: Some(inspected.class),
+                line: inspected.line,
+                column: inspected.column,
+            },
+        }
+    }
 }
 
 fn diagnostic(class: DiagnosticClass, stage: DiagnosticStage, role: ScriptRole) -> Diagnostic {
@@ -1022,6 +1151,80 @@ fn diagnostic(class: DiagnosticClass, stage: DiagnosticStage, role: ScriptRole) 
         class,
         stage,
         script_role: role,
+        exception_class: None,
+        line: None,
+        column: None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InspectedException {
+    class: JsExceptionClass,
+    stack_limit: bool,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+struct ExceptionDiagnostics<'a> {
+    inspector: &'a Persistent<Function<'static>>,
+    model_source: Option<&'a str>,
+}
+
+impl ExceptionDiagnostics<'_> {
+    fn inspect<'js>(&self, ctx: &Ctx<'js>, thrown: Value<'js>) -> InspectedException {
+        let fallback = InspectedException {
+            class: JsExceptionClass::Other,
+            stack_limit: false,
+            line: None,
+            column: None,
+        };
+        let result = self.inspector.clone().restore(ctx).and_then(|inspector| {
+            inspector.call::<_, rquickjs::prelude::List<(u8, bool, u32, u32)>>((thrown,))
+        });
+        let rquickjs::prelude::List((class, stack_limit, line, column)) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error, Error::Exception) {
+                    let _ = ctx.catch();
+                }
+                return fallback;
+            }
+        };
+        let class = match class {
+            0 => JsExceptionClass::SyntaxError,
+            1 => JsExceptionClass::TypeError,
+            2 => JsExceptionClass::ReferenceError,
+            3 => JsExceptionClass::RangeError,
+            4 => JsExceptionClass::InternalError,
+            5 => JsExceptionClass::Other,
+            _ => return fallback,
+        };
+        let location = self.model_source.and_then(|source| {
+            source_position_is_valid(source, line, column).then_some((line, column))
+        });
+        InspectedException {
+            class,
+            stack_limit,
+            line: location.map(|location| location.0),
+            column: location.map(|location| location.1),
+        }
+    }
+}
+
+fn classify_thrown_exception<'js>(
+    ctx: &Ctx<'js>,
+    thrown: Value<'js>,
+    deadline: Instant,
+    interrupted: &AtomicBool,
+    stage: DiagnosticStage,
+    role: ScriptRole,
+    diagnostics: &ExceptionDiagnostics<'_>,
+) -> ClosedFailure {
+    let inspected = diagnostics.inspect(ctx, thrown);
+    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        ClosedFailure::timeout(stage, role)
+    } else {
+        ClosedFailure::javascript_exception(inspected, stage, role)
     }
 }
 
@@ -1381,6 +1584,9 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                     class: DiagnosticClass::ResourceLimit,
                     stage: DiagnosticStage::Evaluation,
                     script_role: ScriptRole::Model,
+                    exception_class: None,
+                    line: None,
+                    column: None,
                 });
             }
         }
@@ -1724,6 +1930,9 @@ fn execute_run_step(
                     class: DiagnosticClass::Internal,
                     stage: DiagnosticStage::Initialization,
                     script_role: ScriptRole::SkillSource,
+                    exception_class: None,
+                    line: None,
+                    column: None,
                 }),
                 skill_events: Vec::new(),
                 evidence_complete: false,
@@ -1872,7 +2081,7 @@ fn execute_fresh_step(
     let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
         ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
     })?;
-    let (clone, string_gate) =
+    let (clone, string_gate, exception_inspector) =
         load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
             classify_error(
                 &context,
@@ -1883,6 +2092,10 @@ fn execute_fresh_step(
                 role,
             )
         })?;
+    let exception_diagnostics = ExceptionDiagnostics {
+        inspector: &exception_inspector,
+        model_source: (role == ScriptRole::Model).then_some(source),
+    };
     #[cfg(feature = "skills")]
     let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
     #[cfg(feature = "skills")]
@@ -1924,9 +2137,24 @@ fn execute_fresh_step(
                 tool_call_id.to_string(),
             );
     }
-    let value = evaluate(&context, source, &runtime, deadline, &interrupted, role)?;
+    let value = evaluate(
+        &context,
+        source,
+        &runtime,
+        deadline,
+        &interrupted,
+        role,
+        &exception_diagnostics,
+    )?;
     let mut remaining_jobs = limits.max_pending_jobs;
-    drain_jobs(&runtime, deadline, &interrupted, &mut remaining_jobs, role)?;
+    drain_jobs(
+        &runtime,
+        deadline,
+        &interrupted,
+        &mut remaining_jobs,
+        role,
+        &exception_diagnostics,
+    )?;
     settle_and_convert(
         &runtime,
         &context,
@@ -1936,6 +2164,7 @@ fn execute_fresh_step(
         deadline,
         &interrupted,
         role,
+        &exception_diagnostics,
     )
 }
 
@@ -2015,10 +2244,18 @@ fn evaluate(
     deadline: Instant,
     interrupted: &AtomicBool,
     role: ScriptRole,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<Persistent<Value<'static>>, ClosedFailure> {
     context
         .with(|ctx| {
-            ctx.eval::<Value, _>(source)
+            let filename = if role == ScriptRole::Model {
+                MODEL_SCRIPT_NAME
+            } else {
+                "mini-agent-verification.js"
+            };
+            let mut options = EvalOptions::default();
+            options.filename = Some(filename.to_string());
+            ctx.eval_with_options::<Value, _>(source, options)
                 .map(|value| Persistent::save(&ctx, value))
         })
         .map_err(|error| {
@@ -2030,6 +2267,7 @@ fn evaluate(
                 interrupted,
                 DiagnosticStage::Evaluation,
                 role,
+                exception_diagnostics,
             )
         })
 }
@@ -2040,6 +2278,7 @@ fn drain_jobs(
     interrupted: &AtomicBool,
     remaining_jobs: &mut usize,
     role: ScriptRole,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<(), ClosedFailure> {
     loop {
         if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -2062,16 +2301,22 @@ fn drain_jobs(
             Err(exception) => {
                 let near_heap_limit = runtime_is_near_heap_limit(runtime);
                 return Err(exception.0.with(|ctx| {
-                    let _ = ctx.catch();
                     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        let _ = ctx.catch();
                         ClosedFailure::timeout(DiagnosticStage::JobDrain, role)
                     } else if near_heap_limit {
+                        let _ = ctx.catch();
                         ClosedFailure::out_of_memory(DiagnosticStage::JobDrain, role)
                     } else {
-                        ClosedFailure::error(
-                            JsErrorCode::Exception,
+                        let thrown = ctx.catch();
+                        classify_thrown_exception(
+                            &ctx,
+                            thrown,
+                            deadline,
+                            interrupted,
                             DiagnosticStage::JobDrain,
                             role,
+                            exception_diagnostics,
                         )
                     }
                 }));
@@ -2092,6 +2337,7 @@ fn settle_and_convert(
     deadline: Instant,
     interrupted: &AtomicBool,
     role: ScriptRole,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<StepOutcome, ClosedFailure> {
     let near_heap_limit = runtime_is_near_heap_limit(runtime);
     context.with(|ctx| {
@@ -2103,6 +2349,7 @@ fn settle_and_convert(
                 interrupted,
                 DiagnosticStage::ResultConversion,
                 role,
+                Some(exception_diagnostics),
             )
         })?;
         if let Some(promise) = value.as_promise() {
@@ -2118,18 +2365,31 @@ fn settle_and_convert(
                         )
                     })?,
                 PromiseState::Rejected => {
-                    let _ = promise.result::<Value>();
-                    let _ = ctx.catch();
+                    let rejected = promise.result::<Value>();
                     if near_heap_limit {
+                        if matches!(rejected, Some(Err(Error::Exception))) {
+                            let _ = ctx.catch();
+                        }
                         return Err(ClosedFailure::out_of_memory(
                             DiagnosticStage::Evaluation,
                             role,
                         ));
                     }
-                    return Err(ClosedFailure::error(
-                        JsErrorCode::Exception,
+                    let Some(Err(error)) = rejected else {
+                        return Err(ClosedFailure::error(
+                            JsErrorCode::Internal,
+                            DiagnosticStage::Evaluation,
+                            role,
+                        ));
+                    };
+                    return Err(classify_ctx_error(
+                        &ctx,
+                        error,
+                        deadline,
+                        interrupted,
                         DiagnosticStage::Evaluation,
                         role,
+                        Some(exception_diagnostics),
                     ));
                 }
                 PromiseState::Pending => {
@@ -2141,10 +2401,20 @@ fn settle_and_convert(
                 }
             };
         }
-        convert_value(&ctx, value, clone, string_gate, deadline, interrupted, role)
+        convert_value(
+            &ctx,
+            value,
+            clone,
+            string_gate,
+            deadline,
+            interrupted,
+            role,
+            exception_diagnostics,
+        )
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_value<'js>(
     ctx: &Ctx<'js>,
     value: Value<'js>,
@@ -2153,6 +2423,7 @@ fn convert_value<'js>(
     deadline: Instant,
     interrupted: &AtomicBool,
     role: ScriptRole,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<StepOutcome, ClosedFailure> {
     if value.is_undefined() || value.is_null() {
         return Ok(StepOutcome::Void);
@@ -2166,6 +2437,7 @@ fn convert_value<'js>(
                 interrupted,
                 DiagnosticStage::ResultConversion,
                 role,
+                Some(exception_diagnostics),
             )
         })?;
         let bounded = string_gate.call::<_, String>((value,)).map_err(|error| {
@@ -2176,6 +2448,7 @@ fn convert_value<'js>(
                 interrupted,
                 DiagnosticStage::ResultConversion,
                 role,
+                Some(exception_diagnostics),
             );
             match failure.outcome {
                 StepOutcome::Timeout | StepOutcome::OutOfMemory => failure,
@@ -2221,6 +2494,7 @@ fn convert_value<'js>(
             interrupted,
             DiagnosticStage::ResultConversion,
             role,
+            Some(exception_diagnostics),
         )
     })?;
     let encoded = clone.call::<_, String>((value,)).map_err(|error| {
@@ -2231,6 +2505,7 @@ fn convert_value<'js>(
             interrupted,
             DiagnosticStage::ResultConversion,
             role,
+            Some(exception_diagnostics),
         );
         match failure.outcome {
             StepOutcome::Timeout | StepOutcome::OutOfMemory => failure,
@@ -2267,7 +2542,7 @@ fn classify_error(
     stage: DiagnosticStage,
     role: ScriptRole,
 ) -> ClosedFailure {
-    context.with(|ctx| classify_ctx_error(&ctx, error, deadline, interrupted, stage, role))
+    context.with(|ctx| classify_ctx_error(&ctx, error, deadline, interrupted, stage, role, None))
 }
 
 fn classify_ctx_error(
@@ -2277,6 +2552,7 @@ fn classify_ctx_error(
     interrupted: &AtomicBool,
     stage: DiagnosticStage,
     role: ScriptRole,
+    exception_diagnostics: Option<&ExceptionDiagnostics<'_>>,
 ) -> ClosedFailure {
     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
         if matches!(error, Error::Exception) {
@@ -2291,10 +2567,16 @@ fn classify_ctx_error(
         return ClosedFailure::error(JsErrorCode::Internal, stage, role);
     }
 
-    let _ = ctx.catch();
-    ClosedFailure::error(JsErrorCode::Exception, stage, role)
+    let thrown = ctx.catch();
+    exception_diagnostics.map_or_else(
+        || ClosedFailure::error(JsErrorCode::Exception, stage, role),
+        |diagnostics| {
+            classify_thrown_exception(ctx, thrown, deadline, interrupted, stage, role, diagnostics)
+        },
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_evaluation_error(
     context: &Context,
     runtime: &Runtime,
@@ -2303,6 +2585,7 @@ fn classify_evaluation_error(
     interrupted: &AtomicBool,
     stage: DiagnosticStage,
     role: ScriptRole,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> ClosedFailure {
     let near_heap_limit = runtime_is_near_heap_limit(runtime);
     context.with(|ctx| {
@@ -2318,8 +2601,16 @@ fn classify_evaluation_error(
         if !matches!(error, Error::Exception) {
             return ClosedFailure::error(JsErrorCode::Internal, stage, role);
         }
-        let _ = ctx.catch();
-        ClosedFailure::error(JsErrorCode::Exception, stage, role)
+        let thrown = ctx.catch();
+        classify_thrown_exception(
+            &ctx,
+            thrown,
+            deadline,
+            interrupted,
+            stage,
+            role,
+            exception_diagnostics,
+        )
     })
 }
 
@@ -2515,6 +2806,37 @@ fn execute_isolated_skill_verification_case(
             };
         }
     };
+    let Some(bytecode) = trusted_bootstrap_bytecode() else {
+        return VerificationCaseResult {
+            case_id: case.case_id.clone(),
+            passed: false,
+            diagnostic: Some(diagnostic(
+                DiagnosticClass::Internal,
+                DiagnosticStage::Initialization,
+                role,
+            )),
+            transcript: fakes.transcript().bounded_for_wire(),
+        };
+    };
+    let (_, _, exception_inspector) = match load_trusted_bootstrap_functions(&context, bytecode) {
+        Ok(functions) => functions,
+        Err(_) => {
+            return VerificationCaseResult {
+                case_id: case.case_id.clone(),
+                passed: false,
+                diagnostic: Some(diagnostic(
+                    DiagnosticClass::Internal,
+                    DiagnosticStage::Initialization,
+                    role,
+                )),
+                transcript: fakes.transcript().bounded_for_wire(),
+            };
+        }
+    };
+    let exception_diagnostics = ExceptionDiagnostics {
+        inspector: &exception_inspector,
+        model_source: None,
+    };
     let mutated_export = match &case.kind {
         VerificationCaseKind::Mutation { export_name } => Some(export_name.as_str()),
         _ => None,
@@ -2568,6 +2890,7 @@ fn execute_isolated_skill_verification_case(
                 deadline,
                 interrupted,
                 &mut remaining_jobs,
+                &exception_diagnostics,
             )
             .0
         }
@@ -2579,6 +2902,7 @@ fn execute_isolated_skill_verification_case(
             deadline,
             interrupted,
             &mut remaining_jobs,
+            &exception_diagnostics,
         ),
         VerificationCaseKind::Mutation { .. } => execute_mutation_verification_case(
             runtime,
@@ -2588,6 +2912,7 @@ fn execute_isolated_skill_verification_case(
             deadline,
             interrupted,
             &mut remaining_jobs,
+            &exception_diagnostics,
         ),
     };
     drop(loaded);
@@ -2786,33 +3111,50 @@ fn execute_held_out_verification_case(
     deadline: Instant,
     interrupted: &AtomicBool,
     remaining_jobs: &mut usize,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> VerificationCaseResult {
     let role = ScriptRole::HeldOutTest;
-    let outcome =
-        evaluate(context, &case.script, runtime, deadline, interrupted, role).and_then(|value| {
-            drain_jobs(runtime, deadline, interrupted, remaining_jobs, role)?;
-            context.with(|ctx| {
-                let value = value.restore(&ctx).map_err(|error| {
-                    classify_ctx_error(
-                        &ctx,
-                        error,
-                        deadline,
-                        interrupted,
+    let outcome = evaluate(
+        context,
+        &case.script,
+        runtime,
+        deadline,
+        interrupted,
+        role,
+        exception_diagnostics,
+    )
+    .and_then(|value| {
+        drain_jobs(
+            runtime,
+            deadline,
+            interrupted,
+            remaining_jobs,
+            role,
+            exception_diagnostics,
+        )?;
+        context.with(|ctx| {
+            let value = value.restore(&ctx).map_err(|error| {
+                classify_ctx_error(
+                    &ctx,
+                    error,
+                    deadline,
+                    interrupted,
+                    DiagnosticStage::Verification,
+                    role,
+                    Some(exception_diagnostics),
+                )
+            })?;
+            verification_expected_matches(expected, &value)
+                .then_some(())
+                .ok_or_else(|| {
+                    ClosedFailure::error(
+                        JsErrorCode::InvalidResult,
                         DiagnosticStage::Verification,
                         role,
                     )
-                })?;
-                verification_expected_matches(expected, &value)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        ClosedFailure::error(
-                            JsErrorCode::InvalidResult,
-                            DiagnosticStage::Verification,
-                            role,
-                        )
-                    })
-            })
-        });
+                })
+        })
+    });
     match outcome {
         Ok(()) => VerificationCaseResult {
             case_id: case.case_id.clone(),
@@ -2857,6 +3199,7 @@ fn execute_mutation_verification_case(
     deadline: Instant,
     interrupted: &AtomicBool,
     remaining_jobs: &mut usize,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> VerificationCaseResult {
     for test in &artifact.tests {
         let (result, terminal) = execute_verification_case(
@@ -2868,6 +3211,7 @@ fn execute_mutation_verification_case(
             deadline,
             interrupted,
             remaining_jobs,
+            exception_diagnostics,
         );
         if !result.passed {
             if terminal {
@@ -2959,6 +3303,17 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     {
         return failed_verification(&request, DiagnosticClass::Internal);
     }
+    let Some(bytecode) = trusted_bootstrap_bytecode() else {
+        return failed_verification(&request, DiagnosticClass::Internal);
+    };
+    let (_, _, exception_inspector) = match load_trusted_bootstrap_functions(&context, bytecode) {
+        Ok(functions) => functions,
+        Err(_) => return failed_verification(&request, DiagnosticClass::Internal),
+    };
+    let exception_diagnostics = ExceptionDiagnostics {
+        inspector: &exception_inspector,
+        model_source: None,
+    };
 
     let mut remaining_jobs = limits.max_pending_jobs;
     let source = evaluate(
@@ -2968,6 +3323,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
         deadline,
         &interrupted,
         ScriptRole::SkillSource,
+        &exception_diagnostics,
     )
     .and_then(|value| {
         drain_jobs(
@@ -2976,8 +3332,16 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
             &interrupted,
             &mut remaining_jobs,
             ScriptRole::SkillSource,
+            &exception_diagnostics,
         )?;
-        ensure_source_settled(&runtime, &context, value, deadline, &interrupted)
+        ensure_source_settled(
+            &runtime,
+            &context,
+            value,
+            deadline,
+            &interrupted,
+            &exception_diagnostics,
+        )
     });
     if let Err(failure) = source {
         return failed_verification_with(&request, failure.diagnostic);
@@ -2999,6 +3363,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
                 deadline,
                 &interrupted,
                 &mut remaining_jobs,
+                &exception_diagnostics,
             );
             if terminal {
                 terminal_diagnostic = case.diagnostic.clone();
@@ -3019,6 +3384,7 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
                 deadline,
                 &interrupted,
                 &mut remaining_jobs,
+                &exception_diagnostics,
             );
             if terminal {
                 terminal_diagnostic = result.diagnostic.clone();
@@ -3040,6 +3406,7 @@ fn ensure_source_settled(
     value: Persistent<Value<'static>>,
     deadline: Instant,
     interrupted: &AtomicBool,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<(), ClosedFailure> {
     let near_heap_limit = runtime_is_near_heap_limit(runtime);
     context.with(|ctx| {
@@ -3051,6 +3418,7 @@ fn ensure_source_settled(
                 interrupted,
                 DiagnosticStage::Verification,
                 ScriptRole::SkillSource,
+                Some(exception_diagnostics),
             )
         })?;
         let Some(promise) = value.as_promise() else {
@@ -3066,16 +3434,28 @@ fn ensure_source_settled(
                 )),
             },
             PromiseState::Rejected => {
-                let _ = promise.result::<Value>();
-                let _ = ctx.catch();
+                let rejected = promise.result::<Value>();
                 if near_heap_limit {
+                    if matches!(rejected, Some(Err(Error::Exception))) {
+                        let _ = ctx.catch();
+                    }
                     Err(ClosedFailure::out_of_memory(
                         DiagnosticStage::Verification,
                         ScriptRole::SkillSource,
                     ))
+                } else if let Some(Err(error)) = rejected {
+                    Err(classify_ctx_error(
+                        &ctx,
+                        error,
+                        deadline,
+                        interrupted,
+                        DiagnosticStage::Verification,
+                        ScriptRole::SkillSource,
+                        Some(exception_diagnostics),
+                    ))
                 } else {
                     Err(ClosedFailure::error(
-                        JsErrorCode::Exception,
+                        JsErrorCode::Internal,
                         DiagnosticStage::Verification,
                         ScriptRole::SkillSource,
                     ))
@@ -3100,69 +3480,99 @@ fn execute_verification_case(
     deadline: Instant,
     interrupted: &AtomicBool,
     remaining_jobs: &mut usize,
+    exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> (VerificationCaseResult, bool) {
-    let result =
-        evaluate(context, script, runtime, deadline, interrupted, role).and_then(|value| {
-            drain_jobs(runtime, deadline, interrupted, remaining_jobs, role)?;
-            let near_heap_limit = runtime_is_near_heap_limit(runtime);
-            context.with(|ctx| {
-                let mut value = value.restore(&ctx).map_err(|error| {
-                    classify_ctx_error(
-                        &ctx,
-                        error,
-                        deadline,
-                        interrupted,
-                        DiagnosticStage::Verification,
-                        role,
-                    )
-                })?;
-                if let Some(promise) = value.as_promise() {
-                    value = match promise.state() {
-                        PromiseState::Resolved => promise
-                            .result::<Value>()
-                            .and_then(Result::ok)
-                            .ok_or_else(|| {
-                                ClosedFailure::error(
-                                    JsErrorCode::Internal,
-                                    DiagnosticStage::Verification,
-                                    role,
-                                )
-                            })?,
-                        PromiseState::Rejected => {
-                            let _ = promise.result::<Value>();
-                            let _ = ctx.catch();
-                            if near_heap_limit {
-                                return Err(ClosedFailure::out_of_memory(
-                                    DiagnosticStage::Verification,
-                                    role,
-                                ));
+    let result = evaluate(
+        context,
+        script,
+        runtime,
+        deadline,
+        interrupted,
+        role,
+        exception_diagnostics,
+    )
+    .and_then(|value| {
+        drain_jobs(
+            runtime,
+            deadline,
+            interrupted,
+            remaining_jobs,
+            role,
+            exception_diagnostics,
+        )?;
+        let near_heap_limit = runtime_is_near_heap_limit(runtime);
+        context.with(|ctx| {
+            let mut value = value.restore(&ctx).map_err(|error| {
+                classify_ctx_error(
+                    &ctx,
+                    error,
+                    deadline,
+                    interrupted,
+                    DiagnosticStage::Verification,
+                    role,
+                    Some(exception_diagnostics),
+                )
+            })?;
+            if let Some(promise) = value.as_promise() {
+                value = match promise.state() {
+                    PromiseState::Resolved => promise
+                        .result::<Value>()
+                        .and_then(Result::ok)
+                        .ok_or_else(|| {
+                            ClosedFailure::error(
+                                JsErrorCode::Internal,
+                                DiagnosticStage::Verification,
+                                role,
+                            )
+                        })?,
+                    PromiseState::Rejected => {
+                        let rejected = promise.result::<Value>();
+                        if near_heap_limit {
+                            if matches!(rejected, Some(Err(Error::Exception))) {
+                                let _ = ctx.catch();
                             }
-                            return Err(ClosedFailure::error(
-                                JsErrorCode::Exception,
+                            return Err(ClosedFailure::out_of_memory(
                                 DiagnosticStage::Verification,
                                 role,
                             ));
                         }
-                        PromiseState::Pending => {
+                        let Some(Err(error)) = rejected else {
                             return Err(ClosedFailure::error(
-                                JsErrorCode::JobLimit,
-                                DiagnosticStage::JobDrain,
+                                JsErrorCode::Internal,
+                                DiagnosticStage::Verification,
                                 role,
                             ));
-                        }
-                    };
-                }
-                if value.as_bool() == Some(true) {
-                    Ok(())
-                } else {
-                    Err(ClosedFailure::error(
-                        JsErrorCode::InvalidResult,
-                        DiagnosticStage::Verification,
-                        role,
-                    ))
-                }
-            })
-        });
+                        };
+                        return Err(classify_ctx_error(
+                            &ctx,
+                            error,
+                            deadline,
+                            interrupted,
+                            DiagnosticStage::Verification,
+                            role,
+                            Some(exception_diagnostics),
+                        ));
+                    }
+                    PromiseState::Pending => {
+                        return Err(ClosedFailure::error(
+                            JsErrorCode::JobLimit,
+                            DiagnosticStage::JobDrain,
+                            role,
+                        ));
+                    }
+                };
+            }
+            if value.as_bool() == Some(true) {
+                Ok(())
+            } else {
+                Err(ClosedFailure::error(
+                    JsErrorCode::InvalidResult,
+                    DiagnosticStage::Verification,
+                    role,
+                ))
+            }
+        })
+    });
     match result {
         Ok(()) => (
             VerificationCaseResult {

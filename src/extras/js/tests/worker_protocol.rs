@@ -935,3 +935,35 @@ fn worker_protocol_protocol_fault_closes_both_sides() {
         Err(ProtocolError::InvalidTransition { .. })
     ));
 }
+
+#[test]
+fn worker_protocol_exception_metadata_is_closed_in_v4() {
+    let diagnostic = Diagnostic {
+        class: DiagnosticClass::Exception,
+        stage: DiagnosticStage::Evaluation,
+        script_role: ScriptRole::Model,
+        exception_class: Some(JsExceptionClass::TypeError),
+        line: Some(12),
+        column: Some(7),
+    };
+    let encoded = serde_json::to_string(&diagnostic).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Diagnostic>(&encoded).unwrap(),
+        diagnostic
+    );
+    assert!(serde_json::from_str::<Diagnostic>(
+        r#"{"class":"exception","stage":"evaluation","script_role":"model","exception_class":"EvalError","line":12,"column":7}"#,
+    )
+    .is_err());
+}
+
+#[test]
+fn worker_protocol_model_source_positions_are_positive_and_in_bounds() {
+    let source = "first();\nsecond();";
+    assert!(source_position_is_valid(source, 1, 1));
+    assert!(source_position_is_valid(source, 2, 10));
+    assert!(!source_position_is_valid(source, 0, 1));
+    assert!(!source_position_is_valid(source, 1, 0));
+    assert!(!source_position_is_valid(source, 3, 1));
+    assert!(!source_position_is_valid(source, 2, 11));
+}

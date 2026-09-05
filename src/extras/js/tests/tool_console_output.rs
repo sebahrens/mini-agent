@@ -1,6 +1,6 @@
 //! JsTool-level contained-worker coverage for model-visible console output and
 //! failure diagnostics. The worker collects bounded `console.*` records and a
-//! stable `Diagnostic` (stage / script role) on every failure; both must reach
+//! stable `Diagnostic` (closed class, model location, stage, and script role) on every failure; both must reach
 //! the caller instead of being dropped at the tool boundary.
 
 use rig::tool::Tool;
@@ -52,8 +52,12 @@ async fn js_tool_marks_truncated_console_records() {
 async fn js_tool_error_carries_stage_and_script_role_diagnostic_and_console() {
     let result = run("console.log('before failure'); throw new Error('boom')").await;
     assert!(
-        result.starts_with("JS error: exception (stage: evaluation; script: model"),
+        result.starts_with("JS exception at 1:"),
         "unexpected: {result}"
+    );
+    assert!(
+        result.contains("(stage: evaluation; script: model)"),
+        "unexpected diagnostic: {result}"
     );
     assert!(
         result.contains("\n[console.log] before failure"),
@@ -64,7 +68,10 @@ async fn js_tool_error_carries_stage_and_script_role_diagnostic_and_console() {
 #[tokio::test]
 async fn js_tool_malformed_source_reports_stage_and_script_role() {
     let result = run("let = ;").await;
-    assert!(result.starts_with("JS error: "), "unexpected: {result}");
+    assert!(
+        result.starts_with("JS SyntaxError at 1:"),
+        "unexpected: {result}"
+    );
     assert!(
         result.contains("(stage: evaluation; script: model"),
         "diagnostic stage and script role must be rendered: {result}"

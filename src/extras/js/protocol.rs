@@ -702,6 +702,20 @@ pub(crate) struct Diagnostic {
     pub(crate) class: DiagnosticClass,
     pub(crate) stage: DiagnosticStage,
     pub(crate) script_role: ScriptRole,
+    pub(crate) exception_class: Option<JsExceptionClass>,
+    pub(crate) line: Option<u32>,
+    pub(crate) column: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JsExceptionClass {
+    SyntaxError,
+    TypeError,
+    ReferenceError,
+    RangeError,
+    InternalError,
+    Other,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -733,6 +747,21 @@ pub(crate) enum ScriptRole {
     MutationTest,
     InheritedTest,
     HeldOutTest,
+}
+
+pub(crate) fn source_position_is_valid(source: &str, line: u32, column: u32) -> bool {
+    if line == 0 || column == 0 {
+        return false;
+    }
+    let Ok(line_index) = usize::try_from(line - 1) else {
+        return false;
+    };
+    let Some(source_line) = source.split('\n').nth(line_index) else {
+        return false;
+    };
+    usize::try_from(column)
+        .ok()
+        .is_some_and(|column| column <= source_line.len().saturating_add(1))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

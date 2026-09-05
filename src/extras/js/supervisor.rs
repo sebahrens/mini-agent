@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
-    FrameError, InvocationId, JsErrorCode, ParentFrame, ParentProtocol, ParentWireFrame, RunStep,
-    StepOutcome, StepResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerWireFrame, read_frame, write_frame,
+    FrameError, InvocationId, JsErrorCode, JsExceptionClass, ParentFrame, ParentProtocol,
+    ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VerificationResult,
+    VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -1286,6 +1286,33 @@ fn verification_result_is_reusable(result: &VerificationResult) -> bool {
     })
 }
 
+fn verification_diagnostics_are_closed(result: &VerificationResult) -> bool {
+    result.cases.iter().all(|case| match &case.diagnostic {
+        None => case.passed,
+        Some(diagnostic) => {
+            !case.passed
+                && diagnostic.script_role != ScriptRole::Model
+                && diagnostic.line.is_none()
+                && diagnostic.column.is_none()
+                && match diagnostic.class {
+                    DiagnosticClass::Syntax => {
+                        diagnostic.exception_class == Some(JsExceptionClass::SyntaxError)
+                    }
+                    DiagnosticClass::Exception => {
+                        diagnostic.exception_class != Some(JsExceptionClass::SyntaxError)
+                    }
+                    DiagnosticClass::ResourceLimit => matches!(
+                        diagnostic.exception_class,
+                        None | Some(JsExceptionClass::RangeError)
+                    ),
+                    DiagnosticClass::Contract | DiagnosticClass::Internal => {
+                        diagnostic.exception_class.is_none()
+                    }
+                }
+        }
+    })
+}
+
 fn store_idle_with_retirement(
     inner: &Arc<SupervisorInner>,
     state: &mut SupervisorState,
@@ -1714,6 +1741,9 @@ async fn run_invocation<H: InvocationEffectHandler>(
             }
             WorkerFrame::StepResult(result) => return Ok(InvocationTerminal::Step(result)),
             WorkerFrame::VerificationResult(result) => {
+                if !verification_diagnostics_are_closed(&result) {
+                    return Err(WorkerError::Protocol);
+                }
                 return Ok(InvocationTerminal::Verification(result));
             }
             WorkerFrame::ProtocolFault(fault) => {

@@ -3841,7 +3841,10 @@ mod workspace_tests {
             })
             .await;
         if let Ok(value) = &js_read {
-            assert!(value.starts_with("JS error:"), "the JS read must fail");
+            assert!(
+                value.starts_with("JS ") && value.contains("(stage:"),
+                "the JS read must fail: {value}"
+            );
             assert!(
                 !value.contains("secret-value"),
                 "a JS read must not reveal a symlink target"
@@ -3853,7 +3856,10 @@ mod workspace_tests {
             })
             .await;
         if let Ok(value) = &js_write {
-            assert!(value.starts_with("JS error:"), "the JS write must fail");
+            assert!(
+                value.starts_with("JS ") && value.contains("(stage:"),
+                "the JS write must fail: {value}"
+            );
         }
         assert!(!first.join("secret/core.txt").exists());
         assert!(!first.join("secret/js.txt").exists());
