@@ -1049,6 +1049,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_budget_partial_does_not_cancel_sibling_tasks() {
+        let counters = Arc::new(FakeCounters::default());
+        let partial = FakeStep {
+            delay: Duration::ZERO,
+            output: Ok("finding\n[partial: turn budget exhausted]".to_string()),
+            cost_units: 1,
+        };
+        let sibling = FakeStep {
+            delay: Duration::from_millis(5),
+            output: Ok("sibling completed".to_string()),
+            cost_units: 1,
+        };
+        let report = execute_tasks(
+            prompts(2),
+            limits(),
+            fake_executor(vec![partial, sibling], Arc::clone(&counters)),
+        )
+        .await;
+
+        let rendered = report.render();
+        assert!(report.stop_reason.is_none());
+        assert_eq!(report.completed, 2);
+        assert_eq!(counters.started.load(Ordering::SeqCst), 2);
+        assert!(rendered.contains("[partial: turn budget exhausted]"));
+        assert!(rendered.contains("sibling completed"));
+        assert!(!rendered.contains("[cancelled:"));
+    }
+
+    #[tokio::test]
     async fn task_tool_limits_bound_peak_concurrency() {
         let counters = Arc::new(FakeCounters::default());
         let steps = (0..5)

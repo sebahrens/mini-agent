@@ -233,10 +233,6 @@ subagent_provider = "openrouter"
 
 ## Known limits and planned changes (2026-09-05 review)
 
-- A child that reaches `task_max_turns` currently fails with a provider `MaxTurnsError`; the
-  failure cancels the other prompts in the same call and its partial text is discarded
-  (mini-agent-ddno). Planned: return the partial report with a `[partial: turn budget
-  exhausted]` marker and keep siblings running.
 - `SubagentStart`/`SubagentStop` hooks receive the fixed agent type `explore` regardless of
   `agent_type` (mini-agent-abys).
 - The child receives only the prompt string: no conversation history, files, or constraints,
@@ -321,6 +317,10 @@ original prompt order:
 - the triggering failure contains `[failed: ...]`;
 - started siblings contain `[cancelled: ...]`;
 - queued prompts contain `[not started: ...]`.
+
+Exhausting `task_max_turns` is not a child failure. The child returns all text
+accumulated so far followed by `[partial: turn budget exhausted]`; its queued
+and in-flight siblings continue normally (mini-agent-ddno).
 
 Partial returns begin with a summary containing the stop reason and aggregate
 started/completed/cost accounting. Cost includes usage already observed from

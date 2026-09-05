@@ -2296,6 +2296,26 @@ pub(crate) struct SubagentRunOutput {
 }
 
 #[cfg(feature = "subagents")]
+const SUBAGENT_TURN_BUDGET_PARTIAL: &str = "[partial: turn budget exhausted]";
+
+#[cfg(feature = "subagents")]
+fn append_subagent_turn_budget_partial(response: &mut String) {
+    if !response.is_empty() && !response.ends_with('\n') {
+        response.push('\n');
+    }
+    response.push_str(SUBAGENT_TURN_BUDGET_PARTIAL);
+}
+
+#[cfg(feature = "subagents")]
+fn is_subagent_turn_budget_error(error: &rig::agent::StreamingError) -> bool {
+    matches!(
+        error,
+        rig::agent::StreamingError::Prompt(prompt)
+            if matches!(prompt.as_ref(), rig::completion::PromptError::MaxTurnsError { .. })
+    )
+}
+
+#[cfg(feature = "subagents")]
 pub(crate) async fn run_subagent<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -2320,6 +2340,12 @@ where
     .await;
     let mut stream = match stream {
         Ok(stream) => stream,
+        Err(error) if is_subagent_turn_budget_error(&error) => {
+            return SubagentRunOutput {
+                response: Ok(SUBAGENT_TURN_BUDGET_PARTIAL.to_string()),
+                usage: usage_ledger.total(),
+            };
+        }
         Err(error) => {
             return SubagentRunOutput {
                 response: Err(format!("subagent error: {error}")),
@@ -2356,6 +2382,10 @@ where
                 usage_ledger.record_completion(call.usage);
             }
             Ok(_) => {}
+            Err(error) if is_subagent_turn_budget_error(&error) => {
+                append_subagent_turn_budget_partial(&mut full_response);
+                break;
+            }
             Err(e) => {
                 return SubagentRunOutput {
                     response: Err(format!("subagent error: {e}")),
@@ -2583,6 +2613,63 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_turn_exhaustion_returns_accumulated_text_as_partial_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("preliminary finding"),
+            MockStreamEvent::tool_call("count-once", CountingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(1)
+            .build();
+
+        let run = super::run_subagent(
+            &agent,
+            "investigate",
+            1,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+        )
+        .await;
+
+        assert_eq!(model.requests().len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            run.response.unwrap(),
+            "preliminary finding\n[partial: turn budget exhausted]"
+        );
+    }
+
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn subagent_zero_turn_budget_returns_partial_without_provider_call() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("must not run"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(0)
+            .build();
+
+        let run = super::run_subagent(
+            &agent,
+            "investigate",
+            0,
+            None,
+            &crate::retry::RetryConfig::default(),
+            super::SharedUsageLedger::default(),
+        )
+        .await;
+
+        assert!(model.requests().is_empty());
+        assert_eq!(run.response.unwrap(), "[partial: turn budget exhausted]");
     }
 
     #[tokio::test]
