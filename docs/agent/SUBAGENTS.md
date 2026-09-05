@@ -51,9 +51,11 @@ The main agent has a new tool called `task`. It accepts:
 ## Specialist Agent Types
 
 `task` also accepts an optional `agent_type`. When set, the named definition is
-prepended to the base explore prompt as the authoritative persona, scope,
-method, and output contract. Unknown names are rejected with the valid names so
-a misspelled specialist can never masquerade as a generic exploration.
+prepended to the base explore prompt as the persona, domain scope,
+investigation method, and output contract. Host-owned safety and honesty rules
+are appended after every configurable prompt layer and cannot be overridden by
+the specialization. Unknown names are rejected with the valid names so a
+misspelled specialist can never masquerade as a generic exploration.
 
 | `agent_type` | Domain |
 |--------------|--------|
@@ -91,15 +93,23 @@ architecture detail. New specialist definitions must preserve this
 caveats-first ordering.
 
 Definitions are markdown resolved by `src/context/agents.rs`, highest priority
-first:
+first among eligible layers:
 
 ```
-.zerostack/agents/<name>.md      # project override
+.zerostack/agents/<name>.md      # trusted project override
 data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
-When a project definition wins, the host prefixes the task result with its
+Project definitions participate only when the exact current
+`.zerostack/config.toml` is bound in the private project-config trust store.
+An untrusted checkout cannot add or replace agent types; resolution falls back
+to user-global or compiled-in definitions. Changing the project config content
+or copying the checkout invalidates that content-and-path-bound trust.
+
+The task permission prompt identifies both the requested `agent_type` and its
+resolved source without embedding the specialist prompt body. When a trusted
+project definition wins, the host also prefixes the task result with its
 `.zerostack/agents/<name>.md` source. This makes a repository-controlled
 replacement visible to the calling agent instead of silently presenting it as
 the compiled-in specialist.
@@ -116,10 +126,10 @@ only in the error returned for an unknown name. The schema does not enumerate
 them yet (mini-agent-kh1o). Frontmatter keys other than `name` (for example
 `tools:` or `model:`) are ignored (mini-agent-6khf).
 
-Project definitions are loaded without a project-trust check; a checkout can
-therefore replace a specialist's prompt, and the base prompt tells the child
-that the specialization overrides its defaults. The read-only tool set still
-holds. Trust gating is planned (mini-agent-yb9w).
+The host appends the repository-as-untrusted, prompt-injection reporting,
+honest-unknowns, read-only, and no-shell rules after the specialization,
+architecture context, and user suffix. The specialization may override general
+investigation defaults, but never those host rules (mini-agent-yb9w).
 
 ## What the Subagent Can Do
 

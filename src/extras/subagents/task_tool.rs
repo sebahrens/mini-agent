@@ -142,12 +142,19 @@ fn validate_prompts(prompts: &[String], limits: TaskLimits) -> Result<(), ToolEr
     Ok(())
 }
 
+#[derive(Debug)]
+struct ResolvedSpecialization {
+    prompt: String,
+    project_override_notice: Option<String>,
+    source: String,
+}
+
 fn resolve_specialization(
     agent_type: Option<&str>,
     workspace: Option<&crate::paths::WorkspaceBinding>,
-) -> Result<(Option<String>, Option<String>), ToolError> {
+) -> Result<Option<ResolvedSpecialization>, ToolError> {
     let Some(agent_type) = agent_type else {
-        return Ok((None, None));
+        return Ok(None);
     };
     let Some(definition) = crate::context::agents::lookup_for_workspace(agent_type, workspace)
     else {
@@ -156,10 +163,29 @@ fn resolve_specialization(
             "task: unknown agent_type '{agent_type}'; valid types: {valid}"
         )));
     };
-    let notice = definition
+    let project_override_notice = definition
         .project_override_path(agent_type)
         .map(|path| format!("[specialist source: project override {}]", path.display()));
-    Ok((Some(definition.prompt), notice))
+    let source = definition.source_description(agent_type);
+    Ok(Some(ResolvedSpecialization {
+        prompt: definition.prompt,
+        project_override_notice,
+        source,
+    }))
+}
+
+fn permission_input(
+    prompts: &[String],
+    agent_type: Option<&str>,
+    specialist_source: Option<&str>,
+) -> String {
+    let prompts = prompts.join(" | ");
+    match (agent_type, specialist_source) {
+        (Some(agent_type), Some(source)) => {
+            format!("agent_type: {agent_type}\nspecialist source: {source}\nprompts: {prompts}")
+        }
+        _ => prompts,
+    }
 }
 
 pub struct TaskTool {
@@ -267,14 +293,25 @@ editing in a known location, grepping for a literal you will act on immediately.
         validate_prompts(&args.prompts, limits)?;
 
         let agent_type = args.agent_type.clone();
-        let (specialization, project_override_notice) =
+        let specialization =
             resolve_specialization(agent_type.as_deref(), self.workspace.as_deref())?;
+        let permission_input = permission_input(
+            &args.prompts,
+            agent_type.as_deref(),
+            specialization
+                .as_ref()
+                .map(|resolved| resolved.source.as_str()),
+        );
+        let project_override_notice = specialization
+            .as_ref()
+            .and_then(|resolved| resolved.project_override_notice.clone());
+        let specialization = specialization.map(|resolved| resolved.prompt);
 
         check_perm(
             &self.permission,
             &self.ask_tx,
             Self::NAME,
-            &args.prompts.join(" | "),
+            &permission_input,
         )
         .await?;
 
@@ -926,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn task_specialization_and_provenance_follow_each_session_workspace() {
+    fn untrusted_project_specialization_is_excluded_from_resolution() {
         let container = std::env::temp_dir().join(format!(
             "mini-agent-task-specialization-{}",
             uuid::Uuid::new_v4()
@@ -940,37 +977,26 @@ mod tests {
         let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
         let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
 
-        let (first_prompt, first_notice) =
-            resolve_specialization(Some("review"), Some(&first_binding)).unwrap();
-        let (second_prompt, second_notice) =
-            resolve_specialization(Some("review"), Some(&second_binding)).unwrap();
-
-        assert_eq!(first_prompt.as_deref(), Some("FIRST_TASK"));
-        assert_eq!(second_prompt.as_deref(), Some("SECOND_TASK"));
-        assert_eq!(
-            first_notice,
-            Some(format!(
-                "[specialist source: project override {}]",
-                first_binding
-                    .root()
-                    .join(".zerostack/agents/review.md")
-                    .display()
-            ))
-        );
-        assert_eq!(
-            second_notice,
-            Some(format!(
-                "[specialist source: project override {}]",
-                second_binding
-                    .root()
-                    .join(".zerostack/agents/review.md")
-                    .display()
-            ))
-        );
+        assert!(resolve_specialization(Some("review"), Some(&first_binding)).is_err());
+        assert!(resolve_specialization(Some("review"), Some(&second_binding)).is_err());
 
         drop(first_binding);
         drop(second_binding);
         std::fs::remove_dir_all(container).unwrap();
+    }
+
+    #[test]
+    fn permission_input_names_specialist_and_source_without_prompt_contents() {
+        let input = permission_input(
+            &["audit authentication".into()],
+            Some("rust-security-review"),
+            Some("compiled-in default"),
+        );
+
+        assert!(input.contains("agent_type: rust-security-review"));
+        assert!(input.contains("specialist source: compiled-in default"));
+        assert!(input.contains("prompts: audit authentication"));
+        assert!(!input.contains("You are a"));
     }
 
     #[test]

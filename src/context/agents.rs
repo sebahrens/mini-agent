@@ -100,6 +100,40 @@ impl AgentDefinition {
             AgentDefinitionSource::Embedded | AgentDefinitionSource::UserGlobal => None,
         }
     }
+
+    pub(crate) fn source_description(&self, name: &str) -> String {
+        match &self.source {
+            AgentDefinitionSource::Embedded => "compiled-in default".to_string(),
+            AgentDefinitionSource::UserGlobal => "user-global configuration".to_string(),
+            AgentDefinitionSource::ProjectOverride { directory } => format!(
+                "trusted project override {}",
+                directory.join(format!("{name}.md")).display()
+            ),
+        }
+    }
+}
+
+fn project_definitions_trusted(paths: &crate::paths::AppPaths) -> bool {
+    crate::config::load::project_config_is_trusted(
+        paths.project_config_file().as_deref(),
+        &paths.project_config_trust_file(),
+    )
+}
+
+fn merge_project_definitions(
+    agents: &mut HashMap<String, AgentDefinition>,
+    definitions: impl IntoIterator<Item = (String, String)>,
+    directory: PathBuf,
+    trusted: bool,
+) {
+    if !trusted {
+        return;
+    }
+    merge_definitions(
+        agents,
+        normalize_agent_definitions(definitions),
+        AgentDefinitionSource::ProjectOverride { directory },
+    );
 }
 
 fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition> {
@@ -124,13 +158,14 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
 pub fn load() -> HashMap<String, AgentDefinition> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let mut agents = load_base(&paths);
-    if let Some(project_dir) = paths.project_agents_dir() {
-        merge_definitions(
+    if project_definitions_trusted(&paths)
+        && let Some(project_dir) = paths.project_agents_dir()
+    {
+        merge_project_definitions(
             &mut agents,
-            normalize_agent_definitions(crate::context::load_dir_files(&project_dir, "md")),
-            AgentDefinitionSource::ProjectOverride {
-                directory: project_dir,
-            },
+            crate::context::load_dir_files(&project_dir, "md"),
+            project_dir,
+            true,
         );
     }
     agents
@@ -146,15 +181,15 @@ pub(crate) fn load_for_workspace_binding(
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
     let mut agents = load_base(&paths);
     let project_dir = workspace.root().join(".zerostack/agents");
-    if let Ok(definitions) = workspace.read_relative_dir_files(Path::new(".zerostack/agents"), "md")
+    let trusted = paths
+        .with_workspace_root(workspace.root())
+        .map(|paths| project_definitions_trusted(&paths))
+        .unwrap_or(false);
+    if trusted
+        && let Ok(definitions) =
+            workspace.read_relative_dir_files(Path::new(".zerostack/agents"), "md")
     {
-        merge_definitions(
-            &mut agents,
-            normalize_agent_definitions(definitions),
-            AgentDefinitionSource::ProjectOverride {
-                directory: project_dir,
-            },
-        );
+        merge_project_definitions(&mut agents, definitions, project_dir, true);
     }
     agents
 }
@@ -228,19 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn project_definition_wins_and_retains_override_provenance() {
+    fn only_trusted_project_definition_wins_and_retains_override_provenance() {
         let mut agents = HashMap::new();
         merge_definitions(
             &mut agents,
             [("review".to_string(), "embedded".to_string())],
             AgentDefinitionSource::Embedded,
         );
-        merge_definitions(
+        merge_project_definitions(
             &mut agents,
             [("review".to_string(), "project".to_string())],
-            AgentDefinitionSource::ProjectOverride {
-                directory: PathBuf::from("/workspace/.zerostack/agents"),
-            },
+            PathBuf::from("/workspace/.zerostack/agents"),
+            false,
+        );
+
+        let ignored = agents.get("review").unwrap();
+        assert_eq!(ignored.prompt, "embedded");
+        assert_eq!(ignored.source, AgentDefinitionSource::Embedded);
+
+        merge_project_definitions(
+            &mut agents,
+            [("review".to_string(), "project".to_string())],
+            PathBuf::from("/workspace/.zerostack/agents"),
+            true,
         );
 
         let resolved = agents.remove("review").unwrap();
@@ -255,10 +300,32 @@ mod tests {
             resolved.project_override_path("review"),
             Some(PathBuf::from("/workspace/.zerostack/agents/review.md"))
         );
+        assert_eq!(
+            resolved.source_description("review"),
+            "trusted project override /workspace/.zerostack/agents/review.md"
+        );
     }
 
     #[test]
-    fn workspace_bound_definitions_do_not_cross_sessions() {
+    fn permission_source_descriptions_cover_non_project_layers() {
+        let embedded = AgentDefinition {
+            prompt: "embedded".into(),
+            source: AgentDefinitionSource::Embedded,
+        };
+        let user = AgentDefinition {
+            prompt: "user".into(),
+            source: AgentDefinitionSource::UserGlobal,
+        };
+
+        assert_eq!(embedded.source_description("review"), "compiled-in default");
+        assert_eq!(
+            user.source_description("review"),
+            "user-global configuration"
+        );
+    }
+
+    #[test]
+    fn untrusted_workspace_definitions_are_never_resolved() {
         let container = std::env::temp_dir().join(format!(
             "mini-agent-agent-definitions-{}",
             uuid::Uuid::new_v4()
@@ -272,18 +339,12 @@ mod tests {
 
         let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
         let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
-        let first_definition = lookup_for_workspace("review", Some(&first_binding)).unwrap();
-        let second_definition = lookup_for_workspace("review", Some(&second_binding)).unwrap();
-
-        assert_eq!(first_definition.prompt, "FIRST_WORKSPACE");
-        assert_eq!(second_definition.prompt, "SECOND_WORKSPACE");
-        assert_eq!(
-            first_definition.project_override_path("review"),
-            Some(first_binding.root().join(".zerostack/agents/review.md"))
-        );
-        assert_eq!(
-            second_definition.project_override_path("review"),
-            Some(second_binding.root().join(".zerostack/agents/review.md"))
+        assert!(lookup_for_workspace("review", Some(&first_binding)).is_none());
+        assert!(lookup_for_workspace("review", Some(&second_binding)).is_none());
+        assert!(
+            !available_names_for_workspace(Some(&first_binding))
+                .iter()
+                .any(|name| name == "review")
         );
 
         drop(first_binding);

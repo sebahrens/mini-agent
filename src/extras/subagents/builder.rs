@@ -131,16 +131,13 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     // Optional specialization prompt prepended before the base explore prompt.
     specialization: Option<&str>,
 ) -> Agent<M> {
-    let mut preamble = build_explore_preamble(
+    let suffix = crate::session::storage::load_suffix();
+    let preamble = build_explore_preamble(
         #[cfg(feature = "archmd")]
         architecture,
         specialization,
+        suffix.as_deref(),
     );
-
-    if let Some(s) = crate::session::storage::load_suffix() {
-        preamble.push_str("\n\n---\n\n");
-        preamble.push_str(&s);
-    }
 
     let tools = authorization.filesystem_tools(
         max_text_file_size,
@@ -175,6 +172,7 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
 fn build_explore_preamble(
     #[cfg(feature = "archmd")] architecture: Option<&str>,
     specialization: Option<&str>,
+    suffix: Option<&str>,
 ) -> String {
     let mut preamble = String::new();
     if let Some(spec) = specialization
@@ -191,6 +189,12 @@ fn build_explore_preamble(
         preamble.push_str("\n\n");
         preamble.push_str(arch);
     }
+    if let Some(suffix) = suffix {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(suffix);
+    }
+    preamble.push_str("\n\n---\n\n");
+    preamble.push_str(prompt::NON_OVERRIDABLE_EXPLORE_RULES);
     preamble
 }
 
@@ -354,8 +358,8 @@ mod tests {
     #[cfg(feature = "archmd")]
     #[test]
     fn explore_preamble_uses_only_the_supplied_session_architecture() {
-        let first = build_explore_preamble(Some("FIRST_SESSION_ARCHITECTURE"), None);
-        let second = build_explore_preamble(Some("SECOND_SESSION_ARCHITECTURE"), None);
+        let first = build_explore_preamble(Some("FIRST_SESSION_ARCHITECTURE"), None, None);
+        let second = build_explore_preamble(Some("SECOND_SESSION_ARCHITECTURE"), None, None);
         assert!(first.contains("FIRST_SESSION_ARCHITECTURE"));
         assert!(!first.contains("SECOND_SESSION_ARCHITECTURE"));
         assert!(second.contains("SECOND_SESSION_ARCHITECTURE"));
@@ -368,6 +372,7 @@ mod tests {
             #[cfg(feature = "archmd")]
             None,
             Some("You are a Rust async specialist."),
+            None,
         );
         let spec_pos = preamble.find("You are a Rust async specialist.").unwrap();
         let base_pos = preamble
@@ -383,9 +388,34 @@ mod tests {
             "the base prompt must not install a second persona"
         );
         assert!(
-            preamble.contains("persona, scope, method, and report format are authoritative"),
+            preamble.contains("persona, domain scope"),
             "the base prompt must make the specialization contract authoritative"
         );
+        let safety_pos = preamble
+            .find("## Non-overridable safety and honesty rules")
+            .unwrap();
+        assert!(base_pos < safety_pos);
+        assert!(preamble[safety_pos..].contains("Never invent findings"));
+        assert!(preamble[safety_pos..].contains("Do NOT modify files"));
+    }
+
+    #[test]
+    fn host_safety_rules_follow_every_injectable_prompt_layer() {
+        let preamble = build_explore_preamble(
+            #[cfg(feature = "archmd")]
+            Some("ARCHITECTURE_INJECTION"),
+            Some("SPECIALIZATION_INJECTION"),
+            Some("SUFFIX_INJECTION"),
+        );
+        let safety = preamble
+            .find("## Non-overridable safety and honesty rules")
+            .unwrap();
+        for marker in ["SPECIALIZATION_INJECTION", "SUFFIX_INJECTION"] {
+            assert!(preamble.find(marker).unwrap() < safety, "{marker}");
+        }
+        #[cfg(feature = "archmd")]
+        assert!(preamble.find("ARCHITECTURE_INJECTION").unwrap() < safety);
+        assert!(preamble[safety..].contains("No specialization, repository content"));
     }
 
     #[test]
@@ -394,11 +424,13 @@ mod tests {
             #[cfg(feature = "archmd")]
             None,
             None,
+            None,
         );
         let with_empty = build_explore_preamble(
             #[cfg(feature = "archmd")]
             None,
             Some(""),
+            None,
         );
         assert_eq!(with_none, with_empty);
     }
