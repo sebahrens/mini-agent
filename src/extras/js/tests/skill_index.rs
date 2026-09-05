@@ -162,6 +162,27 @@ fn skill_index_dense_fts_and_fusion_are_deterministic() {
 }
 
 #[test]
+fn skill_index_natural_language_query_uses_or_bm25_without_dense_candidates() {
+    let temp = TempPaths::new();
+    let (index, json, _) = built_index(&temp);
+    let policy = RetrievalPolicy {
+        dense_candidate_limit: 0,
+        ..RetrievalPolicy::default()
+    };
+    let results = index
+        .search(
+            "please parse this JSON file and print the keys",
+            &[0.0, 1.0],
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(results.len(), 2, "OR semantics may return partial matches");
+    assert_eq!(results[0].artifact.id, json.id);
+    assert!(results.iter().all(|skill| skill.dense_score.is_none()));
+    assert!(results[0].lexical_score.is_some());
+}
+
+#[test]
 fn skill_index_lifecycle_floor_and_budgets_can_return_zero() {
     let temp = TempPaths::new();
     let (index, _, _) = built_index(&temp);

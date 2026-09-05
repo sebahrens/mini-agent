@@ -98,6 +98,9 @@ pub struct DeterministicBackend {
     dimensions: usize,
 }
 
+pub(crate) const DETERMINISTIC_MODEL_ID: &str = "deterministic-hash";
+const DETERMINISTIC_MODEL_REVISION: &str = "deterministic-v2";
+
 impl DeterministicBackend {
     /// Create a new deterministic backend.
     pub fn new() -> Self {
@@ -106,8 +109,8 @@ impl DeterministicBackend {
             // (model_id, model_revision) and compatibility is decided from that
             // key, so claiming to be BGE here would let hash vectors be compared
             // against real BGE vectors as if they were interchangeable.
-            model_id: "deterministic-hash".to_string(),
-            model_revision: "deterministic-v2".to_string(),
+            model_id: DETERMINISTIC_MODEL_ID.to_string(),
+            model_revision: DETERMINISTIC_MODEL_REVISION.to_string(),
             dimensions: 384,
         }
     }
@@ -908,6 +911,15 @@ impl Embedder {
         })
     }
 
+    /// Whether vectors from this backend carry semantic similarity meaning.
+    ///
+    /// The built-in deterministic backend is an identity-stable test and
+    /// storage fallback, not a semantic model. Its hash projections must never
+    /// participate in dense retrieval.
+    pub(crate) fn supports_semantic_retrieval(&self) -> bool {
+        self.metadata.model_id != DETERMINISTIC_MODEL_ID
+    }
+
     /// Get immutable model metadata.
     pub fn model_metadata(&self) -> &ModelMetadata {
         &self.metadata
@@ -1125,6 +1137,11 @@ mod tests {
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), 384);
         assert_eq!(embeddings[1].len(), 384);
+    }
+
+    #[test]
+    fn deterministic_embedder_disables_semantic_retrieval() {
+        assert!(!Embedder::new().unwrap().supports_semantic_retrieval());
     }
 
     #[test]

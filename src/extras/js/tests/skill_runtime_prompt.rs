@@ -78,6 +78,18 @@ fn retrieval_document(skill: &SkillArtifact) -> String {
 }
 
 #[tokio::test]
+async fn deterministic_backend_reports_lexical_only_retrieval() {
+    let temp = TempPaths::new();
+    let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
+
+    let discovery = runtime.prepare_turn("parse this JSON document").await;
+
+    assert!(discovery.diagnostics.iter().any(|entry| {
+        entry == "semantic_retrieval_unavailable:deterministic_embedding_backend"
+    }));
+}
+
+#[tokio::test]
 async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
     let temp = TempPaths::new();
     let learned = learned_skill();

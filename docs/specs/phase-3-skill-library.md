@@ -489,18 +489,17 @@ report tied to the full artifact ID.
 
 ---
 
-## Accepted amendments (2026-09-05, pending delivery)
+## Accepted amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
-Until the named bead is closed with its tests, the pre-amendment text remains the delivered
-contract.
+Each item becomes part of the delivered contract when its named bead closes with regression tests.
 
-1. **Backend-aware dense retrieval** (mini-agent-bfsg). The `Deterministic` embedding backend
-   carries no semantic meaning. When it is the active backend, dense retrieval is disabled
+1. **Backend-aware dense retrieval** (mini-agent-bfsg, delivered). The `Deterministic` embedding
+   backend carries no semantic meaning. When it is the active backend, dense retrieval is disabled
    (lexical channel only) for both learned-JS and Agent-Skill indexes, and startup reports that
    semantic retrieval is unavailable. Score floors are per backend; a floor that admits random
    vectors is a defect.
-2. **Lexical query semantics** (mini-agent-io7h). The FTS5 query is an OR over stop-worded,
+2. **Lexical query semantics** (mini-agent-io7h, delivered). The FTS5 query is an OR over stop-worded,
    IDF-weighted prompt terms ranked by BM25 (or NEAR groups), never an AND over every term. The
    benchmark gains a natural-language prompt case that must match through the lexical channel.
 3. **Skill context delivery** (mini-agent-rd89). The trusted skill context is delivered as a

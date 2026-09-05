@@ -287,6 +287,26 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
     let snapshot_build_duration = exact_build_duration + ann_build_duration;
     assert_eq!(index.len(), corpus_size);
 
+    let natural_language_policy = RetrievalPolicy {
+        dense_candidate_limit: 0,
+        ..RetrievalPolicy::default()
+    };
+    let mut lexical_probe = vec![0.0; model.dimensions];
+    lexical_probe[0] = 1.0;
+    let natural_language_result = index
+        .search(
+            "please parse this JSON document and return its keys",
+            &lexical_probe,
+            &natural_language_policy,
+        )
+        .unwrap();
+    assert!(
+        natural_language_result
+            .first()
+            .is_some_and(|skill| skill.artifact.exports[0].name.starts_with("parseJson_")),
+        "natural-language prompts must retrieve through the lexical channel"
+    );
+
     embedder.clear_cache().await;
     let retrieval_query = "parseJson_000000";
     let cold_started = Instant::now();

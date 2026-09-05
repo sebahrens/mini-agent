@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hnsw_rs::prelude::{DistDot, Hnsw};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::SkillArtifact;
 use super::embed::ModelMetadata;
@@ -15,6 +15,12 @@ use super::store::{SkillRecordMetadata, StoredEmbedding};
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_QUERY_TERMS: usize = 64;
+const MAX_FTS_QUERY_TERMS: usize = 16;
+const LEXICAL_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from", "get", "give",
+    "how", "i", "in", "into", "is", "it", "me", "my", "of", "on", "or", "please", "print", "show",
+    "that", "the", "this", "to", "use", "want", "with", "you",
+];
 #[cfg(not(test))]
 const ANN_MIN_ROWS: usize = 10_000;
 // Keep the normal CI smoke small while exercising the same HNSW construction/search path.
@@ -451,15 +457,15 @@ impl ImmutableSkillIndex {
         query: &str,
         policy: &RetrievalPolicy,
     ) -> Result<Vec<(usize, f32)>, SkillIndexError> {
-        let Some(fts_query) = fts_query(query) else {
-            return Ok(Vec::new());
-        };
         let Some(lexical) = &self.lexical else {
             return Ok(Vec::new());
         };
         let connection = lexical
             .lock()
             .map_err(|_| SkillIndexError::LexicalPoisoned)?;
+        let Some(fts_query) = fts_query(&connection, query)? else {
+            return Ok(Vec::new());
+        };
         let mut statement = connection.prepare_cached(
             "SELECT id, rank
              FROM snapshot_search
@@ -479,7 +485,7 @@ impl ImmutableSkillIndex {
             if self.hidden.contains(&index) {
                 continue;
             }
-            let score = (1.0 / (1.0 + bm25.max(0.0))) as f32;
+            let score = (-bm25).max(0.0) as f32;
             if score >= policy.lexical_score_floor {
                 candidates.push((index, score));
             }
@@ -591,7 +597,8 @@ fn build_lexical_snapshot(
             tags,
             exports,
             tokenize = 'unicode61'
-        );",
+        );
+        CREATE VIRTUAL TABLE snapshot_vocab USING fts5vocab(snapshot_search, 'row');",
     )?;
     {
         let transaction = connection.transaction()?;
@@ -731,14 +738,72 @@ fn manifest_size(artifact: &SkillArtifact) -> usize {
         + 128
 }
 
-fn fts_query(query: &str) -> Option<String> {
-    let mut terms = query
-        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .filter(|term| !term.is_empty())
+pub(crate) fn lexical_tokens(text: &str) -> Vec<String> {
+    text.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty() && !LEXICAL_STOP_WORDS.contains(&term.as_str()))
         .take(MAX_QUERY_TERMS)
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+pub(crate) fn lexical_query_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+    for term in query
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty() && !LEXICAL_STOP_WORDS.contains(&term.as_str()))
+    {
+        if seen.insert(term.clone()) {
+            terms.push(term);
+            if terms.len() == MAX_QUERY_TERMS {
+                break;
+            }
+        }
+    }
     terms.sort();
-    terms.dedup();
-    (!terms.is_empty()).then(|| terms.join(" AND "))
+    terms
+}
+
+fn fts_query(connection: &Connection, query: &str) -> Result<Option<String>, rusqlite::Error> {
+    let total_documents =
+        connection.query_row("SELECT count(*) FROM snapshot_search", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    if total_documents == 0 {
+        return Ok(None);
+    }
+
+    let mut statement =
+        connection.prepare_cached("SELECT doc FROM snapshot_vocab WHERE term = ?1")?;
+    let mut weighted = Vec::new();
+    for term in lexical_query_terms(query) {
+        let document_frequency = statement
+            .query_row(params![term], |row| row.get::<_, i64>(0))
+            .optional()?;
+        let Some(document_frequency) = document_frequency else {
+            continue;
+        };
+        if document_frequency == 0 {
+            continue;
+        }
+        let numerator = total_documents.saturating_sub(document_frequency) as f64 + 0.5;
+        let denominator = document_frequency as f64 + 0.5;
+        let idf = (1.0 + numerator / denominator).ln();
+        weighted.push((term, idf));
+    }
+    weighted.sort_by(|(left_term, left_idf), (right_term, right_idf)| {
+        right_idf
+            .total_cmp(left_idf)
+            .then_with(|| left_term.cmp(right_term))
+    });
+    weighted.truncate(MAX_FTS_QUERY_TERMS);
+    weighted.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok((!weighted.is_empty()).then(|| {
+        weighted
+            .into_iter()
+            .map(|(term, _)| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }))
 }

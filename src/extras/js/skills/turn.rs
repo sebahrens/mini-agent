@@ -137,6 +137,11 @@ impl SkillRuntime {
     ) -> Result<Self, super::embed::EmbeddingError> {
         let embedder = Arc::new(Embedder::from_config(embedding_config)?);
         let mut diagnostics = Vec::new();
+        let semantic_retrieval_enabled = embedder.supports_semantic_retrieval();
+        if !semantic_retrieval_enabled {
+            diagnostics
+                .push("semantic_retrieval_unavailable:deterministic_embedding_backend".to_string());
+        }
         let learned = if learned_js_enabled {
             match shared_coordinator(paths, Arc::clone(&embedder)) {
                 Ok((coordinator, _created)) => Some(coordinator),
@@ -158,13 +163,17 @@ impl SkillRuntime {
             }
         };
         let revision = embedder.model_metadata().model_revision.clone();
+        let mut learned_policy = RetrievalPolicy::default();
+        if !semantic_retrieval_enabled {
+            learned_policy.dense_candidate_limit = 0;
+        }
         Ok(Self {
             embedder,
             learned,
             agent_skills,
             startup_diagnostics: diagnostics,
             turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
-            learned_policy: RetrievalPolicy::default(),
+            learned_policy,
             agent_policy: AgentSkillSearchPolicy::default(),
         })
     }
@@ -300,9 +309,16 @@ impl SkillRuntime {
             agent_skill_generation = index.generation();
             let index = Arc::clone(index);
             let vector = vector.clone();
+            let query = query.clone();
             let policy = self.agent_policy.clone();
+            let semantic_retrieval_enabled = self.embedder.supports_semantic_retrieval();
             match crate::agent::runner::spawn_blocking_scoped(move || {
-                index.search(&vector, &policy).map(|skills| {
+                let search = if semantic_retrieval_enabled {
+                    index.search(&vector, &policy)
+                } else {
+                    index.search_lexical(&query, &policy)
+                };
+                search.map(|skills| {
                     let mut remaining = MAX_AGENT_RESOURCE_CONTEXT_BYTES;
                     skills
                         .into_iter()
