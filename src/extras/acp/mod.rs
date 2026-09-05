@@ -136,6 +136,7 @@ struct TurnControl {
     state: AtomicU8,
     cancelled: Notify,
     runner_cancel: StdMutex<Option<crate::agent::runner::AgentWorkCancellation>>,
+    sandbox: StdMutex<Option<crate::sandbox::Sandbox>>,
 }
 
 impl TurnControl {
@@ -144,6 +145,7 @@ impl TurnControl {
             state: AtomicU8::new(TURN_ACTIVE),
             cancelled: Notify::new(),
             runner_cancel: StdMutex::new(None),
+            sandbox: StdMutex::new(None),
         }
     }
 
@@ -163,7 +165,21 @@ impl TurnControl {
         if let Some(cancel) = lock_unpoisoned(&self.runner_cancel).as_ref() {
             cancel.cancel();
         }
+        if let Some(sandbox) = lock_unpoisoned(&self.sandbox).as_ref() {
+            sandbox.kill_active();
+        }
         self.cancelled.notify_waiters();
+        true
+    }
+
+    fn attach_sandbox(&self, sandbox: crate::sandbox::Sandbox) -> bool {
+        let mut slot = lock_unpoisoned(&self.sandbox);
+        if self.state.load(Ordering::Acquire) != TURN_ACTIVE {
+            drop(slot);
+            sandbox.kill_active();
+            return false;
+        }
+        *slot = Some(sandbox);
         true
     }
 
@@ -877,6 +893,8 @@ async fn handle_prompt(
         control,
         registration,
     } = snapshot;
+
+    control.attach_sandbox(sandbox.clone());
 
     let request_cancellation = responder.cancellation();
     if request_cancellation.is_cancelled() {
@@ -3092,6 +3110,36 @@ mod protocol_tests {
         assert!(cancellation.is_cancelled());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_cancellation_stops_session_background_jobs() {
+        let sandbox = Sandbox::new(false, "bwrap");
+        let id = sandbox
+            .start_background_command(
+                "while :; do sleep 1; done".to_string(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let control = TurnControl::new();
+        assert!(control.attach_sandbox(sandbox.clone()));
+        assert!(control.cancel());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = sandbox.background_job_snapshot(&id).unwrap();
+                if snapshot.status.as_str() == "cancelled" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ACP cancellation must settle every session background job");
+        assert_eq!(sandbox.running_background_job_count(), 0);
+        assert_eq!(sandbox.active_group_count(), 0);
+    }
+
     #[tokio::test]
     async fn dropping_registered_generation_aborts_work_without_removing_the_next_turn() {
         let first = Arc::new(TurnControl::new());
@@ -3657,10 +3705,12 @@ mod workspace_tests {
             first_bash.call(BashArgs {
                 command: "pwd; cat sentinel.txt".into(),
                 timeout: None,
+                background: false,
             }),
             second_bash.call(BashArgs {
                 command: "pwd; cat sentinel.txt".into(),
                 timeout: None,
+                background: false,
             })
         );
         let first_pwd = first_pwd.unwrap();
@@ -3796,6 +3846,7 @@ mod workspace_tests {
             bash.call(BashArgs {
                 command: "cat sentinel.txt".into(),
                 timeout: None,
+                background: false,
             })
             .await
             .is_err()

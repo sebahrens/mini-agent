@@ -37,6 +37,7 @@ pub struct StatusContext<'a> {
     pub prompt_name: Option<&'a str>,
     pub perm_mode: Option<&'a str>,
     pub chain_label: Option<&'a str>,
+    pub background_jobs: usize,
     pub btw_cost: f64,
     pub btw_in: u64,
     pub btw_out: u64,
@@ -118,6 +119,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     ctx.prompt_name.hash(&mut state);
     ctx.perm_mode.hash(&mut state);
     ctx.chain_label.hash(&mut state);
+    ctx.background_jobs.hash(&mut state);
     ctx.btw_cost.to_bits().hash(&mut state);
     ctx.btw_in.hash(&mut state);
     ctx.btw_out.hash(&mut state);
@@ -335,6 +337,9 @@ fn resolve_item(
             .map(|m| format!("mode:{m}")),
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
         "chain" => ctx.chain_label.map(|s| s.to_string()),
+        "background_jobs" => {
+            (ctx.background_jobs > 0 || always).then(|| format!("jobs:{}", ctx.background_jobs))
+        }
         "compaction" => {
             (!session.compactions.is_empty()).then(|| format!("cmp:{}", session.compactions.len()))
         }
@@ -609,6 +614,8 @@ pub fn default_spec() -> StatusLineConfig {
         seg("loop", Some("dark_grey")),
         sep(" "),
         seg("mode", Some("dark_grey")),
+        sep(" "),
+        seg("background_jobs", Some("dark_grey")),
         sep(" "),
         seg("cost", Some("dark_grey")),
         sep(" "),

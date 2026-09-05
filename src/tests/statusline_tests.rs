@@ -9,6 +9,7 @@ fn ctx() -> StatusContext<'static> {
         prompt_name: None,
         perm_mode: None,
         chain_label: None,
+        background_jobs: 0,
         btw_cost: 0.0,
         btw_in: 0,
         btw_out: 0,
@@ -40,6 +41,30 @@ fn default_statusline_shows_core_items() {
     let text = line_text(&lines[0]);
     assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
     assert!(text.contains("/1.0M"), "{text}"); // context max
+}
+
+#[test]
+fn background_job_count_is_visible_and_cache_bound() {
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("background_jobs")],
+        }],
+    };
+    let session = Session::new("openrouter", "m", 1000, "");
+    let empty = ctx();
+    assert!(statusline::build_lines(&spec, &session, &empty)[0].is_empty());
+    let empty_key = statusline::cache_key(&session, &empty);
+    let mut running = ctx();
+    running.background_jobs = 2;
+    assert_eq!(
+        line_text(&statusline::build_lines(&spec, &session, &running)[0]),
+        "jobs:2"
+    );
+    assert!(
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &running)[0])
+            .contains("jobs:2")
+    );
+    assert_ne!(empty_key, statusline::cache_key(&session, &running));
 }
 
 #[test]

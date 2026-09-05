@@ -791,6 +791,12 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/sandbox.rs",
+        "std::mem::drop(runtime.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/agent/runner.rs",
         "std::mem::drop(self.runtime.spawn(async move {",
         1,
@@ -2729,6 +2735,12 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/sandbox.rs",
+        "std::mem::drop(runtime.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/sandbox/worker/macos.rs",
         "let output = std::process::Command::new(SW_VERS)",

@@ -159,6 +159,7 @@ pub(crate) fn refresh_display(
         prompt_name: ui.context.current_prompt_name.as_deref(),
         perm_mode: perm_mode.as_deref(),
         chain_label: chain.label_msg.as_deref(),
+        background_jobs: ui.sandbox.running_background_job_count(),
         btw_cost: btw.cost,
         btw_in: btw.input,
         btw_out: btw.output,

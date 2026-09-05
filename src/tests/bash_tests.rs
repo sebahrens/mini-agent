@@ -53,23 +53,27 @@ async fn bash_compound_command_permission_denies_before_starting_any_child() {
     ];
 
     for command in cases {
-        let _ = std::fs::remove_file(&marker);
-        let tool = bash_tool_with_rules([("*".to_string(), Action::Allow)]);
-        let result = tool
-            .call(BashArgs {
-                command: command.clone(),
-                timeout: None,
-            })
-            .await;
+        for background in [false, true] {
+            let _ = std::fs::remove_file(&marker);
+            let tool = bash_tool_with_rules([("*".to_string(), Action::Allow)]);
+            let result = tool
+                .call(BashArgs {
+                    command: command.clone(),
+                    timeout: None,
+                    background,
+                })
+                .await;
 
-        assert!(
-            result.is_err(),
-            "compound script must not be authorized by a broad allow rule: {command:?}"
-        );
-        assert!(
-            !marker.exists(),
-            "permission denial must happen before any child creates the sentinel: {command:?}"
-        );
+            assert!(
+                result.is_err(),
+                "compound script must not be authorized by a broad allow rule: {command:?}"
+            );
+            assert_eq!(tool.sandbox.running_background_job_count(), 0);
+            assert!(
+                !marker.exists(),
+                "permission denial must happen before any child creates the sentinel: {command:?}"
+            );
+        }
     }
 }
 
@@ -80,6 +84,7 @@ async fn bash_compound_command_permission_rejects_malformed_script_before_launch
         .call(BashArgs {
             command: "echo $(".to_string(),
             timeout: None,
+            background: false,
         })
         .await;
 
@@ -94,6 +99,7 @@ async fn bash_compound_command_permission_allows_exact_complete_script() {
         .call(BashArgs {
             command: command.to_string(),
             timeout: None,
+            background: false,
         })
         .await
         .unwrap();
@@ -133,6 +139,7 @@ async fn bash_success_output_is_bounded_to_head_and_tail_with_omitted_marker() {
         .call(BashArgs {
             command: "seq 1 100".to_string(),
             timeout: None,
+            background: false,
         })
         .await
         .unwrap();
@@ -162,6 +169,7 @@ async fn bash_output_within_line_cap_is_returned_verbatim() {
         .call(BashArgs {
             command: "seq 1 5".to_string(),
             timeout: None,
+            background: false,
         })
         .await
         .unwrap();
@@ -177,6 +185,7 @@ async fn bash_resource_limit_error_bounds_partial_output_to_line_cap() {
         .call(BashArgs {
             command: "yes | head -n 2000000".to_string(),
             timeout: None,
+            background: false,
         })
         .await
         .expect_err("output limit must surface as a tool error");
@@ -204,6 +213,7 @@ async fn bash_without_line_cap_returns_all_lines() {
         .call(BashArgs {
             command: "seq 1 100".to_string(),
             timeout: None,
+            background: false,
         })
         .await
         .unwrap();

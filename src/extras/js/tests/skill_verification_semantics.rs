@@ -560,7 +560,7 @@ mod tests {
         let interrupted = match &result {
             Err(VerificationError::SourceEvaluationFailed(_)) => true,
             #[cfg(target_os = "linux")]
-            Err(VerificationError::RuntimeCreationFailed(message)) => {
+            Err(VerificationError::InfrastructureUnavailable(message)) => {
                 message == "worker unavailable"
             }
             _ => false,

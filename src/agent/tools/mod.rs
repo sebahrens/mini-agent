@@ -186,6 +186,7 @@ pub(crate) fn combine_coaching(first: Option<String>, second: Option<String>) ->
 
 #[cfg(test)]
 pub use bash::BashTool;
+pub use bash::JobStatusTool;
 pub use bash::ShellTool;
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
@@ -268,6 +269,23 @@ pub(crate) struct EditOp {
 pub struct BashArgs {
     pub command: String,
     pub timeout: Option<u64>,
+    #[serde(default)]
+    pub background: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    #[default]
+    Poll,
+    Stop,
+}
+
+#[derive(Deserialize)]
+pub struct JobStatusArgs {
+    pub id: String,
+    #[serde(default)]
+    pub action: JobAction,
 }
 
 #[derive(Deserialize)]

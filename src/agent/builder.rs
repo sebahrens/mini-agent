@@ -43,6 +43,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "list_dir"
             | "todo_write"
             | "shell"
+            | "job_status"
             | "bash"
             | "git"
             | "js"
@@ -295,6 +296,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     names.push("git");
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
         names.push("shell");
+        names.push("job_status");
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
@@ -315,7 +317,13 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     if cli.tool_is_eligible(cfg, "lsp_diagnostics") && cfg.resolve_lsp().is_some() {
         names.push("lsp_diagnostics");
     }
-    names.retain(|name| cli.tool_is_eligible(cfg, name));
+    names.retain(|name| {
+        if *name == "job_status" {
+            cli.tool_is_eligible(cfg, "shell")
+        } else {
+            cli.tool_is_eligible(cfg, name)
+        }
+    });
     names
 }
 
@@ -361,7 +369,11 @@ pub(crate) fn filter_tools_by_allowlist(
     }
     tools
         .into_iter()
-        .filter(|t| allowed.contains(canonical_tool_name(t.name().as_ref())))
+        .filter(|tool| {
+            let name = tool.name();
+            let name = canonical_tool_name(name.as_ref());
+            allowed.contains(name) || (name == "job_status" && allowed.contains("shell"))
+        })
         .collect()
 }
 
@@ -534,6 +546,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             base_tools.push(Box::new(tools::ShellTool::new(
                 permission.clone(),
                 ask_tx.clone(),
+                sandbox.clone(),
+                max_bash_output_lines,
+            )));
+            base_tools.push(Box::new(tools::JobStatusTool::new(
                 sandbox.clone(),
                 max_bash_output_lines,
             )));
@@ -1066,6 +1082,10 @@ mod js_tests {
             .find(|tool| tool.name == "shell")
             .unwrap();
         assert!(shell.description.contains("POSIX shell"));
+        assert!(
+            definitions.iter().any(|tool| tool.name == "job_status"),
+            "a registered shell must include its background-job companion"
+        );
 
         let missing = Sandbox::new(false, "bwrap").with_resolved_shell(None);
         assert!(registered_shell_capability(&cli, &cfg, &missing).is_none());
@@ -1086,7 +1106,7 @@ mod js_tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|tool| tool.name == "shell")
+                .any(|tool| matches!(tool.name.as_str(), "shell" | "job_status"))
         );
 
         let no_tools = crate::cli::Cli {
@@ -1201,6 +1221,7 @@ mod js_tests {
             "list_dir",
             "todo_write",
             "bash",
+            "job_status",
             "js",
             "task",
             "memory_write",

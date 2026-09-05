@@ -201,7 +201,7 @@ The audit currently resolves as follows:
 | `TC-INTERNAL-VERIFICATION` | Fixed embedded-policy Bash constructor/status in `src/extras/loop/mod.rs`; fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |
 | `TC-LIFECYCLE-HELPER` | Shared bounded captured-process terminal and in-process Unix process-group signalling in `src/sandbox.rs`. Caller trust remains the caller's class; this helper grants no authority itself. |
 | `TEST-ONLY` | Inline Bash-tool and loop-validation process-existence helpers, plus the unconfined protocol-pipe worker fixture in `src/sandbox/worker.rs`. |
-| `NON-PROCESS` | Lexical exclusions in ACP, export/HTTP, JS runtime/skill/supervisor stderr-drain, verification-dispatch, idle-retirement, fake verification, source comments, and assertions that legacy loop callers contain no raw Tokio process constructor. |
+| `NON-PROCESS` | Lexical exclusions in ACP, export/HTTP, JS runtime/skill/supervisor stderr-drain, verification-dispatch, idle-retirement, the session-owned sandbox background-task dispatch, fake verification, source comments, and assertions that legacy loop callers contain no raw Tokio process constructor. |
 
 ## Review and change rules
 

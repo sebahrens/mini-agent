@@ -919,7 +919,7 @@ Each segment has:
 | `left`  | Powerline cap glyph drawn before the item. A name (see below) or any literal string. Optional. |
 | `right` | Powerline cap glyph drawn after the item. Optional. |
 | `icon`  | Glyph shown before the value. `true` uses the item's built-in icon; a string sets a custom one (a named icon or a literal glyph). Optional. Needs a Nerd Font. |
-| `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
+| `always` | Force a numeric item (`tokens_input`, `tokens_output`, `cost`, `background_jobs`) to show even when its value is `0` (normally hidden until non-zero). Optional. |
 
 Items with a built-in icon (used by `icon = true`): `git_branch`, `git_changes`,
 `git_status`, `cwd`, `model`, `cost`, `context_used`/`context_max`/
@@ -976,6 +976,7 @@ Available items:
 | `mode`                | Security mode when not `standard` (`mode:<name>`). |
 | `loop`                | Active loop label. |
 | `chain`               | Chain-of-prompts label. |
+| `background_jobs`     | Running background shell jobs (`jobs:<n>`; hidden at zero). |
 | `compaction`          | Number of compactions (`cmp:<n>`). |
 | `btw`                 | `/btw` side-question token/cost usage. |
 | `reasoning`           | Shows `reasoning` when reasoning is enabled (hidden when off). |
@@ -1093,6 +1094,14 @@ output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
 both pipes are drained concurrently. Timeout, cancellation, or any output cap
 kills and reaps the command's process group and returns an explicit non-success
 status, with any retained prefix labelled as partial.
+
+Set the shell tool's `background` argument to `true` for builds, test suites,
+or servers that must outlive one tool call. The call returns a session-scoped
+job id; `job_status` polls its state and rolling output or stops it with
+`action = "stop"`. Background commands have a 24-hour maximum, accept a lower
+`timeout`, keep 64 KiB of head/tail output per stream, allow eight concurrent
+jobs, and retain the newest 32 job records. Cancellation and session shutdown
+kill and reap every owned background process tree.
 
 For a completed command, stdout and stderr preserve byte order within their own
 streams. They are decoded independently using UTF-8 replacement, then rendered

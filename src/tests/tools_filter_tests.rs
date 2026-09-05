@@ -67,8 +67,8 @@ fn allowlist_with_no_matches_returns_empty() {
 
 #[test]
 fn single_tool_allowlist() {
-    let tools = make_tools(&["read", "write", "bash"]);
+    let tools = make_tools(&["read", "write", "bash", "job_status"]);
     let allowlist = vec!["bash".to_string()];
     let filtered = filter_tools_by_allowlist(tools, &allowlist);
-    assert_eq!(tool_names(&filtered), vec!["bash"]);
+    assert_eq!(tool_names(&filtered), vec!["bash", "job_status"]);
 }

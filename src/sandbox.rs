@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(all(windows, any(feature = "mcp", feature = "lsp")))]
 use process_wrap::tokio::JobObject;
@@ -12,7 +13,7 @@ use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::process_creation::TokioCommandCreationExt;
 
@@ -50,6 +51,7 @@ pub struct Sandbox {
     windows_appcontainer_write_roots: Vec<PathBuf>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
     cancelled_groups: Arc<Mutex<HashSet<u32>>>,
+    background_jobs: Arc<BackgroundJobsInner>,
     /// Lazily captured environment snapshot shared by all clones.
     cached_essential_env: EssentialEnvironmentCache,
     /// Canonicalized cache directory computed once per instance.
@@ -183,7 +185,7 @@ impl ShellCapability {
 
     pub(crate) fn model_guidance(&self) -> String {
         format!(
-            "\n- **shell**: Run {} commands (timeout in ms). The legacy `bash` name is accepted only as a compatibility alias.",
+            "\n- **shell**: Run {} commands (timeout in ms). Use `background: true` for long builds, tests, or servers, then poll or stop the returned id with **job_status**. The legacy `bash` name is accepted only as a compatibility alias.",
             self.dialect.name()
         )
     }
@@ -342,6 +344,94 @@ pub(crate) struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: CommandStatus,
+}
+
+const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
+const MAX_RETAINED_BACKGROUND_JOBS: usize = 32;
+const BACKGROUND_STREAM_BYTES: usize = 64 * 1024;
+pub(crate) const DEFAULT_BACKGROUND_COMMAND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundJobStatus {
+    Running,
+    Stopping,
+    Completed,
+    TimedOut,
+    Cancelled,
+    OutputLimitExceeded,
+    Failed,
+}
+
+impl BackgroundJobStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::OutputLimitExceeded => "output_limit_exceeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running | Self::Stopping)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundJobSnapshot {
+    pub id: String,
+    pub command: String,
+    pub status: BackgroundJobStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundJobTerminal {
+    status: BackgroundJobStatus,
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct BackgroundJobRecord {
+    sequence: u64,
+    command: String,
+    cancellation: CommandCancellation,
+    capture: Option<SharedCommandCapture>,
+    terminal: Option<BackgroundJobTerminal>,
+    stop_requested: bool,
+    changed: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundJobsInner {
+    next_sequence: AtomicU64,
+    jobs: Mutex<HashMap<String, BackgroundJobRecord>>,
+}
+
+struct OutputCommandOptions {
+    cancellation: Option<watch::Receiver<bool>>,
+    audit: Option<OwnedExplicitShellAudit>,
+    input: Option<Vec<u8>>,
+    capture: Option<SharedCommandCapture>,
+}
+
+impl Drop for BackgroundJobsInner {
+    fn drop(&mut self) {
+        let jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+        for job in jobs.values() {
+            if job.terminal.is_none() {
+                job.cancellation.cancel();
+            }
+        }
+    }
 }
 
 /// Cancellation signal for one captured subprocess operation.
@@ -957,6 +1047,7 @@ impl Sandbox {
             windows_appcontainer_write_roots: Vec::new(),
             active_groups: Arc::new(Mutex::new(HashSet::new())),
             cancelled_groups: Arc::new(Mutex::new(HashSet::new())),
+            background_jobs: Arc::new(BackgroundJobsInner::default()),
             cached_essential_env: Arc::new(OnceLock::new()),
             cached_cache_dir: Arc::new(Mutex::new(None)),
             cached_seatbelt_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -2098,6 +2189,191 @@ impl Sandbox {
         self.output_built_command_with_limits(cmd, limits).await
     }
 
+    pub(crate) async fn start_background_command(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            std::io::Error::other("background commands require an active Tokio runtime")
+        })?;
+        let sequence = self
+            .background_jobs
+            .next_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        let id = format!("job-{}", uuid::Uuid::new_v4());
+        let cancellation = CommandCancellation::new();
+        let capture = SharedCommandCapture::rolling();
+        let changed = Arc::new(Notify::new());
+        {
+            let mut jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            prune_background_jobs(&mut jobs);
+            if jobs.values().filter(|job| job.terminal.is_none()).count()
+                >= MAX_CONCURRENT_BACKGROUND_JOBS
+            {
+                return Err(std::io::Error::other(
+                    "background job capacity is full (maximum 8 running jobs)",
+                ));
+            }
+            jobs.insert(
+                id.clone(),
+                BackgroundJobRecord {
+                    sequence,
+                    command: summarize_background_command(&command),
+                    cancellation: cancellation.clone(),
+                    capture: Some(capture.clone()),
+                    terminal: None,
+                    stop_requested: false,
+                    changed,
+                },
+            );
+        }
+
+        let owner = Arc::downgrade(&self.background_jobs);
+        let sandbox = self.detached_background_sandbox();
+        let task_id = id.clone();
+        std::mem::drop(runtime.spawn(async move {
+            let terminal = match sandbox
+                .run_background_command(command, timeout, &cancellation, capture)
+                .await
+            {
+                Ok(output) => background_terminal(output),
+                Err(error) => BackgroundJobTerminal {
+                    status: BackgroundJobStatus::Failed,
+                    exit_code: None,
+                    stdout: Vec::new(),
+                    stderr: format!("background command failed: {error}").into_bytes(),
+                },
+            };
+            finish_background_job(&owner, &task_id, terminal);
+        }));
+        Ok(id)
+    }
+
+    pub(crate) fn background_job_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        validate_background_job_id(id)?;
+        let jobs = self
+            .background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let job = jobs
+            .get(id)
+            .ok_or_else(|| format!("background job not found: {id}"))?;
+        Ok(snapshot_background_job(id, job))
+    }
+
+    pub(crate) async fn stop_background_job(
+        &self,
+        id: &str,
+    ) -> Result<BackgroundJobSnapshot, String> {
+        validate_background_job_id(id)?;
+        let changed = {
+            let mut jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let job = jobs
+                .get_mut(id)
+                .ok_or_else(|| format!("background job not found: {id}"))?;
+            if job.terminal.is_some() {
+                return Ok(snapshot_background_job(id, job));
+            }
+            job.stop_requested = true;
+            job.cancellation.cancel();
+            job.changed.clone()
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let snapshot = self.background_job_snapshot(id)?;
+            if snapshot.status.is_terminal() {
+                return Ok(snapshot);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.background_job_snapshot(id);
+            }
+        }
+    }
+
+    pub(crate) fn running_background_job_count(&self) -> usize {
+        self.background_jobs
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|job| job.terminal.is_none())
+            .count()
+    }
+
+    fn detached_background_sandbox(&self) -> Self {
+        let mut sandbox = self.clone();
+        sandbox.background_jobs = Arc::new(BackgroundJobsInner::default());
+        sandbox
+    }
+
+    async fn run_background_command(
+        &self,
+        command: String,
+        timeout: std::time::Duration,
+        cancellation: &CommandCancellation,
+        capture: SharedCommandCapture,
+    ) -> std::io::Result<CommandOutput> {
+        if cancellation.is_cancelled() {
+            return Ok(CommandOutput {
+                exit_status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                status: CommandStatus::Cancelled,
+            });
+        }
+        let cmd = match self.wrap_command(&command) {
+            Ok(command) => command,
+            Err(error) => {
+                return Ok(CommandOutput {
+                    exit_status: None,
+                    stdout: Vec::new(),
+                    stderr: error.into_bytes(),
+                    status: CommandStatus::Failed,
+                });
+            }
+        };
+        let limits = CommandLimits {
+            timeout,
+            stdout_bytes: BACKGROUND_STREAM_BYTES,
+            stderr_bytes: BACKGROUND_STREAM_BYTES,
+            combined_bytes: BACKGROUND_STREAM_BYTES * 2,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        self.run_built_output_command(
+            cmd,
+            limits,
+            OutputCommandOptions {
+                cancellation: Some(cancellation.subscribe()),
+                audit: None,
+                input: None,
+                capture: Some(capture),
+            },
+            response_tx,
+        )
+        .await;
+        response_rx.await.map_err(|_| {
+            std::io::Error::other("background command worker stopped before returning a result")
+        })
+    }
+
     pub(crate) async fn output_command_with_limits_cancelled(
         &self,
         command: &str,
@@ -2214,7 +2490,17 @@ impl Sandbox {
         let sandbox = self.clone();
         std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
             sandbox
-                .run_built_output_command(cmd, limits, cancellation, audit, input, response_tx)
+                .run_built_output_command(
+                    cmd,
+                    limits,
+                    OutputCommandOptions {
+                        cancellation,
+                        audit,
+                        input,
+                        capture: None,
+                    },
+                    response_tx,
+                )
                 .await;
         }));
         response_rx.await.map_err(|_| {
@@ -2226,11 +2512,15 @@ impl Sandbox {
         &self,
         mut cmd: Command,
         limits: CommandLimits,
-        mut cancellation: Option<watch::Receiver<bool>>,
-        audit: Option<OwnedExplicitShellAudit>,
-        input: Option<Vec<u8>>,
+        options: OutputCommandOptions,
         mut response_tx: oneshot::Sender<CommandOutput>,
     ) {
+        let OutputCommandOptions {
+            mut cancellation,
+            audit,
+            input,
+            capture,
+        } = options;
         if cancellation
             .as_ref()
             .is_some_and(|receiver| *receiver.borrow())
@@ -2279,7 +2569,7 @@ impl Sandbox {
             ProcessGroupGuard::new(child.id(), self.active_groups.clone()),
             audit,
         );
-        let captured = Arc::new(Mutex::new(CapturedCommandOutput::default()));
+        let captured = capture.unwrap_or_else(SharedCommandCapture::bounded);
         let (reader_error_tx, mut reader_error_rx) = mpsc::unbounded_channel();
         let stdout_handle = spawn_bounded_pipe_reader(
             child.stdout.take(),
@@ -2377,14 +2667,13 @@ impl Sandbox {
         }
         self.take_cancelled(pid);
 
-        let mut captured = captured.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdout, stderr) = captured.finish();
         let output = CommandOutput {
             exit_status,
-            stdout: std::mem::take(&mut captured.stdout),
-            stderr: std::mem::take(&mut captured.stderr),
+            stdout,
+            stderr,
             status: command_status,
         };
-        drop(captured);
         lifecycle.finish(&output);
         let _ = response_tx.send(output);
     }
@@ -2479,6 +2768,20 @@ impl Sandbox {
     }
 
     pub fn kill_active(&self) {
+        // Cancel registered jobs before examining process groups. A job may
+        // have been inserted but not spawned yet; its command worker observes
+        // this token both before wrapping and immediately before spawning.
+        {
+            let mut jobs = self
+                .background_jobs
+                .jobs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for job in jobs.values_mut().filter(|job| job.terminal.is_none()) {
+                job.stop_requested = true;
+                job.cancellation.cancel();
+            }
+        }
         let groups: Vec<u32> = self
             .active_groups
             .lock()
@@ -2602,11 +2905,231 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
     }
 }
 
-#[derive(Default)]
+fn summarize_background_command(command: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut summary = command
+        .chars()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if command.chars().count() > MAX_CHARS {
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn validate_background_job_id(id: &str) -> Result<(), String> {
+    let valid = id
+        .strip_prefix("job-")
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
+    if valid {
+        Ok(())
+    } else {
+        Err("invalid background job id".to_string())
+    }
+}
+
+fn prune_background_jobs(jobs: &mut HashMap<String, BackgroundJobRecord>) {
+    while jobs.len() >= MAX_RETAINED_BACKGROUND_JOBS {
+        let Some(id) = jobs
+            .iter()
+            .filter(|(_, job)| job.terminal.is_some())
+            .min_by_key(|(_, job)| job.sequence)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        jobs.remove(&id);
+    }
+}
+
+fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
+    let status = match output.status {
+        CommandStatus::Completed => BackgroundJobStatus::Completed,
+        CommandStatus::TimedOut => BackgroundJobStatus::TimedOut,
+        CommandStatus::Cancelled => BackgroundJobStatus::Cancelled,
+        CommandStatus::OutputLimitExceeded(_) => BackgroundJobStatus::OutputLimitExceeded,
+        CommandStatus::Failed => BackgroundJobStatus::Failed,
+    };
+    BackgroundJobTerminal {
+        status,
+        exit_code: output.exit_status.and_then(|status| status.code()),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+fn finish_background_job(
+    owner: &Weak<BackgroundJobsInner>,
+    id: &str,
+    terminal: BackgroundJobTerminal,
+) {
+    let Some(owner) = owner.upgrade() else {
+        return;
+    };
+    let changed = {
+        let mut jobs = owner.jobs.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(job) = jobs.get_mut(id) else {
+            return;
+        };
+        job.capture = None;
+        job.terminal = Some(terminal);
+        job.changed.clone()
+    };
+    changed.notify_waiters();
+}
+
+fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJobSnapshot {
+    if let Some(terminal) = &job.terminal {
+        return BackgroundJobSnapshot {
+            id: id.to_string(),
+            command: job.command.clone(),
+            status: terminal.status,
+            exit_code: terminal.exit_code,
+            stdout: terminal.stdout.clone(),
+            stderr: terminal.stderr.clone(),
+        };
+    }
+    let (stdout, stderr) = job
+        .capture
+        .as_ref()
+        .expect("a nonterminal background job must retain its live capture")
+        .snapshot();
+    BackgroundJobSnapshot {
+        id: id.to_string(),
+        command: job.command.clone(),
+        status: if job.stop_requested {
+            BackgroundJobStatus::Stopping
+        } else {
+            BackgroundJobStatus::Running
+        },
+        exit_code: None,
+        stdout,
+        stderr,
+    }
+}
+
+#[derive(Debug, Default)]
 struct CapturedCommandOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     combined_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct RollingStream {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total_bytes: usize,
+}
+
+impl RollingStream {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        let head_limit = BACKGROUND_STREAM_BYTES * 3 / 4;
+        let tail_limit = BACKGROUND_STREAM_BYTES - head_limit;
+        let head_remaining = head_limit.saturating_sub(self.head.len());
+        let to_head = bytes.len().min(head_remaining);
+        self.head.extend_from_slice(&bytes[..to_head]);
+        self.tail.extend(&bytes[to_head..]);
+        let overflow = self.tail.len().saturating_sub(tail_limit);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+    }
+
+    fn snapshot(&self, stream: &str) -> Vec<u8> {
+        let retained = self.head.len().saturating_add(self.tail.len());
+        let omitted = self.total_bytes.saturating_sub(retained);
+        let mut output = Vec::with_capacity(retained.saturating_add(96));
+        output.extend_from_slice(&self.head);
+        if omitted > 0 {
+            output.extend_from_slice(
+                format!("\n[... {omitted} {stream} bytes omitted ...]\n").as_bytes(),
+            );
+        }
+        output.extend(self.tail.iter().copied());
+        output
+    }
+}
+
+#[derive(Debug, Default)]
+struct RollingCommandOutput {
+    stdout: RollingStream,
+    stderr: RollingStream,
+}
+
+#[derive(Debug)]
+enum CommandCapture {
+    Bounded(CapturedCommandOutput),
+    Rolling(RollingCommandOutput),
+}
+
+#[derive(Clone, Debug)]
+struct SharedCommandCapture(Arc<Mutex<CommandCapture>>);
+
+impl SharedCommandCapture {
+    fn bounded() -> Self {
+        Self(Arc::new(Mutex::new(CommandCapture::Bounded(
+            CapturedCommandOutput::default(),
+        ))))
+    }
+
+    fn rolling() -> Self {
+        Self(Arc::new(Mutex::new(CommandCapture::Rolling(
+            RollingCommandOutput::default(),
+        ))))
+    }
+
+    fn push(
+        &self,
+        stream: CommandOutputStream,
+        bytes: &[u8],
+        limits: CommandLimits,
+    ) -> Result<(), CommandOutputLimit> {
+        let mut capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &mut *capture {
+            CommandCapture::Bounded(capture) => capture.push(stream, bytes, limits),
+            CommandCapture::Rolling(capture) => {
+                match stream {
+                    CommandOutputStream::Stdout => capture.stdout.push(bytes),
+                    CommandOutputStream::Stderr => capture.stderr.push(bytes),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
+        let capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &*capture {
+            CommandCapture::Bounded(capture) => (capture.stdout.clone(), capture.stderr.clone()),
+            CommandCapture::Rolling(capture) => (
+                capture.stdout.snapshot("stdout"),
+                capture.stderr.snapshot("stderr"),
+            ),
+        }
+    }
+
+    fn finish(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut capture = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match &mut *capture {
+            CommandCapture::Bounded(capture) => (
+                std::mem::take(&mut capture.stdout),
+                std::mem::take(&mut capture.stderr),
+            ),
+            CommandCapture::Rolling(capture) => (
+                capture.stdout.snapshot("stdout"),
+                capture.stderr.snapshot("stderr"),
+            ),
+        }
+    }
 }
 
 impl CapturedCommandOutput {
@@ -2666,7 +3189,7 @@ enum CommandTermination {
 fn spawn_bounded_pipe_reader<R>(
     pipe: Option<R>,
     stream: CommandOutputStream,
-    captured: Arc<Mutex<CapturedCommandOutput>>,
+    captured: SharedCommandCapture,
     limits: CommandLimits,
     error_tx: mpsc::UnboundedSender<CommandRunError>,
 ) -> tokio::task::JoinHandle<()>
@@ -2687,11 +3210,7 @@ where
                     return;
                 }
             };
-            let result = captured.lock().unwrap_or_else(|e| e.into_inner()).push(
-                stream,
-                &buffer[..read],
-                limits,
-            );
+            let result = captured.push(stream, &buffer[..read], limits);
             if let Err(limit) = result {
                 let _ = error_tx.send(CommandRunError::OutputLimit(limit));
                 return;
@@ -2868,6 +3387,56 @@ mod sandbox_tests {
 
     fn unavailable() -> Sandbox {
         Sandbox::new(true, "__no_such_backend_exists__")
+    }
+
+    fn background_record(sequence: u64, terminal: bool) -> BackgroundJobRecord {
+        BackgroundJobRecord {
+            sequence,
+            command: "fixture".to_string(),
+            cancellation: CommandCancellation::new(),
+            capture: (!terminal).then_some(SharedCommandCapture::rolling()),
+            terminal: terminal.then_some(BackgroundJobTerminal {
+                status: BackgroundJobStatus::Completed,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }),
+            stop_requested: false,
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    #[test]
+    fn background_command_summary_is_single_line_and_character_bounded() {
+        let command = format!("first\nsecond\r{}", "x".repeat(200));
+        let summary = summarize_background_command(&command);
+        assert!(!summary.chars().any(char::is_control));
+        assert_eq!(summary.chars().count(), 163);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn background_retention_prunes_only_the_oldest_terminal_record() {
+        let mut jobs = HashMap::new();
+        for sequence in 0..24 {
+            jobs.insert(
+                format!("terminal-{sequence}"),
+                background_record(sequence, true),
+            );
+        }
+        for sequence in 24..32 {
+            jobs.insert(
+                format!("live-{sequence}"),
+                background_record(sequence, false),
+            );
+        }
+
+        prune_background_jobs(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_RETAINED_BACKGROUND_JOBS - 1);
+        assert!(!jobs.contains_key("terminal-0"));
+        assert!(jobs.contains_key("terminal-1"));
+        assert!((24..32).all(|sequence| jobs.contains_key(&format!("live-{sequence}"))));
     }
 
     fn shell_fixture(name: &str) -> (PathBuf, PathBuf) {
