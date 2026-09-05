@@ -2203,6 +2203,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_print_with_verification<M>(
     agent: &Agent<M>,
     prompt: &str,
@@ -3630,6 +3631,7 @@ mod tests {
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
+            None,
             None,
             Arc::clone(&work_scope),
         );
