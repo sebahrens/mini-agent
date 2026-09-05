@@ -264,6 +264,9 @@ async fn tool_description_prefers_javascript_for_computation() {
 
     assert!(description.contains("Prefer this tool for computation"));
     assert!(description.contains("instead of invoking Python through a shell"));
+    assert!(description.contains("strict script in a fresh runtime"));
+    assert!(description.contains("top-level `await` supported"));
+    assert!(description.contains("Host globals are synchronous"));
     assert!(description.contains("spawn(program: string, args: string[])"));
 }
 

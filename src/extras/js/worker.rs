@@ -621,6 +621,17 @@ const STRING_GATE_SOURCE: &str = r#"
 })()
 "#;
 
+const ASYNC_COMPLETION_VALUE_SOURCE: &str = r#"
+(() => {
+    const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    return completion => {
+        const descriptor = getOwnPropertyDescriptor(completion, "value");
+        if (!descriptor || !("value" in descriptor)) throw 0;
+        return descriptor.value;
+    };
+})()
+"#;
+
 const MODEL_SCRIPT_NAME: &str = "mini-agent-model.js";
 const EXCEPTION_INSPECTOR_SOURCE: &str = r#"
 (() => {
@@ -844,7 +855,8 @@ fn trusted_bootstrap_source() -> String {
     format!(
         "export const strictClone = {STRICT_CLONE_SOURCE};\n\
          export const stringGate = {STRING_GATE_SOURCE};\n\
-         export const exceptionInspector = {EXCEPTION_INSPECTOR_SOURCE};"
+         export const exceptionInspector = {EXCEPTION_INSPECTOR_SOURCE};\n\
+         export const asyncCompletionValue = {ASYNC_COMPLETION_VALUE_SOURCE};"
     )
 }
 
@@ -871,17 +883,20 @@ fn trusted_bootstrap_bytecode() -> Option<&'static [u8]> {
         .as_deref()
 }
 
+struct TrustedBootstrapFunctions {
+    strict_clone: Persistent<Function<'static>>,
+    string_gate: Persistent<Function<'static>>,
+    exception_inspector: Persistent<Function<'static>>,
+    async_completion_value: Persistent<Function<'static>>,
+}
+
 #[allow(unsafe_code)]
 fn load_trusted_bootstrap_functions(
     context: &Context,
     bytecode: &[u8],
-) -> rquickjs::Result<(
-    Persistent<Function<'static>>,
-    Persistent<Function<'static>>,
-    Persistent<Function<'static>>,
-)> {
+) -> rquickjs::Result<TrustedBootstrapFunctions> {
     context.with(|ctx| {
-        // SAFETY: these bytes are compiled once in this process from the two
+        // SAFETY: these bytes are compiled once in this process from the
         // trusted constants above, with the same linked QuickJS ABI, and are
         // never accepted from disk, IPC, model output, or any other input.
         let module = unsafe { Module::load(ctx.clone(), bytecode)? };
@@ -890,11 +905,13 @@ fn load_trusted_bootstrap_functions(
         let clone = module.get::<_, Function>("strictClone")?;
         let string_gate = module.get::<_, Function>("stringGate")?;
         let exception_inspector = module.get::<_, Function>("exceptionInspector")?;
-        Ok((
-            Persistent::save(&ctx, clone),
-            Persistent::save(&ctx, string_gate),
-            Persistent::save(&ctx, exception_inspector),
-        ))
+        let async_completion_value = module.get::<_, Function>("asyncCompletionValue")?;
+        Ok(TrustedBootstrapFunctions {
+            strict_clone: Persistent::save(&ctx, clone),
+            string_gate: Persistent::save(&ctx, string_gate),
+            exception_inspector: Persistent::save(&ctx, exception_inspector),
+            async_completion_value: Persistent::save(&ctx, async_completion_value),
+        })
     })
 }
 
@@ -928,6 +945,7 @@ mod trusted_bootstrap_bytecode_tests {
             let _: Function = module.get("strictClone")?;
             let _: Function = module.get("stringGate")?;
             let _: Function = module.get("exceptionInspector")?;
+            let _: Function = module.get("asyncCompletionValue")?;
             Ok(())
         })
     }
@@ -958,19 +976,30 @@ mod trusted_bootstrap_bytecode_tests {
             let deadline = Instant::now() + STEP_TIMEOUT;
             runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
             let context = Context::full(&runtime).expect("create fresh context");
-            let (clone, string_gate, exception_inspector) =
+            let functions =
                 load_trusted_bootstrap_functions(&context, &bytecode).expect("load bytecode");
 
             context.with(|ctx| {
-                let clone = clone.clone().restore(&ctx).expect("restore strict clone");
-                let string_gate = string_gate
+                let clone = functions
+                    .strict_clone
+                    .clone()
+                    .restore(&ctx)
+                    .expect("restore strict clone");
+                let string_gate = functions
+                    .string_gate
                     .clone()
                     .restore(&ctx)
                     .expect("restore string gate");
-                let exception_inspector = exception_inspector
+                let exception_inspector = functions
+                    .exception_inspector
                     .clone()
                     .restore(&ctx)
                     .expect("restore exception inspector");
+                let async_completion_value = functions
+                    .async_completion_value
+                    .clone()
+                    .restore(&ctx)
+                    .expect("restore async completion extractor");
                 let value: Object = ctx.eval(format!("({expected})")).expect("create value");
                 let encoded: String = clone.call((value,)).expect("clone value");
                 assert_eq!(encoded, expected);
@@ -979,6 +1008,11 @@ mod trusted_bootstrap_bytecode_tests {
                 let metadata: rquickjs::prelude::List<(u8, bool, u32, u32)> =
                     exception_inspector.call((42,)).expect("inspect primitive");
                 assert_eq!(metadata.0, (5, false, 0, 0));
+                let completion: Object = ctx.eval("({value: 42})").expect("create completion");
+                let completion_value: i32 = async_completion_value
+                    .call((completion,))
+                    .expect("extract completion value");
+                assert_eq!(completion_value, 42);
             });
         }
     }
@@ -2081,17 +2115,20 @@ fn execute_fresh_step(
     let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
         ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
     })?;
-    let (clone, string_gate, exception_inspector) =
-        load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
-            classify_error(
-                &context,
-                error,
-                deadline,
-                &interrupted,
-                DiagnosticStage::Initialization,
-                role,
-            )
-        })?;
+    let functions = load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
+        classify_error(
+            &context,
+            error,
+            deadline,
+            &interrupted,
+            DiagnosticStage::Initialization,
+            role,
+        )
+    })?;
+    let clone = functions.strict_clone;
+    let string_gate = functions.string_gate;
+    let exception_inspector = functions.exception_inspector;
+    let async_completion_value = functions.async_completion_value;
     let exception_diagnostics = ExceptionDiagnostics {
         inspector: &exception_inspector,
         model_source: (role == ScriptRole::Model).then_some(source),
@@ -2161,6 +2198,7 @@ fn execute_fresh_step(
         value,
         clone,
         string_gate,
+        async_completion_value,
         deadline,
         &interrupted,
         role,
@@ -2255,6 +2293,7 @@ fn evaluate(
             };
             let mut options = EvalOptions::default();
             options.filename = Some(filename.to_string());
+            options.promise = role == ScriptRole::Model;
             ctx.eval_with_options::<Value, _>(source, options)
                 .map(|value| Persistent::save(&ctx, value))
         })
@@ -2334,6 +2373,7 @@ fn settle_and_convert(
     value: Persistent<Value<'static>>,
     clone: Persistent<Function<'static>>,
     string_gate: Persistent<Function<'static>>,
+    async_completion_value: Persistent<Function<'static>>,
     deadline: Instant,
     interrupted: &AtomicBool,
     role: ScriptRole,
@@ -2352,54 +2392,86 @@ fn settle_and_convert(
                 Some(exception_diagnostics),
             )
         })?;
-        if let Some(promise) = value.as_promise() {
-            value = match promise.state() {
-                PromiseState::Resolved => promise
-                    .result::<Value>()
-                    .and_then(Result::ok)
-                    .ok_or_else(|| {
+        let mut unwrap_async_completion = role == ScriptRole::Model;
+        loop {
+            if let Some(promise) = value.as_promise() {
+                value = match promise.state() {
+                    PromiseState::Resolved => promise
+                        .result::<Value>()
+                        .and_then(Result::ok)
+                        .ok_or_else(|| {
+                            ClosedFailure::error(
+                                JsErrorCode::Internal,
+                                DiagnosticStage::ResultConversion,
+                                role,
+                            )
+                        })?,
+                    PromiseState::Rejected => {
+                        let rejected = promise.result::<Value>();
+                        if near_heap_limit {
+                            if matches!(rejected, Some(Err(Error::Exception))) {
+                                let _ = ctx.catch();
+                            }
+                            return Err(ClosedFailure::out_of_memory(
+                                DiagnosticStage::Evaluation,
+                                role,
+                            ));
+                        }
+                        let Some(Err(error)) = rejected else {
+                            return Err(ClosedFailure::error(
+                                JsErrorCode::Internal,
+                                DiagnosticStage::Evaluation,
+                                role,
+                            ));
+                        };
+                        return Err(classify_ctx_error(
+                            &ctx,
+                            error,
+                            deadline,
+                            interrupted,
+                            DiagnosticStage::Evaluation,
+                            role,
+                            Some(exception_diagnostics),
+                        ));
+                    }
+                    PromiseState::Pending => {
+                        return Err(ClosedFailure::error(
+                            JsErrorCode::JobLimit,
+                            DiagnosticStage::JobDrain,
+                            role,
+                        ));
+                    }
+                };
+                continue;
+            }
+            if unwrap_async_completion {
+                unwrap_async_completion = false;
+                let extractor = async_completion_value.clone().restore(&ctx).map_err(|_| {
+                    ClosedFailure::error(
+                        JsErrorCode::Internal,
+                        DiagnosticStage::ResultConversion,
+                        role,
+                    )
+                })?;
+                value = extractor.call((value,)).map_err(|error| {
+                    if matches!(error, Error::Exception) {
+                        let _ = ctx.catch();
+                    }
+                    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        ClosedFailure::timeout(DiagnosticStage::ResultConversion, role)
+                    } else if near_heap_limit {
+                        ClosedFailure::out_of_memory(DiagnosticStage::ResultConversion, role)
+                    } else {
                         ClosedFailure::error(
                             JsErrorCode::Internal,
                             DiagnosticStage::ResultConversion,
                             role,
                         )
-                    })?,
-                PromiseState::Rejected => {
-                    let rejected = promise.result::<Value>();
-                    if near_heap_limit {
-                        if matches!(rejected, Some(Err(Error::Exception))) {
-                            let _ = ctx.catch();
-                        }
-                        return Err(ClosedFailure::out_of_memory(
-                            DiagnosticStage::Evaluation,
-                            role,
-                        ));
                     }
-                    let Some(Err(error)) = rejected else {
-                        return Err(ClosedFailure::error(
-                            JsErrorCode::Internal,
-                            DiagnosticStage::Evaluation,
-                            role,
-                        ));
-                    };
-                    return Err(classify_ctx_error(
-                        &ctx,
-                        error,
-                        deadline,
-                        interrupted,
-                        DiagnosticStage::Evaluation,
-                        role,
-                        Some(exception_diagnostics),
-                    ));
-                }
-                PromiseState::Pending => {
-                    return Err(ClosedFailure::error(
-                        JsErrorCode::JobLimit,
-                        DiagnosticStage::JobDrain,
-                        role,
-                    ));
-                }
-            };
+                })?;
+                continue;
+            }
+            break;
         }
         convert_value(
             &ctx,
@@ -2818,8 +2890,8 @@ fn execute_isolated_skill_verification_case(
             transcript: fakes.transcript().bounded_for_wire(),
         };
     };
-    let (_, _, exception_inspector) = match load_trusted_bootstrap_functions(&context, bytecode) {
-        Ok(functions) => functions,
+    let exception_inspector = match load_trusted_bootstrap_functions(&context, bytecode) {
+        Ok(functions) => functions.exception_inspector,
         Err(_) => {
             return VerificationCaseResult {
                 case_id: case.case_id.clone(),
@@ -3306,8 +3378,8 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
     let Some(bytecode) = trusted_bootstrap_bytecode() else {
         return failed_verification(&request, DiagnosticClass::Internal);
     };
-    let (_, _, exception_inspector) = match load_trusted_bootstrap_functions(&context, bytecode) {
-        Ok(functions) => functions,
+    let exception_inspector = match load_trusted_bootstrap_functions(&context, bytecode) {
+        Ok(functions) => functions.exception_inspector,
         Err(_) => return failed_verification(&request, DiagnosticClass::Internal),
     };
     let exception_diagnostics = ExceptionDiagnostics {

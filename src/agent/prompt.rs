@@ -18,7 +18,9 @@ You are an expert coding assistant. Use only the tools made available to you. Re
 pub const JS_TOOL_PROMPT: &str = "\n\n## JavaScript execution\n\
 The **js** tool is the default for computation, parsing, data transformation, control flow, and \
 portable automation. Prefer it over shell-hosted Python. Use Python only when the user requests \
-Python, the task specifically depends on its ecosystem, or JavaScript cannot satisfy the task.";
+Python, the task specifically depends on its ecosystem, or JavaScript cannot satisfy the task. \
+JavaScript runs in strict mode in a fresh runtime on every call and supports top-level `await`; \
+its host globals are synchronous, so awaiting them is optional.";
 
 pub const READ_TOOL_PROMPT: &str = "\n\n## File reads\n\
 - **read** reads file contents. Repeated reads of the same path/offset/limit are blocked until the \
@@ -104,6 +106,8 @@ mod tests {
     fn system_prompt_prefers_javascript_and_limits_python_fallback() {
         assert!(JS_TOOL_PROMPT.contains("default for computation"));
         assert!(JS_TOOL_PROMPT.contains("Use Python only when the user requests"));
+        assert!(JS_TOOL_PROMPT.contains("supports top-level `await`"));
+        assert!(JS_TOOL_PROMPT.contains("strict mode in a fresh runtime"));
         assert!(!SYSTEM_PROMPT.contains("**js**"));
         assert!(!SYSTEM_PROMPT.contains("**read**"));
     }

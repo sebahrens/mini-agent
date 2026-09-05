@@ -801,7 +801,9 @@ impl Tool for JsTool {
         format!(
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
-             Python through a shell. Available global contracts and examples: {} Returns the last expression \
+             Python through a shell. Code runs as a strict script in a fresh runtime for every \
+             call, with top-level `await` supported. Host globals are synchronous, so awaiting \
+             them is optional. Available global contracts and examples: {} Returns the last expression \
              value as a string. A step may issue at most 256 effect calls; the 257th returns a \
              closed effect-limit error while preserving bounded console output. Runtime failures \
              use closed, source-free error classes.{}",

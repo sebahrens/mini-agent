@@ -484,6 +484,55 @@ fn worker_runtime_fresh_steps_cover_values_promises_console_and_absent_authority
 }
 
 #[test]
+fn worker_runtime_model_scripts_support_top_level_await_and_remain_strict() {
+    let results = run_steps(
+        &[
+            "const value = await Promise.resolve(41); value + 1",
+            "const value = await 41; value + 1",
+            "undeclared_model_binding = 1",
+            "await 0; throw new TypeError('TOP_LEVEL_AWAIT_SECRET')",
+            "Object.defineProperty(Object.prototype, 'value', {get(){console.error('COMPLETION_GETTER_RAN'); return 7}, set(_){}}); 42",
+            "40 + 2",
+        ],
+        10_000,
+        10_000,
+    );
+
+    assert_eq!(results[0].outcome, StepOutcome::Value("42".into()));
+    assert_eq!(results[1].outcome, StepOutcome::Value("42".into()));
+    assert_closed_exception(
+        &results[2],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::ReferenceError,
+        Some((1, 1)),
+    );
+    assert_closed_exception(
+        &results[3],
+        JsErrorCode::Exception,
+        DiagnosticClass::Exception,
+        JsExceptionClass::TypeError,
+        Some((1, 19)),
+    );
+    assert!(
+        !serde_json::to_string(&results[3])
+            .unwrap()
+            .contains("TOP_LEVEL_AWAIT_SECRET")
+    );
+    assert_closed_error(
+        &results[4],
+        JsErrorCode::Internal,
+        DiagnosticClass::Internal,
+        DiagnosticStage::ResultConversion,
+    );
+    assert!(
+        results[4].console.is_empty(),
+        "async completion extraction invoked a model getter"
+    );
+    assert_eq!(results[5].outcome, StepOutcome::Value("42".into()));
+}
+
+#[test]
 fn worker_runtime_rejects_module_loading_and_recovers() {
     let results = run_steps(
         &[

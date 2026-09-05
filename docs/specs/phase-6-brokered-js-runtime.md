@@ -949,13 +949,17 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 Each item is additive under the canonical checklist above; none relaxes an invariant. Until the
 named bead is closed with its tests, the pre-amendment behavior remains the delivered contract.
 
-1. **Async evaluation of model script** (mini-agent-ml1u). The worker evaluates `agent.js` in a
-   mode that permits top-level `await` (rquickjs promise/async evaluation or an implicit async
-   wrapper), settling the returned promise inside the existing bounded pending-job drain and the
-   pre-installed interrupt deadline. The effect globals stay synchronous; awaiting them is a
-   no-op. The tool description states strict-mode script semantics, the absence of persistent
-   state between steps, and every limit (deadline, heap, result, console, read/write, spawn
-   output, effects per step) (mini-agent-7w1l, mini-agent-b7xb).
+1. **Async evaluation of model script** (mini-agent-ml1u). The worker evaluates
+   `mini-agent-model.js` as a strict async global script, so top-level `await` is accepted while
+   verifier scripts retain their existing synchronous semantics. It unwraps QuickJS's one
+   internal async-completion envelope through a trusted, pre-captured own-data descriptor lookup
+   that never dispatches a model getter. This happens before the existing recursive promise
+   settlement, preserving the last-expression result for both synchronous code and code that
+   returns a promise. All jobs remain charged to the bounded pending-job drain and the pre-installed
+   interrupt deadline. The effect globals stay synchronous; awaiting them is a no-op. The tool
+   description and agent prompt state strict-mode semantics, fresh runtime state, top-level `await`,
+   and synchronous host globals. Remaining limit-description work is tracked by mini-agent-7w1l
+   and mini-agent-b7xb.
 2. **Closed exception class and location** (mini-agent-m2kw). `Failure semantics` already allows
    a closed class and validated source-free location. The worker derives, from the caught
    exception, only the constructor name mapped onto a closed allow-list
