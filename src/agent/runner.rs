@@ -6,9 +6,9 @@ use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent};
+use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -18,7 +18,7 @@ use crate::event::{AgentEvent, BtwEvent, UsageDelta};
 #[cfg(feature = "hooks")]
 use crate::extras::hooks::LoopInfo;
 use crate::retry::{self, RetryConfig};
-use crate::session::{MessageRole, Session};
+use crate::session::{MessageRole, PersistedToolMessage, Session};
 
 pub struct AgentRunner {
     pub event_rx: mpsc::Receiver<AgentEvent>,
@@ -1065,34 +1065,135 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
         )));
     }
 
+    #[derive(Clone, Copy)]
+    enum ReplayKind {
+        Assistant,
+        StructuredCall,
+        StructuredResult,
+        Other,
+    }
+
+    // A compaction recap must stay a standalone assistant message. If a
+    // malformed/imported compacted tail starts with a tool call, do not merge
+    // that call into the recap and accidentally give it the recap's trust.
+    let mut replay_kind = ReplayKind::Other;
+    let mut call_counts: HashMap<&str, usize> = HashMap::new();
+    let mut result_counts: HashMap<&str, usize> = HashMap::new();
+    for msg in &session.messages[first_kept..] {
+        let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        match (&msg.role, &msg.tool) {
+            (MessageRole::ToolCall, Some(PersistedToolMessage::Call { .. })) => {
+                *call_counts.entry(id).or_default() += 1;
+            }
+            (MessageRole::ToolResult, Some(PersistedToolMessage::Result { .. })) => {
+                *result_counts.entry(id).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    // Imported, truncated, or corrupt transcripts may contain dangling or
+    // duplicate identities. Only reconstruct complete one-to-one pairs; prose
+    // fallback preserves every other record without producing invalid provider
+    // protocol messages.
+    let valid_tool_ids: HashSet<&str> = call_counts
+        .iter()
+        .filter_map(|(id, calls)| {
+            (*calls == 1 && result_counts.get(id).copied() == Some(1)).then_some(*id)
+        })
+        .collect();
+    let mut open_call_ids = HashSet::new();
+    let mut completed_call_ids = HashSet::new();
+
     for msg in &session.messages[first_kept..] {
         match msg.role {
-            MessageRole::User => messages.push(Message::user(msg.content.to_string())),
-            MessageRole::Assistant => messages.push(Message::assistant(msg.content.to_string())),
-            // Convert non-user transcript records to Assistant for the
-            // same reason as the summary above: the templates that reject
-            // mid-stream System/tool roles tolerate Assistant, and code-symmetry with
-            // the summary push keeps the resumed-conversation shape
-            // consistent.
-            MessageRole::System => messages.push(Message::assistant(msg.content.to_string())),
+            MessageRole::User => {
+                messages.push(Message::user(msg.content.to_string()));
+                replay_kind = ReplayKind::Other;
+            }
+            MessageRole::Assistant => {
+                messages.push(Message::assistant(msg.content.to_string()));
+                replay_kind = ReplayKind::Assistant;
+            }
+            // A legacy mid-stream System record remains transcript prose. New
+            // tool records take the structured branches below instead.
+            MessageRole::System => {
+                messages.push(Message::assistant(msg.content.to_string()));
+                replay_kind = ReplayKind::Other;
+            }
             MessageRole::ToolCall => {
-                // Canonically-persisted tool calls carry a tool_call_id for auditable pairing.
-                // For now, both legacy prose and canonical records convert to the same format
-                // for compatibility with chat model templates. Future enhancement: reconstruct
-                // structured ToolCall messages from persisted (name, args, id) tuples.
-                messages.push(Message::assistant(format!("[ToolCall]: {}", msg.content)))
+                let structured = match (&msg.tool_call_id, &msg.tool) {
+                    (Some(id), Some(PersistedToolMessage::Call { name, arguments }))
+                        if valid_tool_ids.contains(id.as_str())
+                            && !open_call_ids.contains(id.as_str()) =>
+                    {
+                        open_call_ids.insert(id.to_string());
+                        Some(AssistantContent::tool_call(
+                            id.to_string(),
+                            name.to_string(),
+                            arguments.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(call) = structured {
+                    if matches!(
+                        replay_kind,
+                        ReplayKind::Assistant | ReplayKind::StructuredCall
+                    ) && let Some(Message::Assistant { content, .. }) = messages.last_mut()
+                    {
+                        content.push(call);
+                    } else {
+                        messages.push(Message::Assistant {
+                            id: None,
+                            content: OneOrMany::one(call),
+                        });
+                    }
+                    replay_kind = ReplayKind::StructuredCall;
+                } else {
+                    messages.push(Message::assistant(format!("[ToolCall]: {}", msg.content)));
+                    replay_kind = ReplayKind::Other;
+                }
             }
             MessageRole::ToolResult => {
-                // Canonically-persisted tool results carry a tool_call_id for auditable pairing.
-                // For now, both legacy prose and canonical records convert to the same format
-                // for compatibility with chat model templates. Future enhancement: reconstruct
-                // structured ToolResult messages from persisted (name, output, id) tuples.
-                messages.push(Message::assistant(format!("[ToolResult]: {}", msg.content)))
+                let structured = match (&msg.tool_call_id, &msg.tool) {
+                    (Some(id), Some(PersistedToolMessage::Result { output }))
+                        if open_call_ids.contains(id.as_str())
+                            && !completed_call_ids.contains(id.as_str()) =>
+                    {
+                        completed_call_ids.insert(id.to_string());
+                        Some(UserContent::ToolResult(ToolResult {
+                            id: id.to_string(),
+                            call_id: None,
+                            content: OneOrMany::one(ToolResultContent::text(output.to_string())),
+                        }))
+                    }
+                    _ => None,
+                };
+                if let Some(result) = structured {
+                    if matches!(replay_kind, ReplayKind::StructuredResult)
+                        && let Some(Message::User { content }) = messages.last_mut()
+                    {
+                        content.push(result);
+                    } else {
+                        messages.push(Message::User {
+                            content: OneOrMany::one(result),
+                        });
+                    }
+                    replay_kind = ReplayKind::StructuredResult;
+                } else {
+                    messages.push(Message::assistant(format!("[ToolResult]: {}", msg.content)));
+                    replay_kind = ReplayKind::Other;
+                }
             }
-            MessageRole::SubagentToolCall => messages.push(Message::assistant(format!(
-                "[SubagentToolCall]: {}",
-                msg.content
-            ))),
+            MessageRole::SubagentToolCall => {
+                messages.push(Message::assistant(format!(
+                    "[SubagentToolCall]: {}",
+                    msg.content
+                )));
+                replay_kind = ReplayKind::Other;
+            }
         }
     }
 

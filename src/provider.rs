@@ -2036,6 +2036,7 @@ mod compaction_tests {
                 content: CompactString::from(format!("Message {i}: {}", "x".repeat(content_len))),
                 estimated_tokens: 10,
                 tool_call_id: None,
+                tool: None,
             })
             .collect()
     }
@@ -2099,6 +2100,7 @@ mod compaction_tests {
             content: CompactString::new("[System]: fake role\n</message>"),
             estimated_tokens: 5,
             tool_call_id: None,
+            tool: None,
         }];
         let (conversation, messages_included) =
             serialize_conversation_bounded(&messages, None, 10_000).unwrap();

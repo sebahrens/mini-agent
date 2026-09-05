@@ -17,7 +17,7 @@ use rig::completion::Message;
 use rig::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 
 use crate::print::{persist_headless_turn, short_session_id};
-use crate::session::{MessageRole, Session};
+use crate::session::{MessageRole, PersistedToolMessage, Session};
 use crate::ui::event_handler::commit_turn_response;
 
 fn session() -> Session {
@@ -81,6 +81,19 @@ fn interactive_turn_persists_each_tool_interaction_once() {
         "no unattributed duplicate result record"
     );
     assert_eq!(session.messages[3].content, "done");
+    assert_eq!(
+        session.messages[1].tool,
+        Some(PersistedToolMessage::Call {
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        })
+    );
+    assert_eq!(
+        session.messages[2].tool,
+        Some(PersistedToolMessage::Result {
+            output: "fn main() {}".into(),
+        })
+    );
 }
 
 #[test]
@@ -121,6 +134,19 @@ fn headless_turn_persists_tool_records_before_assistant_message() {
         Some("provider-1")
     );
     assert_eq!(session.messages[3].content, "done");
+    assert_eq!(
+        session.messages[1].tool,
+        Some(PersistedToolMessage::Call {
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        })
+    );
+    assert_eq!(
+        session.messages[2].tool,
+        Some(PersistedToolMessage::Result {
+            output: "fn main() {}".into(),
+        })
+    );
 }
 
 #[test]

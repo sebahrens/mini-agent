@@ -27,6 +27,7 @@ fn jsonl_round_trip_preserves_messages() {
         assert_eq!(imported.role, original.role);
         assert_eq!(imported.content, original.content);
         assert_eq!(imported.tool_call_id, original.tool_call_id);
+        assert_eq!(imported.tool, original.tool);
     }
 }
 

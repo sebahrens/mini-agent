@@ -49,6 +49,10 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         if let Some(id) = &msg.tool_call_id {
             line["tool_call_id"] = serde_json::Value::String(id.to_string());
         }
+        if let Some(tool) = &msg.tool {
+            line["tool"] =
+                serde_json::to_value(tool).context("serialize structured tool record")?;
+        }
         let line = line.to_string();
         if line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
             anyhow::bail!("session message exceeds the JSONL line limit");
@@ -76,6 +80,8 @@ struct ImportMessage {
     estimated_tokens: u64,
     #[serde(default)]
     tool_call_id: Option<CompactString>,
+    #[serde(default)]
+    tool: Option<crate::session::PersistedToolMessage>,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +215,7 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
             content: message.content,
             estimated_tokens: message.estimated_tokens,
             tool_call_id: message.tool_call_id,
+            tool: message.tool,
         });
         if messages.len() > MAX_SESSION_IMPORT_MESSAGES {
             anyhow::bail!(
@@ -250,6 +257,7 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
             content: msg.content,
             estimated_tokens: msg.estimated_tokens,
             tool_call_id: msg.tool_call_id,
+            tool: msg.tool,
         });
     }
     if messages.is_empty() {

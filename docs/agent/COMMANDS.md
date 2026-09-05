@@ -37,7 +37,10 @@ All slash commands are available from the TUI input prompt.
 HTML exports treat every session field as untrusted. Raw HTML is displayed as escaped text;
 assistant Markdown keeps normal formatting, HTTP(S)/`mailto:` or relative links, and HTTPS images,
 while executable/active schemes, non-HTTPS images, and tags are removed. The page also carries a
-restrictive Content Security Policy as defense in depth. JSONL exports preserve the original text.
+restrictive Content Security Policy as defense in depth. JSONL exports preserve the original text
+and, for newly recorded tool interactions, the correlated tool-call name, arguments, identifier,
+and bounded tool result used to resume the model conversation. Older exports without those optional
+fields remain importable and replay their tool records as labeled transcript text.
 
 ## Provider & Model
 

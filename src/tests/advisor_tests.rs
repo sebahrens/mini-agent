@@ -7,6 +7,7 @@ fn msg(role: MessageRole, content: &str) -> SessionMessage {
         content: content.into(),
         estimated_tokens: 0,
         tool_call_id: None,
+        tool: None,
     }
 }
 

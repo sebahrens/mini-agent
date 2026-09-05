@@ -8,6 +8,8 @@
 //! extends this to prove the resumed history survives a `Stop`-forced retry.
 
 use rig::agent::AgentBuilder;
+use rig::completion::Message;
+use rig::message::{AssistantContent, UserContent};
 
 use crate::agent::runner::{convert_history, run_print};
 use crate::retry::RetryConfig;
@@ -19,6 +21,13 @@ use crate::tests::fake_model::{history_at, text_chunks};
 fn resumed_session() -> Session {
     let mut session = Session::new("anthropic", "claude-test", 200_000, "");
     session.add_message(MessageRole::User, "what's the plan");
+    session.add_message(MessageRole::Assistant, "I will inspect the plan.");
+    session.add_tool_call_with_id(
+        "resume-call",
+        "read",
+        &serde_json::json!({"path": "docs/plan.md", "line_start": 3}),
+    );
+    session.add_tool_result_with_id("resume-call", "read", "ship section 3");
     session.add_message(MessageRole::Assistant, "ship section 3");
     session
 }
@@ -57,6 +66,17 @@ async fn resumed_session_history_reaches_model_initial_turn() {
         "run_print must forward the resumed session's prior messages to the \
          model as history on the initial stream_chat call"
     );
+    let Message::Assistant { content, .. } = &observed_history[1] else {
+        panic!("resumed assistant tool call must reach the provider")
+    };
+    let Some(AssistantContent::ToolCall(call)) = content.iter().nth(1) else {
+        panic!("resumed tool call must retain its structured arguments")
+    };
+    assert_eq!(call.function.arguments["path"], "docs/plan.md");
+    let Message::User { content } = &observed_history[2] else {
+        panic!("resumed tool result must reach the provider as user content")
+    };
+    assert!(matches!(content.first(), UserContent::ToolResult(_)));
 }
 
 // 4.2: a `Stop` hook forcing a continuation must still see the resumed

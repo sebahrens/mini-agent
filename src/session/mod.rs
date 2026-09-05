@@ -32,6 +32,23 @@ pub struct SessionMessage {
     /// Stable internal identity for auditable call/result correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<CompactString>,
+    /// Model-visible structured payload for resumable tool history. `content`
+    /// remains the bounded, human-readable transcript used by exports and the
+    /// UI; legacy sessions simply omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<PersistedToolMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistedToolMessage {
+    Call {
+        name: CompactString,
+        arguments: serde_json::Value,
+    },
+    Result {
+        output: CompactString,
+    },
 }
 
 /// A single-step restore point captured before a conversation rewind, so the
@@ -363,14 +380,15 @@ impl Session {
     }
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
-        self.add_message_with_tool_call_id(role, content, None);
+        self.add_message_with_tool_data(role, content, None, None);
     }
 
-    fn add_message_with_tool_call_id(
+    fn add_message_with_tool_data(
         &mut self,
         role: MessageRole,
         content: &str,
         tool_call_id: Option<&str>,
+        tool: Option<PersistedToolMessage>,
     ) {
         let tokens = Self::estimate_tokens(content);
         self.messages.push(SessionMessage {
@@ -378,6 +396,7 @@ impl Session {
             content: CompactString::new(content),
             estimated_tokens: tokens,
             tool_call_id: tool_call_id.map(CompactString::new),
+            tool,
         });
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
@@ -387,10 +406,14 @@ impl Session {
     }
 
     pub fn add_tool_call_with_id(&mut self, id: &str, name: &str, args: &serde_json::Value) {
-        self.add_message_with_tool_call_id(
+        self.add_message_with_tool_data(
             MessageRole::ToolCall,
             &crate::ui::utils::format_tool_call_summary(name, args),
             (!id.is_empty()).then_some(id),
+            Some(PersistedToolMessage::Call {
+                name: CompactString::new(name),
+                arguments: args.clone(),
+            }),
         );
     }
 
@@ -413,11 +436,14 @@ impl Session {
         name: &str,
         output: &str,
     ) -> (String, Option<std::path::PathBuf>) {
-        let (content, artifact) = self.tool_result_content(name, output);
-        self.add_message_with_tool_call_id(
+        let (content, replay_output, artifact) = self.tool_result_content(name, output);
+        self.add_message_with_tool_data(
             MessageRole::ToolResult,
             &content,
             (!id.is_empty()).then_some(id),
+            Some(PersistedToolMessage::Result {
+                output: CompactString::new(replay_output),
+            }),
         );
         (content, artifact)
     }
@@ -461,7 +487,7 @@ impl Session {
         name: &str,
         output: &str,
     ) -> (String, Option<std::path::PathBuf>) {
-        let (content, artifact) = self.tool_result_content(name, output);
+        let (content, _, artifact) = self.tool_result_content(name, output);
         self.add_message(MessageRole::ToolResult, &content);
         (content, artifact)
     }
@@ -470,23 +496,27 @@ impl Session {
         &self,
         name: &str,
         output: &str,
-    ) -> (String, Option<std::path::PathBuf>) {
+    ) -> (String, String, Option<std::path::PathBuf>) {
         let output_chars = output.chars().count();
         if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
-            return (format!("{name}:\n{output}"), None);
+            return (format!("{name}:\n{output}"), output.to_string(), None);
         }
 
         match storage::save_tool_output(&self.id, name, output) {
-            Ok(path) => (
-                format_truncated_tool_result(name, output, output_chars, &path),
-                Some(path),
-            ),
-            Err(err) => (
-                format!(
-                    "{name}:\n{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
-                ),
-                None,
-            ),
+            Ok(path) => {
+                let replay_output = format_truncated_tool_output(output, output_chars, &path);
+                (
+                    format!("{name}:\n{replay_output}"),
+                    replay_output,
+                    Some(path),
+                )
+            }
+            Err(err) => {
+                let replay_output = format!(
+                    "{output}\n\n[failed to save long tool output separately; kept full output in session to avoid data loss: {err}]"
+                );
+                (format!("{name}:\n{replay_output}"), replay_output, None)
+            }
         }
     }
 
@@ -744,6 +774,7 @@ impl Session {
             content: CompactString::from(summary.clone()),
             estimated_tokens: summary_tokens,
             tool_call_id: None,
+            tool: None,
         };
 
         // Remove summarized messages and insert summary
@@ -787,19 +818,14 @@ impl Session {
     }
 }
 
-fn format_truncated_tool_result(
-    name: &str,
-    output: &str,
-    output_chars: usize,
-    path: &Path,
-) -> String {
+fn format_truncated_tool_output(output: &str, output_chars: usize, path: &Path) -> String {
     let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
     let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
     let tail: String = output.chars().skip(tail_start).collect();
     let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
 
     format!(
-        "{name}:\n{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
+        "{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
         path.display()
     )
 }

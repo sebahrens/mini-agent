@@ -6,8 +6,8 @@ use crate::session::storage::{
     save_session, save_tool_output, suffix_path, tool_output_dir,
 };
 use crate::session::{
-    PermissionAllowEntry, Session, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_SAVE_THRESHOLD,
-    TOOL_RESULT_TAIL_CHARS,
+    PermissionAllowEntry, PersistedToolMessage, Session, TOOL_RESULT_HEAD_CHARS,
+    TOOL_RESULT_SAVE_THRESHOLD, TOOL_RESULT_TAIL_CHARS,
 };
 use crate::ui::state::{AgentRunState, PendingMainTurn};
 use crate::ui::utils::suggest_pattern;
@@ -540,6 +540,13 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
     assert!(content.ends_with(&tail));
     assert!(content.contains("[tool output truncated: 12001 characters; 2001 omitted]"));
     assert!(!content.contains(&"M".repeat(80)));
+    let Some(PersistedToolMessage::Result { output: replay }) = &s.messages[0].tool else {
+        panic!("tool result must retain a structured replay payload")
+    };
+    assert!(replay.starts_with(&head));
+    assert!(replay.ends_with(&tail));
+    assert!(!replay.starts_with("bash/unsafe:"));
+    assert!(!replay.contains(&"M".repeat(80)));
 
     let path_line = content
         .lines()
@@ -553,6 +560,10 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
         .unwrap();
     assert!(Path::new(path).starts_with(&env.dir));
     assert_eq!(std::fs::read_to_string(path).unwrap(), output);
+
+    save_session(&s).unwrap();
+    let reloaded = load_session_exact(&s.id).unwrap().unwrap();
+    assert_eq!(reloaded.messages[0].tool, s.messages[0].tool);
     drop(env);
 }
 

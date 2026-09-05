@@ -1424,6 +1424,7 @@ impl Startup {
                     content: CompactString::new(&msg),
                     estimated_tokens: Session::estimate_tokens(&msg),
                     tool_call_id: None,
+                    tool: None,
                 });
                 crate::extras::advisor::set_session_messages(msgs);
             }
