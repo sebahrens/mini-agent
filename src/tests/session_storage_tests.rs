@@ -226,6 +226,52 @@ fn failed_turn_persistence_rollback_keeps_partial_events_off_disk() {
 }
 
 #[test]
+fn interrupted_turn_progress_is_persisted_with_unknown_tool_outcome() {
+    let env = setup_test_env();
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    save_session(&session).unwrap();
+    let mut run = AgentRunState::default();
+    let pending = PendingMainTurn::capture(&session, "make a change");
+    mark_main_turn_started(&mut session, &mut run, pending);
+    session.add_tool_call_with_id(
+        "interrupted-write",
+        "write",
+        &serde_json::json!({"path": "changed.txt"}),
+    );
+    run.response_buf = "I started the requested change.".to_string();
+
+    assert!(crate::ui::preserve_pending_main_turn_progress(
+        &mut run,
+        &mut session
+    ));
+    save_session(&session).unwrap();
+    let errors = run.pending_turn.take().unwrap().commit_side_effects(false);
+    assert!(errors.is_empty());
+
+    let reloaded = find_sessions_by_prefix(&session.id[..8]).unwrap();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].messages.len(), 4);
+    assert_eq!(reloaded[0].messages[0].role, MessageRole::User);
+    assert_eq!(reloaded[0].messages[1].role, MessageRole::ToolCall);
+    assert_eq!(reloaded[0].messages[2].role, MessageRole::ToolResult);
+    assert_eq!(
+        reloaded[0].messages[2].tool_call_id.as_deref(),
+        Some("interrupted-write")
+    );
+    assert!(
+        reloaded[0].messages[2]
+            .content
+            .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
+    );
+    assert_eq!(reloaded[0].messages[3].role, MessageRole::Assistant);
+    assert_eq!(
+        reloaded[0].messages[3].content,
+        "I started the requested change."
+    );
+    drop(env);
+}
+
+#[test]
 fn failed_turn_rollback_removes_long_tool_output_and_defers_chat_history() {
     let env = setup_test_env();
     let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");

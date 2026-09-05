@@ -357,10 +357,52 @@ fn warn_unknown_stream_item<R: serde::Serialize>(item: &MultiTurnStreamItem<R>) 
 }
 
 const MAX_PENDING_TOOL_CALLS: usize = 256;
-const UNKNOWN_TOOL_OUTCOME: &str =
+pub(crate) const UNKNOWN_TOOL_OUTCOME: &str =
     "[Tool execution outcome is unknown because the agent stream ended before a result.]";
 const UNRESOLVED_TOOL_CALLS_ERROR: &str =
     "Agent stream ended with unresolved tool calls; execution outcome is unknown.";
+const TRANSIENT_PROVIDER_CONTINUATION: &str = "A transient provider error interrupted the previous completion call. Continue from the preserved transcript without repeating completed tool calls.";
+
+struct CompletionRetryState {
+    failures: usize,
+    backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+}
+
+impl CompletionRetryState {
+    fn new(config: &RetryConfig) -> Self {
+        Self {
+            failures: 0,
+            backoff: std::time::Duration::from_millis(config.initial_backoff_ms),
+            max_backoff: std::time::Duration::from_millis(config.max_backoff_ms),
+        }
+    }
+
+    fn reset(&mut self, config: &RetryConfig) {
+        self.failures = 0;
+        self.backoff = std::time::Duration::from_millis(config.initial_backoff_ms);
+    }
+
+    fn retry_delay(
+        &mut self,
+        config: &RetryConfig,
+        error: &rig::agent::StreamingError,
+    ) -> Option<(usize, std::time::Duration)> {
+        self.failures = self.failures.saturating_add(1);
+        let provider_error = matches!(
+            error,
+            rig::agent::StreamingError::Completion(_) | rig::agent::StreamingError::Prompt(_)
+        );
+        if self.failures >= config.max_attempts || !provider_error || !retry::is_retryable(error) {
+            return None;
+        }
+
+        let jitter = retry::simple_jitter(self.backoff.as_millis() as u64);
+        let delay = self.backoff + jitter;
+        self.backoff = (self.backoff * 2).min(self.max_backoff);
+        Some((self.failures, delay))
+    }
+}
 
 #[derive(Debug)]
 struct PendingToolCall {
@@ -1136,7 +1178,6 @@ async fn continue_prompt_injector<M>(
     original_prompt: &str,
     retry_history: &[Message],
     continuation_bridge: &[Message],
-    retry_config: &RetryConfig,
     max_turns: usize,
 ) -> StreamingResult<M::StreamingResponse>
 where
@@ -1150,16 +1191,10 @@ where
     let mut new_history = retry_history.to_vec();
     new_history.push(Message::user(original_prompt.to_string()));
     new_history.extend_from_slice(bridge_history);
-    match retry::retry_stream_chat(retry_config, || {
-        let h = new_history.clone();
-        let prompt = current_prompt.clone();
-        async move { agent.stream_chat(prompt, h).max_turns(max_turns).await }
-    })
-    .await
-    {
-        Ok(stream) => stream,
-        Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
-    }
+    agent
+        .stream_chat(current_prompt.clone(), new_history)
+        .max_turns(max_turns)
+        .await
 }
 
 fn normalized_continuation_bridge(
@@ -1406,6 +1441,7 @@ where
         let mut response = String::new();
         let mut response_len_at_stream_start = response.len();
         let mut usage_ledger = UsageLedger::default();
+        let mut completion_retry = CompletionRetryState::new(&retry_config);
         usage_ledger.start_stream();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
@@ -1477,6 +1513,7 @@ where
 
         loop {
             let mut terminal_response_seen = false;
+            let mut retrying_interrupted_completion = false;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
@@ -1733,6 +1770,7 @@ where
                         break;
                     }
                     Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                        completion_retry.reset(&retry_config);
                         turns_used = turns_used.saturating_add(1);
                         let usage = call.usage;
                         let delta = usage_ledger.record(usage);
@@ -1777,13 +1815,31 @@ where
                         completion_had_tool_call = false;
                     }
                     Err(e) => {
-                        tracing::error!("agent stream error: {e}");
                         finalize_interactive_tool_calls(
                             &mut tool_calls,
                             &mut interactions,
                             &event_tx,
                         )
                         .await;
+                        if let Some((attempt, delay)) =
+                            completion_retry.retry_delay(&retry_config, &e)
+                        {
+                            tracing::warn!(
+                                "agent retry {attempt}/{max} after mid-stream error: {e}",
+                                max = retry_config.max_attempts,
+                            );
+                            let _ = event_tx
+                                .send(AgentEvent::Retrying {
+                                    attempt,
+                                    max: retry_config.max_attempts,
+                                })
+                                .await;
+                            tokio::time::sleep(delay).await;
+                            next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
+                            retrying_interrupted_completion = true;
+                            break;
+                        }
+                        tracing::error!("agent stream error: {e}");
                         let error = retry::with_context_length_hint(&e.to_string());
                         let _ = event_tx
                             .send(AgentEvent::Error(CompactString::new(error)))
@@ -1797,6 +1853,7 @@ where
             finalize_interactive_tool_calls(&mut tool_calls, &mut interactions, &event_tx).await;
 
             if !terminal_response_seen
+                && !retrying_interrupted_completion
                 && let Err(error) =
                     charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
             {
@@ -1862,7 +1919,6 @@ where
                     &retry_prompt,
                     &retry_history,
                     &continuation_bridge,
-                    &retry_config,
                     remaining_turns,
                 )
                 .await,
@@ -2002,6 +2058,7 @@ where
     let mut completion_had_tool_call = false;
     let mut exhausted_budget_after_completion = None;
     let mut usage_ledger = UsageLedger::default();
+    let mut completion_retry = CompletionRetryState::new(retry_config);
     usage_ledger.start_stream();
     let mut turns_used = 0usize;
     let mut turns_at_stream_start = turns_used;
@@ -2012,7 +2069,6 @@ where
     // empty response must never be returned (and persisted) as the turn.
     let mut empty_response_count: u32 = 0;
     const MAX_EMPTY_RESPONSES: u32 = 3;
-    #[cfg(feature = "hooks")]
     let mut next_instruction: Option<String> = None;
     #[cfg(feature = "hooks")]
     let mut stop_hook_active = false;
@@ -2024,6 +2080,7 @@ where
     while continue_turn {
         continue_turn = false;
         let mut terminal_response_seen = false;
+        let mut retrying_interrupted_completion = false;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
@@ -2101,6 +2158,7 @@ where
                     }
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    completion_retry.reset(retry_config);
                     turns_used = turns_used.saturating_add(1);
                     usage_ledger.record(call.usage);
                     tracing::debug!(
@@ -2174,11 +2232,20 @@ where
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    // Propagate the stream failure instead of returning `Ok`
-                    // with a truncated/empty response: dispatch must exit
-                    // non-zero and must never persist an empty assistant turn
-                    // (which would then be replayed as history on `--continue`).
                     tool_calls.finalize_unresolved(&mut interactions);
+                    if let Some((attempt, delay)) = completion_retry.retry_delay(retry_config, &e) {
+                        tracing::warn!(
+                            "agent retry {attempt}/{max} after mid-stream error: {e}",
+                            max = retry_config.max_attempts,
+                        );
+                        tokio::time::sleep(delay).await;
+                        next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
+                        retrying_interrupted_completion = true;
+                        continue_turn = true;
+                        break;
+                    }
+                    // Propagate an exhausted or non-retryable stream failure
+                    // instead of returning `Ok` with a truncated response.
                     return Err(anyhow::anyhow!(retry::with_context_length_hint(
                         &e.to_string()
                     )));
@@ -2188,7 +2255,7 @@ where
 
         tool_calls.finalize_unresolved(&mut interactions);
 
-        if !terminal_response_seen {
+        if !terminal_response_seen && !retrying_interrupted_completion {
             charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
                 .map_err(anyhow::Error::new)?;
             continue_turn = true;
@@ -2209,12 +2276,9 @@ where
                      completing. Compact the session or raise turn_token_budget before retrying."
                 );
             }
-            #[cfg(feature = "hooks")]
             let continuation_instruction = next_instruction
                 .take()
                 .unwrap_or_else(|| "Please continue.".to_string());
-            #[cfg(not(feature = "hooks"))]
-            let continuation_instruction = "Please continue.".to_string();
             let new_interactions = take_new_interactions(&mut interactions);
             committed_interactions.extend(new_interactions.iter().cloned());
             continuation_bridge = normalized_continuation_bridge(
@@ -2232,7 +2296,6 @@ where
                     prompt,
                     &retry_history,
                     &continuation_bridge,
-                    retry_config,
                     remaining_turns,
                 )
                 .await,
@@ -2411,8 +2474,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy, ToolCallTracker,
-        ToolCallTrackerError, UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
+        MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy,
+        TRANSIENT_PROVIDER_CONTINUATION, ToolCallTracker, ToolCallTrackerError,
+        UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
         append_attributed_tool_result, attributed_tool_result, charge_nonterminal_eof,
         completed_stream_delta, streamed_reasoning_text, warn_unknown_stream_item,
     };
@@ -2519,6 +2583,186 @@ mod tests {
         assert!(headless_error.contains("context_length_exceeded"));
         assert!(headless_error.contains("/compress"));
         assert!(headless_error.contains("compact_enabled = true"));
+    }
+
+    fn immediate_retry_config(max_attempts: usize) -> crate::retry::RetryConfig {
+        crate::retry::RetryConfig {
+            max_attempts,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_retries_transient_error_after_tool_without_repeating_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "completed-before-error",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::error("connection reset by peer")],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut retry_events = 0;
+        let interactions = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Retrying { attempt, max } => {
+                    retry_events += 1;
+                    assert_eq!((attempt, max), (1, 3));
+                }
+                crate::event::AgentEvent::Done {
+                    response,
+                    interactions,
+                } => {
+                    assert_eq!(response, "recovered");
+                    break interactions;
+                }
+                crate::event::AgentEvent::Error(error) => {
+                    panic!("transient second-call error was not recovered: {error}")
+                }
+                _ => {}
+            }
+        };
+
+        assert_eq!(retry_events, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.requests().len(), 3);
+        assert_eq!(tool_call_ids_of(&interactions), ["completed-before-error"]);
+        assert_eq!(
+            tool_result_ids_of(&interactions),
+            ["completed-before-error"]
+        );
+        assert_eq!(interactions.last(), Some(&Message::assistant("recovered")));
+        assert_eq!(
+            model.requests()[2].chat_history.last_ref(),
+            &Message::user(TRANSIENT_PROVIDER_CONTINUATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_retries_transient_error_after_tool_without_repeating_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "completed-before-error",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::error("socket connection reset")],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &immediate_retry_config(3),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("transient second-call error should recover");
+
+        assert_eq!(response, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.requests().len(), 3);
+        assert_eq!(tool_call_ids_of(&interactions), ["completed-before-error"]);
+        assert_eq!(
+            tool_result_ids_of(&interactions),
+            ["completed-before-error"]
+        );
+        assert_eq!(
+            model.requests()[2].chat_history.last_ref(),
+            &Message::user(TRANSIENT_PROVIDER_CONTINUATION)
+        );
+    }
+
+    #[tokio::test]
+    async fn midstream_provider_retries_stop_at_configured_attempt_bound() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "completed-before-errors",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::error("connection reset one")],
+            vec![MockStreamEvent::error("connection reset two")],
+            vec![MockStreamEvent::error("connection reset three")],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut retries = Vec::new();
+        let error = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Retrying { attempt, max } => {
+                    retries.push((attempt, max));
+                }
+                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Done { .. } => {
+                    panic!("exhausted transient errors must not succeed")
+                }
+                _ => {}
+            }
+        };
+
+        assert!(error.contains("connection reset three"));
+        assert_eq!(retries, [(1, 3), (2, 3)]);
+        assert_eq!(model.requests().len(), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     impl<M: CompletionModel> AgentHook<M> for RetryInvalidTool {

@@ -659,6 +659,48 @@ pub(crate) fn rollback_pending_main_turn(
     prompt
 }
 
+pub(crate) fn pending_main_turn_has_progress(run: &AgentRunState, session: &Session) -> bool {
+    run.pending_turn
+        .as_ref()
+        .is_some_and(|turn| turn.has_progress(session, &run.response_buf, &run.turn_trace))
+}
+
+/// Make an interrupted turn protocol-complete before committing its partial
+/// transcript. This is infallible so callers can use it on error-unwind and
+/// Ctrl-C paths without risking a second rollback-triggering failure.
+pub(crate) fn preserve_pending_main_turn_progress(
+    run: &mut AgentRunState,
+    session: &mut Session,
+) -> bool {
+    if !pending_main_turn_has_progress(run, session) {
+        return false;
+    }
+
+    let needs_trace_recap = run
+        .pending_turn
+        .as_ref()
+        .is_some_and(|turn| !turn.has_recorded_turn_messages(session))
+        && run.response_buf.trim().is_empty()
+        && !run.turn_trace.is_empty();
+    if let Some(turn) = run.pending_turn.as_ref() {
+        turn.finalize_unresolved_tool_calls(session);
+    }
+    if !run.response_buf.trim().is_empty() {
+        session.add_message(MessageRole::Assistant, &run.response_buf);
+    } else if needs_trace_recap {
+        let recap = format!(
+            "[Interrupted turn progress]\n{}",
+            run.turn_trace
+                .iter()
+                .map(compact_str::CompactString::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        session.add_message(MessageRole::Assistant, &recap);
+    }
+    true
+}
+
 /// Persist only a settled session. Tool events mutate the live transaction,
 /// but the disk snapshot remains at the pre-turn state until the turn reaches
 /// one terminal success/failure/cancellation transition.

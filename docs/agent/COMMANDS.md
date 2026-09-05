@@ -235,6 +235,12 @@ Interactive validators carry generation IDs, so cancelling and starting a new
 run or loop immediately retires the old generation; a late cleanup completion
 cannot advance or respawn the replacement loop.
 
+When a main run is interrupted after assistant or tool progress, the partial
+transcript is retained so on-disk edits stay explainable on resume. Any tool call
+whose result was not observed is recorded with an unknown-outcome marker. Only
+a failure before any agent progress restores the original prompt to the editor
+and rolls the transcript back.
+
 | Command | Description |
 | ------- | ----------- |
 | `/loop [prompt]` | Start the iterative coding loop (bounded to 100 iterations). |

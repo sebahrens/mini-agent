@@ -215,11 +215,11 @@ pub async fn handle_agent_event(
         }
         AgentEvent::Retrying { attempt, max } => {
             run.was_reasoning = false;
+            finalize_response_segment(renderer, run)?;
             if run.agent_line_started {
                 renderer.write_line("", Color::White)?;
                 run.agent_line_started = false;
             }
-            run.response_buf.clear();
             run.response_start_block = None;
             renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
         }
@@ -231,6 +231,8 @@ pub async fn handle_agent_event(
             }
             run.agent_rx = None;
             run.agent_line_started = false;
+            finalize_response_segment(renderer, run)?;
+            crate::ui::preserve_pending_main_turn_progress(run, ui.session);
             run.response_buf.clear();
             run.response_start_block = None;
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;

@@ -40,7 +40,8 @@ use super::handle_human_handoff;
 use super::rebind_mcp_manager;
 use super::{
     C_AGENT, C_BTW, C_ERROR, C_TOOL, PrebuildPayload, apply_prompt_mode, classify_submission,
-    mid_turn_compact_and_respawn, record_started_main_turn, refresh_display,
+    mid_turn_compact_and_respawn, pending_main_turn_has_progress,
+    preserve_pending_main_turn_progress, record_started_main_turn, refresh_display,
     rollback_pending_main_turn, spawn_event_thread, start_main_run, stop_turn_context_exhausted,
 };
 #[cfg(feature = "git-worktree")]
@@ -1028,6 +1029,9 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        let terminal_error = matches!(&event, AgentEvent::Error(_));
+        let failed_turn_has_progress =
+            terminal_error && pending_main_turn_has_progress(&self.run, self.ui.session);
         match &event {
             AgentEvent::ToolCall { name, args, .. }
                 if self.run.turn_trace.len() < TURN_TRACE_MAX =>
@@ -1047,10 +1051,11 @@ impl<'a> App<'a> {
                         crate::extras::truncate::truncate_cjk(output, 500, "…")
                     )));
             }
-            AgentEvent::Done { .. } | AgentEvent::Error(_) => {
+            AgentEvent::Done { .. } => {
                 self.run.turn_trace.clear();
                 self.run.awaiting_compaction_relief = false;
             }
+            AgentEvent::Error(_) => self.run.awaiting_compaction_relief = false,
             _ => {}
         }
 
@@ -1093,11 +1098,11 @@ impl<'a> App<'a> {
         let mid_turn_pressure =
             mid_turn_observation.filter(|(_, threshold, pressure)| pressure > threshold);
 
-        // A failed turn is never an authoritative session state. Restore the
-        // pre-turn transcript before the error handler performs its one
-        // terminal save, so disk cannot observe a ghost prompt/tool tail.
+        // Preserve an interrupted turn once the model or a tool made observable
+        // progress. Only a zero-progress failure restores the prompt and the
+        // pre-turn snapshot.
         let terminal_success = matches!(&event, AgentEvent::Done { .. });
-        let failed_prompt = matches!(&event, AgentEvent::Error(_))
+        let failed_prompt = (terminal_error && !failed_turn_has_progress)
             .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
             .flatten();
         let handled = event_handler::handle_agent_event(
@@ -1142,6 +1147,10 @@ impl<'a> App<'a> {
                 self.fail_pending_main_turn();
             }
             return Err(error);
+        }
+
+        if terminal_error {
+            self.run.turn_trace.clear();
         }
 
         if let Some(text) = failed_prompt {
@@ -1288,6 +1297,7 @@ impl<'a> App<'a> {
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
     fn fail_pending_main_turn(&mut self) {
+        let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
         if let Some(handle) = self.run.main_abort.take() {
@@ -1305,13 +1315,18 @@ impl<'a> App<'a> {
         if let Some(signals) = self.ui.status_signals.as_ref() {
             signals.send_stop();
         }
-        if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
-            self.input.load_text(&text);
+        if preserve_progress {
+            self.settle_success_transaction();
+        } else {
+            if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
+                self.input.load_text(&text);
+            }
+            let _ = self.save_session();
         }
-        let _ = self.save_session();
     }
 
     fn abort_main_run(&mut self) -> anyhow::Result<()> {
+        let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         let validation_active = self.run.cancel_validation();
         #[cfg(not(feature = "loop"))]
@@ -1331,7 +1346,9 @@ impl<'a> App<'a> {
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
         self.run.pending_inputs.clear();
-        let failed_prompt = rollback_pending_main_turn(&mut self.run, self.ui.session);
+        let failed_prompt = (!preserve_progress)
+            .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
+            .flatten();
         #[cfg(feature = "loop")]
         if let Some(ref mut ls) = self.chain.loop_state {
             ls.active = false;
@@ -1355,7 +1372,11 @@ impl<'a> App<'a> {
                 guard.restore_user_mode();
             }
         }
-        self.save_session()?;
+        if preserve_progress {
+            self.settle_success_transaction();
+        } else {
+            self.save_session()?;
+        }
         self.renderer.write_line(
             "interrupted (changes may be partial; review with git diff)",
             C_ERROR,
@@ -2111,6 +2132,7 @@ impl<'a> App<'a> {
     }
 
     fn stop_context_exhausted(&mut self, prompt_tokens: u64, threshold: f64) -> anyhow::Result<()> {
+        let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         let rendered = stop_turn_context_exhausted(
             prompt_tokens,
             threshold,
@@ -2118,10 +2140,14 @@ impl<'a> App<'a> {
             &self.ui,
             &mut self.run,
         );
-        if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
-            self.input.load_text(&text);
+        if preserve_progress {
+            self.settle_success_transaction();
+        } else {
+            if let Some(text) = rollback_pending_main_turn(&mut self.run, self.ui.session) {
+                self.input.load_text(&text);
+            }
+            self.save_session()?;
         }
-        self.save_session()?;
         rendered
     }
 
@@ -2870,6 +2896,115 @@ mod initial_turn_tests {
         assert_eq!(restored.as_deref(), Some("cancel me"));
         assert_eq!(serde_json::to_value(&session).unwrap(), expected);
         assert!(run.pending_turn.is_none());
+    }
+
+    #[test]
+    fn interrupted_turn_with_progress_is_preserved_and_protocol_complete() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_message(MessageRole::User, "prior question");
+        session.add_message(MessageRole::Assistant, "prior answer");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "make the edit");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        session.add_tool_call_with_id(
+            "interrupted-call",
+            "edit",
+            &serde_json::json!({"path": "src/main.rs"}),
+        );
+        run.response_buf = "partial explanation".to_string();
+
+        assert!(crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+
+        assert!(run.pending_turn.is_some());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User,
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+                MessageRole::Assistant,
+            ]
+        );
+        let synthetic = &session.messages[4];
+        assert_eq!(synthetic.tool_call_id.as_deref(), Some("interrupted-call"));
+        assert!(
+            synthetic
+                .content
+                .contains(crate::agent::runner::UNKNOWN_TOOL_OUTCOME)
+        );
+        assert_eq!(session.messages[5].content, "partial explanation");
+    }
+
+    #[test]
+    fn interrupted_turn_does_not_duplicate_a_completed_tool_result() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "inspect");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        session.add_tool_call_with_id("completed-call", "read", &serde_json::json!({}));
+        session.add_tool_result_with_id("completed-call", "read", "done");
+
+        assert!(crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::ToolResult)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn zero_progress_failure_remains_eligible_for_rollback() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "retry me");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+
+        assert!(!crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+        assert_eq!(
+            crate::ui::rollback_pending_main_turn(&mut run, &mut session).as_deref(),
+            Some("retry me")
+        );
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn presentation_failure_preserves_the_observed_turn_trace() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let mut run = AgentRunState::default();
+        let pending_turn = PendingMainTurn::capture(&session, "inspect");
+        crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+        run.turn_trace.push("→ read src/main.rs".into());
+
+        assert!(crate::ui::preserve_pending_main_turn_progress(
+            &mut run,
+            &mut session
+        ));
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].role, MessageRole::Assistant);
+        assert!(
+            session.messages[1]
+                .content
+                .contains("Interrupted turn progress")
+        );
+        assert!(session.messages[1].content.contains("read src/main.rs"));
     }
 
     #[cfg(feature = "multimodal")]

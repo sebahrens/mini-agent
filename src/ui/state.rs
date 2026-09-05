@@ -155,9 +155,10 @@ pub(super) struct ActiveValidation {
 }
 
 /// Transaction snapshot for one user-authored main turn. No in-progress turn
-/// is authoritative on disk: success commits the live session, while failure
-/// or cancellation restores its pre-turn transcript state before saving while
-/// retaining independently authoritative usage and explicit permission grants.
+/// is authoritative on disk: terminal transitions commit any observed agent
+/// progress, while a zero-progress failure restores the pre-turn transcript.
+/// Independently authoritative usage and explicit permission grants survive
+/// either transition.
 pub(crate) struct PendingMainTurn {
     prompt: String,
     session_id: compact_str::CompactString,
@@ -213,6 +214,64 @@ impl PendingMainTurn {
 
     pub(crate) fn record_tool_output(&mut self, path: std::path::PathBuf) {
         self.tool_output_paths.push(path);
+    }
+
+    pub(crate) fn has_progress(
+        &self,
+        session: &Session,
+        response_buf: &str,
+        turn_trace: &[compact_str::CompactString],
+    ) -> bool {
+        !response_buf.trim().is_empty()
+            || !turn_trace.is_empty()
+            || session.messages.len() > self.session_before.messages.len().saturating_add(1)
+            || session.compactions.len() != self.session_before.compactions.len()
+            || {
+                #[cfg(feature = "memory")]
+                {
+                    !self.memory_summaries.is_empty()
+                }
+                #[cfg(not(feature = "memory"))]
+                {
+                    false
+                }
+            }
+    }
+
+    pub(crate) fn has_recorded_turn_messages(&self, session: &Session) -> bool {
+        session.messages.len() > self.session_before.messages.len().saturating_add(1)
+    }
+
+    pub(crate) fn finalize_unresolved_tool_calls(&self, session: &mut Session) {
+        let turn_start = self
+            .session_before
+            .messages
+            .len()
+            .min(session.messages.len());
+        let resolved: std::collections::HashSet<String> = session.messages[turn_start..]
+            .iter()
+            .filter(|message| message.role == crate::session::MessageRole::ToolResult)
+            .filter_map(|message| message.tool_call_id.as_deref().map(str::to_owned))
+            .collect();
+        let mut unresolved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in session.messages[turn_start..]
+            .iter()
+            .filter(|message| message.role == crate::session::MessageRole::ToolCall)
+            .filter_map(|message| message.tool_call_id.as_deref())
+        {
+            if !resolved.contains(id) && seen.insert(id.to_owned()) {
+                unresolved.push(id.to_owned());
+            }
+        }
+
+        for id in unresolved {
+            session.add_tool_result_with_id(
+                &id,
+                "unknown",
+                crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
+            );
+        }
     }
 
     #[cfg(feature = "multimodal")]
