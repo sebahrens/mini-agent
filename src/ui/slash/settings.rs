@@ -312,10 +312,12 @@ async fn handle_editsys(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
     match parts[1] {
         "similarity" => {
             tools::set_edit_system(EditSystem::Similarity);
+            ctx.rebuild_agent().await;
             write_ok(ctx.renderer, "edit system: similarity (SEARCH/REPLACE)");
         }
         "hashedit" => {
             tools::set_edit_system(EditSystem::Hashedit);
+            ctx.rebuild_agent().await;
             write_ok(ctx.renderer, "edit system: hashedit (tag-based)");
         }
         _ => write_error(

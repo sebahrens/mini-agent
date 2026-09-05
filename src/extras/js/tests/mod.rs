@@ -264,7 +264,7 @@ async fn tool_description_prefers_javascript_for_computation() {
 
     assert!(description.contains("Prefer this tool for computation"));
     assert!(description.contains("instead of invoking Python through a shell"));
-    assert!(description.contains("spawn(cmd, args)"));
+    assert!(description.contains("spawn(program: string, args: string[])"));
 }
 
 #[tokio::test]
@@ -273,7 +273,11 @@ async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
     let tool =
         make_test_tool_with_permissions_and_process_tree(Sandbox::new(false, "bwrap"), None, None);
 
-    assert!(!tool.description().contains("spawn(cmd, args)"));
+    assert!(
+        !tool
+            .description()
+            .contains("spawn(program: string, args: string[])")
+    );
 }
 
 #[cfg(feature = "skills")]

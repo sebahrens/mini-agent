@@ -200,6 +200,23 @@ async fn test_sim_preserves_crlf_line_endings() {
     );
 }
 
+#[tokio::test]
+async fn test_sim_crlf_multiline_search_is_exact_and_replacement_uses_crlf() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_crlf_multiline.txt");
+    std::fs::write(tmp.path(), b"alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+    let result = sim_edit(&tmp, "alpha\nbeta", "first\nsecond")
+        .await
+        .expect("LF-authored block should match CRLF file exactly after adaptation");
+
+    assert!(!result.contains("whitespace normalization"), "{result}");
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"first\r\nsecond\r\ngamma\r\n"
+    );
+}
+
 // ── Hashedit (V2) tests ─────────────────────────────────────────────────
 
 fn make_tagged_line(line_num: usize, content: &str) -> String {
@@ -469,9 +486,64 @@ async fn test_sim_normalized_match_after_trailing_whitespace() {
     std::fs::write(tmp.path(), "foo   \n    bar\n").unwrap();
     let result = sim_edit(&tmp, "\tbar", "    baz").await.unwrap();
     assert!(result.contains("whitespace normalization"), "{result}");
+    assert!(result.contains("replaced region:\n    bar"), "{result}");
     assert_eq!(
         std::fs::read_to_string(tmp.path()).unwrap(),
         "foo   \n    baz\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_normalized_match_must_be_unique() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_norm_ambiguous.txt");
+    let original = "fn a() {\n\tvalue = 1;\n}\nfn b() {\n\tvalue = 1;\n}\n";
+    std::fs::write(tmp.path(), original).unwrap();
+
+    let message = sim_edit(&tmp, "    value = 1;", "    value = 2;")
+        .await
+        .expect_err("ambiguous normalized matches must be rejected");
+
+    assert!(message.contains("matched more than once"), "{message}");
+    assert!(message.contains("lines 2 and 5"), "{message}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_sim_fuzzy_match_must_be_unique() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_fuzzy_ambiguous.txt");
+    let original = "fn a() {\n    value = 100;\n}\nfn b() {\n    value = 100;\n}\n";
+    std::fs::write(tmp.path(), original).unwrap();
+
+    let message = sim_edit(&tmp, "    value = 101;", "    value = 200;")
+        .await
+        .expect_err("ambiguous fuzzy matches must be rejected");
+
+    assert!(message.contains("multiple fuzzy matches"), "{message}");
+    assert!(message.contains("line 2"), "{message}");
+    assert!(message.contains("line 5"), "{message}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_sim_single_fuzzy_match_echoes_replaced_region() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_fuzzy_echo.txt");
+    std::fs::write(tmp.path(), "keep\n    value = 100;\nend\n").unwrap();
+
+    let result = sim_edit(&tmp, "    value = 101;", "    value = 200;")
+        .await
+        .expect("one fuzzy candidate should apply");
+
+    assert!(result.contains("fuzzy match"), "{result}");
+    assert!(
+        result.contains("replaced region:\n    value = 100;"),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "keep\n    value = 200;\nend\n"
     );
 }
 
@@ -742,6 +814,34 @@ async fn test_hash_adjacent_edits_are_allowed() {
     assert_eq!(
         std::fs::read_to_string(tmp.path()).unwrap(),
         "A\nB\nline3\n"
+    );
+}
+
+#[tokio::test]
+async fn test_hash_multiline_replacement_uses_dominant_crlf() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_crlf_multiline.txt");
+    let original = "line1\r\nline2\r\nline3\r\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let file_crc = crc32_hex(original.replace("\r\n", "\n").as_bytes());
+    let tool = edit::EditTool::new(None, None);
+
+    tool.call(EditArgs {
+        path: tmp.path().into(),
+        block: None,
+        file_crc: Some(file_crc),
+        edits: Some(vec![EditOp {
+            line: Some(make_tagged_line(2, "line2")),
+            lines: None,
+            text: "second-a\nsecond-b".into(),
+        }]),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"line1\r\nsecond-a\r\nsecond-b\r\nline3\r\n"
     );
 }
 

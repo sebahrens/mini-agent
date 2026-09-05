@@ -767,15 +767,19 @@ impl Tool for JsTool {
 
     fn description(&self) -> String {
         let mut globals = vec![
-            "read_file(path)",
-            "write_file(path, content)",
-            "console.log(...)",
+            "`read_file(path: string): string` (synchronous). Example: `const text = read_file('src/main.rs');`",
+            "`write_file(path: string, content: string): void` (synchronous). Example: `write_file('out.txt', 'done\\n');`",
+            "`console.log(...values): void`. Example: `console.log('count', 3);`",
         ];
         if cfg!(feature = "sandbox") {
-            globals.push("fetch(url, options)");
+            globals.push(
+                "`fetch(url: string, options?: {method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}): {status: number, text: string}` (synchronous; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {method: 'GET'}); console.log(r.status, r.text);`",
+            );
         }
         if self.sandbox.owns_complete_process_tree() {
-            globals.push("spawn(cmd, args)");
+            globals.push(
+                "`spawn(program: string, args: string[]): {stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}` (synchronous; `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
+            );
         }
         #[cfg(feature = "skills")]
         let mut proposal_guidance = "";
@@ -796,9 +800,9 @@ impl Tool for JsTool {
         format!(
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
-             Python through a shell. Available globals: {}. Returns the last expression \
+             Python through a shell. Available global contracts and examples: {} Returns the last expression \
              value as a string. Runtime failures use closed, source-free error classes.{}",
-            globals.join(", "),
+            globals.join(" "),
             proposal_guidance,
         )
     }
@@ -1856,6 +1860,47 @@ mod js_permission_bridge {
             .await
             .expect("call should succeed within single deadline");
         assert_eq!(result, "42");
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    use rig::tool::Tool;
+
+    #[tokio::test]
+    async fn description_documents_fetch_and_spawn_contracts_and_examples() {
+        let tool = JsTool::new(
+            Sandbox::new(false, "bwrap").with_complete_process_tree_for_test(),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        );
+        let description = tool.description();
+
+        #[cfg(feature = "sandbox")]
+        {
+            assert!(description.contains("method?: 'GET'|'POST'"));
+            assert!(description.contains("{status: number, text: string}"));
+            assert!(description.contains("has no `ok`, `headers`, or `json()`"));
+            assert!(description.contains("const r = fetch('https://example.com/data'"));
+        }
+        assert!(description.contains("spawn(program: string, args: string[])"));
+        assert!(description.contains("timed_out: boolean"));
+        assert!(description.contains("`args` must be an array"));
+        assert!(description.contains("spawn('git', ['status', '--short'])"));
+    }
+
+    #[tokio::test]
+    async fn description_omits_spawn_without_complete_tree_ownership() {
+        let tool = JsTool::new(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        );
+
+        assert!(!tool.description().contains("spawn(program:"));
     }
 }
 

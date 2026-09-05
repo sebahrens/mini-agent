@@ -33,11 +33,26 @@ pub fn simple_jitter(range_ms: u64) -> Duration {
 }
 
 pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
+    // Prefer Rig's preserved provider status over rendered-message heuristics.
+    // In particular, Anthropic overloads can arrive as the non-standard 529
+    // status.  A known 4xx response must not become retryable merely because
+    // its body happens to contain a word such as "connection".
+    if let Some(provider_status) = provider_response_status(error) {
+        let code = provider_status.as_u16();
+        return code == 429
+            || code == 500
+            || code == 502
+            || code == 503
+            || code == 504
+            || code == 529;
+    }
+
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(e) = current {
         let msg = e.to_string();
 
         if msg.contains("429")
+            || msg.contains("529")
             || msg.contains("503")
             || msg.contains("502")
             || msg.contains("504")
@@ -58,6 +73,7 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
             || lower.contains("too many requests")
             || lower.contains("service unavailable")
             || lower.contains("temporarily unavailable")
+            || lower.contains("overloaded")
             || lower.contains("internal server error")
             || lower.contains("bad gateway")
             || lower.contains("gateway timeout")
@@ -69,6 +85,24 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         current = e.source();
     }
     false
+}
+
+fn provider_response_status(error: &(dyn std::error::Error + 'static)) -> Option<http::StatusCode> {
+    let mut current = Some(error);
+    while let Some(candidate) = current {
+        if let Some(error) = candidate.downcast_ref::<rig::completion::PromptError>()
+            && let Some(status) = error.provider_response_status()
+        {
+            return Some(status);
+        }
+        if let Some(error) = candidate.downcast_ref::<rig::completion::CompletionError>()
+            && let Some(status) = error.provider_response_status()
+        {
+            return Some(status);
+        }
+        current = candidate.source();
+    }
+    None
 }
 
 /// Provider-neutral recognition for errors that mean the submitted prompt did
@@ -176,6 +210,46 @@ mod tests {
     #[test]
     fn test_is_retryable_http_500() {
         let err = io::Error::other("HTTP 500 Internal Server Error");
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_anthropic_529_from_provider_status() {
+        let status = http::StatusCode::from_u16(529).expect("529 is a valid extension status");
+        let err = rig::completion::CompletionError::from_http_response(
+            status,
+            r#"{"type":"overloaded_error"}"#,
+        );
+
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_anthropic_overload_message_fallback() {
+        let err = io::Error::other(r#"Invalid status code 529: {"type":"overloaded_error"}"#);
+
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn test_provider_status_takes_precedence_over_message_fallback() {
+        let err = rig::completion::CompletionError::from_http_response(
+            http::StatusCode::BAD_REQUEST,
+            r#"{"error":"connection configuration is invalid"}"#,
+        );
+
+        assert!(!is_retryable(&err));
+    }
+
+    #[test]
+    fn test_prompt_error_forwards_retryable_provider_status() {
+        let status = http::StatusCode::from_u16(529).expect("529 is a valid extension status");
+        let completion = rig::completion::CompletionError::from_http_response(
+            status,
+            r#"{"type":"overloaded_error"}"#,
+        );
+        let err = rig::completion::PromptError::from(completion);
+
         assert!(is_retryable(&err));
     }
 

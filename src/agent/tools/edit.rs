@@ -132,7 +132,9 @@ fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
 enum MatchResult {
     Exact(usize),
     Normalized(usize, usize),
+    AmbiguousNormalized(usize, usize),
     FuzzyApply(usize, usize, f64),
+    AmbiguousFuzzy((usize, f64), (usize, f64)),
     FuzzySuggest(usize, f64, String),
     NotFound,
 }
@@ -186,8 +188,21 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     // than by arithmetic on the original text.
     let content_norm = NormalizedText::new(content);
     let search_norm = normalize_whitespace(search);
-    if let Some(norm_pos) = content_norm.text.find(&search_norm) {
-        let (byte_start, byte_end) = content_norm.source_range(norm_pos, search_norm.len());
+    if search_norm.is_empty() {
+        return MatchResult::NotFound;
+    }
+    let mut normalized_matches = content_norm
+        .text
+        .match_indices(&search_norm)
+        .map(|(norm_pos, _)| content_norm.source_range(norm_pos, search_norm.len()));
+    let first_normalized = normalized_matches.next();
+    if let (Some((first, _)), Some((second, _))) = (first_normalized, normalized_matches.next()) {
+        return MatchResult::AmbiguousNormalized(
+            content[..first].matches('\n').count() + 1,
+            content[..second].matches('\n').count() + 1,
+        );
+    }
+    if let Some((byte_start, byte_end)) = first_normalized {
         return MatchResult::Normalized(byte_start, byte_end);
     }
 
@@ -234,6 +249,7 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
 
     let mut best_sim = 0.0f64;
     let mut best_start = 0usize;
+    let mut applicable = None;
 
     for start in 0..=content_lines.len() - search_lines.len() {
         let window_norm = content_norm_lines[start..start + search_lines.len()].join("\n");
@@ -242,15 +258,18 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
             best_sim = sim;
             best_start = start;
         }
-        if sim >= 0.999 {
-            break;
+        if sim >= 0.85 {
+            if let Some((first_start, first_sim)) = applicable {
+                return MatchResult::AmbiguousFuzzy((first_start + 1, first_sim), (start + 1, sim));
+            }
+            applicable = Some((start, sim));
         }
     }
 
-    if best_sim >= 0.85 {
-        let byte_start = spans[best_start].start;
-        let byte_end = spans[best_start + search_lines.len() - 1].content_end;
-        MatchResult::FuzzyApply(byte_start, byte_end, best_sim)
+    if let Some((start, sim)) = applicable {
+        let byte_start = spans[start].start;
+        let byte_end = spans[start + search_lines.len() - 1].content_end;
+        MatchResult::FuzzyApply(byte_start, byte_end, sim)
     } else if best_sim >= 0.60 {
         let preview: String = content_lines[best_start..]
             .iter()
@@ -268,12 +287,49 @@ fn count_exact_matches(content: &str, search: &str) -> usize {
     content.match_indices(search).count()
 }
 
+fn dominant_line_ending(content: &str) -> &'static str {
+    let crlf = content
+        .as_bytes()
+        .windows(2)
+        .filter(|w| *w == b"\r\n")
+        .count();
+    let total_lf = content
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let bare_lf = total_lf.saturating_sub(crlf);
+    if crlf > bare_lf { "\r\n" } else { "\n" }
+}
+
+fn with_line_ending(text: &str, line_ending: &str) -> String {
+    let normalized = text.replace("\r\n", "\n");
+    if line_ending == "\n" {
+        normalized
+    } else {
+        normalized.replace('\n', line_ending)
+    }
+}
+
+fn bounded_match_excerpt(content: &str, start: usize, end: usize) -> String {
+    const MAX_CHARS: usize = 240;
+    let matched = &content[start..end];
+    let mut chars = matched.chars();
+    let excerpt: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
 async fn handle_similarity(
     path: &str,
     block: &str,
     content: &str,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     let blocks = parse_blocks(block)?;
+    let line_ending = dominant_line_ending(content);
 
     struct ResolvedSim {
         byte_start: usize,
@@ -291,16 +347,18 @@ async fn handle_similarity(
             String::new()
         };
 
-        match find_best_match(content, &blk.search) {
+        let search = with_line_ending(&blk.search, line_ending);
+        let replace = with_line_ending(&blk.replace, line_ending);
+        match find_best_match(content, &search) {
             MatchResult::Exact(pos) => {
-                let count = count_exact_matches(content, &blk.search);
+                let count = count_exact_matches(content, &search);
                 if count > 1 {
                     let line_starts: Vec<usize> = std::iter::once(0)
                         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
                         .collect();
 
                     let mut match_info = Vec::new();
-                    for byte_idx in content.match_indices(&blk.search).map(|(i, _)| i) {
+                    for byte_idx in content.match_indices(&search).map(|(i, _)| i) {
                         let line_num = match line_starts.binary_search(&byte_idx) {
                             Ok(i) => i + 1,
                             Err(i) => i,
@@ -323,8 +381,8 @@ async fn handle_similarity(
                 }
                 resolved.push(ResolvedSim {
                     byte_start: pos,
-                    byte_end: pos + blk.search.len(),
-                    replace: blk.replace.clone(),
+                    byte_end: pos + search.len(),
+                    replace: replace.clone(),
                     note: String::new(),
                 });
             }
@@ -332,17 +390,40 @@ async fn handle_similarity(
                 resolved.push(ResolvedSim {
                     byte_start: start,
                     byte_end: end,
-                    replace: blk.replace.clone(),
-                    note: "matched after whitespace normalization".to_string(),
+                    replace: replace.clone(),
+                    note: format!(
+                        "matched after whitespace normalization; replaced region:\n{}",
+                        bounded_match_excerpt(content, start, end)
+                    ),
                 });
+            }
+            MatchResult::AmbiguousNormalized(first_line, second_line) => {
+                return Err(ToolError::Msg(format!(
+                    "{label}search text matched more than once after whitespace normalization in {} (including lines {} and {}).\n\nAdd more surrounding context to the SEARCH block to make it unique.",
+                    path, first_line, second_line,
+                )));
             }
             MatchResult::FuzzyApply(start, end, sim) => {
                 resolved.push(ResolvedSim {
                     byte_start: start,
                     byte_end: end,
-                    replace: blk.replace.clone(),
-                    note: format!("fuzzy match, {:.0}% similarity", sim * 100.0),
+                    replace: replace.clone(),
+                    note: format!(
+                        "fuzzy match, {:.0}% similarity; replaced region:\n{}",
+                        sim * 100.0,
+                        bounded_match_excerpt(content, start, end)
+                    ),
                 });
+            }
+            MatchResult::AmbiguousFuzzy(first, second) => {
+                return Err(ToolError::Msg(format!(
+                    "{label}search text had multiple fuzzy matches above the apply threshold in {}: line {} ({:.0}%) and line {} ({:.0}%).\n\nCopy the exact text or add more surrounding context to make the SEARCH block unique.",
+                    path,
+                    first.0,
+                    first.1 * 100.0,
+                    second.0,
+                    second.1 * 100.0,
+                )));
             }
             MatchResult::FuzzySuggest(line, sim, preview) => {
                 return Err(ToolError::Msg(format!(
@@ -476,6 +557,7 @@ async fn handle_hashedit(
     let content_lines: Vec<&str> = spans.iter().map(|span| span.text).collect();
     let notes = Vec::new();
     let mut ranges = Vec::new();
+    let line_ending = dominant_line_ending(content);
 
     for (i, op) in edits.iter().enumerate() {
         let label = if edits.len() > 1 {
@@ -497,7 +579,11 @@ async fn handle_hashedit(
 
                 let (byte_start, byte_end) =
                     line_range_to_byte_range(&spans, line_num, line_num, op.text.is_empty());
-                ranges.push((byte_start, byte_end, op.text.clone()));
+                ranges.push((
+                    byte_start,
+                    byte_end,
+                    with_line_ending(&op.text, line_ending),
+                ));
             }
             (None, Some(multi_lines)) => {
                 let entries = extract_line_info(multi_lines)?;
@@ -530,7 +616,11 @@ async fn handle_hashedit(
                 let end_line = entries[entries.len() - 1].0;
                 let (byte_start, byte_end) =
                     line_range_to_byte_range(&spans, start_line, end_line, op.text.is_empty());
-                ranges.push((byte_start, byte_end, op.text.clone()));
+                ranges.push((
+                    byte_start,
+                    byte_end,
+                    with_line_ending(&op.text, line_ending),
+                ));
             }
             (Some(_), Some(_)) => {
                 return Err(ToolError::Msg(format!(
@@ -816,6 +906,21 @@ impl Tool for EditTool {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod match_excerpt_tests {
+    use super::bounded_match_excerpt;
+
+    #[test]
+    fn non_exact_match_excerpt_is_bounded_on_character_boundaries() {
+        let content = "é".repeat(300);
+        let excerpt = bounded_match_excerpt(&content, 0, content.len());
+
+        assert_eq!(excerpt.chars().count(), 241);
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(excerpt.trim_end_matches('…'), "é".repeat(240));
     }
 }
 
