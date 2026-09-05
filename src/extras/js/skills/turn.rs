@@ -213,6 +213,9 @@ impl SkillRuntime {
                     diagnostics.push(format!("learned_js_refresh_state_unavailable:{error}"))
                 }
             }
+            if let Some(error) = coordinator.rebuild_backoff_diagnostic() {
+                diagnostics.push(format!("learned_js_refresh_backoff:{error}"));
+            }
         }
 
         let mut learned_bundle = TurnSkillBundle {

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -18,6 +19,8 @@ use super::lifecycle::LifecycleStatus;
 use super::router::CanaryCandidate;
 
 const EMBEDDING_BATCH_SIZE: usize = 256;
+const REBUILD_BACKOFF_BASE: Duration = Duration::from_secs(1);
+const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
@@ -51,8 +54,16 @@ pub struct IndexCoordinator {
     published: RwLock<Arc<ImmutableSkillIndex>>,
     hydrated: AtomicBool,
     rebuild_in_flight: AtomicBool,
+    rebuild_backoff: Mutex<RebuildBackoff>,
     #[cfg(test)]
     rebuild_starts: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct RebuildBackoff {
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+    last_error: Option<String>,
 }
 
 struct RebuildFlightGuard<'a>(&'a AtomicBool);
@@ -93,6 +104,7 @@ impl IndexCoordinator {
             published: RwLock::new(empty),
             hydrated: AtomicBool::new(false),
             rebuild_in_flight: AtomicBool::new(false),
+            rebuild_backoff: Mutex::new(RebuildBackoff::default()),
             #[cfg(test)]
             rebuild_starts: AtomicUsize::new(0),
         })
@@ -124,6 +136,9 @@ impl IndexCoordinator {
     /// immutable generation. The caller deliberately does not await the join
     /// handle: the current agent work scope owns it through cancellation.
     pub fn schedule_rebuild(self: &Arc<Self>) -> bool {
+        if self.rebuild_backoff_active().unwrap_or(true) {
+            return false;
+        }
         if self
             .rebuild_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -288,6 +303,7 @@ impl IndexCoordinator {
                 })?;
                 *published = Arc::new(snapshot);
                 self.hydrated.store(true, Ordering::Release);
+                self.reset_rebuild_backoff();
                 Ok((
                     result,
                     PublicationReport {
@@ -298,6 +314,7 @@ impl IndexCoordinator {
                 ))
             }
             Err(error) => {
+                self.record_rebuild_failure(&error);
                 let diagnostic = error.to_string();
                 store
                     .mark_generation_applied_with_mode(
@@ -355,6 +372,15 @@ impl IndexCoordinator {
     /// Recover a pending generation or request and publish a fresh generation.
     /// This performs embedding and SQLite work and must run on a blocking worker.
     pub fn rebuild_and_publish(&self) -> Result<u64, CoordinatorError> {
+        let result = self.rebuild_and_publish_inner();
+        match &result {
+            Ok(_) => self.reset_rebuild_backoff(),
+            Err(error) => self.record_rebuild_failure(error),
+        }
+        result
+    }
+
+    fn rebuild_and_publish_inner(&self) -> Result<u64, CoordinatorError> {
         let model = self.embedder.model_metadata().clone();
         let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
         let state = store.generation_state()?;
@@ -372,7 +398,11 @@ impl IndexCoordinator {
         let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
         let missing = initial
             .iter()
-            .filter(|(_, embedding, _)| embedding.is_none())
+            .filter(|(_, embedding, _)| {
+                embedding
+                    .as_ref()
+                    .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
+            })
             .map(|(artifact, _, _)| (artifact.id.clone(), skill_document(artifact)))
             .collect::<Vec<_>>();
         for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
@@ -441,6 +471,44 @@ impl IndexCoordinator {
         Ok(generation)
     }
 
+    fn rebuild_backoff_active(&self) -> Result<bool, CoordinatorError> {
+        let state = self
+            .rebuild_backoff
+            .lock()
+            .map_err(|_| CoordinatorError::Poisoned)?;
+        Ok(state
+            .retry_not_before
+            .is_some_and(|retry_not_before| Instant::now() < retry_not_before))
+    }
+
+    fn record_rebuild_failure(&self, error: &CoordinatorError) {
+        let Ok(mut state) = self.rebuild_backoff.lock() else {
+            return;
+        };
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let shift = state.consecutive_failures.saturating_sub(1).min(6);
+        let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let delay = REBUILD_BACKOFF_BASE
+            .saturating_mul(multiplier)
+            .min(REBUILD_BACKOFF_MAX);
+        state.retry_not_before = Some(Instant::now() + delay);
+        state.last_error = Some(error.to_string());
+    }
+
+    fn reset_rebuild_backoff(&self) {
+        if let Ok(mut state) = self.rebuild_backoff.lock() {
+            *state = RebuildBackoff::default();
+        }
+    }
+
+    pub(crate) fn rebuild_backoff_diagnostic(&self) -> Option<String> {
+        let state = self.rebuild_backoff.lock().ok()?;
+        state
+            .retry_not_before
+            .filter(|retry_not_before| Instant::now() < *retry_not_before)
+            .and_then(|_| state.last_error.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn rebuild_starts_for_test(&self) -> usize {
         self.rebuild_starts.load(Ordering::Relaxed)
@@ -501,7 +569,11 @@ fn build_generation(
     let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
     let missing = initial
         .iter()
-        .filter(|(_, embedding, _)| embedding.is_none())
+        .filter(|(_, embedding, _)| {
+            embedding
+                .as_ref()
+                .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
+        })
         .map(|(artifact, _, _)| (artifact.id.clone(), skill_document(artifact)))
         .collect::<Vec<_>>();
     for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
@@ -575,9 +647,23 @@ fn refresh_snapshot_embeddings(
                 skill_id: artifact.id.clone(),
                 reason: "compatible vector is missing after rebuild".to_string(),
             })?;
+            if !embedding_is_compatible(&embedding, model) {
+                return Err(StoreError::MalformedEmbedding {
+                    skill_id: artifact.id,
+                    reason: "embedding metadata is incompatible after rebuild".to_string(),
+                });
+            }
             Ok((artifact, embedding, metadata))
         })
         .collect()
+}
+
+fn embedding_is_compatible(embedding: &StoredEmbedding, model: &ModelMetadata) -> bool {
+    embedding.model_id == model.model_id
+        && embedding.model_revision == model.model_revision
+        && embedding.dimensions == model.dimensions
+        && embedding.normalized == model.normalized
+        && embedding.values.len() == model.dimensions
 }
 
 fn skill_document(artifact: &super::SkillArtifact) -> String {

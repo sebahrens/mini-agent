@@ -500,9 +500,9 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 3. **Store concurrency** (mini-agent-pwf2). The store opens with WAL journaling and a busy
    timeout; every read-modify-write transaction begins `IMMEDIATE`. Dropping a telemetry batch
    because of `SQLITE_BUSY` is a defect covered by a contention test.
-4. **Corrupt rows** (mini-agent-jj8b). A row whose embedding cannot be decoded is skipped and
-   reported like a malformed artifact row; it never darkens the index or triggers a rebuild on
-   every turn, and repeated rebuild failures back off.
+4. **Corrupt rows** (mini-agent-jj8b, delivered). A row whose embedding cannot be decoded is
+   skipped and reported like a malformed artifact row; it never darkens the index or triggers a
+   rebuild on every turn, and repeated rebuild failures back off.
 5. **Canary embeddings** (mini-agent-c8q6). Rebuilds backfill canary rows so an embedding model
    change cannot silently un-route them.
 

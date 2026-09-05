@@ -177,6 +177,20 @@ fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
     let coordinator = IndexCoordinator::open(&paths, embedder).unwrap();
     coordinator.rebuild_and_publish().unwrap();
     assert!(coordinator.lease().unwrap().contains_id(&predecessor.id));
+    // A malformed row is now treated as missing and repaired. Keep this test's
+    // publication-failure contract by making the repair write itself fail only
+    // after the initial active generation has been built.
+    SkillStore::open_at(&paths)
+        .unwrap()
+        .conn_mut()
+        .execute_batch(
+            "CREATE TRIGGER fail_embedding_repair
+             BEFORE INSERT ON skill_embeddings
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected embedding repair failure');
+             END;",
+        )
+        .unwrap();
     let report = coordinator
         .coordinate_mutation(
             std::collections::HashSet::from([predecessor.id.clone()]),

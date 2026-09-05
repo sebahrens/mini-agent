@@ -637,14 +637,20 @@ impl SkillStore {
                 superseded_by_id,
                 row_version: u64::try_from(row_version).unwrap_or(0),
             };
-            let embedding = decode_stored_embedding(
+            let embedding = match decode_stored_embedding(
                 &artifact.id,
                 model_id,
                 model_revision,
                 dimensions,
                 normalized,
                 bytes,
-            )?;
+            ) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    tracing::warn!(skill_id = %artifact.id, %error, "ignoring corrupt learned-skill embedding row");
+                    None
+                }
+            };
             snapshot.push((artifact, embedding, metadata));
         }
         Ok(snapshot)
@@ -701,14 +707,20 @@ impl SkillStore {
                 superseded_by_id,
                 row_version: u64::try_from(row_version).unwrap_or(0),
             };
-            let embedding = decode_stored_embedding(
+            let embedding = match decode_stored_embedding(
                 &id,
                 model_id,
                 model_revision,
                 dimensions,
                 normalized,
                 bytes,
-            )?;
+            ) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    tracing::warn!(skill_id = %id, %error, "ignoring corrupt learned-skill embedding row");
+                    None
+                }
+            };
             snapshot.push((id, embedding, metadata));
         }
         Ok(snapshot)

@@ -59,6 +59,34 @@ struct ConcurrentAdmissionBackend {
     artifact: Mutex<Option<SkillArtifact>>,
 }
 
+struct FailingEmbeddingBackend;
+
+impl EmbeddingBackend for FailingEmbeddingBackend {
+    fn embed_documents(&self, _documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Err(EmbeddingError::RequestFailed("fixture outage".to_string()))
+    }
+
+    fn embed_query(&self, _query: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Err(EmbeddingError::RequestFailed("fixture outage".to_string()))
+    }
+
+    fn model_id(&self) -> &str {
+        "failing-fixture"
+    }
+
+    fn model_revision(&self) -> &str {
+        "v1"
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn normalized(&self) -> bool {
+        true
+    }
+}
+
 impl EmbeddingBackend for ConcurrentAdmissionBackend {
     fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if let Some(artifact) = self.artifact.lock().unwrap().take() {
@@ -333,6 +361,121 @@ fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
         )
         .unwrap();
     assert_eq!(stored_bytes, vector_bytes(&expected));
+}
+
+#[test]
+fn corrupt_embedding_row_is_reported_as_missing_and_repaired_without_hiding_siblings() {
+    let temp = TempPaths::new();
+    let first = artifact("parseJson", "Parse JSON documents.", "json");
+    let second = artifact("parseCsv", "Parse CSV documents.", "csv");
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&first).unwrap();
+    store.insert_verified(&second).unwrap();
+    drop(store);
+
+    let embedder = Arc::new(Embedder::new().unwrap());
+    let model = embedder.model_metadata().clone();
+    let coordinator = IndexCoordinator::open(&temp.paths, Arc::clone(&embedder)).unwrap();
+    coordinator.rebuild_and_publish().unwrap();
+    assert_eq!(coordinator.lease().unwrap().len(), 2);
+    drop(coordinator);
+
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_embeddings SET embedding = X'00' WHERE skill_id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+    store
+        .request_generation(
+            &model.model_id,
+            &model.model_revision,
+            model.dimensions,
+            model.normalized,
+        )
+        .unwrap();
+    let rows = store
+        .snapshot_rows(&model.model_id, &model.model_revision)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .find(|(artifact, _, _)| artifact.id == first.id)
+            .is_some_and(|(_, embedding, _)| embedding.is_none())
+    );
+    assert!(
+        rows.iter()
+            .find(|(artifact, _, _)| artifact.id == second.id)
+            .is_some_and(|(_, embedding, _)| embedding.is_some())
+    );
+    drop(store);
+
+    let reopened = IndexCoordinator::open(&temp.paths, Arc::clone(&embedder)).unwrap();
+    reopened.rebuild_and_publish().unwrap();
+    assert_eq!(reopened.lease().unwrap().len(), 2);
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    assert!(
+        store
+            .get_embedding(&first.id, &model.model_id, &model.model_revision)
+            .unwrap()
+            .is_some(),
+        "the rebuild should replace the corrupt row"
+    );
+    drop(store);
+    drop(reopened);
+
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_embeddings SET normalized = 2 WHERE skill_id = ?1",
+            [&first.id],
+        )
+        .unwrap();
+    store
+        .request_generation(
+            &model.model_id,
+            &model.model_revision,
+            model.dimensions,
+            model.normalized,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = IndexCoordinator::open(&temp.paths, embedder).unwrap();
+    reopened.rebuild_and_publish().unwrap();
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    assert!(
+        store
+            .get_embedding(&first.id, &model.model_id, &model.model_revision)
+            .unwrap()
+            .is_some_and(|embedding| embedding.normalized),
+        "incompatible metadata should also be re-embedded"
+    );
+}
+
+#[test]
+fn failed_rebuilds_back_off_before_another_background_attempt() {
+    let temp = TempPaths::new();
+    let skill = artifact("parseJson", "Parse JSON documents.", "json");
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&skill))
+        .unwrap();
+    let embedder = Arc::new(Embedder::with_backend(Arc::new(FailingEmbeddingBackend)).unwrap());
+    let coordinator = Arc::new(IndexCoordinator::open(&temp.paths, embedder).unwrap());
+
+    let error = coordinator.rebuild_and_publish().unwrap_err();
+    assert!(error.to_string().contains("fixture outage"));
+    assert!(coordinator.needs_refresh().unwrap());
+    assert!(
+        coordinator
+            .rebuild_backoff_diagnostic()
+            .is_some_and(|diagnostic| diagnostic.contains("fixture outage"))
+    );
+    assert!(!coordinator.schedule_rebuild());
+    assert_eq!(coordinator.rebuild_starts_for_test(), 0);
 }
 
 #[test]
