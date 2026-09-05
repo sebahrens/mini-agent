@@ -4,11 +4,19 @@
 - **Overview version**: 2.0.0
 - **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-09
+- **Last reconciled**: 2026-09-05
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the specifications it indexes. This file maps
 the current implementation; it cannot override those contracts.
+
+## Pending amendments
+
+See `docs/specs/00-index.md` → *Accepted amendments pending delivery (2026-09-05)* and
+[the review plan](docs/plans/2026-09-05-001-harness-design-review.md). Current model-facing
+limits worth knowing before they land: model script runs in strict script mode without top-level
+`await`; all JavaScript failures render as `exception`; only `read_file`, `write_file`, `fetch`,
+and (Linux/Windows) `spawn` effects exist; `propose_skill` is not registered.
 
 ## Foundation — paths and persistence
 

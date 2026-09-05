@@ -108,9 +108,18 @@ The filename stem is the `agent_type` value and must be 1–64 lowercase ASCII
 letters, digits, or hyphens, without leading, trailing, or repeated hyphens.
 An optional YAML frontmatter block may declare a matching `name`; the block is
 validated and removed before the prompt is installed. Malformed metadata,
-mismatched names, and empty prompt bodies are ignored. The tool schema resolves
-the installed definitions dynamically, so adding a valid file does not require
-a hard-coded roster update.
+mismatched names, and empty prompt bodies are ignored silently and the
+compiled-in definition of the same name is used instead (mini-agent-cflr). The
+`agent_type` schema field is a plain string: the installed definitions are
+resolved dynamically when a call is validated, and the valid names are listed
+only in the error returned for an unknown name. The schema does not enumerate
+them yet (mini-agent-kh1o). Frontmatter keys other than `name` (for example
+`tools:` or `model:`) are ignored (mini-agent-6khf).
+
+Project definitions are loaded without a project-trust check; a checkout can
+therefore replace a specialist's prompt, and the base prompt tells the child
+that the specialization overrides its defaults. The read-only tool set still
+holds. Trust gating is planned (mini-agent-yb9w).
 
 ## What the Subagent Can Do
 
@@ -136,7 +145,7 @@ a hard-coded roster update.
 |----------------|-----------------------------------------|
 | `write`        | Subagent is read-only by design         |
 | `edit`         | Subagent is read-only by design         |
-| `bash`         | Not needed — read tools cover exploration |
+| `bash`         | Children stay inside the read-only containment boundary; they cannot run builds or tests and must say so |
 | `memory_write` | Subagent should not persist memory      |
 | `todo`         | Not registered — no planning tool in child context |
 | `task`         | Nested subagents are deliberately unsupported |
@@ -174,7 +183,7 @@ normal TOML/YAML/JSON zerostack configuration described in
 | `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
 | `task_max_output_bytes`     | `usize`  | `262144` (256 KiB)       | Hard cap on the complete returned tool output |
 | `task_max_cost_units`       | `u64`    | `500000`                 | Aggregate provider token/cost-unit budget |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline. A fixed 300 s per-child cap also applies and is not configurable (mini-agent-166x) |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
 | `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
@@ -211,6 +220,25 @@ task_enabled = true
 subagent_model = "deepseek-v4-flash"
 subagent_provider = "openrouter"
 ```
+
+## Known limits and planned changes (2026-09-05 review)
+
+- A child that reaches `task_max_turns` currently fails with a provider `MaxTurnsError`; the
+  failure cancels the other prompts in the same call and its partial text is discarded
+  (mini-agent-ddno). Planned: return the partial report with a `[partial: turn budget
+  exhausted]` marker and keep siblings running.
+- `SubagentStart`/`SubagentStop` hooks receive the fixed agent type `explore` regardless of
+  `agent_type` (mini-agent-abys).
+- The child receives only the prompt string: no conversation history, files, or constraints,
+  and it returns free text. Planned: a structured brief (`objective`, `files`, `constraints`,
+  `expected_sections`) and a host-checked return skeleton (Findings, Unverified, Coverage)
+  (mini-agent-nfd7, mini-agent-sux9).
+- Planned: per-persona `model`, `tools` subset, and `description` frontmatter
+  (mini-agent-6khf); persona names in the schema enum and in the orchestrator prompt
+  (mini-agent-kh1o); trust-gated project definitions (mini-agent-yb9w); an append-only project
+  notes layer so embedded personas can stay generic (mini-agent-7hjo).
+
+See [the review plan](../plans/2026-09-05-001-harness-design-review.md) for the full list.
 
 ## Slash Commands
 

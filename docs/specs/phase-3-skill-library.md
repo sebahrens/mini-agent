@@ -1,10 +1,10 @@
 # Phase 3 — Skill Library
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-09-05
 - **Entry dependencies**: Foundation and Phase 1 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 3 blocker
 
@@ -488,6 +488,34 @@ not accept an “already verified” caller assertion without a corresponding tr
 report tied to the full artifact ID.
 
 ---
+
+## Accepted amendments (2026-09-05, pending delivery)
+
+Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
+Until the named bead is closed with its tests, the pre-amendment text remains the delivered
+contract.
+
+1. **Backend-aware dense retrieval** (mini-agent-bfsg). The `Deterministic` embedding backend
+   carries no semantic meaning. When it is the active backend, dense retrieval is disabled
+   (lexical channel only) for both learned-JS and Agent-Skill indexes, and startup reports that
+   semantic retrieval is unavailable. Score floors are per backend; a floor that admits random
+   vectors is a defect.
+2. **Lexical query semantics** (mini-agent-io7h). The FTS5 query is an OR over stop-worded,
+   IDF-weighted prompt terms ranked by BM25 (or NEAR groups), never an AND over every term. The
+   benchmark gains a natural-language prompt case that must match through the lexical channel.
+3. **Skill context delivery** (mini-agent-rd89). The trusted skill context is delivered as a
+   per-request block outside the persisted user text (system slot or ephemeral block) so it is
+   neither spoofable by an unescaped prompt nor accumulated in conversation history.
+4. **Callable-export manifest** (mini-agent-4bqq). The model-visible manifest states that each
+   export is a callable global inside the `js` tool, shows one call example per skill, and omits
+   routing internals (route policy, share basis points, fingerprints).
+5. **Per-turn bundle caching** (mini-agent-ml1a). The worker may cache compiled artifacts keyed
+   by turn id, skill id, and identity for the duration of one frozen bundle; the parent may send
+   identities instead of source after the first step of a turn. Identity verification still
+   precedes every load.
+
+Proposal under decision (not accepted): a bounded model-issued `skills_search(query)` effect
+returning metadata only (mini-agent-a8a0). See the open decision in `00-index.md`.
 
 ## Acceptance criteria
 

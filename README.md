@@ -190,6 +190,11 @@ This is **bounded self-improvement**, not uncontrolled self-modification:
 - failures can quarantine a revision without deleting its audit history; and
 - repair creates a new immutable revision, so rollback never means guessing what changed.
 
+In the current release the proposal path is not registered in the shipped binary and there is
+no operator command to import or approve skills; the library, verification, and lifecycle code
+ship, but the store stays empty until the planned operator surface lands
+([review plan](docs/plans/2026-09-05-001-harness-design-review.md)).
+
 Over time, the agent spends fewer tokens rediscovering reliable transformations and gains
 domain-specific tools shaped by the repository it actually works in. The library becomes a compact
 record of executable know-how rather than a growing prompt full of prose recipes.

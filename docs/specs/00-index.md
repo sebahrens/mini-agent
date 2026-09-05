@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.3.0
+- **Specification version**: 1.4.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-09
+- **Last reconciled**: 2026-09-05
 
 ## Authority and conflict resolution
 
@@ -58,6 +58,34 @@ its original phase.
 | Phase 3, `Runtime binding` and `No-effect skill verification` | Same-context source binding and parent/in-thread verifier runtime ownership | `Capability broker`, `Verification parity` | Frozen turn bundle, declared exports, deterministic fake semantics, exact-true tests |
 | Phase 4, `propose_skill()` and proposal persistence | Identity-v1 flat capability payload, JS-thread host placement, and direct access to durable enqueue | `Capability broker`, `Persistence boundary` | Proposal field bounds, held-out evaluation, human approval gates |
 | Phase 5, `Lifecycle and immutable lineage` and `Automatic quarantine` | Normal lifecycle treatment of identity-v1 artifacts during Phase 6 migration | `Persistence boundary`, `Failure semantics` | Evidence policy, transactional lifecycle/index coordination, repair/rollback for eligible identities, retention |
+
+## Accepted amendments pending delivery (2026-09-05)
+
+The [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md)
+accepted the amendments below. Each owning phase spec carries the normative wording in a section
+named **Accepted amendments (2026-09-05, pending delivery)**. An amendment is not delivered until
+its bead is closed with the tests named there; until then the pre-amendment text stays in force
+for status claims. No amendment changes the Phase 6 canonical checklist.
+
+| Amendment | Owning spec | Bead |
+|-----------|-------------|------|
+| Async evaluation of model script; documented script semantics and limits | Phase 6 | mini-agent-ml1u, mini-agent-7w1l |
+| Closed exception class and validated line/column in diagnostics (protocol v4) | Phase 6 | mini-agent-m2kw |
+| Effect-count exhaustion as a bounded step error | Phase 6 | mini-agent-12cr |
+| Read-only `list_dir`/`glob`/`grep` effects and batched `read_files` | Phase 6 (narrowing per Phase 2) | mini-agent-w2lv, mini-agent-ae65 |
+| Distinct closed denial codes; permission-wait rendering | Phase 6 | mini-agent-dr93, mini-agent-osaj |
+| Typed result channel and parent-owned JSON scratch store (design gate) | Phase 6 | mini-agent-yl18 |
+| Deterministic backend disables dense retrieval; OR/BM25 lexical query | Phase 3 | mini-agent-bfsg, mini-agent-io7h |
+| Skill context outside persisted user text; callable-export manifest | Phase 3 | mini-agent-rd89, mini-agent-4bqq |
+| Operator surface (import/approve/reject/stats) and seed library | Phase 4 | mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t |
+| Fault-only quarantine, canary ordering, WAL/immediate transactions, corrupt-row skipping | Phase 5 | mini-agent-lugc, mini-agent-840z, mini-agent-pwf2, mini-agent-jj8b |
+
+**Open decision.** The cross-phase invariant "Phase 3 retrieval must be driven by the current
+user prompt before model generation; generated JavaScript is never the retrieval query" remains
+in force. mini-agent-a8a0 proposes a bounded, model-issued `skills_search` effect that returns
+metadata only and never injects source into the frozen turn bundle. Adopting it requires an
+explicit amendment to that invariant in this index; until then it is a proposal, not an accepted
+amendment.
 
 ## Feature relationships
 

@@ -6,6 +6,14 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Documented the 2026-09-05 harness design review (epic `mini-agent-5ana`): spec index 1.4.0,
+  Phase 6 1.1.0, Phase 3 1.3.0, Phase 4 1.3.0, and Phase 5 1.2.0 gain *Accepted amendments
+  (2026-09-05, pending delivery)* sections; agent docs now state the current limits of the
+  `js` surface, learned-skill retrieval, subagent personas, memory refresh, and the shell
+  deadline. No runtime behavior changed.
+
 ## [1.8.0] - 2026-09-03
 
 ### Added

@@ -4,7 +4,7 @@
 - **Overview version**: 2.0.0
 - **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-09
+- **Last reconciled**: 2026-09-05
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the phase specifications it indexes. If this
@@ -21,6 +21,15 @@ its own policy services.
 This architecture supplements Bash and other process-bearing features. It does not port shell
 hooks or make hooks, MCP servers, LSPs, loop validation, or the explicit interactive shell part of
 the JS worker boundary.
+
+## Pending amendments
+
+The [2026-09-05 harness design review](docs/plans/2026-09-05-001-harness-design-review.md)
+accepted additive changes to the model-facing surface (async model script, closed exception
+class with line/column, read-only discovery and batched effects, distinct denial codes, a typed
+result channel) and to skill retrieval and operator commands. They are recorded per owning spec
+under **Accepted amendments (2026-09-05, pending delivery)** and are not described as delivered
+anywhere in this overview until their beads close.
 
 ## Execution and trust boundary
 

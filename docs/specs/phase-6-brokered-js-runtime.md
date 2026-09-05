@@ -1,10 +1,10 @@
 # Phase 6 — Brokered Cross-Platform JavaScript Runtime
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.0.0
+- **Specification version**: 1.1.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-09
+- **Last reconciled**: 2026-09-05
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
 - **Exit dependency**: every gate and acceptance requirement in this document
 
@@ -887,7 +887,9 @@ publication cannot begin. If the writer wins that atomic start decision, cancell
 bounded while the already-approved syscall may finish and the result stays `outcome_unknown`. JS
 receives `spawn` authority only when the configured process sandbox
 owns the complete descendant lifetime independently of process-group membership (currently the
-Linux bwrap PID namespace). Elsewhere spawn fails closed before intent. Within that boundary, spawn
+Linux bwrap PID namespace and the attested Windows AppContainer backend; never macOS Seatbelt).
+Elsewhere spawn fails closed before intent, although the `spawn` global is still installed and
+throws `capability_denied` (mini-agent-7u1n). Within that boundary, spawn
 cancellation signals the command-specific token, kills the process group and containing namespace,
 reaps the direct child, and then records `outcome_unknown` because the program may already have
 changed external state. Fetch preserves its one outer wall-clock
@@ -932,6 +934,54 @@ Proposal cancellation is exact before queue dispatch and returns `cancelled`. Af
 entered the bounded queue, cancellation returns `outcome_unknown` while a detached blocking waiter
 drains the response; the broker durably reconciles that ambiguous outcome before recycling the
 invocation. Callers must not replay that proposal automatically.
+
+## Accepted amendments (2026-09-05, pending delivery)
+
+Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
+Each item is additive under the canonical checklist above; none relaxes an invariant. Until the
+named bead is closed with its tests, the pre-amendment behavior remains the delivered contract.
+
+1. **Async evaluation of model script** (mini-agent-ml1u). The worker evaluates `agent.js` in a
+   mode that permits top-level `await` (rquickjs promise/async evaluation or an implicit async
+   wrapper), settling the returned promise inside the existing bounded pending-job drain and the
+   pre-installed interrupt deadline. The effect globals stay synchronous; awaiting them is a
+   no-op. The tool description states strict-mode script semantics, the absence of persistent
+   state between steps, and every limit (deadline, heap, result, console, read/write, spawn
+   output, effects per step) (mini-agent-7w1l, mini-agent-b7xb).
+2. **Closed exception class and location** (mini-agent-m2kw). `Failure semantics` already allows
+   a closed class and validated source-free location. The worker derives, from the caught
+   exception, only the constructor name mapped onto a closed allow-list
+   (`SyntaxError`, `TypeError`, `ReferenceError`, `RangeError`, `InternalError`, `other`) and the
+   integer line/column of the model's own script, then discards the exception. Protocol v4
+   reintroduces the position fields removed in v3. Stored-skill and verifier scripts never
+   report positions. Messages, names outside the allow-list, stacks, and thrown values remain
+   forbidden.
+3. **Effect-count exhaustion** (mini-agent-12cr). Reaching `MAX_EFFECTS_PER_STEP` is a bounded
+   step failure with closed code `effect_limit` that returns the console records collected so
+   far; it is not a protocol fault and does not exit the worker. A worker that continues to
+   dispatch effects after that failure is still a protocol fault.
+4. **Read-only discovery effects** (mini-agent-w2lv). `list_dir(path)`, `glob(pattern)`, and
+   `grep(pattern, options)` are typed read-only effects executed by the parent file service
+   under the same invocation grant, workspace binding, Phase 2 prefix narrowing, session
+   permission, and durable audit as `read_file`. They return bounded JSON (entries, paths,
+   `{path, line, text}` matches) and never file contents beyond the matched line. They are
+   available on every platform and do not depend on `spawn` authority.
+5. **Batched effects** (mini-agent-ae65). `read_files([paths])` (and any later batch form)
+   is one effect request carrying one intent and one completion record, while every path is
+   narrowed, permission-checked, and size-bounded individually; a single denied path fails the
+   batch closed before any read. Audit records within one step may be group-committed as long as
+   intent still precedes the first byte of the effect.
+6. **Closed denial codes** (mini-agent-dr93). `EffectErrorCode` gains `not_found`,
+   `is_directory`, `denied`, and `too_large`. Codes are chosen by the parent from its own
+   observations and remain free of target text.
+7. **Permission-wait rendering** (mini-agent-osaj). When the shared deadline expires while a
+   permission `Ask` is pending, the parent renders the closed code `permission_wait_expired`
+   instead of the compute-timeout template. The deadline itself is unchanged.
+8. **Typed result and scratch store** (mini-agent-yl18, design gate). A `result(value)` terminal
+   effect returning JSON-shaped data with parent-side validation, and `scratch_put(key, json)` /
+   `scratch_get(key)` effects backed by a parent-owned, session-scoped, size-capped, audited
+   JSON store, are accepted in principle. Neither persists QuickJS state; both require a written
+   design against this checklist before implementation.
 
 ## Acceptance matrix
 

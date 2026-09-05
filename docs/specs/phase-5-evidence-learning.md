@@ -1,10 +1,10 @@
 # Phase 5 — Evidence-Based Self-Learning
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: library/test infrastructure delivered; lifecycle operator surface not shipped
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-04
+- **Last reconciled**: 2026-09-05
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
@@ -486,6 +486,25 @@ as alternatives/supersession candidates or retired after review.
 - Automatic decisions never call `unwrap`, silently ignore a store error, or mutate source/tests.
 
 ---
+
+## 12a. Accepted amendments (2026-09-05, pending delivery)
+
+Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
+
+1. **Fault-only quarantine** (mini-agent-lugc). Behavioral quarantine counts faults
+   (`timed_out`, `oom`, `capability_denied`, and `threw` only when the export declares no error
+   contract for that input class); an expected `threw` caused by caller input is telemetry, not
+   evidence against the revision. A typed skill input error distinguishes the two.
+2. **Canary ordering** (mini-agent-840z). When several canaries supersede one active revision,
+   routing selects by age and observed invocation count, never by lexicographic identity.
+3. **Store concurrency** (mini-agent-pwf2). The store opens with WAL journaling and a busy
+   timeout; every read-modify-write transaction begins `IMMEDIATE`. Dropping a telemetry batch
+   because of `SQLITE_BUSY` is a defect covered by a contention test.
+4. **Corrupt rows** (mini-agent-jj8b). A row whose embedding cannot be decoded is skipped and
+   reported like a malformed artifact row; it never darkens the index or triggers a rebuild on
+   every turn, and repeated rebuild failures back off.
+5. **Canary embeddings** (mini-agent-c8q6). Rebuilds backfill canary rows so an embedding model
+   change cannot silently un-route them.
 
 ## 13. Acceptance criteria
 

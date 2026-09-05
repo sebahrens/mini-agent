@@ -1,10 +1,10 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: library/test infrastructure delivered; operator adapter not shipped
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-04
+- **Last reconciled**: 2026-09-05
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
@@ -340,6 +340,23 @@ outputs, raw prompts, tool arguments, file contents, environment values, or secr
 may display source and sanitized metadata only through an explicitly authorized interface.
 
 ---
+
+## Accepted amendments (2026-09-05, pending delivery)
+
+Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
+
+1. **Operator surface** (mini-agent-p0h1). The shipped binary gains authenticated local-owner
+   commands to import a skill draft (verified in the contained worker and inserted as awaiting
+   approval), approve or reject an awaiting revision into or out of canary, and list awaiting
+   revisions. `propose_skill` may be re-registered behind an explicit configuration flag so
+   proposals land in the same queue. Every human gate in this phase is preserved; no command
+   activates code automatically.
+2. **Seed library and Agent-Skill bridge** (mini-agent-vvud). A shipped set of pure learned
+   skills is verified at build/test time through the normal gate, and an Agent Skill may declare
+   the learned-JS identities that accompany it; declaration never bypasses verification or
+   approval.
+3. **Stats surface** (mini-agent-i78t). Per-skill selections, invocations, success rate, and
+   last-use are readable by the operator.
 
 ## Acceptance criteria
 

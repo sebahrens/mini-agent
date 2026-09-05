@@ -25,6 +25,12 @@ dense/FTS/fusion and total-search percentiles, build/rebuild/removal costs, conc
 latency, observed RSS, relevance checks, and the 5 ms p99 verdict. CI validates fields and
 invariants at 2,000 revisions but deliberately does not apply a host-sensitive latency gate.
 
+> **Relevance caveat (2026-09-05).** The reference run used the deterministic hash backend. With
+> that backend a self-query is an exact-string match and every other score is noise, so the
+> self-query and recall figures below measure HNSW fidelity to the exact oracle, not semantic
+> relevance. The shipped backend is `deterministic-v2`; the checked-in result names v1
+> (mini-agent-17x2). Latency, build, and memory figures are unaffected.
+
 ## Latest reference result
 
 The accepted 2026-07-31 debug-profile run used an Intel Core i7-1068NG7 (8 logical CPUs), 32 GiB

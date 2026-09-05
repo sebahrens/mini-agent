@@ -55,6 +55,19 @@ operator command currently invokes those lifecycle mutations.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
 network, process, or sandbox permission paths.
 
+## Current limits and planned changes (2026-09-05 review)
+
+- The default `Deterministic` embedding backend is a hash projection with no semantic meaning;
+  with the default score floor it can select unrelated skills at random. Configure a real
+  embedding backend for meaningful dense retrieval. Planned: dense retrieval is disabled under
+  the deterministic backend (mini-agent-bfsg).
+- The lexical channel requires every prompt word to match, so natural-language prompts rarely
+  match; an OR/BM25 query is planned (mini-agent-io7h).
+- The shipped binary has no command to import, approve, or list learned skills, so the store
+  stays empty in production. An operator surface, a seed library, and a stats view are planned
+  (mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t).
+- The model manifest does not yet say that exports are callable globals (mini-agent-4bqq).
+
 See [the Phase 3 specification](../specs/phase-3-skill-library.md),
 [the Phase 6 brokered-runtime specification](../specs/phase-6-brokered-js-runtime.md), and
 [the 100k benchmark](../benchmarks/skill-retrieval.md) for invariants and measured limits.
