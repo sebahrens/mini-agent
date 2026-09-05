@@ -1,6 +1,9 @@
 #[cfg(feature = "loop")]
 pub mod r#loop;
 
+#[path = "loop/validation.rs"]
+pub(crate) mod validation;
+
 #[cfg(feature = "git-worktree")]
 pub mod git_worktree;
 

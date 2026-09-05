@@ -1446,6 +1446,27 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send retry notification: {}", e);
                 }
             }
+            AgentEvent::Verification {
+                attempt,
+                max,
+                passed,
+                output,
+            } => {
+                let status = if passed { "passed" } else { "failed" };
+                let text = if passed {
+                    format!("verification {status} ({attempt}/{max})")
+                } else {
+                    format!("verification {status} ({attempt}/{max})\n{output}")
+                };
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(chunk),
+                );
+                if let Err(e) = cx.send_notification(notif) {
+                    tracing::warn!("ACP failed to send verification notification: {}", e);
+                }
+            }
             AgentEvent::UsageDelta { .. } => {
                 // Mid-stream provider usage; ACP has no status bar to update, so
                 // there is nothing to surface for this event.

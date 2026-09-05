@@ -339,6 +339,32 @@ read = "allow"
 permission.doom_loop = "ask"
 ```
 
+### Completion verification
+
+Set a trusted project quality command to prevent a tool-using turn from being
+reported as complete before that command passes:
+
+```toml
+verify_command = "cargo test"
+verify_timeout_secs = 600
+verify_max_attempts = 3
+```
+
+After the agent invokes a potentially mutating tool, zerostack runs this command
+in the startup workspace through the configured general sandbox. Known
+read-only tools do not trigger the gate; unknown tools are treated
+conservatively as potentially mutating. A failed attempt sends a sanitized,
+bounded tail of stdout/stderr back to the model and allows it to repair the
+problem within both `verify_max_attempts` and the remaining
+`max_agent_turns`. Exhausting either bound fails the turn instead of emitting a
+successful completion. Interactive TUI and ACP clients receive verification
+status events; headless mode writes the status and diagnostics to stderr.
+
+`verify_command` is executed by a shell and therefore carries the authority of
+the user who configured it. It is a sensitive project-local setting: an
+untrusted `.zerostack/config.toml` cannot activate it in TUI, headless, or ACP
+mode.
+
 Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
@@ -348,6 +374,9 @@ Accepted top-level keys:
 | `max_tokens`              | integer | Maximum tokens for a single model response (the per-request output cap sent to the provider). Default: `16384`. This never limits a whole turn; see `turn_token_budget`.     |
 | `turn_token_budget`       | integer | Optional cumulative fail-closed cap for one agentic turn: the sum of input+output tokens across every completion call the turn makes. Unset by default (no cap; turns are still bounded by `max_agent_turns`). Deliberately separate from `max_tokens` — a multi-tool-call turn legitimately accumulates many responses' worth of prompt tokens. |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `200`.                                                                                                                           |
+| `verify_command`          | string  | Optional trusted command that must pass before a turn which invoked a potentially mutating tool may complete. Unset or blank disables the gate. Project-local values are sensitive and require content-bound trust. |
+| `verify_timeout_secs`     | integer | Wall-clock timeout for each `verify_command` attempt. Default: `300`; clamped to `1..=3600`. |
+| `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
 | `retry`                   | object  | Retry policy with `max_attempts` (default `3`), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`). The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. |

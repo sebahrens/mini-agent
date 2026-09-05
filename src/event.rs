@@ -46,6 +46,12 @@ pub enum AgentEvent {
         attempt: usize,
         max: usize,
     },
+    Verification {
+        attempt: u32,
+        max: u32,
+        passed: bool,
+        output: CompactString,
+    },
     /// The sole chargeable usage stream. A delta usually represents one
     /// provider completion call; it can also be a terminal reconciliation when
     /// an adapter reports only an aggregate.

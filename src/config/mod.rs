@@ -73,6 +73,17 @@ pub struct Config {
     pub keep_recent_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_turns: Option<usize>,
+    /// Trusted operator command run before a tool-using turn may complete.
+    /// Project-local values require the existing sensitive-config approval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_command: Option<CompactString>,
+    /// Wall-clock bound for one verification attempt. Default: 300 seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_timeout_secs: Option<u64>,
+    /// Total verification attempts within one agent turn. Default: 3; capped
+    /// at 8 so a persistently failing command cannot loop indefinitely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_text_file_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -435,6 +446,14 @@ impl Config {
     /// single response, not a turn.
     pub fn resolve_turn_token_budget(&self) -> Option<u64> {
         self.turn_token_budget
+    }
+
+    pub fn resolve_verify_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.verify_timeout_secs.unwrap_or(300).clamp(1, 3_600))
+    }
+
+    pub fn resolve_verify_max_attempts(&self) -> u32 {
+        self.verify_max_attempts.unwrap_or(3).clamp(1, 8)
     }
 
     pub fn resolve_chat_left_margin(&self) -> u16 {
@@ -840,6 +859,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_turn_token_budget(), Some(200_000));
+    }
+
+    #[test]
+    fn completion_verification_defaults_and_bounds_are_stable() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.resolve_verify_timeout(),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(defaults.resolve_verify_max_attempts(), 3);
+
+        let below_minimum = Config {
+            verify_timeout_secs: Some(0),
+            verify_max_attempts: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            below_minimum.resolve_verify_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(below_minimum.resolve_verify_max_attempts(), 1);
+
+        let above_maximum = Config {
+            verify_timeout_secs: Some(86_400),
+            verify_max_attempts: Some(u32::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            above_maximum.resolve_verify_timeout(),
+            std::time::Duration::from_secs(3_600)
+        );
+        assert_eq!(above_maximum.resolve_verify_max_attempts(), 8);
     }
 
     #[test]

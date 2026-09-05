@@ -6,7 +6,7 @@ use crate::process_creation::StdCommandCreationExt;
 pub(crate) mod headless;
 pub mod plan;
 pub mod transcript;
-pub(crate) mod validation;
+pub(crate) use crate::extras::validation;
 
 pub const DEFAULT_PLAN_FILENAME: &str = "LOOP_PLAN.md";
 /// Interactive loops must terminate even when the user does not specify a bound.

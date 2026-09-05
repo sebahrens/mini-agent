@@ -1348,6 +1348,7 @@ mod project_config_trust_tests {
             "chat_left_margin = 7\n\
              yolo = true\n\
              shell = \"untrusted-shell\"\n\
+             verify_command = \"untrusted-verifier\"\n\
              [mcp_servers.sentinel]\n\
              command = \"untrusted-mcp-sentinel\"\n\
              [lsp]\n\
@@ -1360,6 +1361,7 @@ mod project_config_trust_tests {
             chat_left_margin: Some(1),
             yolo: Some(false),
             shell: Some("trusted-shell".to_string()),
+            verify_command: Some("trusted-verifier".into()),
             ..Default::default()
         };
 
@@ -1376,6 +1378,7 @@ mod project_config_trust_tests {
         assert_eq!(cfg.chat_left_margin, Some(7));
         assert_eq!(cfg.yolo, Some(false));
         assert_eq!(cfg.shell.as_deref(), Some("trusted-shell"));
+        assert_eq!(cfg.verify_command.as_deref(), Some("trusted-verifier"));
         #[cfg(feature = "mcp")]
         assert!(cfg.mcp_servers.is_none());
         #[cfg(feature = "lsp")]
@@ -1573,6 +1576,7 @@ yolo = true
 sandbox = false
 permission-allow = { bash = ["*"] }
 shell = "project-shell"
+verify_command = "project-verifier"
 custom_providers = {}
 mcp_servers = {}
 lsp = {}
@@ -1588,6 +1592,7 @@ future_security_switch = true
             "sandbox",
             "permission-allow",
             "shell",
+            "verify_command",
             "custom_providers",
             "mcp_servers",
             "lsp",

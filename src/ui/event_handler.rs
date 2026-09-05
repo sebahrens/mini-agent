@@ -190,6 +190,34 @@ pub async fn handle_agent_event(
                 }
             }
         }
+        AgentEvent::Verification {
+            attempt,
+            max,
+            passed,
+            output,
+        } => {
+            run.was_reasoning = false;
+            finalize_response_segment(renderer, run)?;
+            if run.agent_line_started {
+                renderer.write_line("", Color::White)?;
+                run.agent_line_started = false;
+            }
+            if !passed {
+                // A rejected completion starts a distinct response segment on
+                // the continuation turn. Keep the cumulative buffer for final
+                // session reconciliation, but never append new tokens to the
+                // already-finalized markdown block above.
+                run.response_start_block = None;
+            }
+            let status = if passed { "passed" } else { "failed" };
+            renderer.write_line(
+                &format!("◈ verification {status} ({attempt}/{max})"),
+                if passed { Color::Green } else { C_ERROR },
+            )?;
+            if !passed {
+                renderer.write_line(&sanitize_output(&output), Color::DarkGrey)?;
+            }
+        }
         AgentEvent::Done {
             response,
             interactions,

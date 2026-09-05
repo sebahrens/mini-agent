@@ -20,6 +20,59 @@ use crate::extras::hooks::LoopInfo;
 use crate::retry::{self, RetryConfig};
 use crate::session::{MessageRole, PersistedToolMessage, Session};
 
+const VERIFICATION_DIAGNOSTIC_CHARS: usize = 12_000;
+
+#[derive(Clone)]
+pub(crate) struct CompletionVerification {
+    command: CompactString,
+    sandbox: crate::sandbox::Sandbox,
+    limits: crate::sandbox::CommandLimits,
+    max_attempts: u32,
+}
+
+impl CompletionVerification {
+    pub(crate) fn from_config(
+        cfg: &crate::config::Config,
+        sandbox: crate::sandbox::Sandbox,
+    ) -> Option<Self> {
+        let command = cfg.verify_command.as_deref()?.trim();
+        if command.is_empty() {
+            return None;
+        }
+        Some(Self {
+            command: CompactString::new(command),
+            sandbox,
+            limits: crate::sandbox::CommandLimits {
+                timeout: cfg.resolve_verify_timeout(),
+                stdout_bytes: 1024 * 1024,
+                stderr_bytes: 1024 * 1024,
+                combined_bytes: 1536 * 1024,
+            },
+            max_attempts: cfg.resolve_verify_max_attempts(),
+        })
+    }
+
+    async fn run(&self) -> crate::extras::validation::ValidationResult {
+        crate::extras::validation::start_with_limits(&self.sandbox, &self.command, self.limits)
+            .wait()
+            .await
+    }
+}
+
+fn tool_may_mutate_workspace(name: &str) -> bool {
+    !matches!(
+        name,
+        "read"
+            | "grep"
+            | "find_files"
+            | "list_dir"
+            | "web_search"
+            | "skill_search"
+            | "skill_list"
+            | "todo_read"
+    )
+}
+
 pub struct AgentRunner {
     pub event_rx: mpsc::Receiver<AgentEvent>,
     /// Cancels the underlying agent task. Without this a superseded or
@@ -1375,6 +1428,7 @@ where
         turn_guard,
         #[cfg(feature = "hooks")]
         loop_info,
+        None,
         false,
         work_scope,
     )
@@ -1405,6 +1459,7 @@ where
         turn_guard,
         #[cfg(feature = "hooks")]
         loop_info,
+        None,
         AgentWorkScope::new(),
     )
 }
@@ -1417,6 +1472,7 @@ pub(crate) fn spawn_agent_paused_in_scope<M>(
     turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    completion_verification: Option<CompletionVerification>,
     work_scope: Arc<AgentWorkScope>,
 ) -> PausedAgentRunner
 where
@@ -1434,6 +1490,7 @@ where
         turn_guard,
         #[cfg(feature = "hooks")]
         loop_info,
+        completion_verification,
         true,
         Arc::clone(&work_scope),
     );
@@ -1471,6 +1528,7 @@ where
         turn_guard,
         #[cfg(feature = "hooks")]
         loop_info,
+        None,
         false,
         work_scope,
     )
@@ -1487,6 +1545,7 @@ fn spawn_agent_with_start_mode<M>(
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    completion_verification: Option<CompletionVerification>,
     start_paused: bool,
     work_scope: Arc<AgentWorkScope>,
 ) -> (AgentRunner, Option<tokio::sync::oneshot::Sender<()>>)
@@ -1536,6 +1595,8 @@ where
         let mut stream_prompt: Option<String> = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
+        let mut workspace_may_have_changed = false;
+        let mut verification_attempt = 0u32;
         let max_turns = agent.default_max_turns.unwrap_or(1);
         let mut turns_used = 0usize;
         let mut turns_at_stream_start = turns_used;
@@ -1650,6 +1711,7 @@ where
                                     return;
                                 }
                                 let tool_name = &tool_call.function.name;
+                                workspace_may_have_changed |= tool_may_mutate_workspace(tool_name);
                                 tracing::debug!(
                                     "agent tool start: name={}, internal_call_id={}, args_len={}",
                                     tool_name,
@@ -1826,6 +1888,36 @@ where
                         }
 
                         if !response_text.is_empty() {
+                            if workspace_may_have_changed
+                                && let Some(verification) = completion_verification.as_ref()
+                            {
+                                verification_attempt = verification_attempt.saturating_add(1);
+                                let result = verification.run().await;
+                                let passed = result.succeeded();
+                                let diagnostic = result.render_tail(VERIFICATION_DIAGNOSTIC_CHARS);
+                                let _ = event_tx
+                                    .send(AgentEvent::Verification {
+                                        attempt: verification_attempt,
+                                        max: verification.max_attempts,
+                                        passed,
+                                        output: CompactString::new(&diagnostic),
+                                    })
+                                    .await;
+                                if !passed {
+                                    if verification_attempt < verification.max_attempts {
+                                        next_instruction = Some(format!(
+                                            "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
+                                        ));
+                                        break;
+                                    }
+                                    let _ = event_tx
+                                        .send(AgentEvent::Error(CompactString::from(format!(
+                                            "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                            }
                             #[cfg(feature = "hooks")]
                             if let crate::extras::hooks::StopGate::Continue { reason } =
                                 crate::extras::hooks::dispatch_stop(
@@ -2110,6 +2202,35 @@ where
     .await
 }
 
+pub(crate) async fn run_print_with_verification<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    pure_stdout: bool,
+    retry_config: &RetryConfig,
+    turn_token_budget: Option<u64>,
+    history: Vec<Message>,
+    completion_verification: Option<CompletionVerification>,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    run_print_with_stream_policy_and_verification(
+        agent,
+        prompt,
+        pure_stdout,
+        retry_config,
+        turn_token_budget,
+        history,
+        RunnerStreamPolicy::default(),
+        completion_verification,
+        #[cfg(feature = "hooks")]
+        loop_info,
+    )
+    .await
+}
+
 // Mirrors `run_print`'s public parameter list plus the test-only stream policy;
 // with the `hooks` feature's `loop_info` that is one over clippy's threshold.
 // The arguments are the caller's positional run inputs (matching
@@ -2124,6 +2245,37 @@ async fn run_print_with_stream_policy<M>(
     turn_token_budget: Option<u64>,
     history: Vec<Message>,
     stream_policy: RunnerStreamPolicy,
+    #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+{
+    run_print_with_stream_policy_and_verification(
+        agent,
+        prompt,
+        pure_stdout,
+        retry_config,
+        turn_token_budget,
+        history,
+        stream_policy,
+        None,
+        #[cfg(feature = "hooks")]
+        loop_info,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_print_with_stream_policy_and_verification<M>(
+    agent: &Agent<M>,
+    prompt: &str,
+    pure_stdout: bool,
+    retry_config: &RetryConfig,
+    turn_token_budget: Option<u64>,
+    history: Vec<Message>,
+    stream_policy: RunnerStreamPolicy,
+    completion_verification: Option<CompletionVerification>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
 where
@@ -2170,6 +2322,8 @@ where
     // empty response must never be returned (and persisted) as the turn.
     let mut empty_response_count: u32 = 0;
     const MAX_EMPTY_RESPONSES: u32 = 3;
+    let mut workspace_may_have_changed = false;
+    let mut verification_attempt = 0u32;
     let mut next_instruction: Option<String> = None;
     #[cfg(feature = "hooks")]
     let mut stop_hook_active = false;
@@ -2209,6 +2363,7 @@ where
                         anyhow::bail!(token_budget_exhaustion_message(used, budget));
                     }
                     let name = &tool_call.function.name;
+                    workspace_may_have_changed |= tool_may_mutate_workspace(name);
                     if let Err(error) = tool_calls.record(&internal_call_id, &tool_call) {
                         tool_calls.finalize_unresolved(&mut interactions);
                         return Err(anyhow::anyhow!(error));
@@ -2305,6 +2460,33 @@ where
                         );
                         continue_turn = true;
                         break;
+                    }
+                    if workspace_may_have_changed
+                        && let Some(verification) = completion_verification.as_ref()
+                    {
+                        verification_attempt = verification_attempt.saturating_add(1);
+                        let result = verification.run().await;
+                        let passed = result.succeeded();
+                        let diagnostic = result.render_tail(VERIFICATION_DIAGNOSTIC_CHARS);
+                        eprintln!(
+                            "verification {} ({verification_attempt}/{})",
+                            if passed { "passed" } else { "failed" },
+                            verification.max_attempts,
+                        );
+                        if !passed {
+                            eprintln!("{diagnostic}");
+                            if verification_attempt < verification.max_attempts {
+                                next_instruction = Some(format!(
+                                    "The configured verification command failed. Fix the cause and rerun verification before finishing.\n\n{diagnostic}"
+                                ));
+                                continue_turn = true;
+                                break;
+                            } else {
+                                anyhow::bail!(
+                                    "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
+                                );
+                            }
+                        }
                     }
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
@@ -2595,6 +2777,8 @@ mod tests {
     use rig::test_utils::{MockCompletionModel, MockStreamEvent, MockToolError};
     use rig::tool::Tool;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2960,6 +3144,286 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn completion_verification(
+        command: String,
+        max_attempts: u32,
+    ) -> super::CompletionVerification {
+        let cfg = crate::config::Config {
+            verify_command: Some(command.into()),
+            verify_timeout_secs: Some(2),
+            verify_max_attempts: Some(max_attempts),
+            ..Default::default()
+        };
+        super::CompletionVerification::from_config(
+            &cfg,
+            crate::sandbox::Sandbox::new(false, "bwrap"),
+        )
+        .expect("non-empty verification command")
+    }
+
+    #[test]
+    fn completion_verification_ignores_blank_commands_and_classifies_known_read_only_tools() {
+        let cfg = crate::config::Config {
+            verify_command: Some("  \n\t ".into()),
+            ..Default::default()
+        };
+        assert!(
+            super::CompletionVerification::from_config(
+                &cfg,
+                crate::sandbox::Sandbox::new(false, "bwrap")
+            )
+            .is_none()
+        );
+        for name in [
+            "read",
+            "grep",
+            "find_files",
+            "list_dir",
+            "web_search",
+            "skill_search",
+            "skill_list",
+            "todo_read",
+        ] {
+            assert!(!super::tool_may_mutate_workspace(name), "{name}");
+        }
+        for name in ["write", "edit", "bash", "js", "unknown_mcp_tool"] {
+            assert!(super::tool_may_mutate_workspace(name), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_verification_blocks_interactive_done_until_a_retry_passes() {
+        let marker = std::env::temp_dir().join(format!(
+            "mini-agent-completion-verification-interactive-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = shell_quote(&marker);
+        let verification = completion_verification(
+            format!(
+                "if [ -f {quoted} ]; then printf 'repaired'; else printf 'first failure' >&2; : > {quoted}; exit 17; fi"
+            ),
+            3,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "mutating-call",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("candidate"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("fixed"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_with_start_mode(
+            agent,
+            "change the workspace".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            RunnerStreamPolicy::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            Some(verification),
+            false,
+            super::AgentWorkScope::new(),
+        )
+        .0;
+
+        let mut verification_events = Vec::new();
+        let response = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Verification {
+                    attempt,
+                    max,
+                    passed,
+                    output: diagnostic,
+                } => verification_events.push((attempt, max, passed, diagnostic.to_string())),
+                crate::event::AgentEvent::Done { response, .. } => break response.to_string(),
+                crate::event::AgentEvent::Error(error) => {
+                    panic!("verification retry should recover: {error}")
+                }
+                _ => {}
+            }
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response, "candidatefixed");
+        assert_eq!(verification_events.len(), 2);
+        assert_eq!((verification_events[0].0, verification_events[0].1), (1, 3));
+        assert!(!verification_events[0].2);
+        assert!(verification_events[0].3.contains("first failure"));
+        assert_eq!((verification_events[1].0, verification_events[1].1), (2, 3));
+        assert!(verification_events[1].2);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            requests[2].chat_history.last_ref(),
+            Message::User { content }
+                if content.iter().any(|item| matches!(
+                    item,
+                    UserContent::Text(text)
+                        if text.text.contains("configured verification command failed")
+                            && text.text.contains("first failure")
+                ))
+        ));
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_verification_is_bounded_and_never_emits_done_after_exhaustion() {
+        let verification =
+            completion_verification("printf 'still broken' >&2; exit 9".to_string(), 2);
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "mutating-call",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("candidate one"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("candidate two"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent_with_start_mode(
+            agent,
+            "change the workspace".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            RunnerStreamPolicy::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+            Some(verification),
+            false,
+            super::AgentWorkScope::new(),
+        )
+        .0;
+
+        let mut attempts = Vec::new();
+        let error = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Verification {
+                    attempt, passed, ..
+                } => {
+                    assert!(!passed);
+                    attempts.push(attempt);
+                }
+                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Done { response, .. } => {
+                    panic!("failed verification must not emit done: {response}")
+                }
+                _ => {}
+            }
+        };
+
+        assert_eq!(attempts, [1, 2]);
+        assert!(error.contains("Verification failed after 2 attempts"));
+        assert!(error.contains("still broken"));
+        assert_eq!(model.requests().len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_verification_headless_retries_with_the_same_gate() {
+        let marker = std::env::temp_dir().join(format!(
+            "mini-agent-completion-verification-headless-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let quoted = shell_quote(&marker);
+        let verification = completion_verification(
+            format!(
+                "if [ -f {quoted} ]; then exit 0; else printf 'headless failure' >&2; : > {quoted}; exit 1; fi"
+            ),
+            2,
+        );
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "mutating-call",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("candidate"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("fixed"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(Arc::new(AtomicUsize::new(0))))
+            .default_max_turns(3)
+            .build();
+
+        let (response, _, _) = super::run_print_with_verification(
+            &agent,
+            "change the workspace",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            Some(verification),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless verification retry should recover");
+
+        assert_eq!(response, "candidatefixed");
+        assert_eq!(model.requests().len(), 3);
+        assert!(matches!(
+            model.requests()[2].chat_history.last_ref(),
+            Message::User { content }
+                if content.iter().any(|item| matches!(
+                    item,
+                    UserContent::Text(text) if text.text.contains("headless failure")
+                ))
+        ));
+        let _ = std::fs::remove_file(marker);
+    }
+
     #[cfg(feature = "subagents")]
     #[tokio::test]
     async fn subagent_turn_exhaustion_returns_accumulated_text_as_partial_success() {
@@ -3042,6 +3506,7 @@ mod tests {
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "hooks")]
+            None,
             None,
             work_scope,
         );

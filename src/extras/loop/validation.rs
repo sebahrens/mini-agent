@@ -1,7 +1,8 @@
-//! Bounded execution for the command configured by `--loop-run`.
+//! Bounded execution for configured validation commands.
 //!
-//! Both headless and interactive loops call this module so sandbox selection,
-//! resource limits, stream rendering, and failure diagnostics stay identical.
+//! Loop validators and completion verification gates call this module so
+//! sandbox selection, resource limits, stream rendering, and failure
+//! diagnostics stay identical across headless and interactive surfaces.
 
 use std::process::ExitStatus;
 
@@ -77,6 +78,13 @@ impl ValidationOperation {
 }
 
 impl ValidationResult {
+    pub(crate) fn succeeded(&self) -> bool {
+        matches!(
+            self.status,
+            ValidationStatus::Success { exit_code: Some(0) }
+        )
+    }
+
     fn from_command_output(output: CommandOutput, limits: CommandLimits) -> Self {
         let status = match output.status {
             CommandStatus::Completed => completed_status(output.exit_status),
@@ -130,6 +138,24 @@ impl ValidationResult {
         append_stream(&mut rendered, "stdout", &stdout, !self.stdout.is_empty());
         append_stream(&mut rendered, "stderr", &stderr, !self.stderr.is_empty());
         rendered
+    }
+
+    /// Tail-focused diagnostic for model continuation prompts. Keep the
+    /// structured status line even when verbose build output is clipped.
+    pub(crate) fn render_tail(&self, max_chars: usize) -> String {
+        let rendered = self.render();
+        let char_count = rendered.chars().count();
+        if char_count <= max_chars {
+            return rendered;
+        }
+        let tail: String = rendered
+            .chars()
+            .skip(char_count.saturating_sub(max_chars))
+            .collect();
+        format!(
+            "{}\n[verification diagnostic clipped to final {max_chars} characters]\n{tail}",
+            self.metadata(true)
+        )
     }
 
     fn metadata(&self, diagnostic_truncated: bool) -> String {
@@ -257,7 +283,7 @@ pub(crate) fn start(sandbox: &Sandbox, command: &str) -> ValidationOperation {
     start_with_limits(sandbox, command, LOOP_VALIDATION_LIMITS)
 }
 
-fn start_with_limits(
+pub(crate) fn start_with_limits(
     sandbox: &Sandbox,
     command: &str,
     limits: CommandLimits,

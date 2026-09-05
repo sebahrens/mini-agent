@@ -1051,6 +1051,17 @@ impl<'a> App<'a> {
                         crate::extras::truncate::truncate_cjk(output, 500, "…")
                     )));
             }
+            AgentEvent::Verification { passed, .. }
+                if self.run.turn_trace.len() < TURN_TRACE_MAX =>
+            {
+                self.run
+                    .turn_trace
+                    .push(compact_str::CompactString::from(if *passed {
+                        "✓ verification passed"
+                    } else {
+                        "✗ verification failed"
+                    }));
+            }
             AgentEvent::Done { .. } => {
                 self.run.turn_trace.clear();
                 self.run.awaiting_compaction_relief = false;

@@ -2098,7 +2098,6 @@ impl Sandbox {
         self.output_built_command_with_limits(cmd, limits).await
     }
 
-    #[cfg(feature = "loop")]
     pub(crate) async fn output_command_with_limits_cancelled(
         &self,
         command: &str,

@@ -916,6 +916,7 @@ pub struct AnyAgent {
     /// `max_tokens` is the per-response output cap sent to the provider — a
     /// different unit entirely.
     turn_token_budget: Option<u64>,
+    completion_verification: Option<runner::CompletionVerification>,
     #[cfg(feature = "skills")]
     skills: Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>>,
     #[cfg(feature = "skills")]
@@ -927,6 +928,7 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            completion_verification: None,
             #[cfg(feature = "skills")]
             skills: None,
             #[cfg(feature = "skills")]
@@ -936,6 +938,14 @@ impl AnyAgent {
 
     pub(crate) fn with_turn_token_budget(mut self, budget: Option<u64>) -> Self {
         self.turn_token_budget = budget;
+        self
+    }
+
+    fn with_completion_verification(
+        mut self,
+        verification: Option<runner::CompletionVerification>,
+    ) -> Self {
+        self.completion_verification = verification;
         self
     }
 
@@ -953,6 +963,7 @@ impl AnyAgent {
         Self {
             inner,
             turn_token_budget: None,
+            completion_verification: None,
             #[cfg(feature = "skills")]
             skills,
             #[cfg(feature = "skills")]
@@ -1022,13 +1033,14 @@ impl AnyAgent {
         let prompt = prompt.to_string();
         match &self.inner {
             AnyAgentInner::OpenRouter(a) => {
-                runner::run_print(
+                runner::run_print_with_verification(
                     a,
                     &prompt,
                     pure_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
+                    self.completion_verification.clone(),
                     #[cfg(feature = "hooks")]
                     loop_info,
                 )
@@ -1036,26 +1048,28 @@ impl AnyAgent {
             }
             AnyAgentInner::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
-                    runner::run_print(
+                    runner::run_print_with_verification(
                         a,
                         &prompt,
                         pure_stdout,
                         retry_config,
                         self.turn_token_budget,
                         history,
+                        self.completion_verification.clone(),
                         #[cfg(feature = "hooks")]
                         loop_info,
                     )
                     .await
                 }
                 OpenAiAgent::Completions(a) => {
-                    runner::run_print(
+                    runner::run_print_with_verification(
                         a,
                         &prompt,
                         pure_stdout,
                         retry_config,
                         self.turn_token_budget,
                         history,
+                        self.completion_verification.clone(),
                         #[cfg(feature = "hooks")]
                         loop_info,
                     )
@@ -1063,39 +1077,42 @@ impl AnyAgent {
                 }
             },
             AnyAgentInner::Anthropic(a) => {
-                runner::run_print(
+                runner::run_print_with_verification(
                     a,
                     &prompt,
                     pure_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
+                    self.completion_verification.clone(),
                     #[cfg(feature = "hooks")]
                     loop_info,
                 )
                 .await
             }
             AnyAgentInner::Gemini(a) => {
-                runner::run_print(
+                runner::run_print_with_verification(
                     a,
                     &prompt,
                     pure_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
+                    self.completion_verification.clone(),
                     #[cfg(feature = "hooks")]
                     loop_info,
                 )
                 .await
             }
             AnyAgentInner::Ollama(a) => {
-                runner::run_print(
+                runner::run_print_with_verification(
                     a,
                     &prompt,
                     pure_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
+                    self.completion_verification.clone(),
                     #[cfg(feature = "hooks")]
                     loop_info,
                 )
@@ -1246,6 +1263,7 @@ impl AnyAgent {
             prompt
         };
         let turn_token_budget = self.turn_token_budget;
+        let completion_verification = self.completion_verification;
         match self.inner {
             AnyAgentInner::OpenRouter(a) => runner::spawn_agent_paused_in_scope(
                 a,
@@ -1257,6 +1275,7 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                completion_verification.clone(),
                 work_scope,
             ),
             AnyAgentInner::OpenAI(a) => match a {
@@ -1270,6 +1289,7 @@ impl AnyAgent {
                     turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
+                    completion_verification.clone(),
                     work_scope,
                 ),
                 OpenAiAgent::Completions(a) => runner::spawn_agent_paused_in_scope(
@@ -1282,6 +1302,7 @@ impl AnyAgent {
                     turn_guard,
                     #[cfg(feature = "hooks")]
                     loop_info,
+                    completion_verification.clone(),
                     work_scope,
                 ),
             },
@@ -1295,6 +1316,7 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                completion_verification.clone(),
                 work_scope,
             ),
             AnyAgentInner::Gemini(a) => runner::spawn_agent_paused_in_scope(
@@ -1307,6 +1329,7 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                completion_verification.clone(),
                 work_scope,
             ),
             AnyAgentInner::Ollama(a) => runner::spawn_agent_paused_in_scope(
@@ -1319,6 +1342,7 @@ impl AnyAgent {
                 turn_guard,
                 #[cfg(feature = "hooks")]
                 loop_info,
+                completion_verification,
                 work_scope,
             ),
         }
@@ -1664,6 +1688,7 @@ pub async fn build_agent_in_workspace(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
+    let completion_verification = runner::CompletionVerification::from_config(cfg, sandbox.clone());
     #[cfg(feature = "js")]
     let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "js")]
@@ -1802,6 +1827,7 @@ pub async fn build_agent_in_workspace(
         skills,
     )
     .with_turn_token_budget(cfg.resolve_turn_token_budget())
+    .with_completion_verification(completion_verification)
 }
 
 #[cfg(feature = "skills")]
