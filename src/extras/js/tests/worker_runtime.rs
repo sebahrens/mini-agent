@@ -299,6 +299,146 @@ fn assert_closed_error(
     assert_eq!(diagnostic.script_role, ScriptRole::Model);
 }
 
+#[tokio::test]
+async fn worker_runtime_allows_exactly_the_effect_limit() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "for (let i = 0; i < 256; i += 1) read_file('fixture'); 'complete'".into(),
+            )
+            .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("the documented effect limit must remain allowed");
+
+    assert_eq!(result.outcome, StepOutcome::Value("complete".into()));
+    assert_eq!(
+        *witness.ordinals.lock().unwrap(),
+        (0..crate::extras::js::protocol::MAX_EFFECTS_PER_STEP).collect::<Vec<_>>()
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_runtime_effect_limit_returns_terminal_with_console_and_recovers() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "console.log('before limit'); \
+                 for (let i = 0; i < 300; i += 1) { \
+                     try { read_file('fixture'); } catch (_) {} \
+                 } \
+                 console.log('after limit'); \
+                 'partial'"
+                    .into(),
+            )
+            .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("effect exhaustion must return a valid terminal result");
+
+    assert_closed_error(
+        &result,
+        JsErrorCode::EffectLimit,
+        DiagnosticClass::ResourceLimit,
+        DiagnosticStage::Evaluation,
+    );
+    assert_eq!(
+        result.console,
+        vec![
+            crate::extras::js::protocol::ConsoleRecord {
+                level: ConsoleLevel::Log,
+                text: "before limit".into(),
+                truncated: false,
+            },
+            crate::extras::js::protocol::ConsoleRecord {
+                level: ConsoleLevel::Log,
+                text: "after limit".into(),
+                truncated: false,
+            },
+        ]
+    );
+    assert_eq!(
+        *witness.ordinals.lock().unwrap(),
+        (0..crate::extras::js::protocol::MAX_EFFECTS_PER_STEP).collect::<Vec<_>>()
+    );
+    #[cfg(feature = "skills")]
+    assert!(!result.evidence_complete);
+    let generation = supervisor
+        .generation_for_test()
+        .await
+        .expect("effect exhaustion must leave the worker reusable");
+
+    let recovered = supervisor
+        .execute(
+            RunStep::new("6 * 7".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .expect("a request after effect exhaustion must use a healthy worker");
+    assert_eq!(recovered.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(supervisor.generation_for_test().await, Some(generation));
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_runtime_uncaught_effect_limit_uses_the_closed_limit_error() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "console.warn('before limit'); \
+                 for (let i = 0; i < 257; i += 1) read_file('fixture'); \
+                 console.error('unreachable')"
+                    .into(),
+            )
+            .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("uncaught effect exhaustion must return a valid terminal result");
+
+    assert_closed_error(
+        &result,
+        JsErrorCode::EffectLimit,
+        DiagnosticClass::ResourceLimit,
+        DiagnosticStage::Evaluation,
+    );
+    assert_eq!(
+        result.console,
+        vec![crate::extras::js::protocol::ConsoleRecord {
+            level: ConsoleLevel::Warn,
+            text: "before limit".into(),
+            truncated: false,
+        }]
+    );
+    assert_eq!(
+        *witness.ordinals.lock().unwrap(),
+        (0..crate::extras::js::protocol::MAX_EFFECTS_PER_STEP).collect::<Vec<_>>()
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
 #[test]
 fn worker_runtime_fresh_steps_cover_values_promises_console_and_absent_authority() {
     let results = run_steps(
@@ -2892,6 +3032,7 @@ fn run_scripted_supervisor_worker() -> ! {
                         "exception" => JsErrorCode::Exception,
                         "stack" => JsErrorCode::StackLimit,
                         "jobs" => JsErrorCode::JobLimit,
+                        "effects" => JsErrorCode::EffectLimit,
                         "result" => JsErrorCode::InvalidResult,
                         "internal" => JsErrorCode::Internal,
                         _ => std::process::exit(78),

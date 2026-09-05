@@ -990,7 +990,9 @@ impl ClosedFailure {
         let class = match code {
             JsErrorCode::Syntax => DiagnosticClass::Syntax,
             JsErrorCode::Exception => DiagnosticClass::Exception,
-            JsErrorCode::StackLimit | JsErrorCode::JobLimit => DiagnosticClass::ResourceLimit,
+            JsErrorCode::StackLimit | JsErrorCode::JobLimit | JsErrorCode::EffectLimit => {
+                DiagnosticClass::ResourceLimit
+            }
             JsErrorCode::InvalidResult => DiagnosticClass::Contract,
             JsErrorCode::Internal => DiagnosticClass::Internal,
         };
@@ -1259,20 +1261,28 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     let skill_request_ordinal = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let sequence = Arc::new(Mutex::new(sequence));
     let protocol_failed = Arc::new(AtomicBool::new(false));
+    let effect_limit_reached = Arc::new(AtomicBool::new(false));
     let wire_dispatcher: WorkerEffectDispatcher = {
         let effect_build = build.clone();
         let effect_invocation_id = invocation_id.clone();
         let ordinal = ordinal.clone();
         let sequence = sequence.clone();
         let protocol_failed = protocol_failed.clone();
+        let effect_limit_reached = effect_limit_reached.clone();
         let transport = transport.clone();
         Arc::new(move |grant_id, advisory, operation| {
             if protocol_failed.load(Ordering::Acquire) {
                 return backend_failure();
             }
+            if effect_limit_reached.load(Ordering::Acquire) {
+                return backend_failure();
+            }
             let effect_ordinal = ordinal.fetch_add(1, Ordering::AcqRel);
             if effect_ordinal >= super::protocol::MAX_EFFECTS_PER_STEP {
-                protocol_failed.store(true, Ordering::Release);
+                // Quota exhaustion is an ordinary closed step result. Never emit a 257th effect
+                // frame or poison the transport: the parent remains in the Running state and can
+                // accept the terminal result with the first 256 effects durably accounted for.
+                effect_limit_reached.store(true, Ordering::Release);
                 return backend_failure();
             }
             let request = EffectRequest {
@@ -1344,7 +1354,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
         )
             as Arc<dyn Fn(String, String, u32) -> Result<SkillInvocationGrant, ()> + Send + Sync>
     };
-    let terminal = execute_run_step(
+    let mut terminal = execute_run_step(
         request,
         limits,
         model_dispatcher,
@@ -1355,6 +1365,25 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
+        if effect_limit_reached.load(Ordering::Acquire) {
+            #[cfg(feature = "skills")]
+            {
+                terminal.evidence_complete = false;
+            }
+            if matches!(
+                &terminal.outcome,
+                StepOutcome::Value(_)
+                    | StepOutcome::Void
+                    | StepOutcome::Error(JsErrorCode::Exception)
+            ) {
+                terminal.outcome = StepOutcome::Error(JsErrorCode::EffectLimit);
+                terminal.diagnostic = Some(Diagnostic {
+                    class: DiagnosticClass::ResourceLimit,
+                    stage: DiagnosticStage::Evaluation,
+                    script_role: ScriptRole::Model,
+                });
+            }
+        }
         Ok((terminal, *sequence.lock().map_err(|_| ())?))
     }
 }

@@ -1267,7 +1267,10 @@ fn step_outcome_is_reusable(outcome: &StepOutcome) -> bool {
         StepOutcome::Value(_)
             | StepOutcome::Void
             | StepOutcome::Error(
-                JsErrorCode::Syntax | JsErrorCode::Exception | JsErrorCode::InvalidResult
+                JsErrorCode::Syntax
+                    | JsErrorCode::Exception
+                    | JsErrorCode::EffectLimit
+                    | JsErrorCode::InvalidResult
             )
     )
 }

@@ -171,9 +171,10 @@ Rust compiler version. Ordinary local and packaged builds therefore reject a sam
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
 
-Protocol version 3 retains the version 2 launch binding and removes response fields that never had
-production data: fetch response headers/truncation and diagnostic line/column positions. The
-parent generates a fresh non-nil UUID
+Protocol version 4 retains the version 3 launch binding and adds the closed step-level
+`effect_limit` error used when generated code attempts a 257th parent-brokered effect. Version 3
+removed response fields that never had production data: fetch response headers/truncation and
+diagnostic line/column positions. The parent generates a fresh non-nil UUID
 challenge when it constructs that launch's protocol state, sends it in `ParentHello`, and accepts
 `WorkerReady` only when the worker echoes the exact challenge. The worker records only the
 challenge received in its one accepted `ParentHello` and may send `WorkerReady` only with that

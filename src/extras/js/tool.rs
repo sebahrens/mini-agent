@@ -801,7 +801,9 @@ impl Tool for JsTool {
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
              Python through a shell. Available global contracts and examples: {} Returns the last expression \
-             value as a string. Runtime failures use closed, source-free error classes.{}",
+             value as a string. A step may issue at most 256 effect calls; the 257th returns a \
+             closed effect-limit error while preserving bounded console output. Runtime failures \
+             use closed, source-free error classes.{}",
             globals.join(" "),
             proposal_guidance,
         )
@@ -1315,6 +1317,7 @@ fn js_error_code(code: JsErrorCode) -> &'static str {
         JsErrorCode::Exception => "exception",
         JsErrorCode::StackLimit => "stack limit exceeded",
         JsErrorCode::JobLimit => "job limit exceeded",
+        JsErrorCode::EffectLimit => "effect limit exceeded",
         JsErrorCode::InvalidResult => "invalid result",
         JsErrorCode::Internal => "internal error",
     }
@@ -1889,6 +1892,8 @@ mod description_tests {
         assert!(description.contains("timed_out: boolean"));
         assert!(description.contains("`args` must be an array"));
         assert!(description.contains("spawn('git', ['status', '--short'])"));
+        assert!(description.contains("at most 256 effect calls"));
+        assert!(description.contains("257th returns a closed effect-limit error"));
     }
 
     #[tokio::test]
@@ -1988,6 +1993,15 @@ mod step_result_rendering {
         assert_eq!(
             render_step_result(&result),
             "JS error: exception (stage: evaluation; script: model)\n[console.log] before"
+        );
+        let effect_limit = step(
+            StepOutcome::Error(JsErrorCode::EffectLimit),
+            vec![record(ConsoleLevel::Log, "before limit")],
+            Some(diagnostic(DiagnosticStage::Evaluation)),
+        );
+        assert_eq!(
+            render_step_result(&effect_limit),
+            "JS error: effect limit exceeded (stage: evaluation; script: model)\n[console.log] before limit"
         );
         let oom = step(
             StepOutcome::OutOfMemory,

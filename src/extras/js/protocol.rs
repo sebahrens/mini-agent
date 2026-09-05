@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
@@ -675,6 +675,7 @@ pub(crate) enum JsErrorCode {
     Exception,
     StackLimit,
     JobLimit,
+    EffectLimit,
     InvalidResult,
     Internal,
 }

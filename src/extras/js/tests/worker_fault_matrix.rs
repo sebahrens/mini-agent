@@ -173,6 +173,7 @@ async fn worker_fault_matrix_allowlists_every_javascript_error_code() {
         ("js-error-exception", JsErrorCode::Exception, true),
         ("js-error-stack", JsErrorCode::StackLimit, false),
         ("js-error-jobs", JsErrorCode::JobLimit, false),
+        ("js-error-effects", JsErrorCode::EffectLimit, true),
         ("js-error-result", JsErrorCode::InvalidResult, true),
         ("js-error-internal", JsErrorCode::Internal, false),
     ] {
