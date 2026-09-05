@@ -497,7 +497,7 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    evidence against the revision. A typed skill input error distinguishes the two.
 2. **Canary ordering** (mini-agent-840z). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
-3. **Store concurrency** (mini-agent-pwf2). The store opens with WAL journaling and a busy
+3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy
    timeout; every read-modify-write transaction begins `IMMEDIATE`. Dropping a telemetry batch
    because of `SQLITE_BUSY` is a defect covered by a contention test.
 4. **Corrupt rows** (mini-agent-jj8b, delivered). A row whose embedding cannot be decoded is

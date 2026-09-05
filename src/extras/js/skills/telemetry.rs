@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::time::Duration;
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -23,6 +24,8 @@ pub const MAX_ARGUMENT_SHAPE_BYTES: usize = 512;
 pub const TELEMETRY_QUEUE_CAPACITY: usize = 64;
 pub const MAX_EVENT_ID_BYTES: usize = 256;
 pub const MAX_EVENT_TOKEN_BYTES: usize = 128;
+const TELEMETRY_BUSY_RETRY_INITIAL: Duration = Duration::from_millis(10);
+const TELEMETRY_BUSY_RETRY_MAX: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -569,6 +572,19 @@ pub enum TelemetryError {
     IdempotencyConflict,
 }
 
+impl TelemetryError {
+    fn is_sqlite_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                )
+        )
+    }
+}
+
 /// Stable invocation identity for acknowledged tool-call retries.
 pub fn stable_invocation_id(
     turn_id: &str,
@@ -594,6 +610,7 @@ pub struct TelemetryIngestor<'a> {
 pub struct TelemetryDispatcher {
     tx: Option<SyncSender<EventBatch>>,
     observability_lost: Arc<AtomicU64>,
+    busy_retries: Arc<AtomicU64>,
     join: Option<std::thread::JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
 }
@@ -637,16 +654,26 @@ impl TelemetryDispatcher {
         coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
         work_guard: Option<crate::agent::runner::AgentWorkGuard>,
     ) -> Result<Self, DispatchError> {
-        let mut store = SkillStore::open_at(paths)?;
+        let store = SkillStore::open_at(paths)?;
+        Self::spawn_with_store(store, coordinator, work_guard)
+    }
+
+    fn spawn_with_store(
+        mut store: SkillStore,
+        coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
+        work_guard: Option<crate::agent::runner::AgentWorkGuard>,
+    ) -> Result<Self, DispatchError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
+        let busy_retries = Arc::new(AtomicU64::new(0));
+        let worker_busy_retries = Arc::clone(&busy_retries);
         let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
                 let _work_guard = work_guard;
                 while let Ok(batch) = rx.recv() {
-                    match TelemetryIngestor::new(&mut store).ingest(&batch) {
+                    match ingest_retrying_busy(&mut store, &batch, &worker_busy_retries) {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
@@ -670,9 +697,23 @@ impl TelemetryDispatcher {
         Ok(Self {
             tx: Some(tx),
             observability_lost,
+            busy_retries,
             join: Some(join),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_busy_timeout_for_test(
+        paths: &crate::paths::AppPaths,
+        busy_timeout: Duration,
+    ) -> Result<Self, DispatchError> {
+        let store = SkillStore::open_at(paths)?;
+        store
+            .connection()
+            .busy_timeout(busy_timeout)
+            .map_err(super::store::StoreError::from)?;
+        Self::spawn_with_store(store, None, None)
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {
@@ -684,6 +725,36 @@ impl TelemetryDispatcher {
                 TrySendError::Full(_) => DispatchError::Saturated,
                 TrySendError::Disconnected(_) => DispatchError::Disconnected,
             })
+    }
+}
+
+fn ingest_retrying_busy(
+    store: &mut SkillStore,
+    batch: &EventBatch,
+    busy_retries: &AtomicU64,
+) -> Result<IngestionReport, TelemetryError> {
+    let mut delay = TELEMETRY_BUSY_RETRY_INITIAL;
+    let mut attempts = 0u64;
+    loop {
+        match TelemetryIngestor::new(store).ingest(batch) {
+            Err(error) if error.is_sqlite_busy() => {
+                busy_retries.fetch_add(1, Ordering::Relaxed);
+                attempts = attempts.saturating_add(1);
+                // Retain the batch in this worker and retry with capped backoff.
+                // Log only exponentially spaced attempts, and never payloads.
+                if attempts.is_power_of_two() {
+                    tracing::warn!(
+                        event_count = batch.events().len(),
+                        attempts,
+                        retry_delay_ms = delay.as_millis(),
+                        "skill telemetry store is busy; retaining batch for retry"
+                    );
+                }
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(TELEMETRY_BUSY_RETRY_MAX);
+            }
+            result => return result,
+        }
     }
 }
 
@@ -773,6 +844,7 @@ impl TelemetryDispatcher {
         Self {
             tx: Some(tx),
             observability_lost: Arc::new(AtomicU64::new(0)),
+            busy_retries: Arc::new(AtomicU64::new(0)),
             join: None,
             runtime: None,
         }
@@ -781,6 +853,11 @@ impl TelemetryDispatcher {
     #[cfg(test)]
     pub(crate) fn observability_lost_for_test(&self) -> u64 {
         self.observability_lost.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn busy_retries_for_test(&self) -> u64 {
+        self.busy_retries.load(Ordering::Relaxed)
     }
 }
 
@@ -882,7 +959,10 @@ impl<'a> TelemetryIngestor<'a> {
     }
 
     pub fn ingest(&mut self, batch: &EventBatch) -> Result<IngestionReport, TelemetryError> {
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_against_durable_terminals(&tx, batch)?;
 
         let mut inserted = 0;

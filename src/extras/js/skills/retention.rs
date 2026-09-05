@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
@@ -107,7 +107,10 @@ impl<'a> RetentionService<'a> {
         if cutoff < 0 || aggregate_version < 1 || now < cutoff {
             return Err(RetentionError::InvalidInput);
         }
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let watermark: i64 = tx
             .query_row(
                 "SELECT through_event_id FROM skill_compaction_watermarks
@@ -232,7 +235,10 @@ impl<'a> RetentionService<'a> {
         {
             return Err(RetentionError::InvalidInput);
         }
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists = tx
             .query_row(
                 "SELECT 1 FROM skill_revisions WHERE id = ?",

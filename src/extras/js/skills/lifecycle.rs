@@ -509,7 +509,10 @@ impl<'a> LifecycleService<'a> {
         {
             return Err(LifecycleError::PrivilegedTransition);
         }
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         if let Some(replayed) = read_idempotent_transition(&tx, request)? {
             tx.commit()?;
@@ -625,7 +628,10 @@ impl<'a> LifecycleService<'a> {
         created_at: i64,
     ) -> Result<(), LifecycleError> {
         validate_human_approval(approval)?;
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let revision = read_revision(&tx, skill_id)?;
         let report: Option<String> = tx
             .query_row(
@@ -859,7 +865,10 @@ impl<'a> LifecycleService<'a> {
             return Err(LifecycleError::EvidenceMismatch);
         }
         request.snapshot.validate()?;
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let replay_key = format!("{}:candidate", request.idempotency_key);
         if let Some(existing) = tx
             .query_row(

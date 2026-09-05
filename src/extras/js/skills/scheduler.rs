@@ -1,6 +1,6 @@
 //! Restart-safe, bounded leases for evidence-policy decisions.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::store::SkillStore;
 
@@ -78,7 +78,10 @@ impl<'a> PolicyScheduler<'a> {
         let expires = now
             .checked_add(lease_seconds)
             .ok_or(SchedulerError::InvalidLease)?;
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let selected: Option<(String, String, String, i64)> = tx
             .query_row(
                 "SELECT decision_id, skill_id, policy_version, attempts

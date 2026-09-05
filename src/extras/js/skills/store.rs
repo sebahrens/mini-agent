@@ -12,13 +12,14 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact, SkillExport};
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +358,24 @@ impl SkillStore {
         let db_path = db_dir.join("skills.db");
         let db = Connection::open(&db_path)?;
 
+        // Every process-local connection must use the same concurrency policy.
+        // BEGIN IMMEDIATE below then waits here instead of failing during a
+        // deferred read-to-write upgrade, while WAL keeps unrelated readers
+        // from blocking the writer.
+        db.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        let current_journal_mode: String =
+            db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        let journal_mode = if current_journal_mode.eq_ignore_ascii_case("wal") {
+            current_journal_mode
+        } else {
+            db.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?
+        };
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Constraint(format!(
+                "failed to enable WAL journaling: SQLite selected {journal_mode}"
+            )));
+        }
+
         // Enable foreign keys for referential integrity.
         db.execute_batch("PRAGMA foreign_keys = ON;")?;
 
@@ -410,7 +429,9 @@ impl SkillStore {
 
         let now = current_timestamp()?;
 
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let tombstoned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM skill_tombstones WHERE id = ?)",
             params![artifact.id],
@@ -784,7 +805,9 @@ impl SkillStore {
             .collect::<Result<Vec<_>, StoreError>>()?;
         let now = current_timestamp()?;
         let normalized = if normalized { 1 } else { 0 };
-        let transaction = self.db.transaction()?;
+        let transaction = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut statement = transaction.prepare_cached(
                 "INSERT OR REPLACE INTO skill_embeddings (
@@ -904,7 +927,9 @@ impl SkillStore {
         id: &str,
     ) -> Result<(), StoreError> {
         let now = current_timestamp()?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM skill_revisions WHERE id = ?)",
             params![id],
@@ -973,7 +998,9 @@ impl SkillStore {
         dimensions: usize,
         normalized: bool,
     ) -> Result<u64, StoreError> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE skill_generations
              SET desired_generation = desired_generation + 1,
@@ -1055,7 +1082,9 @@ impl SkillStore {
         artifact.verify_identity()?;
         validate_full_id(predecessor_id)?;
 
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let tombstoned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM skill_tombstones WHERE id = ?1)",
             [&artifact.id],
@@ -1177,7 +1206,9 @@ impl SkillStore {
         let lease_expires_at = now
             .checked_add(lease_seconds)
             .ok_or_else(|| StoreError::Constraint("lease deadline overflow".to_string()))?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate: Option<(String, String, Option<String>, u32, i64)> = tx
             .query_row(
                 "SELECT proposal_id, skill_id, predecessor_id, attempt_count, row_version
@@ -1348,7 +1379,9 @@ impl SkillStore {
         now: i64,
     ) -> Result<(), StoreError> {
         validate_report_binding(proposal_id, report)?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_report(&tx, report)?;
         let changed = tx.execute(
             "UPDATE skill_proposals
@@ -1399,7 +1432,9 @@ impl SkillStore {
             ));
         }
 
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(String, Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT status, report_id, reason_code
@@ -1970,7 +2005,9 @@ impl SkillStore {
                 "denial reason is required".to_string(),
             ));
         }
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let skill_id: String = tx
             .query_row(
                 "SELECT skill_id FROM skill_proposals
@@ -2017,7 +2054,9 @@ impl SkillStore {
         now: i64,
     ) -> Result<(), StoreError> {
         validate_report_binding(proposal_id, report)?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_report(&tx, report)?;
         let proposal_changed = tx.execute(
             "UPDATE skill_proposals
@@ -2057,7 +2096,9 @@ impl SkillStore {
         now: i64,
     ) -> Result<(), StoreError> {
         admin.ok_or(StoreError::Unauthorized)?;
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let skill_id: String = tx
             .query_row(
                 "SELECT skill_id FROM skill_proposals

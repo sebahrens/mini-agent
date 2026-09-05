@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hnsw_rs::prelude::{DistDot, Hnsw};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::SkillArtifact;
 use super::embed::ModelMetadata;
@@ -601,7 +601,7 @@ fn build_lexical_snapshot(
         CREATE VIRTUAL TABLE snapshot_vocab USING fts5vocab(snapshot_search, 'row');",
     )?;
     {
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO snapshot_search (id, identifier, description, tags, exports)

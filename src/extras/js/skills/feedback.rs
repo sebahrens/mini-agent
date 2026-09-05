@@ -1,6 +1,6 @@
 //! Authenticated, targeted, append-only skill feedback.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use super::privacy::Redactor;
@@ -128,7 +128,10 @@ impl<'a> FeedbackService<'a> {
             .reason_text
             .as_deref()
             .map(|value| self.redactor.redact(value));
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let revision_exists = tx
             .query_row(
                 "SELECT 1 FROM skill_revisions WHERE id = ?",
@@ -238,7 +241,10 @@ impl<'a> FeedbackService<'a> {
         if feedback_id.is_empty() || reason_code.is_empty() || created_at < 0 {
             return Err(FeedbackError::InvalidFeedback);
         }
-        let tx = self.store.connection_mut().transaction()?;
+        let tx = self
+            .store
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (skill_id, current, version): (String, String, i64) = tx
             .query_row(
                 "SELECT skill_id, state, version FROM skill_feedback
