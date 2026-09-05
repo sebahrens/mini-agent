@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
-#[cfg(test)]
 use super::store::{ApprovalAuthorizationRequest, approval_manifest_digest};
 use super::store::{ApprovalTransition, SkillStore, StoreError, consume_approval_authorization};
 
@@ -243,6 +242,23 @@ pub struct HumanApproval {
 }
 
 impl HumanApproval {
+    /// Create the fixed local-owner approval used only by the explicit CLI
+    /// lifecycle surface. Application-data directory ownership is the local
+    /// authentication boundary.
+    pub(crate) fn local_owner(
+        evaluation_report_id: impl Into<String>,
+        expected_row_version: i64,
+    ) -> Result<Self, LifecycleError> {
+        let approval = Self {
+            approval_id: format!("local-owner-activation-{}", uuid::Uuid::new_v4()),
+            actor_id: "local-owner".to_string(),
+            evaluation_report_id: evaluation_report_id.into(),
+            expected_row_version,
+        };
+        validate_human_approval(&approval)?;
+        Ok(approval)
+    }
+
     /// Test-only stand-in for an opaque approval produced by the parent authentication adapter.
     #[cfg(test)]
     pub(crate) fn verified(
@@ -423,6 +439,37 @@ pub struct LifecycleService<'a> {
 }
 
 impl<'a> LifecycleService<'a> {
+    /// Persist a short-lived authorization for the fixed local-owner CLI
+    /// adapter. Keeping construction here preserves the opaque binding between
+    /// approval, artifact, report, and transition.
+    pub(crate) fn authorize_root_local_owner(
+        &mut self,
+        skill_id: &str,
+        approval: &HumanApproval,
+        issued_at: i64,
+    ) -> Result<super::store::ApprovalAuthorization, LifecycleError> {
+        validate_human_approval(approval)?;
+        let artifact = self
+            .store
+            .get(skill_id)?
+            .ok_or_else(|| StoreError::NotFound(skill_id.to_string()))?;
+        let expires_at = issued_at
+            .checked_add(APPROVAL_AUTHORIZATION_LIFETIME_SECONDS)
+            .ok_or(LifecycleError::InvalidHumanApproval)?;
+        Ok(self
+            .store
+            .issue_root_approval_authorization(ApprovalAuthorizationRequest {
+                authorization_id: approval.approval_id.clone(),
+                principal: approval.actor_id.clone(),
+                artifact_id: skill_id.to_string(),
+                report_id: approval.evaluation_report_id.clone(),
+                manifest_digest: approval_manifest_digest(&artifact)?,
+                transition: ApprovalTransition::CanaryToActive,
+                issued_at,
+                expires_at,
+            })?)
+    }
+
     /// Test-only stand-in for the separate parent authentication interaction.
     #[cfg(test)]
     pub(crate) fn authorize_root_for_test(

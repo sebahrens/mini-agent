@@ -1,0 +1,15 @@
+{
+  "proposal": {
+    "source": "function parseJson(_cap, text) { return JSON.parse(text); }",
+    "description": "Parse JSON text into a JavaScript value with strict JSON semantics.",
+    "exports": [{"name": "parseJson", "signature": "(text: string) => unknown"}],
+    "tests": ["parseJson('{\"answer\":42}').answer === 42", "Array.isArray(parseJson('[1,2]'))"],
+    "capability": {"tier": "pure", "grants": []},
+    "tags": ["seed", "json", "parse"],
+    "predecessor_id": null
+  },
+  "held_out_suites": [{
+    "selector": {"tags": ["seed", "json"], "exports": ["parseJson"], "capability_tier": "pure"},
+    "cases": [{"expression": "parseJson('{\"nested\":{\"ok\":true}}').nested.ok", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
+  }]
+}

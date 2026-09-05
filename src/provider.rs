@@ -1701,6 +1701,7 @@ pub async fn build_agent_in_workspace(
         &skill_service_owner,
         &workspace,
         cfg.embedding.clone(),
+        cfg.enable_skill_proposals.unwrap_or(false),
     )
     .await;
 
@@ -1837,6 +1838,7 @@ async fn resolve_skill_services(
     owner: &std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
     embedding: Option<crate::config::EmbeddingConfig>,
+    enable_proposals: bool,
 ) -> Option<std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>> {
     if !eligible
         || !matches!(
@@ -1846,7 +1848,7 @@ async fn resolve_skill_services(
     {
         return None;
     }
-    owner.resolve(workspace, embedding).await
+    owner.resolve(workspace, embedding, enable_proposals).await
 }
 
 #[cfg(feature = "js")]
@@ -1933,12 +1935,12 @@ mod startup_capability_tests {
         };
 
         assert!(
-            super::resolve_skill_services(false, &available, &owner, &workspace, None)
+            super::resolve_skill_services(false, &available, &owner, &workspace, None, false)
                 .await
                 .is_none()
         );
         assert!(
-            super::resolve_skill_services(true, &unavailable, &owner, &workspace, None)
+            super::resolve_skill_services(true, &unavailable, &owner, &workspace, None, false)
                 .await
                 .is_none()
         );

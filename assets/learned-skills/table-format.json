@@ -1,0 +1,15 @@
+{
+  "proposal": {
+    "source": "function formatTable(_cap, rows) { if (!Array.isArray(rows) || rows.length === 0) return ''; const width = Math.max(...rows.map(r => r.length)); const cols = Array.from({length: width}, (_, i) => Math.max(...rows.map(r => String(r[i] == null ? '' : r[i]).length))); return rows.map(r => cols.map((n,i) => String(r[i] == null ? '' : r[i]).padEnd(n)).join(' | ').replace(/\\s+$/, '')).join('\\n'); }",
+    "description": "Format rectangular or ragged value rows as an aligned plain-text table.",
+    "exports": [{"name": "formatTable", "signature": "(rows: unknown[][]) => string"}],
+    "tests": ["formatTable([['a','bb'],['ccc','d']]).split('\\n')[0] === 'a   | bb'", "formatTable([]) === ''"],
+    "capability": {"tier": "pure", "grants": []},
+    "tags": ["seed", "table", "format"],
+    "predecessor_id": null
+  },
+  "held_out_suites": [{
+    "selector": {"tags": ["seed", "table"], "exports": ["formatTable"], "capability_tier": "pure"},
+    "cases": [{"expression": "formatTable([['name','n'],['mini',2]]).includes('mini | 2')", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
+  }]
+}

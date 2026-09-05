@@ -100,13 +100,17 @@ pub(crate) struct HeldOutSuite {
 }
 
 impl HeldOutSuiteDraft {
+    pub(crate) fn validate(&self) -> Result<(), HeldOutError> {
+        validate_suite(self)
+    }
+
     pub(crate) fn import(
         self,
         store: &mut SkillStore,
         admin: &AdminIdentity,
         now: i64,
     ) -> Result<String, HeldOutError> {
-        validate_suite(&self)?;
+        self.validate()?;
         let canonical = CanonicalSuitePayload {
             version: SUITE_FORMAT_VERSION,
             selector: self.selector,

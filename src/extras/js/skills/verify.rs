@@ -291,6 +291,17 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         WorkerError::Cancelled => {
             VerificationError::InfrastructureUnavailable("worker verification cancelled".into())
         }
+        WorkerError::ContainmentUnavailable
+        | WorkerError::Launch
+        | WorkerError::Transport
+        | WorkerError::Protocol
+        | WorkerError::BuildMismatch
+        | WorkerError::EffectOutcomeUnknown
+        | WorkerError::StaleGeneration
+        | WorkerError::IdentityExhausted
+        | WorkerError::BlockingVerifyInAsyncRuntime => {
+            VerificationError::InfrastructureUnavailable("worker unavailable".into())
+        }
         WorkerError::TimedOut => VerificationError::SourceEvaluationFailed("timeout".to_string()),
         WorkerError::NativeCpuLimit => {
             VerificationError::SourceEvaluationFailed("native CPU resource limit".to_string())
@@ -298,7 +309,9 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         WorkerError::UnexpectedVerificationEffect => {
             VerificationError::SourceEvaluationFailed("external effect denied".to_string())
         }
-        _ => VerificationError::RuntimeCreationFailed("worker unavailable".to_string()),
+        WorkerError::VerificationQueueFull | WorkerError::VerificationQueueClosed => {
+            unreachable!("verification queue failures return above")
+        }
     }
 }
 

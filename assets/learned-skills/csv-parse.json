@@ -1,0 +1,15 @@
+{
+  "proposal": {
+    "source": "function parseCsv(_cap, text) { const rows = []; let row = [], field = '', quoted = false; for (let i = 0; i < text.length; i++) { const c = text[i]; if (quoted) { if (c === '\"' && text[i+1] === '\"') { field += '\"'; i++; } else if (c === '\"') quoted = false; else field += c; } else if (c === '\"') quoted = true; else if (c === ',') { row.push(field); field = ''; } else if (c === '\\n') { row.push(field.replace(/\\r$/, '')); rows.push(row); row = []; field = ''; } else field += c; } if (quoted) throw new Error('unterminated CSV quote'); if (field.length || row.length) { row.push(field.replace(/\\r$/, '')); rows.push(row); } return rows; }",
+    "description": "Parse RFC-4180-style comma-separated text, including quoted fields and escaped quotes.",
+    "exports": [{"name": "parseCsv", "signature": "(text: string) => string[][]"}],
+    "tests": ["parseCsv('a,b\\n1,2').length === 2", "parseCsv('\"a,b\",c')[0][0] === 'a,b'"],
+    "capability": {"tier": "pure", "grants": []},
+    "tags": ["seed", "csv", "parse"],
+    "predecessor_id": null
+  },
+  "held_out_suites": [{
+    "selector": {"tags": ["seed", "csv"], "exports": ["parseCsv"], "capability_tier": "pure"},
+    "cases": [{"expression": "parseCsv('name,note\\nmini,\"a \"\"quote\"\"\"')[1][1]", "expected": {"type": "string", "value": "a \"quote\""}, "fake_files": {}, "transcript": {}}]
+  }]
+}

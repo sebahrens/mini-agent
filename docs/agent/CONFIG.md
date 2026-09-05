@@ -161,6 +161,20 @@ Stored vectors are keyed by `(model_id, model_revision)`. Change `model_revision
 when the upstream model changes so existing vectors become ineligible instead of
 being compared against incompatible new ones.
 
+Model-authored learned-skill proposals are off by default. Enable the bounded
+proposal and admission workers with a trusted global setting:
+
+```toml
+enable_skill_proposals = true
+```
+
+The setting is security-sensitive in project-local configuration and remains
+inactive until that exact project config is content-bound and trusted. Enabling
+it exposes `propose_skill` to model-authored JS only; stored skills never receive
+proposal authority, and every proposal still needs held-out evaluation plus the
+explicit local-owner approval and activation commands documented in
+[Skills](SKILLS.md).
+
 ### Building the `local` backend
 
 `skills-embed` pulls `ort-sys` (ONNX Runtime). On hosts it ships prebuilt
@@ -405,6 +419,7 @@ Accepted top-level keys:
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
 | `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` is optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
 | `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
+| `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
 | `permission-regex`        | object  | Same structure as `permission` but patterns are interpreted as regex instead of glob.                       |
 | `permission-allow`        | object  | Map of tool names to lists of glob patterns to allow. Works alongside the `permission` field. See below.    |

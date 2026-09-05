@@ -1464,6 +1464,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_agent_paused_in_scope<M>(
     agent: Agent<M>,
     prompt: String,

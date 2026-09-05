@@ -578,6 +578,15 @@ mod tests {
     }
 
     #[test]
+    fn containment_outage_is_retryable_verification_infrastructure() {
+        assert!(matches!(
+            worker_error(WorkerError::ContainmentUnavailable),
+            VerificationError::InfrastructureUnavailable(message)
+                if message == "worker unavailable"
+        ));
+    }
+
+    #[test]
     fn test_fresh_runtime_per_verification() {
         let s = skill(
             "function test() { return true; }",

@@ -1,0 +1,15 @@
+{
+  "proposal": {
+    "source": "function unifiedDiff(_cap, before, after, label) { if (before === after) return ''; const oldLines = before.split('\\n'), newLines = after.split('\\n'), name = label || 'file'; const body = []; for (const line of oldLines) body.push('-' + line); for (const line of newLines) body.push('+' + line); return '--- a/' + name + '\\n+++ b/' + name + '\\n@@ -1,' + oldLines.length + ' +1,' + newLines.length + ' @@\\n' + body.join('\\n'); }",
+    "description": "Format a deterministic whole-file unified diff for two text values.",
+    "exports": [{"name": "unifiedDiff", "signature": "(before: string, after: string, label?: string) => string"}],
+    "tests": ["unifiedDiff('a','b','x').startsWith('--- a/x\\n+++ b/x')", "unifiedDiff('same','same') === ''"],
+    "capability": {"tier": "pure", "grants": []},
+    "tags": ["seed", "diff", "format"],
+    "predecessor_id": null
+  },
+  "held_out_suites": [{
+    "selector": {"tags": ["seed", "diff"], "exports": ["unifiedDiff"], "capability_tier": "pure"},
+    "cases": [{"expression": "unifiedDiff('one','two','demo.txt').includes('@@ -1,1 +1,1 @@')", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
+  }]
+}

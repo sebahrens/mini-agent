@@ -701,6 +701,12 @@ impl JsTool {
         self
     }
 
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_proposal_service(mut self, service: ProposalEffectService) -> Self {
+        self.proposal_service = Some(service);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_runtime_for_test(
         sandbox: Sandbox,

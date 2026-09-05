@@ -921,6 +921,18 @@ pub(crate) struct AuthenticatedHumanDecision {
 }
 
 impl AuthenticatedHumanDecision {
+    /// Mint the fixed local-owner capability for an explicit one-shot CLI
+    /// operation. The OS account that can access the private application data
+    /// directory is the authentication boundary; no caller-controlled
+    /// principal is accepted here.
+    pub(crate) fn local_owner(authenticated_at: i64) -> Self {
+        Self {
+            decision_id: format!("local-owner-review-{}", uuid::Uuid::new_v4()),
+            principal: "local-owner".to_string(),
+            authenticated_at,
+        }
+    }
+
     /// Test-only stand-in for the parent authentication boundary.
     ///
     /// Production code cannot construct this capability from caller-provided strings. The

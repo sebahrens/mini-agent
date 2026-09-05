@@ -55,7 +55,15 @@ pub struct Cli {
     #[arg(
         long = "purge-learned-skill",
         value_name = "SHA256",
-        conflicts_with = "compact_learned_skill_events",
+        conflicts_with_all = [
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
         help = "Permanently purge one learned-skill revision and its dependent records"
     )]
     pub purge_learned_skill: Option<String>,
@@ -63,6 +71,14 @@ pub struct Cli {
     #[cfg(feature = "skills")]
     #[arg(
         long = "compact-learned-skill-events",
+        conflicts_with_all = [
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
         help = "Compact learned-skill telemetry older than the retention window"
     )]
     pub compact_learned_skill_events: bool,
@@ -76,7 +92,15 @@ pub struct Cli {
             "learned_skill_feedback_reason",
             "learned_skill_feedback_key"
         ],
-        conflicts_with_all = ["purge_learned_skill", "compact_learned_skill_events"],
+        conflicts_with_all = [
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
         help = "Submit authenticated local-owner feedback for one learned skill"
     )]
     pub learned_skill_feedback: Option<String>,
@@ -113,6 +137,58 @@ pub struct Cli {
         requires = "learned_skill_feedback"
     )]
     pub learned_skill_feedback_invocation: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "import-learned-skill",
+        value_name = "DIR_OR_JSON",
+        conflicts_with_all = [
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
+        help = "Import and contained-verify learned-skill JSON package(s) for approval"
+    )]
+    pub import_learned_skill: Option<std::path::PathBuf>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "install-learned-skill-seeds",
+        conflicts_with_all = [
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
+        help = "Import and contained-verify the bundled pure learned-skill seed library"
+    )]
+    pub install_learned_skill_seeds: bool,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "approve-learned-skill",
+        value_name = "SHA256",
+        conflicts_with_all = ["reject_learned_skill", "activate_learned_skill"],
+        help = "Approve an evaluated learned skill into non-retrievable canary state"
+    )]
+    pub approve_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "reject-learned-skill",
+        value_name = "SHA256",
+        conflicts_with = "activate_learned_skill",
+        help = "Reject an evaluated learned skill as the authenticated local owner"
+    )]
+    pub reject_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "activate-learned-skill",
+        value_name = "SHA256",
+        help = "Activate an approved root learned skill after its held-out baseline"
+    )]
+    pub activate_learned_skill: Option<String>,
 
     #[arg(
         long = "import-agent-skill",
@@ -907,5 +983,22 @@ mod tests {
             ])
             .is_err()
         );
+        let imported =
+            Cli::try_parse_from(["mini-agent", "--import-learned-skill", "skill.json"]).unwrap();
+        assert_eq!(
+            imported.import_learned_skill,
+            Some(std::path::PathBuf::from("skill.json"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--approve-learned-skill",
+                &"b".repeat(64),
+                "--reject-learned-skill",
+                &"b".repeat(64),
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["mini-agent", "--install-learned-skill-seeds"]).is_ok());
     }
 }

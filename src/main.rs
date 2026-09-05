@@ -195,6 +195,11 @@ async fn run_inner() -> anyhow::Result<()> {
     if cli.purge_learned_skill.is_some()
         || cli.compact_learned_skill_events
         || cli.learned_skill_feedback.is_some()
+        || cli.import_learned_skill.is_some()
+        || cli.install_learned_skill_seeds
+        || cli.approve_learned_skill.is_some()
+        || cli.reject_learned_skill.is_some()
+        || cli.activate_learned_skill.is_some()
     {
         let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
             extras::js::skills::operations::FeedbackOperation {
@@ -214,10 +219,34 @@ async fn run_inner() -> anyhow::Result<()> {
                     .expect("clap requires feedback key"),
             }
         });
+        let library = cli
+            .import_learned_skill
+            .as_deref()
+            .map(extras::js::skills::operations::LibraryOperation::Import)
+            .or_else(|| {
+                cli.install_learned_skill_seeds
+                    .then_some(extras::js::skills::operations::LibraryOperation::InstallSeeds)
+            })
+            .or_else(|| {
+                cli.approve_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Approve)
+            })
+            .or_else(|| {
+                cli.reject_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Reject)
+            })
+            .or_else(|| {
+                cli.activate_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Activate)
+            });
         extras::js::skills::operations::run(
             cli.purge_learned_skill.as_deref(),
             cli.compact_learned_skill_events,
             feedback,
+            library,
             &app_paths,
             cfg.embedding.as_ref(),
         )?;

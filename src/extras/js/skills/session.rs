@@ -8,7 +8,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
+use super::admission::{AdmissionEvaluator, AdmissionWorker};
 use super::embed::Embedder;
+use super::proposal::{
+    AttemptBudget, DEFAULT_SESSION_ATTEMPTS, ProposalEffectService, ProposalHost, ProposalQueue,
+    ProposalWorker,
+};
+use super::store::SkillStore;
 use super::telemetry::TelemetryDispatcher;
 use super::turn::{SkillRuntime, SkillTurnContext, shared_coordinator};
 use crate::config::EmbeddingConfig;
@@ -77,6 +83,7 @@ impl SkillServiceOwner {
         &self,
         workspace: &Arc<WorkspaceBinding>,
         embedding: Option<EmbeddingConfig>,
+        enable_proposals: bool,
     ) -> Option<Arc<SkillSessionServices>> {
         let root = workspace.root().to_path_buf();
         self.cache
@@ -84,7 +91,7 @@ impl SkillServiceOwner {
                 #[cfg(test)]
                 self.initialization_attempts
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                SkillSessionServices::open(root, embedding).await
+                SkillSessionServices::open(root, embedding, enable_proposals).await
             })
             .await
     }
@@ -104,6 +111,33 @@ mod tests {
     use crate::extras::js::skills::turn::{SkillTurnContext, TurnSkillBundle};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn app_paths() -> (std::path::PathBuf, crate::paths::AppPaths) {
+        let root = std::env::temp_dir().join(format!(
+            "skill-session-proposals-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                crate::paths::PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                crate::paths::PathPlatform::Windows
+            } else {
+                crate::paths::PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.join("config")),
+            data_base: Some(root.join("data")),
+            local_data_base: Some(root.join("local")),
+            state_base: Some(root.join("state")),
+            cache_base: Some(root.join("cache")),
+            workspace_root: None,
+            overrides: Default::default(),
+        })
+        .unwrap();
+        (root, paths)
+    }
 
     #[tokio::test]
     async fn repeated_rebuilds_initialize_runtime_and_each_worker_once() {
@@ -234,16 +268,58 @@ mod tests {
         let owner = super::SkillServiceOwner::new();
         assert_eq!(owner.initialization_attempts(), 0);
     }
+
+    #[test]
+    fn production_proposal_services_enqueue_into_the_durable_admission_queue() {
+        use crate::extras::js::skills::proposal::{JsCapability, JsExport, JsProposal};
+
+        let (root, paths) = app_paths();
+        let services = super::SkillSessionServices::start_proposal_services(&paths, None).unwrap();
+        let result = services
+            .service
+            .execute(JsProposal {
+                source: "function run(_cap) { return 1; }".to_string(),
+                description: "Session proposal service test".to_string(),
+                exports: vec![JsExport {
+                    name: "run".to_string(),
+                    signature: "() => number".to_string(),
+                }],
+                tests: vec!["run() === 1".to_string()],
+                capability: JsCapability {
+                    tier: "pure".to_string(),
+                    grants: Vec::new(),
+                },
+                tags: vec!["session-test".to_string()],
+                predecessor_id: None,
+            })
+            .unwrap();
+        assert!(
+            crate::extras::js::skills::store::SkillStore::open_at(&paths)
+                .unwrap()
+                .get_proposal(&result.proposal_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(services);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 struct ObservationServices {
     telemetry: Arc<TelemetryDispatcher>,
 }
 
+struct ProposalServices {
+    service: ProposalEffectService,
+    _proposal_worker: ProposalWorker,
+    _admission_worker: AdmissionWorker,
+}
+
 /// The initialized learned-JS runtime and parent-side service workers for one workspace session.
 pub(crate) struct SkillSessionServices {
     runtime: Arc<SkillRuntime>,
     observation: Option<ObservationServices>,
+    proposals: Option<ProposalServices>,
     turn_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -251,6 +327,7 @@ impl SkillSessionServices {
     async fn open(
         workspace_root: PathBuf,
         embedding: Option<EmbeddingConfig>,
+        enable_proposals: bool,
     ) -> Option<Arc<Self>> {
         let paths = match crate::paths::process_paths()
             .and_then(|paths| paths.with_workspace_root(&workspace_root))
@@ -289,11 +366,53 @@ impl SkillSessionServices {
             }
         };
 
+        let proposals = if enable_proposals {
+            match Self::start_proposal_services(&paths, embedding.as_ref()) {
+                Ok(services) => Some(services),
+                Err(error) => {
+                    tracing::warn!(error = %error, "learned-skill proposals are disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Some(Arc::new(Self {
             runtime,
             observation,
+            proposals,
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         }))
+    }
+
+    fn start_proposal_services(
+        paths: &crate::paths::AppPaths,
+        embedding: Option<&EmbeddingConfig>,
+    ) -> Result<ProposalServices, String> {
+        let proposal_worker = ProposalQueue::start_store_worker(
+            SkillStore::open_at(paths).map_err(|error| error.to_string())?,
+            32,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| error.to_string())?;
+        let evaluator = AdmissionEvaluator::new(
+            SkillStore::open_at(paths).map_err(|error| error.to_string())?,
+            Embedder::from_config(embedding).map_err(|error| error.to_string())?,
+            format!("session-{}", uuid::Uuid::new_v4()),
+        )
+        .map_err(|error| error.to_string())?;
+        let admission_worker =
+            AdmissionWorker::start_session_scoped(evaluator).map_err(|error| error.to_string())?;
+        let service = ProposalEffectService::new(ProposalHost::new(
+            proposal_worker.sender(),
+            AttemptBudget::new(DEFAULT_SESSION_ATTEMPTS),
+        ));
+        Ok(ProposalServices {
+            service,
+            _proposal_worker: proposal_worker,
+            _admission_worker: admission_worker,
+        })
     }
 
     fn start_observation_services(
@@ -327,5 +446,11 @@ impl SkillSessionServices {
         self.observation
             .as_ref()
             .map(|services| Arc::clone(&services.telemetry))
+    }
+
+    pub(crate) fn proposal_service(&self) -> Option<ProposalEffectService> {
+        self.proposals
+            .as_ref()
+            .map(|services| services.service.clone())
     }
 }

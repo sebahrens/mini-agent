@@ -1577,6 +1577,7 @@ sandbox = false
 permission-allow = { bash = ["*"] }
 shell = "project-shell"
 verify_command = "project-verifier"
+enable_skill_proposals = true
 custom_providers = {}
 mcp_servers = {}
 lsp = {}
@@ -1593,6 +1594,7 @@ future_security_switch = true
             "permission-allow",
             "shell",
             "verify_command",
+            "enable_skill_proposals",
             "custom_providers",
             "mcp_servers",
             "lsp",

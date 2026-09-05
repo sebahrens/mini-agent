@@ -133,6 +133,11 @@ pub struct Config {
     /// offline deterministic backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<types::EmbeddingConfig>,
+    /// Allow model-authored JavaScript steps to submit bounded learned-skill
+    /// proposals. Proposals still require contained verification, held-out
+    /// evaluation, and explicit local-owner approval before use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_skill_proposals: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "permission-regex")]

@@ -1827,6 +1827,18 @@ impl SkillStore {
         self.issue_approval_authorization(request)
     }
 
+    pub(super) fn issue_root_approval_authorization(
+        &mut self,
+        request: ApprovalAuthorizationRequest,
+    ) -> Result<ApprovalAuthorization, StoreError> {
+        if request.transition != ApprovalTransition::CanaryToActive
+            || request.principal != "local-owner"
+        {
+            return Err(StoreError::Unauthorized);
+        }
+        self.issue_approval_authorization(request)
+    }
+
     #[cfg(test)]
     pub(super) fn issue_approval_authorization_for_test(
         &mut self,

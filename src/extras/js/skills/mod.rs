@@ -5,9 +5,9 @@
 //! identity. Persistence lives in [`store`], embedding in [`embed`], and no-effect
 //! verification in [`verify`].
 //!
-//! Proposal, admission, feedback, and repair APIs remain library/test infrastructure. The shipped
-//! agent does not expose proposal authority until an authenticated operator approval adapter is
-//! available. Retention and privacy purge have explicit local-operator command surfaces.
+//! Proposal, admission, feedback, and repair remain parent-owned infrastructure. Model proposal
+//! authority is an explicit trusted-config opt-in, and imports, review, activation, retention, and
+//! privacy purge have separate local-owner command surfaces.
 //!
 //! Identity rules (see `docs/specs/phase-3-skill-library.md`):
 //!

@@ -1,0 +1,15 @@
+{
+  "proposal": {
+    "source": "function parseToml(_cap, text) { const out = {}; let section = out; for (const raw of text.split(/\\r?\\n/)) { const line = raw.trim(); if (!line || line.startsWith('#')) continue; if (line.startsWith('[') && line.endsWith(']')) { const name = line.slice(1,-1).trim(); if (!name) throw new Error('invalid section'); section = out[name] || (out[name] = {}); continue; } const at = line.indexOf('='); if (at < 1) throw new Error('invalid assignment'); const key = line.slice(0,at).trim(); const value = line.slice(at+1).trim(); if (/^\"(?:[^\"\\\\]|\\\\.)*\"$/.test(value)) section[key] = JSON.parse(value); else if (value === 'true' || value === 'false') section[key] = value === 'true'; else if (/^[+-]?\\d+(?:\\.\\d+)?$/.test(value)) section[key] = Number(value); else throw new Error('unsupported TOML value'); } return out; }",
+    "description": "Parse deterministic flat TOML scalars and one-level tables without effects.",
+    "exports": [{"name": "parseToml", "signature": "(text: string) => object"}],
+    "tests": ["parseToml('name = \"mini\"\\ncount = 2').count === 2", "parseToml('[tool]\\nenabled = true').tool.enabled === true"],
+    "capability": {"tier": "pure", "grants": []},
+    "tags": ["seed", "toml", "parse"],
+    "predecessor_id": null
+  },
+  "held_out_suites": [{
+    "selector": {"tags": ["seed", "toml"], "exports": ["parseToml"], "capability_tier": "pure"},
+    "cases": [{"expression": "parseToml('title = \"demo\"\\n[build]\\njobs = 4').build.jobs === 4", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
+  }]
+}

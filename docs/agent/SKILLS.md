@@ -22,8 +22,11 @@ turn leases remain unchanged.
 
 Within a logical agent session, discovery storage and telemetry are initialized lazily once for
 the canonical workspace and reused across model switches, compaction, and other full-agent
-rebuilds. Proposal and admission workers are not started by the shipped binary. `--no-tools`, an
-ineligible JS tool, or unavailable worker containment starts none of the discovery services. ACP
+rebuilds. `--no-tools`, an ineligible JS tool, or unavailable worker containment starts none of
+the discovery services. When
+`enable_skill_proposals = true` is set in trusted configuration, one bounded proposal-store worker
+and one contained-verification admission worker join the session bundle; otherwise the
+`propose_skill` global remains absent. ACP
 sessions retain separate service owners and turn contexts, so concurrent clients cannot replace
 one another's selected-skill bundle.
 
@@ -38,9 +41,9 @@ Replaying a consumed handle or calling after parent expiry/revocation fails clos
 FIFO, or metadata fallback exists. Protected host globals cannot be replaced.
 Model-authored code then runs separately as `agent.js`, preserving its line numbers. Identity,
 collision, export, source, or capability errors fail before agent code executes. The shipped agent
-does not expose `propose_skill`: there is no authenticated operator adapter for held-out suite
-import, approval/denial, activation, or purge. Proposal and admission APIs remain test/library
-infrastructure. Stored skill initialization and exports never receive proposal authority.
+exposes `propose_skill` only under the trusted opt-in above. It enters the same durable queue as
+operator imports and never makes a proposal retrievable. Stored skill initialization and exports
+never receive proposal authority.
 
 Private realms prevent one skill from receiving another skill's source-level capability object;
 they do not contain native compromise. The parent treats the union of all live current-step grants
@@ -50,10 +53,39 @@ workspace, network, credential, database, or persistence authority.
 
 The library's removal contract is optimistic, versioned retirement. Retirement and privacy purge
 publish an immediate immutable visibility mask without rebuilding the graph; purge also deletes
-persistent vectors, and a purged identity is tombstoned so it cannot be resurrected. No shipped
-operator command currently invokes those lifecycle mutations.
+persistent vectors, and a purged identity is tombstoned so it cannot be resurrected. The
+`--purge-learned-skill` operator command invokes the coordinated privacy-purge path.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
 network, process, or sandbox permission paths.
+
+## Local-owner lifecycle
+
+Learned-skill lifecycle commands run before provider initialization and use the private local data
+directory as their OS-account authentication boundary:
+
+```text
+mini-agent --import-learned-skill <package.json|directory>
+mini-agent --install-learned-skill-seeds
+mini-agent --approve-learned-skill <full-sha256>
+mini-agent --reject-learned-skill <full-sha256>
+mini-agent --activate-learned-skill <full-sha256>
+```
+
+A directory import reads 1–32 sorted regular `.json` files and ignores symlinks. Each file is
+bounded to 256 KiB and contains exactly a `proposal` in the `propose_skill` wire shape plus a
+non-empty `held_out_suites` array in the Phase 4 held-out-suite shape. Import canonicalizes
+identity v2, registers the trusted baseline, enqueues the immutable artifact, and evaluates it in
+the contained worker. A passing artifact stops at `awaiting_approval`; approval moves it to a
+non-retrievable canary, and a distinct activation command publishes a lineage-root skill. Failed
+or missing baselines cannot be approved. Worker/containment outages leave the proposal pending and
+make the import command fail, rather than misclassifying infrastructure failure as skill failure.
+Replacement activation continues to require the
+evidence-based promotion path and is deliberately rejected by this root-activation command.
+
+`--install-learned-skill-seeds` imports five bundled pure packages: JSON, bounded TOML, and CSV
+parsing, whole-file unified-diff formatting, and aligned text-table formatting. The seeds use the
+same held-out evaluation and two-action approval/activation route as external packages; they are
+not silently trusted or activated.
 
 ## Current limits and planned changes (2026-09-05 review)
 
@@ -63,9 +95,8 @@ network, process, or sandbox permission paths.
   the deterministic backend (mini-agent-bfsg).
 - The lexical channel requires every prompt word to match, so natural-language prompts rarely
   match; an OR/BM25 query is planned (mini-agent-io7h).
-- The shipped binary has no command to import, approve, or list learned skills, so the store
-  stays empty in production. An operator surface, a seed library, and a stats view are planned
-  (mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t).
+- A stats/list view remains planned (mini-agent-vvud, mini-agent-i78t); lifecycle commands print
+  the full identity and resulting state for scripting in the meantime.
 - The model manifest does not yet say that exports are callable globals (mini-agent-4bqq).
 
 See [the Phase 3 specification](../specs/phase-3-skill-library.md),

@@ -445,6 +445,9 @@ fn register_js_tool_with_status(
         if let Some(telemetry) = services.telemetry() {
             js_tool = js_tool.with_shared_telemetry(telemetry);
         }
+        if let Some(proposals) = services.proposal_service() {
+            js_tool = js_tool.with_proposal_service(proposals);
+        }
     }
 
     tools.push(Box::new(js_tool));
