@@ -2231,6 +2231,10 @@ mod protocol_tests {
 
     impl Drop for ProtocolTempDir {
         fn drop(&mut self) {
+            #[cfg(feature = "hooks")]
+            if let Ok(workspace) = std::env::current_dir() {
+                crate::extras::hooks::set_active_workspace(&workspace);
+            }
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -2247,6 +2251,18 @@ mod protocol_tests {
     #[test]
     fn initialize_always_advertises_the_implemented_v1_protocol() {
         assert_eq!(acp_protocol_version(), ProtocolVersion::V1);
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn protocol_workspace_fixture_restores_the_hook_workspace_before_cleanup() {
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
+        {
+            let workspace = ProtocolTempDir::new();
+            crate::extras::hooks::set_active_workspace(workspace.path());
+            assert_eq!(crate::extras::hooks::active_workspace(), workspace.path());
+        }
+        assert_eq!(crate::extras::hooks::active_workspace(), expected);
     }
 
     #[test]

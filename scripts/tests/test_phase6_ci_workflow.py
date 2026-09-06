@@ -284,7 +284,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     r"(?s)(?:for|foreach).+skills.+cargo test",
                 )
 
-    def test_macos_matrix_isolates_the_agent_rebuild_worker_reuse_test(self) -> None:
+    def test_matrix_isolates_process_global_worker_and_skill_tests(self) -> None:
         body = job_body(self.workflow, "test")
         full_path = (
             "extras::js::tool::js_permission_bridge::"
@@ -295,7 +295,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         )[1].split("- name:", 1)[0]
         self.assertIn("matrix.os != 'macos-latest'", linux_step)
         self.assertNotIn("--test-threads=1", linux_step)
-        self.assertNotIn("--skip", linux_step)
+        self.assertIn(
+            "--skip tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            linux_step,
+        )
 
         macos_step = body.split(
             "name: Test (${{ matrix.features }}) on macOS with process-global worker isolation",
@@ -321,11 +325,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("-- --exact --test-threads=1", isolated_step)
 
         task_step = body.split(
-            "name: Test macOS task-level skill eval in a fresh process", 1
+            "name: Test task-level skill eval in a fresh process", 1
         )[1].split("- name:", 1)[0]
-        self.assertIn("matrix.os == 'macos-latest'", task_step)
         self.assertIn("contains(matrix.features, 'skills')", task_step)
         self.assertIn("contains(matrix.features, 'sandbox')", task_step)
+        self.assertIn("contains(matrix.features, 'subagents')", task_step)
         self.assertIn(
             "tests::harness_eval_tests::"
             "task_json_library_axis_uses_real_store_and_records_oracles",
@@ -340,6 +344,27 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         )[0]
         for header in (matrix_header, all_features_header):
             self.assertIn("RUST_MIN_STACK: 8388608", header)
+
+        all_features = job_body(self.workflow, "all-features")
+        main_step = all_features.split("name: Test all features", 1)[1].split(
+            "- name:", 1
+        )[0]
+        self.assertIn("-- --test-threads=1", main_step)
+        self.assertIn(
+            "--skip tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            main_step,
+        )
+        isolated_step = all_features.split(
+            "name: Test all-features task-level skill eval in a fresh process", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("--all-features", isolated_step)
+        self.assertIn(
+            "tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            isolated_step,
+        )
+        self.assertIn("-- --exact --test-threads=1", isolated_step)
 
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")

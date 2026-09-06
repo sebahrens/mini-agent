@@ -260,7 +260,9 @@ jobs:
 
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest'
-        run: cargo test --locked ${{ matrix.features }}
+        run: >-
+          cargo test --locked ${{ matrix.features }} --
+          --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
         if: matrix.os == 'macos-latest'
@@ -278,11 +280,11 @@ jobs:
           extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
           -- --exact --test-threads=1
 
-      - name: Test macOS task-level skill eval in a fresh process
+      - name: Test task-level skill eval in a fresh process
         if: >-
-          matrix.os == 'macos-latest' &&
           contains(matrix.features, 'skills') &&
-          contains(matrix.features, 'sandbox')
+          contains(matrix.features, 'sandbox') &&
+          contains(matrix.features, 'subagents')
         env:
           RUST_MIN_STACK: 8388608
         run: >-
@@ -312,7 +314,15 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Test all features
-        run: cargo test --locked --all-features
+        run: >-
+          cargo test --locked --all-features -- --test-threads=1
+          --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+
+      - name: Test all-features task-level skill eval in a fresh process
+        run: >-
+          cargo test --locked --all-features
+          tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+          -- --exact --test-threads=1
 
   parallel-test-smoke:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
