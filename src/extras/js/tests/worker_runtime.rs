@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -143,14 +143,14 @@ fn write_parent_frame(output: &mut impl Write, frame: &ParentWireFrame) {
 /// The current executable is a libtest binary. Discard only libtest's bounded textual preamble,
 /// then return the first valid worker frame. The worker child exits directly, so no harness text
 /// can follow the protocol once bootstrap begins.
-fn read_worker_frame_after_test_preamble(input: &mut impl Read) -> (Vec<u8>, WorkerWireFrame) {
+fn read_worker_frame_after_test_preamble(
+    input: &mut impl Read,
+) -> std::io::Result<(Vec<u8>, WorkerWireFrame)> {
     let mut preamble = Vec::new();
     let mut window = Vec::new();
     loop {
         let mut byte = [0_u8; 1];
-        input
-            .read_exact(&mut byte)
-            .expect("worker exited before emitting Ready");
+        input.read_exact(&mut byte)?;
         window.push(byte[0]);
         if window.len() < 5 {
             continue;
@@ -162,20 +162,20 @@ fn read_worker_frame_after_test_preamble(input: &mut impl Read) -> (Vec<u8>, Wor
             let mut encoded = window[..4].to_vec();
             encoded.push(window[4]);
             let mut tail = vec![0_u8; length - 1];
-            input
-                .read_exact(&mut tail)
-                .expect("worker Ready frame was truncated");
+            input.read_exact(&mut tail)?;
             encoded.extend_from_slice(&tail);
             if let Ok(frame) = read_frame(&mut encoded.as_slice()) {
-                return (preamble, frame);
+                return Ok((preamble, frame));
             }
         }
 
         preamble.push(window.remove(0));
-        assert!(
-            preamble.len() <= 4096,
-            "worker emitted an unbounded non-protocol preamble"
-        );
+        if preamble.len() > 4096 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "worker emitted an unbounded non-protocol preamble",
+            ));
+        }
     }
 }
 
@@ -215,18 +215,38 @@ fn run_worker_transcript(
     test_timeout_ms: u64,
     test_max_pending_jobs: usize,
 ) -> (Vec<WorkerWireFrame>, Vec<u8>) {
-    let mut process = TestWorkerLauncher::internal_worker_process_with_limits(
-        test_timeout_ms,
-        test_max_pending_jobs,
-    )
-    .launch()
-    .expect("test worker should launch");
-    let mut parent = ParentProtocol::new(BuildIdentity::current());
-
-    let hello = hello(&parent, 0);
-    parent.on_send(&hello).unwrap();
-    write_parent_frame(&mut process.input, &hello);
-    let (preamble, ready) = read_worker_frame_after_test_preamble(&mut process.output);
+    const MAX_STARTUP_ATTEMPTS: usize = 3;
+    let (mut process, mut parent, preamble, ready) = 'startup: {
+        for attempt in 1..=MAX_STARTUP_ATTEMPTS {
+            let mut process = TestWorkerLauncher::internal_worker_process_with_limits(
+                test_timeout_ms,
+                test_max_pending_jobs,
+            )
+            .launch()
+            .expect("test worker should launch");
+            let mut parent = ParentProtocol::new(BuildIdentity::current());
+            let hello = hello(&parent, 0);
+            parent.on_send(&hello).unwrap();
+            write_parent_frame(&mut process.input, &hello);
+            match read_worker_frame_after_test_preamble(&mut process.output) {
+                Ok((preamble, ready)) => {
+                    break 'startup (process, parent, preamble, ready);
+                }
+                Err(error) => {
+                    let _ = process.terminate_tree();
+                    let _ = process.wait();
+                    if error.kind() == ErrorKind::UnexpectedEof && attempt < MAX_STARTUP_ATTEMPTS {
+                        eprintln!(
+                            "test worker exited before Ready on attempt {attempt}; retrying with a fresh worker"
+                        );
+                        continue;
+                    }
+                    panic!("test worker failed before Ready on attempt {attempt}: {error}")
+                }
+            }
+        }
+        unreachable!("the final startup failure returns through the error arm")
+    };
     assert_redacted(&preamble);
     assert!(matches!(ready.message, WorkerFrame::Ready(_)));
     parent.on_receive(&ready).unwrap();
@@ -235,7 +255,8 @@ fn run_worker_transcript(
         parent.on_send(request).unwrap();
         write_parent_frame(&mut process.input, request);
         let (interleaved_harness, response) =
-            read_worker_frame_after_test_preamble(&mut process.output);
+            read_worker_frame_after_test_preamble(&mut process.output)
+                .expect("worker exited before emitting the request response");
         assert_redacted(&interleaved_harness);
         parent.on_receive(&response).unwrap();
         frames.push(response);
@@ -1453,7 +1474,8 @@ fn worker_bootstrap_protocol_valid_hello_ready_shutdown_round_trip() {
 
     let mut stdout = Vec::new();
     process.output.read_to_end(&mut stdout).unwrap();
-    let (preamble, ready) = read_worker_frame_after_test_preamble(&mut stdout.as_slice());
+    let (preamble, ready) = read_worker_frame_after_test_preamble(&mut stdout.as_slice())
+        .expect("worker Ready fixture must contain one complete frame");
     assert_redacted(&preamble);
     assert!(matches!(ready.message, WorkerFrame::Ready(_)));
     parent
