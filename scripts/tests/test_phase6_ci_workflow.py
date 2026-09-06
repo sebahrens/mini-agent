@@ -290,10 +290,12 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "extras::js::tool::js_permission_bridge::"
             "js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver"
         )
-        linux_step = body.split("name: Test (${{ matrix.features }}) on Linux", 1)[
-            1
-        ].split("- name:", 1)[0]
+        linux_step = body.split(
+            "name: Test (${{ matrix.features }}) on Linux with process-global worker isolation",
+            1,
+        )[1].split("- name:", 1)[0]
         self.assertIn("matrix.os != 'macos-latest'", linux_step)
+        self.assertIn("-- --test-threads=1", linux_step)
         self.assertNotIn("--skip", linux_step)
 
         macos_step = body.split(

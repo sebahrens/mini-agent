@@ -236,9 +236,12 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Test (${{ matrix.features }}) on Linux
+      # Several JS tests launch authenticated child copies of the libtest binary. Running those
+      # process-global worker fixtures concurrently can make an unrelated child lose its protocol
+      # transport under hosted-runner load, so keep the full Linux matrix deterministic too.
+      - name: Test (${{ matrix.features }}) on Linux with process-global worker isolation
         if: matrix.os != 'macos-latest'
-        run: cargo test --locked ${{ matrix.features }}
+        run: cargo test --locked ${{ matrix.features }} -- --test-threads=1
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
         if: matrix.os == 'macos-latest'
