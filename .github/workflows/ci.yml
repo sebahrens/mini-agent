@@ -375,7 +375,7 @@ jobs:
         with:
           rustflags: ''
       - name: Test the Windows default feature suite
-        run: cargo test --locked -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1 --nocapture
 
   linux-sandbox-policy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

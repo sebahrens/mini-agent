@@ -2597,7 +2597,9 @@ mod tests {
             let captured = captured.clone();
             async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
         });
-        gate.wait_until_reached().await;
+        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+            .await
+            .expect("exact stash restore must reach the post-apply mutation gate");
         assert_eq!(
             std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
             "captured\n"
@@ -2606,8 +2608,9 @@ mod tests {
         let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
         gate.resume();
 
-        let error = task
+        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
             .await
+            .expect("exact stash restore must finish after the mutation gate resumes")
             .unwrap()
             .expect_err("changed stash stack must be retained");
         assert!(
@@ -2637,12 +2640,15 @@ mod tests {
             let captured = captured.clone();
             async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
         });
-        gate.wait_until_reached().await;
+        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+            .await
+            .expect("exact stash restore must reach the post-apply mutation gate");
         std::fs::write(repo.path().join("tracked.txt"), "editor wins\n").unwrap();
         gate.resume();
 
-        let error = task
+        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
             .await
+            .expect("exact stash restore must finish after the mutation gate resumes")
             .unwrap()
             .expect_err("changed content must retain stash");
         assert!(
@@ -2672,12 +2678,15 @@ mod tests {
             let captured = captured.clone();
             async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
         });
-        gate.wait_until_reached().await;
+        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+            .await
+            .expect("exact stash restore must reach the post-apply mutation gate");
         std::fs::write(repo.path().join("editor-note.txt"), b"editor bytes\0\xff").unwrap();
         gate.resume();
 
-        let error = task
+        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
             .await
+            .expect("exact stash restore must finish after the mutation gate resumes")
             .unwrap()
             .expect_err("untracked content must retain stash");
         assert!(
@@ -2775,12 +2784,17 @@ mod tests {
         assert!(unrelated_stash.is_some());
 
         let task = tokio::spawn(async move { try_merge(&info, "main").await });
-        gate.wait_until_reached().await;
+        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+            .await
+            .expect("stash creation must reach the pre-publication mutation gate");
 
         git(repo.path(), ["stash", "push", "-m", "concurrent external"]);
         let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
         gate.resume();
-        let (_state, outcome) = task.await.unwrap();
+        let (_state, outcome) = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
+            .await
+            .expect("merge must finish after the stash publication gate resumes")
+            .unwrap();
 
         assert!(
             matches!(outcome, MergeOutcome::Error(error) if error.contains("publish-created-stash")),

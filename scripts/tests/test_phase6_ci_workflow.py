@@ -428,6 +428,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "- name:", 1
         )[0]
         self.assertIn("cargo test --locked -- --test-threads=1", step)
+        self.assertIn("--test-threads=1 --nocapture", step)
 
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
