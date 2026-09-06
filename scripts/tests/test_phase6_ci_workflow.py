@@ -294,11 +294,25 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "name: Test (${{ matrix.features }}) on Linux", 1
         )[1].split("- name:", 1)[0]
         self.assertIn("matrix.os != 'macos-latest'", linux_step)
+        self.assertIn("!contains(matrix.features, 'js')", linux_step)
         self.assertNotIn("--test-threads=1", linux_step)
         self.assertIn(
             "--skip tests::harness_eval_tests::"
             "task_json_library_axis_uses_real_store_and_records_oracles",
             linux_step,
+        )
+
+        linux_js_step = body.split(
+            "name: Test (${{ matrix.features }}) on Linux with process-global worker isolation",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("matrix.os != 'macos-latest'", linux_js_step)
+        self.assertIn("contains(matrix.features, 'js')", linux_js_step)
+        self.assertIn("-- --test-threads=1", linux_js_step)
+        self.assertIn(
+            "--skip tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            linux_js_step,
         )
 
         macos_step = body.split(
