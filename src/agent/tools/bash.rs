@@ -443,6 +443,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_infinite_command_uses_lower_deadline() {
         let started = Instant::now();
@@ -475,6 +476,7 @@ mod tests {
         assert_eq!(error, "shell timeout must be at least 1 millisecond");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_timeout_kills_descendant() {
         let pid_file = std::env::temp_dir().join(format!(
@@ -503,6 +505,7 @@ mod tests {
         let _ = std::fs::remove_file(pid_file);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_receiver_loss_kills_descendant() {
         let pid_file = std::env::temp_dir().join(format!(
@@ -532,6 +535,7 @@ mod tests {
         let _ = std::fs::remove_file(pid_file);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_stdout_only_is_bounded() {
         let limits = test_limits();
@@ -548,6 +552,7 @@ mod tests {
         assert!(output.stderr.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_stderr_only_is_bounded() {
         let limits = test_limits();
@@ -564,6 +569,7 @@ mod tests {
         assert_eq!(output.stderr.len(), limits.stderr_bytes);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_mixed_output_uses_combined_cap() {
         let limits = CommandLimits {
@@ -589,6 +595,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_exit_code_and_stream_order_are_stable() {
         let output = test_tool()
@@ -603,6 +610,7 @@ mod tests {
         assert_eq!(output, "[stdout]\nstdout\n[stderr]\nstderr\nExit code: 7");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tiny_line_cap_preserves_the_nonzero_exit_status() {
         let output = BashTool::new(None, None, Sandbox::new(false, "bwrap"), Some(1))

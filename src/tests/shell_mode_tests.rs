@@ -15,6 +15,7 @@ const SHORT_LIMITS: CommandLimits = CommandLimits {
     combined_bytes: 6144,
 };
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_preserves_exact_authored_script_and_reports_bypass() {
     let sandbox = Sandbox::new(false, "bwrap");
@@ -72,6 +73,7 @@ async fn implicit_unavailable_default_clears_ambient_credentials() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_success_and_nonzero_share_one_status_policy() {
     let sandbox = Sandbox::new(false, "bwrap");
@@ -94,6 +96,7 @@ async fn explicit_shell_success_and_nonzero_share_one_status_policy() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_lossily_renders_invalid_utf8_without_panicking() {
     let sandbox = Sandbox::new(false, "bwrap");
@@ -105,6 +108,7 @@ async fn explicit_shell_lossily_renders_invalid_utf8_without_panicking() {
     assert_eq!(run.rendered_output(), "�x");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_captures_exact_cwd_and_inherited_bypass_environment() {
     let sandbox = Sandbox::new(false, "bwrap");
@@ -220,6 +224,7 @@ async fn explicit_shell_available_backend_runs_or_fails_closed_before_payload() 
     let _ = std::fs::remove_file(marker);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_timeout_kills_term_ignoring_descendant_and_recovers() {
     let marker = unique_marker("timeout-descendant");
@@ -246,6 +251,7 @@ async fn explicit_shell_timeout_kills_term_ignoring_descendant_and_recovers() {
     assert_eq!(next.rendered_output(), "recovered");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_operation_cancellation_kills_and_reaps_tree() {
     let marker = unique_marker("cancel-descendant");
@@ -281,6 +287,7 @@ async fn explicit_shell_operation_cancellation_kills_and_reaps_tree() {
     let _ = std::fs::remove_file(started);
 }
 
+#[cfg(unix)]
 #[test]
 fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -340,6 +347,7 @@ fn explicit_shell_caller_drop_audits_after_tree_cleanup() {
     assert!(!marker.exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_bounds_stdout_stderr_and_mixed_floods() {
     let sandbox = Sandbox::new(false, "bwrap");
@@ -374,6 +382,7 @@ async fn explicit_shell_bounds_stdout_stderr_and_mixed_floods() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn support_utility_runner_bounds_and_reaps_an_interactive_process_tree() {
     let marker = unique_marker("support-descendant");
@@ -401,6 +410,7 @@ async fn support_utility_runner_bounds_and_reaps_an_interactive_process_tree() {
     assert_eq!(sandbox.active_group_count(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn lazygit_style_caller_drop_audits_cleanup_and_allows_the_next_launch() {
     let logs = Arc::new(Mutex::new(Vec::new()));
