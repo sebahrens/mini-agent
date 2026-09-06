@@ -421,11 +421,7 @@ impl Drop for CredentialLock {
 }
 
 #[cfg(unix)]
-const OPEN_NOFOLLOW: std::os::raw::c_int = if cfg!(target_os = "macos") {
-    0x100
-} else {
-    0x2_0000
-};
+const OPEN_NOFOLLOW: std::os::raw::c_int = libc::O_NOFOLLOW;
 
 #[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> std::io::Result<()> {

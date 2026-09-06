@@ -780,24 +780,9 @@ fn has_unsafe_link_count(_path: &Path, _file: Option<&fs::File>, _metadata: &fs:
 fn open_source_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    #[cfg(target_os = "linux")]
-    const NO_FOLLOW: i32 = 0x2_0000;
-    #[cfg(target_os = "linux")]
-    const NON_BLOCK: i32 = 0x800;
-    #[cfg(target_os = "linux")]
-    const CLOSE_ON_EXEC: i32 = 0x8_0000;
-    #[cfg(target_os = "macos")]
-    const NO_FOLLOW: i32 = 0x100;
-    #[cfg(target_os = "macos")]
-    const NON_BLOCK: i32 = 0x4;
-    #[cfg(target_os = "macos")]
-    const CLOSE_ON_EXEC: i32 = 0x100_0000;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const NO_FOLLOW: i32 = 0;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const NON_BLOCK: i32 = 0;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const CLOSE_ON_EXEC: i32 = 0;
+    const NO_FOLLOW: i32 = libc::O_NOFOLLOW;
+    const NON_BLOCK: i32 = libc::O_NONBLOCK;
+    const CLOSE_ON_EXEC: i32 = libc::O_CLOEXEC;
 
     fs::OpenOptions::new()
         .read(true)

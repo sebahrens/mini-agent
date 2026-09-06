@@ -14,7 +14,7 @@ Notable changes to mini-agent are documented in this file. The format follows
   `js` surface, learned-skill retrieval, subagent personas, memory refresh, and the shell
   deadline. No runtime behavior changed.
 
-## [1.8.0] - 2026-09-03
+## [1.8.0] - 2026-09-06
 
 ### Added
 
@@ -74,6 +74,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Fixed AArch64 Unix file opens to use target-specific `libc` flags instead of x86 constants, and
+  prepared Bubblewrap/user namespaces before Linux release-archive runtime smokes.
 - Fixed concurrent VS Code chat and command startup so they share one session creation, and made
   stop, workspace changes, and trust changes invalidate in-flight creation safely.
 - Fixed status-bar ownership so each extension session disposes its item exactly once.

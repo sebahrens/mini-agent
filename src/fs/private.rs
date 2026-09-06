@@ -10,25 +10,13 @@ fn unsupported() -> std::io::Error {
 }
 
 #[cfg(unix)]
-const OPEN_NOFOLLOW: std::os::raw::c_int = if cfg!(target_os = "macos") {
-    0x100
-} else {
-    0x2_0000
-};
+const OPEN_NOFOLLOW: std::os::raw::c_int = libc::O_NOFOLLOW;
 
-#[cfg(target_os = "linux")]
-const OPEN_DIRECTORY: std::os::raw::c_int = 0x1_0000;
-#[cfg(target_os = "macos")]
-const OPEN_DIRECTORY: std::os::raw::c_int = 0x10_0000;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-const OPEN_DIRECTORY: std::os::raw::c_int = 0;
+#[cfg(unix)]
+const OPEN_DIRECTORY: std::os::raw::c_int = libc::O_DIRECTORY;
 
-#[cfg(target_os = "linux")]
-const OPEN_CLOEXEC: std::os::raw::c_int = 0x8_0000;
-#[cfg(target_os = "macos")]
-const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-const OPEN_CLOEXEC: std::os::raw::c_int = 0;
+#[cfg(unix)]
+const OPEN_CLOEXEC: std::os::raw::c_int = libc::O_CLOEXEC;
 
 #[cfg(unix)]
 fn stage_error(stage: &'static str, error: std::io::Error) -> std::io::Error {

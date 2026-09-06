@@ -33,19 +33,9 @@ mod bound_platform {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
 
-    #[cfg(target_os = "linux")]
-    const OPEN_NOFOLLOW: c_int = 0x2_0000;
-    #[cfg(target_os = "linux")]
-    const OPEN_CLOEXEC: c_int = 0x8_0000;
-    #[cfg(target_os = "linux")]
-    const OPEN_NONBLOCK: c_int = 0x800;
-
-    #[cfg(target_os = "macos")]
-    const OPEN_NOFOLLOW: c_int = 0x100;
-    #[cfg(target_os = "macos")]
-    const OPEN_CLOEXEC: c_int = 0x100_0000;
-    #[cfg(target_os = "macos")]
-    const OPEN_NONBLOCK: c_int = 0x4;
+    const OPEN_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+    const OPEN_CLOEXEC: c_int = libc::O_CLOEXEC;
+    const OPEN_NONBLOCK: c_int = libc::O_NONBLOCK;
 
     #[repr(C)]
     struct DirectoryStream {

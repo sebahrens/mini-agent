@@ -447,6 +447,8 @@ def validate_workflow(text: str, binary: str) -> list[str]:
     archive_smoke_fragments = (
         "needs: [package-metadata, build, build-static, build-windows]",
         "name: archives-${{ matrix.target }}",
+        "sudo apt-get install -y bubblewrap",
+        "kernel.apparmor_restrict_unprivileged_userns=0",
         "python3 scripts/release_artifacts.py smoke \\",
         "--expect-js yes",
         "--expect-js no",

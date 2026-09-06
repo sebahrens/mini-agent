@@ -1497,12 +1497,7 @@ fn open_private_rw(path: &Path, create: bool, create_new: bool) -> std::io::Resu
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        const NOFOLLOW: i32 = if cfg!(target_os = "macos") {
-            0x100
-        } else {
-            0x2_0000
-        };
-        options.custom_flags(NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options
         .open(path)

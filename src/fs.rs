@@ -1257,27 +1257,16 @@ fn atomic_write_stage<T>(_stage: &'static str, result: std::io::Result<T>) -> st
     result
 }
 
-#[cfg(target_os = "linux")]
-const OPEN_DIRECTORY: std::os::raw::c_int = 0x1_0000;
-#[cfg(target_os = "linux")]
-const OPEN_NOFOLLOW: std::os::raw::c_int = 0x2_0000;
-#[cfg(target_os = "linux")]
-const OPEN_CLOEXEC: std::os::raw::c_int = 0x8_0000;
-#[cfg(target_os = "linux")]
-const OPEN_CREATE: std::os::raw::c_int = 0x40;
-#[cfg(target_os = "linux")]
-const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x80;
-
-#[cfg(target_os = "macos")]
-const OPEN_DIRECTORY: std::os::raw::c_int = 0x10_0000;
-#[cfg(target_os = "macos")]
-const OPEN_NOFOLLOW: std::os::raw::c_int = 0x100;
-#[cfg(target_os = "macos")]
-const OPEN_CLOEXEC: std::os::raw::c_int = 0x100_0000;
-#[cfg(target_os = "macos")]
-const OPEN_CREATE: std::os::raw::c_int = 0x200;
-#[cfg(target_os = "macos")]
-const OPEN_EXCLUSIVE: std::os::raw::c_int = 0x800;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPEN_DIRECTORY: std::os::raw::c_int = libc::O_DIRECTORY;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPEN_NOFOLLOW: std::os::raw::c_int = libc::O_NOFOLLOW;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPEN_CLOEXEC: std::os::raw::c_int = libc::O_CLOEXEC;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPEN_CREATE: std::os::raw::c_int = libc::O_CREAT;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPEN_EXCLUSIVE: std::os::raw::c_int = libc::O_EXCL;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(clippy::too_many_arguments, unsafe_code)]

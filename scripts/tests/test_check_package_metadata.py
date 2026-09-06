@@ -462,6 +462,11 @@ steps:
         ).read_text(encoding="utf-8")
         mutations = (
             ("--expect-js yes", "--expect-js no"),
+            ("sudo apt-get install -y bubblewrap", "true # skipped bubblewrap"),
+            (
+                "kernel.apparmor_restrict_unprivileged_userns=0",
+                "true # skipped user namespace enablement",
+            ),
             (
                 "needs: [archive-smoke, corresponding-source]",
                 "needs: [build, build-static, build-windows, corresponding-source]",

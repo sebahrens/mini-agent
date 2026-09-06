@@ -19,7 +19,9 @@ platform. Full archives must pass the offline `--js-runtime-check` (`1 + 1` eval
 lite archives must reject that feature-specific diagnostic. Full archives use the supported default
 Cargo feature set; lite archives use `--no-default-features`. Opt-in native features such as
 `skills-embed` are not silently bundled into cross-platform archives and keep their
-platform-specific installation requirements.
+platform-specific installation requirements. Linux archive-smoke runners install Bubblewrap and
+enable the hosted runner's unprivileged-user-namespace boundary before executing the production
+runtime check; omitting either prerequisite must fail the release metadata policy check.
 
 The manually dispatched `Windows release archive smoke` workflow is the non-publishing audit path
 for the Windows default-feature archive. It builds the documented target, transfers the exact

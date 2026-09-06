@@ -170,11 +170,7 @@ fn ensure_private_log_directory(path: &std::path::Path) -> io::Result<()> {
 fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    const OPEN_NOFOLLOW: std::os::raw::c_int = if cfg!(target_os = "macos") {
-        0x100
-    } else {
-        0x2_0000
-    };
+    const OPEN_NOFOLLOW: std::os::raw::c_int = libc::O_NOFOLLOW;
     if prepare_parent && let Some(parent) = path.parent() {
         ensure_private_log_directory(parent)?;
     }
