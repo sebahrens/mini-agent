@@ -329,6 +329,29 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("RUST_MIN_STACK: 8388608", binding_step)
         self.assertIn("extras::js::tests::skill_runtime_binding", binding_step)
         self.assertIn("-- --test-threads=1", binding_step)
+        isolated_binding_tests = (
+            "hidden_capability_abi_mismatch_fails_before_export_source_runs",
+            "identity_mismatch_fails_before_skill_source_runs",
+            "production_and_verifier_make_identical_loader_decisions_for_differential_artifacts",
+        )
+        for test_name in isolated_binding_tests:
+            self.assertIn(
+                f"--skip extras::js::tests::skill_runtime_binding::{test_name}",
+                binding_step,
+            )
+
+        identity_step = body.split(
+            "name: Test skill runtime identity boundaries in fresh processes", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("contains(matrix.features, 'skills')", identity_step)
+        self.assertIn("RUST_MIN_STACK: 8388608", identity_step)
+        self.assertEqual(identity_step.count("cargo test --locked"), 3)
+        for test_name in isolated_binding_tests:
+            self.assertIn(
+                f"extras::js::tests::skill_runtime_binding::{test_name}",
+                identity_step,
+            )
+        self.assertEqual(identity_step.count("-- --exact --test-threads=1"), 3)
 
         isolated_step = body.split(
             "name: Test macOS agent-rebuild worker reuse in a fresh process", 1
