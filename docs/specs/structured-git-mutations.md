@@ -1,6 +1,10 @@
 # ADR: Structured Git mutations
 
-Status: accepted (2026-08-14)
+- **Document role**: normative cross-cutting decision
+- **Specification version**: 1.0.1
+- **Delivery status**: delivered
+- **Last reconciled**: 2026-09-06
+- **Accepted**: 2026-08-14
 
 ## Decision
 

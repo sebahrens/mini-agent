@@ -1,20 +1,22 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.0
-- **Delivery status**: library/test infrastructure delivered; operator adapter not shipped
+- **Specification version**: 1.4.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
 **Library contract**: a bounded `propose_skill()` host function, durable evaluation queue,
 independent held-out cases, and human approval into canary state.
 
-**Shipped-binary status**: mini-agent does not register `propose_skill`, start proposal/admission
-workers, import held-out suites, or expose approval decisions. Those APIs remain library and test
-infrastructure until an authenticated operator adapter provides the complete review lifecycle.
-This prevents proposals from being accepted into a queue that no shipped surface can drain.
+**Shipped-binary status**: a build with the `skills` feature exposes authenticated local-owner
+commands for package/held-out-suite import, seed installation, stats, approval, rejection, and
+explicit lineage-root activation. Trusted `enable_skill_proposals = true` configuration registers
+`propose_skill` and starts the bounded proposal/admission workers; it is off by default. Proposals
+stop at `awaiting_approval`, approval creates a non-retrievable canary, and activation remains a
+distinct local-owner action.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). The filename is retained for stable links, but Phase 4 does **not**
@@ -25,9 +27,8 @@ Phase 6 supersedes this phase's identity-v1 flat proposal capability payload, JS
 placement, and verifier runtime ownership. Identity-v2 proposals carry complete structured scopes,
 cross worker IPC as bounded drafts, and are canonicalized/persisted only by the parent. Phase 4's
 field bounds, independent held-out evaluation, immutable reports, and human approval gates remain
-authoritative. Brokered identity-v2 proposal transport is exercised by the library test path; the
-checkmarks below are implementation evidence, not a claim that the operator workflow is exposed
-by the shipped binary.
+authoritative. Brokered identity-v2 proposal transport and the local-owner operator workflow are
+both exercised through production wiring and regression tests.
 
 ---
 
@@ -341,11 +342,11 @@ may display source and sanitized metadata only through an explicitly authorized 
 
 ---
 
-## Accepted amendments (2026-09-05)
+## Delivered amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
 
-1. **Operator surface** (mini-agent-p0h1). The shipped binary gains authenticated local-owner
+1. **Operator surface** (mini-agent-p0h1, delivered). The shipped binary provides authenticated local-owner
    commands to import a skill draft (verified in the contained worker and inserted as awaiting
    approval), approve or reject an awaiting revision into or out of canary, and list awaiting
    revisions. `propose_skill` may be re-registered behind an explicit configuration flag so
@@ -356,7 +357,7 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    declare up to 32 exact learned-JS identities; import resolves them only after verification and
    turn selection attaches only active revisions, so declaration never bypasses approval,
    activation, containment, or learned-skill budgets.
-3. **Stats surface** (mini-agent-i78t). Per-skill selections, invocations, success rate, and
+3. **Stats surface** (mini-agent-i78t, delivered). Per-skill selections, invocations, success rate, and
    last-use are readable by the operator.
 
 ## Acceptance criteria

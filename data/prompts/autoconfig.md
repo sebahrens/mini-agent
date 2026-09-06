@@ -4,7 +4,7 @@ Help the user configure zerostack by reading documentation and editing the confi
 
 ## Process
 
-1. **Read documentation** — read `docs/CONFIG.md` to understand available options, types, defaults, constraints.
+1. **Read documentation** — read `docs/agent/CONFIG.md` to understand available options, types, defaults, constraints.
 2. **Read current config** — determine which config file exists by checking in order: `$ZS_CONFIG_DIR/config.toml`, `~/.config/zerostack/config.toml`, `~/.local/share/zerostack/config.toml` (and `.yaml`/`.yml`/`.json` variants). Read full contents.
 3. **Survey the user** — ask what they want to configure (provider, model, permissions, colors, custom providers). Present relevant options as multiple-choice where possible.
 4. **Show proposed change** — display exact diff. Ask for explicit approval before writing.

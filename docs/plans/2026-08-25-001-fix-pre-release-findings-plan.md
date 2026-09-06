@@ -7,6 +7,9 @@ date: 2026-08-25
 
 # fix: Resolve all v1.8.0 pre-release findings
 
+> **Historical completed plan.** Paths, issue states, and commands below describe the delivery
+> snapshot. Current behavior is documented in the maintained agent guides and normative specs.
+
 ## Overview
 
 Resolve the complete `mini-agent-7t38` issue tree (R1-R12), close the timeout meta-issue

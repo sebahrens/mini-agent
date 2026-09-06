@@ -1,8 +1,13 @@
 # VS Code Extension + Windows MSI Distribution
 
-- **Status**: design approved, pre-implementation
+- **Status**: historical design; implementation delivered with later amendments
 - **Beads epic**: `mini-agent-dxkw`
 - **Date**: 2026-08-15
+
+> **Historical design artifact.** The shipped extension and MSI follow later-reviewed artifact
+> names and security behavior. Current user and packaging contracts are in
+> [`../../vscode-acp-setup.md`](../../vscode-acp-setup.md) and
+> [`../../../packaging/windows/README.md`](../../../packaging/windows/README.md).
 
 ## Goal
 

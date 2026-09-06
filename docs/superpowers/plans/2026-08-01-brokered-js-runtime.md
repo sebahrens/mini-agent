@@ -1,5 +1,9 @@
 # Brokered Cross-Platform JavaScript Runtime Implementation Plan
 
+> **Historical completed implementation plan.** The checkboxes and paths below preserve the
+> original work plan and may be obsolete. Current authority is
+> [`../../specs/00-index.md`](../../specs/00-index.md) and its indexed specifications.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the in-process QuickJS thread with a small, fail-closed, cross-platform worker process whose only effects are typed, permission-checked, audited requests brokered by the mini-agent parent.

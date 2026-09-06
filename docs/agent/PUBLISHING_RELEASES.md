@@ -15,13 +15,17 @@ named `mini-agent-<target>.tar.gz`; lite archives are named
 `mini-agent` (or `mini-agent.exe`), `LICENSE`, `NOTICE`, and `SOURCE.md`. The release workflow checks
 that exact payload, extracts it into a clean directory, and runs the executable with `--version`
 before upload. A second clean-runner gate downloads each exact private archive on its native
-platform. Full archives must pass the offline `--js-runtime-check` (`1 + 1` evaluates to `2`), while
-lite archives must reject that feature-specific diagnostic. Full archives use the supported default
-Cargo feature set; lite archives use `--no-default-features`. Opt-in native features such as
-`skills-embed` are not silently bundled into cross-platform archives and keep their
-platform-specific installation requirements. Linux archive-smoke runners install Bubblewrap and
-enable the hosted runner's unprivileged-user-namespace boundary before executing the production
-runtime check; omitting either prerequisite must fail the release metadata policy check.
+platform. Full archives must pass the offline `--js-runtime-check` (`1 + 1` evaluates to `2`) on a
+validated containment host. The Intel archive runs on GitHub's macOS 15 runner, where the normative
+contract deliberately keeps containment unavailable, so that row instead proves the JS diagnostic
+exists and fails closed with the expected unavailable diagnostic; the artifact can execute JS on a
+validated macOS 26 Intel host. Lite archives must reject the feature-specific diagnostic entirely.
+Full archives use the supported default Cargo feature set; lite archives use
+`--no-default-features`. Opt-in native features such as `skills-embed` are not silently bundled into
+cross-platform archives and keep their platform-specific installation requirements. Linux
+archive-smoke runners install Bubblewrap and enable the hosted runner's
+unprivileged-user-namespace boundary before executing the production runtime check; omitting either
+prerequisite must fail the release metadata policy check.
 
 The manually dispatched `Windows release archive smoke` workflow is the non-publishing audit path
 for the Windows default-feature archive. It builds the documented target, transfers the exact

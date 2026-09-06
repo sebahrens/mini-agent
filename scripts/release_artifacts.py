@@ -301,7 +301,7 @@ def smoke_archive(
     archive: Path,
     executable_name: str,
     expected_version: str,
-    expect_js: bool,
+    js_expectation: str,
 ) -> None:
     if not archive.is_file() or archive.is_symlink():
         raise ReleaseArtifactError(f"release archive is not a regular file: {archive}")
@@ -325,7 +325,7 @@ def smoke_archive(
                 f"status={version.returncode}, stdout={version.stdout.strip()!r}"
             )
         js = _run(binary, "--js-runtime-check", environment=smoke_environment)
-        if expect_js:
+        if js_expectation == "yes":
             if js.returncode != 0 or js.stdout.strip() != "JS runtime check: PASS (2)":
                 helper_status = _closed_windows_preflight_status(
                     binary, environment=smoke_environment
@@ -336,8 +336,30 @@ def smoke_archive(
                     f"stderr={js.stderr.strip()!r}, "
                     f"closed_preflight_stage_status={helper_status}"
                 )
-        elif js.returncode == 0 or "unexpected argument" not in js.stderr:
-            raise ReleaseArtifactError("lite archive unexpectedly exposes the JS runtime check")
+        elif js_expectation == "unavailable":
+            expected_errors = (
+                "JavaScript runtime self-check could not execute",
+                "JavaScript worker containment is unavailable",
+            )
+            if (
+                js.returncode == 0
+                or js.stdout.strip()
+                or any(message not in js.stderr for message in expected_errors)
+            ):
+                raise ReleaseArtifactError(
+                    "packaged JS runtime did not fail closed as unavailable: "
+                    f"status={js.returncode}, stdout={js.stdout.strip()!r}, "
+                    f"stderr={js.stderr.strip()!r}"
+                )
+        elif js_expectation == "no":
+            if js.returncode == 0 or "unexpected argument" not in js.stderr:
+                raise ReleaseArtifactError(
+                    "lite archive unexpectedly exposes the JS runtime check"
+                )
+        else:
+            raise ReleaseArtifactError(
+                f"unknown JS smoke expectation: {js_expectation!r}"
+            )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -355,7 +377,9 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument("--archive", type=Path, required=True)
     smoke.add_argument("--executable-name", required=True)
     smoke.add_argument("--expected-version", required=True)
-    smoke.add_argument("--expect-js", choices=("yes", "no"), required=True)
+    smoke.add_argument(
+        "--expect-js", choices=("yes", "no", "unavailable"), required=True
+    )
     return root
 
 
@@ -373,7 +397,7 @@ def main() -> int:
                 args.archive,
                 args.executable_name,
                 args.expected_version,
-                args.expect_js == "yes",
+                args.expect_js,
             )
     except ReleaseArtifactError as error:
         print(f"release artifact validation failed: {error}", file=sys.stderr)

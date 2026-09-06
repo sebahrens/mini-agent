@@ -81,9 +81,12 @@ tools and revise its action from execution feedback; the paper reports gains of 
 evaluated tasks.
 
 In mini-agent, “code as tool” does **not** mean arbitrary ambient authority. The JavaScript language
-handles computation; Rust retains effects. `read_file`, `write_file`, `fetch`, `spawn`, and
-`propose_skill` are capability-brokered operations with explicit grants. There is no `require()`,
-`import()`, or direct network/filesystem API.
+handles computation; Rust retains effects. Model-authored code may receive the bounded
+`read_file`, `read_files`, `list_dir`, `glob`, `grep`, `write_file`, `fetch`, `spawn`, `result`,
+`scratch_put`, and `scratch_get` operations. A trusted opt-in can additionally expose
+`propose_skill`; `skills_search` is a separate read-only discovery tool in skills-enabled builds.
+Every operation is capability-brokered with explicit grants. There is no `require()`, `import()`,
+or direct network/filesystem API.
 
 ## JavaScript as the cross-platform feature
 
@@ -190,10 +193,13 @@ This is **bounded self-improvement**, not uncontrolled self-modification:
 - failures can quarantine a revision without deleting its audit history; and
 - repair creates a new immutable revision, so rollback never means guessing what changed.
 
-In the current release the proposal path is not registered in the shipped binary and there is
-no operator command to import or approve skills; the library, verification, and lifecycle code
-ship, but the store stays empty until the planned operator surface lands
-([review plan](docs/plans/2026-09-05-001-harness-design-review.md)).
+Skills-enabled builds ship the complete local-owner lifecycle surface. Operators can import and
+contained-verify packages, install the bundled seed library, inspect status and usage, approve or
+reject candidates, explicitly activate an approved lineage root, submit attributable feedback,
+compact retained events, and irreversibly purge a revision. Setting
+`enable_skill_proposals = true` in trusted configuration also exposes `propose_skill` and starts the
+bounded proposal/admission workers. Every approval and activation gate above remains separate;
+importing or proposing code never activates it automatically.
 
 Over time, the agent spends fewer tokens rediscovering reliable transformations and gains
 domain-specific tools shaped by the repository it actually works in. The library becomes a compact
@@ -250,8 +256,9 @@ task-level regression coverage without a live provider.
 
 ## Feature flags
 
-The default build includes the core ZeroStack experience plus `acp`, `js`, `sandbox`, and `memory`.
-Learned-skill storage is opt-in because it adds SQLite and retrieval dependencies.
+The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,
+`status-signals`, `multithread`, `export`, `js`, `sandbox`, and `memory`. Learned-skill storage is
+opt-in because it adds SQLite and retrieval dependencies.
 
 Pre-built release archives include JavaScript execution but not learned-skill storage. To install a
 build that can propose, verify, retrieve, and curate skills, build from source with:

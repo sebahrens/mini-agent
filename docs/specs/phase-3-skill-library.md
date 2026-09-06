@@ -1,10 +1,10 @@
 # Phase 3 — Skill Library
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.0
+- **Specification version**: 1.3.1
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 - **Entry dependencies**: Foundation and Phase 1 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 3 blocker
 
@@ -500,10 +500,10 @@ report tied to the full artifact ID.
 
 ---
 
-## Accepted amendments (2026-09-05)
+## Delivered amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
-Each item becomes part of the delivered contract when its named bead closes with regression tests.
+Every named bead is closed with regression tests; each item is part of the delivered contract.
 
 1. **Backend-aware dense retrieval** (mini-agent-bfsg, delivered). The `Deterministic` embedding
    backend carries no semantic meaning. When it is the active backend, dense retrieval is disabled
@@ -516,10 +516,10 @@ Each item becomes part of the delivered contract when its named bead closes with
 3. **Skill context delivery** (mini-agent-rd89, delivered). The trusted skill context is delivered as a
    per-request block outside the persisted user text (system slot or ephemeral block) so it is
    neither spoofable by an unescaped prompt nor accumulated in conversation history.
-4. **Callable-export manifest** (mini-agent-4bqq). The model-visible manifest states that each
+4. **Callable-export manifest** (mini-agent-4bqq, delivered). The model-visible manifest states that each
    export is a callable global inside the `js` tool, shows one call example per skill, and omits
    routing internals (route policy, share basis points, fingerprints).
-5. **Per-turn bundle caching** (mini-agent-ml1a). The worker may cache compiled artifacts keyed
+5. **Per-turn bundle caching** (mini-agent-ml1a, delivered). The worker may cache compiled artifacts keyed
    by turn id, skill id, and identity for the duration of one frozen bundle; the parent may send
    identities instead of source after the first step of a turn. Identity verification still
    precedes every load.

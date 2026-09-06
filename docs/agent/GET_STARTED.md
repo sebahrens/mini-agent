@@ -184,7 +184,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `-p <msg>` | Sends a message |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
-| `-c` | Continues from last open session |
+| `-c`, `--continue` | Continue the most recent session. |
 | `-r`, `--resume` | List recent sessions for selection. |
 | `--name <name>` | Set a name for the new session |
 | `--session <id-or-name>` | Load session by ID prefix or name |

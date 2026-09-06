@@ -24,10 +24,11 @@ small and responsive. It does not turn host-sensitive timings into a shared-runn
 does not treat observed memory or CPU use as a security boundary. The native 256 MiB address-space
 and 35 CPU-second ceilings are enforced and probed by the platform containment jobs separately.
 
-The checked-in [baseline manifest](results/js-worker-baseline.json) is the reviewed aggregate from
-the dedicated Linux, macOS 26, and Windows reference runners. It describes those exact machines
-and builds; it is not a claim about unmeasured hosts. A platform whose production containment is
-unavailable emits a status-only
+The checked-in [baseline manifest](results/js-worker-baseline.json) is the v1.8 target/schema
+manifest. It intentionally records `evidence_state: pending_external_runs` and an empty
+`platform_evidence` array until dedicated Linux, macOS 26, and Windows reference artifacts for this
+version are aggregated. It is not current performance evidence. A platform whose production
+containment is unavailable emits a status-only
 `containment_unavailable` record with closed backend, assurance, and reason code. It contains no
 latency, memory, or count fields and does not satisfy a resource target. Windows may emit
 measurements only after the configured
@@ -39,12 +40,13 @@ synchronous `CreateProcessW` is not cancellable, a result that returns late rema
 helper until teardown rather than implying a hard bound on the worker's complete lifetime. The
 benchmark's executable-specific cache is test-only and cannot alter production availability.
 
-## Reviewed reference evidence
+## Historical reviewed reference evidence (v1.7)
 
-CI run `31319107422` at commit `aa203c5` produced the three platform records used by the checked-in
-aggregate. The final aggregator at commit `9c6f164` independently revalidated those records
+CI run `31319107422` at commit `aa203c5` produced three v1.7 platform records. The final aggregator
+at commit `9c6f164` independently revalidated those records
 after allowing only an eight-machine-epsilon tolerance for a derived delta that changed by one
-floating-point representation step during a cross-platform JSON round trip.
+floating-point representation step during a cross-platform JSON round trip. Version 1.8 reset the
+checked-in manifest to pending rather than carrying those older measurements forward.
 
 | Platform | Cold Ready p95 | Warm call p95 | 4 KiB IPC p95 | Recovery p95 | Max private memory | Worker / helpers / idle runtimes |
 |----------|---------------:|--------------:|----------------:|-------------:|-------------------:|----------------------------------:|
@@ -63,9 +65,9 @@ The macOS cold and recovery measurements include the complete one-time-image Sea
 preflight or teardown. The original publisher rewrote and durably flushed the complete installed
 debug executable for every generation. Follow-up `mini-agent-avx3` replaces that stage with Darwin's
 atomic APFS copy-on-write clone, while retaining distinct-inode, metadata, ACL, permission,
-descriptor, and independent source/image SHA-256 proof. The checked-in three-platform baseline
-remains the release reference until the matched-host optimization record below is reviewed and
-promoted. The independently enforced native limits remain separate from this performance review.
+descriptor, and independent source/image SHA-256 proof. These historical three-platform
+measurements remain a comparison reference only; they are not the checked-in v1.8 baseline. The
+independently enforced native limits remain separate from this performance review.
 
 ### Matched-host macOS publication optimization
 
@@ -151,8 +153,9 @@ unavailability produces a valid status-only artifact instead of running measurem
 Each reference pair is observation collection, not a target exit gate. A single performance-goal
 miss is recorded in `target_results` and does not block Phase 6. It becomes blocking only after the
 miss is reproduced on a matched, otherwise quiet host using the comparison method below and a
-review explicitly promotes that repeatable miss to a blocking acceptance issue. Until then the
-checked-in aggregate reports what was observed without converting a target boolean into a verdict.
+review explicitly promotes that repeatable miss to a blocking acceptance issue. A published
+aggregate reports what was observed without converting a target boolean into a verdict; the
+pending checked-in v1.8 manifest makes no observations.
 
 To create the repeatability record required in the three-platform aggregate, run once to a
 `-reference.json` output, then run the same command again with:

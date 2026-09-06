@@ -1,5 +1,11 @@
 # VS Code Extension + Windows MSI Distribution — Implementation Plan
 
+> **Historical completed implementation plan.** Artifact names, paths, and workflow sketches below
+> preserve the original proposal and may differ from production. Current packaging is documented in
+> [`../../../docs/vscode-acp-setup.md`](../../../docs/vscode-acp-setup.md),
+> [`../../../packaging/windows/README.md`](../../../packaging/windows/README.md), and the release
+> workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship mini-agent to non-technical Windows users via a VS Code marketplace extension and an MSI installer — zero terminal required.

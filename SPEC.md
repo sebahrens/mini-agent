@@ -1,22 +1,24 @@
 # JavaScript Runtime — Implementation Overview
 
 - **Document role**: non-normative implementation overview
-- **Overview version**: 2.0.0
+- **Overview version**: 2.1.0
 - **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the specifications it indexes. This file maps
 the current implementation; it cannot override those contracts.
 
-## Pending amendments
+## Delivered 2026-09-05 amendments
 
-See `docs/specs/00-index.md` → *Accepted amendments pending delivery (2026-09-05)* and
-[the review plan](docs/plans/2026-09-05-001-harness-design-review.md). Current model-facing
-limits worth knowing before they land: model script runs in strict script mode without top-level
-`await`; all JavaScript failures render as `exception`; only `read_file`, `write_file`, `fetch`,
-and (Linux/Windows) `spawn` effects exist; `propose_skill` is not registered.
+See `docs/specs/00-index.md` → *Delivered amendments (2026-09-05)* and
+[the review plan](docs/plans/2026-09-05-001-harness-design-review.md). The shipped model script is
+a strict async global script with top-level `await`, closed exception classes and source-free
+line/column metadata, read-only discovery and batched reads, distinct effect-denial codes, a typed
+result channel, and a parent-owned JSON scratch store. Skills-enabled builds also ship the
+local-owner lifecycle commands; trusted `enable_skill_proposals = true` configuration exposes
+`propose_skill` and starts the proposal/admission workers.
 
 ## Foundation — paths and persistence
 
@@ -168,11 +170,12 @@ package identity. Normal startup and `--print-config` status evaluation create o
 persistent AppContainer profile and may add a persistent exact read/execute ACE to a supported,
 user-owned installed executable. There is no automatic cleanup, ACL rollback, or consent prompt.
 
-Run 31319107422 supplies the dedicated Linux, macOS 15/26, Windows worker, and Windows
-general-sandbox gates plus the three platform resource records. The final validator at commit
-`9c6f164` independently aggregated those records into the reviewed
-[`js-worker` resource baseline](docs/benchmarks/js-worker.md), which records measured
-reference-host behavior without converting noisy timing targets into security controls.
+CI run 31319107422 and commit `9c6f164` remain historical v1.7 reference evidence for the
+dedicated Linux, macOS 15/26, Windows worker, and Windows general-sandbox gates. The checked-in
+v1.8 [`js-worker` baseline manifest](docs/benchmarks/results/js-worker-baseline.json) is explicitly
+`pending_external_runs` with no platform records until the current version's three reference
+artifacts are aggregated. Neither historical nor current measurements convert noisy timing targets
+into security controls.
 
 ## Separate process trust classes
 

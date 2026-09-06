@@ -13,6 +13,7 @@ import tomllib
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -243,6 +244,9 @@ EXPECTED_CROSS_IMAGES = {
 EXPECTED_ARCHIVE_ARRAY = re.compile(
     r"^\s*expected=\(\n(?P<body>(?:\s+[^\n]+\n)+?)\s*\)$", re.MULTILINE
 )
+MARKDOWN_LINK = re.compile(
+    r"!?\[[^\]]*\]\((?P<target><[^>]+>|[^)\s]+)(?:\s+['\"][^)]*['\"])?\)"
+)
 
 
 def cargo_metadata(root: Path) -> dict[str, Any]:
@@ -450,7 +454,9 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         "sudo apt-get install -y bubblewrap",
         "kernel.apparmor_restrict_unprivileged_userns=0",
         "python3 scripts/release_artifacts.py smoke \\",
-        "--expect-js yes",
+        'js_expectation: "unavailable"',
+        "JS_EXPECTATION: ${{ matrix.js_expectation }}",
+        '--expect-js "$JS_EXPECTATION"',
         "--expect-js no",
     )
     missing_archive_smoke = [
@@ -460,6 +466,23 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         errors.append(
             ".github/workflows/release.yml must native-smoke every exact full/lite "
             f"archive before checksums; missing={missing_archive_smoke}"
+        )
+
+    vscode_job = _workflow_job(text, "vscode-vsix")
+    vscode_fragments = (
+        'npm run "package:$VSCODE_TARGET"',
+        "npm run typecheck",
+        "npm run lint",
+        "npm test",
+        "npm run sbom",
+    )
+    missing_vscode = [
+        fragment for fragment in vscode_fragments if fragment not in vscode_job
+    ]
+    if missing_vscode or "node scripts/package-target.mjs" in vscode_job:
+        errors.append(
+            ".github/workflows/release.yml must package VSIX candidates through the "
+            f"npm-owned target scripts; missing={missing_vscode}"
         )
 
     checksum_job = _workflow_job(text, "checksums")
@@ -958,6 +981,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every binary release archive use the executable name\n`{binary}`.",
+            "The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, and `memory`.",
         ),
         "docs/agent/PUBLISHING_RELEASES.md": (
             f"Cargo and every package channel install the public executable as `{binary}`.",
@@ -974,6 +998,25 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
         "docs/agent/GET_STARTED.md": (
             f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh",
             f"https://github.com/{CANONICAL_REPOSITORY}",
+            "`-c`, `--continue`",
+        ),
+        "docs/agent/SKILLS.md": (
+            "--compact-learned-skill-events",
+            "--learned-skill-feedback-kind",
+            "--learned-skill-feedback-invocation",
+            "--purge-learned-skill",
+        ),
+        "docs/specs/00-index.md": (
+            "## Delivered amendments (2026-09-05)",
+            "`evidence_state: pending_external_runs`",
+        ),
+        "docs/specs/platform-paths.md": (
+            "**Delivery status**: delivered",
+            "The implemented feature rows are default, `mcp`, `js`, `skills`, and `mcp,js,skills`",
+        ),
+        "SPEC.md": (
+            "strict async global script with top-level `await`",
+            "`propose_skill` and starts the proposal/admission workers",
         ),
         "scripts/smoke-canonical-installer.sh": (
             'bash "${ROOT_DIR}/install.sh" --release "$VERSION" --dir "${INSTALL_ROOT}/bin"',
@@ -1061,6 +1104,43 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
     justfile = (root / "justfile").read_text(encoding="utf-8")
     if "cargo build" in justfile:
         errors.append("justfile must use the repository's cargo install build command")
+    return errors
+
+
+def validate_local_markdown_links(root: Path) -> list[str]:
+    """Require repository-local Markdown link targets to exist."""
+
+    paths = sorted(
+        {
+            *root.glob("*.md"),
+            *root.glob("docs/**/*.md"),
+            *root.glob("packaging/**/*.md"),
+            *root.glob("editors/**/*.md"),
+            *root.glob("data/**/*.md"),
+        }
+    )
+    errors: list[str] = []
+    for path in paths:
+        if "node_modules" in path.parts or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in MARKDOWN_LINK.finditer(text):
+            target = match.group("target").strip("<>")
+            if (
+                target.startswith("#")
+                or target.startswith("/")
+                or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target)
+            ):
+                continue
+            relative = unquote(target.split("#", 1)[0])
+            if not relative:
+                continue
+            resolved = path.parent.joinpath(relative)
+            if not resolved.exists():
+                line = text.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"{path.relative_to(root)}:{line} links to missing local target {relative!r}"
+                )
     return errors
 
 
@@ -1397,6 +1477,7 @@ def validate(
     errors.extend(validate_aur_srcinfo_checksums(root))
     errors.extend(validate_stale_coordinates(root))
     errors.extend(validate_removed_nix_surface(root))
+    errors.extend(validate_local_markdown_links(root))
 
     version = cargo_version(metadata, root)
     if version:

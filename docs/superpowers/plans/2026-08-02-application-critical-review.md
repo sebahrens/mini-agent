@@ -1,9 +1,12 @@
 # Mini-agent Application Critical Review and Remediation Plan
 
 **Date:** 2026-08-02
-**Status:** Findings complete; implementation work to be tracked in Beads
+**Status:** Historical completed review; remediation delivered through Beads
 **Normative authority:** `docs/specs/00-index.md` and the specifications it indexes
-**Related live plan:** `docs/superpowers/plans/2026-08-01-brokered-js-runtime.md`
+**Related historical plan:** `docs/superpowers/plans/2026-08-01-brokered-js-runtime.md`
+
+> **Historical review snapshot.** The referenced remediation work is tracked to completion in
+> Beads; current behavior and open gaps come from the maintained guides and normative specs.
 
 ## 1. Executive assessment
 

@@ -1,10 +1,10 @@
 # Phase 5 — Evidence-Based Self-Learning
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
-- **Delivery status**: library/test infrastructure delivered; lifecycle operator surface not shipped
+- **Specification version**: 1.3.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
@@ -12,10 +12,12 @@
 **Delivers**: directly attributed skill telemetry, evidence-gated canary promotion, automatic
 quarantine, immutable repair revisions, supersession, rollback, and bounded audit history.
 
-**Shipped-binary status**: retrieval and directly attributed telemetry are wired. Promotion,
-repair, retention, rollback, and privacy-purge entry points remain library/test infrastructure;
-the shipped agent starts none of the proposal or admission workers and exposes no lifecycle
-mutation surface. The policy below remains normative for a future authenticated operator adapter.
+**Shipped-binary status**: retrieval, directly attributed telemetry, evidence-based transitions,
+and proposal/admission workers are wired in skills-enabled builds. The workers start only when
+trusted `enable_skill_proposals = true` configuration opts in. Local-owner commands expose stats,
+targeted feedback, retention compaction, privacy purge, import, approval/rejection, and explicit
+root activation; evidence-based replacement promotion, repair, supersession, and rollback remain
+policy-owned library operations rather than unsafe generic mutation commands.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Phase 5 owns evidence-based lifecycle automation. It cannot bypass
@@ -27,8 +29,8 @@ quarantined before Phase 6 execution, rollback cannot reactivate them, and expli
 required for identity version 2. Phase 5's evidence thresholds, transactional lifecycle/index
 coordination, immutable lineage, repair, rollback mechanics for eligible artifacts, privacy, and
 retention remain authoritative. Phase 6's identity-v1 quarantine and identity-v2 eligibility
-extension is implemented on the current retrieval path. Lifecycle mutations are not presented as
-production-operable until the missing adapter is shipped.
+extension is implemented on the current retrieval path. The bounded local-owner adapter exposes
+only the authenticated operations listed above and does not bypass evidence or human gates.
 
 ---
 
@@ -494,15 +496,15 @@ as alternatives/supersession candidates or retired after review.
 
 ---
 
-## 12a. Accepted amendments (2026-09-05, pending delivery)
+## 12a. Delivered amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
 
-1. **Fault-only quarantine** (mini-agent-lugc). Behavioral quarantine counts `timed_out`, `oom`,
+1. **Fault-only quarantine** (mini-agent-lugc, delivered). Behavioral quarantine counts `timed_out`, `oom`,
    and `capability_denied`. A `threw` event counts only when active authenticated negative or severe
    feedback targets that exact invocation; an uncorroborated exception caused by caller input is
    telemetry, not evidence against the revision.
-2. **Canary ordering** (mini-agent-840z). When several canaries supersede one active revision,
+2. **Canary ordering** (mini-agent-840z, delivered). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
 3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy
    timeout; every read-modify-write transaction begins `IMMEDIATE`. Dropping a telemetry batch
@@ -510,7 +512,7 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 4. **Corrupt rows** (mini-agent-jj8b, delivered). A row whose embedding cannot be decoded is
    skipped and reported like a malformed artifact row; it never darkens the index or triggers a
    rebuild on every turn, and repeated rebuild failures back off.
-5. **Canary embeddings** (mini-agent-c8q6). Rebuilds backfill canary rows so an embedding model
+5. **Canary embeddings** (mini-agent-c8q6, delivered). Rebuilds backfill canary rows so an embedding model
    change cannot silently un-route them.
 
 ## 13. Acceptance criteria

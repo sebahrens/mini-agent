@@ -303,24 +303,31 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: mini-agent
+            js_expectation: "yes"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             executable: mini-agent
+            js_expectation: "yes"
           - os: macos-15-intel
             target: x86_64-apple-darwin
             executable: mini-agent
+            js_expectation: "unavailable"
           - os: macos-latest
             target: aarch64-apple-darwin
             executable: mini-agent
+            js_expectation: "yes"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             executable: mini-agent
+            js_expectation: "yes"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             executable: mini-agent
+            js_expectation: "yes"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: mini-agent.exe
+            js_expectation: "yes"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -344,12 +351,13 @@ jobs:
           RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_EXECUTABLE: ${{ matrix.executable }}
+          JS_EXPECTATION: ${{ matrix.js_expectation }}
         run: |
           python3 scripts/release_artifacts.py smoke \
             --archive "smoke-input/mini-agent-$RELEASE_TARGET.tar.gz" \
             --executable-name "$RELEASE_EXECUTABLE" \
             --expected-version "$RELEASE_VERSION" \
-            --expect-js yes
+            --expect-js "$JS_EXPECTATION"
           python3 scripts/release_artifacts.py smoke \
             --archive "smoke-input/mini-agent-lite-$RELEASE_TARGET.tar.gz" \
             --executable-name "$RELEASE_EXECUTABLE" \
@@ -482,7 +490,7 @@ jobs:
           npm run typecheck
           npm run lint
           npm test
-          node scripts/package-target.mjs "$VSCODE_TARGET"
+          npm run "package:$VSCODE_TARGET"
           npm run sbom
           mv dist/mini-agent-vscode.cdx.json \
             "dist/mini-agent-$RELEASE_VERSION-$VSCODE_TARGET.cdx.json"

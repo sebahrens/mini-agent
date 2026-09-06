@@ -7,9 +7,8 @@ description, and JSON parameter schema once, then returns owned clones when Rig
 requests provider definitions on later completion turns. Calls and structured
 results are delegated unchanged to the original tool.
 
-Known limit: `/editsys` changes the global edit system without rebuilding the
-agent, so the memoized `read`/`edit` definitions stay in the previous mode
-until an unrelated rebuild (mini-agent-fcer).
+`/editsys` rebuilds the agent immediately after changing the edit system, so the memoized
+`read`/`edit` definitions and their runtime behavior always switch together.
 
 Foreground shell commands run under a fixed 30 s deadline that a call can only
 lower; an explicit timeout must be at least one millisecond. A shell call with

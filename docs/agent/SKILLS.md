@@ -118,9 +118,17 @@ directory as their OS-account authentication boundary:
 ```text
 mini-agent --import-learned-skill <package.json|directory>
 mini-agent --install-learned-skill-seeds
+mini-agent --learned-skill-stats
 mini-agent --approve-learned-skill <full-sha256>
 mini-agent --reject-learned-skill <full-sha256>
 mini-agent --activate-learned-skill <full-sha256>
+mini-agent --compact-learned-skill-events
+mini-agent --purge-learned-skill <full-sha256>
+mini-agent --learned-skill-feedback <full-sha256> \
+  --learned-skill-feedback-kind <positive|negative|severe> \
+  --learned-skill-feedback-reason <code> \
+  --learned-skill-feedback-key <idempotency-key> \
+  [--learned-skill-feedback-invocation <full-sha256>]
 ```
 
 A directory import reads 1–32 sorted regular `.json` files and ignores symlinks. Each file is
@@ -138,6 +146,13 @@ evidence-based promotion path and is deliberately rejected by this root-activati
 parsing, whole-file unified-diff formatting, and aligned text-table formatting. The seeds use the
 same held-out evaluation and two-action approval/activation route as external packages; they are
 not silently trusted or activated.
+
+`--compact-learned-skill-events` aggregates raw events older than the retention window before
+deleting them. `--purge-learned-skill` performs the coordinated, tombstoned privacy purge described
+above. Feedback commands require kind, reason, and caller-chosen idempotency key; the optional
+invocation ID attributes feedback to one exact invocation. Severe authenticated feedback can
+immediately quarantine an eligible canary or active revision through the normal coordinated
+lifecycle path.
 
 ## Current limits
 

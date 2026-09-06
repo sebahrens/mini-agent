@@ -1,10 +1,10 @@
 # Phase 2 — Sandbox Hardening
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.0
+- **Specification version**: 1.3.1
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-09
+- **Last reconciled**: 2026-09-06
 - **Entry dependency**: Phase 1 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 2 blocker
 
@@ -330,8 +330,8 @@ restriction mask.
       the narrowing allow-list, and always obtains `js/fetch` permission.
 - [x] File allow-lists match resolved targets and never bypass Phase 1 permissions or secure I/O.
 - [x] Linux and macOS process escape/denial tests prove their documented backend guarantees.
-- [x] Backend absence/failure and Windows residual non-isolation are visible and never reported as
-      sandboxed.
+- [x] Backend absence/failure and Windows AppContainer residual authority are visible and never
+      reported as stronger isolation than the attested profile provides.
 - [x] Windows can report the default AppContainer backend available only after hosted attestation
       proves explicit-root reads, workspace-only host writes, outside read/write denial,
       hard-link/path/executable stability, crash-stale cleanup, zero capabilities and absent

@@ -1,12 +1,16 @@
 ---
 title: "refactor: Package open Beads work for code-agent handoff"
 type: refactor
-status: active
+status: completed
 date: 2026-08-01
 deepened: 2026-08-01
 ---
 
 # refactor: Package open Beads work for code-agent handoff
+
+> **Historical plan.** This records the 2026-08-01 work decomposition. The referenced work has
+> since been completed; current implementation status comes from Beads and the normative
+> specifications indexed by `docs/specs/00-index.md`.
 
 ## Overview
 

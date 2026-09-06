@@ -8,6 +8,9 @@ epic: mini-agent-0yme
 
 # v1.8.0 final pre-release review
 
+> **Historical completed review.** Findings and issue states below are the 2026-09-03 audit
+> snapshot; consult Beads and the maintained specifications for current status.
+
 Thirteen independent read-only reviewers were fanned out over the whole tree on 2026-09-03
 (core loop, tools, permissions/config, unix sandbox, Windows sandbox, JS runtime core, JS skills,
 MCP/ACP/LSP/hooks, extras, TUI, release engineering, dead-code sweep, VS Code extension).

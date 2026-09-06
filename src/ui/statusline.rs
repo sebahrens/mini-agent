@@ -1,7 +1,7 @@
 //! Configurable status-bar statusline.
 //!
 //! The statusline is up to 3 lines, each an ordered list of segments parsed from
-//! `[statusline]` in config (see `docs/CONFIG.md`). When no `[statusline]` is set, a
+//! `[statusline]` in config (see `docs/agent/CONFIG.md`). When no `[statusline]` is set, a
 //! built-in default layout is used. Items resolve to text + colors at render
 //! time; `separator` is literal text and `flex_separator` expands to fill the
 //! row, pushing later segments to the right.

@@ -1,10 +1,10 @@
 # Phase 1 — Core JS Engine Integration
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.2.1
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-08-02
+- **Last reconciled**: 2026-09-06
 - **Entry dependency**: none for the non-persistent engine
 - **Exit dependency**: every acceptance criterion below and every Phase 1 blocker
 
@@ -266,7 +266,7 @@ Tests cover, at minimum:
 
 - `fetch()` and file allow-lists (Phase 2)
 - Linux/macOS process-isolation hardening (Phase 2)
-- Windows process isolation (not delivered by Phase 2)
+- Windows general-process isolation (added later to Phase 2 through the attested AppContainer backend)
 - portable Agent Skills and learned JS skills (Phase 3)
 - agent proposals and human-gated canaries (Phase 4)
 - evidence-based promotion and lifecycle automation (Phase 5)

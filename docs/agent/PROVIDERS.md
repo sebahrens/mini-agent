@@ -40,7 +40,7 @@ marketplace pricing at runtime.
 
 ## Provider Recipes
 
-- [MiniMax](../providers/Minimax.md)
+- [MiniMax](providers/Minimax.md)
 
 ## Custom Providers
 

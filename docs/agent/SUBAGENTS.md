@@ -366,9 +366,9 @@ subagent_model = "deepseek-v4-flash"
 subagent_provider = "openrouter"
 ```
 
-## Known limits and planned changes (2026-09-05 review)
+## Current structured handoff contract
 
-- The child still receives no conversation history. Callers can provide a
+- The child receives no conversation history. Callers can provide a
   structured brief (`objective`, `files`, `constraints`, `expected_sections`),
   and every successful return is checked against the Findings, Unverified, and
   Coverage skeleton (mini-agent-nfd7, mini-agent-sux9).
@@ -378,14 +378,15 @@ subagent_provider = "openrouter"
   tool subsets (mini-agent-6khf), and trusted `.notes.md` content extends
   generic embedded personas without replacing them (mini-agent-7hjo).
 
-The scheduled deterministic harness also runs one compact fixture case for
+The deterministic harness also runs one compact fixture case for
 every shipped persona. Each case resolves the production persona, passes a
 structured response through the production task scheduler, and checks its
 expected finding plus the host response contract. The fixture lives at
 `tests/harness_eval/personas/fixture.json`; see
 [HARNESS_EVAL.md](HARNESS_EVAL.md).
 
-See [the review plan](../plans/2026-09-05-001-harness-design-review.md) for the full list.
+See the historical [review plan](../plans/2026-09-05-001-harness-design-review.md) for the design
+and delivery record.
 
 ## Slash Commands
 
@@ -416,6 +417,8 @@ Main Agent                               Subagent(s)
 │ list_dir     │   with prompt(s)        │ list_dir            │
 │ todo         │                         │ memory_read         │
 │ task  ───────┤   polls bounded child   │ memory_search       │
+│              │                         │ skills_search       │
+│              │                         │ read-only js        │
 │              │   futures inline via    │                     │
 │              │   FuturesUnordered      │                     │
 │              │   ──────────────        │ runs ≤ max_turns    │

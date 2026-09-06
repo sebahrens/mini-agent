@@ -133,7 +133,7 @@ pub enum IconSpec {
     Custom(CompactString),
 }
 
-/// One statusline piece. `item` names the element (see `docs/CONFIG.md`).
+/// One statusline piece. `item` names the element (see `docs/agent/CONFIG.md`).
 /// `color`/`bg` are named colors or `#rrggbb`. `text` is the literal for the
 /// `separator` item. `left`/`right` are powerline cap glyphs drawn before/after
 /// the item. `icon` shows a glyph before the value.

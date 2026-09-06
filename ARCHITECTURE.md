@@ -1,10 +1,10 @@
 # JS Engine Integration — Architecture Overview
 
 - **Document role**: non-normative architecture overview
-- **Overview version**: 2.0.0
+- **Overview version**: 2.1.0
 - **Delivery status**: Phase 6 delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 
 The sole normative JS corpus is
 [`docs/specs/00-index.md`](docs/specs/00-index.md) and the phase specifications it indexes. If this
@@ -22,14 +22,13 @@ This architecture supplements Bash and other process-bearing features. It does n
 hooks or make hooks, MCP servers, LSPs, loop validation, or the explicit interactive shell part of
 the JS worker boundary.
 
-## Pending amendments
+## Delivered 2026-09-05 amendments
 
 The [2026-09-05 harness design review](docs/plans/2026-09-05-001-harness-design-review.md)
 accepted additive changes to the model-facing surface (async model script, closed exception
 class with line/column, read-only discovery and batched effects, distinct denial codes, a typed
-result channel) and to skill retrieval and operator commands. They are recorded per owning spec
-under **Accepted amendments (2026-09-05, pending delivery)** and are not described as delivered
-anywhere in this overview until their beads close.
+result channel) and to skill retrieval and operator commands. All named delivery beads are closed;
+the owning phase specs record the delivered contract and regression coverage.
 
 ## Execution and trust boundary
 
@@ -115,9 +114,11 @@ workspace-visible profile; it has a dedicated broker-only launcher.
 
 Platform status is typed and source-free. Backend absence or failed attestation disables JS; it
 never selects the historical in-parent engine or an uncontained worker. The reproducible resource
-methodology and reviewed three-platform aggregate are in
-[`docs/benchmarks/js-worker.md`](docs/benchmarks/js-worker.md). Measurements are observational;
-the native memory and CPU ceilings remain independently enforced security controls.
+methodology and historical v1.7 reference measurements are in
+[`docs/benchmarks/js-worker.md`](docs/benchmarks/js-worker.md). The checked-in v1.8 baseline
+manifest is intentionally `pending_external_runs` until a new three-platform aggregate is
+published. Measurements are observational; native memory and CPU ceilings remain independently
+enforced security controls.
 
 On Windows the OS creation call runs on an owned helper thread behind a five-second caller-side
 deadline; the call itself is not cancellable. A late return remains owned and is torn down, but a

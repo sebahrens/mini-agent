@@ -1,7 +1,8 @@
 # Loop-Enforced Feature-Specific Real-Binary Verification
 
-**Date:** 2026-07-29  
-**Status:** Approved design  
+**Date:** 2026-07-29
+**Status:** Delivered
+**Last reconciled:** 2026-09-06
 **Scope:** Require the build agent launched by `scripts/loop.sh` to test-drive each implemented feature through the installed application before the loop accepts the bead.
 
 ## Problem
@@ -11,6 +12,9 @@ The current bead-wide binary gate installs `mini-agent` and runs `mini-agent -p 
 Automated Rust checks remain necessary, but they are not sufficient evidence that users can reach and use the implemented feature through the production binary.
 
 ## Decision
+
+`scripts/loop.sh` implements this contract with per-iteration evidence tokens, validated
+headless/tmux/packaged-artifact profiles, private installed-binary replay, and close/reopen gating.
 
 The existing implementation agent will perform feature-specific real-binary verification before closing its selected bead. `loop.sh` will bind that evidence to the current iteration with an unpredictable token and will not accept or auto-close the bead without a matching passing evidence comment.
 

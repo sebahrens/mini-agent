@@ -30,6 +30,36 @@ class LicenseIdentityValidationTests(unittest.TestCase):
             self.assertIn("canonical GPL-3.0-only", errors[0])
 
 
+class MarkdownLinkValidationTests(unittest.TestCase):
+    def test_existing_local_links_and_external_links_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "docs" / "target.md").write_text("# Target\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "[local](docs/target.md#target) [web](https://example.com)\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [], CHECK_PACKAGE_METADATA.validate_local_markdown_links(root)
+            )
+
+    def test_missing_local_link_reports_source_line_and_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs").mkdir()
+            (root / "docs" / "guide.md").write_text(
+                "# Guide\n\n[missing](nested/nope.md)\n", encoding="utf-8"
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_local_markdown_links(root)
+
+            self.assertEqual(1, len(errors))
+            self.assertIn("docs/guide.md:3", errors[0])
+            self.assertIn("nested/nope.md", errors[0])
+
+
 class ReleaseWorkflowValidationTests(unittest.TestCase):
     def test_reviewed_current_release_action_pins_are_accepted(self) -> None:
         workflow = (
@@ -461,7 +491,8 @@ steps:
             SCRIPT.parents[1] / ".github/workflows/release.yml"
         ).read_text(encoding="utf-8")
         mutations = (
-            ("--expect-js yes", "--expect-js no"),
+            ('--expect-js "$JS_EXPECTATION"', "--expect-js no"),
+            ('js_expectation: "unavailable"', 'js_expectation: "yes"'),
             ("sudo apt-get install -y bubblewrap", "true # skipped bubblewrap"),
             (
                 "kernel.apparmor_restrict_unprivileged_userns=0",
@@ -477,6 +508,20 @@ steps:
                 modified = workflow.replace(old, new, 1)
                 errors = CHECK_PACKAGE_METADATA.validate_workflow(modified, "mini-agent")
                 self.assertTrue(any("native-smoke" in error or "private artifact" in error for error in errors))
+
+    def test_release_requires_vsix_packaging_through_npm(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            'npm run "package:$VSCODE_TARGET"',
+            'node scripts/package-target.mjs "$VSCODE_TARGET"',
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("npm-owned target scripts" in error for error in errors))
 
     def test_release_requires_strict_manifest_and_atomic_publication_gates(self) -> None:
         workflow = (

@@ -1,10 +1,10 @@
 # Cross-Platform Paths and Persistent Storage
 
 - **Document role**: normative cross-phase foundation
-- **Specification version**: 1.0.0
-- **Delivery status**: implementation in progress
+- **Specification version**: 1.1.0
+- **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-07-29
+- **Last reconciled**: 2026-09-06
 - **Entry dependency**: none
 - **Exit dependency**: every required test below and every Foundation blocker
 - **Target platforms**: Linux, macOS, and Windows MSVC
@@ -13,10 +13,11 @@ The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). This file overrides phase-local text for storage classes, persistent
 paths, archive handling, migration, and credential protection.
 
-**Foundation implementation**: `src/paths.rs` provides the host-independent `AppPaths` resolver
-and injected `PathEnvironment` fixtures. `src/paths/portable.rs` provides the shared portable
-component, collision-key, opaque digest-name, and containment policy. Startup constructs the
-immutable roots once; artifact owner migration remains staged in the follow-up delivery tasks.
+**Foundation implementation**: `src/paths.rs` provides the host-independent `AppPaths` resolver,
+injected `PathEnvironment` fixtures, typed artifact owners, and conflict-safe legacy migration.
+`src/paths/portable.rs` provides the shared portable component, collision-key, opaque digest-name,
+and containment policy. Startup constructs the immutable roots once and all maintained persistent
+owners consume them.
 
 ---
 
@@ -303,8 +304,9 @@ Headless/ACP startup never prompts or chooses: a required config conflict aborts
 typed error, while an optional feature conflict disables only that feature and emits a diagnostic.
 Neither path creates a new canonical artifact until the conflict is resolved.
 
-User documentation may describe the target locations as supported only after the migration and
-platform test gates pass. Until then, Windows storage/security claims remain qualified.
+User documentation may describe these locations as supported because the migration and platform
+test gates have passed. Windows storage/security claims remain qualified by the exact protected-
+DACL and no-follow guarantees below rather than implying a filesystem namespace.
 
 ---
 
@@ -317,14 +319,13 @@ allowed to fail, or red.
 
 | Platform | Support status | Required executable evidence |
 |----------|----------------|------------------------------|
-| Linux | Conditional on required green jobs | Injected XDG matrix, real no-follow/mode checks, every implemented feature row, negative controls, and clean debug-install smoke on `ubuntu-latest` |
-| macOS | Conditional on required green jobs | Injected Application Support/Caches matrix, real no-follow/mode checks, every implemented feature row, and clean debug-install smoke on `macos-latest` |
-| Windows | Not ready until all required Windows jobs are green | Injected Roaming/Local Known Folder matrix, real junction/reparse and protected-DACL inspection, every implemented feature row, and clean debug-install smoke on `windows-latest` |
+| Linux | Delivered; each release still requires green jobs | Injected XDG matrix, real no-follow/mode checks, every implemented feature row, negative controls, and clean debug-install smoke on `ubuntu-latest` |
+| macOS | Delivered; each release still requires green jobs | Injected Application Support/Caches matrix, real no-follow/mode checks, every implemented feature row, and clean debug-install smoke on `macos-latest` |
+| Windows | Delivered; each release still requires green jobs | Injected Roaming/Local Known Folder matrix, real junction/reparse and protected-DACL inspection, every implemented feature row, and clean debug-install smoke on `windows-latest` |
 
-The current implemented feature rows are default, `mcp`, `js`, and `mcp,js`. The `skills` and
-`mcp,js,skills` rows become mandatory in this gate when the `skills` Cargo feature lands. Archived
-machine-readable results are evidence for a particular workflow run, not a permanent support
-claim.
+The implemented feature rows are default, `mcp`, `js`, `skills`, and `mcp,js,skills`; all are
+mandatory in the gate. Archived machine-readable results are evidence for a particular workflow
+run, not a permanent support claim.
 
 ---
 

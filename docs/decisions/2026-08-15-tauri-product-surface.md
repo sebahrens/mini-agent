@@ -1,7 +1,7 @@
 # ADR: Tauri as a Product Surface for Mini Agent
 
 **Date**: 2026-08-15
-**Status**: Proposed
+**Status**: Accepted (no-go)
 **Deciders**: Engineering lead
 
 ---
@@ -20,6 +20,10 @@ Mini Agent currently ships as a CLI/TUI tool with archive distribution and is in
 ## Decision
 
 **No-go at this time.**
+
+This decision concerns a Tauri desktop shell only. The project later shipped the independently
+designed native WiX MSI and VS Code extension; that does not reverse the no-go on a second WebView
+application surface.
 
 ### Rationale
 
@@ -51,7 +55,8 @@ A Tauri surface should be reconsidered when **all three** are true:
 ### Consequences
 
 - `mini-agent-o78r.2` (Scaffold Tauri vertical slice) and its children are closed with this rationale.
-- Distribution focus remains: CLI archives, Homebrew, Cargo install, Windows installer via cargo-wix.
+- Distribution focus remains the CLI archives, source/package recipes, native WiX MSI, and VS Code
+  extension.
 - The ACP sidecar architecture described in alternative 3 remains valid if the decision is revisited; no implementation work is lost.
 
 ## Supported Installer Matrix (for reference if decision is reversed)
@@ -66,4 +71,5 @@ A Tauri surface should be reconsidered when **all three** are true:
 | Windows arm64 | NSIS `.exe` | Yes (EV cert) | P3 — requires explicit demand |
 | Windows x86_64 | `.msi` | Yes (EV cert) | P3 — requires explicit demand |
 
-MSI and Windows ARM require explicit user demand before being added to the matrix.
+This hypothetical Tauri matrix remains archival. The shipped x86-64 WiX MSI is a separate native
+installer and is documented in `packaging/windows/README.md`.

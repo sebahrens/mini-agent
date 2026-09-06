@@ -188,7 +188,59 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("SOURCE.md", b"source", 0o644),
                 ],
             )
-            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", True)
+            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", "yes")
+
+    @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
+    def test_full_archive_can_require_a_closed_unavailable_js_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = (
+                b"#!/bin/sh\n"
+                b"case \"$1\" in\n"
+                b"  --version) echo 'mini-agent 1.8.0' ;;\n"
+                b"  --js-runtime-check) echo 'JavaScript runtime self-check could not execute' >&2; echo 'JavaScript worker containment is unavailable' >&2; exit 1 ;;\n"
+                b"  *) exit 2 ;;\n"
+                b"esac\n"
+            )
+            archive = self.archive(
+                directory,
+                [
+                    ("mini-agent", executable, 0o755),
+                    ("LICENSE", b"license", 0o644),
+                    ("NOTICE", b"notice", 0o644),
+                    ("SOURCE.md", b"source", 0o644),
+                ],
+            )
+            RELEASE.smoke_archive(
+                archive, "mini-agent", "1.8.0", "unavailable"
+            )
+
+    @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
+    def test_unavailable_expectation_rejects_a_successful_js_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = (
+                b"#!/bin/sh\n"
+                b"case \"$1\" in\n"
+                b"  --version) echo 'mini-agent 1.8.0' ;;\n"
+                b"  --js-runtime-check) echo 'JS runtime check: PASS (2)' ;;\n"
+                b"  *) exit 2 ;;\n"
+                b"esac\n"
+            )
+            archive = self.archive(
+                directory,
+                [
+                    ("mini-agent", executable, 0o755),
+                    ("LICENSE", b"license", 0o644),
+                    ("NOTICE", b"notice", 0o644),
+                    ("SOURCE.md", b"source", 0o644),
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseArtifactError, "did not fail closed as unavailable"
+            ):
+                RELEASE.smoke_archive(
+                    archive, "mini-agent", "1.8.0", "unavailable"
+                )
 
     def test_windows_failure_diagnostic_reports_only_closed_helper_status(self) -> None:
         completed = subprocess.CompletedProcess([], 68, "", "ignored")
@@ -314,7 +366,7 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("SOURCE.md", b"source", 0o644),
                 ],
             )
-            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", False)
+            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", "no")
 
 
 if __name__ == "__main__":

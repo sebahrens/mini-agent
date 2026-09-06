@@ -1,20 +1,21 @@
 # Phase 6 — Brokered Cross-Platform JavaScript Runtime
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 - **Entry dependency**: the indexed Phase 1–5 contracts whose behavior Phase 6 preserves
 - **Exit dependency**: every gate and acceptance requirement in this document
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). This document is the authority for JavaScript worker containment,
 worker protocol, runtime ownership, brokered effects, effect audit, and production/verification
-realm parity. The implementation and dedicated cross-platform containment gates and platform
-records from CI run 31319107422 satisfy this contract. The checked-in resource baseline was
-independently aggregated by the final validator at commit `9c6f164` and remains observational
-rather than a security boundary.
+realm parity. The implementation and dedicated cross-platform containment gates satisfy this
+contract. CI run 31319107422 and commit `9c6f164` retain historical v1.7 platform-resource
+evidence; the checked-in v1.8 resource manifest is deliberately `pending_external_runs` until a
+new aggregate is published. Resource measurements remain observational rather than a security
+boundary.
 
 Phase 1 remains the authority for the JavaScript language surface, resource limits, stable error
 categories, and permission semantics that this phase preserves. Its exception text/stack
@@ -1002,13 +1003,13 @@ entered the bounded queue, cancellation returns `outcome_unknown` while a detach
 drains the response; the broker durably reconciles that ambiguous outcome before recycling the
 invocation. Callers must not replay that proposal automatically.
 
-## Accepted amendments (2026-09-05, pending delivery)
+## Delivered amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
-Each item is additive under the canonical checklist above; none relaxes an invariant. Until the
-named bead is closed with its tests, the pre-amendment behavior remains the delivered contract.
+Each item is additive under the canonical checklist above; none relaxes an invariant. Every named
+bead is closed with its required regression tests, so all items are part of the delivered contract.
 
-1. **Async evaluation of model script** (mini-agent-ml1u). The worker evaluates
+1. **Async evaluation of model script** (mini-agent-ml1u, delivered). The worker evaluates
    `mini-agent-model.js` as a strict async global script, so top-level `await` is accepted while
    verifier scripts retain their existing synchronous semantics. It unwraps QuickJS's one
    internal async-completion envelope through a trusted, pre-captured own-data descriptor lookup
@@ -1017,9 +1018,9 @@ named bead is closed with its tests, the pre-amendment behavior remains the deli
    returns a promise. All jobs remain charged to the bounded pending-job drain and the pre-installed
    interrupt deadline. The effect globals stay synchronous; awaiting them is a no-op. The tool
    description and agent prompt state strict-mode semantics, fresh runtime state, top-level `await`,
-   and synchronous host globals. Remaining limit-description work is tracked by mini-agent-7w1l
-   and mini-agent-b7xb.
-2. **Closed exception class and location** (mini-agent-m2kw). `Failure semantics` already allows
+   and synchronous host globals. The related limit-description coverage was delivered by
+   mini-agent-7w1l and mini-agent-b7xb.
+2. **Closed exception class and location** (mini-agent-m2kw, delivered). `Failure semantics` already allows
    a closed class and validated source-free location. The worker derives, from the caught
    exception, only the constructor name mapped onto a closed allow-list
    (`SyntaxError`, `TypeError`, `ReferenceError`, `RangeError`, `InternalError`, `other`) and the
@@ -1027,11 +1028,11 @@ named bead is closed with its tests, the pre-amendment behavior remains the deli
    reintroduces the position fields removed in v3. Stored-skill and verifier scripts never
    report positions. Messages, names outside the allow-list, stacks, and thrown values remain
    forbidden.
-3. **Effect-count exhaustion** (mini-agent-12cr). Reaching `MAX_EFFECTS_PER_STEP` is a bounded
+3. **Effect-count exhaustion** (mini-agent-12cr, delivered). Reaching `MAX_EFFECTS_PER_STEP` is a bounded
    step failure with closed code `effect_limit` that returns the console records collected so
    far; it is not a protocol fault and does not exit the worker. A worker that continues to
    dispatch effects after that failure is still a protocol fault.
-4. **Read-only discovery effects** (mini-agent-w2lv). `list_dir(path)`, `glob(pattern)`, and
+4. **Read-only discovery effects** (mini-agent-w2lv, delivered). `list_dir(path)`, `glob(pattern)`, and
    `grep(pattern, options)` are typed read-only effects executed by the parent file service
    under the same invocation grant, workspace binding, Phase 2 prefix narrowing, session
    permission, and durable audit as `read_file`. They return bounded JSON (entries, paths,
@@ -1043,23 +1044,23 @@ named bead is closed with its tests, the pre-amendment behavior remains the deli
    500 characters around the match. A `truncated` boolean reports any result, byte, or traversal
    cap. Traversal is descriptor-bound, ignores symlinks and unsafe file kinds, honors ignore files,
    and checks the shared invocation cancellation/deadline between entries and file reads.
-5. **Batched effects** (mini-agent-ae65). `read_files([paths])` is one effect request carrying one
+5. **Batched effects** (mini-agent-ae65, delivered). `read_files([paths])` is one effect request carrying one
    intent and one completion record, while every path is narrowed, permission-checked, and bounded
    before any content is read. It accepts 1–256 paths with at most 1 MiB aggregate path text and
    returns ordered contents capped at 6 MiB after JSON encoding. A single denied path fails the
    batch closed before any read. Audit records within one step may be group-committed as long as
    intent still precedes the first byte of the effect.
-6. **Closed denial codes** (mini-agent-dr93). `EffectErrorCode` gains `not_found`,
+6. **Closed denial codes** (mini-agent-dr93, delivered). `EffectErrorCode` gains `not_found`,
    `is_directory`, `denied`, and `too_large`. Codes are chosen by the parent from its own
    observations and remain free of target text. A host global throws a plain `Error` with the
    bounded message `<effect>: <code>` and an own `.code` property, so model code can branch on the
    code without parsing QuickJS conversion diagnostics.
-7. **Permission-wait rendering** (mini-agent-osaj). When the shared deadline expires while a
+7. **Permission-wait rendering** (mini-agent-osaj, delivered). When the shared deadline expires while a
    permission `Ask` is pending, the parent renders the closed message `permission prompt not
    answered within the 30s budget; do not retry without a new user decision` instead of the
    compute-timeout template. The deadline itself is unchanged, and the message contains neither
    the permission target nor user-interface data.
-8. **Typed result and scratch store** (mini-agent-yl18). Model-authored steps receive three
+8. **Typed result and scratch store** (mini-agent-yl18, delivered). Model-authored steps receive three
    synchronous globals; stored skills receive none of them. `result(value)` strict-clones `value`
    through the captured descriptor-only JSON gate and sends the encoded JSON in a typed terminal
    effect. The parent rejects invalid JSON, values over 256 KiB, more than 100,000 JSON nodes, or
@@ -1089,19 +1090,20 @@ named bead is closed with its tests, the pre-amendment behavior remains the deli
    capability, cancellation, effect-count, audit-failure, replay, and protocol failures therefore
    remain fail-closed under the existing broker state machine. These effects perform no external
    I/O and need no user permission prompt, but they still require the parent-issued model grant.
-   Protocol v10 carries the closed request/result/outcome variants, their bounds, and the
+   Protocol v10 introduced the closed request/result/outcome variants, their bounds, and the
    parent-attested availability of the model-facing `spawn` global; malformed or
-   oversized payloads are rejected before parsing or mutation. Pure path, diff, and table helpers
+   oversized payloads are rejected before parsing or mutation. Protocol v11 retains that contract.
+   Pure path, diff, and table helpers
    remain separate future work because they need no authority and do not justify expanding this
    effect contract.
 
 ## Acceptance matrix
 
 The matrix defines required evidence. Phase 6 is delivered under the index exit rule using the
-dedicated containment gates and three platform records from CI run 31319107422 plus the checked-in
-aggregate independently revalidated at commit `9c6f164`. Reference-runner observations are
-recorded with their platform and residual-risk qualifications; they are never generalized into
-unmeasured host guarantees.
+dedicated containment gates. CI run 31319107422 and commit `9c6f164` retain historical v1.7
+resource records; the checked-in v1.8 manifest currently records `pending_external_runs` and no
+platform evidence. Reference-runner observations are always versioned and qualified; they are
+never generalized into unmeasured host guarantees.
 
 | Contract area | Required acceptance evidence |
 |---------------|------------------------------|
@@ -1113,6 +1115,6 @@ unmeasured host guarantees.
 | Verification parity | The QuickJS realm gate passes; production and all verifier modes use one loader/ABI path with only declared deterministic fake capabilities and the same sanitized typed diagnostic contract. |
 | Effect audit | Recovery and failure-injection tests prove durable intent before every real effect, bounded completion, hash-chain integrity, fixed version-1 HMAC target correlation/redaction, version-1 key failure, segment rotation/anchors, bounded retention, machine-wide single-writer exclusion, process-restart retry semantics, and no replay. Key rotation remains out of scope. |
 | Platform containment | CI run 31319107422 passes the dedicated real empty-root Linux probe, the macOS 15 fail-closed probe, the validated macOS 26 production-binary denial/guardian live matrix, the Windows cached-attestation/full-canary/supported-install-location matrix, and the separate Windows general-AppContainer gate. The macOS 26 and Windows hosted results apply to their reference runners only. |
-| Resource baseline | The three platform records from CI run 31319107422 were independently aggregated and schema-validated by the final validator at commit `9c6f164`; the reviewed result is checked in at [`../benchmarks/results/js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) under the method in [`../benchmarks/js-worker.md`](../benchmarks/js-worker.md). It records one worker and zero idle runtimes per measured platform. Timing and memory target booleans remain informational unless a matched-host repeat is explicitly promoted; the enforced native ceilings are verified separately. |
+| Resource baseline | The three historical v1.7 platform records from CI run 31319107422 were independently aggregated and schema-validated at commit `9c6f164`. The current v1.8 [`js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) is a pending target/schema manifest with no platform records; it must not be cited as current measured evidence. Timing and memory target booleans remain informational unless a matched-host repeat is explicitly promoted; enforced native ceilings are verified separately. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
 | Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, removes stale platform and path claims from current documentation, and records delivered status consistently. Superseded dated blueprints and implementation plans remain explicitly historical. |

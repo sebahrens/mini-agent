@@ -1,12 +1,16 @@
 ---
 title: "review: harness design review — code as tool, personas, core loop"
 type: review
-status: accepted
+status: completed
 date: 2026-09-05
 epic: mini-agent-5ana
 ---
 
 # 2026-09-05 harness design review and implementation plan
+
+> **Historical completed review.** All 98 `review-2026-09-05` delivery and audit beads are closed.
+> The maintained agent guides and phase specs describe the resulting implementation; unchecked or
+> prospective wording below remains the original review record.
 
 Six read-only reviewers were fanned out over disjoint areas at HEAD `b9277b3` (core loop and
 context, JS code-as-tool surface, learned-skill library, native tools, personas and subagents,

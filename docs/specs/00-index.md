@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.4.0
+- **Specification version**: 1.5.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-05
+- **Last reconciled**: 2026-09-06
 
 ## Authority and conflict resolution
 
@@ -31,7 +31,7 @@ planning context only; it cannot override the cited section.
 
 | Phase | Normative spec | Delivery status | Owns |
 |-------|----------------|-----------------|------|
-| Foundation | [platform-paths.md](platform-paths.md) | In progress | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
+| Foundation | [platform-paths.md](platform-paths.md) | Delivered | Typed Linux/macOS/Windows roots, artifact ownership, secure migration |
 | Cross-cutting | [subprocess-trust.md](subprocess-trust.md) | Contract delivered | Subprocess principals, trust classes, launch fields, fail-closed backend selection, checked launch inventory |
 | 1 | [phase-1-js-engine.md](phase-1-js-engine.md) | Delivered | Core QuickJS integration, `JsTool`, primitive host globals |
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
@@ -59,18 +59,17 @@ its original phase.
 | Phase 4, `propose_skill()` and proposal persistence | Identity-v1 flat capability payload, JS-thread host placement, and direct access to durable enqueue | `Capability broker`, `Persistence boundary` | Proposal field bounds, held-out evaluation, human approval gates |
 | Phase 5, `Lifecycle and immutable lineage` and `Automatic quarantine` | Normal lifecycle treatment of identity-v1 artifacts during Phase 6 migration | `Persistence boundary`, `Failure semantics` | Evidence policy, transactional lifecycle/index coordination, repair/rollback for eligible identities, retention |
 
-## Accepted amendments pending delivery (2026-09-05)
+## Delivered amendments (2026-09-05)
 
 The [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md)
-accepted the amendments below. Each owning phase spec carries the normative wording in a section
-named **Accepted amendments (2026-09-05, pending delivery)**. An amendment is not delivered until
-its bead is closed with the tests named there; until then the pre-amendment text stays in force
-for status claims. No amendment changes the Phase 6 canonical checklist.
+accepted the amendments below. Every named bead is closed with its required regression coverage,
+so the owning phase specs now treat these additions as part of the delivered contract. No
+amendment changes the Phase 6 canonical checklist.
 
 | Amendment | Owning spec | Bead |
 |-----------|-------------|------|
 | Async evaluation of model script; documented script semantics and limits | Phase 6 | mini-agent-ml1u, mini-agent-7w1l |
-| Closed exception class and validated line/column in diagnostics (introduced in protocol v4; retained by v8) | Phase 6 | mini-agent-m2kw |
+| Closed exception class and validated line/column in diagnostics (introduced in protocol v4; retained by v11) | Phase 6 | mini-agent-m2kw |
 | Effect-count exhaustion as a bounded step error | Phase 6 | mini-agent-12cr |
 | Read-only `list_dir`/`glob`/`grep` effects and batched `read_files` | Phase 6 (narrowing per Phase 2) | mini-agent-w2lv, mini-agent-ae65 |
 | Distinct closed denial codes; permission-wait rendering | Phase 6 | mini-agent-dr93, mini-agent-osaj |
