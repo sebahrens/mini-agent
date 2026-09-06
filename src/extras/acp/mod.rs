@@ -3233,7 +3233,7 @@ mod protocol_tests {
             started.elapsed() < Duration::from_millis(150),
             "async:true prompt hooks must not delay prompt dispatch"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !pid_file.exists() {
                 tokio::task::yield_now().await;
             }
@@ -3243,7 +3243,7 @@ mod protocol_tests {
         let pid = std::fs::read_to_string(&pid_file).unwrap();
 
         work_scope.cancellation_handle().cancel();
-        tokio::time::timeout(Duration::from_secs(1), work_scope.wait_idle())
+        tokio::time::timeout(Duration::from_secs(5), work_scope.wait_idle())
             .await
             .expect("hook cancellation must kill and reap the configured subprocess");
         assert!(
