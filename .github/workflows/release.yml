@@ -475,8 +475,12 @@ jobs:
           VSCODE_TARGET: ${{ matrix.vscode-target }}
         run: |
           mkdir -p "editors/vscode/bin/$VSCODE_TARGET"
+          BINARY_NAME="$CANONICAL_BINARY"
+          if [[ "$VSCODE_TARGET" == win32-* ]]; then
+            BINARY_NAME="${CANONICAL_BINARY}.exe"
+          fi
           tar -xzf "release-input/mini-agent-$RUST_TARGET.tar.gz" \
-            -C "editors/vscode/bin/$VSCODE_TARGET"
+            -C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME"
 
       - name: Install locked extension dependencies
         working-directory: editors/vscode

@@ -523,6 +523,20 @@ steps:
 
         self.assertTrue(any("npm-owned target scripts" in error for error in errors))
 
+    def test_release_requires_vsix_to_extract_only_the_executable(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        workflow = workflow.replace(
+            '-C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME"',
+            '-C "editors/vscode/bin/$VSCODE_TARGET"',
+            1,
+        )
+
+        errors = CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent")
+
+        self.assertTrue(any("matching executable" in error for error in errors))
+
     def test_release_requires_strict_manifest_and_atomic_publication_gates(self) -> None:
         workflow = (
             SCRIPT.parents[1] / ".github/workflows/release.yml"

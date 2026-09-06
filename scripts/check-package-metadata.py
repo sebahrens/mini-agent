@@ -475,14 +475,18 @@ def validate_workflow(text: str, binary: str) -> list[str]:
         "npm run lint",
         "npm test",
         "npm run sbom",
+        'BINARY_NAME="$CANONICAL_BINARY"',
+        'BINARY_NAME="${CANONICAL_BINARY}.exe"',
+        '-C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME"',
     )
     missing_vscode = [
         fragment for fragment in vscode_fragments if fragment not in vscode_job
     ]
     if missing_vscode or "node scripts/package-target.mjs" in vscode_job:
         errors.append(
-            ".github/workflows/release.yml must package VSIX candidates through the "
-            f"npm-owned target scripts; missing={missing_vscode}"
+            ".github/workflows/release.yml must extract only the matching executable "
+            "and package VSIX candidates through the npm-owned target scripts; "
+            f"missing={missing_vscode}"
         )
 
     checksum_job = _workflow_job(text, "checksums")
