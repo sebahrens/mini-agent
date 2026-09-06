@@ -70,6 +70,10 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         ctx.renderer,
         "  /model [name]          show or switch model",
     );
+    write_result(
+        ctx.renderer,
+        "  /agent [name]          show or switch the main-agent persona",
+    );
     write_result(ctx.renderer, "  /models                list quick models");
     write_result(
         ctx.renderer,

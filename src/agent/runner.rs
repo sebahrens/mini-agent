@@ -1,14 +1,19 @@
 use compact_str::CompactString;
 use futures::StreamExt;
 use rig::OneOrMany;
-use rig::agent::{Agent, MultiTurnStreamItem, StreamingResult};
+use rig::agent::{
+    Agent, AgentHook, Flow, HookContext, MultiTurnStreamItem, StepEvent, StepEventKind,
+    StreamingResult,
+};
 use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
 use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -21,6 +26,331 @@ use crate::retry::{self, RetryConfig};
 use crate::session::{MessageRole, PersistedToolMessage, Session};
 
 const VERIFICATION_DIAGNOSTIC_CHARS: usize = 12_000;
+const IDENTICAL_TOOL_FAILURE_LIMIT: u32 = 3;
+const ALTERNATING_EDIT_HISTORY: usize = 5;
+pub(crate) const TOOL_LOOP_NOTICE_PREFIX: &str = "[tool-loop detected]";
+
+/// Deletes a just-written spill if the hook is cancelled before it can make
+/// the artifact reachable from the bounded result and transcript handoff.
+struct UncommittedToolResultSpill {
+    path: Option<PathBuf>,
+}
+
+impl UncommittedToolResultSpill {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("uncommitted spill must retain its path")
+    }
+
+    fn commit(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("uncommitted spill must retain its path")
+    }
+}
+
+impl Drop for UncommittedToolResultSpill {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "failed to clean up uncommitted tool-result spill");
+        }
+    }
+}
+
+/// Caps every textual tool result before Rig commits it to the live model
+/// history. The complete output is written to the logical session's private
+/// artifact directory and handed to transcript persistence out-of-band.
+#[derive(Clone)]
+pub(crate) struct ToolResultSpillHook {
+    session_id: CompactString,
+    spills: Option<crate::session::ToolResultSpillStore>,
+}
+
+impl ToolResultSpillHook {
+    pub(crate) fn new(
+        session_id: impl Into<CompactString>,
+        spills: Option<crate::session::ToolResultSpillStore>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            spills,
+        }
+    }
+}
+
+impl<M: CompletionModel> AgentHook<M> for ToolResultSpillHook {
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        let StepEvent::ToolResult {
+            tool_name,
+            tool_call_id,
+            internal_call_id,
+            result,
+            ..
+        } = event
+        else {
+            return Flow::cont();
+        };
+
+        let output_chars = result.chars().count();
+        if output_chars <= crate::session::TOOL_RESULT_SAVE_THRESHOLD {
+            return Flow::cont();
+        }
+
+        let session_id = self.session_id.to_string();
+        let tool_name_owned = tool_name.to_owned();
+        let output = result.to_owned();
+        let output_for_write = output.clone();
+        let saved = spawn_blocking_scoped(move || {
+            crate::session::storage::save_tool_output(
+                &session_id,
+                &tool_name_owned,
+                &output_for_write,
+            )
+            .map(UncommittedToolResultSpill::new)
+        })
+        .await;
+
+        match saved {
+            Ok(Ok(spill)) => {
+                let bounded = crate::session::format_truncated_tool_output(
+                    &output,
+                    output_chars,
+                    spill.path(),
+                );
+                let path = spill.commit();
+                if let Some(spills) = &self.spills {
+                    spills.register(
+                        internal_call_id,
+                        tool_call_id,
+                        tool_name,
+                        &bounded,
+                        path.clone(),
+                    );
+                }
+                Flow::rewrite_result(bounded)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    tool_name,
+                    internal_call_id,
+                    %error,
+                    "failed to persist oversized live tool result"
+                );
+                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                    &output,
+                    output_chars,
+                    &error.to_string(),
+                ))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tool_name,
+                    internal_call_id,
+                    %error,
+                    "tool-result spill worker failed"
+                );
+                Flow::rewrite_result(crate::session::format_unpersisted_truncated_tool_output(
+                    &output,
+                    output_chars,
+                    "the spill worker failed",
+                ))
+            }
+        }
+    }
+
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(kind, StepEventKind::ToolResult)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ToolCallFingerprint([u8; 32]);
+
+fn tool_call_fingerprint(tool_name: &str, args: &str) -> ToolCallFingerprint {
+    let mut digest = Sha256::new();
+    digest.update((tool_name.len() as u64).to_be_bytes());
+    digest.update(tool_name.as_bytes());
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+        hash_canonical_json(&mut digest, &value);
+    } else {
+        digest.update(b"invalid-json");
+        digest.update((args.len() as u64).to_be_bytes());
+        digest.update(args.as_bytes());
+    }
+    ToolCallFingerprint(digest.finalize().into())
+}
+
+fn hash_canonical_json(digest: &mut Sha256, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => digest.update(b"null"),
+        serde_json::Value::Bool(value) => {
+            digest.update(b"bool");
+            digest.update([u8::from(*value)]);
+        }
+        serde_json::Value::Number(value) => {
+            let value = value.to_string();
+            digest.update(b"number");
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            digest.update(b"string");
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        serde_json::Value::Array(values) => {
+            digest.update(b"array");
+            digest.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                hash_canonical_json(digest, value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            digest.update(b"object");
+            digest.update((values.len() as u64).to_be_bytes());
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (key, value) in entries {
+                digest.update((key.len() as u64).to_be_bytes());
+                digest.update(key.as_bytes());
+                hash_canonical_json(digest, value);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ToolLoopState {
+    failures: HashMap<ToolCallFingerprint, u32>,
+    recent_successful_edits: VecDeque<ToolCallFingerprint>,
+    blocked_edit_pair: Option<[ToolCallFingerprint; 2]>,
+}
+
+impl ToolLoopState {
+    fn exact_failure_notice(&self, fingerprint: ToolCallFingerprint) -> Option<String> {
+        let failures = self.failures.get(&fingerprint).copied().unwrap_or(0);
+        (failures >= IDENTICAL_TOOL_FAILURE_LIMIT).then(|| {
+            format!(
+                "{TOOL_LOOP_NOTICE_PREFIX} This exact call has failed {failures} times and was not executed again. Change the arguments or approach; ask the user only when an interactive decision is genuinely required."
+            )
+        })
+    }
+
+    fn alternating_edit_notice(&mut self, fingerprint: ToolCallFingerprint) -> Option<String> {
+        if let Some(pair) = self.blocked_edit_pair {
+            if pair.contains(&fingerprint) {
+                return Some(format!(
+                    "{TOOL_LOOP_NOTICE_PREFIX} This edit belongs to a repeated A/B edit-and-undo cycle and was not executed. Inspect the current file state and use a different approach."
+                ));
+            }
+            self.blocked_edit_pair = None;
+        }
+
+        if self.recent_successful_edits.len() != ALTERNATING_EDIT_HISTORY {
+            return None;
+        }
+        let edits = self.recent_successful_edits.make_contiguous();
+        let first = edits[0];
+        let second = edits[1];
+        if first != second
+            && edits[2] == first
+            && edits[3] == second
+            && edits[4] == first
+            && fingerprint == second
+        {
+            self.blocked_edit_pair = Some([first, second]);
+            return Some(format!(
+                "{TOOL_LOOP_NOTICE_PREFIX} A sixth alternating A/B edit was stopped before execution because the edits are repeatedly undoing one another. Inspect the current file state and use a different approach."
+            ));
+        }
+        None
+    }
+
+    fn record_result(
+        &mut self,
+        tool_name: &str,
+        fingerprint: ToolCallFingerprint,
+        outcome: &rig::tool::ToolOutcome,
+    ) -> Option<String> {
+        if outcome.is_success() {
+            self.failures.remove(&fingerprint);
+            if tool_name == "edit" {
+                self.recent_successful_edits.push_back(fingerprint);
+                while self.recent_successful_edits.len() > ALTERNATING_EDIT_HISTORY {
+                    self.recent_successful_edits.pop_front();
+                }
+            }
+            return None;
+        }
+        if !(outcome.is_error() || outcome.is_denied()) {
+            return None;
+        }
+
+        let failures = self.failures.entry(fingerprint).or_default();
+        *failures = failures.saturating_add(1);
+        (*failures == IDENTICAL_TOOL_FAILURE_LIMIT).then(|| {
+            format!(
+                "{TOOL_LOOP_NOTICE_PREFIX} This exact call has failed {IDENTICAL_TOOL_FAILURE_LIMIT} times. Change the arguments or approach; ask the user only when an interactive decision is genuinely required."
+            )
+        })
+    }
+}
+
+/// Run-scoped guard against repeated failing calls and edit/undo oscillation.
+/// Rig creates a fresh [`HookContext`] for every user turn, so no state leaks
+/// between turns or agents.
+pub(crate) struct ToolLoopGuard;
+
+impl<M: CompletionModel> AgentHook<M> for ToolLoopGuard {
+    async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::ToolCall {
+                tool_name, args, ..
+            } => {
+                let fingerprint = tool_call_fingerprint(tool_name, args);
+                let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state.exact_failure_notice(fingerprint).or_else(|| {
+                        (tool_name == "edit")
+                            .then(|| state.alternating_edit_notice(fingerprint))
+                            .flatten()
+                    })
+                });
+                notice.map_or_else(Flow::cont, Flow::skip)
+            }
+            StepEvent::ToolResult {
+                tool_name,
+                args,
+                outcome,
+                ..
+            } => {
+                let fingerprint = tool_call_fingerprint(tool_name, args);
+                let notice = ctx.scratchpad().update(|state: &mut ToolLoopState| {
+                    state.record_result(tool_name, fingerprint, outcome)
+                });
+                notice.map_or_else(Flow::cont, Flow::rewrite_result)
+            }
+            _ => Flow::cont(),
+        }
+    }
+
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(kind, StepEventKind::ToolCall | StepEventKind::ToolResult)
+    }
+}
+
+pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
+    output.starts_with(TOOL_LOOP_NOTICE_PREFIX)
+}
 
 #[derive(Clone)]
 pub(crate) struct CompletionVerification {
@@ -79,6 +409,28 @@ pub struct AgentRunner {
     /// interrupted run keeps driving its stream — and therefore keeps executing
     /// tools (edit/write/bash) — invisibly. Aborting stops it for real.
     pub abort_handle: tokio::task::AbortHandle,
+    pub(crate) compaction_decision_tx: Option<mpsc::Sender<CompactionBoundaryDecision>>,
+    compaction_enabled: Arc<AtomicBool>,
+}
+
+impl AgentRunner {
+    pub(crate) fn without_compaction(
+        event_rx: mpsc::Receiver<AgentEvent>,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> Self {
+        Self {
+            event_rx,
+            abort_handle,
+            compaction_decision_tx: None,
+            compaction_enabled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionBoundaryDecision {
+    Continue,
+    Compact,
 }
 
 tokio::task_local! {
@@ -372,6 +724,16 @@ impl PausedAgentRunner {
     }
 
     pub(crate) fn start(mut self) -> AgentRunner {
+        if let Some(start_tx) = self.start_tx.take() {
+            let _ = start_tx.send(());
+        }
+        self.runner
+    }
+
+    pub(crate) fn start_interactive(mut self) -> AgentRunner {
+        self.runner
+            .compaction_enabled
+            .store(true, Ordering::Release);
         if let Some(start_tx) = self.start_tx.take() {
             let _ = start_tx.send(());
         }
@@ -995,7 +1357,7 @@ impl RunnerStreamPolicy {
     }
 }
 
-/// Spawn an isolated, single-turn, tool-less side-question run. The full result
+/// Spawn an isolated read-only side-question run. The full result
 /// is delivered as a single [`BtwEvent::Done`] (or [`BtwEvent::Error`]) tagged
 /// with `id`. Unlike [`spawn_agent`], it never registers a subagent event sink
 /// and never mutates the session.
@@ -1017,7 +1379,14 @@ where
             retry::retry_stream_chat(&retry_config, move || {
                 let p = prompt.clone();
                 let h = history.clone();
-                async move { agent_ref.stream_chat(p, h).await }
+                async move {
+                    agent_ref
+                        .stream_chat(p, h)
+                        .tool_concurrency(
+                            crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
+                        )
+                        .await
+                }
             })
             .await
         };
@@ -1095,8 +1464,38 @@ where
 }
 
 pub fn convert_history(session: &Session) -> Vec<Message> {
+    convert_history_shared_with_tool_result_retention(
+        session,
+        crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+    )
+    .to_vec()
+}
+
+pub fn convert_history_with_tool_result_retention(
+    session: &Session,
+    keep_recent_tool_results: usize,
+) -> Vec<Message> {
+    convert_history_shared_with_tool_result_retention(session, keep_recent_tool_results).to_vec()
+}
+
+pub fn convert_history_shared_with_tool_result_retention(
+    session: &Session,
+    keep_recent_tool_results: usize,
+) -> Arc<[Message]> {
+    if let Some(history) = session.cached_converted_history(keep_recent_tool_results) {
+        return history;
+    }
+    let history: Arc<[Message]> =
+        convert_history_uncached(session, keep_recent_tool_results).into();
+    session.cache_converted_history(keep_recent_tool_results, Arc::clone(&history));
+    history
+}
+
+fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) -> Vec<Message> {
     let (summary, first_kept) = session.compacted_context();
-    let remaining = session.messages.len().saturating_sub(first_kept);
+    let replay_messages =
+        session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    let remaining = replay_messages.len().saturating_sub(first_kept);
     let extra = if summary.is_some() { 1 } else { 0 };
     let mut messages = Vec::with_capacity(remaining + extra);
 
@@ -1132,7 +1531,7 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
     let mut replay_kind = ReplayKind::Other;
     let mut call_counts: HashMap<&str, usize> = HashMap::new();
     let mut result_counts: HashMap<&str, usize> = HashMap::new();
-    for msg in &session.messages[first_kept..] {
+    for msg in &replay_messages[first_kept..] {
         let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
             continue;
         };
@@ -1159,7 +1558,7 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
     let mut open_call_ids = HashSet::new();
     let mut completed_call_ids = HashSet::new();
 
-    for msg in &session.messages[first_kept..] {
+    for msg in &replay_messages[first_kept..] {
         match msg.role {
             MessageRole::User => {
                 messages.push(Message::user(msg.content.to_string()));
@@ -1211,7 +1610,7 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
             }
             MessageRole::ToolResult => {
                 let structured = match (&msg.tool_call_id, &msg.tool) {
-                    (Some(id), Some(PersistedToolMessage::Result { output }))
+                    (Some(id), Some(PersistedToolMessage::Result { output, .. }))
                         if open_call_ids.contains(id.as_str())
                             && !completed_call_ids.contains(id.as_str()) =>
                     {
@@ -1348,6 +1747,7 @@ where
     agent
         .stream_chat(current_prompt.clone(), new_history)
         .max_turns(max_turns)
+        .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
         .await
 }
 
@@ -1384,7 +1784,22 @@ pub fn build_btw_snapshot(
     turn_trace: &[CompactString],
     main_running: bool,
 ) -> Vec<Message> {
-    let mut snapshot = convert_history(session);
+    build_btw_snapshot_with_tool_result_retention(
+        session,
+        turn_trace,
+        main_running,
+        crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+    )
+}
+
+pub fn build_btw_snapshot_with_tool_result_retention(
+    session: &Session,
+    turn_trace: &[CompactString],
+    main_running: bool,
+    keep_recent_tool_results: usize,
+) -> Vec<Message> {
+    let mut snapshot =
+        convert_history_with_tool_result_retention(session, keep_recent_tool_results);
     if main_running && !turn_trace.is_empty() {
         snapshot.push(Message::user(format!(
             "(Context only — the main assistant is working in parallel right now. \
@@ -1420,7 +1835,7 @@ where
     spawn_agent_with_start_mode(
         agent,
         prompt,
-        history,
+        history.into(),
         retry_config,
         turn_token_budget,
         RunnerStreamPolicy::default(),
@@ -1452,7 +1867,7 @@ where
     spawn_agent_paused_in_scope(
         agent,
         prompt,
-        history,
+        history.into(),
         retry_config,
         turn_token_budget,
         #[cfg(feature = "skills")]
@@ -1468,7 +1883,7 @@ where
 pub(crate) fn spawn_agent_paused_in_scope<M>(
     agent: Agent<M>,
     prompt: String,
-    history: Vec<Message>,
+    history: Arc<[Message]>,
     retry_config: RetryConfig,
     turn_token_budget: Option<u64>,
     #[cfg(feature = "skills")] turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -1503,6 +1918,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_with_stream_policy<M>(
     agent: Agent<M>,
     prompt: String,
@@ -1521,7 +1937,7 @@ where
     spawn_agent_with_start_mode(
         agent,
         prompt,
-        history,
+        history.into(),
         retry_config,
         turn_token_budget,
         stream_policy,
@@ -1540,7 +1956,7 @@ where
 fn spawn_agent_with_start_mode<M>(
     agent: Agent<M>,
     prompt: String,
-    history: Vec<Message>,
+    history: Arc<[Message]>,
     retry_config: RetryConfig,
     turn_token_budget: Option<u64>,
     stream_policy: RunnerStreamPolicy,
@@ -1555,6 +1971,10 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
+    let (compaction_decision_tx, mut compaction_decision_rx) =
+        mpsc::channel::<CompactionBoundaryDecision>(1);
+    let compaction_enabled = Arc::new(AtomicBool::new(false));
+    let runner_compaction_enabled = Arc::clone(&compaction_enabled);
     let runner_lifecycle_tx = event_tx.clone();
     let (start_tx, start_rx) = if start_paused {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1586,6 +2006,7 @@ where
         // copies before any request has even started.
         let retry_prompt = prompt;
         let retry_history = history;
+        let mut first_attempt_history = Some(retry_history.to_vec());
         let mut interactions: Vec<Message> = Vec::new();
         let mut tool_calls = ToolCallTracker::default();
         let mut completion_had_tool_call = false;
@@ -1605,6 +2026,7 @@ where
         let mut response_len_at_stream_start = response.len();
         let mut usage_ledger = UsageLedger::default();
         let mut completion_retry = CompletionRetryState::new(&retry_config);
+        let mut compaction_requested = false;
         usage_ledger.start_stream();
         // Overrides the next continuation message (bottom of the outer
         // `loop`); set when a `Stop` hook forces continuation instead of the
@@ -1627,48 +2049,46 @@ where
         }
 
         let stream: StreamingResult<M::StreamingResponse> = {
-            let mut attempt: usize = 0;
-            let mut backoff = std::time::Duration::from_millis(retry_config.initial_backoff_ms);
-            let max_backoff = std::time::Duration::from_millis(retry_config.max_backoff_ms);
-            loop {
-                attempt += 1;
-                let mut s = agent
-                    .stream_chat(retry_prompt.clone(), retry_history.clone())
-                    .max_turns(max_turns)
-                    .await;
-                let first = s.next().await;
-                match first {
-                    Some(Ok(item)) => {
-                        break futures::stream::once(std::future::ready(Ok(item)))
-                            .chain(s)
-                            .boxed();
+            let retry_events = event_tx.clone();
+            let result = retry::retry_stream_chat_with(
+                &retry_config,
+                || {
+                    let prompt = retry_prompt.clone();
+                    let history = first_attempt_history
+                        .take()
+                        .unwrap_or_else(|| retry_history.to_vec());
+                    async {
+                        agent
+                            .stream_chat(prompt, history)
+                            .max_turns(max_turns)
+                            .tool_concurrency(
+                                crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY,
+                            )
+                            .await
                     }
-                    Some(Err(e))
-                        if attempt < retry_config.max_attempts && retry::is_retryable(&e) =>
-                    {
-                        tracing::warn!(
-                            "agent retry {attempt}/{max} after error: {e}",
-                            max = retry_config.max_attempts,
-                        );
-                        let _ = event_tx
+                },
+                move |notice| {
+                    let retry_events = retry_events.clone();
+                    async move {
+                        let _ = retry_events
                             .send(AgentEvent::Retrying {
-                                attempt,
-                                max: retry_config.max_attempts,
+                                attempt: notice.attempt,
+                                max: notice.max_attempts,
                             })
                             .await;
-                        let jitter = retry::simple_jitter(backoff.as_millis() as u64);
-                        tokio::time::sleep(backoff + jitter).await;
-                        backoff = (backoff * 2).min(max_backoff);
                     }
-                    Some(Err(e)) => {
-                        tracing::error!("agent non-retryable error on attempt {attempt}: {e}");
-                        let error = retry::with_context_length_hint(&e.to_string());
-                        let _ = event_tx
-                            .send(AgentEvent::Error(CompactString::new(error)))
-                            .await;
-                        return;
-                    }
-                    None => break s.boxed(),
+                },
+            )
+            .await;
+            match result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::error!("agent stream start failed after retries: {error}");
+                    let error = retry::with_context_length_hint(&error.to_string());
+                    let _ = event_tx
+                        .send(AgentEvent::Error(CompactString::new(error)))
+                        .await;
+                    return;
                 }
             }
         };
@@ -1819,6 +2239,7 @@ where
                             output.len(),
                         );
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
+                        let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
                         let _ = event_tx
                             .send(AgentEvent::ToolResult {
                                 id: CompactString::from(internal_call_id),
@@ -1826,6 +2247,24 @@ where
                                 output: CompactString::from(output),
                             })
                             .await;
+                        if let Some(message) = loop_notice {
+                            let _ = event_tx
+                                .send(AgentEvent::ToolLoop {
+                                    name: tool_name,
+                                    message: CompactString::from(message),
+                                })
+                                .await;
+                        }
+                        if compaction_requested && tool_calls.pending.is_empty() {
+                            let mut boundary_interactions = completed_interactions.clone();
+                            boundary_interactions.extend(interactions.iter().cloned());
+                            let _ = event_tx
+                                .send(AgentEvent::CompactionBoundary {
+                                    interactions: boundary_interactions,
+                                })
+                                .await;
+                            return;
+                        }
                     }
                     Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                         terminal_response_seen = true;
@@ -1851,6 +2290,7 @@ where
                                 .send(AgentEvent::UsageDelta {
                                     usage: terminal_delta,
                                     context_complete,
+                                    awaits_compaction_decision: false,
                                 })
                                 .await;
                         }
@@ -1888,7 +2328,7 @@ where
                             return;
                         }
 
-                        if !response_text.is_empty() {
+                        if terminal_was_streamed || !response_text.is_empty() {
                             if workspace_may_have_changed
                                 && let Some(verification) = completion_verification.as_ref()
                             {
@@ -1969,18 +2409,44 @@ where
                         let usage = call.usage;
                         let delta = usage_ledger.record(usage);
                         tracing::debug!(
-                            "agent completion: input_tokens={}, output_tokens={}, cumulative_tokens={}",
+                            "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                             usage.input_tokens,
                             usage.output_tokens,
+                            usage.cached_input_tokens,
+                            usage.cache_creation_input_tokens,
                             observed_tokens(usage_ledger.total),
                         );
-                        if delta.has_values() {
-                            let _ = event_tx
+                        let usage_event_delivered = if delta.has_values() {
+                            event_tx
                                 .send(AgentEvent::UsageDelta {
                                     usage: delta,
                                     context_complete: true,
+                                    awaits_compaction_decision: true,
                                 })
-                                .await;
+                                .await
+                                .is_ok()
+                        } else {
+                            false
+                        };
+                        if usage_event_delivered
+                            && runner_compaction_enabled.load(Ordering::Acquire)
+                        {
+                            match compaction_decision_rx.recv().await {
+                                Some(CompactionBoundaryDecision::Compact) => {
+                                    // Rig publishes CompletionCall before it
+                                    // surfaces the completed tool call and its
+                                    // result, so eligibility cannot be decided
+                                    // from the tracker yet. Keep the request
+                                    // armed until a correlated ToolResult; a
+                                    // text-only completion reaches Done without
+                                    // consuming it.
+                                    compaction_requested = true;
+                                }
+                                Some(CompactionBoundaryDecision::Continue) => {}
+                                None => {
+                                    runner_compaction_enabled.store(false, Ordering::Release);
+                                }
+                            }
                         }
                         if let Some((used, budget)) =
                             exhausted_token_budget(usage_ledger.total, turn_token_budget)
@@ -2155,6 +2621,8 @@ where
         AgentRunner {
             event_rx,
             abort_handle: join.abort_handle(),
+            compaction_decision_tx: Some(compaction_decision_tx),
+            compaction_enabled,
         },
         start_tx,
     )
@@ -2168,7 +2636,7 @@ where
 /// `Stop` hook needs to do. Each stream is explicitly bounded to the unused
 /// portion of the agent's `default_max_turns`, so hook continuations share one
 /// model-call budget with the initial stream.
-pub async fn run_print<M>(
+pub async fn run_print<M, H>(
     agent: &Agent<M>,
     prompt: &str,
     pure_stdout: bool,
@@ -2179,7 +2647,7 @@ pub async fn run_print<M>(
     // `convert_history`. Fed to the initial `stream_chat` call below and
     // seeded into `retry_history` for the hooks `Stop`-continuation retry,
     // mirroring `spawn_agent`. Empty for a fresh session.
-    history: Vec<Message>,
+    history: H,
     // `--loop` iteration/active state, for the `Stop` hook envelope's
     // `loop_iteration`/`loop_active` fields; see `runner::spawn_agent`.
     // `None` for plain `-p` one-shot runs.
@@ -2188,6 +2656,7 @@ pub async fn run_print<M>(
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    H: Into<Arc<[Message]>>,
 {
     run_print_with_stream_policy(
         agent,
@@ -2195,7 +2664,7 @@ where
         pure_stdout,
         retry_config,
         turn_token_budget,
-        history,
+        history.into(),
         RunnerStreamPolicy::default(),
         #[cfg(feature = "hooks")]
         loop_info,
@@ -2204,27 +2673,30 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_print_with_verification<M>(
+pub(crate) async fn run_print_with_verification<M, H>(
     agent: &Agent<M>,
     prompt: &str,
     pure_stdout: bool,
+    emit_stdout: bool,
     retry_config: &RetryConfig,
     turn_token_budget: Option<u64>,
-    history: Vec<Message>,
+    history: H,
     completion_verification: Option<CompletionVerification>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    H: Into<Arc<[Message]>>,
 {
     run_print_with_stream_policy_and_verification(
         agent,
         prompt,
         pure_stdout,
+        emit_stdout,
         retry_config,
         turn_token_budget,
-        history,
+        history.into(),
         RunnerStreamPolicy::default(),
         completion_verification,
         #[cfg(feature = "hooks")]
@@ -2239,27 +2711,29 @@ where
 // `spawn_agent_with_start_mode`), so a params struct would only add a second
 // place to keep the two signatures in sync.
 #[allow(clippy::too_many_arguments)]
-async fn run_print_with_stream_policy<M>(
+async fn run_print_with_stream_policy<M, H>(
     agent: &Agent<M>,
     prompt: &str,
     pure_stdout: bool,
     retry_config: &RetryConfig,
     turn_token_budget: Option<u64>,
-    history: Vec<Message>,
+    history: H,
     stream_policy: RunnerStreamPolicy,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
 ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
+    H: Into<Arc<[Message]>>,
 {
     run_print_with_stream_policy_and_verification(
         agent,
         prompt,
         pure_stdout,
+        true,
         retry_config,
         turn_token_budget,
-        history,
+        history.into(),
         stream_policy,
         None,
         #[cfg(feature = "hooks")]
@@ -2273,9 +2747,10 @@ async fn run_print_with_stream_policy_and_verification<M>(
     agent: &Agent<M>,
     prompt: &str,
     pure_stdout: bool,
+    emit_stdout: bool,
     retry_config: &RetryConfig,
     turn_token_budget: Option<u64>,
-    history: Vec<Message>,
+    history: Arc<[Message]>,
     stream_policy: RunnerStreamPolicy,
     completion_verification: Option<CompletionVerification>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
@@ -2289,16 +2764,25 @@ where
         anyhow::bail!("Agent exhausted its maximum turn budget (0) before starting.");
     }
 
+    let mut first_attempt_history = Some(history.to_vec());
     let stream = retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
-        let h = history.clone();
-        async move { agent.stream_chat(p, h).max_turns(max_turns).await }
+        let h = first_attempt_history
+            .take()
+            .unwrap_or_else(|| history.to_vec());
+        async move {
+            agent
+                .stream_chat(p, h)
+                .max_turns(max_turns)
+                .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
+                .await
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())))?;
     let mut stream = stream_policy.apply(stream);
 
-    let retry_history: Vec<Message> = history;
+    let retry_history = history;
     // Interactions of the stream currently being consumed; drained into the
     // continuation bridge (and `committed_interactions`) at every stream end.
     let mut interactions: Vec<Message> = Vec::new();
@@ -2345,8 +2829,10 @@ where
                 ))) => {
                     full_response.push_str(&text.text);
                     append_streamed_text(&mut interactions, &text.text);
-                    print!("{}", text.text);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if emit_stdout {
+                        print!("{}", text.text);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::Reasoning(r),
@@ -2420,9 +2906,11 @@ where
                     turns_used = turns_used.saturating_add(1);
                     usage_ledger.record(call.usage);
                     tracing::debug!(
-                        "agent completion: input_tokens={}, output_tokens={}, cumulative_tokens={}",
+                        "agent completion: input_tokens={}, output_tokens={}, cached_input_tokens={}, cache_creation_input_tokens={}, cumulative_tokens={}",
                         call.usage.input_tokens,
                         call.usage.output_tokens,
+                        call.usage.cached_input_tokens,
+                        call.usage.cache_creation_input_tokens,
                         observed_tokens(usage_ledger.total),
                     );
                     if let Some((used, budget)) =
@@ -2682,6 +3170,7 @@ where
             agent
                 .stream_chat(p, Vec::<Message>::new())
                 .max_turns(max_turns)
+                .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
                 .await
         }
     })
@@ -2761,7 +3250,7 @@ mod tests {
     use super::{
         MAX_PENDING_TOOL_CALLS, NonTerminalStreamExhausted, RunnerStreamPolicy,
         TRANSIENT_PROVIDER_CONTINUATION, ToolCallTracker, ToolCallTrackerError,
-        UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
+        ToolResultSpillHook, UNKNOWN_TOOL_OUTCOME, UNRESOLVED_TOOL_CALLS_ERROR, UsageLedger,
         append_attributed_tool_result, attributed_tool_result, charge_nonterminal_eof,
         completed_stream_delta, streamed_reasoning_text, warn_unknown_stream_item,
     };
@@ -2820,13 +3309,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_compaction_waits_for_the_complete_tool_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "compact-first",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::tool_call(
+                    "compact-second",
+                    CountingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response(usage(120, 8, 0, 0)),
+            ],
+            vec![
+                MockStreamEvent::text("must not start"),
+                MockStreamEvent::final_response(usage(140, 4, 0, 0)),
+            ],
+        ]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model.clone())
+                .tool(CountingTool(calls.clone()))
+                .default_max_turns(2)
+                .build(),
+            "run both tools".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut runner = paused.start_interactive();
+        let decision_tx = runner
+            .compaction_decision_tx
+            .take()
+            .expect("interactive runner exposes its boundary decision channel");
+        let mut result_ids = Vec::new();
+
+        let interactions = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runner.event_rx.recv().await.expect("runner boundary event") {
+                    crate::event::AgentEvent::UsageDelta {
+                        context_complete: true,
+                        ..
+                    } => decision_tx
+                        .send(super::CompactionBoundaryDecision::Compact)
+                        .await
+                        .expect("runner is waiting at the provider boundary"),
+                    crate::event::AgentEvent::ToolResult { id, .. } => {
+                        result_ids.push(id.to_string());
+                    }
+                    crate::event::AgentEvent::CompactionBoundary { interactions } => {
+                        break interactions;
+                    }
+                    crate::event::AgentEvent::Done { .. } => {
+                        panic!("compaction request must stop before the next model call")
+                    }
+                    crate::event::AgentEvent::Error(error) => {
+                        panic!("unexpected runner error: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("tool batch and compaction boundary must not deadlock");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result_ids.len(), 2);
+        assert_ne!(result_ids[0], result_ids[1]);
+        assert_eq!(model.requests().len(), 1, "no follow-up request may start");
+        assert_eq!(
+            tool_call_ids_of(&interactions),
+            ["compact-first", "compact-second"]
+        );
+        assert_eq!(
+            tool_result_ids_of(&interactions),
+            ["compact-first", "compact-second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_compaction_does_not_replace_a_terminal_text_response() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("finished"),
+            MockStreamEvent::final_response(usage(120, 8, 0, 0)),
+        ]]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model.clone()).build(),
+            "answer directly".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut runner = paused.start_interactive();
+        let decision_tx = runner
+            .compaction_decision_tx
+            .take()
+            .expect("interactive runner exposes its boundary decision channel");
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runner.event_rx.recv().await.expect("runner terminal event") {
+                    crate::event::AgentEvent::UsageDelta {
+                        context_complete: true,
+                        ..
+                    } => decision_tx
+                        .send(super::CompactionBoundaryDecision::Compact)
+                        .await
+                        .expect("runner is waiting for the pressure decision"),
+                    crate::event::AgentEvent::Done { response, .. } => break response,
+                    crate::event::AgentEvent::CompactionBoundary { .. } => {
+                        panic!("a text-only response has no tool-result boundary")
+                    }
+                    crate::event::AgentEvent::Error(error) => {
+                        panic!("unexpected runner error: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("terminal response must not deadlock behind compaction");
+
+        assert_eq!(response, "finished");
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_zero_usage_completion_never_waits_for_an_unpublished_decision() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("finished"),
+            MockStreamEvent::final_response(Usage::new()),
+        ]]);
+        let paused = super::spawn_agent_paused(
+            AgentBuilder::new(model).build(),
+            "answer without usage".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut runner = paused.start_interactive();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runner.event_rx.recv().await.expect("runner terminal event") {
+                    crate::event::AgentEvent::UsageDelta { .. } => {
+                        panic!("zero usage must not publish a decision request")
+                    }
+                    crate::event::AgentEvent::Done { response, .. } => break response,
+                    crate::event::AgentEvent::Error(error) => {
+                        panic!("unexpected runner error: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("zero-usage completion must not wait forever");
+
+        assert_eq!(response, "finished");
+    }
+
+    #[tokio::test]
     async fn context_length_stream_errors_include_compaction_guidance_on_both_surfaces() {
+        const CONTEXT_ERROR: &str =
+            "prompt is too long: 213500 tokens > 200000 maximum context length";
         let interactive_model =
             MockCompletionModel::from_stream_turns(vec![vec![MockStreamEvent::error(
-                "context_length_exceeded",
+                CONTEXT_ERROR,
             )]]);
         let mut runner = super::spawn_agent(
-            AgentBuilder::new(interactive_model).build(),
+            AgentBuilder::new(interactive_model.clone()).build(),
             "oversized prompt".to_string(),
             Vec::new(),
             crate::retry::RetryConfig::default(),
@@ -2842,18 +3509,22 @@ mod tests {
                 crate::event::AgentEvent::Done { .. } => {
                     panic!("context overflow must not produce interactive success")
                 }
+                crate::event::AgentEvent::Retrying { .. } => {
+                    panic!("context overflow must not enter the transient retry path")
+                }
                 _ => {}
             }
         };
-        assert!(interactive_error.contains("context_length_exceeded"));
+        assert!(interactive_error.contains(CONTEXT_ERROR));
         assert!(interactive_error.contains("/compress"));
         assert!(interactive_error.contains("compact_enabled = true"));
+        assert_eq!(interactive_model.requests().len(), 1);
 
         let headless_model =
             MockCompletionModel::from_stream_turns(vec![vec![MockStreamEvent::error(
-                "context_length_exceeded",
+                CONTEXT_ERROR,
             )]]);
-        let headless_agent = AgentBuilder::new(headless_model).build();
+        let headless_agent = AgentBuilder::new(headless_model.clone()).build();
         let headless_error = super::run_print(
             &headless_agent,
             "oversized prompt",
@@ -2867,9 +3538,10 @@ mod tests {
         .await
         .expect_err("context overflow must not produce headless success")
         .to_string();
-        assert!(headless_error.contains("context_length_exceeded"));
+        assert!(headless_error.contains(CONTEXT_ERROR));
         assert!(headless_error.contains("/compress"));
         assert!(headless_error.contains("compact_enabled = true"));
+        assert_eq!(headless_model.requests().len(), 1);
     }
 
     fn immediate_retry_config(max_attempts: usize) -> crate::retry::RetryConfig {
@@ -2878,6 +3550,44 @@ mod tests {
             initial_backoff_ms: 0,
             max_backoff_ms: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn interactive_initial_stream_uses_shared_retry_callback_for_events() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![MockStreamEvent::error("connection reset before first item")],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let mut runner = super::spawn_agent(
+            AgentBuilder::new(model.clone()).build(),
+            "start".to_string(),
+            Vec::new(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        assert!(matches!(
+            runner.event_rx.recv().await,
+            Some(crate::event::AgentEvent::Retrying { attempt: 1, max: 3 })
+        ));
+        loop {
+            match runner.event_rx.recv().await.expect("terminal event") {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    assert_eq!(response, "recovered");
+                    break;
+                }
+                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(model.requests().len(), 2);
     }
 
     #[tokio::test]
@@ -3103,6 +3813,109 @@ mod tests {
     struct CountingTool(Arc<AtomicUsize>);
 
     #[derive(Clone)]
+    struct BatchConcurrencyProbe {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    impl Tool for BatchConcurrencyProbe {
+        const NAME: &'static str = "batch_concurrency_probe";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Probe batched tool execution".to_owned()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.barrier.wait().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok("probed".to_owned())
+        }
+    }
+
+    #[derive(Clone)]
+    struct OversizedTool;
+
+    impl Tool for OversizedTool {
+        const NAME: &'static str = "oversized";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Return more text than may enter live model context".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(format!(
+                "{}{}{}",
+                "H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS),
+                "M".repeat(crate::session::TOOL_RESULT_SAVE_THRESHOLD),
+                "T".repeat(crate::session::TOOL_RESULT_TAIL_CHARS),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlwaysFailTool(Arc<AtomicUsize>);
+
+    impl Tool for AlwaysFailTool {
+        const NAME: &'static str = "always_fail";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Always fail after recording an invocation".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(MockToolError)
+        }
+    }
+
+    #[derive(Clone)]
+    struct EditProbeTool(Arc<AtomicUsize>);
+
+    impl Tool for EditProbeTool {
+        const NAME: &'static str = "edit";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Record a successful edit-shaped invocation".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("edited".to_string())
+        }
+    }
+
+    #[derive(Clone)]
     struct ScopedBlockingTool;
 
     impl Tool for ScopedBlockingTool {
@@ -3144,6 +3957,303 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("counted".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_result_is_spilled_before_the_next_model_call() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-live-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _environment = crate::tests::ScopedProcessEnv::set(&[
+            ("ZS_DATA_DIR", Some(root.clone().into_os_string())),
+            ("ZS_CONFIG_DIR", Some(root.clone().into_os_string())),
+            ("ZS_STATE_DIR", Some(root.clone().into_os_string())),
+        ]);
+
+        let mut session = crate::session::Session::new("test", "mock", 128_000, "");
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "oversized-provider-id",
+                    OversizedTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(OversizedTool)
+            .add_hook(ToolResultSpillHook::new(
+                session.id.clone(),
+                Some(session.tool_result_spills.clone()),
+            ))
+            .build();
+
+        let mut stream = agent
+            .stream_chat("start", Vec::<Message>::new())
+            .max_turns(2)
+            .await;
+        let mut streamed_result = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(MultiTurnStreamItem::StreamUserItem(
+                rig::streaming::StreamedUserContent::ToolResult { tool_result, .. },
+            )) = item
+            {
+                streamed_result = Some(tool_result);
+            }
+        }
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let live_output = requests[1]
+            .chat_history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|content| match content {
+                    UserContent::ToolResult(result) => {
+                        result.content.iter().find_map(|content| match content {
+                            ToolResultContent::Text(text) => Some(text.text.as_str()),
+                            ToolResultContent::Image(_) => None,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the next request must contain the bounded tool result");
+        assert!(live_output.chars().count() < crate::session::TOOL_RESULT_SAVE_THRESHOLD);
+        assert!(live_output.starts_with(&"H".repeat(crate::session::TOOL_RESULT_HEAD_CHARS)));
+        assert!(live_output.ends_with(&"T".repeat(crate::session::TOOL_RESULT_TAIL_CHARS)));
+        assert!(live_output.contains("[tool output truncated:"));
+        assert!(!live_output.contains(&"M".repeat(80)));
+
+        let streamed_result = streamed_result.expect("stream surfaces the rewritten result");
+        session.add_tool_result_with_id(&streamed_result.id, OversizedTool::NAME, live_output);
+        let Some(crate::session::PersistedToolMessage::Result {
+            artifact_path: Some(path),
+            ..
+        }) = &session.messages[0].tool
+        else {
+            panic!("persistence must receive the pre-model artifact out of band")
+        };
+        let full_output = std::fs::read_to_string(path.as_str()).unwrap();
+        assert!(full_output.contains(&"M".repeat(80)));
+
+        drop(_environment);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn tool_result_texts(interactions: &[Message]) -> Vec<&str> {
+        interactions
+            .iter()
+            .flat_map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|item| match item {
+                        UserContent::ToolResult(result) => {
+                            result.content.iter().find_map(|part| match part {
+                                ToolResultContent::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_loop_fingerprint_canonicalizes_json_but_keeps_tool_identity() {
+        let first = super::tool_call_fingerprint("edit", r#"{"path":"a","line":1}"#);
+        let reordered = super::tool_call_fingerprint("edit", r#"{ "line": 1, "path": "a" }"#);
+        let other_tool = super::tool_call_fingerprint("write", r#"{"line":1,"path":"a"}"#);
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, other_tool);
+    }
+
+    #[tokio::test]
+    async fn third_identical_failure_is_corrected_and_later_call_is_not_executed() {
+        let args = serde_json::json!({"path": "missing.rs"});
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call("failure-1", AlwaysFailTool::NAME, args.clone()),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("failure-2", AlwaysFailTool::NAME, args.clone()),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("failure-3", AlwaysFailTool::NAME, args.clone()),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call("failure-4", AlwaysFailTool::NAME, args),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("changed approach"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model.clone())
+            .tool(AlwaysFailTool(executions.clone()))
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(5)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "try the tool".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        let mut loop_events = Vec::new();
+        let interactions = loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::ToolLoop { name, message } => {
+                    assert_eq!(name, AlwaysFailTool::NAME);
+                    loop_events.push(message);
+                }
+                crate::event::AgentEvent::Done {
+                    response,
+                    interactions,
+                } => {
+                    assert_eq!(response, "changed approach");
+                    break interactions;
+                }
+                crate::event::AgentEvent::Error(error) => {
+                    panic!("loop correction should recover: {error}")
+                }
+                _ => {}
+            }
+        };
+
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
+        assert_eq!(model.requests().len(), 5);
+        assert_eq!(loop_events.len(), 2);
+        assert!(loop_events[0].contains("failed 3 times"));
+        assert!(loop_events[1].contains("was not executed again"));
+        let results = tool_result_texts(&interactions);
+        assert_eq!(results.len(), 4);
+        assert!(results[2].starts_with(super::TOOL_LOOP_NOTICE_PREFIX));
+        assert!(results[3].starts_with(super::TOOL_LOOP_NOTICE_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn identical_successes_are_not_misclassified_as_a_failure_loop() {
+        let args = serde_json::json!({"value": 1});
+        let mut turns = Vec::new();
+        for index in 0..4 {
+            turns.push(vec![
+                MockStreamEvent::tool_call(
+                    format!("success-{index}"),
+                    CountingTool::NAME,
+                    args.clone(),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        turns.push(vec![
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model)
+            .tool(CountingTool(executions.clone()))
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(5)
+            .build();
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "count repeatedly",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("successful identical calls should not be blocked");
+
+        assert_eq!(response, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
+        assert!(
+            tool_result_texts(&interactions)
+                .iter()
+                .all(|result| !result.starts_with(super::TOOL_LOOP_NOTICE_PREFIX))
+        );
+    }
+
+    #[tokio::test]
+    async fn sixth_alternating_edit_is_skipped_on_the_headless_surface() {
+        let first = serde_json::json!({"path": "demo.rs", "old": "a", "new": "b"});
+        let second = serde_json::json!({"path": "demo.rs", "old": "b", "new": "a"});
+        let mut turns = Vec::new();
+        for (index, args) in [
+            first.clone(),
+            second.clone(),
+            first.clone(),
+            second.clone(),
+            first,
+            second,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            turns.push(vec![
+                MockStreamEvent::tool_call(format!("edit-{index}"), EditProbeTool::NAME, args),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]);
+        }
+        turns.push(vec![
+            MockStreamEvent::text("stopped oscillating"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]);
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model)
+            .tool(EditProbeTool(executions.clone()))
+            .add_hook(super::ToolLoopGuard)
+            .default_max_turns(7)
+            .build();
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "edit the file",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("alternating edit correction should let the model recover");
+
+        assert_eq!(response, "stopped oscillating");
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
+        let results = tool_result_texts(&interactions);
+        assert_eq!(results.len(), 6);
+        assert!(results[5].contains("sixth alternating A/B edit"));
     }
 
     #[cfg(unix)]
@@ -3240,7 +4350,7 @@ mod tests {
         let mut runner = super::spawn_agent_with_start_mode(
             agent,
             "change the workspace".to_string(),
-            Vec::new(),
+            Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,
             RunnerStreamPolicy::default(),
@@ -3324,7 +4434,7 @@ mod tests {
         let mut runner = super::spawn_agent_with_start_mode(
             agent,
             "change the workspace".to_string(),
-            Vec::new(),
+            Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,
             RunnerStreamPolicy::default(),
@@ -3403,6 +4513,7 @@ mod tests {
             &agent,
             "change the workspace",
             false,
+            true,
             &crate::retry::RetryConfig::default(),
             None,
             Vec::new(),
@@ -3502,7 +4613,7 @@ mod tests {
         let paused = super::spawn_agent_paused_in_scope(
             agent,
             "invoke the blocking tool".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,
             #[cfg(feature = "skills")]
@@ -3625,7 +4736,7 @@ mod tests {
         let paused = super::spawn_agent_paused_in_scope(
             agent,
             "invoke blocking tool".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             crate::retry::RetryConfig::default(),
             None,
             #[cfg(feature = "skills")]
@@ -4036,6 +5147,65 @@ mod tests {
         assert_eq!(tool_call_ids, ["batch-first", "batch-second"]);
         assert_eq!(tool_result_ids, tool_call_ids);
         assert_eq!(interactions.last(), Some(&Message::assistant("finished")));
+    }
+
+    #[tokio::test]
+    async fn interactive_runner_enables_concurrent_tool_batches() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "parallel-first",
+                    BatchConcurrencyProbe::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::tool_call(
+                    "parallel-second",
+                    BatchConcurrencyProbe::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::new(model)
+            .tool(BatchConcurrencyProbe {
+                active: Arc::new(AtomicUsize::new(0)),
+                maximum: Arc::clone(&maximum),
+                barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            })
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "run both".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match runner.event_rx.recv().await {
+                    Some(crate::event::AgentEvent::Done { .. }) => break,
+                    Some(crate::event::AgentEvent::Error(error)) => {
+                        panic!("parallel batch failed: {error}")
+                    }
+                    Some(_) => {}
+                    None => panic!("parallel batch ended without Done"),
+                }
+            }
+        })
+        .await
+        .expect("a sequential runner would deadlock at the two-party barrier");
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -5263,6 +6433,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_streamed_text_with_empty_aggregate_completes_without_retry() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("streamed answer"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let mut runner = super::spawn_agent(
+            AgentBuilder::new(model.clone()).build(),
+            "start".to_string(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    assert_eq!(response.as_str(), "streamed answer");
+                    break;
+                }
+                crate::event::AgentEvent::Retrying { .. } => {
+                    panic!("streamed text must not trigger empty-response retry")
+                }
+                crate::event::AgentEvent::Error(error) => {
+                    panic!("streamed text must complete successfully: {error}")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn runner_zero_turn_budget_starts_no_provider_calls_on_both_surfaces() {
         let interactive_model = MockCompletionModel::from_stream_turns(vec![vec![
             MockStreamEvent::text("must not run"),
@@ -6144,11 +7350,13 @@ mod tests {
                 crate::event::AgentEvent::UsageDelta {
                     usage: delta,
                     context_complete,
+                    awaits_compaction_decision,
                 } => {
                     assert!(
                         context_complete,
                         "completion-call deltas are complete snapshots"
                     );
+                    assert!(awaits_compaction_decision);
                     interactive_usage += Usage::from(delta);
                     delta_count += 1;
                 }
@@ -6221,11 +7429,13 @@ mod tests {
                 crate::event::AgentEvent::UsageDelta {
                     usage: delta,
                     context_complete,
+                    awaits_compaction_decision,
                 } => {
                     assert!(
                         context_complete,
                         "final-only usage is a complete fallback snapshot"
                     );
+                    assert!(!awaits_compaction_decision);
                     deltas.push(Usage::from(delta));
                 }
                 crate::event::AgentEvent::Done { response, .. } => {

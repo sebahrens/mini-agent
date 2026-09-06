@@ -114,6 +114,7 @@ pub fn handle_file_key(
 
 pub struct CommandPickerCtx<'a> {
     pub prompt_names: &'a [String],
+    pub agent_names: &'a [String],
     pub theme_names: &'a [String],
     pub quick_model_names: &'a [String],
     pub live_model_names: &'a [String],
@@ -240,6 +241,13 @@ pub fn handle_command_key(
                     pp.set_items(ctx.prompt_names.to_vec());
                     pp.activate();
                     return (true, Some(Picker::Prefixed(pp, "/prompt ")));
+                }
+                if selected == "/agent" && !ctx.agent_names.is_empty() {
+                    picker.deactivate();
+                    let mut ap = ListPicker::new();
+                    ap.set_items(ctx.agent_names.to_vec());
+                    ap.activate();
+                    return (true, Some(Picker::Prefixed(ap, "/agent ")));
                 }
                 if selected == "/models"
                     && !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty())

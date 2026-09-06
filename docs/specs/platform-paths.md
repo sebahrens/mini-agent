@@ -211,7 +211,10 @@ Archive validation is fail-closed:
 
 `allowed-tools` is experimental metadata. Importing it never grants permission. Existing session
 policy, host capability manifests, sandboxing, and MCP permission checks remain authoritative.
-Bundled `scripts/*.js` are Agent Skill resources, not learned JS exports: they are not injected into
+`learned-js` may contain at most 32 unique full SHA-256 identities. Import resolves them against
+separately verified identity-v2 rows before publishing the Agent Skill tree, while selection binds
+only revisions that remain active. The reference cannot approve or activate a revision. Bundled
+`scripts/*.js` are Agent Skill resources, not learned JS exports: they are not injected into
 QuickJS or admitted to the self-learning library unless separately proposed and verified through
 Phases 3–5.
 

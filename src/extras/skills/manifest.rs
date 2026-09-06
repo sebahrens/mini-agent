@@ -11,6 +11,10 @@ pub struct AgentSkillManifest {
     pub metadata: BTreeMap<String, String>,
     /// Preserved for interoperability only. This never grants a capability.
     pub allowed_tools: Option<String>,
+    /// Exact immutable learned-JS identities associated with this instruction package.
+    ///
+    /// These references never activate, approve, or otherwise widen a learned skill.
+    pub learned_js: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +33,8 @@ pub enum ManifestError {
     InvalidDescription,
     #[error("skill compatibility must contain 1-500 characters when present")]
     InvalidCompatibility,
+    #[error("learned-js must contain at most 32 unique full lowercase SHA-256 identities")]
+    InvalidLearnedJs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +48,8 @@ struct RawManifest {
     metadata: BTreeMap<String, String>,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<String>,
+    #[serde(default, rename = "learned-js")]
+    learned_js: Vec<String>,
 }
 
 pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, ManifestError> {
@@ -59,6 +67,18 @@ pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, M
     {
         return Err(ManifestError::InvalidCompatibility);
     }
+    if raw.learned_js.len() > 32
+        || raw.learned_js.iter().any(|id| !is_full_sha256(id))
+        || raw.learned_js.windows(2).any(|ids| ids[0] == ids[1])
+        || {
+            let mut sorted = raw.learned_js.clone();
+            sorted.sort();
+            sorted.dedup();
+            sorted.len() != raw.learned_js.len()
+        }
+    {
+        return Err(ManifestError::InvalidLearnedJs);
+    }
     Ok(AgentSkillManifest {
         name: raw.name,
         description: raw.description,
@@ -66,7 +86,15 @@ pub(super) fn parse_skill_markdown(bytes: &[u8]) -> Result<AgentSkillManifest, M
         compatibility: raw.compatibility,
         metadata: raw.metadata,
         allowed_tools: raw.allowed_tools,
+        learned_js: raw.learned_js,
     })
+}
+
+fn is_full_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn frontmatter(text: &str) -> Result<&str, ManifestError> {
@@ -141,5 +169,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.name, "portable");
+    }
+
+    #[test]
+    fn agent_skill_manifest_accepts_bounded_exact_learned_js_identities() {
+        let first = "a".repeat(64);
+        let second = "0123456789abcdef".repeat(4);
+        let markdown = format!(
+            "---\nname: portable\ndescription: Associates verified capabilities.\nlearned-js:\n  - {first}\n  - {second}\n---\nBody\n"
+        );
+        let manifest = parse_skill_markdown(markdown.as_bytes()).unwrap();
+        assert_eq!(manifest.learned_js, vec![first, second]);
+    }
+
+    #[test]
+    fn agent_skill_manifest_rejects_invalid_or_duplicate_learned_js_identities() {
+        for learned_js in [
+            "learned-js: [short]".to_string(),
+            format!("learned-js: [{}]", "A".repeat(64)),
+            format!("learned-js: [{0}, {0}]", "a".repeat(64)),
+        ] {
+            let markdown = format!(
+                "---\nname: portable\ndescription: Associates verified capabilities.\n{learned_js}\n---\nBody\n"
+            );
+            assert!(matches!(
+                parse_skill_markdown(markdown.as_bytes()),
+                Err(ManifestError::InvalidLearnedJs)
+            ));
+        }
     }
 }

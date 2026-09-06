@@ -183,6 +183,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | ---- | ------ |
 | `-p <msg>` | Sends a message |
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
+| `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
 | `-c` | Continues from last open session |
 | `-r`, `--resume` | List recent sessions for selection. |
 | `--name <name>` | Set a name for the new session |
@@ -206,6 +207,26 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--wt-auto-merge`, `--wt-base-dir <path>` | Configure worktree merge-on-exit and its base directory. |
 | `--status-socket <path>` | Send start/stop status messages to a Unix socket. |
 | `--load-prompt <prompt>` | Use a specific prompt |
+
+`-p --output json` reserves stdout for exactly one JSON object after a successful run:
+
+```json
+{"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
+```
+
+`files_changed` combines workspace paths whose bounded Git status changed during the invocation
+with `write` and `edit` targets visible in the provider transcript. It is empty when no
+change can be observed (for example, a non-Git workspace changed only by an opaque shell command).
+`cost` is the estimated cost of this invocation in US dollars using the resolved model prices; it
+is zero when prices are unavailable. Status and diagnostic messages remain on stderr so scripts can
+parse stdout directly. Headless runs use a non-interactive prompt: the agent states reasonable
+assumptions and proceeds within its granted authority instead of waiting for clarification.
+
+During every user turn, mini-agent also detects repetitive tool loops. The third identical failed
+call is replaced with corrective feedback, later calls with the same tool and arguments are skipped
+before execution, and a sixth alternating A/B edit is stopped before it can undo the prior edit
+again. Interactive sessions show a yellow `loop guard` event; headless and subagent runs receive the
+same corrective tool result. These attempts still consume the configured model-turn budget.
 
 Offline policy probes—`--config-preservation-check`,
 `--project-config-trust-check`, `--js-runtime-check`,
@@ -238,6 +259,18 @@ a cached minimal LPAC/Job production attestation. Other macOS majors remain unav
 There is no in-parent or uncontained fallback. The `mini-agent-lite-*` release archives
 are built with `--no-default-features` and omit JS and other default features
 — use those only when you need a minimal binary without the JS runtime.
+
+Each `js` call gets a fresh strict-mode runtime—variables and imports do not persist—and may use
+top-level `await` even though the brokered host globals are synchronous. The tool description lists
+their exact signatures and examples. Current per-call limits are 30 seconds, a 64 MiB JavaScript
+heap, a 512 KiB JavaScript stack, a 64 KiB result, 256 effects, 1 MiB per file read/write, and 256
+console records capped at 8 KiB each and 256 KiB total. Fetch request bodies are POST-only and
+capped at 256 KiB; fetch responses and each spawn output stream are capped at 1 MiB. Use `read` or
+`grep` for direct lookup and the shell for repository toolchains; use `js` to combine bounded reads
+with parsing or aggregation in one call. Return strings, primitives, or accessor-free plain JSON
+objects/arrays. For Date, Map, Set, class instances, accessors, sparse arrays, or objects containing
+`undefined` or non-finite numbers, return `JSON.stringify(value)` (or another explicit string) so
+result conversion stays predictable and does not implicitly execute object hooks.
 
 On Windows, ordinary startup and `--print-config` evaluate worker status only when the `js` tool is
 eligible. `--no-tools` and allowlists that omit `js` skip the worker check and learned-skill startup.

@@ -20,6 +20,17 @@ prompt. Multiple prompts use **bounded parallelism**. Each subagent has access
 only to read tools and returns a summary of findings, which the main agent then
 incorporates into its response.
 
+With the `skills` feature, each child also receives an isolated Agent Skill
+retrieval context and the read-only `skills_search` discovery tool. Immutable
+indexes are shared, but turn state and locks are not, so parallel children
+cannot replace the parent or one another's selected context. When the `js`
+feature is enabled, the main JS tool is eligible, and the worker containment
+preflight succeeds, each child also receives a read-only `js` realm. Its only
+brokered effect globals are `read_file`, `list_dir`, and `grep`; the parent
+issues only read authority. Child retrieval may bind active pure learned-JS
+exports, but read-only or side-effecting skills and canary substitutions are
+excluded.
+
 ## Feature Gate
 
 Subagents are gated by the `subagents` Cargo feature and are included in the
@@ -42,8 +53,32 @@ The main agent has a new tool called `task`. It accepts:
 }
 ```
 
+For work with explicit scope or deliverables, prefer structured briefs:
+
+```json
+{
+  "briefs": [
+    {
+      "objective": "Audit authentication for session-fixation paths",
+      "files": ["src/auth.rs", "src/session.rs"],
+      "constraints": ["read only", "report only source-backed findings"],
+      "expected_sections": ["attack path", "existing mitigations", "missing tests"]
+    }
+  ],
+  "agent_type": "rust-security-review"
+}
+```
+
+`prompts` and `briefs` are mutually exclusive. Brief fields are rendered into
+a bounded, labelled child handoff; embedded newlines remain JSON-escaped so a
+field value cannot forge another handoff heading. `files` are scope hints, not
+permission grants. `constraints` bound the investigation, while
+`expected_sections` name content that belongs inside the host-required return
+sections rather than replacing them. Each list is limited to 64 non-empty
+items, each item to 8 KiB, and the complete rendered brief to 64 KiB.
+
 - **Single prompt**: one subagent explores, returns findings.
-- **Multiple prompts**: up to `task_max_concurrency` subagents run at once.
+- **Multiple prompts or briefs**: up to `task_max_concurrency` subagents run at once.
   Each result appears under a `## Task N:` heading in original prompt order.
 - The complete request is rejected before permission checking or execution if
   it is empty, contains a blank prompt, or exceeds `task_max_prompts`.
@@ -101,35 +136,121 @@ data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
+A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
+same-named definition, this file replaces nothing: the host appends it under a
+`## Project notes` boundary to every resolved persona after overrides have
+been selected. The shared file is limited to 64 KiB and each combined persona
+remains under the 256 KiB prompt cap. Its exact path is included in permission
+and result provenance. Invalid, empty, unreadable, or oversized notes are
+ignored with a warning and a visible task-result notice.
+
 Project definitions participate only when the exact current
 `.zerostack/config.toml` is bound in the private project-config trust store.
-An untrusted checkout cannot add or replace agent types; resolution falls back
-to user-global or compiled-in definitions. Changing the project config content
-or copying the checkout invalidates that content-and-path-bound trust.
+Project notes use the same gate. An untrusted checkout cannot add, replace, or
+extend agent types; resolution falls back to user-global or compiled-in
+definitions. Changing the project config content or copying the checkout
+invalidates that content-and-path-bound trust.
 
-The task permission prompt identifies both the requested `agent_type` and its
-resolved source without embedding the specialist prompt body. When a trusted
+Before reading a persona file, the task permission prompt identifies the
+requested `agent_type` and the highest-precedence source path that would be
+loaded, without embedding or parsing the specialist prompt body. Once approved,
+the resolved provider/model, effort tier, and tool subset are applied. When a trusted
 project definition wins, the host also prefixes the task result with its
 `.zerostack/agents/<name>.md` source. This makes a repository-controlled
 replacement visible to the calling agent instead of silently presenting it as
-the compiled-in specialist.
+the compiled-in specialist. `SubagentStart` and `SubagentStop` hook envelopes
+carry that resolved `agent_type` and definition source; unspecialized children
+use `explore` and the compiled-in explorer source. The TUI also renders a
+specialist-start line containing the same type and source before nested child
+tool activity.
 
 The filename stem is the `agent_type` value and must be 1–64 lowercase ASCII
 letters, digits, or hyphens, without leading, trailing, or repeated hyphens.
-An optional YAML frontmatter block may declare a matching `name`; the block is
-validated and removed before the prompt is installed. Malformed metadata,
-mismatched names, and empty prompt bodies are ignored silently and the
-compiled-in definition of the same name is used instead (mini-agent-cflr). The
-`agent_type` schema field is a plain string: the installed definitions are
-resolved dynamically when a call is validated, and the valid names are listed
-only in the error returned for an unknown name. The schema does not enumerate
-them yet (mini-agent-kh1o). Frontmatter keys other than `name` (for example
-`tools:` or `model:`) are ignored (mini-agent-6khf).
+An optional YAML frontmatter block may configure the persona:
+
+```yaml
+---
+name: rust-review
+description: Focused Rust API and test review
+tools: [Read, Grep, Glob]
+model: fast-review
+effort: medium
+mode: review
+---
+```
+
+- `description` is the bounded (160-character) summary shown in the task
+  tool's `agent_type` schema. Without it, the first prompt paragraph is used.
+- `tools` narrows the installed child tools. It accepts a YAML list or a
+  comma-separated string. Canonical names are `read`, `grep`, `find_files`,
+  `list_dir`, `js` when JS support is compiled, and `skills_search` when skills support is compiled, plus
+  `memory_read` and `memory_search` when memory support is compiled.
+  Claude-style `Read`, `Grep`, and `Glob` spellings are accepted.
+  Empty lists create a tool-free child; mutating or unknown tools reject the
+  definition rather than widening authority.
+- `model` is first resolved as a configured quick-model alias, including its
+  provider and `extra_body`. Otherwise it is a raw model ID on the current
+  subagent provider. A provider switch that cannot authenticate fails the task
+  explicitly rather than falling back to another model.
+- `effort` is `low`, `medium`, or `high`. It selects one-third, two-thirds, or
+  all of the configured `task_max_turns`, rounded up, and can never widen that
+  global cap.
+- `mode` remains the prompt default used when the persona is selected for the
+  main loop through `/agent`. Child-only `tools`, `model`, and `effort`
+  settings do not alter main-loop authority.
+
+The block is validated and removed before the prompt is installed. Malformed
+metadata, mismatched names, empty prompt bodies, invalid UTF-8, and oversized
+files are rejected. The loader emits a warning naming the file and reason. If the
+rejected user or trusted-project file has the same valid stem as an available
+lower-priority persona, the task result is prefixed with a
+`[specialist source: ... definition ignored: ...]` notice and identifies the
+fallback source. The loader reads at most 256 KiB plus one sentinel byte from
+each user or project definition, including when project files are opened
+through the captured workspace capability.
+
+The `agent_type` schema is generated when the task tool is built. Its enum lists
+the definitions resolved for the active workspace, and its description gives a
+bounded one-line summary from `description` or, when absent, each persona's
+first paragraph. Unknown names are still rejected with the current valid-name
+list. Unknown frontmatter keys are ignored for forward compatibility, logged,
+and surfaced in the task result so typos cannot silently change behavior.
+
+The same resolved definitions can specialize the main loop. `/agent` lists
+them, `/agent <name>` activates one, and `/agent default` clears it. Prompt
+modes may select a persona with `%%agent=<name>`; persona frontmatter may select
+a default prompt with `mode: <prompt-name>`. One-shot dot/review transitions
+snapshot and restore both halves so a temporary mode cannot leak its persona
+into the following turn. Project definitions and project prompt directives
+participate only after the existing project-config trust check succeeds.
 
 The host appends the repository-as-untrusted, prompt-injection reporting,
 honest-unknowns, read-only, and no-shell rules after the specialization,
-architecture context, and user suffix. The specialization may override general
-investigation defaults, but never those host rules (mini-agent-yb9w).
+already-loaded architecture context, and user suffix. A specialization supplies
+domain heuristics and its return contract, but the delegated objective remains
+authoritative for scope: persona checklists do not mandate a whole-repository
+audit. Neither the specialization nor any configurable context can override the
+host rules (mini-agent-yb9w).
+
+Every successful child response is required to use this host-owned structure:
+
+```markdown
+## Findings
+- [confidence: high|medium|low] Evidence-backed finding or explicit no-finding statement.
+
+## Unverified
+- Missing evidence, caller-run checks, or None.
+
+## Coverage
+- Covered: files, paths, and checks actually inspected.
+- Skipped: relevant scope not inspected and why, or None.
+```
+
+The host checks the section order, confidence label, and both coverage entries.
+If a model returns unstructured text, mini-agent retains it under `Raw child
+response` but wraps it in a machine-checkable partial report with low
+confidence. This keeps malformed output useful without letting it masquerade as
+a complete specialist report.
 
 ## What the Subagent Can Do
 
@@ -141,6 +262,16 @@ investigation defaults, but never those host rules (mini-agent-yb9w).
 | `grep`     | Regex search in files         |
 | `find_files` | Find files by glob pattern |
 | `list_dir` | List directory contents       |
+
+### Read-only JavaScript (when `js` is enabled and contained)
+
+The child `js` tool supports local computation plus exactly three brokered
+effects: `read_file`, `list_dir`, and `grep`. `write_file`, `fetch`, `spawn`,
+`scratch_put`, `scratch_get`, `result`, `read_files`, `glob`, and
+`propose_skill` are absent from the realm. The parent broker independently
+limits the invocation grant to `read_file`, so a malformed or compromised
+worker cannot obtain mutation, network, process, or session-state authority.
+Only active pure learned-JS exports can be installed in this realm.
 
 ### Memory tools (when `memory` feature is enabled)
 
@@ -172,8 +303,10 @@ same path-containment and approval rules as the parent:
   through the parent approval channel, exactly as they would be for the main
   agent.
 - **No mutation tools**: the child has no `write`, `edit`, `bash`, or
-  `mcp_tool`, so it cannot modify files, run shell commands, or reach external
-  MCP servers regardless of permissions.
+  `mcp_tool`. Its optional JS realm has no writer, network, process, or
+  session-state globals and its broker grant contains only read authority, so
+  it cannot modify files, run commands, or reach external services regardless
+  of permissions.
 - **No memory writes**: `memory_write` and `memory_edit` are deliberately
   absent; a subagent can only read persistent memory.
 - **No nested tasks**: `task` itself is not registered for child agents, so
@@ -193,7 +326,7 @@ normal TOML/YAML/JSON zerostack configuration described in
 | `task_max_concurrency`      | `usize`  | `4`                      | Max simultaneously running children |
 | `task_max_output_bytes`     | `usize`  | `262144` (256 KiB)       | Hard cap on the complete returned tool output |
 | `task_max_cost_units`       | `u64`    | `500000`                 | Aggregate provider token/cost-unit budget |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline. A fixed 300 s per-child cap also applies and is not configurable (mini-agent-166x) |
+| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline; completed sibling results are retained when it expires |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
 | `subagent_model`            | `string` | `none (uses main model)` | Model name or quick-model alias |
 | `subagent_provider`         | `string` | (same as main)           | Provider for the subagent (optional) |
@@ -202,9 +335,11 @@ All numeric task limits must be greater than zero.
 `task_max_output_bytes` must be at least 256, leaving room for an explicit
 partial-status header, and `task_timeout_secs` cannot exceed 86400 (24 hours).
 Cost units use the provider-reported aggregate token usage when present.
-Because provider usage shapes differ, cached and cache-creation input are
-conservatively included. If a provider reports no usage, the task tool falls
-back to a text-size estimate so unknown usage is not treated as free.
+Cache-read input is charged at one tenth of its reported token count (rounded
+up, so a non-empty hit is never free); cache-creation input remains fully
+charged. If a provider omits the aggregate total, itemized usage is used. If it
+reports no usage at all, the task tool falls back to a text-size estimate so
+unknown usage is not treated as free.
 
 ### Model resolution (in order of precedence)
 
@@ -233,16 +368,22 @@ subagent_provider = "openrouter"
 
 ## Known limits and planned changes (2026-09-05 review)
 
-- `SubagentStart`/`SubagentStop` hooks receive the fixed agent type `explore` regardless of
-  `agent_type` (mini-agent-abys).
-- The child receives only the prompt string: no conversation history, files, or constraints,
-  and it returns free text. Planned: a structured brief (`objective`, `files`, `constraints`,
-  `expected_sections`) and a host-checked return skeleton (Findings, Unverified, Coverage)
-  (mini-agent-nfd7, mini-agent-sux9).
-- Planned: per-persona `model`, `tools` subset, and `description` frontmatter
-  (mini-agent-6khf); persona names in the schema enum and in the orchestrator prompt
-  (mini-agent-kh1o); trust-gated project definitions (mini-agent-yb9w); an append-only project
-  notes layer so embedded personas can stay generic (mini-agent-7hjo).
+- The child still receives no conversation history. Callers can provide a
+  structured brief (`objective`, `files`, `constraints`, `expected_sections`),
+  and every successful return is checked against the Findings, Unverified, and
+  Coverage skeleton (mini-agent-nfd7, mini-agent-sux9).
+- Persona names are present in the schema enum and orchestrator prompt
+  (mini-agent-kh1o), project definitions are trust-gated (mini-agent-yb9w),
+  frontmatter controls per-persona descriptions, models, effort, and read-only
+  tool subsets (mini-agent-6khf), and trusted `.notes.md` content extends
+  generic embedded personas without replacing them (mini-agent-7hjo).
+
+The scheduled deterministic harness also runs one compact fixture case for
+every shipped persona. Each case resolves the production persona, passes a
+structured response through the production task scheduler, and checks its
+expected finding plus the host response contract. The fixture lives at
+`tests/harness_eval/personas/fixture.json`; see
+[HARNESS_EVAL.md](HARNESS_EVAL.md).
 
 See [the review plan](../plans/2026-09-05-001-harness-design-review.md) for the full list.
 
@@ -250,6 +391,7 @@ See [the review plan](../plans/2026-09-05-001-harness-design-review.md) for the 
 
 | Command                            | Description                                |
 |------------------------------------|--------------------------------------------|
+| `/agent [name]`                    | Show or switch the main-agent persona      |
 | `/model-subagent [name]`           | Show or switch the subagent's model        |
 | `/models-subagent [name]`          | List quick models or switch subagent to one|
 

@@ -38,6 +38,7 @@ pub(crate) enum AuditCapability {
     WriteFile,
     Fetch,
     Spawn,
+    SessionState,
     ProposeSkill,
 }
 
@@ -48,6 +49,7 @@ impl AuditCapability {
             Self::WriteFile => "write_file",
             Self::Fetch => "fetch",
             Self::Spawn => "spawn",
+            Self::SessionState => "session_state",
             Self::ProposeSkill => "propose_skill",
         }
     }
@@ -124,6 +126,12 @@ enum SanitizedTargetKind {
         key_version: u16,
         executable_tag: String,
     },
+    SessionState {
+        key_version: u16,
+        operation: String,
+        key_tag: Option<String>,
+        encoded_bytes: u64,
+    },
     Proposal,
 }
 
@@ -190,6 +198,24 @@ impl SanitizedTarget {
             kind: SanitizedTargetKind::Spawn {
                 key_version: TARGET_KEY_VERSION,
                 executable_tag: target_tag(key, "spawn", "resolved_executable", program.as_bytes()),
+            },
+        }
+    }
+
+    fn session_state(
+        key: &[u8; TARGET_KEY_BYTES],
+        operation: &str,
+        scratch_key: Option<&str>,
+        encoded_bytes: usize,
+    ) -> Self {
+        Self {
+            kind: SanitizedTargetKind::SessionState {
+                key_version: TARGET_KEY_VERSION,
+                operation: operation.to_string(),
+                key_tag: scratch_key.map(|scratch_key| {
+                    target_tag(key, operation, "scratch_key", scratch_key.as_bytes())
+                }),
+                encoded_bytes: u64::try_from(encoded_bytes).unwrap_or(u64::MAX),
             },
         }
     }
@@ -661,6 +687,15 @@ impl EffectAudit {
         SanitizedTarget::file(&self.target_key, "read_file", canonical_path)
     }
 
+    pub(crate) fn read_files_target(&self, canonical_paths: &[String]) -> SanitizedTarget {
+        let mut aggregate = String::from("read_files");
+        for path in canonical_paths {
+            aggregate.push('\0');
+            aggregate.push_str(path);
+        }
+        SanitizedTarget::file(&self.target_key, "read_files", &aggregate)
+    }
+
     pub(crate) fn write_file_target(&self, canonical_path: &str) -> SanitizedTarget {
         SanitizedTarget::file(&self.target_key, "write_file", canonical_path)
     }
@@ -675,6 +710,15 @@ impl EffectAudit {
 
     pub(crate) fn spawn_target(&self, resolved_executable: &str) -> SanitizedTarget {
         SanitizedTarget::spawn(&self.target_key, resolved_executable)
+    }
+
+    pub(crate) fn session_state_target(
+        &self,
+        operation: &str,
+        key: Option<&str>,
+        encoded_bytes: usize,
+    ) -> SanitizedTarget {
+        SanitizedTarget::session_state(&self.target_key, operation, key, encoded_bytes)
     }
 
     pub(crate) const fn proposal_target(&self) -> SanitizedTarget {
@@ -1044,7 +1088,7 @@ fn validate_effect_body(body: &EffectBody) -> Result<(), AuditError> {
     validate_optional_identifier(body.export.as_deref())?;
     if !matches!(
         body.capability.as_str(),
-        "read_file" | "write_file" | "fetch" | "spawn" | "propose_skill"
+        "read_file" | "write_file" | "fetch" | "spawn" | "session_state" | "propose_skill"
     ) {
         return Err(AuditError::InvalidMetadata);
     }
@@ -1129,6 +1173,32 @@ fn validate_target(capability: &str, target: &SanitizedTarget) -> Result<(), Aud
             },
             "spawn",
         ) if *key_version == TARGET_KEY_VERSION && valid_hash(executable_tag) => Ok(()),
+        (
+            SanitizedTargetKind::SessionState {
+                key_version,
+                operation,
+                key_tag,
+                encoded_bytes,
+            },
+            "session_state",
+        ) if *key_version == TARGET_KEY_VERSION
+            && matches!(operation.as_str(), "result" | "scratch_put" | "scratch_get")
+            && key_tag.as_ref().is_none_or(|tag| valid_hash(tag))
+            && match operation.as_str() {
+                "result" => {
+                    key_tag.is_none()
+                        && *encoded_bytes <= super::session::STRUCTURED_RESULT_MAX_BYTES as u64
+                }
+                "scratch_put" => {
+                    key_tag.is_some()
+                        && *encoded_bytes <= super::session::SCRATCH_VALUE_MAX_BYTES as u64
+                }
+                "scratch_get" => key_tag.is_some() && *encoded_bytes == 0,
+                _ => false,
+            } =>
+        {
+            Ok(())
+        }
         (SanitizedTargetKind::Proposal, "propose_skill") => Ok(()),
         _ => Err(AuditError::InvalidMetadata),
     }

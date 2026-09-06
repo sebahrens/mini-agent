@@ -94,8 +94,9 @@ pub(crate) async fn run_headless_loop(
             .run_print(
                 &iteration_prompt,
                 cli.pure_stdout,
+                true,
                 &cfg.retry,
-                iteration_history(session),
+                iteration_history(session, cfg),
                 #[cfg(feature = "hooks")]
                 Some(crate::extras::hooks::LoopInfo {
                     iteration: state.iteration,
@@ -162,8 +163,14 @@ pub(crate) async fn run_headless_loop(
     Ok(())
 }
 
-fn iteration_history(session: &Session) -> Vec<rig::completion::Message> {
-    crate::agent::runner::convert_history(session)
+fn iteration_history(
+    session: &Session,
+    cfg: &Config,
+) -> std::sync::Arc<[rig::completion::Message]> {
+    crate::agent::runner::convert_history_shared_with_tool_result_retention(
+        session,
+        cfg.resolve_keep_recent_tool_results(),
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -177,7 +184,7 @@ mod tests {
     fn resumed_session_history_is_forwarded_to_each_loop_iteration() {
         let mut session = Session::new("provider", "model", 128_000, "");
         session.add_message(crate::session::MessageRole::User, "prior turn");
-        assert_eq!(iteration_history(&session).len(), 1);
+        assert_eq!(iteration_history(&session, &Config::default()).len(), 1);
     }
 
     #[tokio::test]

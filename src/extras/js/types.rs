@@ -10,7 +10,15 @@ pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024; // 64 MiB
 pub const STACK_LIMIT: usize = 512 * 1024; // 512 KiB JS stack
 pub const THREAD_STACK: usize = 8 * 1024 * 1024; // 8 MiB OS thread stack
 pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+pub const READ_FILES_MAX_PATHS: usize = 256;
+pub const READ_FILES_MAX_PATH_BYTES: usize = 1024 * 1024; // 1 MiB aggregate request text
+pub const READ_FILES_MAX_RESULT_BYTES: usize = 6 * 1024 * 1024; // encoded JSON contents
 pub const WRITE_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+pub const DISCOVERY_MAX_RESULTS: usize = 1_000;
+pub const DISCOVERY_MAX_VISITED_FILES: usize = 100_000;
+pub const DISCOVERY_MAX_RESULT_BYTES: usize = 256 * 1024;
+pub const DISCOVERY_PATTERN_MAX_BYTES: usize = 8 * 1024;
+pub const GREP_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Closed failures returned by parent-side effect services.
 ///
@@ -21,6 +29,10 @@ pub const WRITE_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) enum EffectServiceError {
     #[error("effect target is invalid")]
     InvalidTarget,
+    #[error("effect target was not found")]
+    NotFound,
+    #[error("effect target is a directory")]
+    IsDirectory,
     #[error("write_file does not follow final symlinks")]
     FinalSymlink,
     #[error("Path changed after permission check")]
@@ -223,6 +235,7 @@ impl SkillExecutionBundle {
 #[derive(PartialEq, Eq)]
 pub enum JsOutcome {
     Value(String),
+    Structured(serde_json::Value),
     Void,
     Error(String),
     Timeout,
@@ -236,6 +249,14 @@ impl fmt::Debug for JsOutcome {
                 .debug_struct("Value")
                 .field("body", &Redacted)
                 .field("body_len", &value.len())
+                .finish(),
+            Self::Structured(value) => f
+                .debug_struct("Structured")
+                .field("body", &Redacted)
+                .field(
+                    "body_len",
+                    &serde_json::to_string(value).map_or(0, |encoded| encoded.len()),
+                )
                 .finish(),
             Self::Void => f.write_str("Void"),
             Self::Error(error) => f
@@ -288,9 +309,16 @@ pub struct PermCancellation {
 #[derive(Default)]
 struct PermCancellationState {
     cancelled: AtomicBool,
+    permission_prompt_timed_out: AtomicBool,
+    pending_permission_prompts: AtomicU64,
     notify: tokio::sync::Notify,
     next_blocking_wake: AtomicU64,
     blocking_wakes: Mutex<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>>,
+}
+
+pub(crate) struct PermissionPromptGuard {
+    state: Arc<PermCancellationState>,
+    registered: bool,
 }
 
 pub(crate) struct PermCancellationWake {
@@ -344,6 +372,40 @@ impl PermCancellation {
         }
     }
 
+    pub(crate) fn begin_permission_prompt(&self) -> PermissionPromptGuard {
+        let registered = self
+            .state
+            .pending_permission_prompts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        PermissionPromptGuard {
+            state: Arc::clone(&self.state),
+            registered,
+        }
+    }
+
+    pub(crate) fn mark_permission_prompt_timed_out(&self) {
+        self.state
+            .permission_prompt_timed_out
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn permission_prompt_pending(&self) -> bool {
+        self.state
+            .pending_permission_prompts
+            .load(Ordering::Acquire)
+            > 0
+    }
+
+    pub(crate) fn permission_prompt_blocked_deadline(&self) -> bool {
+        self.state
+            .permission_prompt_timed_out
+            .load(Ordering::Acquire)
+            || self.permission_prompt_pending()
+    }
+
     pub(crate) fn register_blocking_wake(
         &self,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -370,6 +432,16 @@ impl PermCancellation {
         PermCancellationWake {
             state: Arc::clone(&self.state),
             id: Some(id),
+        }
+    }
+}
+
+impl Drop for PermissionPromptGuard {
+    fn drop(&mut self) {
+        if self.registered {
+            self.state
+                .pending_permission_prompts
+                .fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -741,6 +813,23 @@ mod js_permission_types {
             assert_eq!(response.request_id(), id);
             assert_eq!(request.accept_response(response), Ok(outcome));
         }
+    }
+
+    #[test]
+    fn permission_prompt_deadline_state_is_scoped_and_sticky() {
+        let cancellation = PermCancellation::new();
+        assert!(!cancellation.permission_prompt_blocked_deadline());
+        {
+            let _guard = cancellation.begin_permission_prompt();
+            assert!(cancellation.permission_prompt_pending());
+            assert!(cancellation.permission_prompt_blocked_deadline());
+        }
+        assert!(!cancellation.permission_prompt_pending());
+        assert!(!cancellation.permission_prompt_blocked_deadline());
+
+        cancellation.mark_permission_prompt_timed_out();
+        assert!(cancellation.permission_prompt_blocked_deadline());
+        assert!(!PermCancellation::new().permission_prompt_blocked_deadline());
     }
 
     #[test]

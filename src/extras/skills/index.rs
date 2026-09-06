@@ -22,6 +22,8 @@ pub struct AgentSkillRecord {
     pub resources: Vec<ResourceMetadata>,
     /// Non-authoritative display metadata only.
     pub allowed_tools: Option<String>,
+    /// Exact learned-JS identities declared by the immutable Agent Skill tree.
+    pub learned_js: Vec<String>,
     pub(crate) embedding: Vec<f32>,
 }
 
@@ -278,6 +280,7 @@ mod tests {
             skill_md_sha256: digest.to_string(),
             resources: Vec::new(),
             allowed_tools: None,
+            learned_js: Vec::new(),
             embedding,
         }
     }

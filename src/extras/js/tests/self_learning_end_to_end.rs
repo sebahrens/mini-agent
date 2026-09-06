@@ -55,6 +55,116 @@ fn artifact(value: i32, description: &str) -> SkillArtifact {
 }
 
 #[test]
+fn sibling_replacement_canaries_rotate_by_canonical_invocation_count() {
+    let (root, paths) = fixture();
+    let predecessor = artifact(10, "Active predecessor");
+    let first = artifact(11, "First replacement canary");
+    let second = artifact(12, "Second replacement canary");
+    let embedder = Arc::new(Embedder::new().unwrap());
+    let model = embedder.model_metadata();
+
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    for skill in [&predecessor, &first, &second] {
+        store.insert_verified(skill).unwrap();
+    }
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions SET status = 'active', lineage_root_id = id WHERE id = ?",
+            [&predecessor.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+             SET status = 'canary', supersedes_id = ?, lineage_root_id = ?, created_at = 10
+             WHERE id = ?",
+            rusqlite::params![predecessor.id, predecessor.id, first.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+             SET status = 'canary', supersedes_id = ?, lineage_root_id = ?, created_at = 20
+             WHERE id = ?",
+            rusqlite::params![predecessor.id, predecessor.id, second.id],
+        )
+        .unwrap();
+    for skill in [&first, &second] {
+        let vector = embedder
+            .embed_documents(std::slice::from_ref(&skill.description))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let bytes = vector
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        store
+            .store_embedding(
+                &skill.id,
+                &model.model_id,
+                &model.model_revision,
+                model.dimensions as u32,
+                model.normalized,
+                &bytes,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let coordinator = IndexCoordinator::open(&paths, embedder).unwrap();
+    let generation = coordinator.rebuild_and_publish().unwrap();
+    let selected = coordinator
+        .replacement_candidate(&predecessor.id, generation)
+        .unwrap()
+        .expect("older sibling wins an invocation-count tie");
+    assert_eq!(selected.0.id, first.id);
+    assert!(selected.1.model_compatible);
+
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_events
+             (invocation_id, skill_id, turn_id, event_kind, index_generation,
+              evidence_complete, production, created_at)
+             VALUES (?, ?, 'turn-first', 'invoked', ?, 1, 1, 30)",
+            rusqlite::params!["1".repeat(64), first.id, generation as i64],
+        )
+        .unwrap();
+    drop(store);
+
+    let selected = coordinator
+        .replacement_candidate(&predecessor.id, generation)
+        .unwrap()
+        .expect("less-invoked sibling remains eligible");
+    assert_eq!(selected.0.id, second.id);
+
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_events
+             (invocation_id, skill_id, turn_id, event_kind, index_generation,
+              evidence_complete, production, created_at)
+             VALUES (?, ?, 'turn-second', 'invoked', ?, 1, 1, 40)",
+            rusqlite::params!["2".repeat(64), second.id, generation as i64],
+        )
+        .unwrap();
+    drop(store);
+
+    let selected = coordinator
+        .replacement_candidate(&predecessor.id, generation)
+        .unwrap()
+        .expect("both sibling canaries remain eligible");
+    assert_eq!(selected.0.id, first.id);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
     let (root, paths) = fixture();
     let root_artifact = artifact(1, "Lineage root");

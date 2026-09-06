@@ -63,7 +63,7 @@ Normative wording lives in the owning spec under a section named **Accepted amen
 | Typed result channel and JSON-only scratch store (design gate required) | Phase 6 `Capability broker` | mini-agent-yl18 |
 | Deterministic embedding backend disables dense retrieval; lexical query is OR/BM25 | Phase 3 `SkillIndex and hybrid retrieval` | mini-agent-bfsg, mini-agent-io7h |
 | Skill context delivered outside persisted user text; manifest names exports as callables | Phase 3 `Preamble injection` | mini-agent-rd89, mini-agent-4bqq |
-| Bounded model-issued `skills_search` (metadata only) — decision needed against the index invariant | Phase 3 `Retrieval query`; `00-index.md` | mini-agent-a8a0 |
+| Bounded model-issued `skills_search` (metadata only), accepted and delivered | Phase 3 `Retrieval query`; `00-index.md` | mini-agent-a8a0 |
 | Operator surface: import, approve, reject, stats; seed library | Phase 4 `Human approval into canary` | mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t |
 | Quarantine counts faults, not expected `threw`; canary selection by age; WAL + immediate transactions; skip corrupt embedding rows | Phase 5 `Automatic quarantine`, `Failure semantics` | mini-agent-lugc, mini-agent-840z, mini-agent-pwf2, mini-agent-jj8b |
 | Project persona definitions trust-gated; non-overridable untrusted-content rules; structured brief and return skeleton | `docs/agent/SUBAGENTS.md` (no normative spec) | mini-agent-yb9w, mini-agent-nfd7, mini-agent-ddno |

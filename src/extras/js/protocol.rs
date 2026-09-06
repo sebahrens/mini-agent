@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+pub(crate) const PROTOCOL_VERSION: u16 = 11;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]
@@ -297,15 +297,39 @@ pub(crate) enum ContainmentAttestation {
     Passed,
 }
 
+/// The exact model-authored host surface installed for one fresh realm.
+///
+/// This is worker-visible defense in depth. The parent broker independently
+/// issues only the matching capabilities and remains authoritative if a
+/// compromised worker sends an operation that the selected profile omits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelEffectProfile {
+    Full,
+    ReadOnly,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunStep {
     pub(crate) code: String,
     pub(crate) model_grant_id: Option<GrantId>,
+    pub(crate) model_effect_profile: ModelEffectProfile,
+    /// Whether the parent can contain the complete process tree for model-launched programs.
+    ///
+    /// This controls whether the worker installs the model-facing `spawn` global at all. The
+    /// broker still enforces the corresponding grant on every call.
+    pub(crate) spawn_available: bool,
     #[cfg(feature = "skills")]
     pub(crate) proposal_grant_id: Option<GrantId>,
     #[cfg(feature = "skills")]
     pub(crate) artifacts: Vec<super::skills::SkillArtifact>,
+    /// Identities previously installed in this worker for `turn_id`.
+    ///
+    /// The parent sends either complete `artifacts` or these ordered identities, never both.
+    /// References are useful only within one authenticated worker connection and one turn.
+    #[cfg(feature = "skills")]
+    pub(crate) cached_artifact_ids: Vec<String>,
     #[cfg(feature = "skills")]
     pub(crate) turn_id: String,
     #[cfg(feature = "skills")]
@@ -317,10 +341,14 @@ impl RunStep {
         Self {
             code,
             model_grant_id: None,
+            model_effect_profile: ModelEffectProfile::Full,
+            spawn_available: false,
             #[cfg(feature = "skills")]
             proposal_grant_id: None,
             #[cfg(feature = "skills")]
             artifacts: Vec::new(),
+            #[cfg(feature = "skills")]
+            cached_artifact_ids: Vec::new(),
             #[cfg(feature = "skills")]
             turn_id: String::new(),
             #[cfg(feature = "skills")]
@@ -339,6 +367,16 @@ impl RunStep {
         self
     }
 
+    pub(crate) fn with_model_effect_profile(mut self, profile: ModelEffectProfile) -> Self {
+        self.model_effect_profile = profile;
+        self
+    }
+
+    pub(crate) fn with_spawn_available(mut self, available: bool) -> Self {
+        self.spawn_available = available;
+        self
+    }
+
     #[cfg(feature = "skills")]
     pub(crate) fn with_skills(
         mut self,
@@ -347,6 +385,7 @@ impl RunStep {
         tool_call_id: String,
     ) -> Self {
         self.artifacts = artifacts;
+        self.cached_artifact_ids.clear();
         self.turn_id = turn_id;
         self.tool_call_id = tool_call_id;
         self
@@ -478,9 +517,34 @@ pub(crate) enum EffectOperation {
     ReadFile {
         path: String,
     },
+    ReadFiles {
+        paths: Vec<String>,
+    },
+    ListDir {
+        path: String,
+    },
+    Glob {
+        path: String,
+        pattern: String,
+    },
+    Grep {
+        path: String,
+        pattern: String,
+        options: GrepOptions,
+    },
     WriteFile {
         path: String,
         content: String,
+    },
+    Result {
+        json: String,
+    },
+    ScratchPut {
+        key: String,
+        json: String,
+    },
+    ScratchGet {
+        key: String,
     },
     Fetch {
         url: String,
@@ -495,6 +559,45 @@ pub(crate) enum EffectOperation {
     ProposeSkill {
         draft: SkillProposalDraft,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GrepOptions {
+    pub(crate) include: Option<String>,
+    pub(crate) case_sensitive: bool,
+}
+
+impl Default for GrepOptions {
+    fn default() -> Self {
+        Self {
+            include: None,
+            case_sensitive: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DirectoryEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryEntry {
+    pub(crate) name: String,
+    pub(crate) kind: DirectoryEntryKind,
+    pub(crate) size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GrepMatch {
+    pub(crate) path: String,
+    pub(crate) line: u64,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -577,7 +680,29 @@ pub(crate) enum EffectResult {
     ReadFile {
         content: String,
     },
+    ReadFiles {
+        contents: Vec<String>,
+    },
+    ListDir {
+        entries: Vec<DirectoryEntry>,
+        truncated: bool,
+    },
+    Glob {
+        paths: Vec<String>,
+        truncated: bool,
+    },
+    Grep {
+        matches: Vec<GrepMatch>,
+        truncated: bool,
+    },
     WriteFile,
+    ResultAccepted {
+        json: String,
+    },
+    ScratchPut,
+    ScratchGet {
+        json: Option<String>,
+    },
     Fetch {
         status: u16,
         body: String,
@@ -633,9 +758,11 @@ pub(crate) enum EffectErrorCode {
     Denied,
     CapabilityDenied,
     InvalidTarget,
+    NotFound,
+    IsDirectory,
     Cancelled,
     TimedOut,
-    OutputLimit,
+    TooLarge,
     BackendFailure,
     AuditFailure,
     OutcomeUnknown,
@@ -662,6 +789,7 @@ pub(crate) struct StepResult {
 )]
 pub(crate) enum StepOutcome {
     Value(String),
+    Structured(serde_json::Value),
     Void,
     Error(JsErrorCode),
     Timeout,

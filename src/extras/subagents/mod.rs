@@ -12,7 +12,12 @@ pub(crate) mod task_tool;
 
 pub(crate) struct SubagentConfig {
     pub client: AnyClient,
+    /// User-facing built-in or custom-provider alias corresponding to `client`.
+    pub provider_name: String,
     pub model_name: String,
+    /// CLI key retained only so a persona quick-model can select another
+    /// provider with the same explicit credential semantics as startup.
+    pub api_key: Option<String>,
     pub max_turns: usize,
     pub config: crate::config::Config,
 }
@@ -49,23 +54,28 @@ where
 
 pub fn init(
     client: AnyClient,
+    provider_name: String,
     model_name: String,
+    api_key: Option<String>,
     max_turns: usize,
     config: crate::config::Config,
 ) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(SubagentConfig {
         client,
+        provider_name,
         model_name,
+        api_key,
         max_turns,
         config,
     });
 }
 
-pub fn set_client_and_model(client: AnyClient, model_name: String) {
+pub fn set_client_and_model(client: AnyClient, provider_name: String, model_name: String) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cfg) = guard.as_mut() {
         cfg.client = client;
+        cfg.provider_name = provider_name;
         cfg.model_name = model_name;
     }
 }

@@ -1,7 +1,6 @@
 pub mod config;
 
 use std::collections::{HashMap, VecDeque};
-#[cfg(test)]
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -49,14 +48,55 @@ struct CommittedTurn {
 struct SessionHistory {
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
+    summary: Option<String>,
 }
 
 impl SessionHistory {
     fn snapshot(&self) -> Vec<Message> {
-        self.turns
+        self.snapshot_with_tool_result_retention(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS)
+    }
+
+    fn snapshot_with_tool_result_retention(&self, keep_recent: usize) -> Vec<Message> {
+        let mut messages = self
+            .turns
             .iter()
             .flat_map(|turn| turn.messages.iter().cloned())
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(summary) = self.summary.as_ref() {
+            messages.insert(
+                0,
+                Message::assistant(format!("[Recap of earlier ACP turns]\n{summary}")),
+            );
+        }
+        let result_count = messages
+            .iter()
+            .map(|message| match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter(|item| matches!(item, rig::message::UserContent::ToolResult(_)))
+                    .count(),
+                Message::Assistant { .. } | Message::System { .. } => 0,
+            })
+            .sum::<usize>();
+        let mut remaining_to_clear = result_count.saturating_sub(keep_recent);
+        for message in &mut messages {
+            let Message::User { content } = message else {
+                continue;
+            };
+            for item in content.iter_mut() {
+                if remaining_to_clear == 0 {
+                    break;
+                }
+                let rig::message::UserContent::ToolResult(result) = item else {
+                    continue;
+                };
+                result.content = rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    crate::session::CLEARED_TOOL_RESULT_NOTICE,
+                ));
+                remaining_to_clear -= 1;
+            }
+        }
+        messages
     }
 
     fn commit_completed_turn(&mut self, prompt: &str, interactions: Vec<Message>) {
@@ -74,17 +114,78 @@ impl SessionHistory {
             messages,
             serialized_bytes,
         });
+    }
 
-        while self.turns.len() > MAX_ACP_HISTORY_TURNS
-            || self.serialized_bytes > MAX_ACP_HISTORY_BYTES
-        {
-            let Some(evicted) = self.turns.pop_front() else {
-                break;
-            };
-            self.serialized_bytes = self
+    fn needs_compaction(&self) -> bool {
+        self.turns.len() > MAX_ACP_HISTORY_TURNS
+            || self
                 .serialized_bytes
-                .saturating_sub(evicted.serialized_bytes);
+                .saturating_add(self.summary.as_ref().map_or(0, String::len))
+                > MAX_ACP_HISTORY_BYTES
+    }
+
+    async fn compact_with<F, Fut>(&mut self, summarize: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
+        Fut: Future<Output = anyhow::Result<(String, usize)>>,
+    {
+        const SUMMARY_ALLOWANCE: usize = 16 * 1024;
+        if !self.needs_compaction() {
+            return Ok(());
         }
+
+        let mut selected_turns = 0usize;
+        let mut selected_bytes = 0usize;
+        while selected_turns < self.turns.len()
+            && (self.turns.len().saturating_sub(selected_turns) > MAX_ACP_HISTORY_TURNS
+                || self
+                    .serialized_bytes
+                    .saturating_sub(selected_bytes)
+                    .saturating_add(SUMMARY_ALLOWANCE)
+                    > MAX_ACP_HISTORY_BYTES)
+        {
+            selected_bytes =
+                selected_bytes.saturating_add(self.turns[selected_turns].serialized_bytes);
+            selected_turns += 1;
+        }
+
+        let mut cumulative_messages = Vec::with_capacity(selected_turns);
+        let mut serialized = Vec::new();
+        for turn in self.turns.iter().take(selected_turns) {
+            for message in &turn.messages {
+                let content = serde_json::to_string(message)
+                    .unwrap_or_else(|_| "[unserializable ACP message]".to_string());
+                let role = match message {
+                    Message::User { .. } => crate::session::MessageRole::User,
+                    Message::Assistant { .. } => crate::session::MessageRole::Assistant,
+                    Message::System { .. } => crate::session::MessageRole::System,
+                };
+                serialized.push(crate::session::SessionMessage {
+                    role,
+                    estimated_tokens: crate::session::Session::estimate_tokens(&content),
+                    content: content.into(),
+                    tool_call_id: None,
+                    tool: None,
+                });
+            }
+            cumulative_messages.push(serialized.len());
+        }
+
+        let (summary, messages_included) = summarize(serialized, self.summary.clone()).await?;
+        let turns_included = cumulative_messages
+            .iter()
+            .take_while(|count| **count <= messages_included)
+            .count();
+        if turns_included == 0 {
+            anyhow::bail!("ACP compaction did not cover one complete oldest turn");
+        }
+        for _ in 0..turns_included {
+            if let Some(turn) = self.turns.pop_front() {
+                self.serialized_bytes = self.serialized_bytes.saturating_sub(turn.serialized_bytes);
+            }
+        }
+        self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
+        Ok(())
     }
 }
 
@@ -105,7 +206,10 @@ struct SessionState {
     context: Arc<ContextFiles>,
     turns: Arc<StdMutex<SessionTurns>>,
     read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
     sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "js")]
+    js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")]
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
 }
@@ -115,7 +219,10 @@ struct PromptSessionSnapshot {
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
     sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "js")]
+    js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")]
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     control: Arc<TurnControl>,
@@ -758,7 +865,10 @@ async fn handle_new_session(
             read_tracker: crate::agent::tools::ReadTracker::new(
                 state.cfg.deny_repeated_reads.unwrap_or(true),
             ),
+            todo_store: crate::agent::tools::TodoStore::default(),
             sandbox,
+            #[cfg(feature = "js")]
+            js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
         },
@@ -871,7 +981,10 @@ async fn handle_prompt(
             workspace: sess.workspace.clone(),
             context: sess.context.clone(),
             read_tracker: sess.read_tracker.clone(),
+            todo_store: sess.todo_store.clone(),
             sandbox: sess.sandbox.clone(),
+            #[cfg(feature = "js")]
+            js_session_state: sess.js_session_state.clone(),
             #[cfg(feature = "skills")]
             skill_services: sess.skill_services.clone(),
             control: control.clone(),
@@ -887,7 +1000,10 @@ async fn handle_prompt(
         workspace,
         context,
         read_tracker,
+        todo_store,
         sandbox,
+        #[cfg(feature = "js")]
+        js_session_state,
         #[cfg(feature = "skills")]
         skill_services,
         control,
@@ -928,7 +1044,10 @@ async fn handle_prompt(
                     workspace,
                     context,
                     read_tracker,
+                    todo_store,
                     sandbox,
+                    #[cfg(feature = "js")]
+                    js_session_state,
                     #[cfg(feature = "skills")]
                     skill_services,
                     responder,
@@ -1067,11 +1186,13 @@ async fn run_prompt(
     state: &AcpState,
     prompt_text: &str,
     session_id: SessionId,
-    history: tokio::sync::OwnedMutexGuard<SessionHistory>,
+    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     workspace: Arc<crate::paths::WorkspaceBinding>,
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
     sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")] skill_services: Arc<
         crate::extras::js::skills::session::SkillServiceOwner,
     >,
@@ -1087,10 +1208,16 @@ async fn run_prompt(
     if let Err(error) = workspace.validate() {
         return respond_prompt_failure(session_id, responder, cx, registration, error.to_string());
     }
-    let prior_history = history.snapshot();
-
+    #[cfg(feature = "memory")]
+    let context = {
+        let mut refreshed = (*context).clone();
+        refreshed.refresh_memory_if_changed().await;
+        Arc::new(refreshed)
+    };
     #[cfg(test)]
     if let Some(fixture) = &state.runner_fixture {
+        let prior_history = history
+            .snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
         let paused_runner = tokio::select! {
             biased;
             _ = control.cancelled() => {
@@ -1114,6 +1241,8 @@ async fn run_prompt(
 
     #[cfg(test)]
     if let Some(fixture) = &state.prompt_fixture {
+        let prior_history = history
+            .snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
         let fixture_result = tokio::select! {
             biased;
             _ = control.cancelled() => {
@@ -1213,6 +1342,46 @@ async fn run_prompt(
         }
     };
 
+    if history.needs_compaction() {
+        let quick_models = crate::config::quick_models_map(&state.cfg);
+        let context_window =
+            state
+                .cfg
+                .resolve_context_window(&provider_str, &model_str, &quick_models);
+        let reserve = state
+            .cfg
+            .resolve_reserve_tokens(&model_str, &quick_models, context_window);
+        let compaction_client = &client;
+        let compaction_model = &model_str;
+        let compaction_retry = &state.cfg.retry;
+        let compacted = history
+            .compact_with(move |messages, previous_summary| async move {
+                compaction_client
+                    .compress_messages(
+                        compaction_model,
+                        &messages,
+                        previous_summary.as_deref(),
+                        None,
+                        context_window.saturating_sub(reserve),
+                        reserve,
+                        compaction_retry,
+                    )
+                    .await
+            })
+            .await;
+        if let Err(error) = compacted {
+            return respond_prompt_failure(
+                session_id,
+                responder,
+                cx,
+                registration,
+                format!("ACP history compaction failed: {error}"),
+            );
+        }
+    }
+    let prior_history =
+        history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
+
     let model = client.completion_model(model_str.to_string());
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
@@ -1224,6 +1393,7 @@ async fn run_prompt(
         None
     };
     let work_scope = crate::agent::runner::AgentWorkScope::new();
+    let tool_output_session_id = session_id.to_string();
     let Some(agent) = run_owned_pre_run(
         &control,
         &work_scope,
@@ -1237,9 +1407,14 @@ async fn run_prompt(
             ask_tx,
             sandbox,
             read_tracker,
+            todo_store,
+            &tool_output_session_id,
+            None,
             false,
             temperature,
             extra_body,
+            #[cfg(feature = "js")]
+            js_session_state,
             #[cfg(feature = "skills")]
             skill_services,
             #[cfg(feature = "mcp")]
@@ -1434,6 +1609,11 @@ async fn relay_prompt_events(
                 // stable ID; advertising a nested call here would create an ACP
                 // call that can never receive a matching result.
             }
+            #[cfg(feature = "subagents")]
+            AgentEvent::SubagentStarted { .. } => {
+                // Display-only provenance; the outer task call remains the
+                // canonical ACP tool lifecycle.
+            }
             AgentEvent::ToolResult { id, output, .. } => {
                 let id = id.to_string();
                 let fields = ToolCallUpdateFields::new()
@@ -1448,6 +1628,17 @@ async fn relay_prompt_events(
                 );
                 if let Err(e) = cx.send_notification(notif) {
                     tracing::warn!("ACP failed to send tool result notification: {}", e);
+                }
+            }
+            AgentEvent::ToolLoop { name, message } => {
+                let text = format!("loop guard ({name}): {message}");
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(chunk),
+                );
+                if let Err(e) = cx.send_notification(notif) {
+                    tracing::warn!("ACP failed to send tool-loop notification: {}", e);
                 }
             }
             AgentEvent::Retrying { attempt, max } => {
@@ -1488,6 +1679,13 @@ async fn relay_prompt_events(
             AgentEvent::UsageDelta { .. } => {
                 // Mid-stream provider usage; ACP has no status bar to update, so
                 // there is nothing to surface for this event.
+            }
+            AgentEvent::CompactionBoundary { .. } => {
+                tracing::error!("interactive-only compaction boundary reached ACP");
+                if registration.complete_and_settle() {
+                    let _ = respond_terminal(registration, responder, StopReason::Refusal);
+                }
+                return Ok(());
             }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
@@ -1542,7 +1740,7 @@ async fn respond_cancelled_after_runner(
 mod history_tests {
     use super::*;
     use rig::agent::AgentBuilder;
-    use rig::completion::message::UserContent;
+    use rig::completion::message::{ToolResultContent, UserContent};
     use rig::completion::{AssistantContent, Message};
     use rig::test_utils::{MockCompletionModel, MockStreamEvent};
 
@@ -1710,6 +1908,63 @@ mod history_tests {
     }
 
     #[test]
+    fn acp_snapshot_clears_old_results_without_dropping_calls() {
+        let mut history = SessionHistory::default();
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            history.commit_completed_turn(
+                &format!("prompt-{index}"),
+                vec![
+                    Message::Assistant {
+                        id: None,
+                        content: rig::OneOrMany::one(AssistantContent::tool_call(
+                            id.clone(),
+                            "read",
+                            serde_json::json!({"path": format!("file-{index}")}),
+                        )),
+                    },
+                    Message::tool_result(id, format!("output-{index}")),
+                ],
+            );
+        }
+
+        let snapshot = history.snapshot_with_tool_result_retention(1);
+        let calls = snapshot
+            .iter()
+            .map(|message| match message {
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .filter(|item| matches!(item, AssistantContent::ToolCall(_)))
+                    .count(),
+                Message::User { .. } | Message::System { .. } => 0,
+            })
+            .sum::<usize>();
+        let outputs = snapshot
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|item| match item {
+                    UserContent::ToolResult(result) => match result.content.first() {
+                        ToolResultContent::Text(text) => Some(text.text),
+                        ToolResultContent::Image(_) => None,
+                    },
+                    _ => None,
+                }),
+                Message::Assistant { .. } | Message::System { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls, 3);
+        assert_eq!(
+            outputs,
+            vec![
+                crate::session::CLEARED_TOOL_RESULT_NOTICE.to_string(),
+                crate::session::CLEARED_TOOL_RESULT_NOTICE.to_string(),
+                "output-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn continuation_bridge_is_committed_as_the_exact_model_visible_transcript() {
         let grouped_assistant = Message::Assistant {
             id: None,
@@ -1738,8 +1993,8 @@ mod history_tests {
         assert_eq!(history.snapshot(), model_visible_transcript);
     }
 
-    #[test]
-    fn history_retention_evicts_whole_oldest_turns_at_both_bounds() {
+    #[tokio::test]
+    async fn history_retention_summarizes_whole_oldest_turns_at_both_bounds() {
         let mut by_count = SessionHistory::default();
         for index in 0..=MAX_ACP_HISTORY_TURNS {
             by_count.commit_completed_turn(
@@ -1747,9 +2002,21 @@ mod history_tests {
                 vec![Message::assistant(format!("assistant-{index}"))],
             );
         }
+        assert!(by_count.needs_compaction());
+        by_count
+            .compact_with(|messages, _| async move {
+                let count = messages.len();
+                Ok(("origin user-0 assistant-0".to_string(), count))
+            })
+            .await
+            .unwrap();
         let count_snapshot = by_count.snapshot();
-        assert_eq!(count_snapshot.len(), MAX_ACP_HISTORY_TURNS * 2);
+        assert_eq!(count_snapshot.len(), MAX_ACP_HISTORY_TURNS * 2 + 1);
         assert!(!count_snapshot.contains(&Message::user("user-0")));
+        assert!(
+            count_snapshot[0]
+                == Message::assistant("[Recap of earlier ACP turns]\norigin user-0 assistant-0")
+        );
         assert!(count_snapshot.contains(&Message::user(format!("user-{MAX_ACP_HISTORY_TURNS}"))));
 
         let mut by_bytes = SessionHistory::default();
@@ -1757,9 +2024,17 @@ mod history_tests {
             &"u".repeat(MAX_ACP_HISTORY_BYTES),
             vec![Message::assistant("oversized")],
         );
+        by_bytes
+            .compact_with(|messages, _| async move {
+                let count = messages.len();
+                Ok(("oversized origin retained".to_string(), count))
+            })
+            .await
+            .unwrap();
         assert!(
-            by_bytes.snapshot().is_empty(),
-            "a single oversized turn must not leave history above its byte bound"
+            by_bytes.snapshot()[0]
+                == Message::assistant("[Recap of earlier ACP turns]\noversized origin retained"),
+            "a single oversized turn must be replaced by its bounded recap"
         );
     }
 
@@ -2335,10 +2610,10 @@ mod protocol_tests {
                             .await;
                     });
                     crate::agent::runner::PausedAgentRunner::new(
-                        crate::agent::runner::AgentRunner {
+                        crate::agent::runner::AgentRunner::without_compaction(
                             event_rx,
-                            abort_handle: join.abort_handle(),
-                        },
+                            join.abort_handle(),
+                        ),
                         start_tx,
                         work_scope,
                     )
@@ -3579,6 +3854,7 @@ mod workspace_tests {
             &first_context,
             false,
             Some(&first),
+            false,
         );
         assert!(first_preamble.contains(&first.display().to_string()));
         assert!(!first_preamble.contains(&second.display().to_string()));
@@ -3606,10 +3882,12 @@ mod workspace_tests {
             first_write.call(WriteArgs {
                 path: "created.txt".into(),
                 content: "created-first".into(),
+                overwrite: false,
             }),
             second_write.call(WriteArgs {
                 path: "created.txt".into(),
                 content: "created-second".into(),
+                overwrite: false,
             })
         );
         first_result.unwrap();
@@ -3635,12 +3913,18 @@ mod workspace_tests {
                 path: Some(".".into()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             }),
             second_grep_tool.call(GrepArgs {
                 pattern: "second-only".into(),
                 path: Some(".".into()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
         );
         assert!(first_grep.unwrap().contains("first-only"));
@@ -3668,6 +3952,7 @@ mod workspace_tests {
             .with_workspace_binding(first_workspace)
             .call(EditArgs {
                 path: "created.txt".into(),
+                replace_all: false,
                 block: Some(
                     "<<<<<<< SEARCH\ncreated-first\n=======\nedited-first\n>>>>>>> REPLACE".into(),
                 ),
@@ -3838,6 +4123,7 @@ mod workspace_tests {
                 .call(WriteArgs {
                     path: "rebound.txt".into(),
                     content: "must-not-write".into(),
+                    overwrite: false,
                 })
                 .await
                 .is_err()
@@ -3895,6 +4181,7 @@ mod workspace_tests {
             .call(WriteArgs {
                 path: "safe/link-dir/core.txt".into(),
                 content: "must-not-write".into(),
+                overwrite: false,
             })
             .await;
         assert!(write.is_err());

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::coordinator::IndexCoordinator;
 use super::embed::Embedder;
-use super::index::{RetrievalPolicy, SkillIndex};
+use super::index::{RetrievalPolicy, SkillIndex, manifest_size};
 use super::router::{FrozenRoute, RouteRequest, route};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::extras::skills::catalog::AgentSkillCatalog;
@@ -23,12 +23,63 @@ const MAX_AGENT_RESOURCE_INVENTORY_BYTES: usize = 8 * 1024;
 type CoordinatorRegistry = Mutex<HashMap<String, Arc<IndexCoordinator>>>;
 static COORDINATORS: OnceLock<CoordinatorRegistry> = OnceLock::new();
 
+struct AgentSkillState {
+    catalog: Mutex<AgentSkillCatalog>,
+    current: RwLock<Arc<AgentSkillIndex>>,
+}
+
+impl AgentSkillState {
+    fn open(paths: &AppPaths, embedder: &Embedder) -> Result<Self, String> {
+        let mut catalog = AgentSkillCatalog::new(paths);
+        let current = catalog
+            .refresh(embedder)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            catalog: Mutex::new(catalog),
+            current: RwLock::new(Arc::new(current)),
+        })
+    }
+
+    fn snapshot(&self) -> Arc<AgentSkillIndex> {
+        self.current
+            .read()
+            .map(|index| Arc::clone(&index))
+            .unwrap_or_else(|error| Arc::clone(&error.into_inner()))
+    }
+
+    fn refresh_if_changed(&self, embedder: &Embedder) -> Result<Arc<AgentSkillIndex>, String> {
+        let refreshed = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .refresh_if_changed(embedder)
+            .map_err(|error| error.to_string())?;
+        if let Some(index) = refreshed {
+            let index = Arc::new(index);
+            match self.current.write() {
+                Ok(mut current) => *current = Arc::clone(&index),
+                Err(error) => *error.into_inner() = Arc::clone(&index),
+            }
+            return Ok(index);
+        }
+        Ok(self.snapshot())
+    }
+}
+
 struct AgentSection {
     digest: String,
     markdown: String,
     resources: Vec<(String, u64, String, Option<String>)>,
+    learned_js: Vec<String>,
     score: f32,
     rank: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedAgentSkill {
+    pub name: String,
+    pub description: String,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +157,7 @@ pub struct TurnDiscoveryBundle {
     pub learned_js: Arc<TurnSkillBundle>,
     pub agent_skill_generation: u64,
     pub selected_agent_digests: Vec<String>,
+    pub agent_skills: Vec<ResolvedAgentSkill>,
     pub diagnostics: Vec<String>,
     pub trusted_context: String,
 }
@@ -114,11 +166,12 @@ pub struct TurnDiscoveryBundle {
 pub struct SkillRuntime {
     embedder: Arc<Embedder>,
     learned: Option<Arc<IndexCoordinator>>,
-    agent_skills: Option<Arc<AgentSkillIndex>>,
+    agent_skills: Option<Arc<AgentSkillState>>,
     startup_diagnostics: Vec<String>,
     turn_context: Arc<SkillTurnContext>,
     learned_policy: RetrievalPolicy,
     agent_policy: AgentSkillSearchPolicy,
+    pure_learned_only: bool,
 }
 
 impl SkillRuntime {
@@ -154,9 +207,8 @@ impl SkillRuntime {
             diagnostics.push("learned_js_worker_containment_unavailable".to_string());
             None
         };
-        let mut catalog = AgentSkillCatalog::new(paths);
-        let agent_skills = match catalog.refresh(&embedder) {
-            Ok(index) => Some(Arc::new(index)),
+        let agent_skills = match AgentSkillState::open(paths, &embedder) {
+            Ok(state) => Some(Arc::new(state)),
             Err(error) => {
                 diagnostics.push(format!("agent_skill_catalog_unavailable:{error}"));
                 None
@@ -175,6 +227,7 @@ impl SkillRuntime {
             turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
             learned_policy,
             agent_policy: AgentSkillSearchPolicy::default(),
+            pure_learned_only: false,
         })
     }
 
@@ -191,10 +244,45 @@ impl SkillRuntime {
         Arc::clone(&self.turn_context)
     }
 
+    /// Give a read-only child independent turn state while sharing immutable
+    /// discovery indexes. Only active, pure learned JavaScript can enter the
+    /// child's bundle; effectful skills and canary replacements are excluded.
+    pub(crate) fn fork_for_read_only_child(&self) -> Self {
+        let revision = self.embedder.model_metadata().model_revision.clone();
+        Self {
+            embedder: Arc::clone(&self.embedder),
+            learned: self.learned.clone(),
+            agent_skills: self.agent_skills.clone(),
+            startup_diagnostics: self.startup_diagnostics.clone(),
+            turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
+            learned_policy: self.learned_policy.clone(),
+            agent_policy: self.agent_policy.clone(),
+            pure_learned_only: true,
+        }
+    }
+
     pub async fn prepare_turn(&self, prompt: &str) -> TurnDiscoveryBundle {
         let query = normalize_query(prompt);
         let fingerprint = fingerprint(&query);
         let mut diagnostics = self.startup_diagnostics.clone();
+        let mut agent_skills = self.agent_skills.as_ref().map(|state| state.snapshot());
+        if let Some(state) = &self.agent_skills {
+            let state = Arc::clone(state);
+            let embedder = Arc::clone(&self.embedder);
+            match crate::agent::runner::spawn_blocking_scoped(move || {
+                state.refresh_if_changed(&embedder)
+            })
+            .await
+            {
+                Ok(Ok(index)) => agent_skills = Some(index),
+                Ok(Err(error)) => {
+                    diagnostics.push(format!("agent_skill_catalog_refresh_unavailable:{error}"))
+                }
+                Err(error) => diagnostics.push(format!(
+                    "agent_skill_catalog_refresh_worker_unavailable:{error}"
+                )),
+            }
+        }
         let query_embedding = match self.embedder.embed_query_cached(&query).await {
             Ok(vector) => Some(vector),
             Err(error) => {
@@ -203,18 +291,33 @@ impl SkillRuntime {
             }
         };
         if let Some(coordinator) = &self.learned {
-            match coordinator.needs_refresh() {
-                Ok(true) => {
-                    self.schedule_learned_rebuild();
-                    diagnostics.push("learned_js_refresh_pending".to_string());
+            let coordinator = Arc::clone(coordinator);
+            match crate::agent::runner::spawn_blocking_scoped(move || {
+                let needs_refresh = coordinator.needs_refresh();
+                if matches!(needs_refresh, Ok(true)) {
+                    coordinator.schedule_rebuild();
                 }
-                Ok(false) => {}
-                Err(error) => {
+                (needs_refresh, coordinator.rebuild_backoff_diagnostic())
+            })
+            .await
+            {
+                Ok((Ok(true), backoff)) => {
+                    diagnostics.push("learned_js_refresh_pending".to_string());
+                    if let Some(error) = backoff {
+                        diagnostics.push(format!("learned_js_refresh_backoff:{error}"));
+                    }
+                }
+                Ok((Ok(false), backoff)) => {
+                    if let Some(error) = backoff {
+                        diagnostics.push(format!("learned_js_refresh_backoff:{error}"));
+                    }
+                }
+                Ok((Err(error), _)) => {
                     diagnostics.push(format!("learned_js_refresh_state_unavailable:{error}"))
                 }
-            }
-            if let Some(error) = coordinator.rebuild_backoff_diagnostic() {
-                diagnostics.push(format!("learned_js_refresh_backoff:{error}"));
+                Err(error) => {
+                    diagnostics.push(format!("learned_js_refresh_worker_unavailable:{error}"))
+                }
             }
         }
 
@@ -239,26 +342,48 @@ impl SkillRuntime {
                 Ok(index)
             }) {
                 Ok(index) => {
+                    let generation = index.generation();
                     let query = query.clone();
                     let vector = vector.clone();
                     let policy = self.learned_policy.clone();
+                    let pure_only = self.pure_learned_only;
                     match crate::agent::runner::spawn_blocking_scoped(move || {
-                        index.search(&query, &vector, &policy)
+                        if pure_only {
+                            index
+                                .search_pure_with_metrics(&query, &vector, &policy)
+                                .map(|output| output.skills)
+                        } else {
+                            index.search(&query, &vector, &policy)
+                        }
                     })
                     .await
                     {
                         Ok(Ok(skills)) => {
-                            let routing_key = coordinator.routing_key();
+                            let active_ids = skills
+                                .iter()
+                                .map(|skill| skill.artifact.id.clone())
+                                .collect::<Vec<_>>();
+                            let routing_context = if self.pure_learned_only {
+                                None
+                            } else {
+                                let coordinator = Arc::clone(coordinator);
+                                crate::agent::runner::spawn_blocking_scoped(move || {
+                                    coordinator.routing_context(&active_ids, generation)
+                                })
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .flatten()
+                            };
                             learned_bundle.skills = skills
                                 .into_iter()
                                 .map(|skill| {
-                                    let candidate = coordinator
-                                        .replacement_candidate(&skill.artifact.id, skill.generation)
-                                        .ok()
-                                        .flatten();
-                                    let route = routing_key.as_ref().ok().and_then(|key| {
+                                    let candidate = routing_context.as_ref().and_then(|context| {
+                                        context.candidates.get(&skill.artifact.id).cloned()
+                                    });
+                                    let route = routing_context.as_ref().and_then(|context| {
                                         route(
-                                            key,
+                                            &context.key,
                                             &RouteRequest {
                                                 active_id: skill.artifact.id.clone(),
                                                 active_lineage_root_id: candidate
@@ -302,13 +427,11 @@ impl SkillRuntime {
                 Err(error) => diagnostics.push(format!("learned_js_search_unavailable:{error}")),
             }
         }
-        self.turn_context.replace(learned_bundle.clone());
-        let learned_bundle = self.turn_context.snapshot();
-
         let mut agent_skill_generation = 0;
         let mut selected_agent_digests = Vec::new();
+        let mut selected_agent_skills = Vec::new();
         let mut agent_sections = Vec::new();
-        if let (Some(vector), Some(index)) = (&query_embedding, &self.agent_skills) {
+        if let (Some(vector), Some(index)) = (&query_embedding, &agent_skills) {
             agent_skill_generation = index.generation();
             let index = Arc::clone(index);
             let vector = vector.clone();
@@ -369,10 +492,16 @@ impl SkillRuntime {
                         match markdown {
                             Ok(markdown) => {
                                 selected_agent_digests.push(skill.record.digest.clone());
+                                selected_agent_skills.push(ResolvedAgentSkill {
+                                    name: skill.record.name.clone(),
+                                    description: skill.record.description.clone(),
+                                    digest: skill.record.digest.clone(),
+                                });
                                 agent_sections.push(AgentSection {
                                     digest: skill.record.digest.clone(),
                                     markdown,
                                     resources,
+                                    learned_js: skill.record.learned_js.clone(),
                                     score: skill.score,
                                     rank: skill.rank,
                                 });
@@ -393,6 +522,11 @@ impl SkillRuntime {
             }
         }
 
+        self.attach_declared_skills(&mut learned_bundle, &agent_sections, &mut diagnostics)
+            .await;
+        self.turn_context.replace(learned_bundle);
+        let learned_bundle = self.turn_context.snapshot();
+
         let trusted_context = render_trusted_context(
             &learned_bundle,
             agent_skill_generation,
@@ -403,25 +537,142 @@ impl SkillRuntime {
             learned_js: learned_bundle,
             agent_skill_generation,
             selected_agent_digests,
+            agent_skills: selected_agent_skills,
             diagnostics,
             trusted_context,
         }
     }
 
-    pub async fn prepare_prompt(&self, prompt: &str) -> String {
-        let discovery = self.prepare_turn(prompt).await;
-        tracing::debug!(
-            learned_skill_count = discovery.learned_js.skills.len(),
-            learned_generation = discovery.learned_js.index_generation,
-            agent_skill_count = discovery.selected_agent_digests.len(),
-            agent_generation = discovery.agent_skill_generation,
-            diagnostic_count = discovery.diagnostics.len(),
-            "prepared immutable prompt-time skill context"
-        );
-        if discovery.trusted_context.is_empty() {
-            prompt.to_string()
+    async fn attach_declared_skills(
+        &self,
+        learned: &mut TurnSkillBundle,
+        agent_sections: &[AgentSection],
+        diagnostics: &mut Vec<String>,
+    ) {
+        let mut declarations = Vec::<(String, String)>::new();
+        let mut seen = std::collections::HashSet::new();
+        for section in agent_sections {
+            for id in &section.learned_js {
+                if seen.insert(id.clone()) {
+                    declarations.push((section.digest.clone(), id.clone()));
+                }
+            }
+        }
+        if declarations.is_empty() {
+            return;
+        }
+        let Some(coordinator) = &self.learned else {
+            for (digest, id) in declarations {
+                diagnostics.push(format!(
+                    "agent_skill_learned_js_unavailable:{digest}:{id}:worker_containment"
+                ));
+            }
+            return;
+        };
+
+        let already_selected = learned
+            .skills
+            .iter()
+            .map(|skill| {
+                skill
+                    .route
+                    .as_ref()
+                    .map(|route| route.active_id.clone())
+                    .unwrap_or_else(|| skill.id.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let unresolved = declarations
+            .iter()
+            .filter(|(_, id)| !already_selected.contains(id))
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        let resolved = if unresolved.is_empty() {
+            Vec::new()
         } else {
-            format!("{}\n\n{}", discovery.trusted_context, prompt)
+            let coordinator = Arc::clone(coordinator);
+            let requested = unresolved.clone();
+            match crate::agent::runner::spawn_blocking_scoped(move || {
+                coordinator.resolve_active_ids(&requested)
+            })
+            .await
+            {
+                Ok(Ok(resolved)) => resolved,
+                Ok(Err(error)) => {
+                    diagnostics.push(format!("agent_skill_learned_js_store_unavailable:{error}"));
+                    return;
+                }
+                Err(error) => {
+                    diagnostics.push(format!("agent_skill_learned_js_worker_unavailable:{error}"));
+                    return;
+                }
+            }
+        };
+
+        let mut resolved_by_id = unresolved
+            .into_iter()
+            .zip(resolved)
+            .collect::<HashMap<_, _>>();
+        let mut semantic = learned.skills.drain(..).collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for (digest, id) in declarations {
+            if let Some(index) = semantic.iter().position(|skill| {
+                skill
+                    .route
+                    .as_ref()
+                    .map_or_else(|| skill.id.as_str(), |route| route.active_id.as_str())
+                    == id
+            }) {
+                candidates.push(semantic.remove(index));
+            } else if let Some(Some(artifact)) = resolved_by_id.remove(&id) {
+                if self.pure_learned_only && artifact.capability.tier != super::CapabilityTier::Pure
+                {
+                    diagnostics.push(format!(
+                        "agent_skill_learned_js_unavailable:{digest}:{id}:not_pure"
+                    ));
+                } else {
+                    candidates.push(resolved_skill(&artifact, 1.0, 0, None));
+                }
+            } else {
+                diagnostics.push(format!(
+                    "agent_skill_learned_js_unavailable:{digest}:{id}:not_active"
+                ));
+            }
+        }
+        candidates.extend(semantic);
+
+        let mut manifest_bytes = 0usize;
+        let mut source_bytes = 0usize;
+        for mut skill in candidates {
+            if learned.skills.len() >= self.learned_policy.max_skills {
+                diagnostics.push(format!(
+                    "learned_js_selection_omitted:{}:skill_limit",
+                    skill.id
+                ));
+                continue;
+            }
+            let artifact = SkillArtifact {
+                id: skill.id.clone(),
+                identity_version: skill.identity_version,
+                abi_version: skill.abi_version,
+                source: skill.source.clone(),
+                description: skill.description.clone(),
+                tags: skill.tags.clone(),
+                exports: skill.exports.clone(),
+                tests: skill.tests.clone(),
+                capability: skill.capability.clone(),
+            };
+            let next_manifest = manifest_bytes.saturating_add(manifest_size(&artifact));
+            let next_source = source_bytes.saturating_add(skill.source.len());
+            if next_manifest > self.learned_policy.manifest_byte_budget
+                || next_source > self.learned_policy.source_byte_budget
+            {
+                diagnostics.push(format!("learned_js_selection_omitted:{}:budget", skill.id));
+                continue;
+            }
+            manifest_bytes = next_manifest;
+            source_bytes = next_source;
+            skill.rank = learned.skills.len() + 1;
+            learned.skills.push(skill);
         }
     }
 }
@@ -527,21 +778,14 @@ fn render_trusted_context(
     // Skill can never truncate metadata for JS functions that are already bound.
     if !learned.skills.is_empty() {
         let _ = writeln!(output, "<available_js_skills>");
+        output.push_str(
+            "Each export below is already installed as a callable global inside the `js` tool. Call it directly; do not redefine it.\n",
+        );
         for skill in &learned.skills {
             let _ = writeln!(output, "- id: {}", skill.id);
             let _ = writeln!(output, "  rank: {}", skill.rank);
             let _ = writeln!(output, "  score: {:.6}", skill.score());
             let _ = writeln!(output, "  capability: {}", skill.capability.tier);
-            if let Some(route) = &skill.route {
-                let _ = writeln!(output, "  route: {:?}", route.route_kind);
-                let _ = writeln!(output, "  route_policy: {}", route.policy_version);
-                let _ = writeln!(
-                    output,
-                    "  route_share_basis_points: {}",
-                    route.canary_share_basis_points
-                );
-                let _ = writeln!(output, "  route_fingerprint: {}", route.route_fingerprint);
-            }
             let _ = writeln!(
                 output,
                 "  description: {}",
@@ -554,6 +798,11 @@ fn render_trusted_context(
                     escape_manifest(&export.name),
                     escape_manifest(&export.signature)
                 );
+            }
+            if let Some(export) = skill.exports.first() {
+                let invocation = example_invocation(export);
+                output.push_str(&format!("  use: Call `{invocation}` directly in `js`.\n"));
+                output.push_str(&format!("  example: `const result = {invocation};`\n"));
             }
         }
         output.push_str("</available_js_skills>\n");
@@ -678,6 +927,16 @@ impl SkillRuntime {
             .as_ref()
             .map_or(0, |coordinator| coordinator.rebuild_starts_for_test())
     }
+
+    pub(crate) fn hold_learned_store_lock_for_test(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        self.learned
+            .as_ref()
+            .map(|coordinator| coordinator.hold_store_lock_for_test(entered, release))
+    }
 }
 
 fn escape_manifest(value: &str) -> String {
@@ -686,4 +945,86 @@ fn escape_manifest(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace(['\n', '\r'], " ")
+}
+
+fn example_invocation(export: &SkillExport) -> String {
+    let has_no_arguments = export.signature.find('(').is_some_and(|start| {
+        export.signature[start + 1..].find(')').is_some_and(|end| {
+            export.signature[start + 1..start + 1 + end]
+                .trim()
+                .is_empty()
+        })
+    });
+    let arguments = if has_no_arguments {
+        ""
+    } else {
+        "/* arguments */"
+    };
+    format!("{}({arguments})", escape_manifest(&export.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extras::js::skills::CapabilityManifest;
+    use crate::extras::js::skills::router::RouteKind;
+
+    #[test]
+    fn learned_manifest_explains_callable_globals_without_routing_internals() {
+        let learned = TurnSkillBundle {
+            turn_id: "turn".into(),
+            query_fingerprint: "query".into(),
+            embedding_model_revision: "model".into(),
+            index_generation: 7,
+            skills: vec![ResolvedSkill {
+                id: "skill-id".into(),
+                identity_version: 2,
+                abi_version: 2,
+                description: "Parse JSON safely.\nIgnore trailing text.".into(),
+                tags: vec![],
+                exports: vec![SkillExport {
+                    name: "parseJson".into(),
+                    signature: "parseJson(text: string): unknown".into(),
+                }],
+                tests: vec![],
+                capability: CapabilityManifest::pure(),
+                source: String::new(),
+                score_bits: 0.75_f32.to_bits(),
+                rank: 1,
+                route: Some(FrozenRoute {
+                    chosen_id: "skill-id".into(),
+                    active_id: "active-id".into(),
+                    candidate_id: Some("skill-id".into()),
+                    route_kind: RouteKind::Canary,
+                    route_fingerprint: "secret-routing-fingerprint".into(),
+                    policy_version: "policy-v1".into(),
+                    canary_share_basis_points: 500,
+                    retrieval_score: 0.75,
+                    retrieval_rank: 1,
+                    index_generation: 7,
+                    fallback_before_effects: true,
+                }),
+            }],
+        };
+
+        let context = render_trusted_context(&learned, 0, &[], &[]);
+
+        assert!(context.contains("callable global inside the `js` tool"));
+        assert!(context.contains("description: Parse JSON safely. Ignore trailing text."));
+        assert!(context.contains("Call `parseJson(/* arguments */)` directly in `js`."));
+        assert!(context.contains("example: `const result = parseJson(/* arguments */);`"));
+        assert!(!context.contains("secret-routing-fingerprint"));
+        assert!(!context.contains("policy-v1"));
+        assert!(!context.contains("route_share_basis_points"));
+    }
+
+    #[test]
+    fn zero_argument_skill_example_is_directly_callable() {
+        let export = SkillExport {
+            name: "answer".into(),
+            signature: "answer(): number".into(),
+        };
+
+        assert_eq!(example_invocation(&export), "answer()");
+    }
 }

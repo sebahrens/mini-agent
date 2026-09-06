@@ -429,29 +429,12 @@ impl std::fmt::Display for SecurityMode {
     }
 }
 
-/// Parse a `%%mode=X` directive from the first line of a prompt file.
-/// Returns the mode string (e.g. "restrictive", "last_user_mode") if found.
-/// Also returns the content with the directive line stripped.
+/// Parse a `%%mode=X` directive from a prompt header. Prompt-mode directives
+/// may be composed with `%%agent=Y` in either order; all recognized header
+/// lines are stripped from the returned content.
 pub fn parse_prompt_mode(content: &str) -> (Option<&str>, &str) {
-    let Some(first) = content.lines().next() else {
-        return (None, content);
-    };
-    let trimmed = first.trim();
-    if let Some(mode_str) = trimmed.strip_prefix("%%mode=") {
-        let mode_str = mode_str.trim();
-        if mode_str.is_empty() {
-            return (None, content);
-        }
-        // Strip the first line from the content
-        let rest = if let Some(pos) = content.find('\n') {
-            &content[pos + 1..]
-        } else {
-            ""
-        };
-        (Some(mode_str), rest)
-    } else {
-        (None, content)
-    }
+    let directives = crate::context::prompts::parse_directives(content);
+    (directives.mode, directives.content)
 }
 
 /// Resolve the security mode requested by prompt `name`'s `%%mode=`
@@ -1072,6 +1055,7 @@ mod acp_permission_policy_tests {
             .call(WriteArgs {
                 path: target.to_string_lossy().into_owned(),
                 content: "must not be written".to_string(),
+                overwrite: false,
             })
             .await
             .expect_err("unanswered ACP Ask must deny the write");

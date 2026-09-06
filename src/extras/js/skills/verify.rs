@@ -296,6 +296,7 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         | WorkerError::Transport
         | WorkerError::Protocol
         | WorkerError::BuildMismatch
+        | WorkerError::PermissionPromptTimedOut
         | WorkerError::EffectOutcomeUnknown
         | WorkerError::StaleGeneration
         | WorkerError::IdentityExhausted

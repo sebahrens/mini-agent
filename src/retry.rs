@@ -33,6 +33,17 @@ pub fn simple_jitter(range_ms: u64) -> Duration {
 }
 
 pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
+    // Context overflow cannot recover without changing the request. Check the
+    // entire source chain before provider status or message fallbacks so token
+    // counts such as 213500 never masquerade as HTTP 500.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(candidate) = current {
+        if is_context_length_error_message(&candidate.to_string()) {
+            return false;
+        }
+        current = candidate.source();
+    }
+
     // Prefer Rig's preserved provider status over rendered-message heuristics.
     // In particular, Anthropic overloads can arrive as the non-standard 529
     // status.  A known 4xx response must not become retryable merely because
@@ -51,19 +62,27 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
     while let Some(e) = current {
         let msg = e.to_string();
 
-        if msg.contains("429")
-            || msg.contains("529")
-            || msg.contains("503")
-            || msg.contains("502")
-            || msg.contains("504")
-            || msg.contains("500")
+        if message_has_retryable_status(&msg) {
+            return true;
+        }
+
+        if let Some(io_error) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::BrokenPipe
+            )
         {
             return true;
         }
 
         let lower = msg.to_lowercase();
         if lower.contains("stream ended")
-            || lower.contains("connection")
+            || lower.contains("connection reset")
             || lower.contains("timeout")
             || lower.contains("timed out")
             || lower.contains("reset by peer")
@@ -85,6 +104,25 @@ pub fn is_retryable(error: &(dyn std::error::Error + 'static)) -> bool {
         current = e.source();
     }
     false
+}
+
+fn message_has_retryable_status(message: &str) -> bool {
+    let tokens = message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let retryable = |token: &str| matches!(token, "429" | "500" | "502" | "503" | "504" | "529");
+
+    tokens
+        .windows(2)
+        .any(|window| matches!(window[0].as_str(), "http" | "status") && retryable(&window[1]))
+        || tokens.windows(3).any(|window| {
+            matches!(
+                (window[0].as_str(), window[1].as_str()),
+                ("status", "code") | ("http", "status") | ("http", "error")
+            ) && retryable(&window[2])
+        })
 }
 
 fn provider_response_status(error: &(dyn std::error::Error + 'static)) -> Option<http::StatusCode> {
@@ -136,13 +174,37 @@ pub fn with_context_length_hint(message: &str) -> String {
 
 pub async fn retry_stream_chat<T, E, Fut, S>(
     config: &RetryConfig,
-    mut factory: impl FnMut() -> Fut,
+    factory: impl FnMut() -> Fut,
 ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<T, E>> + Send>>, E>
 where
     E: std::error::Error + Send + 'static,
     Fut: std::future::Future<Output = S>,
     S: futures::Stream<Item = Result<T, E>> + Send + Unpin + 'static,
     T: Send + 'static,
+{
+    retry_stream_chat_with(config, factory, |_| async {}).await
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryNotice {
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay: Duration,
+    pub error: String,
+}
+
+pub async fn retry_stream_chat_with<T, E, Fut, S, C, CFut>(
+    config: &RetryConfig,
+    mut factory: impl FnMut() -> Fut,
+    mut on_retry: C,
+) -> Result<Pin<Box<dyn futures::Stream<Item = Result<T, E>> + Send>>, E>
+where
+    E: std::error::Error + Send + 'static,
+    Fut: std::future::Future<Output = S>,
+    S: futures::Stream<Item = Result<T, E>> + Send + Unpin + 'static,
+    T: Send + 'static,
+    C: FnMut(RetryNotice) -> CFut,
+    CFut: std::future::Future<Output = ()>,
 {
     let mut attempt: usize = 0;
     let mut backoff = Duration::from_millis(config.initial_backoff_ms);
@@ -168,6 +230,13 @@ where
                     "retryable error on first stream item (attempt {attempt}/{}): {e}",
                     config.max_attempts
                 );
+                on_retry(RetryNotice {
+                    attempt,
+                    max_attempts: config.max_attempts,
+                    delay,
+                    error: e.to_string(),
+                })
+                .await;
                 tokio::time::sleep(delay).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
@@ -180,6 +249,7 @@ where
 mod tests {
     use super::*;
     use std::io;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_retry_config_defaults() {
@@ -229,6 +299,40 @@ mod tests {
         let err = io::Error::other(r#"Invalid status code 529: {"type":"overloaded_error"}"#);
 
         assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn context_length_token_counts_never_trigger_status_fallback() {
+        let err =
+            io::Error::other("prompt is too long: 213500 tokens > 200000 maximum context length");
+
+        assert!(!is_retryable(&err));
+    }
+
+    #[test]
+    fn unrelated_digits_and_connection_words_are_not_retryable() {
+        for message in [
+            "request id 500 was rejected by policy",
+            "MCP connection refused: authentication required",
+            "connection configuration is invalid",
+            "processed 1500 input tokens",
+        ] {
+            let err = io::Error::other(message);
+            assert!(!is_retryable(&err), "unexpected retry for: {message}");
+        }
+    }
+
+    #[test]
+    fn structured_status_message_fallbacks_remain_retryable() {
+        for message in [
+            "HTTP 503 Service Unavailable",
+            "HTTP error 502 from upstream",
+            "response status 504",
+            "invalid status code 529",
+        ] {
+            let err = io::Error::other(message);
+            assert!(is_retryable(&err), "missed retryable status: {message}");
+        }
     }
 
     #[test]
@@ -302,5 +406,48 @@ mod tests {
             with_context_length_hint("permission denied"),
             "permission denied"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_retry_primitive_emits_one_notice_per_scheduled_retry() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let attempt_counter = Arc::clone(&attempts);
+        let observed = Arc::clone(&notices);
+
+        let mut stream = retry_stream_chat_with(
+            &config,
+            move || {
+                let attempt = attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        futures::stream::iter(vec![Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("attempt {attempt}"),
+                        ))])
+                    } else {
+                        futures::stream::iter(vec![Ok::<_, io::Error>("done")])
+                    }
+                }
+            },
+            move |notice| {
+                let observed = Arc::clone(&observed);
+                async move { observed.lock().unwrap().push(notice) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), "done");
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].attempt, 1);
+        assert_eq!(notices[1].attempt, 2);
+        assert!(notices.iter().all(|notice| notice.max_attempts == 3));
     }
 }

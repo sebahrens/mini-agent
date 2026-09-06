@@ -6,6 +6,7 @@ pub mod host;
 pub(crate) mod protocol;
 #[cfg(feature = "skills")]
 pub(crate) mod realm;
+pub(crate) mod session;
 #[cfg(feature = "skills")]
 pub mod skills;
 pub(crate) mod supervisor;

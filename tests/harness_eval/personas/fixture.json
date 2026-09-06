@@ -1,0 +1,66 @@
+{
+  "repository_files": {
+    "src/lib.rs": "pub async fn run(input: &str) { std::thread::sleep(std::time::Duration::from_secs(1)); unsafe { std::ptr::read(input.as_ptr()) }; std::process::Command::new(\"sh\").arg(\"-c\").arg(input).spawn().unwrap(); }\n",
+    "app.py": "import time\nasync def handle():\n    time.sleep(1)\n",
+    "src/index.ts": "export function parse(value: unknown): Config { return value as Config; }\n",
+    "editors/vscode/extension.ts": "panel.webview.html = `<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'unsafe-inline'\"><script>run()</script>`;\n",
+    "infra/main.bicep": "resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = { name: 'example' properties: { publicNetworkAccess: 'Enabled' } }\n",
+    "mapplet.xml": "<TRANSFORMATION TYPE=\"Lookup Procedure\"><TABLEATTRIBUTE NAME=\"Lookup policy on multiple match\" VALUE=\"Use Any Value\"/></TRANSFORMATION>\n"
+  },
+  "cases": [
+    {
+      "agent_type": "rust-maintainer",
+      "prompt": "Inspect src/lib.rs for a task-relevant correctness risk.",
+      "expected_finding": "unchecked production panic",
+      "response": "## Findings\n- [confidence: high] unchecked production panic at Command::spawn().unwrap().\n\n## Unverified\n- Runtime behavior was not executed.\n\n## Coverage\n- Covered: src/lib.rs panic sites.\n- Skipped: unrelated lifecycle checks."
+    },
+    {
+      "agent_type": "rust-async-concurrency",
+      "prompt": "Inspect the async function in src/lib.rs.",
+      "expected_finding": "blocking sleep inside async task",
+      "response": "## Findings\n- [confidence: high] blocking sleep inside async task stalls its executor worker.\n\n## Unverified\n- Runtime flavor was not exercised.\n\n## Coverage\n- Covered: run future body.\n- Skipped: unrelated channels and tasks."
+    },
+    {
+      "agent_type": "rust-unsafe-code-audit",
+      "prompt": "Audit the unsafe operation in src/lib.rs.",
+      "expected_finding": "unsafe block has no SAFETY comment",
+      "response": "## Findings\n- [confidence: high] unsafe block has no SAFETY comment and reads a u8 through a pointer derived from input.\n\n## Unverified\n- Miri was not run.\n\n## Coverage\n- Covered: the unsafe block in src/lib.rs.\n- Skipped: unrelated safe code."
+    },
+    {
+      "agent_type": "rust-security-review",
+      "prompt": "Trace untrusted input to process creation in src/lib.rs.",
+      "expected_finding": "shell command injection",
+      "response": "## Findings\n- [confidence: high] shell command injection: input reaches sh -c without validation.\n\n## Unverified\n- Caller control of input was inferred from the public parameter.\n\n## Coverage\n- Covered: input-to-Command taint path.\n- Skipped: unsafe soundness."
+    },
+    {
+      "agent_type": "python-maintainer",
+      "prompt": "Inspect app.py for async correctness.",
+      "expected_finding": "blocking sleep inside async function",
+      "response": "## Findings\n- [confidence: high] blocking sleep inside async function can stall the event loop.\n\n## Unverified\n- No runtime test was executed.\n\n## Coverage\n- Covered: app.py async body.\n- Skipped: packaging and dependencies."
+    },
+    {
+      "agent_type": "node-typescript-maintainer",
+      "prompt": "Inspect src/index.ts for type-boundary risk.",
+      "expected_finding": "unchecked unknown-to-Config cast",
+      "response": "## Findings\n- [confidence: high] unchecked unknown-to-Config cast bypasses runtime validation.\n\n## Unverified\n- tsconfig strictness was not present in the fixture.\n\n## Coverage\n- Covered: exported parse boundary.\n- Skipped: build and package scripts."
+    },
+    {
+      "agent_type": "vscode-extension-developer",
+      "prompt": "Inspect the fixture webview CSP.",
+      "expected_finding": "unsafe-inline webview script policy",
+      "response": "## Findings\n- [confidence: high] unsafe-inline webview script policy permits injected inline script execution.\n\n## Unverified\n- Webview local-resource roots were not in the fixture.\n\n## Coverage\n- Covered: generated CSP and script tag.\n- Skipped: activation and packaging."
+    },
+    {
+      "agent_type": "azure-cloud-architect",
+      "prompt": "Inspect infra/main.bicep for its network trust boundary.",
+      "expected_finding": "public storage network access",
+      "response": "## Findings\n- [confidence: high] public storage network access leaves the data plane reachable outside a private endpoint boundary.\n\n## Unverified\n- Required client networks and residency are unknown.\n\n## Coverage\n- Covered: storage network property.\n- Skipped: cost, regions, and operations."
+    },
+    {
+      "agent_type": "informatica-mapplet-to-fabric-sql",
+      "prompt": "Inspect mapplet.xml for deterministic lookup semantics.",
+      "expected_finding": "Use Any Value lookup is nondeterministic",
+      "response": "## Findings\n- [confidence: high] Use Any Value lookup is nondeterministic and cannot be lowered to a plain join faithfully.\n\n## Unverified\n- A deterministic source ordering key was not supplied.\n\n## Coverage\n- Covered: lookup multiple-match policy.\n- Skipped: other transformations and SQL generation."
+    }
+  ]
+}

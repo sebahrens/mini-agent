@@ -1,4 +1,5 @@
 pub(crate) mod bash;
+pub(crate) mod concurrency;
 pub(crate) mod crc;
 pub(crate) mod edit;
 pub(crate) mod find_files;
@@ -77,13 +78,15 @@ pub(crate) struct ReadTracker {
 struct ReadVersion {
     len: u64,
     modified: Option<std::time::SystemTime>,
+    served_content_crc32: u32,
 }
 
 impl ReadVersion {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    fn new(metadata: &std::fs::Metadata, served_content_crc32: u32) -> Self {
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            served_content_crc32,
         }
     }
 }
@@ -116,11 +119,12 @@ impl ReadTracker {
         offset: usize,
         limit: usize,
         metadata: &std::fs::Metadata,
+        served_content_crc32: u32,
     ) -> Option<String> {
         if !self.deny_repeated_reads {
             return None;
         }
-        let version = ReadVersion::from_metadata(metadata);
+        let version = ReadVersion::new(metadata, served_content_crc32);
         let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
         if !tracked.iter().any(|entry| {
             entry.path == path
@@ -132,7 +136,7 @@ impl ReadTracker {
         }
         let end = offset + limit;
         Some(format!(
-            "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Use the previous result or read a different section.",
+            "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Reuse the earlier result if it is still available, or read a different section by changing offset or limit.",
             offset + 1,
             if end > 0 { end } else { offset + 1 }
         ))
@@ -144,10 +148,8 @@ impl ReadTracker {
         offset: usize,
         limit: usize,
         metadata: &std::fs::Metadata,
+        served_content_crc32: u32,
     ) {
-        if !self.deny_repeated_reads {
-            return;
-        }
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
         tracked
             .retain(|entry| entry.path != path || entry.offset != offset || entry.limit != limit);
@@ -155,16 +157,36 @@ impl ReadTracker {
             path: path.to_string(),
             offset,
             limit,
-            version: ReadVersion::from_metadata(metadata),
+            version: ReadVersion::new(metadata, served_content_crc32),
         });
+    }
+
+    pub(crate) fn permits_full_overwrite(
+        &self,
+        path: &str,
+        metadata: &std::fs::Metadata,
+        content_crc32: u32,
+        total_lines: usize,
+    ) -> bool {
+        let version = ReadVersion::new(metadata, content_crc32);
+        self.tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|entry| {
+                entry.path == path
+                    && entry.offset == 0
+                    && entry.limit >= total_lines
+                    && entry.version == version
+            })
     }
 
     #[cfg(test)]
     pub(crate) fn track_read(&self, path: &str, offset: usize, limit: usize) -> Option<String> {
         let metadata = std::fs::metadata(".").expect("test process has a current directory");
-        let blocked = self.check_read(path, offset, limit, &metadata);
+        let blocked = self.check_read(path, offset, limit, &metadata, 0);
         if blocked.is_none() {
-            self.record_read(path, offset, limit, &metadata);
+            self.record_read(path, offset, limit, &metadata, 0);
         }
         blocked
     }
@@ -172,6 +194,15 @@ impl ReadTracker {
     pub(crate) fn untrack_read_path(&self, path: &str) {
         let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
         tracked.retain(|entry| entry.path != path);
+    }
+
+    /// Forget repeated-read history after a conversation mutation changes
+    /// which prior tool results remain visible to the model.
+    pub(crate) fn clear(&self) {
+        self.tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -193,7 +224,7 @@ pub use find_files::FindFilesTool;
 pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 pub use read::ReadTool;
-pub use todo::WriteTodoList;
+pub use todo::{ReadTodoList, TodoStore, WriteTodoList};
 pub use write::WriteTool;
 
 use std::io;
@@ -225,7 +256,11 @@ impl From<serde_json::Error> for ToolError {
 }
 
 pub fn is_skip_dir(name: &str) -> bool {
-    matches!(name, "node_modules" | "target")
+    matches!(name, "node_modules" | "target") || is_vcs_metadata(name)
+}
+
+pub fn is_vcs_metadata(name: &str) -> bool {
+    matches!(name, ".git" | ".hg" | ".svn" | ".bzr")
 }
 
 #[derive(Deserialize)]
@@ -239,11 +274,15 @@ pub struct ReadArgs {
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Deserialize)]
 pub struct EditArgs {
     pub path: String,
+    #[serde(default)]
+    pub replace_all: bool,
     #[serde(default)]
     pub block: Option<String>,
     #[serde(default)]
@@ -294,6 +333,12 @@ pub struct GrepArgs {
     pub path: Option<String>,
     pub include: Option<String>,
     pub context_lines: Option<usize>,
+    #[serde(default)]
+    pub case_insensitive: bool,
+    #[serde(default)]
+    pub files_only: bool,
+    #[serde(default)]
+    pub count: bool,
 }
 
 #[derive(Deserialize)]

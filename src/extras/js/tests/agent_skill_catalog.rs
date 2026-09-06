@@ -137,6 +137,32 @@ fn agent_skill_catalog_active_digest_switch_is_atomic_and_deterministic() {
 }
 
 #[test]
+fn catalog_refresh_if_changed_skips_stable_trees_and_detects_imports() {
+    let temp = TempPaths::new();
+    let source = write_skill(&temp, "v1");
+    let first = import_agent_skill(&source, &temp.paths).unwrap();
+    let embedder = Embedder::new().unwrap();
+    let mut catalog = AgentSkillCatalog::new(&temp.paths);
+    let initial = catalog.refresh(&embedder).unwrap();
+    assert_eq!(initial.generation(), 1);
+    assert!(catalog.refresh_if_changed(&embedder).unwrap().is_none());
+
+    fs::write(
+        source.join("SKILL.md"),
+        b"---\nname: review-code\ndescription: Reviews imported Rust changes v2.\n---\n\n# V2\n",
+    )
+    .unwrap();
+    let second = import_agent_skill(&source, &temp.paths).unwrap();
+    assert_ne!(first.identity.digest, second.identity.digest);
+    let refreshed = catalog
+        .refresh_if_changed(&embedder)
+        .unwrap()
+        .expect("new import must refresh the catalog");
+    assert_eq!(refreshed.generation(), 2);
+    assert!(catalog.refresh_if_changed(&embedder).unwrap().is_none());
+}
+
+#[test]
 fn agent_skill_progressive_disclosure_rejects_unmanifested_resources() {
     let temp = TempPaths::new();
     let source = write_skill(&temp, "v1");

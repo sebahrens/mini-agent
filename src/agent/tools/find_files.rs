@@ -1,15 +1,19 @@
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
+use globset::{GlobBuilder, GlobMatcher};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use regex::Regex;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
     AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, check_perm_bound_path,
-    check_perm_path, combine_coaching, is_skip_dir,
+    check_perm_path, combine_coaching, is_skip_dir, is_vcs_metadata,
 };
 
 fn path_changed_error(path: &Path) -> std::io::Error {
@@ -155,6 +159,47 @@ mod bound_platform {
         // SAFETY: fstatat succeeded and initialized the value.
         let metadata = unsafe { metadata.assume_init() };
         metadata.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+
+    pub(super) fn read_link(
+        directory: &File,
+        name: &OsStr,
+        _approved_root: &Path,
+    ) -> std::io::Result<OsString> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component contains NUL",
+            )
+        })?;
+        let mut capacity = 256usize;
+        loop {
+            let mut buffer = vec![0u8; capacity];
+            // SAFETY: the directory descriptor and NUL-terminated name are
+            // live, and `buffer` is writable for its declared capacity.
+            let length = unsafe {
+                libc::readlinkat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if length < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let length = length as usize;
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(OsString::from_vec(buffer));
+            }
+            capacity = capacity
+                .checked_mul(2)
+                .filter(|size| *size <= 64 * 1024)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "link target is too long")
+                })?;
+        }
     }
 
     pub(super) struct DirectoryReader {
@@ -433,6 +478,14 @@ mod bound_platform {
         false
     }
 
+    pub(super) fn read_link(
+        _directory: &File,
+        name: &OsStr,
+        approved_root: &Path,
+    ) -> std::io::Result<OsString> {
+        std::fs::read_link(approved_root.join(name)).map(|target| target.into_os_string())
+    }
+
     pub(super) fn is_link_metadata(metadata: &std::fs::Metadata) -> bool {
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
@@ -481,25 +534,75 @@ mod bound_platform {
         false
     }
 
+    pub(super) fn read_link(
+        _directory: &File,
+        _name: &OsStr,
+        _approved_root: &Path,
+    ) -> std::io::Result<OsString> {
+        Err(unsupported())
+    }
+
     pub(super) fn is_link_metadata(_metadata: &std::fs::Metadata) -> bool {
         false
     }
 }
 
-pub(super) struct BoundFile {
-    pub(super) path: PathBuf,
-    pub(super) file_name: OsString,
-    pub(super) file: File,
-    pub(super) metadata: std::fs::Metadata,
+pub(crate) struct BoundFile {
+    pub(crate) path: PathBuf,
+    pub(crate) file_name: OsString,
+    pub(crate) file: File,
+    pub(crate) metadata: std::fs::Metadata,
 }
 
-pub(super) struct BoundDirectory {
+pub(crate) struct BoundDirectory {
     approved_root: PathBuf,
     root: File,
 }
 
+#[derive(Clone, Default)]
+struct IgnoreChain(Option<Arc<IgnoreChainNode>>);
+
+struct IgnoreChainNode {
+    parent: Option<Arc<IgnoreChainNode>>,
+    matchers: Arc<[Gitignore]>,
+}
+
+impl IgnoreChain {
+    fn append(self, matchers: impl Into<Arc<[Gitignore]>>) -> Self {
+        let matchers = matchers.into();
+        if matchers.is_empty() {
+            return self;
+        }
+        Self(Some(Arc::new(IgnoreChainNode {
+            parent: self.0,
+            matchers,
+        })))
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct IgnoreSourceStamp {
+    source: PathBuf,
+    length: Option<u64>,
+    modified: Option<SystemTime>,
+    is_file: bool,
+}
+
+struct ParentIgnoreCacheEntry {
+    stamps: Vec<IgnoreSourceStamp>,
+    matchers: Arc<[Gitignore]>,
+}
+
+const MAX_PARENT_IGNORE_CACHE_ENTRIES: usize = 64;
+static PARENT_IGNORE_CACHE: LazyLock<Mutex<HashMap<PathBuf, ParentIgnoreCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl BoundDirectory {
-    pub(super) fn open(
+    pub(crate) fn approved_root(&self) -> &Path {
+        &self.approved_root
+    }
+
+    pub(crate) fn open(
         approved_root: &Path,
         approved_metadata: &crate::fs::CheckedMetadata,
     ) -> std::io::Result<Self> {
@@ -521,7 +624,7 @@ impl BoundDirectory {
         Self::from_file(approved_root, root)
     }
 
-    pub(super) fn from_file(approved_root: &Path, root: File) -> std::io::Result<Self> {
+    pub(crate) fn from_file(approved_root: &Path, root: File) -> std::io::Result<Self> {
         let metadata = root.metadata()?;
         if !metadata.is_dir() || !bound_platform::is_safe_entry(&metadata) {
             return Err(path_changed_error(approved_root));
@@ -532,24 +635,26 @@ impl BoundDirectory {
         })
     }
 
-    pub(super) fn walker(&self) -> std::io::Result<BoundWalker> {
+    pub(crate) fn walker(&self) -> std::io::Result<BoundWalker> {
         BoundWalker::new(self.root.try_clone()?, self.approved_root.clone())
     }
 
     pub(super) fn list_entries(&self) -> std::io::Result<Vec<BoundListEntry>> {
-        let mut matchers = Vec::new();
+        let mut chain = IgnoreChain::default();
         let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
         if !global.is_empty() {
-            matchers.push(global);
+            chain = chain.append(vec![global]);
         }
-        matchers.extend(parent_ignore_matchers(&self.approved_root));
+        chain = chain.append(parent_ignore_matchers(&self.approved_root));
+        let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
             if let Some(matcher) =
                 local_ignore_matcher(&self.root, Path::new(""), &self.approved_root, ignore_name)
             {
-                matchers.push(matcher);
+                local_matchers.push(matcher);
             }
         }
+        chain = chain.append(local_matchers);
         if let Ok(exclude) = open_relative(&self.root, Path::new(".git/info/exclude"))
             && let Some(matcher) = ignore_matcher(
                 exclude,
@@ -557,17 +662,26 @@ impl BoundDirectory {
                 self.approved_root.join(".git/info/exclude"),
             )
         {
-            matchers.push(matcher);
+            chain = chain.append(vec![matcher]);
         }
 
         let mut entries = Vec::new();
         for name in bound_platform::read_directory(&self.root)? {
+            if is_vcs_metadata(name.to_str().unwrap_or("")) {
+                continue;
+            }
             let child = match bound_platform::open_child(&self.root, &name) {
                 Ok(child) => child,
                 Err(_) if bound_platform::is_link(&self.root, &name) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&matchers, &path, false) {
+                    if !is_ignored(&chain, &path, false) {
                         entries.push(BoundListEntry {
+                            link_target: bound_platform::read_link(
+                                &self.root,
+                                &name,
+                                &self.approved_root,
+                            )
+                            .ok(),
                             file_name: name,
                             is_directory: false,
                             is_link: true,
@@ -582,8 +696,14 @@ impl BoundDirectory {
             let metadata = match child.metadata() {
                 Ok(metadata) if bound_platform::is_link_metadata(&metadata) => {
                     let path = self.approved_root.join(&name);
-                    if !is_ignored(&matchers, &path, false) {
+                    if !is_ignored(&chain, &path, false) {
                         entries.push(BoundListEntry {
+                            link_target: bound_platform::read_link(
+                                &self.root,
+                                &name,
+                                &self.approved_root,
+                            )
+                            .ok(),
                             file_name: name,
                             is_directory: false,
                             is_link: true,
@@ -601,7 +721,7 @@ impl BoundDirectory {
             if is_directory && is_skip_dir(name.to_str().unwrap_or("")) {
                 continue;
             }
-            if is_ignored(&matchers, &path, is_directory) {
+            if is_ignored(&chain, &path, is_directory) {
                 continue;
             }
             let child_count = if is_directory {
@@ -612,6 +732,7 @@ impl BoundDirectory {
                 0
             };
             entries.push(BoundListEntry {
+                link_target: None,
                 file_name: name,
                 is_directory,
                 is_link: false,
@@ -621,10 +742,70 @@ impl BoundDirectory {
         }
         Ok(entries)
     }
+
+    pub(crate) fn list_entries_bounded(
+        &self,
+        max_entries: usize,
+    ) -> std::io::Result<(Vec<BoundDiscoveryEntry>, bool)> {
+        let mut chain = IgnoreChain::default();
+        let (global, _) = GitignoreBuilder::new(&self.approved_root).build_global();
+        if !global.is_empty() {
+            chain = chain.append(vec![global]);
+        }
+        chain = chain.append(parent_ignore_matchers(&self.approved_root));
+        let mut local_matchers = Vec::new();
+        for ignore_name in [".gitignore", ".ignore"] {
+            if let Some(matcher) =
+                local_ignore_matcher(&self.root, Path::new(""), &self.approved_root, ignore_name)
+            {
+                local_matchers.push(matcher);
+            }
+        }
+        chain = chain.append(local_matchers);
+
+        let mut entries = Vec::with_capacity(max_entries.min(64));
+        for name in bound_platform::read_directory(&self.root)? {
+            if is_vcs_metadata(name.to_str().unwrap_or("")) {
+                continue;
+            }
+            let child = match bound_platform::open_child(&self.root, &name) {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            let metadata = match child.metadata() {
+                Ok(metadata) if bound_platform::is_safe_entry(&metadata) => metadata,
+                _ => continue,
+            };
+            let path = self.approved_root.join(&name);
+            let is_directory = metadata.is_dir();
+            if (!is_directory && !metadata.is_file())
+                || (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
+                || is_ignored(&chain, &path, is_directory)
+            {
+                continue;
+            }
+            if entries.len() == max_entries {
+                return Ok((entries, true));
+            }
+            entries.push(BoundDiscoveryEntry {
+                file_name: name,
+                is_directory,
+                size: if is_directory { 0 } else { metadata.len() },
+            });
+        }
+        Ok((entries, false))
+    }
+}
+
+pub(crate) struct BoundDiscoveryEntry {
+    pub(crate) file_name: OsString,
+    pub(crate) is_directory: bool,
+    pub(crate) size: u64,
 }
 
 pub(super) struct BoundListEntry {
     pub(super) file_name: OsString,
+    pub(super) link_target: Option<OsString>,
     pub(super) is_directory: bool,
     pub(super) is_link: bool,
     pub(super) size: u64,
@@ -635,23 +816,25 @@ struct DirectoryFrame {
     directory: File,
     relative_path: PathBuf,
     names: bound_platform::DirectoryReader,
-    matchers: Vec<Gitignore>,
+    matchers: IgnoreChain,
 }
 
 impl DirectoryFrame {
     fn new(
         directory: File,
         relative_path: PathBuf,
-        mut matchers: Vec<Gitignore>,
+        mut matchers: IgnoreChain,
         approved_root: &Path,
     ) -> std::io::Result<Self> {
+        let mut local_matchers = Vec::new();
         for ignore_name in [".gitignore", ".ignore"] {
             if let Some(matcher) =
                 local_ignore_matcher(&directory, &relative_path, approved_root, ignore_name)
             {
-                matchers.push(matcher);
+                local_matchers.push(matcher);
             }
         }
+        matchers = matchers.append(local_matchers);
         let names = bound_platform::read_directory(&directory)?;
         Ok(Self {
             directory,
@@ -662,19 +845,19 @@ impl DirectoryFrame {
     }
 }
 
-pub(super) struct BoundWalker {
+pub(crate) struct BoundWalker {
     approved_root: PathBuf,
     stack: Vec<DirectoryFrame>,
 }
 
 impl BoundWalker {
     fn new(root: File, approved_root: PathBuf) -> std::io::Result<Self> {
-        let mut matchers = Vec::new();
+        let mut matchers = IgnoreChain::default();
         let (global, _) = GitignoreBuilder::new(&approved_root).build_global();
         if !global.is_empty() {
-            matchers.push(global);
+            matchers = matchers.append(vec![global]);
         }
-        matchers.extend(parent_ignore_matchers(&approved_root));
+        matchers = matchers.append(parent_ignore_matchers(&approved_root));
         if let Ok(exclude) = open_relative(&root, Path::new(".git/info/exclude"))
             && let Some(matcher) = ignore_matcher(
                 exclude,
@@ -682,7 +865,7 @@ impl BoundWalker {
                 approved_root.join(".git/info/exclude"),
             )
         {
-            matchers.push(matcher);
+            matchers = matchers.append(vec![matcher]);
         }
         let frame = DirectoryFrame::new(root, PathBuf::new(), matchers, &approved_root)?;
         Ok(Self {
@@ -702,6 +885,9 @@ impl Iterator for BoundWalker {
                 self.stack.pop();
                 continue;
             };
+            if is_vcs_metadata(name.to_str().unwrap_or("")) {
+                continue;
+            }
             let relative_path = frame.relative_path.join(&name);
             let child = match bound_platform::open_child(&frame.directory, &name) {
                 Ok(child) => child,
@@ -769,26 +955,83 @@ fn local_ignore_matcher(
     )
 }
 
-fn parent_ignore_matchers(approved_root: &Path) -> Vec<Gitignore> {
+fn parent_ignore_sources(approved_root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut directories: Vec<&Path> = approved_root.ancestors().skip(1).collect();
     directories.reverse();
-    let mut matchers = Vec::new();
+    let mut sources = Vec::with_capacity(directories.len().saturating_mul(3));
     for directory in directories {
-        let exclude_path = directory.join(".git/info/exclude");
-        if let Ok(file) = File::open(&exclude_path)
-            && let Some(matcher) = ignore_matcher(file, directory, exclude_path)
-        {
-            matchers.push(matcher);
-        }
+        sources.push((directory.to_path_buf(), directory.join(".git/info/exclude")));
         for ignore_name in [".gitignore", ".ignore"] {
-            let source = directory.join(ignore_name);
-            if let Ok(file) = File::open(&source)
-                && let Some(matcher) = ignore_matcher(file, directory, source)
-            {
-                matchers.push(matcher);
-            }
+            sources.push((directory.to_path_buf(), directory.join(ignore_name)));
         }
     }
+    sources
+}
+
+fn parent_ignore_stamps(sources: &[(PathBuf, PathBuf)]) -> Vec<IgnoreSourceStamp> {
+    sources
+        .iter()
+        .map(|(_, source)| match std::fs::metadata(source) {
+            Ok(metadata) => IgnoreSourceStamp {
+                source: source.clone(),
+                length: Some(metadata.len()),
+                modified: metadata.modified().ok(),
+                is_file: metadata.is_file(),
+            },
+            Err(_) => IgnoreSourceStamp {
+                source: source.clone(),
+                length: None,
+                modified: None,
+                is_file: false,
+            },
+        })
+        .collect()
+}
+
+fn parse_parent_ignore_matchers(sources: &[(PathBuf, PathBuf)]) -> Arc<[Gitignore]> {
+    sources
+        .iter()
+        .filter_map(|(directory, source)| {
+            let file = File::open(source).ok()?;
+            ignore_matcher(file, directory, source.clone())
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn parent_ignore_matchers(approved_root: &Path) -> Arc<[Gitignore]> {
+    let sources = parent_ignore_sources(approved_root);
+    let mut stamps = parent_ignore_stamps(&sources);
+    if let Some(matchers) = PARENT_IGNORE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(approved_root)
+        .filter(|entry| entry.stamps == stamps)
+        .map(|entry| Arc::clone(&entry.matchers))
+    {
+        return matchers;
+    }
+
+    let mut matchers = parse_parent_ignore_matchers(&sources);
+    let after_parse = parent_ignore_stamps(&sources);
+    if after_parse != stamps {
+        stamps = after_parse;
+        matchers = parse_parent_ignore_matchers(&sources);
+    }
+
+    let mut cache = PARENT_IGNORE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= MAX_PARENT_IGNORE_CACHE_ENTRIES && !cache.contains_key(approved_root) {
+        cache.clear();
+    }
+    cache.insert(
+        approved_root.to_path_buf(),
+        ParentIgnoreCacheEntry {
+            stamps,
+            matchers: Arc::clone(&matchers),
+        },
+    );
     matchers
 }
 
@@ -805,17 +1048,21 @@ fn ignore_matcher(mut file: File, root: &Path, source: PathBuf) -> Option<Gitign
     builder.build().ok()
 }
 
-fn is_ignored(matchers: &[Gitignore], path: &Path, is_directory: bool) -> bool {
-    let mut ignored = false;
-    for matcher in matchers {
-        let matched = matcher.matched(path, is_directory);
-        if matched.is_ignore() {
-            ignored = true;
-        } else if matched.is_whitelist() {
-            ignored = false;
+fn is_ignored(matchers: &IgnoreChain, path: &Path, is_directory: bool) -> bool {
+    let mut node = matchers.0.as_deref();
+    while let Some(current) = node {
+        for matcher in current.matchers.iter().rev() {
+            let matched = matcher.matched(path, is_directory);
+            if matched.is_ignore() {
+                return true;
+            }
+            if matched.is_whitelist() {
+                return false;
+            }
         }
+        node = current.parent.as_deref();
     }
-    ignored
+    false
 }
 
 pub struct FindFilesTool {
@@ -823,6 +1070,35 @@ pub struct FindFilesTool {
     pub ask_tx: Option<AskSender>,
     pub max_results: u64,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
+}
+
+enum FindFilesPattern {
+    FileNameRegex(Regex),
+    RelativePathGlob(GlobMatcher),
+}
+
+impl FindFilesPattern {
+    fn compile(pattern: &str) -> Result<Self, ToolError> {
+        match Regex::new(pattern) {
+            Ok(regex) => Ok(Self::FileNameRegex(regex)),
+            Err(regex_error) => GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map(|glob| Self::RelativePathGlob(glob.compile_matcher()))
+                .map_err(|glob_error| {
+                    ToolError::Msg(format!(
+                        "Invalid filename regex or relative-path glob: regex: {regex_error}; glob: {glob_error}"
+                    ))
+                }),
+        }
+    }
+
+    fn is_match(&self, file_name: &str, relative_path: &Path) -> bool {
+        match self {
+            Self::FileNameRegex(regex) => regex.is_match(file_name),
+            Self::RelativePathGlob(glob) => glob.is_match(relative_path),
+        }
+    }
 }
 
 impl FindFilesTool {
@@ -856,7 +1132,7 @@ impl Tool for FindFilesTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Recursively find files matching a regex pattern in their filename. Respects .gitignore. Skips node_modules and target.".to_string()
+        "Recursively find files using a filename regex or, when the value is not valid regex, a relative-path glob such as `**/*.rs`. Respects .gitignore. Returns the deterministic lexicographically first results when capped. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -865,7 +1141,7 @@ impl Tool for FindFilesTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex pattern to match file names against"
+                    "description": "Filename regex, or a relative-path glob such as **/*.rs when not valid regex"
                 },
                 "path": {
                     "type": "string",
@@ -885,8 +1161,7 @@ impl Tool for FindFilesTool {
         let coaching =
             check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
 
-        let re = Regex::new(&args.pattern)
-            .map_err(|e| ToolError::Msg(format!("Invalid regex: {}", e)))?;
+        let pattern = FindFilesPattern::compile(&args.pattern)?;
 
         let requested_path = args.path.as_deref().unwrap_or(".");
         if requested_path.is_empty() {
@@ -928,23 +1203,40 @@ impl Tool for FindFilesTool {
         };
         let coaching = combine_coaching(coaching, path_coaching);
 
-        let walker = bound_directory.walker()?;
+        let max_results = usize::try_from(self.max_results).unwrap_or(usize::MAX);
+        let (first_results, total_matches) =
+            crate::agent::runner::spawn_blocking_scoped(move || -> Result<_, ToolError> {
+                let traversal_root = bound_directory.approved_root().to_path_buf();
+                let walker = bound_directory.walker()?;
+                let mut first_results = BinaryHeap::with_capacity(max_results.min(64));
+                let mut total_matches = 0_usize;
 
-        let max_results = self.max_results as usize;
-        let mut results: Vec<String> = Vec::with_capacity(max_results.saturating_add(1).min(64));
-        let mut limit_hit = false;
-
-        for entry in walker {
-            let fname = entry.file_name.to_string_lossy();
-            if re.is_match(&fname) {
-                results.push(entry.path.to_string_lossy().to_string());
-                if results.len() > max_results {
-                    limit_hit = true;
-                    break;
+                for entry in walker {
+                    let fname = entry.file_name.to_string_lossy();
+                    let relative_path = entry
+                        .path
+                        .strip_prefix(&traversal_root)
+                        .unwrap_or(&entry.path);
+                    if pattern.is_match(&fname, relative_path) {
+                        total_matches = total_matches.saturating_add(1);
+                        let path = entry.path.to_string_lossy().to_string();
+                        if first_results.len() < max_results {
+                            first_results.push(path);
+                        } else if let Some(current_last) = first_results.peek()
+                            && path < *current_last
+                        {
+                            first_results.pop();
+                            first_results.push(path);
+                        }
+                    }
                 }
-            }
-        }
-        if results.is_empty() {
+                Ok((first_results, total_matches))
+            })
+            .await
+            .map_err(|error| {
+                ToolError::Msg(format!("find_files directory walker failed: {error}"))
+            })??;
+        if total_matches == 0 {
             let msg = "No files found matching the pattern.".to_string();
             return Ok(match coaching {
                 Some(c) => format!("{}\n\n{}", c, msg),
@@ -952,27 +1244,26 @@ impl Tool for FindFilesTool {
             });
         }
 
-        if limit_hit {
-            results.truncate(max_results);
-        }
+        let limit_hit = total_matches > max_results;
+        let mut results = first_results.into_vec();
         results.sort();
 
-        let total = results.len();
         let result = if limit_hit {
             format!(
-                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — unknown number of additional entries; narrow the pattern or path]",
-                total,
+                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — {} additional entries; narrow the pattern or path]",
+                total_matches,
                 max_results,
-                results[..max_results].join("\n"),
-                max_results
+                results.join("\n"),
+                max_results,
+                total_matches - max_results,
             )
         } else {
-            format!("{} files found:\n{}", total, results.join("\n"))
+            format!("{} files found:\n{}", total_matches, results.join("\n"))
         };
 
         tracing::debug!(
             "tool find_files done: results={}, truncated={}",
-            total,
+            total_matches,
             limit_hit,
         );
         Ok(match coaching {
@@ -1424,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_unknown_remaining_count_when_result_limit_is_hit() {
+    async fn reports_exact_remaining_count_when_result_limit_is_hit() {
         let dir = TempDir::new("truncation");
         for index in 0..101 {
             std::fs::write(dir.path().join(format!("match_{index:03}.txt")), "").unwrap();
@@ -1439,8 +1730,7 @@ mod tests {
             .unwrap();
 
         assert!(output.contains("truncated after 100 entries"));
-        assert!(output.contains("unknown number of additional entries"));
-        assert!(!output.contains("0 more"));
+        assert!(output.contains("1 additional entries"));
     }
 
     #[tokio::test]
@@ -1460,5 +1750,99 @@ mod tests {
 
         assert!(output.starts_with("100 files found:\n"));
         assert!(!output.contains("[truncated"));
+    }
+
+    #[tokio::test]
+    async fn path_glob_matches_nested_and_root_files() {
+        let dir = TempDir::new("path_glob");
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("root.rs"), "").unwrap();
+        std::fs::write(dir.path().join("nested").join("child.rs"), "").unwrap();
+        std::fs::write(dir.path().join("nested").join("child.txt"), "").unwrap();
+
+        let output = FindFilesTool::new(None, None, 10)
+            .call(FindFilesArgs {
+                pattern: "**/*.rs".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            output.contains(dir.path().join("root.rs").to_string_lossy().as_ref()),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                dir.path()
+                    .join("nested")
+                    .join("child.rs")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("child.txt"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn capped_results_are_lexicographically_first_independent_of_walk_order() {
+        let dir = TempDir::new("deterministic_cap");
+        for name in ["z.txt", "m.txt", "a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+
+        let output = FindFilesTool::new(None, None, 2)
+            .call(FindFilesArgs {
+                pattern: r"^[a-z]\.txt$".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert!(output.contains("a.txt"), "{output}");
+        assert!(output.contains("b.txt"), "{output}");
+        assert!(!output.contains("m.txt"), "{output}");
+        assert!(!output.contains("z.txt"), "{output}");
+        assert!(output.starts_with("4 files found (showing first 2):"));
+    }
+
+    #[test]
+    fn parent_ignore_matchers_are_cached_and_invalidated_by_source_changes() {
+        let container = TempDir::new("parent_ignore_cache");
+        let workspace = container.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ignore = container.path().join(".gitignore");
+        std::fs::write(&ignore, "first.txt\n").unwrap();
+
+        let first = parent_ignore_matchers(&workspace);
+        let cached = parent_ignore_matchers(&workspace);
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        std::fs::write(&ignore, "different-length-name.txt\n").unwrap();
+        let refreshed = parent_ignore_matchers(&workspace);
+        assert!(!Arc::ptr_eq(&cached, &refreshed));
+    }
+
+    #[test]
+    fn nested_ignore_whitelist_overrides_parent_matcher_without_cloning_chain() {
+        let dir = TempDir::new("ignore_chain_precedence");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.txt\n").unwrap();
+        std::fs::write(nested.join(".gitignore"), "!keep.txt\n").unwrap();
+        std::fs::write(nested.join("keep.txt"), "visible").unwrap();
+        std::fs::write(nested.join("drop.txt"), "hidden").unwrap();
+
+        let metadata = crate::fs::checked_path_metadata(dir.path()).unwrap();
+        let bound = BoundDirectory::open(dir.path(), &metadata).unwrap();
+        let names: Vec<_> = bound
+            .walker()
+            .unwrap()
+            .map(|entry| entry.file_name.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names.iter().any(|name| name == "keep.txt"));
+        assert!(!names.iter().any(|name| name == "drop.txt"));
     }
 }

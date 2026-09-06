@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hnsw_rs::prelude::{DistDot, Hnsw};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use super::SkillArtifact;
 use super::embed::ModelMetadata;
 use super::store::{SkillRecordMetadata, StoredEmbedding};
+use super::{CapabilityTier, SkillArtifact};
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_QUERY_TERMS: usize = 64;
@@ -259,11 +259,12 @@ impl ImmutableSkillIndex {
         let ann = include_ann
             .then(|| build_ann(&embeddings, entries.len(), model.dimensions))
             .flatten();
-        let lexical = build_lexical_snapshot(&entries)?;
+        let database_path = database_path.as_ref().to_path_buf();
+        let lexical = open_durable_lexical_index(&database_path, &entries)?;
         Ok(Self {
             generation,
             model,
-            database_path: database_path.as_ref().to_path_buf(),
+            database_path,
             entries: entries.into(),
             embeddings,
             ann,
@@ -331,7 +332,18 @@ impl ImmutableSkillIndex {
         query_embedding: &[f32],
         policy: &RetrievalPolicy,
     ) -> Result<SearchOutput, SkillIndexError> {
-        self.search_with_mode(query_text, query_embedding, policy, false)
+        self.search_with_mode(query_text, query_embedding, policy, false, false)
+    }
+
+    /// Search the immutable generation while excluding every effectful skill
+    /// before candidate limits and budgets are applied.
+    pub(crate) fn search_pure_with_metrics(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        policy: &RetrievalPolicy,
+    ) -> Result<SearchOutput, SkillIndexError> {
+        self.search_with_mode(query_text, query_embedding, policy, false, true)
     }
 
     /// Exact full-scan oracle retained for ANN recall and regression audits.
@@ -341,7 +353,7 @@ impl ImmutableSkillIndex {
         query_embedding: &[f32],
         policy: &RetrievalPolicy,
     ) -> Result<SearchOutput, SkillIndexError> {
-        self.search_with_mode(query_text, query_embedding, policy, true)
+        self.search_with_mode(query_text, query_embedding, policy, true, false)
     }
 
     fn search_with_mode(
@@ -350,21 +362,22 @@ impl ImmutableSkillIndex {
         query_embedding: &[f32],
         policy: &RetrievalPolicy,
         _exact: bool,
+        pure_only: bool,
     ) -> Result<SearchOutput, SkillIndexError> {
         validate_query(query_text, query_embedding, &self.model)?;
 
         let dense_started = Instant::now();
         let dense = if _exact {
-            self.exact_dense_candidates(query_embedding, policy)
+            self.exact_dense_candidates(query_embedding, policy, pure_only)
         } else {
-            self.dense_candidates(query_embedding, policy)
+            self.dense_candidates(query_embedding, policy, pure_only)
         };
         let dense_duration = dense_started.elapsed();
         let lexical_started = Instant::now();
-        let lexical = self.lexical_candidates(query_text, policy)?;
+        let lexical = self.lexical_candidates(query_text, policy, pure_only)?;
         let lexical_duration = lexical_started.elapsed();
         let fusion_started = Instant::now();
-        let skills = self.fuse_and_budget(dense, lexical, policy);
+        let skills = self.fuse_and_budget(dense, lexical, policy, pure_only);
 
         Ok(SearchOutput {
             skills,
@@ -376,9 +389,14 @@ impl ImmutableSkillIndex {
         })
     }
 
-    fn dense_candidates(&self, query: &[f32], policy: &RetrievalPolicy) -> Vec<(usize, f32)> {
+    fn dense_candidates(
+        &self,
+        query: &[f32],
+        policy: &RetrievalPolicy,
+        pure_only: bool,
+    ) -> Vec<(usize, f32)> {
         let Some(ann) = &self.ann else {
-            return self.exact_dense_candidates(query, policy);
+            return self.exact_dense_candidates(query, policy, pure_only);
         };
         // A visibility mask must never make request cost grow with the number of
         // retired/purged rows. Physical rebuilds compact masks; until then a
@@ -398,7 +416,11 @@ impl ImmutableSkillIndex {
             .into_iter()
             .filter_map(|neighbour| {
                 let score = (1.0 - neighbour.distance) / ANN_DOT_SAFETY_SCALE;
-                (!self.hidden.contains(&neighbour.d_id) && score >= policy.dense_score_floor)
+                (!self.hidden.contains(&neighbour.d_id)
+                    && (!pure_only
+                        || self.entries[neighbour.d_id].artifact.capability.tier
+                            == CapabilityTier::Pure)
+                    && score >= policy.dense_score_floor)
                     .then_some((neighbour.d_id, score))
             })
             .collect::<Vec<_>>();
@@ -411,10 +433,21 @@ impl ImmutableSkillIndex {
             })
         });
         candidates.truncate(policy.dense_candidate_limit.min(candidates.len()));
+        if pure_only
+            && candidates.len() < policy.dense_candidate_limit
+            && candidate_count < self.entries.len()
+        {
+            return self.exact_dense_candidates(query, policy, true);
+        }
         candidates
     }
 
-    fn exact_dense_candidates(&self, query: &[f32], policy: &RetrievalPolicy) -> Vec<(usize, f32)> {
+    fn exact_dense_candidates(
+        &self,
+        query: &[f32],
+        policy: &RetrievalPolicy,
+        pure_only: bool,
+    ) -> Vec<(usize, f32)> {
         let limit = policy.dense_candidate_limit;
         if limit == 0 {
             return Vec::new();
@@ -428,7 +461,11 @@ impl ImmutableSkillIndex {
         let mut bounded = Vec::<DenseCandidate>::with_capacity(limit);
         for (index, score) in scores.into_iter().enumerate() {
             let candidate = DenseCandidate { index, score };
-            if self.hidden.contains(&index) || candidate.score < policy.dense_score_floor {
+            if self.hidden.contains(&index)
+                || (pure_only
+                    && self.entries[index].artifact.capability.tier != CapabilityTier::Pure)
+                || candidate.score < policy.dense_score_floor
+            {
                 continue;
             }
             if bounded.len() < limit {
@@ -456,6 +493,7 @@ impl ImmutableSkillIndex {
         &self,
         query: &str,
         policy: &RetrievalPolicy,
+        pure_only: bool,
     ) -> Result<Vec<(usize, f32)>, SkillIndexError> {
         let Some(lexical) = &self.lexical else {
             return Ok(Vec::new());
@@ -467,13 +505,20 @@ impl ImmutableSkillIndex {
             return Ok(Vec::new());
         };
         let mut statement = connection.prepare_cached(
-            "SELECT id, rank
-             FROM snapshot_search
-             WHERE snapshot_search MATCH ?
-             ORDER BY rank ASC, id ASC LIMIT ?",
+            "SELECT skill_search.identifier, bm25(skill_search)
+             FROM skill_search
+             INNER JOIN temp.snapshot_skill_ids
+                ON temp.snapshot_skill_ids.id = skill_search.identifier
+             WHERE skill_search MATCH ?1
+               AND (?2 = 0 OR temp.snapshot_skill_ids.pure = 1)
+             ORDER BY bm25(skill_search) ASC, skill_search.identifier ASC LIMIT ?3",
         )?;
         let rows = statement.query_map(
-            params![fts_query, policy.lexical_candidate_limit as i64],
+            params![
+                fts_query,
+                if pure_only { 1_i64 } else { 0_i64 },
+                policy.lexical_candidate_limit as i64
+            ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
         )?;
         let mut candidates = Vec::new();
@@ -498,6 +543,7 @@ impl ImmutableSkillIndex {
         dense: Vec<(usize, f32)>,
         lexical: Vec<(usize, f32)>,
         policy: &RetrievalPolicy,
+        pure_only: bool,
     ) -> Vec<ScoredSkill> {
         let mut fused: BTreeMap<usize, (f32, Option<f32>, Option<f32>)> = BTreeMap::new();
         for (rank, (index, score)) in dense.iter().enumerate() {
@@ -531,6 +577,9 @@ impl ImmutableSkillIndex {
                 break;
             }
             let entry = &self.entries[index];
+            if pure_only && entry.artifact.capability.tier != CapabilityTier::Pure {
+                continue;
+            }
             if !seen_lineages.insert(entry.lineage_key.clone())
                 || !seen_semantics.insert(entry.semantic_key.clone())
             {
@@ -582,57 +631,41 @@ fn build_ann(
     Some(Arc::new(ann))
 }
 
-fn build_lexical_snapshot(
+fn open_durable_lexical_index(
+    database_path: &Path,
     entries: &[SnapshotEntry],
 ) -> Result<Option<Arc<Mutex<Connection>>>, SkillIndexError> {
     if entries.is_empty() {
         return Ok(None);
     }
-    let mut connection = Connection::open_in_memory()?;
-    connection.execute_batch(
-        "CREATE VIRTUAL TABLE snapshot_search USING fts5(
-            id UNINDEXED,
-            identifier,
-            description,
-            tags,
-            exports,
-            tokenize = 'unicode61'
-        );
-        CREATE VIRTUAL TABLE snapshot_vocab USING fts5vocab(snapshot_search, 'row');",
+    let mut connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    connection.execute_batch(
+        "CREATE TEMP TABLE snapshot_skill_ids (
+             id TEXT PRIMARY KEY,
+             pure INTEGER NOT NULL CHECK (pure IN (0, 1))
+         ) WITHOUT ROWID;
+         CREATE VIRTUAL TABLE temp.skill_search_vocab
+         USING fts5vocab(main, skill_search, row);",
+    )?;
+    let transaction = connection.transaction()?;
     {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO snapshot_search (id, identifier, description, tags, exports)
-                 VALUES (?, ?, ?, ?, ?)",
-            )?;
-            for entry in entries {
-                let identifiers = entry
-                    .artifact
-                    .exports
-                    .iter()
-                    .map(|export| export.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let exports = entry
-                    .artifact
-                    .exports
-                    .iter()
-                    .map(|export| format!("{} {}", export.name, export.signature))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                insert.execute(params![
-                    entry.artifact.id,
-                    identifiers,
-                    entry.artifact.description,
-                    entry.artifact.tags.join(" "),
-                    exports,
-                ])?;
-            }
+        let mut insert =
+            transaction.prepare("INSERT INTO snapshot_skill_ids (id, pure) VALUES (?1, ?2)")?;
+        for entry in entries {
+            insert.execute(params![
+                entry.artifact.id.as_str(),
+                if entry.artifact.capability.tier == CapabilityTier::Pure {
+                    1_i64
+                } else {
+                    0_i64
+                }
+            ])?;
         }
-        transaction.commit()?;
     }
+    transaction.commit()?;
     Ok(Some(Arc::new(Mutex::new(connection))))
 }
 
@@ -721,7 +754,7 @@ fn semantic_key(artifact: &SkillArtifact) -> String {
     key
 }
 
-fn manifest_size(artifact: &SkillArtifact) -> usize {
+pub(crate) fn manifest_size(artifact: &SkillArtifact) -> usize {
     artifact.id.len()
         + artifact.description.len()
         + artifact
@@ -766,16 +799,15 @@ pub(crate) fn lexical_query_terms(query: &str) -> Vec<String> {
 }
 
 fn fts_query(connection: &Connection, query: &str) -> Result<Option<String>, rusqlite::Error> {
-    let total_documents =
-        connection.query_row("SELECT count(*) FROM snapshot_search", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
+    let total_documents = connection.query_row("SELECT count(*) FROM skill_search", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
     if total_documents == 0 {
         return Ok(None);
     }
 
     let mut statement =
-        connection.prepare_cached("SELECT doc FROM snapshot_vocab WHERE term = ?1")?;
+        connection.prepare_cached("SELECT doc FROM skill_search_vocab WHERE term = ?1")?;
     let mut weighted = Vec::new();
     for term in lexical_query_terms(query) {
         let document_frequency = statement

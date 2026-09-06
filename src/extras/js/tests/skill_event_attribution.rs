@@ -104,7 +104,7 @@ fn stable_ids_reuse_acknowledged_calls_but_separate_ordinals() {
 }
 
 #[test]
-fn behavioral_quarantine_counts_only_complete_production_calls_in_recent_window() {
+fn behavioral_quarantine_does_not_treat_uncorroborated_throws_as_faults() {
     let (_root, mut store, artifact) = store();
     let window_end = 4_000_000;
     let old = window_end - crate::extras::js::skills::retention::DEFAULT_RAW_RETENTION_SECONDS - 1;
@@ -137,7 +137,59 @@ fn behavioral_quarantine_counts_only_complete_production_calls_in_recent_window(
 
     assert_eq!(
         behavioral_window_counts_for_test(&store, &artifact.id, window_end).unwrap(),
-        (20, 4)
+        (20, 0)
+    );
+}
+
+#[test]
+fn behavioral_quarantine_counts_only_authenticated_targeted_throw_feedback() {
+    use crate::extras::js::skills::feedback::{
+        ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackKind, FeedbackService,
+    };
+    use crate::extras::js::skills::privacy::Redactor;
+
+    let (_root, mut store, artifact) = store();
+    let window_end = 4_000_000;
+    let actor = AuthenticatedActor {
+        actor_id: "owner".into(),
+        kind: ActorKind::Owner,
+        allowed_skill_ids: Some([artifact.id.clone()].into_iter().collect()),
+    };
+    for ordinal in 0..20 {
+        let invocation = format!("{ordinal:064x}");
+        for kind in [SkillEventKind::Invoked, SkillEventKind::Threw] {
+            let mut observation = event(
+                &artifact.id,
+                &invocation,
+                kind,
+                kind.is_terminal().then_some("exception"),
+            );
+            observation.created_at = window_end - 1;
+            TelemetryIngestor::new(&mut store)
+                .ingest(&EventBatch::new(vec![observation]).unwrap())
+                .unwrap();
+        }
+        if ordinal < 5 {
+            FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+                .submit(
+                    &actor,
+                    &FeedbackCommand {
+                        idempotency_key: format!("feedback-{ordinal}"),
+                        skill_id: artifact.id.clone(),
+                        invocation_id: Some(invocation),
+                        kind: FeedbackKind::Negative,
+                        reason_code: "incorrect_result".into(),
+                        reason_text: None,
+                    },
+                    window_end,
+                )
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        behavioral_window_counts_for_test(&store, &artifact.id, window_end).unwrap(),
+        (20, 5)
     );
 }
 

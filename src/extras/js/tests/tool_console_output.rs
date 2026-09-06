@@ -29,6 +29,27 @@ async fn js_tool_returns_console_records_in_order_with_levels() {
 }
 
 #[tokio::test]
+async fn js_tool_console_renders_objects_as_bounded_json() {
+    let result = run("JSON.stringify = () => '\"poison\"'; \
+         console.log({answer: 42, nested: [true, null]}, ['a', {b: 2}]); 'done'")
+    .await;
+
+    assert_eq!(
+        result,
+        "[console.log] {\"answer\":42,\"nested\":[true,null]} [\"a\",{\"b\":2}]\ndone"
+    );
+}
+
+#[tokio::test]
+async fn js_tool_console_falls_back_safely_for_circular_and_non_json_objects() {
+    let result = run("const circular = {}; circular.self = circular; \
+         console.log(circular, new Map([['key', 1]])); 'done'")
+    .await;
+
+    assert_eq!(result, "[console.log] [object Object] [object Map]\ndone");
+}
+
+#[tokio::test]
 async fn js_tool_returns_console_output_for_void_results() {
     let result = run("console.log('only')").await;
     assert_eq!(result, "[console.log] only");

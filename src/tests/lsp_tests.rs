@@ -109,7 +109,8 @@ async fn lsp_sync_rejects_file_swapped_to_external_symlink_after_resolution() {
 
 #[tokio::test]
 async fn frame_roundtrip() {
-    let (mut a, mut b) = tokio::io::duplex(4096);
+    let (mut a, b) = tokio::io::duplex(4096);
+    let mut b = rpc::FrameReader::new(b);
     rpc::write_frame(&mut a, br#"{"jsonrpc":"2.0","id":1}"#)
         .await
         .unwrap();
@@ -117,43 +118,46 @@ async fn frame_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap().as_deref(),
+        b.read_frame().await.unwrap().as_deref(),
         Some(&br#"{"jsonrpc":"2.0","id":1}"#[..])
     );
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap().as_deref(),
+        b.read_frame().await.unwrap().as_deref(),
         Some(&br#"{"jsonrpc":"2.0","id":2}"#[..])
     );
     drop(a);
     // Clean EOF before any header byte → None (server exited).
-    assert_eq!(rpc::read_frame(&mut b).await.unwrap(), None);
+    assert_eq!(b.read_frame().await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn frame_missing_content_length_errors() {
-    let (mut a, mut b) = tokio::io::duplex(4096);
+    let (mut a, b) = tokio::io::duplex(4096);
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n{}")
         .await
         .unwrap();
-    assert!(rpc::read_frame(&mut b).await.is_err());
+    assert!(b.read_frame().await.is_err());
 }
 
 #[tokio::test]
 async fn frame_eof_mid_message_errors() {
-    let (mut a, mut b) = tokio::io::duplex(4096);
+    let (mut a, b) = tokio::io::duplex(4096);
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(b"Content-Length: 100\r\n\r\n{}").await.unwrap();
     drop(a);
-    assert!(rpc::read_frame(&mut b).await.is_err());
+    assert!(b.read_frame().await.is_err());
 }
 
 #[tokio::test]
 async fn lsp_process_frames_reject_oversized_inbound_and_outbound_bodies() {
-    let (mut a, mut b) = tokio::io::duplex(4096);
+    let (mut a, b) = tokio::io::duplex(4096);
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(format!("Content-Length: {}\r\n\r\n", rpc::MAX_BODY_BYTES + 1).as_bytes())
         .await
         .unwrap();
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap_err().kind(),
+        b.read_frame().await.unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
 
@@ -170,12 +174,13 @@ async fn lsp_process_frames_reject_oversized_inbound_and_outbound_bodies() {
 
 #[tokio::test]
 async fn lsp_process_frames_reject_header_flood_and_invalid_utf8() {
-    let (mut a, mut b) = tokio::io::duplex(rpc::MAX_HEADER_BYTES * 2);
+    let (mut a, b) = tokio::io::duplex(rpc::MAX_HEADER_BYTES * 2);
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(&vec![b'x'; rpc::MAX_HEADER_BYTES + 1])
         .await
         .unwrap();
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap_err().kind(),
+        b.read_frame().await.unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
 
@@ -187,24 +192,27 @@ async fn lsp_process_frames_reject_header_flood_and_invalid_utf8() {
     exact.extend(std::iter::repeat_n(b'x', padding));
     exact.extend_from_slice(suffix);
     exact.extend_from_slice(b"{}");
-    let (mut a, mut b) = tokio::io::duplex(exact.len());
+    let (mut a, b) = tokio::io::duplex(exact.len());
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(&exact).await.unwrap();
-    assert_eq!(rpc::read_frame(&mut b).await.unwrap(), Some(b"{}".to_vec()));
+    assert_eq!(b.read_frame().await.unwrap(), Some(b"{}".to_vec()));
 
     exact.insert(prefix.len(), b'x');
-    let (mut a, mut b) = tokio::io::duplex(exact.len());
+    let (mut a, b) = tokio::io::duplex(exact.len());
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(&exact).await.unwrap();
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap_err().kind(),
+        b.read_frame().await.unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
 
-    let (mut a, mut b) = tokio::io::duplex(4096);
+    let (mut a, b) = tokio::io::duplex(4096);
+    let mut b = rpc::FrameReader::new(b);
     a.write_all(b"Content-Length: 2\r\nX-Bad: \xff\r\n\r\n{}")
         .await
         .unwrap();
     assert_eq!(
-        rpc::read_frame(&mut b).await.unwrap_err().kind(),
+        b.read_frame().await.unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
 }

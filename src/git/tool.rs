@@ -277,6 +277,26 @@ impl GitTool {
         Ok(serde_json::json!({ "records": records }))
     }
 
+    async fn head_id(&self) -> Option<String> {
+        let output = self
+            .run(
+                "resolve-resulting-head",
+                vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--quiet".into(),
+                    "HEAD".into(),
+                ],
+                QUERY_LIMITS,
+                false,
+            )
+            .await
+            .ok()?;
+        let id = String::from_utf8(output.stdout).ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
     async fn ensure_no_external_filters(&self, paths: &[String]) -> Result<(), ToolError> {
         let mut args = vec![
             "check-attr".into(),
@@ -433,10 +453,17 @@ impl GitTool {
                 LOCAL_MUTATION_LIMITS,
             )
             .await?;
+        let commit_id = if output.status == CommandStatus::Completed
+            && output.exit_status.is_some_and(|status| status.success())
+        {
+            self.head_id().await
+        } else {
+            None
+        };
         let after = self.status_snapshot().await?;
-        Ok(render_mutation_result(
-            "commit", coaching, before, after, output,
-        ))
+        let mut result = render_mutation_result("commit", coaching, before, after, output);
+        result["commit_id"] = serde_json::json!(commit_id);
+        Ok(result)
     }
 
     async fn read_operation(&self, args: GitArgs) -> Result<serde_json::Value, ToolError> {
@@ -467,7 +494,6 @@ impl GitTool {
                     "--no-ext-diff".into(),
                     "--no-textconv".into(),
                     "--ignore-submodules=all".into(),
-                    "--binary".into(),
                 ];
                 if let Some(revision) = args.revision.as_deref() {
                     self.validate_revision(revision).await?;
@@ -610,6 +636,7 @@ impl Tool for GitTool {
 fn hardened_args(mut args: Vec<String>) -> Vec<String> {
     let mut hardened = vec![
         "--no-optional-locks".into(),
+        "--literal-pathspecs".into(),
         "-c".into(),
         "core.fsmonitor=false".into(),
         "-c".into(),
@@ -885,6 +912,10 @@ mod tests {
         assert_eq!(committed["status"], "success");
         assert_eq!(committed["exit_code"], 0);
         assert_eq!(
+            committed["commit_id"],
+            repo.git(["rev-parse", "HEAD"]).trim()
+        );
+        assert_eq!(
             repo.git(["log", "-1", "--format=%B"]),
             "subject from stdin\n\nbody remains intact\n"
         );
@@ -958,6 +989,42 @@ mod tests {
                 .to_string()
                 .contains("invalid repository-relative")
         );
+    }
+
+    #[tokio::test]
+    async fn pathspec_metacharacters_are_treated_as_literal_file_names() {
+        let repo = TestRepo::new();
+        repo.write("literal[1].txt", "selected\n");
+        repo.write("literal1.txt", "must remain untracked\n");
+
+        repo.tool()
+            .call(args(GitOperation::Stage, &["literal[1].txt"], None))
+            .await
+            .expect("stage literal metacharacter path");
+
+        assert_eq!(
+            repo.git(["diff", "--cached", "--name-only"]),
+            "literal[1].txt\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_reports_binary_changes_without_emitting_binary_patch_payloads() {
+        let repo = TestRepo::new();
+        std::fs::write(repo.path().join("asset.bin"), b"before\0bytes").unwrap();
+        repo.git(["add", "asset.bin"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        std::fs::write(repo.path().join("asset.bin"), b"after\0bytes").unwrap();
+
+        let diff = repo
+            .tool()
+            .call(args(GitOperation::Diff, &["asset.bin"], None))
+            .await
+            .expect("render binary diff");
+        let text = diff["text"].as_str().unwrap();
+
+        assert!(text.contains("Binary files"), "{text}");
+        assert!(!text.contains("GIT binary patch"), "{text}");
     }
 
     #[tokio::test]

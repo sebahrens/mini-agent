@@ -24,8 +24,8 @@ OPENROUTER_VENDORS='["anthropic","openai","google","deepseek","x-ai","meta-llama
 # the provider's API now rejects. We can't read "retired" from the data, so we
 # drop ids whose last_updated/release_date is older than a per-vendor cutoff.
 #
-# Cutoffs below were derived by cross-checking models.dev against each provider's
-# LIVE /models API on 2026-06-04:
+# Cutoffs below are periodically cross-checked against each provider's live
+# model inventory:
 #   anthropic  — retires aggressively; models.dev still lists the 2024 claude-3
 #                line (incl. claude-3-7-sonnet, 2025-02) that the API rejects.
 #                2025-04-01 drops those and keeps the claude-4.x line + aliases.
@@ -46,7 +46,9 @@ api="$(curl -fsSL --max-time 120 "$SRC")"
 #               tokens) straight from models.dev's `cost.input`/`cost.output`,
 #               when present. Used for the direct-API providers (anthropic,
 #               openai, gemini), which have no other source of pricing at
-#               runtime. OpenRouter keeps plain `entry`: it has its own live
+#               runtime. Direct entries without both prices are omitted rather
+#               than advertised with a misleading zero cost. OpenRouter keeps
+#               plain `entry`: it has its own live
 #               pricing fetch (`fetch_openrouter_pricing`), and models.dev's
 #               marketplace-wide OpenRouter cost data is less reliable.
 #  - `denied` : drop non-chat models (embeddings/audio/image/etc.) by id substring,
@@ -72,10 +74,17 @@ echo "$api" | jq --argjson orv "$OPENROUTER_VENDORS" --argjson cut "$CUTOFFS" '
     output_price: (.value.cost.output // null)
   };
   def models_of($p; $c; e): ($p.models // {}) | to_entries | map(chat($c) | e) | sort_by(.id);
+  def priced_models_of($p; $c):
+    ($p.models // {})
+    | to_entries
+    | map(chat($c)
+          | select(.value.cost.input > 0 and .value.cost.output > 0)
+          | priced_entry)
+    | sort_by(.id);
   {
-    anthropic:  models_of(.anthropic; ($cut.anthropic  // "0000-00-00"); priced_entry),
-    openai:     models_of(.openai;    ($cut.openai     // "0000-00-00"); priced_entry),
-    gemini:     models_of(.google;    ($cut.gemini     // "0000-00-00"); priced_entry),
+    anthropic:  priced_models_of(.anthropic; ($cut.anthropic // "0000-00-00")),
+    openai:     priced_models_of(.openai;    ($cut.openai    // "0000-00-00")),
+    gemini:     priced_models_of(.google;    ($cut.gemini    // "0000-00-00")),
     openrouter: (
       (.openrouter.models // {})
       | to_entries

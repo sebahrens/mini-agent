@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::extras::js::skills::coordinator::IndexCoordinator;
 use crate::extras::js::skills::embed::{
@@ -7,7 +9,9 @@ use crate::extras::js::skills::embed::{
 };
 use crate::extras::js::skills::index::{ImmutableSkillIndex, RetrievalPolicy, SkillIndex};
 use crate::extras::js::skills::store::SkillStore;
-use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
+};
 use crate::paths::AppPaths;
 
 struct TempPaths {
@@ -61,6 +65,13 @@ struct ConcurrentAdmissionBackend {
 
 struct FailingEmbeddingBackend;
 
+struct RevisionEmbeddingBackend;
+
+struct BlockingEmbeddingBackend {
+    entered: Mutex<Option<SyncSender<()>>>,
+    release: Mutex<Receiver<()>>,
+}
+
 impl EmbeddingBackend for FailingEmbeddingBackend {
     fn embed_documents(&self, _documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Err(EmbeddingError::RequestFailed("fixture outage".to_string()))
@@ -72,6 +83,62 @@ impl EmbeddingBackend for FailingEmbeddingBackend {
 
     fn model_id(&self) -> &str {
         "failing-fixture"
+    }
+
+    fn model_revision(&self) -> &str {
+        "v1"
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn normalized(&self) -> bool {
+        true
+    }
+}
+
+impl EmbeddingBackend for RevisionEmbeddingBackend {
+    fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(vec![vec![1.0, 0.0]; documents.len()])
+    }
+
+    fn embed_query(&self, _query: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(vec![1.0, 0.0])
+    }
+
+    fn model_id(&self) -> &str {
+        "routing-fixture"
+    }
+
+    fn model_revision(&self) -> &str {
+        "v2"
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    fn normalized(&self) -> bool {
+        true
+    }
+}
+
+impl EmbeddingBackend for BlockingEmbeddingBackend {
+    fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ok(vec![vec![1.0, 0.0]; documents.len()])
+    }
+
+    fn embed_query(&self, _query: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(vec![1.0, 0.0])
+    }
+
+    fn model_id(&self) -> &str {
+        "blocking-fixture"
     }
 
     fn model_revision(&self) -> &str {
@@ -211,6 +278,163 @@ fn skill_index_natural_language_query_uses_or_bm25_without_dense_candidates() {
 }
 
 #[test]
+fn lexical_scores_preserve_bm25_relevance_and_the_floor_filters_candidates() {
+    let temp = TempPaths::new();
+    let (index, json, csv) = built_index(&temp);
+    let lexical_only = RetrievalPolicy {
+        dense_candidate_limit: 0,
+        ..RetrievalPolicy::default()
+    };
+    let results = index
+        .search("parse JSON", &[0.0, 1.0], &lexical_only)
+        .unwrap();
+    let json_score = results
+        .iter()
+        .find(|skill| skill.artifact.id == json.id)
+        .and_then(|skill| skill.lexical_score)
+        .expect("JSON lexical score");
+    let csv_score = results
+        .iter()
+        .find(|skill| skill.artifact.id == csv.id)
+        .and_then(|skill| skill.lexical_score)
+        .expect("CSV lexical score");
+    assert!(
+        json_score > csv_score,
+        "{json_score} must exceed {csv_score}"
+    );
+
+    let filtered = index
+        .search(
+            "parse JSON",
+            &[0.0, 1.0],
+            &RetrievalPolicy {
+                dense_candidate_limit: 0,
+                lexical_score_floor: (json_score + csv_score) / 2.0,
+                ..RetrievalPolicy::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].artifact.id, json.id);
+}
+
+#[test]
+fn lexical_search_reads_the_durable_skill_search_table() {
+    let temp = TempPaths::new();
+    let (index, _, _) = built_index(&temp);
+    let policy = RetrievalPolicy {
+        dense_candidate_limit: 0,
+        ..RetrievalPolicy::default()
+    };
+    assert!(
+        !index
+            .search("parse", &[0.0, 1.0], &policy)
+            .unwrap()
+            .is_empty()
+    );
+
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    store
+        .conn()
+        .execute("DELETE FROM skill_search", [])
+        .unwrap();
+    drop(store);
+
+    assert!(
+        index
+            .search("parse", &[0.0, 1.0], &policy)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn pure_search_filters_effectful_rows_before_lexical_candidate_limits() {
+    let temp = TempPaths::new();
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    let effectful = SkillArtifact::new(
+        "function effectfulParser(_cap, value) { return value; }".to_string(),
+        "Parse JSON JSON JSON documents exactly.".to_string(),
+        vec!["parse".to_string(), "json".to_string()],
+        vec![SkillExport {
+            name: "effectfulParser".to_string(),
+            signature: "effectfulParser(value: unknown): unknown".to_string(),
+        }],
+        vec!["effectfulParser(7) === 7".to_string()],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["src".to_string()],
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let pure = artifact(
+        "pureParser",
+        "Parse structured documents without effects.",
+        "parse",
+    );
+    for skill in [&effectful, &pure] {
+        store.insert_verified(skill).unwrap();
+        store
+            .store_embedding(
+                &skill.id,
+                "fixture-model",
+                "r1",
+                2,
+                true,
+                &vector_bytes(&[1.0, 0.0]),
+            )
+            .unwrap();
+    }
+    let rows = store
+        .list_retrievable()
+        .unwrap()
+        .into_iter()
+        .map(|skill| {
+            let embedding = store
+                .get_embedding(&skill.id, "fixture-model", "r1")
+                .unwrap()
+                .unwrap();
+            let metadata = store.metadata(&skill.id).unwrap().unwrap();
+            (skill, embedding, metadata)
+        })
+        .collect();
+    let index = ImmutableSkillIndex::build(
+        9,
+        ModelMetadata {
+            model_id: "fixture-model".to_string(),
+            model_revision: "r1".to_string(),
+            dimensions: 2,
+            normalized: true,
+        },
+        store.database_path(),
+        rows,
+    )
+    .unwrap();
+    let output = index
+        .search_pure_with_metrics(
+            "parse JSON",
+            &[1.0, 0.0],
+            &RetrievalPolicy {
+                max_skills: 1,
+                dense_candidate_limit: 0,
+                lexical_candidate_limit: 1,
+                ..RetrievalPolicy::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(output.skills.len(), 1);
+    assert_eq!(output.skills[0].artifact.id, pure.id);
+    assert_eq!(
+        output.skills[0].artifact.capability.tier,
+        CapabilityTier::Pure
+    );
+}
+
+#[test]
 fn skill_index_lifecycle_floor_and_budgets_can_return_zero() {
     let temp = TempPaths::new();
     let (index, _, _) = built_index(&temp);
@@ -305,6 +529,30 @@ fn skill_index_generations_publish_complete_snapshots_and_recover() {
 }
 
 #[test]
+fn process_restart_hydrates_the_applied_generation_without_advancing_it() {
+    let temp = TempPaths::new();
+    let skill = artifact("stableGeneration", "Keep the generation stable.", "index");
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&skill))
+        .unwrap();
+    let embedder = Arc::new(Embedder::new().unwrap());
+    let first = IndexCoordinator::open(&temp.paths, Arc::clone(&embedder)).unwrap();
+    let applied = first.rebuild_and_publish().unwrap();
+    drop(first);
+
+    let reopened = IndexCoordinator::open(&temp.paths, embedder).unwrap();
+    let hydrated = reopened.rebuild_and_publish().unwrap();
+    assert_eq!(hydrated, applied);
+    assert!(reopened.lease().unwrap().contains_id(&skill.id));
+    let state = SkillStore::open_at(&temp.paths)
+        .unwrap()
+        .generation_state()
+        .unwrap();
+    assert_eq!(state.desired_generation, applied);
+    assert_eq!(state.applied_generation, applied);
+}
+
+#[test]
 fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
     let temp = TempPaths::new();
     let skill = artifact("slugify", "Create URL-safe slugs.", "text");
@@ -361,6 +609,47 @@ fn skill_index_rebuild_batches_and_refreshes_embedding_only_rows() {
         )
         .unwrap();
     assert_eq!(stored_bytes, vector_bytes(&expected));
+}
+
+#[test]
+fn skill_index_rebuild_backfills_canaries_for_the_new_model_revision() {
+    let temp = TempPaths::new();
+    let active = artifact("activeRun", "Active skill.", "routing");
+    let canary = artifact("canaryRun", "Replacement canary.", "routing");
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&active).unwrap();
+    store.insert_verified(&canary).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions SET status = 'active', lineage_root_id = id WHERE id = ?1",
+            [&active.id],
+        )
+        .unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+             SET status = 'canary', supersedes_id = ?1, lineage_root_id = ?1
+             WHERE id = ?2",
+            rusqlite::params![active.id, canary.id],
+        )
+        .unwrap();
+    drop(store);
+
+    let embedder = Arc::new(Embedder::with_backend(Arc::new(RevisionEmbeddingBackend)).unwrap());
+    let model = embedder.model_metadata().clone();
+    let coordinator = IndexCoordinator::open(&temp.paths, embedder).unwrap();
+    coordinator.rebuild_and_publish().unwrap();
+
+    assert!(coordinator.lease().unwrap().contains_id(&active.id));
+    assert!(!coordinator.lease().unwrap().contains_id(&canary.id));
+    let store = SkillStore::open_at(&temp.paths).unwrap();
+    let embedding = store
+        .get_embedding(&canary.id, &model.model_id, &model.model_revision)
+        .unwrap()
+        .expect("canary embedding should migrate with the active generation");
+    assert_eq!(embedding.values, vec![1.0, 0.0]);
 }
 
 #[test]
@@ -509,6 +798,158 @@ fn skill_index_rebuild_rejects_generation_advanced_by_concurrent_admission() {
     assert!(store.get(&concurrent.id).unwrap().is_some());
     let state = store.generation_state().unwrap();
     assert!(state.desired_generation > state.applied_generation);
+}
+
+#[test]
+fn skill_index_rebuild_releases_store_lock_during_embedding_io() {
+    let temp = TempPaths::new();
+    let skill = artifact(
+        "blockingSkill",
+        "Wait while embedding this skill.",
+        "blocking",
+    );
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&skill))
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let embedder = Embedder::with_backend(Arc::new(BlockingEmbeddingBackend {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    }))
+    .unwrap();
+    let coordinator = Arc::new(IndexCoordinator::open(&temp.paths, Arc::new(embedder)).unwrap());
+
+    let rebuild_coordinator = Arc::clone(&coordinator);
+    let rebuild = std::thread::spawn(move || rebuild_coordinator.rebuild_and_publish());
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("rebuild should enter embedding backend");
+
+    let routing_coordinator = Arc::clone(&coordinator);
+    let (routing_tx, routing_rx) = std::sync::mpsc::sync_channel(0);
+    let routing = std::thread::spawn(move || {
+        routing_tx.send(routing_coordinator.routing_key()).unwrap();
+    });
+    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_millis(200));
+    release_tx.send(()).unwrap();
+    routing.join().unwrap();
+    rebuild.join().unwrap().unwrap();
+
+    assert!(
+        routing_while_embedding
+            .expect("SQLite access should not wait for embedding I/O")
+            .is_ok()
+    );
+}
+
+#[test]
+fn coordinated_mutation_releases_store_lock_during_embedding_io() {
+    let temp = TempPaths::new();
+    let skill = artifact(
+        "activatedBlockingSkill",
+        "Activate while embedding this skill.",
+        "blocking",
+    );
+    let skill_id = skill.id.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let embedder = Embedder::with_backend(Arc::new(BlockingEmbeddingBackend {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    }))
+    .unwrap();
+    let coordinator = Arc::new(IndexCoordinator::open(&temp.paths, Arc::new(embedder)).unwrap());
+
+    let mutation_coordinator = Arc::clone(&coordinator);
+    let mutation = std::thread::spawn(move || {
+        mutation_coordinator.coordinate_mutation(
+            std::collections::HashSet::new(),
+            |store| -> Result<((), u64), crate::extras::js::skills::store::StoreError> {
+                store.insert_verified(&skill)?;
+                store
+                    .conn_mut()
+                    .execute(
+                        "UPDATE skill_revisions SET status = 'active' WHERE id = ?1",
+                        [&skill.id],
+                    )
+                    .map_err(crate::extras::js::skills::store::StoreError::from)?;
+                let generation = store.request_generation("blocking-fixture", "v1", 2, true)?;
+                Ok(((), generation))
+            },
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("coordinated mutation should enter embedding backend");
+
+    let routing_coordinator = Arc::clone(&coordinator);
+    let (routing_tx, routing_rx) = std::sync::mpsc::sync_channel(0);
+    let routing = std::thread::spawn(move || {
+        routing_tx.send(routing_coordinator.routing_key()).unwrap();
+    });
+    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_millis(200));
+    release_tx.send(()).unwrap();
+    routing.join().unwrap();
+    let (_, report) = mutation.join().unwrap().unwrap();
+
+    assert!(
+        routing_while_embedding
+            .expect("SQLite access should not wait for mutation embedding I/O")
+            .is_ok()
+    );
+    assert!(!report.removal_only);
+    assert!(coordinator.lease().unwrap().contains_id(&skill_id));
+}
+
+#[test]
+fn routing_key_cache_is_scoped_to_the_published_generation() {
+    let temp = TempPaths::new();
+    let coordinator = IndexCoordinator::open(
+        &temp.paths,
+        Arc::new(Embedder::new().expect("deterministic embedder")),
+    )
+    .unwrap();
+    let generation = coordinator.rebuild_and_publish().unwrap();
+    let first = coordinator
+        .routing_context(&[], generation)
+        .unwrap()
+        .expect("current routing generation")
+        .key;
+
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "DELETE FROM skill_runtime_secrets WHERE name = 'canary-routing-v1'",
+            [],
+        )
+        .unwrap();
+    let cached = coordinator
+        .routing_context(&[], generation)
+        .unwrap()
+        .expect("same routing generation should remain current")
+        .key;
+    assert_eq!(cached, first);
+
+    let model = coordinator.lease().unwrap().model().clone();
+    store
+        .request_generation(
+            &model.model_id,
+            &model.model_revision,
+            model.dimensions,
+            model.normalized,
+        )
+        .unwrap();
+    drop(store);
+    let next_generation = coordinator.rebuild_and_publish().unwrap();
+    assert_ne!(next_generation, generation);
+    let refreshed = coordinator
+        .routing_context(&[], next_generation)
+        .unwrap()
+        .expect("new routing generation")
+        .key;
+    assert_ne!(refreshed, cached, "a new generation must reload its key");
 }
 
 #[test]

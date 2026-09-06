@@ -155,7 +155,12 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     };
     let new_agent = ctx
-        .build_agent_for_client(&new_client, &session.model, &session.read_tracker)
+        .build_agent_for_client(
+            &new_client,
+            &session.model,
+            &session.read_tracker,
+            &session.todos,
+        )
         .await;
     let msg_count = session.messages.len();
     if let Err(e) = commit_staged_import(
@@ -265,6 +270,7 @@ fn parse_imported_session(
                     total.saturating_add(message.estimated_tokens)
                 });
             session.messages = import.messages;
+            session.mark_history_changed();
             let quick_models = crate::config::quick_models_map(cfg);
             session.update_context_window(cfg.resolve_context_window(
                 &session.provider,
@@ -533,6 +539,8 @@ fn clear_session_mutation(session: &mut crate::session::Session) -> Option<()> {
     session.reset_calibration();
     session.compactions.clear();
     session.rewind_undo = None;
+    session.mark_history_changed();
+    session.read_tracker.clear();
     session.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     Some(())
 }

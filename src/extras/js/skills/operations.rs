@@ -81,6 +81,112 @@ const SEED_PACKAGES: [(&str, &str); 5] = [
     ),
 ];
 
+#[derive(Debug, PartialEq)]
+struct SkillUsageStats {
+    skill_id: String,
+    status: String,
+    invocations: u64,
+    direct_successes: u64,
+    direct_failures: u64,
+    last_used: Option<i64>,
+    declared_effect_methods: u64,
+    estimated_round_trips_saved: u64,
+}
+
+impl SkillUsageStats {
+    fn success_percent(&self) -> f64 {
+        let terminals = self.direct_successes.saturating_add(self.direct_failures);
+        if terminals == 0 {
+            0.0
+        } else {
+            self.direct_successes as f64 * 100.0 / terminals as f64
+        }
+    }
+}
+
+fn estimate_round_trips_saved(direct_successes: u64, declared_effect_methods: u64) -> u64 {
+    // Actual effect counts are intentionally not retained with skill telemetry.
+    // This lower-bound proxy credits only additional distinct declared methods.
+    direct_successes.saturating_mul(declared_effect_methods.saturating_sub(1))
+}
+
+fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> {
+    let mut statement = store.connection().prepare(
+        "SELECT revision.id, revision.status,
+                COALESCE(stats.invoked_count, 0),
+                COALESCE(stats.direct_success_count, 0),
+                COALESCE(stats.direct_failure_count, 0),
+                (SELECT MAX(event.created_at) FROM skill_events AS event
+                  WHERE event.skill_id = revision.id AND event.event_kind = 'invoked'),
+                revision.capability_json
+           FROM skill_revisions AS revision
+           LEFT JOIN skill_stats AS stats ON stats.skill_id = revision.id
+          WHERE revision.identity_version = 2
+          ORDER BY COALESCE(stats.invoked_count, 0) DESC, revision.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (skill_id, status, invocations, successes, failures, last_used, capability_json) = row?;
+        let declared_effect_methods = serde_json::from_str::<serde_json::Value>(&capability_json)
+            .ok()
+            .and_then(|value| value.pointer("/manifest/grants")?.as_array().map(Vec::len))
+            .unwrap_or(0) as u64;
+        let direct_successes = u64::try_from(successes).unwrap_or(0);
+        Ok(SkillUsageStats {
+            skill_id,
+            status,
+            invocations: u64::try_from(invocations).unwrap_or(0),
+            direct_successes,
+            direct_failures: u64::try_from(failures).unwrap_or(0),
+            last_used,
+            declared_effect_methods,
+            estimated_round_trips_saved: estimate_round_trips_saved(
+                direct_successes,
+                declared_effect_methods,
+            ),
+        })
+    })
+    .collect()
+}
+
+pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let rows = load_skill_stats(&store).context("failed to read learned-skill usage")?;
+    println!(
+        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\tdeclared_effect_methods\test_round_trips_saved"
+    );
+    for row in &rows {
+        println!(
+            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}",
+            row.skill_id,
+            row.status,
+            row.invocations,
+            row.success_percent(),
+            row.last_used
+                .map_or_else(|| "never".into(), |value| value.to_string()),
+            row.declared_effect_methods,
+            row.estimated_round_trips_saved,
+        );
+    }
+    let invocations = rows.iter().map(|row| row.invocations).sum::<u64>();
+    let saved = rows
+        .iter()
+        .map(|row| row.estimated_round_trips_saved)
+        .sum::<u64>();
+    println!("total\t-\t{invocations}\t-\t-\t-\t{saved}");
+    Ok(())
+}
+
 pub(crate) fn run(
     purge_id: Option<&str>,
     compact: bool,
@@ -622,6 +728,43 @@ mod tests {
     fn explicit_compaction_is_safe_on_an_empty_store() {
         let (root, paths, _artifact) = fixture();
         run(None, true, None, None, &paths, None).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_stats_report_success_rate_last_use_and_conservative_savings() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_stats (
+                    skill_id, invoked_count, direct_success_count, direct_failure_count, updated_at
+                 ) VALUES (?, 8, 6, 2, 42)",
+                [&artifact.id],
+            )
+            .unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_events (
+                    invocation_id, skill_id, turn_id, event_kind, index_generation,
+                    evidence_complete, production, created_at
+                 ) VALUES (?, ?, 'turn-stats', 'invoked', 0, 1, 1, 42)",
+                rusqlite::params!["a".repeat(64), artifact.id],
+            )
+            .unwrap();
+
+        let rows = load_skill_stats(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].invocations, 8);
+        assert_eq!(rows[0].last_used, Some(42));
+        assert_eq!(rows[0].success_percent(), 75.0);
+        assert_eq!(rows[0].estimated_round_trips_saved, 0);
+
+        assert_eq!(estimate_round_trips_saved(6, 3), 12);
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 

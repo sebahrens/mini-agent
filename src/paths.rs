@@ -6,6 +6,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedUtf8Read {
+    Content(String),
+    Oversized,
+    InvalidUtf8,
+}
+
+pub(crate) fn read_utf8_bounded_status(
+    reader: impl Read,
+    max_bytes: usize,
+) -> io::Result<BoundedUtf8Read> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024).saturating_add(1));
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Ok(BoundedUtf8Read::Oversized);
+    }
+    Ok(match String::from_utf8(bytes) {
+        Ok(content) => BoundedUtf8Read::Content(content),
+        Err(_) => BoundedUtf8Read::InvalidUtf8,
+    })
+}
+
 /// A canonical workspace directory plus the filesystem identity captured when
 /// an ACP session was created.  Keeping the pathname alone is insufficient:
 /// an attacker could rename the directory and replace it with a symlink (or a
@@ -110,6 +134,40 @@ impl WorkspaceBinding {
                 }
                 files.push((stem.to_string(), content));
             }
+        }
+        Ok(files)
+    }
+
+    pub(crate) fn read_relative_dir_files_bounded_status(
+        &self,
+        path: &Path,
+        extension: &str,
+        max_bytes: usize,
+    ) -> io::Result<Vec<(String, Result<String, String>)>> {
+        let directory = self.open_dir_relative(path)?;
+        let mut files = Vec::new();
+        for entry in directory.read_dir(".")? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let candidate = Path::new(&name);
+            if candidate.extension().is_none_or(|value| value != extension) {
+                continue;
+            }
+            let Some(stem) = candidate.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let content = match open_file_no_follow(&directory, &name) {
+                Ok(file) => match read_utf8_bounded_status(file, max_bytes) {
+                    Ok(BoundedUtf8Read::Content(content)) => Ok(content),
+                    Ok(BoundedUtf8Read::Oversized) => {
+                        Err(format!("exceeds the {max_bytes}-byte limit"))
+                    }
+                    Ok(BoundedUtf8Read::InvalidUtf8) => Err("is not valid UTF-8".to_string()),
+                    Err(error) => Err(format!("could not be read: {error}")),
+                },
+                Err(error) => Err(format!("could not be opened: {error}")),
+            };
+            files.push((stem.to_string(), content));
         }
         Ok(files)
     }

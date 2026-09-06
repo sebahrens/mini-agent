@@ -10,6 +10,9 @@ use crate::{fs as secure_fs, paths::portable};
 
 use super::manifest::{AgentSkillManifest, ManifestError, parse_skill_markdown};
 
+#[cfg(feature = "skills")]
+use crate::extras::js::skills::store::SkillStore;
+
 const TREE_IDENTITY_VERSION: &[u8] = b"mini-agent-agent-skill-tree-v1";
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
@@ -59,6 +62,10 @@ pub enum ImportError {
     VerificationFailed,
     #[error("installed Agent Skill digest path already contains different content")]
     DigestConflict,
+    #[error(
+        "learned-js identity {id} is unavailable through the verified lifecycle gate: {reason}"
+    )]
+    LearnedJsUnavailable { id: String, reason: String },
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error(transparent)]
@@ -184,7 +191,9 @@ impl SourceTree {
 ///
 /// This function only reads and copies resources. It never executes a file,
 /// grants a tool permission, or inserts bundled JavaScript into a learned
-/// skill store.
+/// skill store. Declared `learned-js` identities must already have passed the
+/// learned-skill verification gate; the declaration does not change their
+/// approval or activation state.
 pub fn import_agent_skill(
     source: &Path,
     app_paths: &AppPaths,
@@ -220,6 +229,7 @@ pub fn import_agent_skill(
     };
 
     let (tree, manifest) = normalize_skill_tree(tree, expected_directory.as_deref())?;
+    validate_learned_js_references(&manifest, app_paths)?;
     let identity = identity(&tree);
 
     let staging_parent = app_paths.cache_dir.join("import-staging");
@@ -277,6 +287,64 @@ pub fn import_agent_skill(
         install_path,
         reimported: false,
     })
+}
+
+#[cfg(feature = "skills")]
+fn validate_learned_js_references(
+    manifest: &AgentSkillManifest,
+    app_paths: &AppPaths,
+) -> Result<(), ImportError> {
+    if manifest.learned_js.is_empty() {
+        return Ok(());
+    }
+    let store =
+        SkillStore::open_at(app_paths).map_err(|error| ImportError::LearnedJsUnavailable {
+            id: manifest.learned_js[0].clone(),
+            reason: format!("store unavailable: {error}"),
+        })?;
+    for id in &manifest.learned_js {
+        let artifact = store
+            .get(id)
+            .map_err(|error| ImportError::LearnedJsUnavailable {
+                id: id.clone(),
+                reason: format!("identity verification failed: {error}"),
+            })?
+            .ok_or_else(|| ImportError::LearnedJsUnavailable {
+                id: id.clone(),
+                reason: "identity is not installed".to_string(),
+            })?;
+        let lifecycle_state = store
+            .metadata(id)
+            .map_err(|error| ImportError::LearnedJsUnavailable {
+                id: id.clone(),
+                reason: format!("lifecycle state unavailable: {error}"),
+            })?
+            .map(|metadata| metadata.status)
+            .unwrap_or_default();
+        if artifact.identity_version != 2
+            || !matches!(lifecycle_state.as_str(), "verified" | "canary" | "active")
+        {
+            return Err(ImportError::LearnedJsUnavailable {
+                id: id.clone(),
+                reason: format!("lifecycle state is {lifecycle_state:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "skills"))]
+fn validate_learned_js_references(
+    manifest: &AgentSkillManifest,
+    _app_paths: &AppPaths,
+) -> Result<(), ImportError> {
+    if let Some(id) = manifest.learned_js.first() {
+        return Err(ImportError::LearnedJsUnavailable {
+            id: id.clone(),
+            reason: "this binary was built without learned-skill support".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn collect_directory(root: &Path) -> Result<SourceTree, ImportError> {

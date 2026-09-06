@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use rig::tool::Tool;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::agent::tools::crc::crc32_hex;
+use crate::agent::tools::crc::{Crc32, crc32_hex};
 use crate::agent::tools::{
     AskSender, PermCheck, ReadArgs, ReadTracker, ToolError, check_perm_bound_path, check_perm_path,
     edit_system,
@@ -83,12 +83,12 @@ impl Tool for ReadTool {
     fn description(&self) -> String {
         match edit_system() {
             EditSystem::Similarity => format!(
-                "Read the contents of a file. Supports text files. Defaults to first {} lines. Use offset/limit for large files.",
-                self.max_lines
+                "Read a UTF-8 text file with right-aligned 'N| content' line numbers. Defaults to the first {} lines. Files larger than {} bytes require an explicit offset or limit; the selected text must fit within that byte cap. Use a smaller line window for large files.",
+                self.max_lines, self.max_text_file_size
             ),
             EditSystem::Hashedit => format!(
-                "Read file contents with CRC-32 tagged lines for tag-based editing. Each line is prefixed with 'N|TAG' where TAG is an 8-char hex CRC-32 of the line content. Use these tags with the edit tool for CAS-guarded edits. Defaults to first {} lines.",
-                self.max_lines
+                "Read a UTF-8 text file with CRC-32 tagged lines for tag-based editing. Each line is prefixed with 'N|TAG' where TAG is an 8-char hex CRC-32 of the line content. Use these tags with the edit tool for CAS-guarded edits. Defaults to the first {} lines. Files larger than {} bytes require an explicit offset or limit; the selected text must fit within that byte cap.",
+                self.max_lines, self.max_text_file_size
             ),
         }
     }
@@ -145,7 +145,7 @@ impl Tool for ReadTool {
             .await?;
             (Some(resolved), coaching)
         };
-        let mut file = if let Some(file) = capability_file {
+        let file = if let Some(file) = capability_file {
             tokio::fs::File::from_std(file)
         } else {
             crate::fs::open_stable_file(
@@ -161,47 +161,116 @@ impl Tool for ReadTool {
             .unwrap_or_else(|| path.clone());
         let metadata = file.metadata().await?;
 
-        if let Some(msg) = self
-            .read_tracker
-            .check_read(&permission_path, offset, limit, &metadata)
-        {
-            tracing::debug!("tool read blocked (repeated): path={}", path);
-            return Err(ToolError::Msg(msg));
-        }
-
         let file_size = metadata.len();
-        if file_size > self.max_text_file_size {
+        let explicitly_bounded = args.offset.is_some() || args.limit.is_some();
+        if file_size > self.max_text_file_size && !explicitly_bounded {
             tracing::warn!(
-                "tool read file too large: path={}, size={}, max={}",
+                "tool read requires a bounded window: path={}, size={}, max={}",
                 path,
                 file_size,
                 self.max_text_file_size,
             );
             return Err(ToolError::Msg(format!(
-                "File too large ({} bytes). Maximum allowed file size is {} bytes.",
+                "File too large ({} bytes) for an unbounded read. The read output cap is {} bytes; re-call with an explicit offset and/or limit to select a smaller line window.",
                 file_size, self.max_text_file_size
             )));
         }
-        let mut content = String::new();
-        file.read_to_string(&mut content).await?;
-        let total_lines = content.lines().count();
-
-        let (start, end) = read_bounds(offset, limit, total_lines);
-
         let es = edit_system();
+        let oversized = file_size > self.max_text_file_size;
+        let scan_to_eof = !oversized || es == EditSystem::Hashedit;
+        let requested_end = offset.saturating_add(limit);
+        let mut reader = BufReader::new(file);
+        let mut raw_line = Vec::new();
+        let mut excerpt_lines = Vec::with_capacity(limit.min(256));
+        let mut excerpt_bytes = 0_u64;
+        let mut total_lines = 0_usize;
+        let mut has_more_lines = false;
+        let mut file_crc = Crc32::new();
+        let mut served_content_crc = Crc32::new();
+
+        loop {
+            raw_line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut raw_line).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            std::str::from_utf8(&raw_line).map_err(|_| {
+                ToolError::Msg(format!(
+                    "Cannot read '{}' as text because it is not valid UTF-8. Use the shell tool with `strings`, `xxd`, or another binary-aware command to inspect it.",
+                    path
+                ))
+            })?;
+
+            if es == EditSystem::Hashedit {
+                if raw_line.ends_with(b"\r\n") {
+                    file_crc.update(&raw_line[..raw_line.len() - 2]);
+                    file_crc.update(b"\n");
+                } else {
+                    file_crc.update(&raw_line);
+                }
+            }
+
+            let mut content_end = raw_line.len();
+            if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
+                content_end -= 1;
+                if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\r') {
+                    content_end -= 1;
+                }
+            }
+            let line = std::str::from_utf8(&raw_line[..content_end])
+                .expect("the complete line was already validated as UTF-8");
+            let line_index = total_lines;
+            total_lines += 1;
+
+            if line_index >= offset && line_index < requested_end {
+                let separator_bytes = u64::from(!excerpt_lines.is_empty());
+                let next_excerpt_bytes = excerpt_bytes
+                    .saturating_add(separator_bytes)
+                    .saturating_add(line.len() as u64);
+                if next_excerpt_bytes > self.max_text_file_size {
+                    return Err(ToolError::Msg(format!(
+                        "Requested text window exceeds the {} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long or non-text lines, use the shell tool with `head`, `cut`, or `strings`.",
+                        self.max_text_file_size
+                    )));
+                }
+                excerpt_bytes = next_excerpt_bytes;
+                excerpt_lines.push(line.to_string());
+                served_content_crc.update(&(line.len() as u64).to_le_bytes());
+                served_content_crc.update(line.as_bytes());
+            }
+
+            if !scan_to_eof && total_lines > requested_end {
+                has_more_lines = true;
+                break;
+            }
+        }
+
+        let served_content_crc = served_content_crc.finalize();
+        if let Some(msg) = self.read_tracker.check_read(
+            &permission_path,
+            offset,
+            limit,
+            &metadata,
+            served_content_crc,
+        ) {
+            tracing::debug!("tool read blocked (repeated): path={}", path);
+            return Err(ToolError::Msg(msg));
+        }
+
+        let start = offset.min(total_lines);
+        let end = start.saturating_add(excerpt_lines.len());
+        let line_num_width = line_number_width(total_lines.max(end));
 
         let excerpt: String = match es {
             EditSystem::Hashedit => {
                 // Annotate each line with CRC-32 tag
-                content
-                    .lines()
-                    .skip(start)
-                    .take(end - start)
+                excerpt_lines
+                    .iter()
                     .enumerate()
                     .map(|(i, line)| {
                         let line_num = start + i + 1;
                         let tag = crc32_hex(line.as_bytes());
-                        let line_num_width = if total_lines >= 1000 { 4 } else { 3 };
                         format!(
                             "{:>width$}|{} {}",
                             line_num,
@@ -213,35 +282,54 @@ impl Tool for ReadTool {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            EditSystem::Similarity => {
-                // Plain text (original behavior)
-                content
-                    .lines()
-                    .skip(start)
-                    .take(end - start)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            EditSystem::Similarity => numbered_excerpt(&excerpt_lines, start, line_num_width),
         };
 
-        let info = match es {
-            EditSystem::Hashedit => {
-                let file_crc = crc32_hex(content.replace("\r\n", "\n").as_bytes());
+        let total_lines_label = if has_more_lines {
+            format!("at least {total_lines} lines total")
+        } else {
+            format!("{total_lines} lines total")
+        };
+
+        let requested_line = offset.saturating_add(1);
+        let past_eof = excerpt_lines.is_empty() && offset >= total_lines;
+        let info = match (es, past_eof, total_lines) {
+            (EditSystem::Hashedit, true, 0) => format!(
+                "File: {} (0 lines total; empty file) [CRC: {}]",
+                path,
+                file_crc.finalize_hex(),
+            ),
+            (EditSystem::Hashedit, true, _) => format!(
+                "File: {} ({} lines total; requested offset {} is past EOF at line {}) [CRC: {}]",
+                path,
+                total_lines,
+                requested_line,
+                total_lines,
+                file_crc.finalize_hex(),
+            ),
+            (EditSystem::Hashedit, false, _) => {
                 format!(
-                    "File: {} ({} lines total, lines {}-{}) [CRC: {}]\n\n{}",
+                    "File: {} ({}, lines {}-{}) [CRC: {}]\n\n{}",
                     path,
-                    total_lines,
+                    total_lines_label,
                     display_start(start, total_lines),
                     end,
-                    file_crc,
+                    file_crc.finalize_hex(),
                     excerpt
                 )
             }
-            EditSystem::Similarity => {
+            (EditSystem::Similarity, true, 0) => {
+                format!("File: {} (0 lines total; empty file)", path)
+            }
+            (EditSystem::Similarity, true, _) => format!(
+                "File: {} ({} lines total; requested offset {} is past EOF at line {})",
+                path, total_lines, requested_line, total_lines,
+            ),
+            (EditSystem::Similarity, false, _) => {
                 format!(
-                    "File: {} ({} lines total, showing lines {}-{})\n\n{}",
+                    "File: {} ({}, showing lines {}-{})\n\n{}",
                     path,
-                    total_lines,
+                    total_lines_label,
                     display_start(start, total_lines),
                     end,
                     excerpt
@@ -249,7 +337,14 @@ impl Tool for ReadTool {
             }
         };
 
-        let info = if end < total_lines {
+        let info = if has_more_lines {
+            format!(
+                "{}\n\n[truncated after {} lines — more lines are available; re-call with offset {} and a bounded limit to continue]",
+                info,
+                end - start,
+                end + 1,
+            )
+        } else if end < total_lines {
             let remaining = total_lines - end;
             format!(
                 "{}\n\n[truncated after {} lines — {} more lines (lines {}-{}); re-call with offset/limit to see more]",
@@ -274,39 +369,171 @@ impl Tool for ReadTool {
             total_lines,
             end - start,
         );
-        self.read_tracker
-            .record_read(&permission_path, offset, limit, &metadata);
+        self.read_tracker.record_read(
+            &permission_path,
+            offset,
+            limit,
+            &metadata,
+            served_content_crc,
+        );
         Ok(info)
     }
-}
-
-fn read_bounds(offset: usize, limit: usize, total_lines: usize) -> (usize, usize) {
-    let start = offset.min(total_lines);
-    let end = start.saturating_add(limit).min(total_lines);
-    (start, end)
 }
 
 fn display_start(start: usize, total_lines: usize) -> usize {
     if total_lines == 0 { 0 } else { start + 1 }
 }
 
+fn line_number_width(total_lines: usize) -> usize {
+    total_lines.max(1).to_string().len().max(3)
+}
+
+fn numbered_excerpt(lines: &[String], start: usize, width: usize) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>width$}| {}", start + i + 1, line, width = width))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{display_start, read_bounds};
+    use super::{display_start, line_number_width, numbered_excerpt};
 
-    #[test]
-    fn read_bounds_clamps_offset_past_eof() {
-        assert_eq!(read_bounds(20, 10, 5), (5, 5));
-    }
+    use rig::tool::Tool;
 
-    #[test]
-    fn read_bounds_uses_requested_window_inside_file() {
-        assert_eq!(read_bounds(2, 3, 10), (2, 5));
-    }
+    use super::ReadTool;
+    use crate::agent::tools::ReadArgs;
 
     #[test]
     fn display_start_handles_empty_file() {
         assert_eq!(display_start(0, 0), 0);
+    }
+
+    #[test]
+    fn line_numbers_are_at_least_three_characters_and_expand_for_large_files() {
+        assert_eq!(line_number_width(0), 3);
+        assert_eq!(line_number_width(99), 3);
+        assert_eq!(line_number_width(1_000), 4);
+        assert_eq!(line_number_width(100_000), 6);
+    }
+
+    #[test]
+    fn similarity_excerpt_has_right_aligned_absolute_line_numbers() {
+        let lines = vec!["ninety-nine".to_string(), "one hundred".to_string()];
+        assert_eq!(
+            numbered_excerpt(&lines, 98, 3),
+            " 99| ninety-nine\n100| one hundred"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_past_eof_reports_eof_without_an_inverted_line_range() {
+        let path =
+            std::env::temp_dir().join(format!("mini-agent-read-past-eof-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+
+        let output = ReadTool::new(None, None, None, 100)
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(6),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            output.contains("requested offset 6 is past EOF at line 2"),
+            "{output}"
+        );
+        assert!(!output.contains("lines 6-2"), "{output}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_line_window_reads_a_file_larger_than_the_byte_cap() {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-read-large-window-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "zero\none\ntwo\nthree\nfour\nfive\n").unwrap();
+        let tool = ReadTool::new(None, None, Some(12), 100);
+
+        let output = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(3),
+                limit: Some(2),
+            })
+            .await
+            .expect("bounded large-file read should succeed");
+
+        assert!(output.contains("two"), "{output}");
+        assert!(output.contains("three"), "{output}");
+        assert!(!output.contains("four"), "{output}");
+        assert!(output.contains("more lines are available"), "{output}");
+        assert!(output.contains("offset 5"), "{output}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_unbounded_read_explains_how_to_select_a_window() {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-read-large-unbounded-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let tool = ReadTool::new(None, None, Some(4), 100);
+
+        let error = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect_err("unbounded large-file read should retain the safety cap")
+            .to_string();
+
+        assert!(error.contains("explicit offset and/or limit"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_returns_binary_aware_guidance() {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-read-invalid-utf8-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, [b'o', b'k', b'\n', 0xff, b'\n']).unwrap();
+        let tool = ReadTool::new(None, None, None, 100);
+
+        let error = tool
+            .call(ReadArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect_err("non-UTF-8 input must be rejected")
+            .to_string();
+
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(error.contains("strings"), "{error}");
+        assert!(error.contains("xxd"), "{error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn description_discloses_large_file_windowing_and_byte_cap() {
+        let description = ReadTool::new(None, None, Some(1234), 77).description();
+        assert!(description.contains("first 77 lines"), "{description}");
+        assert!(description.contains("1234 bytes"), "{description}");
+        assert!(
+            description.contains("explicit offset or limit"),
+            "{description}"
+        );
     }
 
     #[cfg(unix)]
@@ -316,10 +543,6 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
 
-        use rig::tool::Tool;
-
-        use super::ReadTool;
-        use crate::agent::tools::ReadArgs;
         use crate::permission::ask::UserDecision;
         use crate::permission::checker::PermissionChecker;
         use crate::permission::{PermissionConfigs, SecurityMode};

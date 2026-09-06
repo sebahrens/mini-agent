@@ -36,6 +36,7 @@ task(prompts: [
 ```
 
 - Batch independent questions into one `task` call — they run in parallel.
+- For domain-specific work, set `agent_type` to a specialist listed in the tool schema (for example `rust-security-review` or `rust-async-concurrency`). Omit it for general exploration.
 - Each subagent has a fresh context and a 5-minute budget; ask focused questions.
 - Use the returned summary to act yourself — the subagent cannot apply its own findings.
 

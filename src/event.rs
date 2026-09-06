@@ -36,10 +36,27 @@ pub enum AgentEvent {
         name: CompactString,
         output: CompactString,
     },
+    /// The runner has honored a UI compaction request only after every
+    /// in-flight tool result is correlated into this structured transcript.
+    CompactionBoundary {
+        interactions: Vec<rig::message::Message>,
+    },
+    /// A run-scoped guard replaced or skipped a repetitive tool call. The
+    /// ordinary `ToolResult` is still emitted and persisted; this event gives
+    /// interactive clients an explicit diagnostic without parsing it.
+    ToolLoop {
+        name: CompactString,
+        message: CompactString,
+    },
     #[cfg(any(feature = "subagents", feature = "acp"))]
     SubagentToolCall {
         name: CompactString,
         args: serde_json::Value,
+    },
+    #[cfg(feature = "subagents")]
+    SubagentStarted {
+        agent_type: CompactString,
+        source: CompactString,
     },
     Error(CompactString),
     Retrying {
@@ -62,6 +79,9 @@ pub enum AgentEvent {
         /// reconciliation remains chargeable but must not replace the last
         /// complete context observation.
         context_complete: bool,
+        /// True only when the interactive runner is parked before continuing
+        /// this provider/tool loop and requires a UI boundary decision.
+        awaits_compaction_decision: bool,
     },
     Done {
         response: CompactString,

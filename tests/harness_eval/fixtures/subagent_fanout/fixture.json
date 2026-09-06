@@ -1,0 +1,16 @@
+{
+  "name": "subagent_fanout",
+  "prompt": "Delegate the frontend and backend checks, then record their combined result.",
+  "max_provider_turns": 3,
+  "max_tool_calls": 2,
+  "max_total_tokens": 390,
+  "initial_files": {
+    "frontend.txt": "ui: clean\n",
+    "backend.txt": "api: stable\n"
+  },
+  "expected_files": {
+    "frontend.txt": "ui: clean\n",
+    "backend.txt": "api: stable\n",
+    "report.md": "frontend: ui clean\nbackend: api stable\n"
+  }
+}

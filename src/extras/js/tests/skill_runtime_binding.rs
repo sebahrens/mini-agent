@@ -80,6 +80,27 @@ fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
 }
 
 #[tokio::test]
+async fn repeated_turn_calls_reuse_compiled_skill_but_not_runtime_state() {
+    let artifact = artifact(
+        "let calls = 0; function cached_next() { return ++calls; }",
+        &["cached_next"],
+        CapabilityManifest::pure(),
+    );
+    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
+
+    for _ in 0..2 {
+        assert_eq!(
+            tool.call(JsArgs {
+                code: "cached_next()".to_string(),
+            })
+            .await
+            .unwrap(),
+            "1"
+        );
+    }
+}
+
+#[tokio::test]
 async fn production_and_verifier_make_identical_loader_decisions_for_differential_artifacts() {
     let cases = [
         (
@@ -102,7 +123,7 @@ async fn production_and_verifier_make_identical_loader_decisions_for_differentia
         ),
         (
             "ambient-global",
-            "const ambient = typeof read_file; function probe(cap) { return ambient === 'undefined' && typeof cap.read_file === 'undefined'; }",
+            "const ambient = [typeof read_file, typeof result, typeof scratch_put, typeof scratch_get]; function probe(cap) { return ambient.every(value => value === 'undefined') && typeof cap.read_file === 'undefined'; }",
             "probe()",
             "probe()",
         ),

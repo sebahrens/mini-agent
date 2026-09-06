@@ -2,7 +2,9 @@
 //!
 //! Imported resources remain inert files. In particular, `allowed-tools` is
 //! descriptive metadata and bundled JavaScript is never admitted to the
-//! learned-JS store by this module.
+//! learned-JS store by this module. A bounded `learned-js` frontmatter list may
+//! associate exact, separately verified identities; it never changes their
+//! approval or activation state.
 
 // Phase 3 exposes catalog lifecycle fields that Phase 4 admission consumes.
 #![allow(dead_code)]

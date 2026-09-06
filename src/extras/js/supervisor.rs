@@ -98,6 +98,8 @@ pub(crate) enum WorkerError {
     Cancelled,
     #[error("JavaScript worker invocation exceeded its deadline")]
     TimedOut,
+    #[error("JavaScript permission prompt was not answered before the invocation deadline")]
+    PermissionPromptTimedOut,
     #[error("JavaScript effect completed with an unknown outcome")]
     EffectOutcomeUnknown,
     #[error("JavaScript worker returned a stale process generation")]
@@ -158,6 +160,10 @@ struct WorkerConnection {
     stderr_drain: BoundedStderrDrain,
     created_at: Instant,
     completed_invocations: u64,
+    #[cfg(feature = "skills")]
+    skill_cache_turn: Option<String>,
+    #[cfg(feature = "skills")]
+    skill_cache_ids: Vec<String>,
     retirement: Option<Arc<RetirementTicket>>,
     /// Dedicated protocol handles cloned once when the connection is established.
     input_handle: Arc<Mutex<std::fs::File>>,
@@ -530,6 +536,26 @@ impl JsWorkerSupervisor {
         .await
     }
 
+    #[cfg(feature = "skills")]
+    pub(crate) async fn execute_bound_with_deadline_and_skills(
+        &self,
+        invocation: InvocationId,
+        request: RunStep,
+        skill_bundle: Arc<crate::extras::js::skills::turn::TurnSkillBundle>,
+        mut effects: impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+        deadline: Option<Instant>,
+    ) -> Result<StepResult, WorkerError> {
+        self.execute_inner_request(
+            InvocationRequest::RunWithSkills(request, skill_bundle),
+            &mut effects,
+            cancellation,
+            Some(invocation),
+            deadline,
+        )
+        .await
+    }
+
     async fn execute_inner(
         &self,
         request: RunStep,
@@ -538,9 +564,27 @@ impl JsWorkerSupervisor {
         invocation: Option<InvocationId>,
         deadline_override: Option<Instant>,
     ) -> Result<StepResult, WorkerError> {
+        self.execute_inner_request(
+            InvocationRequest::Run(request),
+            effects,
+            cancellation,
+            invocation,
+            deadline_override,
+        )
+        .await
+    }
+
+    async fn execute_inner_request(
+        &self,
+        request: InvocationRequest,
+        effects: &mut impl InvocationEffectHandler,
+        cancellation: PermCancellation,
+        invocation: Option<InvocationId>,
+        deadline_override: Option<Instant>,
+    ) -> Result<StepResult, WorkerError> {
         match self
             .invoke_interactive(
-                InvocationRequest::Run(request),
+                request,
                 Some(effects),
                 cancellation,
                 invocation,
@@ -680,6 +724,14 @@ impl JsWorkerSupervisor {
             armed: true,
         };
 
+        #[cfg(feature = "skills")]
+        let mut request = request;
+        #[cfg(feature = "skills")]
+        let cache_update = prepare_worker_skill_cache_request(
+            &mut request,
+            connection.skill_cache_turn.as_deref(),
+            &connection.skill_cache_ids,
+        );
         let result = run_invocation(
             &mut connection,
             invocation,
@@ -689,6 +741,13 @@ impl JsWorkerSupervisor {
             deadline,
         )
         .await;
+        #[cfg(feature = "skills")]
+        if result.is_ok()
+            && let Some((turn_id, ids)) = cache_update
+        {
+            connection.skill_cache_turn = Some(turn_id);
+            connection.skill_cache_ids = ids;
+        }
         let reusable_terminal = result.as_ref().is_ok_and(terminal_is_reusable);
         if reusable_terminal {
             authority.finish();
@@ -1246,7 +1305,153 @@ impl Drop for EffectCancellation {
 
 enum InvocationRequest {
     Run(RunStep),
+    #[cfg(feature = "skills")]
+    RunWithSkills(
+        RunStep,
+        Arc<crate::extras::js::skills::turn::TurnSkillBundle>,
+    ),
     Verify(VerifyArtifact),
+}
+
+#[cfg(feature = "skills")]
+fn prepare_worker_skill_cache_request(
+    request: &mut InvocationRequest,
+    cached_turn: Option<&str>,
+    cached_ids: &[String],
+) -> Option<(String, Vec<String>)> {
+    let (step, bundle) = match request {
+        InvocationRequest::Run(step) => (step, None),
+        InvocationRequest::RunWithSkills(step, bundle) => (step, Some(bundle)),
+        InvocationRequest::Verify(_) => return None,
+    };
+    if let Some(bundle) = bundle {
+        step.turn_id = bundle.turn_id.clone();
+        let ids = bundle
+            .skills
+            .iter()
+            .map(|skill| skill.id.clone())
+            .collect::<Vec<_>>();
+        if cached_turn == Some(bundle.turn_id.as_str())
+            && ids.iter().all(|id| cached_ids.contains(id))
+        {
+            step.cached_artifact_ids = ids;
+            step.artifacts.clear();
+            return None;
+        }
+        step.artifacts = bundle
+            .skills
+            .iter()
+            .map(|skill| crate::extras::js::skills::SkillArtifact {
+                id: skill.id.clone(),
+                identity_version: skill.identity_version,
+                abi_version: skill.abi_version,
+                source: skill.source.clone(),
+                description: skill.description.clone(),
+                tags: skill.tags.clone(),
+                exports: skill.exports.clone(),
+                tests: skill.tests.clone(),
+                capability: skill.capability.clone(),
+            })
+            .collect();
+        return Some((bundle.turn_id.clone(), ids));
+    }
+    if step.artifacts.is_empty() {
+        return (!step.turn_id.is_empty() && cached_turn != Some(step.turn_id.as_str()))
+            .then(|| (step.turn_id.clone(), Vec::new()));
+    }
+    let ids = step
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .collect::<Vec<_>>();
+    if cached_turn == Some(step.turn_id.as_str()) && ids.iter().all(|id| cached_ids.contains(id)) {
+        step.cached_artifact_ids = ids;
+        step.artifacts.clear();
+        None
+    } else {
+        Some((step.turn_id.clone(), ids))
+    }
+}
+
+#[cfg(all(test, feature = "skills"))]
+mod skill_cache_tests {
+    use super::*;
+    use crate::extras::js::skills::turn::{ResolvedSkill, TurnSkillBundle};
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+
+    fn artifact() -> SkillArtifact {
+        SkillArtifact::new(
+            "function cached_value() { return 7; }".into(),
+            "parent cache fixture".into(),
+            vec![],
+            vec![SkillExport {
+                name: "cached_value".into(),
+                signature: "cached_value()".into(),
+            }],
+            vec!["cached_value() === 7".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap()
+    }
+
+    fn bundle(artifact: &SkillArtifact) -> Arc<TurnSkillBundle> {
+        Arc::new(TurnSkillBundle {
+            turn_id: "turn-cache".into(),
+            query_fingerprint: "cache-query".into(),
+            embedding_model_revision: "cache-model".into(),
+            index_generation: 1,
+            skills: vec![ResolvedSkill {
+                id: artifact.id.clone(),
+                identity_version: artifact.identity_version,
+                abi_version: artifact.abi_version,
+                description: artifact.description.clone(),
+                tags: artifact.tags.clone(),
+                exports: artifact.exports.clone(),
+                tests: artifact.tests.clone(),
+                capability: artifact.capability.clone(),
+                source: artifact.source.clone(),
+                score_bits: 1.0_f32.to_bits(),
+                rank: 0,
+                route: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn parent_sends_full_artifact_once_then_ordered_identity() {
+        let artifact = artifact();
+        let id = artifact.id.clone();
+        let bundle = bundle(&artifact);
+        let mut first = InvocationRequest::RunWithSkills(
+            RunStep::new("1".into()).with_skills(Vec::new(), "turn-cache".into(), "call-1".into()),
+            bundle.clone(),
+        );
+        let update = prepare_worker_skill_cache_request(&mut first, None, &[]).unwrap();
+        assert_eq!(update, ("turn-cache".to_string(), vec![id.clone()]));
+        let InvocationRequest::RunWithSkills(first, _) = first else {
+            unreachable!()
+        };
+        assert_eq!(first.artifacts, vec![artifact.clone()]);
+        assert!(first.cached_artifact_ids.is_empty());
+
+        let mut next = InvocationRequest::RunWithSkills(
+            RunStep::new("2".into()).with_skills(Vec::new(), "turn-cache".into(), "call-2".into()),
+            bundle,
+        );
+        assert!(
+            prepare_worker_skill_cache_request(
+                &mut next,
+                Some("turn-cache"),
+                std::slice::from_ref(&id),
+            )
+            .is_none()
+        );
+        let InvocationRequest::RunWithSkills(next, _) = next else {
+            unreachable!()
+        };
+        assert!(next.artifacts.is_empty());
+        assert_eq!(next.cached_artifact_ids, vec![id]);
+    }
 }
 
 enum InvocationTerminal {
@@ -1422,6 +1627,10 @@ async fn launch_connection(
         stderr_drain,
         created_at: Instant::now(),
         completed_invocations: 0,
+        #[cfg(feature = "skills")]
+        skill_cache_turn: None,
+        #[cfg(feature = "skills")]
+        skill_cache_ids: Vec::new(),
         retirement: None,
         input_handle: Arc::new(Mutex::new(input_handle)),
         output_handle: Arc::new(Mutex::new(output_handle)),
@@ -1581,6 +1790,8 @@ async fn run_invocation<H: InvocationEffectHandler>(
 ) -> Result<InvocationTerminal, WorkerError> {
     let parent_message = match request {
         InvocationRequest::Run(request) => ParentFrame::RunStep(request),
+        #[cfg(feature = "skills")]
+        InvocationRequest::RunWithSkills(request, _) => ParentFrame::RunStep(request),
         InvocationRequest::Verify(request) => ParentFrame::VerifyArtifact(request),
     };
     let frame = WireFrame::invocation(
@@ -1636,6 +1847,8 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     }
                 };
                 let caller_cancelled = matches!(&wait, EffectWait::Cancelled);
+                let permission_prompt_timed_out = matches!(&wait, EffectWait::TimedOut)
+                    && cancellation.permission_prompt_blocked_deadline();
                 let (result, interrupted) = match wait {
                     EffectWait::Completed(result) => (result, None),
                     EffectWait::Cancelled | EffectWait::TimedOut => {
@@ -1645,6 +1858,8 @@ async fn run_invocation<H: InvocationEffectHandler>(
                         cancel_on_drop.cancellation.cancel();
                         let interrupted = if caller_cancelled {
                             WorkerError::Cancelled
+                        } else if permission_prompt_timed_out {
+                            WorkerError::PermissionPromptTimedOut
                         } else {
                             WorkerError::TimedOut
                         };

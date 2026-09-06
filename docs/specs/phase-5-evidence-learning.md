@@ -70,7 +70,10 @@ raw store methods must not bypass verifier, approval, evidence, or rollback gate
 
 Every replacement stores `supersedes_id`. Successful promotion atomically sets the candidate to
 `active` and the predecessor to `superseded`. A lineage must be acyclic and each active revision
-may have at most one active successor.
+may have at most one active successor. Multiple replacement canaries may collect evidence against
+the same active predecessor. Candidate selection first favors the canary with the fewest canonical
+production invocations, then breaks ties by creation time and immutable ID, so siblings cannot be
+starved and scheduling remains deterministic.
 
 Normal lifecycle operations never delete source, evidence, or predecessor links. An explicit
 privacy purge may physically remove data after also removing dependent embeddings, events,
@@ -173,8 +176,10 @@ pub enum SkillEventKind {
 
 `Selected` and `Injected` do not increment invocation counts. A failure after a skill returned
 successfully is recorded as a step failure but is not automatically attributed to that skill.
-Only wrapper-observed exceptions, rejections, limits, policy faults, held-out regressions, and
-explicit targeted feedback drive automatic quarantine.
+Limits, policy faults, held-out regressions, and explicit targeted feedback drive automatic
+quarantine. A wrapper-observed exception or rejection is telemetry, but it counts as a behavioral
+fault only when active authenticated negative or severe feedback targets that exact invocation;
+caller input mistakes therefore cannot quarantine a correct skill by themselves.
 
 A **qualified canary invocation** has one persisted `Invoked` event and exactly one persisted
 terminal wrapper outcome for the canary revision, was executed rather than shadow-evaluated, and
@@ -360,9 +365,11 @@ Quarantine is immediate for:
 - corrupted embedding/model metadata that makes the revision unsafe to retrieve.
 - explicit strong negative user feedback targeted at a canary invocation or revision.
 
-Behavioral quarantine of an active revision requires directly attributed failures and a minimum
-sample window. The initial policy requires at least 20 invocations and at least 5 directly
-attributed failures before rate-based quarantine. Thresholds are configurable and versioned.
+Behavioral quarantine of an active revision requires directly attributed faults and a minimum
+sample window. Timeouts, OOMs, and capability denials are faults. A thrown exception counts only
+when active authenticated negative or severe feedback targets the exact invocation. The initial
+policy requires at least 20 invocations and at least 5 directly attributed faults before
+rate-based quarantine. Thresholds are configurable and versioned.
 
 A targeted report of an integrity, permission, or unsafe-effect problem is severe and may
 quarantine an active revision immediately. Ordinary “wrong result” feedback enters the behavioral
@@ -491,10 +498,10 @@ as alternatives/supersession candidates or retired after review.
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
 
-1. **Fault-only quarantine** (mini-agent-lugc). Behavioral quarantine counts faults
-   (`timed_out`, `oom`, `capability_denied`, and `threw` only when the export declares no error
-   contract for that input class); an expected `threw` caused by caller input is telemetry, not
-   evidence against the revision. A typed skill input error distinguishes the two.
+1. **Fault-only quarantine** (mini-agent-lugc). Behavioral quarantine counts `timed_out`, `oom`,
+   and `capability_denied`. A `threw` event counts only when active authenticated negative or severe
+   feedback targets that exact invocation; an uncorroborated exception caused by caller input is
+   telemetry, not evidence against the revision.
 2. **Canary ordering** (mini-agent-840z). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
 3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy

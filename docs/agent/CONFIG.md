@@ -47,6 +47,11 @@ stored in the private state root and is invalidated by a content change or a
 copied checkout. Headless and ACP startup never prompt; they apply only the
 benign subset and print a notice for ignored sensitive settings.
 
+Trusted project specialist definitions and the append-only
+`.zerostack/agents/.notes.md` layer use this same content-and-path-bound trust
+decision. They remain inert in untrusted, headless, or copied checkouts even
+when their files are present.
+
 Prompts and themes are loaded from multiple sources, with later sources
 overriding earlier ones for same-named files:
 
@@ -108,7 +113,12 @@ mini-agent --import-agent-skill ./my-skill.zip
 Imports are validated without executing bundled scripts. Trees are installed
 by whole-tree digest below `<data-dir>/agent-skills/<name>/<digest>/`.
 `allowed-tools` is retained as non-authoritative metadata and grants no tool
-permission.
+permission. With the `skills` feature, frontmatter may include up to 32 unique
+full identities in `learned-js`. Every reference must already be an
+identity-v2 revision in `verified`, `canary`, or `active` state or the import
+fails before installation. Selecting the Agent Skill attaches only identities
+that are currently `active`; references never approve, activate, or widen a
+learned skill.
 
 ## Skill embeddings
 
@@ -241,6 +251,13 @@ Failure cleanup removes a temporary file only after confirming that it is the
 same file created by the failed write. Session saves are currently lock-free;
 any lock artifact added later must continue to use the private storage helper.
 
+One-step `/redo` persistence stores only the tail removed by `/undo` or the
+rewind picker; readers still accept the older full-snapshot shape. In memory,
+model-history conversion is cached as a shared immutable snapshot for an
+unchanged session, and retry attempts reuse that snapshot until the provider
+requires an owned request payload. Failed-turn rollback records prefix lengths
+and scalar accounting state instead of cloning the full transcript.
+
 On startup, known legacy content is copied through a private, no-follow,
 content-verified migration and the original is retained. Identical candidates
 are safe to converge. Differing candidates require an explicit numbered
@@ -263,6 +280,7 @@ temperature: 0.7
 context_window: 128000
 reserve_tokens: 8192
 keep_recent_tokens: 10000
+keep_recent_tool_results: 8
 compact_enabled: true
 mid_turn_compact_threshold: 0.80
 deny_repeated_reads: false
@@ -317,6 +335,7 @@ temperature = 0.7
 context_window = 128000
 reserve_tokens = 8192
 keep_recent_tokens = 10000
+keep_recent_tool_results = 8
 compact_enabled = true
 mid_turn_compact_threshold = 0.80
 edit_system = "similarity"
@@ -393,13 +412,14 @@ Accepted top-level keys:
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
-| `retry`                   | object  | Retry policy with `max_attempts` (default `3`), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`). The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `3`), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
-| `max_text_file_size`      | integer | Maximum allowed file size in bytes for read/write tool operations. Default: `1048576` (1 MB).                                                                               |
+| `keep_recent_tool_results` | integer | Number of newest historical tool results kept verbatim when a turn or restarted turn assembles its model history. Older results are replaced with a short recovery notice while their calls, durable session records, and spill files remain intact. Default: `8`; set a larger value to retain more output. |
+| `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. Default: `1048576` (1 MiB). |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
@@ -409,7 +429,7 @@ Accepted top-level keys:
 | `subagent_max_grep_results` | integer | Per-subagent grep-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_find_results` | integer | Per-subagent file-result cap. Default: `200`; requires `subagents`. |
 | `subagent_max_list_dir_entries` | integer | Optional per-subagent directory-entry cap; requires `subagents`. |
-| `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section within one logical session until that session edits or writes the target. Agent rebuilds retain that session's history; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
+| `deny_repeated_reads`     | boolean | Block repeated reads of the same canonical file section while its prior result remains in the current conversation. The section's served-content CRC joins file length and modification time in the version key, so same-length or mtime-preserving edits remain readable. Editing or writing the target, compaction, failed-turn rollback, clear, undo/rewind, and redo reset the relevant session tracker. Ordinary agent rebuilds retain it; concurrent UI, ACP, BTW, and subagent sessions keep independent settings and histories. Default: `true`. Set to `false` to allow re-reading. |
 | `show_cost_always`        | boolean | Show the session cost in the status bar even when it is `$0.0000` (for example when the model has no per-token pricing configured). Default: `false`, which hides the cost until it is above zero. |
 | `compact_enabled`         | boolean | Master switch for all automatic conversation compaction (between ordinary TUI turns, between `/loop` iterations, before an over-budget resumed headless `-p` request, and opt-in mid-turn compaction). Default: `false`. When `false`, nothing is ever compacted automatically.            |
 | `mid_turn_compact_threshold` | number | Opt-in mid-turn compaction. Fraction of the context window (`0.0`–`1.0`) of real provider prompt pressure at which to compact *during* a turn, not just between turns. Unset by default, meaning no mid-turn compaction. Honored only when `compact_enabled` is `true`. Recommended starting value: `0.80`. See Mid-turn compaction below.            |
@@ -642,6 +662,11 @@ Invalid regexes are reported at load time.
 `Stop`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`.
 `PreCompact` and `Notification` are not currently implemented.
 
+Interactive startup begins `SessionStart` as soon as resume state is known,
+starts the independent agent/MCP prebuild, and joins the hook before accepting
+the first user or automatic turn. Print and loop modes still join the hook
+before constructing their first request.
+
 Only `PreToolUse` is permission-blockable by default. A handler's stdout JSON
 may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it
 (defer to the normal permission system). `deny` always blocks, holding even
@@ -657,7 +682,9 @@ Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
 model-visible output.
 
 `SubagentStart` can set `"additionalContext"` to prepend text to the child
-prompt. `UserPromptSubmit` cannot alter the submitted prompt; an
+prompt. Both subagent lifecycle envelopes include the resolved `agent_type`
+and `agent_source` (for example, a project override path or the compiled-in
+explorer). `UserPromptSubmit` cannot alter the submitted prompt; an
 `"additionalContext"` field from that event is ignored. `Stop` and
 `SubagentStop` can set
 `"decision": "block"` with a `"reason"` to force the agent (or subagent) to
@@ -700,26 +727,54 @@ See [COMMANDS.md](COMMANDS.md#hooks) for the `/hooks` slash command.
 
 ## Mid-turn compaction
 
+Before deciding whether automatic compaction is necessary, mini-agent clears
+historical tool results older than `keep_recent_tool_results` from the live
+model context. The tool calls remain structured and the newest results stay
+verbatim. A cleared result tells the model to re-run the tool; when the original
+result was spilled to disk, the notice retains its recorded spill-file path.
+This is a request-time projection only: session exports, undo/redo state, and
+the spill file keep the original result. If the projected context is still over
+budget, the same cleared projection is passed to the summarizer before the
+ordinary compaction flow runs.
+
 By default zerostack only compacts the conversation *between* turns, after a
 response finishes, when the accumulated session history exceeds
-`context_window - reserve_tokens`. A single long turn (many tool calls and large
-tool results) can still blow past the model's real context limit before that
-check ever runs, because the in-flight tool traffic never enters the session's
-token estimate.
+`context_window - reserve_tokens`. Each textual tool result is independently
+bounded before Rig commits it to the live conversation: results over 12,000
+characters are written to the private tool-output directory and replaced for
+the model with a 2,000-character head, an omission/path notice, and an
+8,000-character tail. This applies at the common result boundary for built-in,
+shell, JavaScript, and MCP tools; it therefore also covers a very long single
+line. If the spill write fails, the head/tail bound remains in force and the
+notice reports that the complete output is unavailable. A single long turn with
+many individually bounded results can still exceed the model's real context
+limit before the between-turn check runs, because aggregate in-flight tool
+traffic does not enter the session's token estimate.
 
 The summarizer processes oversized history as bounded recent chunks with a
 rolling summary, at most 16 provider requests, and a five-minute aggregate
-deadline. If a provider still rejects an ordinary request for exceeding its
+deadline. Request byte budgets use the same conservative 3.25-character token
+estimate as session accounting. When a rolling summary exceeds its storage
+bound, each structured summary section retains its heading and prefix instead
+of dropping the middle sections. Compaction boundaries also snap backward to a
+user or assistant message so a retained tool result is never separated from
+its call. If a provider still rejects an ordinary request for exceeding its
 context limit, the error points to `/compress` and `compact_enabled` recovery.
 
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
 provider call zerostack compares the real provider-reported prompt size against
-`context_window`; when the ratio crosses the threshold it aborts the current
-run, compacts, and resumes the same task on the compacted history. The usage
-event and abort cross an asynchronous channel, so a tool may already have
-started and may be interrupted after partial effects. The continuation receives
-a capped best-effort recap that labels this risk; inspect the working tree when
-the last tool may have mutated files.
+`context_window`. When a tool-bearing call crosses the threshold, the runner
+finishes every tool in that call's batch, emits their correlated results in
+order, and pauses before another provider request can start. The TUI then
+compacts and resumes the same task. It never aborts an in-flight tool merely to
+create a compaction boundary.
+
+Tool calls and results are persisted as structured session messages before the
+boundary event, so the summarizer consumes the exact transcript rather than a
+capped presentation trace. Any assistant prose already streamed before the
+batch is retained as assistant history. A text-only terminal response has no
+tool-result boundary and therefore settles normally; ordinary between-turn
+compaction remains available afterward.
 
 Provider usage is normalized without double-counting cache detail. Anthropic's
 native Messages API reports uncached `input_tokens`, cache reads, and cache
@@ -733,6 +788,12 @@ Those routes therefore use the primary input count. For a non-native compatible
 gateway that reports cache components separately, zerostack uses the larger
 normalized `total_tokens - output_tokens` prompt count rather than adding cache
 details blindly.
+
+Verbose logging reports uncached input, cached input, and cache-creation input
+for each completion. Within one unchanged agent session, the system preamble
+and serialized tool definitions remain byte-identical across turns; explicit
+context/tool invalidation rebuilds the agent and intentionally changes that
+cache prefix.
 
 Before the first provider usage calibration, narrow text is estimated at a
 conservative 3.25 characters per token instead of 4. This safety margin targets
@@ -771,6 +832,15 @@ can talk to either of rig's two OpenAI transports:
 Set `api_style` to override the auto-detected default — for example, to force
 `completions` against a gateway, or `responses` against an endpoint that
 actually implements `/responses`.
+
+Responses requests include an opaque SHA-256 `prompt_cache_key` derived from the
+stable session ID, keeping consecutive turns on the same provider cache route.
+An explicit `prompt_cache_key` in `extra_body` overrides this generated default.
+
+For local HTTP(S) endpoints, connection pooling is disabled to avoid stale
+keep-alive sockets used by some local servers. Local detection covers loopback
+and unspecified IP addresses, `localhost` (including `.localhost` subdomains),
+and `host.docker.internal`; lookalike remote domains are not treated as local.
 
 Custom providers may also send arbitrary HTTP headers, which is useful for
 gateways behind an auth proxy such as Cloudflare Access. Header values support
@@ -968,6 +1038,7 @@ Available items:
 | `provider`            | The active provider name. |
 | `tokens_input`        | Total input tokens this session. |
 | `tokens_output`       | Total output tokens this session. |
+| `cache_hit_ratio`     | Cached input as a percentage of provider-normalized prompt tokens (`cache:<n>%`). |
 | `context_used`        | Current context size in tokens. |
 | `context_max`         | The model's context window. |
 | `context_percentage`  | Context used as a percentage of the max. |
@@ -989,8 +1060,10 @@ Available items:
 | `separator`           | Literal text from `text` (default a space). Trimmed around hidden items. |
 | `flex_separator`      | Expands to fill the remaining width; several split the space evenly. |
 
-The `git_changes` and `git_status` items run `git status` once a second (only
-when one of them is used). All other items are read from the session.
+The `git_changes` and `git_status` items schedule at most one bounded background
+`git status` refresh per second (only when one of them is used). The TUI keeps
+rendering the last completed result while Git runs, and discards a late result
+after a workspace switch. All other items are read from the session.
 
 ## Status signals
 
@@ -1053,11 +1126,18 @@ An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
 inherited `read` access used by `lsp_diagnostics`.
 
+`todo_write` replaces the structured task list stored with the current session;
+`todo_read` reads that same session-local list and performs no filesystem access.
+Open items are retained in compaction context so an agent rebuild or compressed
+conversation does not lose the active plan.
+
 The structured Git tool accepts only those seven fixed local operations. Read operations use a
 canonical structured revision, path, and count identity for permission matching. `stage` and
 `unstage` authorize each literal repository-relative path with their exact verb, while `commit`
 uses the bounded commit message as its permission identity. The tool exposes no raw arguments,
-shell commands, remotes, or network operations.
+shell commands, remotes, or network operations. Git receives literal-pathspec mode so filename
+metacharacters cannot expand to other repository paths. Successful commit results include the new
+commit ID, and binary diffs report that files differ without embedding binary patch payloads.
 
 Bash uses a fail-closed, opaque full-script permission model. The exact string
 passed to `bash -c` is also the permission key. An `allow` entry authorizes Bash
@@ -1229,13 +1309,21 @@ The server must reserve stdout for MCP protocol messages and write diagnostics
 to stderr. Every server must complete the MCP initialization handshake within
 10 seconds; for URL servers that budget also covers the TCP/TLS connect and,
 with OAuth, restoring (and refreshing) the stored token. Each server's
-`tools/list` enumeration is bounded to 30 seconds and 64 pages. A server that
-exceeds either budget is reported in a startup notice and skipped without
-delaying the others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
+`tools/list` enumeration is bounded to 30 seconds, 64 pages, and 128 tools per
+server. Each model-facing tool description is limited to 4 KiB and each input
+schema to 16 KiB; descriptions are safely truncated, while tools with invalid
+or oversized schemas are omitted. Startup notices report each applied bound.
+A server that exceeds the time or page budget is skipped without delaying the
+others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 (default 120); on expiry zerostack cancels the request and returns a tool error
 the model can act on instead of stalling the turn. Malformed JSON arguments are
 rejected rather than silently converted to an argument-less call. Text, image,
-and embedded resource data from one result share a hard 1 MiB cumulative bound.
+and embedded resource data from one result share the same model-facing bound as
+ordinary tool output: results over 12,000 characters are stored in the private
+tool-output directory and replaced with a 2,000-character head, an omission
+notice with the spill-file path, and an 8,000-character tail. If private
+storage is unavailable, the bounded head/tail view remains available and tells
+the model to retry with a narrower request.
 
 When two servers expose a tool with the same name, both are registered under
 `<server>__<tool>` (for example `alpha__search` and `beta__search`) and a
@@ -1423,7 +1511,10 @@ Only completed turns are committed: the user prompt, correlated structured tool
 call/result messages, and the terminal assistant response are retained together.
 The next prompt receives that committed history before its current user message.
 History is bounded to 128 complete turns and 2 MiB of serialized Rig messages;
-the oldest complete turns are evicted first. The process retains at most 64 ACP
+before an over-bound history is reused, the ordinary provider-backed rolling
+summarizer replaces the oldest complete turns with a bounded recap. A
+compaction failure refuses that prompt without discarding the task origin. The
+process retains at most 64 ACP
 sessions. Because ACP exposes no session-close notification, creating a 65th
 session is rejected rather than silently invalidating any live session. Each
 session accepts one active prompt; a concurrent prompt for the same session is
@@ -1560,7 +1651,8 @@ zerostack supports two edit systems, selectable via `edit_system` config key,
 The classic aider-style SEARCH/REPLACE format. The LLM copies exact text from
 read output into `<<<<<<< SEARCH` blocks and provides replacements in
 `>>>>>>> REPLACE` blocks. Falls back to whitespace normalization and fuzzy
-matching when the exact text doesn't match.
+matching when the exact text doesn't match. A SEARCH section containing only
+whitespace is rejected rather than being interpreted as an insertion point.
 
 ```
 edit_system = "similarity"
@@ -1590,9 +1682,12 @@ provide the same functionality at runtime.
 
 ## Prompt directives
 
-Custom prompt `.md` files may include a `%%mode=<mode>` directive on the
-**first line** to automatically switch the security mode when the prompt
-is activated (via `/prompt <name>` or as the `default_prompt`).
+Custom prompt `.md` files may start with a contiguous directive header. The
+recognized lines are `%%mode=<mode>` and `%%agent=<name>`; they may appear in
+either order and are stripped before the prompt reaches the model. The first
+selects the security mode and the second composes the prompt with a main-agent
+persona when the prompt is activated (via `/prompt <name>`, `.name`, or as the
+`default_prompt`). `%%agent=default` clears an active persona.
 
 Valid modes: `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`.
 
@@ -1602,11 +1697,12 @@ more permissive mode (for example `%%mode=yolo` while running `--guarded`) is
 ignored and the current mode is kept. Ranking from least to most permissive:
 `readonly`, `planwrite`, `restrictive`, `guarded`, `standard`, `yolo`.
 
-Prompts are loaded from three sources and the source decides whether a
-directive is honored at all. Embedded prompts and the user's own prompts
+Prompts are loaded from three sources and the source decides whether directives
+are honored at all. Embedded prompts and the user's own prompts
 directory are trusted like the global config. Prompts from the project's
-`.zerostack/prompts/` are repository content: their `%%mode=` directive is
-dropped (with a warning) unless the project's `.zerostack/config.toml` has
+`.zerostack/prompts/` are repository content: their `%%mode=` and `%%agent=`
+directives are dropped (with a warning) unless the project's
+`.zerostack/config.toml` has
 been explicitly trusted through the project-config trust store described
 under Trust model; `%%mode=last_user_mode` is always kept because it can
 only restore the user's selection.
@@ -1614,9 +1710,6 @@ only restore the user's selection.
 Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
 set explicitly via `/mode` or startup config — useful when a prompt wants
 to avoid overriding the user's chosen mode.
-
-The directive line is stripped from the prompt content before it reaches
-the agent.
 
 Example `ask.md`:
 
@@ -1638,9 +1731,30 @@ Example `code.md` that defers to the user's mode:
 Write well-tested code. Follow project conventions.
 ```
 
+Example mode paired with a main persona:
+
+```markdown
+%%agent=rust-security-review
+%%mode=readonly
+
+Review the requested Rust change for exploitable security defects.
+```
+
 The mode change is applied when the prompt is activated and persists
 until changed again by `/mode`, another prompt directive, or a restart.
 The status bar shows `| mode:<name>` when the mode is not `standard`.
+
+Use `/agent` to list the personas resolved for the current workspace,
+`/agent <name>` to apply one to the main loop, and `/agent default` to clear it.
+An agent definition may declare `mode: <prompt-name>` in YAML frontmatter; an
+explicit `/agent` selection activates that prompt and remains authoritative if
+the prompt itself contains a different `%%agent=` directive.
+
+For `task` subagents, the same frontmatter may declare a bounded `description`,
+a `tools` subset of the read-only child tools, a raw model ID or `quick_models`
+alias in `model`, and `effort = low|medium|high`. Effort narrows the global
+`task_max_turns` cap to one-third, two-thirds, or all of it. See
+[SUBAGENTS.md](SUBAGENTS.md#specialist-agent-types) for syntax and validation.
 
 ## Prompt-to-model switching
 
@@ -1971,7 +2085,7 @@ crate plus the `zerostack::audit::*` targets reaches the file.
 With `-v`, the following subsystems produce debug/trace output:
 
 - **Agent lifecycle**: prompt sizes, retry events, token usage, tool call dispatch
-- **LLM-exposed tools**: every tool invocation with start/end, arguments, and results (bash, read, write, edit, grep, find_files, list_dir, todo_write)
+- **LLM-exposed tools**: every tool invocation with start/end, arguments, and results (bash, read, write, edit, grep, find_files, list_dir, todo_write, todo_read)
 - **Config loading**: first startup detection, config file path, quick model and provider counts
 - **Session management**: save, delete, and find operations with message counts
 - **Permission checker**: every permission check result, doom-loop detection, mode changes

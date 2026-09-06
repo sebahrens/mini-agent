@@ -9,9 +9,12 @@ use rquickjs::context::EvalOptions;
 use rquickjs::function::{Args, IntoArgs, Rest};
 use rquickjs::object::Property;
 use rquickjs::{
-    Context, Ctx, FromJs, Function, Module, Object, Persistent, Runtime, Value, WriteOptions,
+    Context, Ctx, FromJs, Function, Module, Object, Persistent, Runtime, Value, WriteOptions, qjs,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::mem::MaybeUninit;
+use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use thiserror::Error;
@@ -330,6 +333,78 @@ const CAPABILITY_BRIDGE_FACTORY_SOURCE: &str = r#"
    Promise.resolve, Promise.prototype.then, Promise)
 "#;
 
+const REALM_BOOTSTRAP_MODULE_NAME: &str = "mini-agent:realm-bootstrap";
+static REALM_BOOTSTRAP_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+fn realm_bootstrap_source() -> String {
+    format!(
+        "export const strictClone = {STRICT_CLONE_SOURCE};\n\
+         export const pureBridgeFactory = {BRIDGE_FACTORY_SOURCE};\n\
+         export const capabilityBridgeFactory = {CAPABILITY_BRIDGE_FACTORY_SOURCE};\n\
+         export const pureModelWrapperFactory = {PURE_MODEL_WRAPPER_FACTORY_SOURCE};\n\
+         export const modelWrapperFactory = {MODEL_WRAPPER_FACTORY_SOURCE};\n\
+         export const terminalWrapper = {TERMINAL_WRAPPER_SOURCE};"
+    )
+}
+
+fn compile_realm_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
+    let runtime = Runtime::new()?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let context = Context::full(&runtime)?;
+    context.with(|ctx| {
+        Module::declare(ctx, REALM_BOOTSTRAP_MODULE_NAME, realm_bootstrap_source())?
+            .write(WriteOptions::default())
+    })
+}
+
+fn realm_bootstrap_bytecode() -> Option<&'static [u8]> {
+    REALM_BOOTSTRAP_BYTECODE
+        .get_or_init(|| compile_realm_bootstrap_bytecode().ok())
+        .as_deref()
+}
+
+struct RealmBootstrapFunctions {
+    strict_clone: Persistent<Function<'static>>,
+    pure_bridge_factory: Persistent<Function<'static>>,
+    capability_bridge_factory: Persistent<Function<'static>>,
+    pure_model_wrapper_factory: Persistent<Function<'static>>,
+    model_wrapper_factory: Persistent<Function<'static>>,
+    terminal_wrapper: Persistent<Function<'static>>,
+}
+
+#[allow(unsafe_code)]
+fn load_realm_bootstrap_functions(
+    context: &Context,
+) -> Result<RealmBootstrapFunctions, RealmError> {
+    let bytecode = realm_bootstrap_bytecode().ok_or(RealmError::Initialization)?;
+    context
+        .with(|ctx| {
+            // SAFETY: these process-local bytes are compiled once from the trusted constants
+            // above by the same linked QuickJS ABI and never cross disk, IPC, or model input.
+            let module = unsafe { Module::load(ctx.clone(), bytecode)? };
+            let (module, evaluation) = module.eval()?;
+            evaluation.finish::<()>()?;
+            let strict_clone: Function = module.get("strictClone")?;
+            let pure_bridge_factory: Function = module.get("pureBridgeFactory")?;
+            let capability_bridge_factory: Function = module.get("capabilityBridgeFactory")?;
+            let pure_model_wrapper_factory: Function = module.get("pureModelWrapperFactory")?;
+            let model_wrapper_factory: Function = module.get("modelWrapperFactory")?;
+            let terminal_wrapper: Function = module.get("terminalWrapper")?;
+            Ok::<_, rquickjs::Error>(RealmBootstrapFunctions {
+                strict_clone: Persistent::save(&ctx, strict_clone),
+                pure_bridge_factory: Persistent::save(&ctx, pure_bridge_factory),
+                capability_bridge_factory: Persistent::save(&ctx, capability_bridge_factory),
+                pure_model_wrapper_factory: Persistent::save(&ctx, pure_model_wrapper_factory),
+                model_wrapper_factory: Persistent::save(&ctx, model_wrapper_factory),
+                terminal_wrapper: Persistent::save(&ctx, terminal_wrapper),
+            })
+        })
+        .map_err(|_| RealmError::Initialization)
+}
+
 #[derive(Default)]
 struct ModelSettlementRegistry {
     state: Mutex<ModelSettlementState>,
@@ -451,6 +526,145 @@ struct DispatcherResources {
     terminal_wrapper: Persistent<Function<'static>>,
 }
 
+/// Opaque binding between one full artifact identity and its same-process QuickJS bytecode.
+pub(crate) struct CompiledArtifactBytecode {
+    artifact_id: String,
+    bytes: Vec<u8>,
+}
+
+impl CompiledArtifactBytecode {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn for_artifact(&self, artifact: &SkillArtifact) -> Result<&[u8], RealmError> {
+        (self.artifact_id == artifact.id)
+            .then_some(self.bytes.as_slice())
+            .ok_or(RealmError::Identity)
+    }
+}
+
+/// Compile an identity-checked artifact as global Script bytecode without executing it.
+///
+/// A disposable compiler runtime keeps untrusted parser allocations inside the same memory,
+/// stack, and deadline envelope used by execution. The resulting bytes are process-local and are
+/// never accepted from a wire or persistence boundary.
+pub(crate) fn compile_artifact_bytecode(
+    artifact: &SkillArtifact,
+) -> Result<CompiledArtifactBytecode, RealmError> {
+    artifact
+        .verify_identity()
+        .map_err(|_| RealmError::Identity)?;
+    validate_export_names(artifact)?;
+    let runtime = Runtime::new().map_err(|_| RealmError::Initialization)?;
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let context = Context::full(&runtime).map_err(|_| RealmError::Initialization)?;
+    let bytes = context.with(|ctx| compile_global_bytecode(&ctx, artifact))?;
+    Ok(CompiledArtifactBytecode {
+        artifact_id: artifact.id.clone(),
+        bytes,
+    })
+}
+
+#[allow(unsafe_code)]
+fn compile_global_bytecode(ctx: &Ctx<'_>, artifact: &SkillArtifact) -> Result<Vec<u8>, RealmError> {
+    let source =
+        CString::new(private_skill_source(artifact)).map_err(|_| RealmError::Initialization)?;
+    let filename = CString::new(format!("skill-{}.js", artifact.id))
+        .map_err(|_| RealmError::Initialization)?;
+    let source_len = artifact
+        .source
+        .len()
+        .try_into()
+        .map_err(|_| RealmError::Initialization)?;
+    // SAFETY: both pointers are live for the call and lengths describe the exact immutable source.
+    // COMPILE_ONLY returns an owned QuickJS function object without evaluating stored code.
+    let raw = unsafe {
+        qjs::JS_Eval(
+            ctx.as_raw().as_ptr(),
+            source.as_ptr(),
+            source_len,
+            filename.as_ptr(),
+            (qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_STRICT | qjs::JS_EVAL_FLAG_COMPILE_ONLY)
+                as i32,
+        )
+    };
+    if unsafe { qjs::JS_IsException(raw) } {
+        let _ = ctx.catch();
+        return Err(RealmError::Initialization);
+    }
+    // SAFETY: `raw` is an owned value from this exact context. Wrapping it transfers ownership to
+    // `Value`, whose drop releases it after serialization.
+    let compiled = unsafe { Value::from_raw(ctx.clone(), raw) };
+    let mut length = MaybeUninit::uninit();
+    // SAFETY: the compiled function belongs to `ctx`; QuickJS allocates the returned byte buffer.
+    let bytes = unsafe {
+        qjs::JS_WriteObject(
+            ctx.as_raw().as_ptr(),
+            length.as_mut_ptr(),
+            compiled.as_raw(),
+            qjs::JS_WRITE_OBJ_BYTECODE as i32,
+        )
+    };
+    if bytes.is_null() {
+        let _ = ctx.catch();
+        return Err(RealmError::Initialization);
+    }
+    // SAFETY: QuickJS returned `length` initialized bytes and retains ownership until `js_free`.
+    let length = unsafe { length.assume_init() };
+    let length = match usize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => {
+            // SAFETY: conversion failure does not change ownership of the QuickJS buffer.
+            unsafe { qjs::js_free(ctx.as_raw().as_ptr(), bytes.cast()) };
+            return Err(RealmError::Initialization);
+        }
+    };
+    let output = unsafe { slice::from_raw_parts(bytes, length) }.to_vec();
+    // SAFETY: this releases the buffer with the same context allocator that produced it.
+    unsafe { qjs::js_free(ctx.as_raw().as_ptr(), bytes.cast()) };
+    Ok(output)
+}
+
+#[allow(unsafe_code)]
+fn evaluate_global_bytecode(ctx: &Ctx<'_>, bytecode: &[u8]) -> rquickjs::Result<()> {
+    let bytecode_len = bytecode
+        .len()
+        .try_into()
+        .map_err(|_| rquickjs::Error::Unknown)?;
+    // SAFETY: callers supply only same-process bytes produced by `compile_artifact_bytecode` for
+    // the identity-checked artifact currently being loaded. The byte slice lives for the call.
+    let compiled = unsafe {
+        qjs::JS_ReadObject(
+            ctx.as_raw().as_ptr(),
+            bytecode.as_ptr(),
+            bytecode_len,
+            qjs::JS_READ_OBJ_BYTECODE as i32,
+        )
+    };
+    if unsafe { qjs::JS_IsException(compiled) } {
+        let _ = ctx.catch();
+        return Err(rquickjs::Error::Exception);
+    }
+    // SAFETY: `JS_EvalFunction` consumes the owned object returned by `JS_ReadObject` and returns
+    // another owned value in the same context.
+    let result = unsafe { qjs::JS_EvalFunction(ctx.as_raw().as_ptr(), compiled) };
+    if unsafe { qjs::JS_IsException(result) } {
+        let _ = ctx.catch();
+        return Err(rquickjs::Error::Exception);
+    }
+    // SAFETY: the successful result is owned by this context; the wrapper releases it on drop.
+    drop(unsafe { Value::from_raw(ctx.clone(), result) });
+    Ok(())
+}
+
 /// Load one identity-v2 artifact into a new private context and install exact frozen wrappers.
 ///
 /// The caller must invoke this before model source evaluation. Any error rejects the whole
@@ -461,7 +675,7 @@ pub(crate) fn load_artifact(
     model_context: &Context,
     artifact: &SkillArtifact,
 ) -> Result<LoadedArtifact, RealmError> {
-    load_artifact_internal(runtime, model_context, artifact, None, None, None)
+    load_artifact_internal(runtime, model_context, artifact, None, None, None, None)
 }
 
 /// Load an ABI-v2 artifact whose wrappers inject a fresh, revocable invocation capability.
@@ -476,6 +690,7 @@ pub(crate) fn load_artifact_with_capabilities(
         model_context,
         artifact,
         Some(Arc::new(capabilities)),
+        None,
         None,
         None,
     )
@@ -496,6 +711,32 @@ pub(crate) fn load_artifact_with_bound_exports(
         Some(Arc::new(capabilities)),
         Some(Arc::new(bindings)),
         None,
+        None,
+    )
+}
+
+/// Load production skill source from worker-local bytecode compiled from this exact artifact.
+///
+/// The bytes never cross IPC or disk and are accepted only after the artifact identity is checked
+/// again. Loading them saves parsing and compilation while preserving a fresh runtime and private
+/// context for every model step.
+pub(crate) fn load_artifact_with_bound_exports_bytecode(
+    runtime: &Runtime,
+    model_context: &Context,
+    artifact: &SkillArtifact,
+    bytecode: &CompiledArtifactBytecode,
+    capabilities: InvocationCapabilityRuntime,
+    bindings: HashMap<String, BoundExportInvocation>,
+) -> Result<LoadedArtifact, RealmError> {
+    let bytecode = bytecode.for_artifact(artifact)?;
+    load_artifact_internal(
+        runtime,
+        model_context,
+        artifact,
+        Some(Arc::new(capabilities)),
+        Some(Arc::new(bindings)),
+        None,
+        Some(bytecode),
     )
 }
 
@@ -519,6 +760,7 @@ pub(crate) fn load_artifact_with_bound_exports_for_verification(
         Some(Arc::new(capabilities)),
         Some(Arc::new(bindings)),
         mutated_export,
+        None,
     )
 }
 
@@ -584,6 +826,7 @@ fn load_artifact_internal(
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
     mutated_export: Option<&str>,
+    artifact_bytecode: Option<&[u8]>,
 ) -> Result<LoadedArtifact, RealmError> {
     artifact
         .verify_identity()
@@ -600,15 +843,16 @@ fn load_artifact_internal(
     } else {
         None
     };
+    let private_bootstrap = load_realm_bootstrap_functions(&private_context)?;
     let (bridge_factory, private_encoder) = private_context
         .with(|ctx| {
             // Capture every boundary primitive before stored source can replace a global.
-            let bridge_factory: Function = ctx.eval(if capabilities.is_some() {
-                CAPABILITY_BRIDGE_FACTORY_SOURCE
+            let bridge_factory = if capabilities.is_some() {
+                private_bootstrap.capability_bridge_factory.restore(&ctx)?
             } else {
-                BRIDGE_FACTORY_SOURCE
-            })?;
-            let encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
+                private_bootstrap.pure_bridge_factory.restore(&ctx)?
+            };
+            let encoder = private_bootstrap.strict_clone.restore(&ctx)?;
             Ok::<_, rquickjs::Error>((
                 Persistent::save(&ctx, bridge_factory),
                 Persistent::save(&ctx, encoder),
@@ -622,13 +866,18 @@ fn load_artifact_internal(
         .with(|ctx| {
             ctx.eval::<(), _>(SKILL_REALM_HARDENING_JS)?;
 
-            let mut options = EvalOptions::default();
-            options.filename = Some(format!("skill-{}.js", artifact.id));
-            // Evaluate the artifact itself as a Script. Wrapping it in a generated function would
-            // change the accepted grammar (notably top-level return/import handling) and would
-            // make source-created namespace objects part of the trusted loader boundary.
-            let _: Value =
-                ctx.eval_with_options(private_skill_source(artifact).as_bytes(), options)?;
+            if let Some(bytecode) = artifact_bytecode {
+                evaluate_global_bytecode(&ctx, bytecode)?;
+            } else {
+                let mut options = EvalOptions::default();
+                options.filename = Some(format!("skill-{}.js", artifact.id));
+                // Evaluate the artifact itself as a Script. Wrapping it in a generated function
+                // would change the accepted grammar (notably top-level return/import handling)
+                // and would make source-created namespace objects part of the trusted loader
+                // boundary.
+                let _: Value =
+                    ctx.eval_with_options(private_skill_source(artifact).as_bytes(), options)?;
+            }
             Ok::<_, rquickjs::Error>(())
         })
         .map_err(|_| RealmError::Initialization)?;
@@ -800,16 +1049,17 @@ fn build_model_wrappers(
     settlements: Option<Arc<ModelSettlementRegistry>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
 ) -> Result<(Vec<InstalledWrapper>, Vec<DispatcherResourceOwner>), RealmError> {
+    let bootstrap = load_realm_bootstrap_functions(model_context)?;
     model_context
         .with(|ctx| {
             // These closures are captured before model source runs, so model prototype/global
             // poisoning cannot change the clone or wrapper contract.
-            let model_encoder: Function = ctx.eval(STRICT_CLONE_SOURCE)?;
-            let wrapper_factory: Function = ctx.eval(if settlements.is_some() {
-                MODEL_WRAPPER_FACTORY_SOURCE
+            let model_encoder = bootstrap.strict_clone.restore(&ctx)?;
+            let wrapper_factory = if settlements.is_some() {
+                bootstrap.model_wrapper_factory.restore(&ctx)?
             } else {
-                PURE_MODEL_WRAPPER_FACTORY_SOURCE
-            })?;
+                bootstrap.pure_model_wrapper_factory.restore(&ctx)?
+            };
             let model_encoder = Persistent::save(&ctx, model_encoder);
             let settlement_functions = if let Some(settlements) = settlements.as_ref() {
                 let prepare_settlements = settlements.clone();
@@ -887,6 +1137,7 @@ fn build_model_wrappers(
                         let (dispatcher, resources) = build_bound_dispatcher(
                             &ctx,
                             wrapper,
+                            bootstrap.terminal_wrapper.clone(),
                             capabilities
                                 .as_ref()
                                 .ok_or(rquickjs::Error::Unknown)?
@@ -912,6 +1163,7 @@ fn build_model_wrappers(
 fn build_bound_dispatcher<'js>(
     ctx: &Ctx<'js>,
     wrapper: Function<'js>,
+    terminal_wrapper: Persistent<Function<'static>>,
     capabilities: Arc<InvocationCapabilityRuntime>,
     binding: BoundExportInvocation,
 ) -> rquickjs::Result<(Function<'js>, Arc<Mutex<Option<DispatcherResources>>>)> {
@@ -927,8 +1179,6 @@ fn build_bound_dispatcher<'js>(
         })?
     };
     let terminal_host = Persistent::save(ctx, terminal_host);
-    let terminal_wrapper: Function = ctx.eval(TERMINAL_WRAPPER_SOURCE)?;
-    let terminal_wrapper = Persistent::save(ctx, terminal_wrapper);
     let resources = Arc::new(Mutex::new(Some(DispatcherResources {
         wrapper: private_wrapper,
         terminal_host,
@@ -1044,6 +1294,26 @@ mod tests {
     use crate::extras::js::skills::{CapabilityManifest, SkillExport};
 
     #[test]
+    fn trusted_realm_bootstrap_bytecode_loads_repeatedly_without_shared_state() {
+        for _ in 0..2 {
+            let runtime = Runtime::new().unwrap();
+            let context = Context::full(&runtime).unwrap();
+            for _ in 0..2 {
+                let functions = load_realm_bootstrap_functions(&context).unwrap();
+                context
+                    .with(|ctx| {
+                        let clone = functions.strict_clone.restore(&ctx)?;
+                        let value: Object = ctx.eval("({fresh: true})")?;
+                        let encoded: String = clone.call((value,))?;
+                        assert_eq!(encoded, r#"{"fresh":true}"#);
+                        Ok::<_, rquickjs::Error>(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn invalid_identifier_is_rejected_before_source_generation() {
         let runtime = Runtime::new().unwrap();
         let model = Context::full(&runtime).unwrap();
@@ -1063,6 +1333,57 @@ mod tests {
         assert!(matches!(
             load_artifact(&runtime, &model, &artifact),
             Err(RealmError::InvalidExport)
+        ));
+    }
+
+    #[test]
+    fn cached_global_bytecode_reinitializes_in_every_fresh_runtime() {
+        let artifact = SkillArtifact::new(
+            "let calls = 0; function next_value() { return ++calls; }".to_string(),
+            "bytecode cache fixture".to_string(),
+            Vec::new(),
+            vec![SkillExport {
+                name: "next_value".to_string(),
+                signature: "next_value()".to_string(),
+            }],
+            vec!["next_value() === 1".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let bytecode = compile_artifact_bytecode(&artifact).unwrap();
+        assert!(!bytecode.is_empty());
+
+        for _ in 0..2 {
+            let runtime = Runtime::new().unwrap();
+            let context = Context::full(&runtime).unwrap();
+            context
+                .with(|ctx| {
+                    evaluate_global_bytecode(&ctx, bytecode.for_artifact(&artifact).unwrap())?;
+                    assert_eq!(ctx.eval::<i32, _>("next_value()")?, 1);
+                    Ok::<_, rquickjs::Error>(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn cached_compiler_preserves_global_script_grammar() {
+        let artifact = SkillArtifact::new(
+            "return 1; function unreachable() { return 0; }".to_string(),
+            "invalid global script fixture".to_string(),
+            Vec::new(),
+            vec![SkillExport {
+                name: "unreachable".to_string(),
+                signature: "unreachable()".to_string(),
+            }],
+            vec!["true".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            compile_artifact_bytecode(&artifact),
+            Err(RealmError::Initialization)
         ));
     }
 }

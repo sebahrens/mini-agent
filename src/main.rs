@@ -192,6 +192,12 @@ async fn run_inner() -> anyhow::Result<()> {
     let (mut cfg, is_first_startup) = config::load_with_paths(&app_paths, is_interactive);
 
     #[cfg(feature = "skills")]
+    if cli.learned_skill_stats {
+        extras::js::skills::operations::print_skill_stats(&app_paths)?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "skills")]
     if cli.purge_learned_skill.is_some()
         || cli.compact_learned_skill_events
         || cli.learned_skill_feedback.is_some()

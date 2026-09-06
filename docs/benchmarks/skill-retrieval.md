@@ -25,15 +25,28 @@ dense/FTS/fusion and total-search percentiles, build/rebuild/removal costs, conc
 latency, observed RSS, relevance checks, and the 5 ms p99 verdict. CI validates fields and
 invariants at 2,000 revisions but deliberately does not apply a host-sensitive latency gate.
 
-> **Relevance caveat (2026-09-05).** The reference run used the deterministic hash backend. With
-> that backend a self-query is an exact-string match and every other score is noise, so the
-> self-query and recall figures below measure HNSW fidelity to the exact oracle, not semantic
-> relevance. The shipped backend is `deterministic-v2`; the checked-in result names v1
-> (mini-agent-17x2). Latency, build, and memory figures are unaffected.
+The deterministic backend's recall and self-query figures measure only HNSW fidelity to its exact
+oracle. They are not semantic-relevance measurements: self-queries are exact-string matches and
+other hash-vector similarities have no linguistic meaning. The current `deterministic-v2` smoke
+record is
+[`results/skill-retrieval-deterministic-v2-smoke-2026-09-05.json`](results/skill-retrieval-deterministic-v2-smoke-2026-09-05.json).
+The older 100k `deterministic-v1` record below remains a historical performance baseline only.
+
+Run the real-backend semantic audit with:
+
+```bash
+MINI_AGENT_SKILL_RELEVANCE=1 \
+  cargo test --features skills-embed skill_retrieval_real_backend_relevance -- --ignored --nocapture
+```
+
+It uses BAAI/bge-small-en-v1.5, disables lexical candidates, and ranks twelve held-out natural
+language paraphrases against twelve skill documents; none is a self-query. The 2026-09-05 run
+achieved **91.7% top-1** and **0.958 MRR**. Its durable record is
+[`results/skill-semantic-relevance-2026-09-05.json`](results/skill-semantic-relevance-2026-09-05.json).
 
 ## Latest reference result
 
-The accepted 2026-07-31 debug-profile run used an Intel Core i7-1068NG7 (8 logical CPUs), 32 GiB
+The historical 2026-07-31 debug-profile run used an Intel Core i7-1068NG7 (8 logical CPUs), 32 GiB
 RAM, macOS x86_64, the deterministic-v1 model, 384 dimensions, 100,000 revisions, and 60 search
 samples over corpus-wide self queries and normalized hard blends. HNSW used 24 construction
 connections, `ef_construction=100`, an `ef_search` floor of 36, a 32-candidate production frontier,
@@ -46,9 +59,9 @@ and a 40-candidate recall-audit frontier; exact contiguous matrix search remaine
 | FTS candidates p99 | 1.489 ms |
 | Fusion/dedupe/budget p99 | 0.118 ms |
 | Exact-oracle p99 | 70.575 ms |
-| ANN recall@10 against exact | **96.75%** |
-| Independent-rebuild recall@10 | **98.5%** |
-| Self-query top-1 rate | **98%** |
+| ANN recall@10 against exact (HNSW fidelity) | **96.75%** |
+| Independent-rebuild recall@10 (HNSW fidelity) | **98.5%** |
+| Self-query top-1 rate (HNSW fidelity) | **98%** |
 | Concurrent-reader p99 | 3.627 ms |
 | Snapshot build / rebuild | 92.750 / 110.369 s |
 | 5,000-row lifecycle visibility mask | 5.567 ms |

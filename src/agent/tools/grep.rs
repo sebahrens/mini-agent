@@ -1,7 +1,8 @@
 use std::io::Read;
+use std::ops::Range;
 use std::path::Path;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rig::tool::Tool;
 
 use super::find_files::BoundDirectory;
@@ -9,6 +10,73 @@ use crate::agent::tools::{
     AskSender, GrepArgs, PermCheck, ToolError, check_perm, check_perm_bound_path, check_perm_path,
     combine_coaching,
 };
+const MAX_OUTPUT_LINE_CHARS: usize = 500;
+const MAX_SEARCH_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const BINARY_SNIFF_BYTES: u64 = 8 * 1024;
+
+struct GrepSearchResult {
+    file_count: usize,
+    files_with_matches: usize,
+    results: Vec<String>,
+    emitted_results: usize,
+    limit_hit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GrepSearchOptions {
+    max_results: usize,
+    context: usize,
+    files_only: bool,
+    count: bool,
+}
+
+pub(crate) fn truncate_output_line(line: &str, match_range: Option<Range<usize>>) -> String {
+    let total_chars = line.chars().count();
+    if total_chars <= MAX_OUTPUT_LINE_CHARS {
+        return line.to_string();
+    }
+
+    let (mut start_char, mut end_char) = if let Some(range) = match_range {
+        let match_start = line[..range.start].chars().count();
+        let match_end = match_start + line[range].chars().count();
+        let match_chars = match_end.saturating_sub(match_start);
+
+        if match_chars >= MAX_OUTPUT_LINE_CHARS {
+            (match_start, match_start + MAX_OUTPUT_LINE_CHARS)
+        } else {
+            let surrounding = MAX_OUTPUT_LINE_CHARS - match_chars;
+            let start = match_start.saturating_sub(surrounding / 2);
+            let end =
+                (match_end + surrounding.saturating_sub(match_start - start)).min(total_chars);
+            (start, end)
+        }
+    } else {
+        (0, MAX_OUTPUT_LINE_CHARS)
+    };
+
+    if end_char - start_char < MAX_OUTPUT_LINE_CHARS {
+        start_char = start_char.saturating_sub(MAX_OUTPUT_LINE_CHARS - (end_char - start_char));
+    }
+    end_char = (start_char + MAX_OUTPUT_LINE_CHARS).min(total_chars);
+
+    let start_byte = line
+        .char_indices()
+        .nth(start_char)
+        .map_or(line.len(), |(index, _)| index);
+    let end_byte = line
+        .char_indices()
+        .nth(end_char)
+        .map_or(line.len(), |(index, _)| index);
+    let mut output = String::with_capacity(end_byte - start_byte + 6);
+    if start_char > 0 {
+        output.push('…');
+    }
+    output.push_str(&line[start_byte..end_byte]);
+    if end_char < total_chars {
+        output.push('…');
+    }
+    output
+}
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
@@ -41,27 +109,239 @@ impl GrepTool {
 
     pub(crate) fn glob_to_regex(glob: &str) -> String {
         let mut re = String::with_capacity(glob.len() * 2);
-        for c in glob.chars() {
+        let chars: Vec<char> = glob.chars().collect();
+        let mut index = 0;
+        let mut brace_depth = 0_usize;
+        while index < chars.len() {
+            let c = chars[index];
             match c {
                 '.' => re.push_str("\\."),
-                '*' => re.push_str(".*"),
-                '?' => re.push('.'),
-                '{' => re.push_str("(?:"),
-                '}' => re.push(')'),
-                ',' => re.push('|'),
+                '*' if chars.get(index + 1) == Some(&'*') => {
+                    if chars.get(index + 2) == Some(&'/') {
+                        re.push_str("(?:.*/)?");
+                        index += 2;
+                    } else {
+                        re.push_str(".*");
+                        index += 1;
+                    }
+                }
+                '*' => re.push_str("[^/]*"),
+                '?' => re.push_str("[^/]"),
+                '{' => {
+                    brace_depth += 1;
+                    re.push_str("(?:");
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    re.push(')');
+                }
+                ',' if brace_depth > 0 => re.push('|'),
                 '(' | ')' | '[' | ']' | '+' | '^' | '$' | '|' | '\\' => {
                     re.push('\\');
                     re.push(c);
                 }
                 _ => re.push(c),
             }
+            index += 1;
         }
         re
+    }
+
+    pub(crate) fn compile_include_glob(glob: &str) -> Result<(Regex, bool), ToolError> {
+        let mut depth = 0_usize;
+        for character in glob.chars() {
+            match character {
+                '{' => depth += 1,
+                '}' if depth == 0 => {
+                    return Err(ToolError::Msg(format!(
+                        "Invalid include glob '{glob}': unmatched closing brace"
+                    )));
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return Err(ToolError::Msg(format!(
+                "Invalid include glob '{glob}': unclosed brace"
+            )));
+        }
+        let pattern = format!("^(?:{})$", Self::glob_to_regex(glob));
+        let regex = Regex::new(&pattern)
+            .map_err(|error| ToolError::Msg(format!("Invalid include glob '{glob}': {error}")))?;
+        Ok((regex, glob.contains('/')))
     }
 
     pub(crate) fn is_binary(data: &[u8]) -> bool {
         data.iter().take(8192).any(|&b| b == 0)
     }
+
+    pub(crate) fn read_non_binary<R: Read>(
+        reader: &mut R,
+        capacity: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let mut prefix = Vec::with_capacity(capacity.min(BINARY_SNIFF_BYTES as usize));
+        reader
+            .by_ref()
+            .take(BINARY_SNIFF_BYTES)
+            .read_to_end(&mut prefix)?;
+        if Self::is_binary(&prefix) {
+            return Ok(None);
+        }
+
+        let mut data = Vec::with_capacity(capacity);
+        data.extend_from_slice(&prefix);
+        reader.read_to_end(&mut data)?;
+        Ok(Some(data))
+    }
+}
+
+fn search_bound_directory(
+    bound_directory: BoundDirectory,
+    re: Regex,
+    include_re: Option<(Regex, bool)>,
+    options: GrepSearchOptions,
+) -> Result<GrepSearchResult, ToolError> {
+    let include_root = bound_directory.approved_root().to_path_buf();
+    let walker = bound_directory.walker()?;
+    let mut file_count = 0;
+    let mut files_with_matches = 0;
+    let mut results = Vec::with_capacity(options.max_results.min(64));
+    let mut emitted_results = 0_usize;
+    let mut limit_hit = false;
+
+    for entry in walker {
+        if emitted_results >= options.max_results {
+            limit_hit = true;
+            break;
+        }
+
+        if let Some((re_include, path_aware)) = &include_re {
+            let candidate = if *path_aware {
+                entry
+                    .path
+                    .strip_prefix(&include_root)
+                    .unwrap_or(&entry.path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            } else {
+                entry.file_name.to_string_lossy().into_owned()
+            };
+            if !re_include.is_match(&candidate) {
+                continue;
+            }
+        }
+
+        if entry.metadata.len() > MAX_SEARCH_FILE_BYTES {
+            continue;
+        }
+
+        let path_str = entry.path.to_string_lossy().to_string();
+        let capacity = entry.metadata.len() as usize;
+        let mut file = entry.file;
+        let Some(data) = GrepTool::read_non_binary(&mut file, capacity).unwrap_or_default() else {
+            continue;
+        };
+        file_count += 1;
+        let content = String::from_utf8_lossy(&data);
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+
+        let match_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| re.is_match(line))
+            .map(|(index, _)| index)
+            .collect();
+
+        if match_lines.is_empty() {
+            continue;
+        }
+        files_with_matches += 1;
+
+        if options.files_only {
+            results.push(path_str);
+            emitted_results += 1;
+            continue;
+        }
+        if options.count {
+            results.push(format!("{}:{}", path_str, match_lines.len()));
+            emitted_results += 1;
+            continue;
+        }
+
+        if options.context == 0 {
+            for (match_index, &matched_line) in match_lines.iter().enumerate() {
+                let matched = re.find(lines[matched_line]).map(|found| found.range());
+                let displayed = truncate_output_line(lines[matched_line], matched);
+                results.push(format!("{}:{}:{}", path_str, matched_line + 1, displayed));
+                emitted_results += 1;
+                if emitted_results >= options.max_results {
+                    limit_hit = match_index + 1 < match_lines.len();
+                    break;
+                }
+            }
+        } else {
+            let mut shown = vec![false; total];
+            for &matched_line in &match_lines {
+                let start = matched_line.saturating_sub(options.context);
+                let end = (matched_line + 1 + options.context).min(total);
+                for shown_line in &mut shown[start..end] {
+                    *shown_line = true;
+                }
+            }
+
+            let mut index = 0;
+            while index < total && emitted_results < options.max_results {
+                if !shown[index] {
+                    index += 1;
+                    continue;
+                }
+
+                if !results.is_empty() {
+                    results.push("--".to_string());
+                }
+
+                while index < total && shown[index] && emitted_results < options.max_results {
+                    let is_match = match_lines.binary_search(&index).is_ok();
+                    let separator = if is_match { ':' } else { '-' };
+                    let matched = is_match
+                        .then(|| re.find(lines[index]))
+                        .flatten()
+                        .map(|found| found.range());
+                    let displayed = truncate_output_line(lines[index], matched);
+                    results.push(format!(
+                        "{}:{}{} {}",
+                        path_str,
+                        index + 1,
+                        separator,
+                        displayed
+                    ));
+                    emitted_results += 1;
+                    index += 1;
+                }
+            }
+
+            if emitted_results >= options.max_results
+                && index < total
+                && shown[index..].iter().any(|&is_shown| is_shown)
+            {
+                limit_hit = true;
+            }
+        }
+
+        if limit_hit {
+            break;
+        }
+    }
+
+    Ok(GrepSearchResult {
+        file_count,
+        files_with_matches,
+        results,
+        emitted_results,
+        limit_hit,
+    })
 }
 
 impl Tool for GrepTool {
@@ -72,7 +352,10 @@ impl Tool for GrepTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Search file contents using a regex pattern (Rust regex syntax). Respects .gitignore. Skips binary files, node_modules, and target.".to_string()
+        format!(
+            "Search file contents using a regex pattern (Rust regex syntax). Returns at most {} result lines and truncates each displayed source line to {} characters around its match. Files larger than 10 MiB and binary files are skipped. Respects .gitignore. Skips dependency/build directories and VCS metadata unless that directory is requested explicitly.",
+            self.max_results, MAX_OUTPUT_LINE_CHARS
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -81,7 +364,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex pattern to search for (supports Rust regex syntax)"
+                    "description": "Regex pattern to search for (Rust regex syntax; inline flags such as (?i) are supported)"
                 },
                 "path": {
                     "type": "string",
@@ -89,11 +372,23 @@ impl Tool for GrepTool {
                 },
                 "include": {
                     "type": "string",
-                    "description": "Optional file glob pattern to filter (e.g. '*.rs', '*.{ts,tsx}')"
+                    "description": "Optional path-aware file glob (e.g. '*.rs', 'src/*.rs', '**/*.{ts,tsx}')"
                 },
                 "context_lines": {
                     "type": "integer",
                     "description": "Number of context lines to show before and after each match (like grep -C)"
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Match the pattern without regard to case (default false)"
+                },
+                "files_only": {
+                    "type": "boolean",
+                    "description": "Return only paths of files containing a match (default false)"
+                },
+                "count": {
+                    "type": "boolean",
+                    "description": "Return each matching path and its match count (default false)"
                 }
             },
             "required": ["pattern"]
@@ -109,7 +404,14 @@ impl Tool for GrepTool {
         );
         let coaching = check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
 
-        let re = Regex::new(&args.pattern)
+        if args.files_only && args.count {
+            return Err(ToolError::Msg(
+                "grep files_only and count modes are mutually exclusive".to_string(),
+            ));
+        }
+        let re = RegexBuilder::new(&args.pattern)
+            .case_insensitive(args.case_insensitive)
+            .build()
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;
 
         let requested_path = args.path.as_deref().unwrap_or(".");
@@ -148,126 +450,37 @@ impl Tool for GrepTool {
         let coaching = combine_coaching(coaching, path_coaching);
         let context = args.context_lines.unwrap_or(0);
 
-        let include_re = args.include.as_ref().map(|g| {
-            let pattern = format!("^(?:{})$", Self::glob_to_regex(g));
-            Regex::new(&pattern).unwrap_or_else(|_| Regex::new(".*").unwrap())
-        });
-
-        let walker = bound_directory.walker()?;
+        let include_re = args
+            .include
+            .as_deref()
+            .map(Self::compile_include_glob)
+            .transpose()?;
 
         let max_results = self.max_results as usize;
-        let mut file_count = 0;
-        let mut files_with_matches: usize = 0;
-        let mut all_results: Vec<String> = Vec::with_capacity(max_results.min(64));
-        let mut limit_hit = false;
-
-        for entry in walker {
-            if all_results.len() >= max_results {
-                limit_hit = true;
-                break;
-            }
-
-            if let Some(ref re_include) = include_re {
-                let fname = entry.file_name.to_string_lossy();
-                if !re_include.is_match(&fname) {
-                    continue;
-                }
-            }
-
-            if entry.metadata.len() > 10 * 1024 * 1024 {
-                continue;
-            }
-
-            let path_str = entry.path.to_string_lossy().to_string();
-            let capacity = entry.metadata.len() as usize;
-            let mut file = entry.file;
-            let read_result = crate::agent::runner::spawn_blocking_scoped(move || {
-                let mut data = Vec::with_capacity(capacity);
-                file.read_to_end(&mut data).map(|_| data)
-            })
-            .await
-            .map_err(|error| ToolError::Msg(format!("grep file reader failed: {error}")))?;
-
-            match read_result {
-                Ok(data) => {
-                    if Self::is_binary(&data) {
-                        continue;
-                    }
-                    file_count += 1;
-                    let content = String::from_utf8_lossy(&data);
-                    let lines: Vec<&str> = content.lines().collect();
-                    let total = lines.len();
-
-                    let match_lines: Vec<usize> = lines
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, l)| re.is_match(l))
-                        .map(|(i, _)| i)
-                        .collect();
-
-                    if match_lines.is_empty() {
-                        continue;
-                    }
-                    files_with_matches += 1;
-
-                    if context == 0 {
-                        for (match_index, &ml) in match_lines.iter().enumerate() {
-                            all_results.push(format!("{}:{}:{}", path_str, ml + 1, lines[ml]));
-                            if all_results.len() >= max_results {
-                                limit_hit = match_index + 1 < match_lines.len();
-                                break;
-                            }
-                        }
-                    } else {
-                        let mut shown = vec![false; total];
-                        for &ml in &match_lines {
-                            let start = ml.saturating_sub(context);
-                            let end = (ml + 1 + context).min(total);
-                            for s in &mut shown[start..end] {
-                                *s = true;
-                            }
-                        }
-
-                        let mut i = 0;
-                        while i < total && all_results.len() < max_results {
-                            if !shown[i] {
-                                i += 1;
-                                continue;
-                            }
-
-                            if !all_results.is_empty() {
-                                all_results.push("--".to_string());
-                            }
-
-                            while i < total && shown[i] && all_results.len() < max_results {
-                                let is_match = match_lines.binary_search(&i).is_ok();
-                                let sep = if is_match { ':' } else { '-' };
-                                all_results.push(format!(
-                                    "{}-{}{} {}",
-                                    path_str,
-                                    i + 1,
-                                    sep,
-                                    lines[i]
-                                ));
-                                i += 1;
-                            }
-                        }
-
-                        if all_results.len() >= max_results
-                            && i < total
-                            && shown[i..].iter().any(|&is_shown| is_shown)
-                        {
-                            limit_hit = true;
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-
-            if limit_hit {
-                break;
-            }
-        }
+        let files_only = args.files_only;
+        let count = args.count;
+        let search = crate::agent::runner::spawn_blocking_scoped(move || {
+            search_bound_directory(
+                bound_directory,
+                re,
+                include_re,
+                GrepSearchOptions {
+                    max_results,
+                    context,
+                    files_only,
+                    count,
+                },
+            )
+        })
+        .await
+        .map_err(|error| ToolError::Msg(format!("grep directory walker failed: {error}")))??;
+        let GrepSearchResult {
+            file_count,
+            files_with_matches,
+            results: all_results,
+            emitted_results,
+            limit_hit,
+        } = search;
         if all_results.is_empty() {
             let msg = "No matches found.".to_string();
             return Ok(match coaching {
@@ -276,21 +489,35 @@ impl Tool for GrepTool {
             });
         }
 
-        let total = all_results.len();
+        let total = emitted_results;
         let truncated = limit_hit;
+        let result_label = if args.files_only || args.count {
+            "matching files"
+        } else {
+            "results"
+        };
+        let truncation_detail = if args.files_only || args.count {
+            "additional matching files may exist"
+        } else {
+            "unknown number of additional matches"
+        };
         let result = if truncated {
             format!(
-                "{} results (showing first {}, searched {} files):\n{}\n\n[truncated after {} matches — unknown number of additional matches; narrow the pattern or restrict to a path]",
+                "{} {} (showing first {}, searched {} files):\n{}\n\n[truncated after {} {} — {}; narrow the pattern or restrict to a path]",
                 total,
+                result_label,
                 max_results,
                 file_count,
                 all_results.join("\n"),
-                max_results
+                max_results,
+                result_label,
+                truncation_detail,
             )
         } else {
             format!(
-                "{} results (searched {} files):\n{}",
+                "{} {} (searched {} files):\n{}",
                 total,
+                result_label,
                 file_count,
                 all_results.join("\n")
             )
@@ -301,7 +528,12 @@ impl Tool for GrepTool {
         // its next action, which is the highest-leverage point in the loop.
         // Suppressed when truncated, since the truncation hint already steers
         // the agent toward narrowing or task.
-        let result = if !truncated && total >= 10 && files_with_matches >= 2 {
+        let result = if !args.files_only
+            && !args.count
+            && !truncated
+            && total >= 10
+            && files_with_matches >= 2
+        {
             format!(
                 "{}\n\n[{} matches across {} files; for cross-file enumeration or synthesis, `task` returns a verified summary in one call]",
                 result, total, files_with_matches,
@@ -418,6 +650,9 @@ mod tests {
                                 path: Some(path),
                                 include: None,
                                 context_lines: None,
+                                case_insensitive: false,
+                                files_only: false,
+                                count: false,
                             })
                             .await
                     })
@@ -516,6 +751,9 @@ mod tests {
             path: Some(external.path().to_string_lossy().into_owned()),
             include: None,
             context_lines: None,
+            case_insensitive: false,
+            files_only: false,
+            count: false,
         });
         let respond = async {
             let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
@@ -551,6 +789,9 @@ mod tests {
                 path: Some(relative_root.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await
             .unwrap();
@@ -574,6 +815,9 @@ mod tests {
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             },
             &canonical_external,
             UserDecision::Deny,
@@ -622,6 +866,9 @@ mod tests {
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await;
 
@@ -648,6 +895,9 @@ mod tests {
                 path: Some(requested.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             },
             &canonical_external,
             UserDecision::Deny,
@@ -671,6 +921,9 @@ mod tests {
                 path: Some("~".to_string()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             },
             &canonical_home,
             UserDecision::Deny,
@@ -699,6 +952,9 @@ mod tests {
                 path: Some(link.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             },
             &canonical_external,
             UserDecision::Deny,
@@ -735,6 +991,9 @@ mod tests {
             path: Some(link.to_string_lossy().into_owned()),
             include: None,
             context_lines: None,
+            case_insensitive: false,
+            files_only: false,
+            count: false,
         });
         let swap = async {
             let request = ask_rx.recv().await.expect("permission request");
@@ -771,6 +1030,9 @@ mod tests {
             path: Some(authorized.to_string_lossy().into_owned()),
             include: None,
             context_lines: None,
+            case_insensitive: false,
+            files_only: false,
+            count: false,
         });
         let replace = async {
             let request = ask_rx.recv().await.expect("permission request");
@@ -837,6 +1099,9 @@ mod tests {
                 path: Some(workspace.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await
             .unwrap();
@@ -857,6 +1122,9 @@ mod tests {
                 path: None,
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await
             .unwrap();
@@ -876,6 +1144,9 @@ mod tests {
                 path: Some(String::new()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await;
 
@@ -905,6 +1176,9 @@ mod tests {
                 path: Some(external.to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await;
 
@@ -927,6 +1201,9 @@ mod tests {
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await
             .expect("grep failed");
@@ -948,11 +1225,194 @@ mod tests {
                 path: Some(dir.path().to_string_lossy().into_owned()),
                 include: None,
                 context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
             })
             .await
             .expect("grep failed");
 
         assert!(!output.contains("[truncated after"));
         assert!(output.starts_with("2 results (searched 1 files):"));
+    }
+
+    #[tokio::test]
+    async fn truncates_long_match_lines_around_the_match_on_character_boundaries() {
+        let dir = TempDir::new("long-match-line");
+        let long_line = format!("{}needle{}", "α".repeat(800), "β".repeat(800));
+        std::fs::write(dir.path().join("minified.js"), &long_line)
+            .expect("failed to write grep test file");
+
+        let output = GrepTool::new(None, None, 10)
+            .call(GrepArgs {
+                pattern: "needle".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                include: None,
+                context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
+            })
+            .await
+            .expect("grep failed");
+
+        let result_line = output
+            .lines()
+            .find(|line| line.contains("minified.js:"))
+            .expect("grep result line");
+        let displayed = result_line
+            .rsplit_once(":1:")
+            .map(|(_, content)| content)
+            .expect("path:line:content format");
+        assert!(displayed.contains("needle"), "{displayed}");
+        assert!(displayed.starts_with('…'), "{displayed}");
+        assert!(displayed.ends_with('…'), "{displayed}");
+        assert_eq!(displayed.chars().count(), MAX_OUTPUT_LINE_CHARS + 2);
+        assert!(!output.contains(&long_line));
+    }
+
+    #[tokio::test]
+    async fn truncates_long_context_lines_as_well_as_matches() {
+        let dir = TempDir::new("long-context-line");
+        let context_line = "x".repeat(1_000);
+        std::fs::write(
+            dir.path().join("context.txt"),
+            format!("{context_line}\nneedle\n"),
+        )
+        .expect("failed to write grep test file");
+
+        let output = GrepTool::new(None, None, 10)
+            .call(GrepArgs {
+                pattern: "needle".to_string(),
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                include: None,
+                context_lines: Some(1),
+                case_insensitive: false,
+                files_only: false,
+                count: false,
+            })
+            .await
+            .expect("grep failed");
+
+        assert!(!output.contains(&context_line));
+        let context_result = output
+            .lines()
+            .find(|line| line.contains("context.txt:1-"))
+            .expect("context result line");
+        assert!(context_result.ends_with('…'), "{context_result}");
+    }
+
+    #[test]
+    fn description_discloses_result_and_file_size_limits() {
+        let description = GrepTool::new(None, None, 37).description();
+        assert!(description.contains("at most 37 result lines"));
+        assert!(description.contains("500 characters"));
+        assert!(description.contains("10 MiB"));
+    }
+
+    fn ergonomic_args(path: &Path, include: Option<&str>) -> GrepArgs {
+        GrepArgs {
+            pattern: "needle".to_string(),
+            path: Some(path.to_string_lossy().into_owned()),
+            include: include.map(str::to_string),
+            context_lines: None,
+            case_insensitive: false,
+            files_only: false,
+            count: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn path_aware_include_globs_match_root_and_nested_files() {
+        let dir = TempDir::new("path-aware-include");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("root.rs"), "Needle\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "Needle\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.txt"), "Needle\n").unwrap();
+
+        let mut args = ergonomic_args(dir.path(), Some("**/*.rs"));
+        args.case_insensitive = true;
+        let output = GrepTool::new(None, None, 10)
+            .call(args)
+            .await
+            .unwrap()
+            .replace('\\', "/");
+        assert!(output.contains("root.rs"), "{output}");
+        assert!(output.contains("src/lib.rs"), "{output}");
+        assert!(!output.contains("lib.txt"), "{output}");
+
+        let mut args = ergonomic_args(dir.path(), Some("src/*.rs"));
+        args.case_insensitive = true;
+        let output = GrepTool::new(None, None, 10)
+            .call(args)
+            .await
+            .unwrap()
+            .replace('\\', "/");
+        assert!(!output.contains("root.rs"), "{output}");
+        assert!(output.contains("src/lib.rs"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn invalid_include_glob_is_an_explicit_error() {
+        let dir = TempDir::new("invalid-include");
+        let error = GrepTool::new(None, None, 10)
+            .call(ergonomic_args(dir.path(), Some("*.{rs,txt")))
+            .await
+            .expect_err("malformed glob must not become match-all")
+            .to_string();
+        assert!(error.contains("Invalid include glob"), "{error}");
+        assert!(error.contains("unclosed brace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn files_only_and_count_modes_return_compact_file_results() {
+        let dir = TempDir::new("compact-modes");
+        std::fs::write(dir.path().join("two.txt"), "needle\nneedle again\n").unwrap();
+
+        let mut files_only = ergonomic_args(dir.path(), None);
+        files_only.files_only = true;
+        let output = GrepTool::new(None, None, 10)
+            .call(files_only)
+            .await
+            .unwrap();
+        assert_eq!(output.matches("two.txt").count(), 1, "{output}");
+        assert!(!output.contains("needle again"), "{output}");
+
+        let mut count = ergonomic_args(dir.path(), None);
+        count.count = true;
+        let output = GrepTool::new(None, None, 10).call(count).await.unwrap();
+        assert!(
+            output.lines().any(|line| line.ends_with("two.txt:2")),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_output_uses_path_colon_line_and_separators_do_not_consume_limit() {
+        let dir = TempDir::new("context-format");
+        std::fs::write(dir.path().join("context.txt"), "before\nneedle\nafter\n").unwrap();
+        let mut args = ergonomic_args(dir.path(), None);
+        args.context_lines = Some(1);
+
+        let output = GrepTool::new(None, None, 3).call(args).await.unwrap();
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("context.txt:1- before")),
+            "{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("context.txt:2: needle")),
+            "{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("context.txt:3- after")),
+            "{output}"
+        );
+        assert!(output.starts_with("3 results"), "{output}");
     }
 }

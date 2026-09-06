@@ -1,16 +1,113 @@
 use crate::context;
 use crate::session::storage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
-use crate::ui::{PromptModeOutcome, apply_prompt_mode};
+use crate::ui::{PromptModeOutcome, apply_main_agent, apply_prompt_mode};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
         "/prompt" => handle_prompt(parts, ctx).await,
+        "/agent" => handle_agent(parts, ctx).await,
         "/theme" => handle_theme(parts, ctx).await,
         "/regen-prompts" => handle_regen_prompts(ctx).await,
         "/regen-themes" => handle_regen_themes(ctx).await,
         _ => Ok(()),
     }
+}
+
+async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let mut names = ctx
+        .context
+        .agent_definitions
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    if parts.len() < 2 {
+        let current = ctx
+            .context
+            .current_agent_name
+            .as_deref()
+            .unwrap_or("(default)");
+        write_ok(
+            ctx.renderer,
+            format!("available main-agent personas (current: {current}):"),
+        );
+        for name in names {
+            write_result(ctx.renderer, format!("  {name}"));
+        }
+        write_result(ctx.renderer, "usage: /agent <name>  |  /agent default");
+        return Ok(());
+    }
+
+    let name = parts[1].trim();
+    if name == "default" {
+        ctx.context.current_agent_explicit = true;
+        if ctx.context.current_agent_name.take().is_some() {
+            ctx.rebuild_agent().await;
+            write_ok(ctx.renderer, "main-agent persona cleared");
+        } else {
+            write_ok(ctx.renderer, "main-agent persona already uses the default");
+        }
+        return Ok(());
+    }
+
+    let Some(outcome) = apply_main_agent(name, ctx.context, ctx.permission) else {
+        write_error(ctx.renderer, format!("unknown agent: '{name}'"));
+        if !names.is_empty() {
+            write_ok(ctx.renderer, "available main-agent personas:");
+            for name in names {
+                write_result(ctx.renderer, format!("  {name}"));
+            }
+        }
+        return Ok(());
+    };
+    let source = ctx
+        .context
+        .agent_definitions
+        .get(name)
+        .map(|definition| definition.source_description(name))
+        .unwrap_or_else(|| "unknown source".to_string());
+
+    let mut rebuilt = false;
+    if let Some(prompt_name) = outcome.default_prompt {
+        if outcome.prompt_applied {
+            rebuilt = ctx.switch_to_prompt_model(&prompt_name).await;
+            write_ok(
+                ctx.renderer,
+                format!("active prompt: {prompt_name} (from agent '{name}')"),
+            );
+        } else {
+            write_error(
+                ctx.renderer,
+                format!(
+                    "agent '{name}' names unavailable prompt mode '{prompt_name}'; persona remains active"
+                ),
+            );
+        }
+    }
+    match outcome.prompt_mode {
+        PromptModeOutcome::RestoredUserMode => {
+            if let Some(perm) = ctx.permission {
+                let current = perm
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .mode();
+                write_ok(ctx.renderer, format!("restored user mode: {current}"));
+            }
+        }
+        PromptModeOutcome::Applied(mode) => {
+            write_ok(
+                ctx.renderer,
+                format!("security mode: {mode} (from agent prompt)"),
+            );
+        }
+        PromptModeOutcome::None => {}
+    }
+    if !rebuilt {
+        ctx.rebuild_agent().await;
+    }
+    write_ok(ctx.renderer, format!("active agent: {name} ({source})"));
+    Ok(())
 }
 
 async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

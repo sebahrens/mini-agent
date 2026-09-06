@@ -71,7 +71,7 @@ impl Tool for ShellTool {
                 "command": { "type": "string", "description": format!("{dialect} command to execute") },
                 "timeout": {
                     "type": "integer",
-                    "minimum": 0,
+                    "minimum": 1,
                     "description": "Lower command deadline in milliseconds (optional; maximum 30000 foreground or 86400000 background)"
                 },
                 "background": {
@@ -90,6 +90,11 @@ impl Tool for ShellTool {
             args.timeout,
             args.background,
         );
+        if args.timeout == Some(0) {
+            return Err(ToolError::Msg(
+                "shell timeout must be at least 1 millisecond".to_string(),
+            ));
+        }
         // The complete script is the permission key and is passed unchanged to
         // the shell. Never split or tokenize it: Bash can execute nested
         // programs from syntax that ad-hoc command splitting cannot classify.
@@ -130,19 +135,18 @@ impl Tool for ShellTool {
             return Err(resource_limit_error(output, limits, self.max_output_lines));
         }
 
-        let exit_code = output
-            .exit_status
-            .and_then(|status| status.code())
-            .unwrap_or(-1);
-
-        if exit_code != 0 {
-            tracing::warn!("tool shell: non-zero exit code={}", exit_code);
+        let termination = render_termination(output.exit_status);
+        if let Some(termination) = termination.as_deref() {
+            tracing::warn!("tool shell: {termination}");
         }
 
         let output_len = output.stdout.len() + output.stderr.len();
         let mut result = render_streams(&output.stdout, &output.stderr);
-        if exit_code != 0 {
-            result.push_str(&format!("\nExit code: {}", exit_code));
+        if let Some(termination) = termination {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&termination);
         }
 
         let result = bound_output_lines(result, self.max_output_lines);
@@ -152,8 +156,8 @@ impl Tool for ShellTool {
             None => result,
         };
         tracing::debug!(
-            "tool shell done: exit_code={}, output_len={}",
-            exit_code,
+            "tool shell done: status={:?}, output_len={}",
+            output.exit_status,
             output_len,
         );
         Ok(result)
@@ -223,15 +227,38 @@ fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let mut result = String::new();
     if !stdout.is_empty() {
+        result.push_str("[stdout]\n");
         result.push_str(&stdout);
     }
     if !stderr.is_empty() {
-        if !result.is_empty() {
+        if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
+        result.push_str("[stderr]\n");
         result.push_str(&stderr);
     }
     result
+}
+
+fn render_termination(status: Option<std::process::ExitStatus>) -> Option<String> {
+    let status = status?;
+    if let Some(code) = status.code() {
+        return (code != 0).then(|| format!("Exit code: {code}"));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(number) = status.signal() {
+            let name = nix::sys::signal::Signal::try_from(number)
+                .map(|signal| format!("{signal:?}"))
+                .unwrap_or_else(|_| "UNKNOWN".to_string());
+            return Some(format!("Terminated by signal: {name} ({number})"));
+        }
+    }
+
+    Some("Process terminated without an exit code".to_string())
 }
 
 fn render_background_job(snapshot: BackgroundJobSnapshot, max_output_lines: Option<u64>) -> String {
@@ -265,7 +292,7 @@ fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
     };
     let cap = usize::try_from(cap).unwrap_or(usize::MAX).max(1);
     // Keep roughly 80 % of the budget for the head and 20 % for the tail.
-    let tail = cap / 5;
+    let tail = (cap / 5).max(1);
     let head = cap - tail;
     let (mut bounded, total) = head_lines(&text, head);
     if total <= cap {
@@ -421,6 +448,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_timeout_is_rejected_instead_of_becoming_an_instant_deadline() {
+        let error = test_tool()
+            .call(BashArgs {
+                command: "printf should-not-run".to_string(),
+                timeout: Some(0),
+                background: false,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "shell timeout must be at least 1 millisecond");
+    }
+
+    #[tokio::test]
     async fn bash_resource_limits_timeout_kills_descendant() {
         let pid_file = std::env::temp_dir().join(format!(
             "mini-agent-bash-timeout-descendant-{}",
@@ -545,7 +587,33 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(output, "stdout\nstderr\nExit code: 7");
+        assert_eq!(output, "[stdout]\nstdout\n[stderr]\nstderr\nExit code: 7");
+    }
+
+    #[tokio::test]
+    async fn tiny_line_cap_preserves_the_nonzero_exit_status() {
+        let output = BashTool::new(None, None, Sandbox::new(false, "bwrap"), Some(1))
+            .call(BashArgs {
+                command: "printf 'one\\ntwo\\nthree\\n'; exit 9".to_string(),
+                timeout: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(output.ends_with("Exit code: 9"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_termination_uses_the_signal_name_instead_of_minus_one() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(nix::libc::SIGTERM);
+        assert_eq!(
+            render_termination(Some(status)).as_deref(),
+            Some("Terminated by signal: SIGTERM (15)")
+        );
     }
 
     #[cfg(unix)]

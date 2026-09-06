@@ -104,6 +104,104 @@ fn repeated_layout_hits_share_the_cached_line_vector() {
 }
 
 #[test]
+fn streaming_rerenders_only_the_active_block() {
+    let mut feed = Feed::new();
+    for index in 0..100 {
+        feed.push_line(BlockStyle::Plain, format!("completed {index}"));
+    }
+    feed.push_streaming_block(BlockStyle::Agent);
+    let _ = feed.lines(80);
+    assert_eq!(feed.block_renders(), 101);
+
+    for _ in 0..20 {
+        assert!(feed.append_to_last("token "));
+        let _ = feed.lines(80);
+    }
+    assert_eq!(
+        feed.block_renders(),
+        121,
+        "completed blocks must stay in their per-block render caches"
+    );
+}
+
+#[test]
+fn streaming_layout_shares_completed_row_allocations() {
+    let mut feed = Feed::new();
+    feed.push_line(BlockStyle::Plain, "completed system row");
+    feed.push_streaming_block(BlockStyle::Agent);
+    assert!(feed.append_to_last("completed agent paragraph\n\n"));
+    let before = feed.lines(80);
+    let before_segments = before.segment_ptrs_for_test();
+
+    assert!(feed.append_to_last("unfinished tail"));
+    let after = feed.lines(80);
+    let after_segments = after.segment_ptrs_for_test();
+
+    assert_eq!(before_segments[0], after_segments[0]);
+    assert_eq!(before_segments[1], after_segments[1]);
+    assert!(after_segments.len() > before_segments.len());
+}
+
+#[test]
+fn feed_retention_bounds_completed_blocks() {
+    let mut feed = Feed::new();
+    let (max_blocks, _, _) = Feed::retention_limits_for_test();
+    for index in 0..max_blocks + 7 {
+        feed.push_line(BlockStyle::Plain, format!("row {index}"));
+    }
+
+    assert_eq!(feed.block_count(), max_blocks);
+    assert_eq!(feed.block_text(0), Some("row 7"));
+    let newest = format!("row {}", max_blocks + 6);
+    assert_eq!(feed.block_text(max_blocks - 1), Some(newest.as_str()));
+    let lines = feed.lines(80);
+    assert_eq!(lines[0].text, "[7 earlier feed blocks omitted]");
+}
+
+#[test]
+fn feed_retention_bounds_bytes_and_compacts_one_large_stream() {
+    let mut feed = Feed::new();
+    let (_, max_feed_bytes, max_block_bytes) = Feed::retention_limits_for_test();
+    let payload = "x".repeat(max_block_bytes / 2);
+    for _ in 0..20 {
+        feed.push_line(BlockStyle::Plain, &payload);
+    }
+    assert!(feed.total_bytes_for_test() <= max_feed_bytes);
+
+    feed.clear();
+    feed.push_streaming_block(BlockStyle::Agent);
+    assert!(feed.append_to_last("é".repeat(max_block_bytes).as_str()));
+    let retained = feed.block_text(0).expect("compacted stream");
+    assert!(retained.starts_with("[earlier feed content omitted]"));
+    assert!(retained.len() < max_block_bytes);
+    assert!(retained.is_char_boundary(retained.len()));
+}
+
+#[test]
+fn feed_retention_preserves_live_block_index_while_shedding_foreign_blocks() {
+    let mut feed = Feed::new();
+    let (max_blocks, _, _) = Feed::retention_limits_for_test();
+    for index in 0..max_blocks - 1 {
+        feed.push_line(BlockStyle::Plain, format!("history {index}"));
+    }
+    feed.push_streaming_block(BlockStyle::Agent);
+    let live = feed.block_count() - 1;
+    assert!(feed.append_to(live, "first"));
+
+    for index in 0..10 {
+        feed.push_line(BlockStyle::System, format!("foreign {index}"));
+        assert!(feed.append_to(live, " token"));
+    }
+
+    assert!(feed.is_streaming(live));
+    assert!(feed.block_count() <= max_blocks);
+    assert!(
+        feed.block_text(live)
+            .is_some_and(|text| text.ends_with(" token"))
+    );
+}
+
+#[test]
 fn visible_range_bottom_aligned_when_short() {
     let mut feed = Feed::new();
     feed.push_line(BlockStyle::Plain, "one");

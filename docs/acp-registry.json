@@ -29,6 +29,7 @@
         "find_files",
         "list_dir",
         "todo_write",
+        "todo_read",
         "git",
         "js",
         "task",

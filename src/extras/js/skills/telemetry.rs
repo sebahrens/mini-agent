@@ -778,7 +778,17 @@ fn behavioral_window_counts(
     let window_start = window_end.saturating_sub(super::retention::DEFAULT_RAW_RETENTION_SECONDS);
     store.connection().query_row(
         "SELECT COUNT(*), COALESCE(SUM(
-             terminal.event_kind IN ('threw','timed_out','oom','capability_denied')
+             terminal.event_kind IN ('timed_out','oom','capability_denied')
+             OR (
+                 terminal.event_kind = 'threw'
+                 AND EXISTS (
+                     SELECT 1 FROM skill_feedback AS feedback
+                      WHERE feedback.skill_id = terminal.skill_id
+                        AND feedback.invocation_id = terminal.invocation_id
+                        AND feedback.feedback_kind IN ('negative', 'severe')
+                        AND feedback.state = 'active'
+                 )
+             )
          ), 0)
          FROM skill_events AS invoked
          JOIN skill_events AS terminal

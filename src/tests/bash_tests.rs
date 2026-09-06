@@ -104,7 +104,7 @@ async fn bash_compound_command_permission_allows_exact_complete_script() {
         .await
         .unwrap();
 
-    assert_eq!(output, "exact-script");
+    assert_eq!(output, "[stdout]\nexact-script");
 }
 
 fn bash_tool_with_line_cap(max_output_lines: Option<u64>) -> BashTool {
@@ -150,7 +150,10 @@ async fn bash_success_output_is_bounded_to_head_and_tail_with_omitted_marker() {
         "expected at most 24 lines (20 kept plus marker), got {}:\n{output}",
         lines.len()
     );
-    assert!(output.starts_with("1\n2\n3\n"), "head missing:\n{output}");
+    assert!(
+        output.starts_with("[stdout]\n1\n2\n"),
+        "head missing:\n{output}"
+    );
     assert!(output.ends_with("99\n100"), "tail missing:\n{output}");
     assert!(
         output.contains("lines omitted"),
@@ -163,7 +166,7 @@ async fn bash_success_output_is_bounded_to_head_and_tail_with_omitted_marker() {
 }
 
 #[tokio::test]
-async fn bash_output_within_line_cap_is_returned_verbatim() {
+async fn bash_output_within_line_cap_is_returned_with_a_stream_label() {
     let tool = bash_tool_with_line_cap(Some(20));
     let output = tool
         .call(BashArgs {
@@ -173,7 +176,7 @@ async fn bash_output_within_line_cap_is_returned_verbatim() {
         })
         .await
         .unwrap();
-    assert_eq!(output, "1\n2\n3\n4\n5\n");
+    assert_eq!(output, "[stdout]\n1\n2\n3\n4\n5\n");
 }
 
 #[tokio::test]
@@ -217,6 +220,7 @@ async fn bash_without_line_cap_returns_all_lines() {
         })
         .await
         .unwrap();
-    assert_eq!(output.lines().count(), 100);
+    assert_eq!(output.lines().count(), 101);
+    assert!(output.starts_with("[stdout]\n1\n"));
     assert!(!output.contains("omitted"));
 }

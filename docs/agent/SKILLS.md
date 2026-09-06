@@ -7,18 +7,42 @@ first model request of each user turn:
   bounded metadata is indexed; a selected `SKILL.md` is loaded progressively, and resource content
   is included only for exact Markdown/code-path references within its independent budget.
   `allowed-tools` and bundled scripts are inert metadata/resources and never grant permissions.
+  A bounded `learned-js` frontmatter list can associate exact, separately verified learned-JS
+  identities with the instructions. Each turn compares a bounded catalog signature, so imports
+  and ACTIVE-pointer changes become visible to already-running TUI and ACP sessions.
 - Learned JavaScript skills are immutable, identity-checked, verified artifacts in
   `<local-data>/skills/skills.db`. Only active revisions enter a generation snapshot. Their source
   is never placed in the model prompt; the frozen source bundle is sent directly to the contained
   JavaScript worker. Identity-v1 rows are quarantined and cannot execute; current artifacts use
   identity v2 with ABI-bound structured target grants.
 
-One cached query embedding feeds both typed indexes. Learned-JS retrieval uses an immutable HNSW
-generation, a generation-local FTS5 snapshot, RRF fusion, score floors, semantic/lineage dedupe,
-and independent prompt/source budgets. Small corpora use the exact contiguous dense oracle. Large
-startup rebuilds run once per process in a dedicated background thread; an exact/FTS generation is
-published before the HNSW graph, then the completed graph is atomically published while existing
-turn leases remain unchanged.
+One cached query embedding feeds both typed indexes. The initial query is the bounded user prompt.
+While working, the model can call the read-only `skills_search` tool with a more specific query;
+the result exposes only Agent Skill name/description/digest and learned-JS
+ID/description/export-signature metadata. That call re-freezes the learned-JS bundle at the tool
+result boundary, so newly selected exports are available to later `js` calls in the same turn.
+It does not reveal stored source or tests and cannot install, approve, activate, or widen a skill.
+Queries are non-empty and limited to 8 KiB.
+
+Selected instructions and manifests are appended to the system preamble through a per-completion,
+non-sticky request patch. The user prompt remains a separate, byte-identical user message, so a
+user-authored trusted-context delimiter cannot impersonate the system block. The patch is rebuilt
+for internal tool-loop requests and is never added to the returned or persisted conversation
+history; subsequent user turns therefore do not accumulate earlier 64 KiB skill blocks.
+
+Learned-JS retrieval uses an immutable HNSW generation, the durable active-only `skill_search`
+FTS5 index, RRF fusion, functional BM25 score floors, semantic/lineage dedupe, and independent
+prompt/source budgets. The immutable generation's ID map filters every durable lexical result, so
+new additions cannot enter an existing lease and removals disappear immediately. Small corpora use
+the exact contiguous dense oracle. Startup hydration reuses the already-applied durable generation
+without incrementing it; an exact/durable-FTS generation is published before an optional HNSW
+graph, then the completed graph is atomically published while existing turn leases remain
+unchanged. Rebuilds snapshot SQLite state under the coordinator mutex, release that mutex for every
+potentially remote embedding batch, and reacquire it only to cache vectors and atomically validate
+or publish the generation. Turn-time refresh and canary-routing queries run on blocking workers;
+the canary secret is cached only for the exact published generation. Model or revision changes
+backfill both active and canary vectors in the new generation, while canaries remain excluded from
+independent prompt retrieval and are reachable only through routing.
 
 Within a logical agent session, discovery storage and telemetry are initialized lazily once for
 the canonical workspace and reused across model switches, compaction, and other full-agent
@@ -30,6 +54,14 @@ and one contained-verification admission worker join the session bundle; otherwi
 sessions retain separate service owners and turn contexts, so concurrent clients cannot replace
 one another's selected-skill bundle.
 
+Each read-only exploration subagent gets its own retrieval context and turn lock while sharing the
+parent session's immutable Agent Skill index. The child receives initial Agent Skill instructions
+and may use `skills_search` when its persona allows that tool. When contained JavaScript is
+available, the child receives a read-only `js` realm and may discover and execute active pure
+learned-JS exports. Read-only/side-effecting learned skills and canary replacements are excluded,
+and the realm exposes only `read_file`, `list_dir`, and `grep` effects under a parent-issued read
+grant. Child searches cannot replace the parent or a sibling's frozen bundle.
+
 At a JS call boundary, `JsTool` snapshots the current bundle. Each selected skill runs in a private
 lexical namespace, its full SHA-256 identity and exports are revalidated, and only declared,
 JSON-shaped function boundaries are published with the exact host-capability scope. Every selected
@@ -37,6 +69,14 @@ artifact/export receives a reusable Rust-owned binding, but no reusable bearer a
 genuinely new wrapper call, that dispatcher asks the parent for the next exact call ordinal; the
 parent derives the artifact/export-attributed invocation ID and returns a fresh one-shot handle
 with newly minted scoped grants. The wrapper consumes that handle before stored source runs.
+The warm worker compiles each identity-checked selected artifact once per turn and keeps only its
+immutable artifact plus process-local bytecode. After the first call on that worker generation,
+the parent sends ordered full identities instead of re-shipping source. Every call still creates a
+fresh constrained runtime and private context, loads and evaluates the bytecode there, and mints
+new invocation authority; cache misses or cross-turn references fail closed.
+The trusted manifest identifies every selected export as a callable global in the `js` tool and
+includes one direct-call example per skill. Routing policy, canary-share, and fingerprint metadata
+remain parent-only and are not exposed to the model.
 Replaying a consumed handle or calling after parent expiry/revocation fails closed, and no ambient,
 FIFO, or metadata fallback exists. Protected host globals cannot be replaced.
 Model-authored code then runs separately as `agent.js`, preserving its line numbers. Identity,
@@ -55,8 +95,20 @@ The library's removal contract is optimistic, versioned retirement. Retirement a
 publish an immediate immutable visibility mask without rebuilding the graph; purge also deletes
 persistent vectors, and a purged identity is tombstoned so it cannot be resurrected. The
 `--purge-learned-skill` operator command invokes the coordinated privacy-purge path.
+Use `--learned-skill-stats` to print per-revision status, invocation count, direct success rate,
+last-use Unix timestamp, declared effect methods, and an estimated saved-round-trip lower bound.
+The estimate credits only successful calls with more than one distinct declared effect method;
+raw effect arguments and counts are intentionally not retained in skill telemetry.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
 network, process, or sandbox permission paths.
+
+An Agent Skill import resolves every `learned-js` identity through the normal learned-skill store
+before installing the tree. Missing, corrupt, pending, rejected, retired, quarantined, or purged
+identities fail the import; verified and canary identities may be referenced but remain unavailable
+to execution. When an Agent Skill is selected for a turn, only its currently active declared
+identities are placed ahead of ordinary retrieval results, with exact-ID deduplication and the same
+learned-skill count, manifest-byte, and source-byte budgets. This association cannot approve,
+activate, revive, or grant authority to code.
 
 ## Local-owner lifecycle
 
@@ -87,17 +139,11 @@ parsing, whole-file unified-diff formatting, and aligned text-table formatting. 
 same held-out evaluation and two-action approval/activation route as external packages; they are
 not silently trusted or activated.
 
-## Current limits and planned changes (2026-09-05 review)
+## Current limits
 
-- The default `Deterministic` embedding backend is a hash projection with no semantic meaning;
-  with the default score floor it can select unrelated skills at random. Configure a real
-  embedding backend for meaningful dense retrieval. Planned: dense retrieval is disabled under
-  the deterministic backend (mini-agent-bfsg).
-- The lexical channel requires every prompt word to match, so natural-language prompts rarely
-  match; an OR/BM25 query is planned (mini-agent-io7h).
-- A stats/list view remains planned (mini-agent-vvud, mini-agent-i78t); lifecycle commands print
-  the full identity and resulting state for scripting in the meantime.
-- The model manifest does not yet say that exports are callable globals (mini-agent-4bqq).
+The default deterministic embedding backend has no semantic meaning, so dense retrieval is
+disabled for that backend and the lexical OR/BM25 channel remains available. Configure a semantic
+embedding backend to add dense candidates.
 
 See [the Phase 3 specification](../specs/phase-3-skill-library.md),
 [the Phase 6 brokered-runtime specification](../specs/phase-6-brokered-js-runtime.md), and

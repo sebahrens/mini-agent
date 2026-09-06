@@ -442,7 +442,7 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
 
     if parts.len() < 2 {
         let (provider_name, model_name) =
-            subagents::with_config(|cfg| (cfg.client.provider_name(), cfg.model_name.clone()))?;
+            subagents::with_config(|cfg| (cfg.provider_name.clone(), cfg.model_name.clone()))?;
         write_ok(
             ctx.renderer,
             format!("current subagent model: {} / {}", provider_name, model_name),
@@ -451,7 +451,9 @@ async fn handle_model_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
     }
 
     let new_model = parts[1].trim().to_string();
-    let model = ctx.client.completion_model(new_model.clone());
+    let subagent_client =
+        subagents::with_config(|cfg| cfg.client.clone()).map_err(anyhow::Error::from)?;
+    let model = subagent_client.completion_model(new_model.clone());
     model_for_subagent(ctx, model).await?;
     subagents::set_model_name(new_model.clone());
     write_ok(
@@ -471,7 +473,7 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
 
     if parts.len() < 2 {
         let (provider_name, model_name) =
-            subagents::with_config(|cfg| (cfg.client.provider_name(), cfg.model_name.clone()))?;
+            subagents::with_config(|cfg| (cfg.provider_name.clone(), cfg.model_name.clone()))?;
         if sorted.is_empty() {
             write_ok(
                 ctx.renderer,
@@ -504,7 +506,9 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
 
     let name = parts[1].trim();
     if let Some(q) = qm.get(name) {
-        if q.provider.as_str() != ctx.client.provider_name() {
+        let (current_provider, current_client) =
+            subagents::with_config(|cfg| (cfg.provider_name.clone(), cfg.client.clone()))?;
+        if q.provider.as_str() != current_provider {
             let new_client = crate::provider::create_client(
                 &q.provider,
                 ctx.cli.api_key.as_deref(),
@@ -513,9 +517,13 @@ async fn handle_models_subagent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyho
             )?;
             let model = new_client.completion_model(q.model.to_string());
             model_for_subagent(ctx, model).await?;
-            subagents::set_client_and_model(new_client, q.model.to_string());
+            subagents::set_client_and_model(
+                new_client,
+                q.provider.to_string(),
+                q.model.to_string(),
+            );
         } else {
-            let model = ctx.client.completion_model(q.model.to_string());
+            let model = current_client.completion_model(q.model.to_string());
             model_for_subagent(ctx, model).await?;
             subagents::set_model_name(q.model.to_string());
         }
@@ -557,6 +565,9 @@ async fn model_for_subagent(
         ),
         #[cfg(feature = "archmd")]
         None,
+        None,
+        crate::extras::subagents::builder::PersonaExecution::default(),
+        #[cfg(feature = "skills")]
         None,
     )
     .await;

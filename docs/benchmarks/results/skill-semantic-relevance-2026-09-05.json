@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "benchmark": "mini-agent-skill-semantic-relevance",
+  "profile": "debug",
+  "model": {
+    "id": "BAAI/bge-small-en-v1.5",
+    "revision": "v1.5",
+    "dimensions": 384,
+    "normalized": true
+  },
+  "method": {
+    "documents": 12,
+    "queries": 12,
+    "query_kind": "held-out natural-language paraphrase",
+    "lexical_candidates": 0,
+    "self_queries": 0
+  },
+  "relevance": {
+    "top1_rate": 0.9166666666666666,
+    "mean_reciprocal_rank": 0.9583333333333334,
+    "observations": [
+      { "query": "read a JSON payload", "expected": "parse_json", "rank": 1 },
+      { "query": "load rows from a CSV file", "expected": "parse_csv", "rank": 1 },
+      { "query": "turn a title into a web address fragment", "expected": "slugify", "rank": 1 },
+      { "query": "keep only the first copy of each list value", "expected": "dedupe", "rank": 1 },
+      { "query": "how long should the next network retry wait", "expected": "retry_delay", "rank": 1 },
+      { "query": "divide a large document into smaller passages", "expected": "chunk_text", "rank": 1 },
+      { "query": "hide API keys before logging an error", "expected": "redact_secrets", "rank": 1 },
+      { "query": "find every URL referenced by a markdown page", "expected": "markdown_links", "rank": 1 },
+      { "query": "sort package releases from oldest to newest", "expected": "semver_sort", "rank": 1 },
+      { "query": "bucket rows that share the same category", "expected": "group_records", "rank": 2 },
+      { "query": "keep a number between minimum and maximum bounds", "expected": "clamp_number", "rank": 1 },
+      { "query": "make two differently cased email addresses comparable", "expected": "normalize_email", "rank": 1 }
+    ]
+  }
+}

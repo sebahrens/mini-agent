@@ -318,6 +318,7 @@ pub(crate) async fn gate_subagent_start(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
     agent_type: &str,
+    agent_source: &str,
 ) -> Option<String> {
     let canonical = normalize::canonical_tool_name(agent_type);
     let decision = dispatcher
@@ -327,6 +328,7 @@ pub(crate) async fn gate_subagent_start(
             ctx,
             envelope::EventFields::SubagentStart {
                 agent_type: canonical.clone(),
+                agent_source: agent_source.to_string(),
             },
         )
         .await;
@@ -339,9 +341,12 @@ pub(crate) async fn gate_subagent_start(
 /// Production entry point: reads the process-wide dispatcher and gates
 /// subagent start for `agent_type`. Returns `None` when no dispatcher is
 /// installed.
-pub(crate) async fn dispatch_subagent_start(agent_type: &str) -> Option<String> {
+pub(crate) async fn dispatch_subagent_start(
+    agent_type: &str,
+    agent_source: &str,
+) -> Option<String> {
     let dispatcher = get_dispatcher()?;
-    gate_subagent_start(&dispatcher, &best_effort_ctx(), agent_type).await
+    gate_subagent_start(&dispatcher, &best_effort_ctx(), agent_type, agent_source).await
 }
 
 /// Outcome of dispatching `SubagentStop`: release the child's result, or
@@ -357,6 +362,7 @@ pub(crate) async fn gate_subagent_stop(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
     agent_type: &str,
+    agent_source: &str,
     stop_hook_active: bool,
 ) -> SubagentStopGate {
     let canonical = normalize::canonical_tool_name(agent_type);
@@ -368,6 +374,7 @@ pub(crate) async fn gate_subagent_stop(
             envelope::EventFields::SubagentStop {
                 stop_hook_active,
                 agent_type: canonical.clone(),
+                agent_source: agent_source.to_string(),
             },
         )
         .await;
@@ -382,6 +389,7 @@ pub(crate) async fn gate_subagent_stop(
 /// dispatcher is installed.
 pub(crate) async fn dispatch_subagent_stop(
     agent_type: &str,
+    agent_source: &str,
     stop_hook_active: bool,
 ) -> SubagentStopGate {
     let Some(dispatcher) = get_dispatcher() else {
@@ -391,6 +399,7 @@ pub(crate) async fn dispatch_subagent_stop(
         &dispatcher,
         &best_effort_ctx(),
         agent_type,
+        agent_source,
         stop_hook_active,
     )
     .await

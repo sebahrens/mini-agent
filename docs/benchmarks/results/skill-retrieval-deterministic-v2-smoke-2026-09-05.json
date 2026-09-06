@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "seed": 1592590339,
+  "profile": "debug",
+  "label": "ci-smoke",
+  "corpus": {
+    "revisions": 2000,
+    "mix": ["semantic", "identifier", "mixed", "irrelevant", "near_duplicate", "lifecycle_filtered"]
+  },
+  "model": {
+    "id": "deterministic-hash",
+    "revision": "deterministic-v2",
+    "dimensions": 384,
+    "normalized": true
+  },
+  "machine": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu": "Apple M3 Ultra",
+    "logical_cpus": 32,
+    "memory_bytes": "549755813888"
+  },
+  "latency": {
+    "corpus_document_embedding_us": 48895.208000000006,
+    "fts_build_us": 130481.292,
+    "snapshot_build_us": 120240.791,
+    "snapshot_build_phases": { "exact_fts_us": 30544.416, "ann_construction_us": 89696.375 },
+    "snapshot_rebuild_us": 118621.083,
+    "snapshot_rebuild_phases": { "exact_fts_us": 30325.417, "ann_construction_us": 88295.666 },
+    "lifecycle_removal_refresh_us": 119.0,
+    "query_embedding_cold_us": 782.0,
+    "query_embedding_warm_us": 14.958,
+    "index_search": { "samples": 8, "p50_us": 5878.084000000001, "p95_us": 6015.2080000000005, "p99_us": 6015.2080000000005 },
+    "dense": { "samples": 8, "p50_us": 380.542, "p95_us": 392.708, "p99_us": 392.708 },
+    "fts_candidates": { "samples": 8, "p50_us": 5479.459, "p95_us": 5603.917, "p99_us": 5603.917 },
+    "fusion_dedupe_budget": { "samples": 8, "p50_us": 16.166, "p95_us": 16.459, "p99_us": 16.459 },
+    "concurrent_reader": { "samples": 4, "p50_us": 810.416, "p95_us": 840.875, "p99_us": 840.875 },
+    "exact_oracle": { "samples": 200, "p50_us": 1147.541, "p95_us": 1179.542, "p99_us": 1212.0 }
+  },
+  "memory": { "rss_before_kib": 16576, "peak_observed_rss_kib": 69584 },
+  "relevance": {
+    "scope": "HNSW fidelity only; deterministic hash vectors do not measure semantic relevance",
+    "ann_recall_at_10_against_exact": 0.9815000000000006,
+    "independent_rebuild_recall_at_10": 0.985,
+    "ann_self_query_top1_rate": 0.99,
+    "deterministic_order": true,
+    "zero_result": true,
+    "lifecycle_filtered": true
+  },
+  "gate": {
+    "host_sensitive_smoke_only": true,
+    "p99_target_us": 5000,
+    "observed_p99_us": 6015.2080000000005,
+    "recall_at_10_target": 0.95,
+    "observed_recall_at_10": 0.9815000000000006,
+    "passed": false
+  }
+}

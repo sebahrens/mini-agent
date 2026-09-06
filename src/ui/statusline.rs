@@ -97,6 +97,7 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     session.total_output_tokens.hash(&mut state);
     session.total_cached_input_tokens.hash(&mut state);
     session.total_cache_creation_input_tokens.hash(&mut state);
+    session.total_real_input_tokens.hash(&mut state);
     session.total_cost.to_bits().hash(&mut state);
     session.effective_context_tokens().hash(&mut state);
     session.context_window.hash(&mut state);
@@ -317,6 +318,18 @@ fn resolve_item(
             .then(|| fmt_tokens(session.total_input_tokens)),
         "tokens_output" => (session.total_output_tokens > 0 || always)
             .then(|| fmt_tokens(session.total_output_tokens)),
+        "cache_hit_ratio" => {
+            let total = session.total_real_input_tokens;
+            (total > 0 || always).then(|| {
+                let percent = session
+                    .total_cached_input_tokens
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0)
+                    .min(100);
+                format!("cache:{percent}%")
+            })
+        }
         "context_used" => {
             // A `~` marks the figure as an estimate until the provider reports
             // real usage (it then snaps to the exact number).
@@ -605,6 +618,8 @@ pub fn default_spec() -> StatusLineConfig {
         seg("context_percentage", Some("dark_grey")),
         sep("  \u{21d1}"),
         seg("tokens_input", Some("dark_grey")),
+        sep(" "),
+        seg("cache_hit_ratio", Some("dark_grey")),
         sep(" \u{21d3}"),
         seg("tokens_output", Some("dark_grey")),
         StatusLineSegment {

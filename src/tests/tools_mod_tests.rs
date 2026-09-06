@@ -1,6 +1,9 @@
 use rig::tool::Tool;
 
-use crate::agent::tools::{EditArgs, EditTool, ReadArgs, ReadTool, ReadTracker, is_skip_dir};
+use crate::agent::tools::{
+    EditArgs, EditTool, FindFilesArgs, FindFilesTool, GrepArgs, GrepTool, ListDirArgs, ListDirTool,
+    ReadArgs, ReadTool, ReadTracker, is_skip_dir,
+};
 use crate::session::Session;
 
 #[test]
@@ -14,6 +17,13 @@ fn skip_target() {
 }
 
 #[test]
+fn skip_common_vcs_metadata_directories() {
+    for name in [".git", ".hg", ".svn", ".bzr"] {
+        assert!(is_skip_dir(name), "{name} should be skipped");
+    }
+}
+
+#[test]
 fn skip_case_sensitive() {
     assert!(!is_skip_dir("Node_Modules"));
     assert!(!is_skip_dir("TARGET"));
@@ -24,6 +34,87 @@ fn skip_other_dirs() {
     assert!(!is_skip_dir("src"));
     assert!(!is_skip_dir(""));
     assert!(!is_skip_dir("node_modules_extra"));
+}
+
+#[tokio::test]
+async fn workspace_tools_skip_vcs_metadata_unless_it_is_the_explicit_root() {
+    let root = std::env::temp_dir().join(format!(
+        "mini-agent-skip-vcs-metadata-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".git/secret.txt"), "VCS_SENTINEL\n").unwrap();
+    std::fs::write(root.join(".svn"), "VCS_FILE_SENTINEL\n").unwrap();
+    std::fs::write(root.join("src/visible.txt"), "VISIBLE_SENTINEL\n").unwrap();
+
+    {
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&root)
+            .call(ListDirArgs { path: None })
+            .await
+            .unwrap();
+        assert!(listing.contains("src"), "{listing}");
+        assert!(!listing.contains(".git"), "{listing}");
+        assert!(!listing.contains(".svn"), "{listing}");
+
+        let grep = GrepTool::new(None, None, 100)
+            .with_workspace(&root)
+            .call(GrepArgs {
+                pattern: "SENTINEL".into(),
+                path: None,
+                include: None,
+                context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
+            })
+            .await
+            .unwrap();
+        assert!(grep.contains("visible.txt"), "{grep}");
+        assert!(!grep.contains("secret.txt"), "{grep}");
+        assert!(!grep.contains(".svn"), "{grep}");
+
+        let found = FindFilesTool::new(None, None, 100)
+            .with_workspace(&root)
+            .call(FindFilesArgs {
+                pattern: r".*\.txt".into(),
+                path: None,
+            })
+            .await
+            .unwrap();
+        assert!(found.contains("visible.txt"), "{found}");
+        assert!(!found.contains("secret.txt"), "{found}");
+
+        let explicit_listing = ListDirTool::new(None, None, None)
+            .with_workspace(&root)
+            .call(ListDirArgs {
+                path: Some(".git".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            explicit_listing.contains("secret.txt"),
+            "{explicit_listing}"
+        );
+
+        let explicit_grep = GrepTool::new(None, None, 100)
+            .with_workspace(&root)
+            .call(GrepArgs {
+                pattern: "VCS_SENTINEL".into(),
+                path: Some(".git".into()),
+                include: None,
+                context_lines: None,
+                case_insensitive: false,
+                files_only: false,
+                count: false,
+            })
+            .await
+            .unwrap();
+        assert!(explicit_grep.contains("secret.txt"), "{explicit_grep}");
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -161,7 +252,7 @@ async fn concurrent_read_tools_with_different_settings_do_not_share_history() {
 }
 
 #[tokio::test]
-async fn repeated_read_is_allowed_after_an_external_file_change() {
+async fn repeated_read_is_allowed_after_same_length_mtime_preserving_change() {
     let path = std::env::temp_dir().join(format!(
         "mini-agent-read-tracker-external-change-{}-{}",
         std::process::id(),
@@ -177,9 +268,18 @@ async fn repeated_read_is_allowed_after_an_external_file_change() {
 
     assert!(tool.call(args()).await.is_ok());
     assert!(tool.call(args()).await.is_err());
-    tokio::fs::write(&path, "after with a different length")
-        .await
+    let original_metadata = std::fs::metadata(&path).unwrap();
+    let original_modified = original_metadata.modified().unwrap();
+    tokio::fs::write(&path, "after!").await.unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
         .unwrap();
+    let changed_metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(changed_metadata.len(), original_metadata.len());
+    assert_eq!(changed_metadata.modified().unwrap(), original_modified);
     assert!(tool.call(args()).await.is_ok());
 
     let _ = tokio::fs::remove_file(path).await;
@@ -364,6 +464,7 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     owner_edit
         .call(EditArgs {
             path: path.clone(),
+            replace_all: false,
             block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".to_string()),
             file_crc: None,
             edits: None,
@@ -404,6 +505,7 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
     assert!(read.call(alias_args()).await.is_ok());
     edit.call(EditArgs {
         path: target.to_string_lossy().into_owned(),
+        replace_all: false,
         block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".to_string()),
         file_crc: None,
         edits: None,

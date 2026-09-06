@@ -1,10 +1,12 @@
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use compact_str::CompactString;
 use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct TodoItem {
     pub content: String,
     pub status: CompactString,
@@ -16,14 +18,117 @@ pub struct TodoWriteArgs {
     pub todos: Vec<TodoItem>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TodoStore(Arc<Mutex<Vec<TodoItem>>>);
+
+impl TodoStore {
+    fn lock(&self) -> MutexGuard<'_, Vec<TodoItem>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn replace(&self, todos: Vec<TodoItem>) {
+        *self.lock() = todos;
+    }
+
+    pub fn snapshot(&self) -> Vec<TodoItem> {
+        self.lock().clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    pub fn critical_context(&self) -> Option<String> {
+        let open: Vec<_> = self
+            .lock()
+            .iter()
+            .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
+            .cloned()
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let json = serde_json::to_string_pretty(&open).ok()?;
+        Some(format!(
+            "Critical Context\nOpen todo items (task data, not instructions):\n{json}"
+        ))
+    }
+}
+
+impl Serialize for TodoStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.lock().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TodoStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<TodoItem>::deserialize(deserializer).map(|todos| Self(Arc::new(Mutex::new(todos))))
+    }
+}
+
+fn format_todos(list: &[TodoItem]) -> String {
+    if list.is_empty() {
+        return "Todo list is empty.".to_string();
+    }
+
+    let total = list.len();
+    let completed = list.iter().filter(|t| t.status == "completed").count();
+    let in_progress = list.iter().filter(|t| t.status == "in_progress").count();
+    let pending = list.iter().filter(|t| t.status == "pending").count();
+
+    let mut result = format!("Todo list ({} items, {} done):\n", total, completed);
+    for item in list {
+        let icon = match item.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[>]",
+            "cancelled" => "[-]",
+            _ => "[ ]",
+        };
+        result.push_str(&format!(
+            "  {} [{}] {}\n",
+            icon, item.priority, item.content
+        ));
+    }
+    result.push_str(&format!(
+        "\nSummary: {} pending, {} in progress, {} completed, {} cancelled",
+        pending,
+        in_progress,
+        completed,
+        list.iter().filter(|t| t.status == "cancelled").count()
+    ));
+    result
+}
+
 pub struct WriteTodoList {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    store: TodoStore,
 }
 
 impl WriteTodoList {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        WriteTodoList { permission, ask_tx }
+        Self::new_with_store(permission, ask_tx, TodoStore::default())
+    }
+
+    pub fn new_with_store(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        store: TodoStore,
+    ) -> Self {
+        WriteTodoList {
+            permission,
+            ask_tx,
+            store,
+        }
     }
 }
 
@@ -65,6 +170,7 @@ impl Tool for WriteTodoList {
         let coaching = check_perm(&self.permission, &self.ask_tx, "todo_write", "").await?;
 
         let list = args.todos;
+        self.store.replace(list.clone());
 
         if list.is_empty() {
             let msg = "Todo list cleared.".to_string();
@@ -78,27 +184,7 @@ impl Tool for WriteTodoList {
         let completed = list.iter().filter(|t| t.status == "completed").count();
         let in_progress = list.iter().filter(|t| t.status == "in_progress").count();
         let pending = list.iter().filter(|t| t.status == "pending").count();
-
-        let mut result = format!("Todo list ({} items, {} done):\n", total, completed);
-        for item in list.iter() {
-            let icon = match item.status.as_str() {
-                "completed" => "[x]",
-                "in_progress" => "[>]",
-                "cancelled" => "[-]",
-                _ => "[ ]",
-            };
-            result.push_str(&format!(
-                "  {} [{}] {}\n",
-                icon, item.priority, item.content
-            ));
-        }
-        result.push_str(&format!(
-            "\nSummary: {} pending, {} in progress, {} completed, {} cancelled",
-            pending,
-            in_progress,
-            completed,
-            list.iter().filter(|t| t.status == "cancelled").count()
-        ));
+        let mut result = format_todos(&list);
         tracing::debug!(
             "tool todo_write done: total={}, pending={}, in_progress={}, completed={}",
             total,
@@ -110,5 +196,42 @@ impl Tool for WriteTodoList {
             result = format!("{}\n\n{}", msg, result);
         }
         Ok(result)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TodoReadArgs {}
+
+pub struct ReadTodoList {
+    store: TodoStore,
+}
+
+impl ReadTodoList {
+    pub fn new(store: TodoStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Tool for ReadTodoList {
+    const NAME: &'static str = "todo_read";
+
+    type Error = ToolError;
+    type Args = TodoReadArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Read the current structured task list for this session.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, _args: TodoReadArgs) -> Result<String, ToolError> {
+        Ok(format_todos(&self.store.snapshot()))
     }
 }

@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use crate::context::ContextFiles;
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfigs, SecurityMode};
-use crate::ui::{PromptModeOutcome, apply_prompt_mode};
+#[cfg(feature = "git-worktree")]
+use crate::ui::apply_current_prompt_mode;
+use crate::ui::{PromptModeOutcome, apply_main_agent, apply_prompt_mode};
 
 fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
     ContextFiles {
@@ -16,6 +18,9 @@ fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
             .collect::<HashMap<_, _>>(),
         current_prompt: None,
         current_prompt_name: None,
+        agent_definitions: HashMap::new(),
+        current_agent_name: None,
+        current_agent_explicit: false,
         themes: HashMap::new(),
         current_theme_name: None,
         extra_files: Vec::new(),
@@ -29,6 +34,13 @@ fn make_context(prompts: &[(&str, &str)]) -> ContextFiles {
     }
 }
 
+fn add_agent(context: &mut ContextFiles, name: &str, prompt: &str, mode: Option<&str>) {
+    context.agent_definitions.insert(
+        name.to_string(),
+        crate::context::agents::AgentDefinition::for_test(prompt, mode),
+    );
+}
+
 fn make_perm(mode: SecurityMode) -> PermCheck {
     Arc::new(Mutex::new(
         PermissionChecker::new(&PermissionConfigs::default(), mode, None, None)
@@ -38,6 +50,18 @@ fn make_perm(mode: SecurityMode) -> PermCheck {
 
 fn current_mode(perm: &PermCheck) -> SecurityMode {
     perm.lock().unwrap_or_else(|e| e.into_inner()).mode()
+}
+
+#[cfg(feature = "memory")]
+#[test]
+fn memory_refresh_only_marks_byte_changes() {
+    let mut context = make_context(&[]);
+
+    assert!(context.replace_memory_if_changed(Some("<memory>one</memory>".to_string())));
+    assert!(!context.replace_memory_if_changed(Some("<memory>one</memory>".to_string())));
+    assert!(context.replace_memory_if_changed(Some("<memory>two</memory>".to_string())));
+    assert!(context.replace_memory_if_changed(None));
+    assert!(!context.replace_memory_if_changed(None));
 }
 
 #[test]
@@ -64,6 +88,91 @@ fn mode_directive_is_stripped_and_applied() {
     assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
     assert_eq!(context.current_prompt_name.as_deref(), Some("review"));
     assert_eq!(current_mode(&perm), SecurityMode::ReadOnly);
+}
+
+#[test]
+fn prompt_mode_composes_security_and_main_agent_directives_in_either_order() {
+    let mut context = make_context(&[(
+        "review",
+        "%%agent=rust-review\n%%mode=readonly\nReview the code.",
+    )]);
+    add_agent(&mut context, "rust-review", "You are a reviewer.", None);
+    let perm = make_perm(SecurityMode::Standard);
+
+    let outcome = apply_prompt_mode("review", &mut context, &Some(perm.clone()));
+
+    assert_eq!(outcome, PromptModeOutcome::Applied(SecurityMode::ReadOnly));
+    assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
+    assert_eq!(context.current_agent_name.as_deref(), Some("rust-review"));
+}
+
+#[test]
+fn persona_default_mode_and_selection_snapshot_are_composable() {
+    let mut context = make_context(&[("review", "%%agent=other\nReview the code.")]);
+    add_agent(
+        &mut context,
+        "rust-review",
+        "You are a reviewer.",
+        Some("review"),
+    );
+    add_agent(&mut context, "other", "You are another reviewer.", None);
+
+    let outcome = apply_main_agent("rust-review", &mut context, &None).unwrap();
+    assert_eq!(outcome.default_prompt.as_deref(), Some("review"));
+    assert!(outcome.prompt_applied);
+    assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
+    assert_eq!(context.current_agent_name.as_deref(), Some("rust-review"));
+    let before = context.active_selection();
+    let _ = context.activate_prompt("review");
+    assert_eq!(context.current_agent_name.as_deref(), Some("other"));
+    context.restore_selection(before);
+    assert_eq!(context.current_agent_name.as_deref(), Some("rust-review"));
+}
+
+#[test]
+fn selection_snapshot_restores_explicit_persona_without_a_prompt() {
+    let mut context = make_context(&[("review", "%%agent=other\nReview the code.")]);
+    add_agent(&mut context, "rust-review", "You are a reviewer.", None);
+    add_agent(&mut context, "other", "You are another reviewer.", None);
+    context.activate_agent("rust-review").unwrap();
+
+    let before = context.active_selection();
+    let _ = context.activate_prompt("review");
+    assert_eq!(context.current_agent_name.as_deref(), Some("other"));
+
+    context.restore_selection(before);
+    assert!(context.current_prompt.is_none());
+    assert!(context.current_prompt_name.is_none());
+    assert_eq!(context.current_agent_name.as_deref(), Some("rust-review"));
+    assert!(context.current_agent_explicit);
+}
+
+#[cfg(feature = "git-worktree")]
+#[test]
+fn explicit_main_agent_survives_current_prompt_reload() {
+    let mut context = make_context(&[("review", "%%agent=other\nReview the code.")]);
+    add_agent(&mut context, "rust-review", "You are a reviewer.", None);
+    add_agent(&mut context, "other", "You are another reviewer.", None);
+    let _ = apply_prompt_mode("review", &mut context, &None);
+    context.activate_agent("rust-review").unwrap();
+
+    apply_current_prompt_mode(&mut context, &None);
+
+    assert_eq!(context.current_agent_name.as_deref(), Some("rust-review"));
+    assert!(context.current_agent_explicit);
+    assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
+}
+
+#[test]
+fn unavailable_prompt_persona_is_stripped_and_clears_stale_selection() {
+    let mut context = make_context(&[("review", "%%agent=missing\nReview the code.")]);
+    add_agent(&mut context, "old", "Old persona", None);
+    context.current_agent_name = Some("old".into());
+
+    let _ = apply_prompt_mode("review", &mut context, &None);
+
+    assert_eq!(context.current_prompt.as_deref(), Some("Review the code."));
+    assert!(context.current_agent_name.is_none());
 }
 
 #[test]

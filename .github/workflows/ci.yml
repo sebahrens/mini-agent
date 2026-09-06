@@ -56,6 +56,9 @@ jobs:
       - name: Test Phase 6 cross-platform CI gate
         run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
 
+      - name: Test harness evaluation CI policy
+        run: python3 -m unittest scripts.tests.test_harness_eval_ci
+
       - name: Test VS Code CI policy
         run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
 

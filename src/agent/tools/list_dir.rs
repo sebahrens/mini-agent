@@ -72,7 +72,7 @@ impl Tool for ListDirTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string()
+        "List files and directories in a directory. Respects .gitignore and hides dependency/build directories and VCS metadata unless requested explicitly. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -133,9 +133,15 @@ impl Tool for ListDirTool {
             (bound, coaching)
         };
 
-        let mut entries: Vec<(String, String, String)> = Vec::new();
+        let mut entries: Vec<(String, String, String, Option<String>)> = Vec::new();
+        let bound_entries =
+            crate::agent::runner::spawn_blocking_scoped(move || bound_directory.list_entries())
+                .await
+                .map_err(|error| {
+                    ToolError::Msg(format!("list_dir directory reader failed: {error}"))
+                })??;
 
-        for entry in bound_directory.list_entries()? {
+        for entry in bound_entries {
             let name = entry.file_name.to_string_lossy().to_string();
             let kind = if entry.is_directory {
                 format!("dir({})", entry.child_count)
@@ -151,12 +157,15 @@ impl Tool for ListDirTool {
                 String::new()
             };
 
-            entries.push((name, kind, size));
+            let link_target = entry
+                .link_target
+                .map(|target| target.to_string_lossy().into_owned());
+            entries.push((name, kind, size, link_target));
         }
 
         entries.sort_by(|a, b| {
-            let a_is_dir = a.1.starts_with("dir") || a.1 == "link";
-            let b_is_dir = b.1.starts_with("dir") || b.1 == "link";
+            let a_is_dir = a.1.starts_with("dir");
+            let b_is_dir = b.1.starts_with("dir");
             if a_is_dir != b_is_dir {
                 b_is_dir.cmp(&a_is_dir)
             } else {
@@ -181,14 +190,18 @@ impl Tool for ListDirTool {
             .max()
             .unwrap_or(0);
         let mut result = format!("Listing {}:\n", path);
-        for (name, kind, size) in &entries[..shown] {
+        for (name, kind, size, link_target) in &entries[..shown] {
             let padded = format!("{:width$}", name, width = max_name);
             let size_str = if size.is_empty() {
                 String::new()
             } else {
                 format!("  {}", size)
             };
-            result.push_str(&format!("  [{}]  {}{}\n", kind, padded, size_str));
+            let target = link_target
+                .as_ref()
+                .map(|target| format!(" -> {target}"))
+                .unwrap_or_default();
+            result.push_str(&format!("  [{}]  {}{}{}\n", kind, padded, target, size_str));
         }
         if let Some(cap) = cap
             && total_entries > cap
@@ -242,6 +255,31 @@ mod tests {
             .unwrap();
 
         assert!(listing.contains("[link]  link.txt"), "{listing}");
+        assert!(listing.contains("-> target.txt"), "{listing}");
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn links_sort_with_files_after_directories() {
+        let temp = std::env::temp_dir().join(format!(
+            "mini-agent-list-dir-link-sort-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(temp.join("z-dir")).unwrap();
+        std::fs::write(temp.join("a-file"), "file").unwrap();
+        std::os::unix::fs::symlink("a-file", temp.join("b-link")).unwrap();
+
+        let listing = ListDirTool::new(None, None, None)
+            .with_workspace(&temp)
+            .call(ListDirArgs { path: None })
+            .await
+            .unwrap();
+        let dir = listing.find("z-dir").unwrap();
+        let file = listing.find("a-file").unwrap();
+        let link = listing.find("b-link").unwrap();
+
+        assert!(dir < file && file < link, "{listing}");
         std::fs::remove_dir_all(temp).unwrap();
     }
 

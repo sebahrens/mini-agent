@@ -239,6 +239,22 @@ fn worker_protocol_codec_round_trips_a_frame() {
 }
 
 #[test]
+fn run_step_round_trip_preserves_the_read_only_effect_profile() {
+    let expected = invoked(
+        2,
+        ParentFrame::RunStep(
+            RunStep::new("1 + 1".into()).with_model_effect_profile(ModelEffectProfile::ReadOnly),
+        ),
+    );
+    let actual: ParentWireFrame = read_frame(&mut Cursor::new(encode(&expected))).unwrap();
+    assert_eq!(actual, expected);
+    let ParentFrame::RunStep(step) = actual.message else {
+        panic!("expected run step");
+    };
+    assert_eq!(step.model_effect_profile, ModelEffectProfile::ReadOnly);
+}
+
+#[test]
 fn worker_protocol_rejects_same_version_with_a_different_build_fingerprint() {
     let parent_build =
         BuildIdentity::new(format!("{}+{}", env!("CARGO_PKG_VERSION"), "a".repeat(64))).unwrap();
@@ -937,7 +953,7 @@ fn worker_protocol_protocol_fault_closes_both_sides() {
 }
 
 #[test]
-fn worker_protocol_exception_metadata_is_closed_in_v4() {
+fn worker_protocol_exception_metadata_is_closed_in_v6() {
     let diagnostic = Diagnostic {
         class: DiagnosticClass::Exception,
         stage: DiagnosticStage::Evaluation,
@@ -955,6 +971,105 @@ fn worker_protocol_exception_metadata_is_closed_in_v4() {
         r#"{"class":"exception","stage":"evaluation","script_role":"model","exception_class":"EvalError","line":12,"column":7}"#,
     )
     .is_err());
+}
+
+#[test]
+fn worker_protocol_v6_effect_error_codes_are_closed_and_source_free() {
+    for (code, encoded) in [
+        (EffectErrorCode::NotFound, r#"{"code":"not_found"}"#),
+        (EffectErrorCode::IsDirectory, r#"{"code":"is_directory"}"#),
+        (EffectErrorCode::Denied, r#"{"code":"denied"}"#),
+        (EffectErrorCode::TooLarge, r#"{"code":"too_large"}"#),
+    ] {
+        let error = EffectError { code };
+        assert_eq!(serde_json::to_string(&error).unwrap(), encoded);
+        assert_eq!(serde_json::from_str::<EffectError>(encoded).unwrap(), error);
+    }
+    assert!(serde_json::from_str::<EffectError>(r#"{"code":"/secret/file"}"#).is_err());
+}
+
+#[test]
+fn worker_protocol_v7_discovery_operations_and_results_are_closed() {
+    let operation = EffectOperation::Grep {
+        path: "src".into(),
+        pattern: "needle".into(),
+        options: GrepOptions {
+            include: Some("**/*.rs".into()),
+            case_sensitive: false,
+        },
+    };
+    let encoded = serde_json::to_string(&operation).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"kind":"grep","data":{"path":"src","pattern":"needle","options":{"include":"**/*.rs","case_sensitive":false}}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<EffectOperation>(&encoded).unwrap(),
+        operation
+    );
+    assert!(
+        serde_json::from_str::<EffectOperation>(
+            r#"{"kind":"grep","data":{"path":"src","pattern":"x","options":{"include":null,"case_sensitive":true,"escape":"/secret"}}}"#,
+        )
+        .is_err()
+    );
+
+    let result = EffectResult::Grep {
+        matches: vec![GrepMatch {
+            path: "src/main.rs".into(),
+            line: 4,
+            text: "needle".into(),
+        }],
+        truncated: false,
+    };
+    let encoded = serde_json::to_string(&result).unwrap();
+    assert_eq!(
+        serde_json::from_str::<EffectResult>(&encoded).unwrap(),
+        result
+    );
+    assert!(
+        serde_json::from_str::<EffectResult>(
+            r#"{"kind":"grep","data":{"matches":[{"path":"src/main.rs","line":4,"text":"needle","content":"secret"}],"truncated":false}}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn worker_protocol_v8_read_files_operation_and_result_are_closed() {
+    let operation = EffectOperation::ReadFiles {
+        paths: vec!["first.txt".into(), "second.txt".into()],
+    };
+    let encoded = serde_json::to_string(&operation).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"kind":"read_files","data":{"paths":["first.txt","second.txt"]}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<EffectOperation>(&encoded).unwrap(),
+        operation
+    );
+    assert!(
+        serde_json::from_str::<EffectOperation>(
+            r#"{"kind":"read_files","data":{"paths":["first.txt"],"content":"secret"}}"#,
+        )
+        .is_err()
+    );
+
+    let result = EffectResult::ReadFiles {
+        contents: vec!["first".into(), "second".into()],
+    };
+    let encoded = serde_json::to_string(&result).unwrap();
+    assert_eq!(
+        serde_json::from_str::<EffectResult>(&encoded).unwrap(),
+        result
+    );
+    assert!(
+        serde_json::from_str::<EffectResult>(
+            r#"{"kind":"read_files","data":{"contents":["first"],"path":"secret"}}"#,
+        )
+        .is_err()
+    );
 }
 
 #[test]

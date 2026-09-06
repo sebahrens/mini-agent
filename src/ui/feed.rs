@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ops::Index;
 use std::sync::Arc;
 
 use compact_str::CompactString;
@@ -7,6 +9,12 @@ use crossterm::style::Color;
 use super::markdown::{markdown_to_styled, word_wrap};
 use super::renderer::LineEntry;
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
+
+const MAX_FEED_BLOCKS: usize = 4_096;
+const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+const RETAINED_BLOCK_BYTES: usize = MAX_BLOCK_BYTES / 2;
+const OMITTED_PREFIX: &str = "[earlier feed content omitted]\n\n";
 
 /// Semantic role of a conversation block in the feed.
 ///
@@ -77,6 +85,15 @@ pub struct Block {
     /// Memoized markdown layout. Interior mutability keeps `Feed::lines` a
     /// `&self` read; `Feed` mutators that rewrite block text invalidate it.
     md_cache: RefCell<Option<MdCache>>,
+    revision: u64,
+    render_cache: RefCell<Option<BlockRenderCache>>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockRenderCache {
+    width: usize,
+    revision: u64,
+    segments: Vec<Arc<Vec<LineEntry>>>,
 }
 
 /// Memoized markdown layout of an agent block's completed text at a width.
@@ -105,12 +122,80 @@ struct MdCache {
 
 impl Block {
     pub fn new(style: BlockStyle, text: impl Into<String>) -> Self {
+        let mut text = text.into();
+        compact_oversized_block(&mut text);
         Self {
             style,
-            text: text.into(),
+            text,
             running: false,
             md_cache: RefCell::new(None),
+            revision: 0,
+            render_cache: RefCell::new(None),
         }
+    }
+}
+
+/// Immutable, segmented visual rows. Indexing stays O(log blocks), while a
+/// feed mutation shares every unchanged block's row allocation.
+#[derive(Clone, Debug, Default)]
+pub struct FeedLines {
+    segments: Vec<Arc<Vec<LineEntry>>>,
+    starts: Vec<usize>,
+    len: usize,
+}
+
+impl FeedLines {
+    fn new(segments: Vec<Arc<Vec<LineEntry>>>) -> Self {
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut len = 0usize;
+        for segment in &segments {
+            starts.push(len);
+            len = len.saturating_add(segment.len());
+        }
+        Self {
+            segments,
+            starts,
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&LineEntry> {
+        if index >= self.len {
+            return None;
+        }
+        let segment = self.starts.partition_point(|start| *start <= index) - 1;
+        self.segments[segment].get(index - self.starts[segment])
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &LineEntry> {
+        self.segments.iter().flat_map(|segment| segment.iter())
+    }
+
+    pub(crate) fn with_segment(&self, segment: Arc<Vec<LineEntry>>) -> Self {
+        let mut segments = self.segments.clone();
+        segments.push(segment);
+        Self::new(segments)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn segment_ptrs_for_test(&self) -> Vec<*const Vec<LineEntry>> {
+        self.segments.iter().map(Arc::as_ptr).collect()
+    }
+}
+
+impl Index<usize> for FeedLines {
+    type Output = LineEntry;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("feed line index out of bounds")
     }
 }
 
@@ -118,7 +203,10 @@ impl Block {
 /// any width.
 #[derive(Clone, Debug, Default)]
 pub struct Feed {
-    blocks: Vec<Block>,
+    blocks: VecDeque<Block>,
+    total_bytes: usize,
+    pruned_blocks: u64,
+    retention_generation: u64,
     /// Bumped by every content mutation. The renderer compares generations to
     /// know whether the chat viewport needs a redraw, which also catches
     /// mutations made through `Renderer::feed_mut()`.
@@ -136,6 +224,10 @@ pub struct Feed {
     /// test-only proof that streaming achieves sub-quadratic parsing.
     #[cfg(test)]
     markdown_bytes_parsed: std::cell::Cell<usize>,
+    /// Number of per-block render cache misses; proves streaming invalidates
+    /// only the block receiving tokens.
+    #[cfg(test)]
+    block_renders: std::cell::Cell<usize>,
 }
 
 /// Memoized layout of the whole feed at a viewport width and generation.
@@ -143,19 +235,24 @@ pub struct Feed {
 struct LayoutCache {
     width: usize,
     generation: u64,
-    lines: Arc<Vec<LineEntry>>,
+    lines: Arc<FeedLines>,
 }
 
 impl Feed {
     pub fn new() -> Self {
         Self {
-            blocks: Vec::new(),
+            blocks: VecDeque::new(),
+            total_bytes: 0,
+            pruned_blocks: 0,
+            retention_generation: 0,
             generation: 0,
             layout_cache: RefCell::new(None),
             #[cfg(test)]
             layout_computes: std::cell::Cell::new(0),
             #[cfg(test)]
             markdown_bytes_parsed: std::cell::Cell::new(0),
+            #[cfg(test)]
+            block_renders: std::cell::Cell::new(0),
         }
     }
 
@@ -167,6 +264,9 @@ impl Feed {
     pub fn clear(&mut self) {
         self.generation += 1;
         self.blocks.clear();
+        self.total_bytes = 0;
+        self.pruned_blocks = 0;
+        self.retention_generation = self.retention_generation.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -178,9 +278,16 @@ impl Feed {
         self.blocks.len()
     }
 
+    pub(crate) fn retention_generation(&self) -> u64 {
+        self.retention_generation
+    }
+
     pub fn push_block(&mut self, style: BlockStyle, text: impl Into<String>) {
         self.generation += 1;
-        self.blocks.push(Block::new(style, text));
+        let block = Block::new(style, text);
+        self.total_bytes = self.total_bytes.saturating_add(block.text.len());
+        self.blocks.push_back(block);
+        self.prune_completed_prefix();
     }
 
     /// Push an empty block that a producer will append to incrementally
@@ -189,10 +296,11 @@ impl Feed {
     /// as plain text. Call `finalize_block` (or `finalize_last`) when the
     /// stream ends.
     pub fn push_streaming_block(&mut self, style: BlockStyle) {
+        self.prune_completed_prefix();
         self.generation += 1;
         let mut block = Block::new(style, "");
         block.running = true;
-        self.blocks.push(block);
+        self.blocks.push_back(block);
     }
 
     /// Mark the last block as complete: its full text (including the former
@@ -217,7 +325,9 @@ impl Feed {
             block.running = false;
             // Force one full re-parse now that the text is complete.
             *block.md_cache.borrow_mut() = None;
+            *block.render_cache.borrow_mut() = None;
         }
+        self.prune_completed_prefix();
     }
 
     /// True when the block at `idx` exists and is still being streamed into.
@@ -251,7 +361,20 @@ impl Feed {
     pub fn append_to(&mut self, idx: usize, text: impl AsRef<str>) -> bool {
         if let Some(block) = self.blocks.get_mut(idx) {
             self.generation += 1;
+            let old_len = block.text.len();
             block.text.push_str(text.as_ref());
+            let compacted = compact_oversized_block(&mut block.text);
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(old_len)
+                .saturating_add(block.text.len());
+            block.revision = block.revision.wrapping_add(1);
+            *block.render_cache.borrow_mut() = None;
+            if compacted {
+                *block.md_cache.borrow_mut() = None;
+                self.retention_generation = self.retention_generation.wrapping_add(1);
+            }
+            self.prune_completed_prefix();
             true
         } else {
             false
@@ -262,19 +385,33 @@ impl Feed {
     #[cfg(test)]
     pub fn replace_last(&mut self, style: BlockStyle, text: impl Into<String>) {
         self.generation += 1;
-        if let Some(last) = self.blocks.last_mut() {
+        if let Some(last) = self.blocks.back_mut() {
+            self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
             last.style = style;
             last.text = text.into();
+            compact_oversized_block(&mut last.text);
+            self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
+            last.revision = last.revision.wrapping_add(1);
             *last.md_cache.borrow_mut() = None;
+            *last.render_cache.borrow_mut() = None;
         } else {
-            self.blocks.push(Block::new(style, text));
+            let block = Block::new(style, text);
+            self.total_bytes = block.text.len();
+            self.blocks.push_back(block);
         }
+        self.prune_completed_prefix();
     }
 
     #[cfg(test)]
     pub fn truncate_blocks(&mut self, len: usize) {
         self.generation += 1;
+        self.total_bytes = self
+            .blocks
+            .iter()
+            .take(len)
+            .map(|block| block.text.len())
+            .sum();
         self.blocks.truncate(len);
     }
 
@@ -291,7 +428,7 @@ impl Feed {
     /// generation)`, so scroll and selection queries (`line_count`,
     /// `visible_range`, `line_at_visual_row`, `selected_text`) operate on the
     /// cached visual rows instead of re-laying out the feed on every call.
-    pub fn lines(&self, width: usize) -> Arc<Vec<LineEntry>> {
+    pub fn lines(&self, width: usize) -> Arc<FeedLines> {
         {
             let cache = self.layout_cache.borrow();
             if let Some(c) = cache.as_ref()
@@ -324,34 +461,27 @@ impl Feed {
         self.markdown_bytes_parsed.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn block_renders(&self) -> usize {
+        self.block_renders.get()
+    }
+
     /// Lay out every block at `width`. Called by `lines` on a cache miss.
-    fn compute_lines(&self, width: usize) -> Vec<LineEntry> {
-        let mut result = Vec::new();
-        for block in &self.blocks {
-            match block.style {
-                BlockStyle::Agent => {
-                    let styled = agent_block_lines(self, block, width);
-                    result.extend(styled.iter().cloned());
-                }
-                _ => {
-                    let color = block.style.color();
-                    for line in block.text.split('\n') {
-                        let trimmed = line.trim_end_matches('\r');
-                        if trimmed.is_empty() {
-                            result.push(LineEntry {
-                                text: CompactString::new(""),
-                                color,
-                            });
-                        } else {
-                            for chunk in word_wrap(trimmed, width) {
-                                result.push(LineEntry { text: chunk, color });
-                            }
-                        }
-                    }
-                }
-            }
+    fn compute_lines(&self, width: usize) -> FeedLines {
+        let mut segments = Vec::new();
+        if self.pruned_blocks > 0 {
+            segments.push(Arc::new(plain_block_lines(
+                &Block::new(
+                    BlockStyle::System,
+                    format!("[{} earlier feed blocks omitted]", self.pruned_blocks),
+                ),
+                width,
+            )));
         }
-        result
+        for block in &self.blocks {
+            segments.extend(block_segments(self, block, width));
+        }
+        FeedLines::new(segments)
     }
 
     /// Total number of visible rows for the given width.
@@ -457,6 +587,108 @@ impl Feed {
             Some(result)
         }
     }
+
+    fn prune_completed_prefix(&mut self) {
+        let mut removed = false;
+        while self.blocks.len() > 1
+            && (self.blocks.len() > MAX_FEED_BLOCKS || self.total_bytes > MAX_FEED_BYTES)
+        {
+            let running = self.blocks.iter().position(|block| block.running);
+            let block = if let Some(running) = running {
+                // Never shift a live block's externally tracked index. Shed
+                // the oldest completed block appended after it; the completed
+                // prefix is compacted as soon as the stream finalizes.
+                self.blocks
+                    .iter()
+                    .enumerate()
+                    .skip(running + 1)
+                    .find_map(|(index, block)| (!block.running).then_some(index))
+                    .and_then(|index| self.blocks.remove(index))
+            } else {
+                self.blocks.pop_front()
+            };
+            if let Some(block) = block {
+                self.total_bytes = self.total_bytes.saturating_sub(block.text.len());
+                self.pruned_blocks = self.pruned_blocks.saturating_add(1);
+                removed = true;
+            } else {
+                break;
+            }
+        }
+        if removed {
+            self.generation = self.generation.wrapping_add(1);
+            self.retention_generation = self.retention_generation.wrapping_add(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retention_limits_for_test() -> (usize, usize, usize) {
+        (MAX_FEED_BLOCKS, MAX_FEED_BYTES, MAX_BLOCK_BYTES)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_bytes_for_test(&self) -> usize {
+        self.total_bytes
+    }
+}
+
+fn compact_oversized_block(text: &mut String) -> bool {
+    if text.len() <= MAX_BLOCK_BYTES {
+        return false;
+    }
+    let mut start = text.len().saturating_sub(RETAINED_BLOCK_BYTES);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let suffix = text[start..].to_string();
+    text.clear();
+    text.push_str(OMITTED_PREFIX);
+    text.push_str(&suffix);
+    true
+}
+
+fn block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
+    {
+        let cache = block.render_cache.borrow();
+        if let Some(cache) = cache.as_ref()
+            && cache.width == width
+            && cache.revision == block.revision
+        {
+            return cache.segments.clone();
+        }
+    }
+
+    #[cfg(test)]
+    feed.block_renders.set(feed.block_renders.get() + 1);
+    let segments = match block.style {
+        BlockStyle::Agent => agent_block_segments(feed, block, width),
+        _ => vec![Arc::new(plain_block_lines(block, width))],
+    };
+    *block.render_cache.borrow_mut() = Some(BlockRenderCache {
+        width,
+        revision: block.revision,
+        segments: segments.clone(),
+    });
+    segments
+}
+
+fn plain_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
+    let mut result = Vec::new();
+    let color = block.style.color();
+    for line in block.text.split('\n') {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            result.push(LineEntry {
+                text: CompactString::new(""),
+                color,
+            });
+        } else {
+            for chunk in word_wrap(trimmed, width) {
+                result.push(LineEntry { text: chunk, color });
+            }
+        }
+    }
+    result
 }
 
 /// Find the byte offset of the last finalized markdown block boundary.
@@ -587,8 +819,22 @@ fn contains_global_markdown_definition(text: &str) -> bool {
     })
 }
 
-/// Lay out an agent block: markdown for completed lines, plain text for the
-/// unfinished tail line of a still-streaming block.
+/// Lay out an agent block as shared completed-markdown and ephemeral tail
+/// segments. Appending a token to the tail never clones completed rows.
+fn agent_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
+    let completed = agent_completed_lines(feed, block, width);
+    let mut segments = Vec::with_capacity(2);
+    if !completed.is_empty() {
+        segments.push(completed);
+    }
+    let tail = agent_tail_lines(block, width, segments.is_empty());
+    if !tail.is_empty() {
+        segments.push(Arc::new(tail));
+    }
+    segments
+}
+
+/// Lay out the completed portion of an agent block as markdown.
 ///
 /// The markdown parse of the completed prefix is memoized in the block's
 /// `MdCache`. To avoid O(n^2) re-parsing during streaming, the cache tracks
@@ -596,7 +842,7 @@ fn contains_global_markdown_definition(text: &str) -> bool {
 /// When completed_len extends within the same stable boundary, only the new
 /// portion (stable_len..completed_len) is re-parsed and appended. Mutators
 /// that rewrite text (`replace_last`, `finalize_last`) clear the cache explicitly.
-fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEntry>> {
+fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEntry>> {
     // Text parsed as markdown: the whole block once finalized, or only the
     // completed lines (up to the last newline) while streaming.
     let completed_len = if block.running {
@@ -611,12 +857,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
     // Try an exact cache hit before scanning markdown boundaries. Appending an
     // unfinished tail leaves completed_len unchanged and needs no markdown work.
     if let Some(cached) = cached_agent_lines(block, width, completed_len) {
-        let mut lines = cached;
-        if block.running && completed_len < block.text.len() {
-            append_agent_tail(Arc::make_mut(&mut lines), block, completed_len, width);
-            prefix_agent_first_line(Arc::make_mut(&mut lines).as_mut_slice());
-        }
-        return lines;
+        return cached;
     }
 
     // Mutators that can replace text clear md_cache, so a same-width cache
@@ -671,12 +912,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
             lines: Arc::clone(&cached_lines),
         });
 
-        let mut rendered = cached_lines;
-        if block.running && completed_len < block.text.len() {
-            append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
-            prefix_agent_first_line(Arc::make_mut(&mut rendered).as_mut_slice());
-        }
-        return rendered;
+        return cached_lines;
     }
 
     // Full re-parse: need to establish a new stable boundary or handle width change.
@@ -705,12 +941,7 @@ fn agent_block_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEn
         lines: Arc::clone(&cached_lines),
     });
 
-    let mut rendered = cached_lines;
-    if block.running && completed_len < block.text.len() {
-        append_agent_tail(Arc::make_mut(&mut rendered), block, completed_len, width);
-        prefix_agent_first_line(Arc::make_mut(&mut rendered).as_mut_slice());
-    }
-    rendered
+    cached_lines
 }
 
 fn prefix_agent_first_line(lines: &mut [LineEntry]) {
@@ -730,21 +961,24 @@ fn parse_agent_markdown(feed: &Feed, text: &str, width: usize) -> Vec<LineEntry>
     markdown_to_styled(text, width)
 }
 
-fn append_agent_tail(
-    lines: &mut Vec<LineEntry>,
-    block: &Block,
-    completed_len: usize,
-    width: usize,
-) {
-    if block.running && completed_len < block.text.len() {
-        let tail = block.text[completed_len..].trim_end_matches('\r');
-        if !tail.is_empty() {
-            let color = BlockStyle::Agent.color();
-            for chunk in word_wrap(tail, width) {
-                lines.push(LineEntry { text: chunk, color });
-            }
-        }
+fn agent_tail_lines(block: &Block, width: usize, needs_prefix: bool) -> Vec<LineEntry> {
+    if !block.running {
+        return Vec::new();
     }
+    let completed_len = block.text.rfind('\n').map_or(0, |idx| idx + 1);
+    let tail = block.text[completed_len..].trim_end_matches('\r');
+    if tail.is_empty() {
+        return Vec::new();
+    }
+    let color = BlockStyle::Agent.color();
+    let mut lines = word_wrap(tail, width)
+        .into_iter()
+        .map(|text| LineEntry { text, color })
+        .collect::<Vec<_>>();
+    if needs_prefix {
+        prefix_agent_first_line(&mut lines);
+    }
+    lines
 }
 
 /// Return the memoized markdown layout when it matches `(width, stable_len, parsed_len)`.

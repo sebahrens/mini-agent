@@ -779,7 +779,7 @@ async fn proposal_host_wiring_enforces_session_budget() {
         .await
         .expect("structured JS error");
     assert!(
-        exhausted.starts_with("JS TypeError at ")
+        exhausted.starts_with("JS exception at ")
             && exhausted.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {exhausted}"
     );
@@ -812,7 +812,7 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
             .await
             .expect("structured validation error");
         assert!(
-            output.starts_with("JS TypeError at ")
+            output.starts_with("JS exception at ")
                 && output.ends_with("(stage: evaluation; script: model)"),
             "unexpected: {output}"
         );
@@ -824,7 +824,7 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
         .await
         .expect("structured budget error");
     assert!(
-        exhausted.starts_with("JS TypeError at ")
+        exhausted.starts_with("JS exception at ")
             && exhausted.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {exhausted}"
     );

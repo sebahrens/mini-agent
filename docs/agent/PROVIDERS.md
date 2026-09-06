@@ -30,6 +30,14 @@ The model is set with `--model` or `ZS_MODEL`:
 mini-agent --provider openai --model gpt-4o
 ```
 
+When a built-in provider is selected without an explicit model, zerostack uses
+these catalogued defaults: `claude-sonnet-5` for Anthropic, `gpt-5.5` for
+OpenAI, and `gemini-3.7-flash` for Gemini/Google. Direct-provider entries in the
+embedded catalog always include positive input and output prices; the refresh
+script omits entries whose upstream pricing is absent so the status line never
+silently treats a paid model as free. OpenRouter continues to refresh its
+marketplace pricing at runtime.
+
 ## Provider Recipes
 
 - [MiniMax](../providers/Minimax.md)
@@ -144,7 +152,7 @@ For these providers, zerostack passes through to rig without additional configur
 These providers require `cache_control` markers; zerostack adds them via rig's `.with_prompt_caching()`:
 
 - **Anthropic (direct API)** — marks system prompt, the final tool definition, and the last message. All three breakpoints contribute to cumulative savings as the conversation grows.
-- **Claude via OpenRouter** — marks the system prompt only. Anthropic's caching is prefix-based, so the tools array in front of the system block is also captured. For `anthropic/*` model IDs, zerostack also pins `provider.order = ["Anthropic"]` with `allow_fallbacks: true`, because Bedrock and Vertex AI silently drop `cache_control` markers.
+- **Claude via OpenRouter** — marks both the system prompt and the last user/tool message. The latter advances the cache boundary as the conversation grows, so prior turns and tool results are reused instead of re-billed. For `anthropic/*` model IDs, zerostack also pins `provider.order = ["Anthropic"]` with `allow_fallbacks: true`, because Bedrock and Vertex AI silently drop `cache_control` markers.
 
 ### Empirical impact
 
@@ -158,15 +166,11 @@ Measured on Sonnet 4.6, second turn of a tool-heavy session (grep + read across 
 
 Projected monthly cost at 50 such turns per working day: $204 (baseline) → $26 (Anthropic direct) or $29 (OpenRouter Claude). The two cached paths are within ~$3/month of each other.
 
-### Known limitation: OpenRouter does not mark the last message
-
-As of rig 0.38, OpenRouter's `apply_prompt_caching` marks the system message only. The Anthropic provider also marks the last message, which means accumulated tool results from earlier turns continue to be cached as the conversation grows; OpenRouter does not mark this position.
-
-On tool-heavy workloads this manifests as ~2,676 tokens running at full input rate on OpenRouter vs ~4 tokens on Anthropic direct, a gap of ~8% per turn. The bulk of savings comes from caching the system prompt and tools — both paths capture that.
-
-This is an upstream rig limitation, not zerostack-specific.
-
-**Recommendation:** if you happen to have both API keys, Anthropic direct is marginally cheaper. If you don't, OpenRouter Claude with caching captures most of the savings.
+Rig 0.40 marks the OpenRouter system block but not the conversation tail. For
+`anthropic/*` models, zerostack also sends OpenRouter's top-level
+`cache_control = { type = "ephemeral" }`; OpenRouter then advances the boundary
+to the last cacheable block on both streaming and non-streaming requests. Other
+OpenRouter models keep their provider-native caching behavior.
 
 ## CLI Flags
 

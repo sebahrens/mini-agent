@@ -55,6 +55,7 @@ pub(crate) enum HostCapability {
     WriteFile,
     Fetch,
     Spawn,
+    SessionState,
     ProposeSkill,
 }
 
@@ -65,14 +66,22 @@ impl HostCapability {
             Self::WriteFile,
             Self::Fetch,
             Self::Spawn,
+            Self::SessionState,
             Self::ProposeSkill,
         ])
     }
 
     fn for_operation(operation: &EffectOperation) -> Self {
         match operation {
-            EffectOperation::ReadFile { .. } => Self::ReadFile,
+            EffectOperation::ReadFile { .. }
+            | EffectOperation::ReadFiles { .. }
+            | EffectOperation::ListDir { .. }
+            | EffectOperation::Glob { .. }
+            | EffectOperation::Grep { .. } => Self::ReadFile,
             EffectOperation::WriteFile { .. } => Self::WriteFile,
+            EffectOperation::Result { .. }
+            | EffectOperation::ScratchPut { .. }
+            | EffectOperation::ScratchGet { .. } => Self::SessionState,
             EffectOperation::Fetch { .. } => Self::Fetch,
             EffectOperation::Spawn { .. } => Self::Spawn,
             EffectOperation::ProposeSkill { .. } => Self::ProposeSkill,
@@ -576,7 +585,9 @@ impl InvocationGrant {
             HostCapability::WriteFile => SkillHostCapability::WriteFile,
             HostCapability::Fetch => SkillHostCapability::Fetch,
             HostCapability::Spawn => SkillHostCapability::Spawn,
-            HostCapability::ProposeSkill => return Err(BrokerBuildError::InvalidManifest),
+            HostCapability::SessionState | HostCapability::ProposeSkill => {
+                return Err(BrokerBuildError::InvalidManifest);
+            }
         };
         if !prepared.manifest.allows(declared) {
             return Err(BrokerBuildError::InvalidManifest);
@@ -723,6 +734,10 @@ pub(crate) enum HostEffectError {
     ManifestDenied,
     #[error("operation target is invalid")]
     InvalidTarget,
+    #[error("operation target was not found")]
+    NotFound,
+    #[error("operation target is a directory")]
+    IsDirectory,
     #[error("operation target is outside the allowed scope")]
     TargetDenied,
     #[error("permission policy denies the operation")]
@@ -744,10 +759,13 @@ pub(crate) enum HostEffectError {
 impl HostEffectError {
     fn wire_code(self) -> EffectErrorCode {
         match self {
-            Self::InvalidTarget | Self::TargetDenied => EffectErrorCode::InvalidTarget,
+            Self::InvalidTarget => EffectErrorCode::InvalidTarget,
+            Self::NotFound => EffectErrorCode::NotFound,
+            Self::IsDirectory => EffectErrorCode::IsDirectory,
+            Self::TargetDenied => EffectErrorCode::Denied,
             Self::InvocationCancelled => EffectErrorCode::Cancelled,
             Self::AskTimedOut | Self::EffectTimedOut => EffectErrorCode::TimedOut,
-            Self::OutputLimit => EffectErrorCode::OutputLimit,
+            Self::OutputLimit => EffectErrorCode::TooLarge,
             Self::BackendFailure => EffectErrorCode::BackendFailure,
             Self::AuditFailure => EffectErrorCode::AuditFailure,
             Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
@@ -784,6 +802,8 @@ impl From<EffectServiceError> for HostEffectError {
             | EffectServiceError::FinalSymlink
             | EffectServiceError::TargetChanged
             | EffectServiceError::InvalidBody => Self::InvalidTarget,
+            EffectServiceError::NotFound => Self::NotFound,
+            EffectServiceError::IsDirectory => Self::IsDirectory,
             EffectServiceError::TargetDenied
             | EffectServiceError::FileNoConfiguredRoots
             | EffectServiceError::FileInvalidConfiguration
@@ -817,6 +837,9 @@ pub(crate) enum AuthorizedTarget {
     ReadFile {
         canonical_path: String,
     },
+    ReadFiles {
+        canonical_paths: Vec<String>,
+    },
     WriteFile {
         canonical_path: String,
     },
@@ -827,6 +850,11 @@ pub(crate) enum AuthorizedTarget {
     Spawn {
         resolved_executable: String,
     },
+    SessionState {
+        operation: &'static str,
+        key: Option<String>,
+        encoded_bytes: usize,
+    },
     ProposeSkill,
 }
 
@@ -835,6 +863,9 @@ pub(crate) enum AuthorizedTarget {
 pub(crate) enum NormalizedTarget {
     ReadFile {
         workspace_relative: Option<String>,
+    },
+    ReadFiles {
+        workspace_relative: Vec<Option<String>>,
     },
     WriteFile {
         workspace_relative: Option<String>,
@@ -847,6 +878,7 @@ pub(crate) enum NormalizedTarget {
         program: String,
         resolved_executable: SpawnExecutableIdentity,
     },
+    SessionState,
     ProposeSkill,
 }
 
@@ -961,6 +993,7 @@ pub(crate) struct InvocationBroker<S> {
     /// dropping an uncooperative service future so cancellation can append a truthful unknown
     /// completion before authority is erased.
     in_flight_effect: Option<String>,
+    structured_result_receipt: super::session::StructuredResultReceipt,
     #[cfg(feature = "skills")]
     skill_calls: Option<SkillCallAuthority>,
     #[cfg(feature = "skills")]
@@ -994,6 +1027,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             service,
             audit,
             in_flight_effect: None,
+            structured_result_receipt: super::session::StructuredResultReceipt::default(),
             #[cfg(feature = "skills")]
             skill_calls: None,
             #[cfg(feature = "skills")]
@@ -1003,6 +1037,14 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             #[cfg(test)]
             fail_completion_durability: None,
         })
+    }
+
+    pub(crate) fn with_structured_result_receipt(
+        mut self,
+        receipt: super::session::StructuredResultReceipt,
+    ) -> Self {
+        self.structured_result_receipt = receipt;
+        self
     }
 
     #[cfg(feature = "skills")]
@@ -1235,6 +1277,15 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         self.in_flight_effect = None;
         if matches!(execution_result, Err(HostEffectError::InvocationCancelled)) {
             self.cancel_invocation();
+        } else if let (EffectOperation::Result { .. }, Ok(EffectResult::ResultAccepted { json })) =
+            (&request.operation, &execution_result)
+        {
+            let receipt_result = self
+                .structured_result_receipt
+                .record(json.clone())
+                .map_err(|_| HostEffectError::BackendFailure);
+            self.finish();
+            receipt_result?;
         }
         execution_result
     }
@@ -1264,8 +1315,10 @@ impl<S: ParentEffectService> InvocationBroker<S> {
             return Err(HostEffectError::AttributionMismatch);
         }
         if !grant.allowed.contains(&capability)
-            || (capability == HostCapability::ProposeSkill
-                && matches!(grant.principal, GrantPrincipal::Skill { .. }))
+            || (matches!(
+                capability,
+                HostCapability::ProposeSkill | HostCapability::SessionState
+            ) && matches!(grant.principal, GrantPrincipal::Skill { .. }))
         {
             return Err(HostEffectError::CapabilityDenied);
         }
@@ -1536,6 +1589,16 @@ fn enforce_manifest_scope(
                 .is_some_and(|target| path_scope_contains(prefix, target))
         }),
         (
+            Some(CapabilityScope::ReadFile { workspace_prefixes }),
+            NormalizedTarget::ReadFiles { workspace_relative },
+        ) => workspace_relative.iter().all(|target| {
+            workspace_prefixes.iter().any(|prefix| {
+                target
+                    .as_deref()
+                    .is_some_and(|target| path_scope_contains(prefix, target))
+            })
+        }),
+        (
             Some(CapabilityScope::Fetch { origins, methods }),
             NormalizedTarget::Fetch { origin, method },
         ) => {
@@ -1578,7 +1641,9 @@ fn skill_capability(capability: HostCapability) -> SkillHostCapability {
         HostCapability::WriteFile => SkillHostCapability::WriteFile,
         HostCapability::Fetch => SkillHostCapability::Fetch,
         HostCapability::Spawn => SkillHostCapability::Spawn,
-        HostCapability::ProposeSkill => unreachable!("skills cannot receive proposal grants"),
+        HostCapability::SessionState | HostCapability::ProposeSkill => {
+            unreachable!("skills cannot receive model-only grants")
+        }
     }
 }
 
@@ -1710,9 +1775,8 @@ fn executable_copy_service_error(error: ExecutableCopyError) -> EffectServiceErr
     match error {
         ExecutableCopyError::Cancelled => EffectServiceError::Cancelled,
         ExecutableCopyError::TimedOut => EffectServiceError::TimedOut,
-        ExecutableCopyError::Read | ExecutableCopyError::Write | ExecutableCopyError::TooLarge => {
-            EffectServiceError::InvalidTarget
-        }
+        ExecutableCopyError::TooLarge => EffectServiceError::OutputLimit,
+        ExecutableCopyError::Read | ExecutableCopyError::Write => EffectServiceError::InvalidTarget,
     }
 }
 
@@ -1779,6 +1843,9 @@ fn sanitize_target(
         (HostCapability::ReadFile, AuthorizedTarget::ReadFile { canonical_path }) => {
             Ok(audit.file_target(&canonical_path))
         }
+        (HostCapability::ReadFile, AuthorizedTarget::ReadFiles { canonical_paths }) => {
+            Ok(audit.read_files_target(&canonical_paths))
+        }
         (HostCapability::WriteFile, AuthorizedTarget::WriteFile { canonical_path }) => {
             Ok(audit.write_file_target(&canonical_path))
         }
@@ -1800,6 +1867,14 @@ fn sanitize_target(
         (HostCapability::ProposeSkill, AuthorizedTarget::ProposeSkill) => {
             Ok(audit.proposal_target())
         }
+        (
+            HostCapability::SessionState,
+            AuthorizedTarget::SessionState {
+                operation,
+                key,
+                encoded_bytes,
+            },
+        ) => Ok(audit.session_state_target(operation, key.as_deref(), encoded_bytes)),
         _ => Err(HostEffectError::AuditFailure),
     }
 }
@@ -1810,6 +1885,7 @@ fn audit_capability(capability: HostCapability) -> AuditCapability {
         HostCapability::WriteFile => AuditCapability::WriteFile,
         HostCapability::Fetch => AuditCapability::Fetch,
         HostCapability::Spawn => AuditCapability::Spawn,
+        HostCapability::SessionState => AuditCapability::SessionState,
         HostCapability::ProposeSkill => AuditCapability::ProposeSkill,
     }
 }
@@ -1832,14 +1908,16 @@ fn audit_result_code(result: &Result<EffectResult, HostEffectError>) -> AuditRes
         Ok(EffectResult::Error(error)) => match error.code {
             EffectErrorCode::Cancelled => AuditResultCode::Cancelled,
             EffectErrorCode::TimedOut => AuditResultCode::TimedOut,
-            EffectErrorCode::OutputLimit => AuditResultCode::OutputLimit,
+            EffectErrorCode::TooLarge => AuditResultCode::OutputLimit,
             EffectErrorCode::OutcomeUnknown => AuditResultCode::OutcomeUnknown,
             EffectErrorCode::BackendFailure | EffectErrorCode::AuditFailure => {
                 AuditResultCode::BackendFailure
             }
             EffectErrorCode::Denied
             | EffectErrorCode::CapabilityDenied
-            | EffectErrorCode::InvalidTarget => AuditResultCode::Denied,
+            | EffectErrorCode::InvalidTarget
+            | EffectErrorCode::NotFound
+            | EffectErrorCode::IsDirectory => AuditResultCode::Denied,
         },
         Ok(_) => AuditResultCode::Succeeded,
         Err(HostEffectError::InvocationCancelled) => AuditResultCode::Cancelled,
@@ -1935,6 +2013,46 @@ fn attribution_matches(principal: &GrantPrincipal, advisory: &AdvisoryAttributio
         } => {
             advisory.artifact_id.as_deref() == Some(artifact_id.as_str())
                 && advisory.export.as_deref() == Some(export.as_str())
+        }
+    }
+}
+
+#[cfg(test)]
+mod closed_effect_error_tests {
+    use super::*;
+
+    #[test]
+    fn service_failures_keep_actionable_closed_wire_codes() {
+        for (service, host, wire) in [
+            (
+                EffectServiceError::NotFound,
+                HostEffectError::NotFound,
+                EffectErrorCode::NotFound,
+            ),
+            (
+                EffectServiceError::IsDirectory,
+                HostEffectError::IsDirectory,
+                EffectErrorCode::IsDirectory,
+            ),
+            (
+                EffectServiceError::TargetDenied,
+                HostEffectError::TargetDenied,
+                EffectErrorCode::Denied,
+            ),
+            (
+                EffectServiceError::OutputLimit,
+                HostEffectError::OutputLimit,
+                EffectErrorCode::TooLarge,
+            ),
+            (
+                EffectServiceError::BodyLimit,
+                HostEffectError::OutputLimit,
+                EffectErrorCode::TooLarge,
+            ),
+        ] {
+            let mapped = HostEffectError::from(service);
+            assert_eq!(mapped, host);
+            assert_eq!(mapped.wire_code(), wire);
         }
     }
 }

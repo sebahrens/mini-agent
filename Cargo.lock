@@ -2925,6 +2925,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "futures",
+ "globset",
  "hnsw_rs",
  "http",
  "ignore",

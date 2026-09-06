@@ -180,6 +180,7 @@ fn charge_usage_delta_updates_persisted_token_cache_and_cost_totals_together() {
     assert_eq!(session.total_output_tokens, 25);
     assert_eq!(session.total_cached_input_tokens, 700);
     assert_eq!(session.total_cache_creation_input_tokens, 80);
+    assert_eq!(session.total_real_input_tokens, 880);
     let billable_input = crate::pricing::billable_input_tokens(true, 100, 700, 80);
     let expected = crate::pricing::estimate_cost(billable_input, 25, 2.0, 10.0);
     assert!((session.total_cost - expected).abs() < f64::EPSILON);
@@ -208,6 +209,7 @@ fn charge_usage_delta_is_additive_without_hidden_terminal_charge() {
 
     assert_eq!(session.total_input_tokens, 30);
     assert_eq!(session.total_output_tokens, 6);
+    assert_eq!(session.total_real_input_tokens, 30);
     assert_eq!(
         session.total_cost,
         crate::pricing::estimate_cost(30, 6, 1.0, 2.0)
@@ -221,6 +223,7 @@ fn charge_usage_delta_saturates_persisted_token_totals() {
     session.total_output_tokens = u64::MAX - 1;
     session.total_cached_input_tokens = u64::MAX - 1;
     session.total_cache_creation_input_tokens = u64::MAX - 1;
+    session.total_real_input_tokens = u64::MAX - 1;
 
     session.charge_usage_delta(
         crate::event::UsageDelta {
@@ -237,6 +240,7 @@ fn charge_usage_delta_saturates_persisted_token_totals() {
     assert_eq!(session.total_output_tokens, u64::MAX);
     assert_eq!(session.total_cached_input_tokens, u64::MAX);
     assert_eq!(session.total_cache_creation_input_tokens, u64::MAX);
+    assert_eq!(session.total_real_input_tokens, u64::MAX);
 }
 
 // Helper: a session with `n` ASCII messages of `len` chars each, so every
@@ -280,6 +284,23 @@ fn compaction_cut_zero_keep_recent_summarizes_all() {
 fn compaction_cut_single_message_is_kept() {
     let s = session_with_messages(1, 40);
     assert_eq!(Session::select_compaction_cut(&s.messages, 5), 0);
+}
+
+#[test]
+fn compaction_cut_never_orphans_a_tool_result() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.add_message(MessageRole::User, "question");
+    session.add_message(MessageRole::Assistant, "I will inspect it");
+    session.add_tool_call("read", &serde_json::json!({"path": "large"}));
+    session.add_tool_result("read", &"x".repeat(500));
+    session.add_message(MessageRole::Assistant, "answer");
+
+    let cut = Session::select_compaction_cut(&session.messages, 45);
+    assert!(matches!(
+        session.messages[cut].role,
+        MessageRole::User | MessageRole::Assistant
+    ));
+    assert_ne!(session.messages[cut].role, MessageRole::ToolResult);
 }
 
 #[test]
@@ -496,6 +517,23 @@ fn detect_git_branch_outside_repo_is_none() {
     assert!(Session::detect_git_branch(p.to_str().unwrap()).is_none());
 }
 
+#[tokio::test]
+async fn detect_git_status_uses_the_bounded_async_runner() {
+    let status = Session::detect_git_status(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+    assert!(status.is_some(), "repository status should be available");
+}
+
+#[tokio::test]
+async fn detect_git_status_outside_repo_is_none() {
+    let directory = std::env::temp_dir().join(format!(
+        "mini-agent-git-status-non-repo-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    assert!(Session::detect_git_status(&directory).await.is_none());
+    std::fs::remove_dir(directory).unwrap();
+}
+
 #[test]
 fn parse_porcelain_counts_changes_and_sync() {
     let out = "\
@@ -571,6 +609,78 @@ fn redo_restores_the_messages_a_rewind_removed() {
 }
 
 #[test]
+fn persisted_rewind_stores_only_the_removed_tail() {
+    let mut session = session_with_messages(100, 2_000);
+    let original_bytes = serde_json::to_vec(&session).unwrap().len();
+
+    assert_eq!(session.rewind_to(90), 10);
+    let rewound_bytes = serde_json::to_vec(&session).unwrap().len();
+
+    assert!(
+        rewound_bytes < original_bytes + original_bytes / 4,
+        "redo state unexpectedly duplicated the retained prefix: {rewound_bytes} vs {original_bytes}"
+    );
+    assert!(session.redo());
+    assert_eq!(session.messages.len(), 100);
+}
+
+#[test]
+fn history_mutations_reset_repeated_read_tracking() {
+    let mut session = Session::new("openai", "gpt-4", 128_000, "");
+    session.initialize_read_tracker(true);
+    session.add_message(MessageRole::User, "first");
+    session.add_message(MessageRole::Assistant, "reply");
+
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_none()
+    );
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_some()
+    );
+    session.compress("summary".to_string(), 1, 1);
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_none()
+    );
+
+    session.add_message(MessageRole::User, "second");
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_some()
+    );
+    session.rewind_to(1);
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_none()
+    );
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_some()
+    );
+    assert!(session.redo());
+    assert!(
+        session
+            .read_tracker
+            .track_read("src/lib.rs", 0, 50)
+            .is_none()
+    );
+}
+
+#[test]
 fn adding_a_message_invalidates_the_redo_point() {
     let mut s = Session::new("openai", "gpt-4", 128000, "");
     s.add_message(MessageRole::User, "first");
@@ -583,4 +693,33 @@ fn adding_a_message_invalidates_the_redo_point() {
     s.add_message(MessageRole::User, "a fresh direction");
     assert!(s.rewind_undo.is_none());
     assert!(!s.redo());
+}
+
+#[cfg(feature = "js")]
+#[test]
+fn javascript_scratch_is_process_local_and_never_serialized_with_a_session() {
+    let session = Session::new("openai", "gpt-4", 128_000, "scratch-persistence");
+    let scratch = session
+        .js_session_state
+        .for_workspace(std::path::Path::new("/workspace"));
+    scratch
+        .put(
+            "private:key".into(),
+            "{\"secret\":\"not-persisted\"}".into(),
+        )
+        .unwrap();
+
+    let encoded = serde_json::to_string(&session).unwrap();
+    assert!(!encoded.contains("private:key"));
+    assert!(!encoded.contains("not-persisted"));
+
+    let restored: Session = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        restored
+            .js_session_state
+            .for_workspace(std::path::Path::new("/workspace"))
+            .get("private:key")
+            .unwrap(),
+        None
+    );
 }

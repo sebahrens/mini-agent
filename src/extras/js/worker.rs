@@ -13,18 +13,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
-#[cfg(feature = "sandbox")]
 use rquickjs::prelude::Opt;
 use rquickjs::promise::PromiseState;
 use rquickjs::{
-    Context, Ctx, Error, Function, IntoJs, Module, Object, Persistent, Runtime, Value, WriteOptions,
+    Context, Ctx, Error, Exception, Function, IntoJs, Module, Object, Persistent, Runtime, Value,
+    WriteOptions,
 };
 
 use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
-    DiagnosticStage, EffectErrorCode, EffectOperation, EffectRequest, EffectResponse, EffectResult,
-    JsErrorCode, JsExceptionClass, ParentFrame, ParentWireFrame, ProtocolError, ProtocolFault,
-    ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
+    DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode, EffectOperation,
+    EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions, JsErrorCode,
+    JsExceptionClass, ModelEffectProfile, ParentFrame, ParentWireFrame, ProtocolError,
+    ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
     VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
     WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid, write_frame,
 };
@@ -32,11 +33,14 @@ use super::protocol::{
 use super::protocol::{HttpHeader, HttpMethod};
 #[cfg(feature = "skills")]
 use super::protocol::{
-    MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CALLS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
-    MAX_SKILL_EXPORTS_PER_ARTIFACT, SkillCallRequest, SkillCallResponse, SkillInvocationGrant,
+    InvocationId, MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CALLS_PER_STEP,
+    MAX_SKILL_CAPABILITY_GRANTS_PER_STEP, MAX_SKILL_EXPORTS_PER_ARTIFACT, SkillCallRequest,
+    SkillCallResponse, SkillInvocationGrant,
 };
+use super::session::{SCRATCH_KEY_MAX_BYTES, SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES};
 use super::types::{
-    MEMORY_LIMIT, READ_FILE_MAX_BYTES, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
+    DISCOVERY_PATTERN_MAX_BYTES, MEMORY_LIMIT, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
+    READ_FILES_MAX_PATHS, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
@@ -244,87 +248,325 @@ impl<'js> IntoJs<'js> for WorkerFetchResult {
     }
 }
 
+struct WorkerDirectoryEntry(DirectoryEntry);
+
+impl<'js> IntoJs<'js> for WorkerDirectoryEntry {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("name", self.0.name)?;
+        object.set(
+            "kind",
+            match self.0.kind {
+                DirectoryEntryKind::File => "file",
+                DirectoryEntryKind::Directory => "directory",
+            },
+        )?;
+        object.set("size", self.0.size)?;
+        Ok(object.into())
+    }
+}
+
+struct WorkerListDirResult {
+    entries: Vec<DirectoryEntry>,
+    truncated: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerListDirResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set(
+            "entries",
+            self.entries
+                .into_iter()
+                .map(WorkerDirectoryEntry)
+                .collect::<Vec<_>>(),
+        )?;
+        object.set("truncated", self.truncated)?;
+        Ok(object.into())
+    }
+}
+
+struct WorkerGlobResult {
+    paths: Vec<String>,
+    truncated: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerGlobResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("paths", self.paths)?;
+        object.set("truncated", self.truncated)?;
+        Ok(object.into())
+    }
+}
+
+struct WorkerGrepMatch(GrepMatch);
+
+impl<'js> IntoJs<'js> for WorkerGrepMatch {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set("path", self.0.path)?;
+        object.set("line", self.0.line)?;
+        object.set("text", self.0.text)?;
+        Ok(object.into())
+    }
+}
+
+struct WorkerGrepResult {
+    matches: Vec<GrepMatch>,
+    truncated: bool,
+}
+
+impl<'js> IntoJs<'js> for WorkerGrepResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let object = Object::new(ctx.clone())?;
+        object.set(
+            "matches",
+            self.matches
+                .into_iter()
+                .map(WorkerGrepMatch)
+                .collect::<Vec<_>>(),
+        )?;
+        object.set("truncated", self.truncated)?;
+        Ok(object.into())
+    }
+}
+
 fn install_model_effect_globals(
     context: &Context,
     effects: ModelEffectDispatcher,
+    spawn_available: bool,
+    profile: ModelEffectProfile,
 ) -> rquickjs::Result<()> {
     context.with(|ctx| {
         let read_effects = effects.clone();
-        let read_file = Function::new(ctx.clone(), move |path: String| {
-            validate_path(&path).map_err(|code| effect_error("read_file", code))?;
+        let read_file = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: String| {
+            validate_path(&path).map_err(|code| effect_error(&ctx, "read_file", code))?;
             match read_effects(EffectOperation::ReadFile { path }) {
                 EffectResult::ReadFile { content } => Ok(content),
-                EffectResult::Error(error) => Err(effect_error("read_file", error.code)),
+                EffectResult::Error(error) => Err(effect_error(&ctx, "read_file", error.code)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
-        let write_effects = effects.clone();
-        let write_file = Function::new(ctx.clone(), move |path: String, content: String| {
-            validate_path(&path).map_err(|code| effect_error("write_file", code))?;
-            if content.len() > WRITE_FILE_MAX_BYTES {
-                return Err(effect_error("write_file", EffectErrorCode::OutputLimit));
-            }
-            match write_effects(EffectOperation::WriteFile { path, content }) {
-                EffectResult::WriteFile => Ok(()),
-                EffectResult::Error(error) => Err(effect_error("write_file", error.code)),
+        let read_many_effects = effects.clone();
+        let read_files = Function::new(ctx.clone(), move |ctx: Ctx<'_>, paths: Vec<String>| {
+            validate_read_files_paths(&paths)
+                .map_err(|code| effect_error(&ctx, "read_files", code))?;
+            match read_many_effects(EffectOperation::ReadFiles { paths }) {
+                EffectResult::ReadFiles { contents } => Ok(contents),
+                EffectResult::Error(error) => Err(effect_error(&ctx, "read_files", error.code)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
-        let spawn_effects = effects.clone();
-        let spawn = Function::new(
+        let list_effects = effects.clone();
+        let list_dir = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: Opt<String>| {
+            let path = path.0.unwrap_or_else(|| ".".to_string());
+            validate_path(&path).map_err(|code| effect_error(&ctx, "list_dir", code))?;
+            match list_effects(EffectOperation::ListDir { path }) {
+                EffectResult::ListDir { entries, truncated } => {
+                    Ok(WorkerListDirResult { entries, truncated })
+                }
+                EffectResult::Error(error) => Err(effect_error(&ctx, "list_dir", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let glob_effects = effects.clone();
+        let glob = Function::new(
             ctx.clone(),
-            move |program: String, arguments: Vec<String>| {
-                validate_spawn(&program, &arguments).map_err(|code| effect_error("spawn", code))?;
-                match spawn_effects(EffectOperation::Spawn { program, arguments }) {
-                    EffectResult::Spawn {
-                        stdout,
-                        stderr,
-                        exit_code,
-                        timed_out,
-                        stdout_truncated,
-                        stderr_truncated,
-                    } => Ok(WorkerSpawnResult {
-                        stdout,
-                        stderr,
-                        code: exit_code,
-                        timed_out,
-                        stdout_truncated,
-                        stderr_truncated,
-                    }),
-                    EffectResult::Error(error) => Err(effect_error("spawn", error.code)),
+            move |ctx: Ctx<'_>, pattern: String, options: Opt<Object<'_>>| {
+                validate_discovery_pattern(&pattern)
+                    .map_err(|code| effect_error(&ctx, "glob", code))?;
+                let path = parse_glob_options(options.0.as_ref())
+                    .map_err(|code| effect_error(&ctx, "glob", code))?;
+                match glob_effects(EffectOperation::Glob { path, pattern }) {
+                    EffectResult::Glob { paths, truncated } => {
+                        Ok(WorkerGlobResult { paths, truncated })
+                    }
+                    EffectResult::Error(error) => Err(effect_error(&ctx, "glob", error.code)),
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            },
+        )?;
+        let grep_effects = effects.clone();
+        let grep = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, pattern: String, options: Opt<Object<'_>>| {
+                validate_discovery_pattern(&pattern)
+                    .map_err(|code| effect_error(&ctx, "grep", code))?;
+                let (path, options) = parse_grep_options(options.0.as_ref())
+                    .map_err(|code| effect_error(&ctx, "grep", code))?;
+                match grep_effects(EffectOperation::Grep {
+                    path,
+                    pattern,
+                    options,
+                }) {
+                    EffectResult::Grep { matches, truncated } => {
+                        Ok(WorkerGrepResult { matches, truncated })
+                    }
+                    EffectResult::Error(error) => Err(effect_error(&ctx, "grep", error.code)),
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            },
+        )?;
+        let write_effects = effects.clone();
+        let write_file = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, path: String, content: String| {
+                validate_path(&path).map_err(|code| effect_error(&ctx, "write_file", code))?;
+                if content.len() > WRITE_FILE_MAX_BYTES {
+                    return Err(effect_error(&ctx, "write_file", EffectErrorCode::TooLarge));
+                }
+                match write_effects(EffectOperation::WriteFile { path, content }) {
+                    EffectResult::WriteFile => Ok(()),
+                    EffectResult::Error(error) => Err(effect_error(&ctx, "write_file", error.code)),
                     _ => Err(rquickjs::Error::Unknown),
                 }
             },
         )?;
         #[cfg(feature = "sandbox")]
         let fetch = {
-            let fetch_effects = effects;
-            Function::new(ctx.clone(), move |url: String, options: Opt<Object<'_>>| {
-                if url.is_empty() || url.contains('\0') || url.len() > FETCH_URL_MAX_BYTES {
-                    return Err(effect_error("fetch", EffectErrorCode::InvalidTarget));
-                }
-                let (method, headers, body) = parse_fetch_options(options.0.as_ref())?;
-                match fetch_effects(EffectOperation::Fetch {
-                    url,
-                    method,
-                    headers,
-                    body,
-                }) {
-                    EffectResult::Fetch { status, body, .. } => {
-                        Ok(WorkerFetchResult { status, text: body })
+            let fetch_effects = effects.clone();
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, url: String, options: Opt<Object<'_>>| {
+                    if url.is_empty() || url.contains('\0') || url.len() > FETCH_URL_MAX_BYTES {
+                        return Err(effect_error(&ctx, "fetch", EffectErrorCode::InvalidTarget));
                     }
-                    EffectResult::Error(error) => Err(effect_error("fetch", error.code)),
-                    _ => Err(rquickjs::Error::Unknown),
-                }
-            })?
+                    let (method, headers, body) = parse_fetch_options(options.0.as_ref())?;
+                    match fetch_effects(EffectOperation::Fetch {
+                        url,
+                        method,
+                        headers,
+                        body,
+                    }) {
+                        EffectResult::Fetch { status, body, .. } => {
+                            Ok(WorkerFetchResult { status, text: body })
+                        }
+                        EffectResult::Error(error) => Err(effect_error(&ctx, "fetch", error.code)),
+                        _ => Err(rquickjs::Error::Unknown),
+                    }
+                },
+            )?
         };
         ctx.globals().set("read_file", read_file)?;
-        ctx.globals().set("write_file", write_file)?;
-        ctx.globals().set("spawn", spawn)?;
+        ctx.globals().set("list_dir", list_dir)?;
+        ctx.globals().set("grep", grep)?;
+        if profile == ModelEffectProfile::Full {
+            ctx.globals().set("read_files", read_files)?;
+            ctx.globals().set("glob", glob)?;
+            ctx.globals().set("write_file", write_file)?;
+        }
+        if profile == ModelEffectProfile::Full && spawn_available {
+            let spawn_effects = effects.clone();
+            let spawn = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, program: String, arguments: Vec<String>| {
+                    validate_spawn(&program, &arguments)
+                        .map_err(|code| effect_error(&ctx, "spawn", code))?;
+                    match spawn_effects(EffectOperation::Spawn { program, arguments }) {
+                        EffectResult::Spawn {
+                            stdout,
+                            stderr,
+                            exit_code,
+                            timed_out,
+                            stdout_truncated,
+                            stderr_truncated,
+                        } => Ok(WorkerSpawnResult {
+                            stdout,
+                            stderr,
+                            code: exit_code,
+                            timed_out,
+                            stdout_truncated,
+                            stderr_truncated,
+                        }),
+                        EffectResult::Error(error) => Err(effect_error(&ctx, "spawn", error.code)),
+                        _ => Err(rquickjs::Error::Unknown),
+                    }
+                },
+            )?;
+            ctx.globals().set("spawn", spawn)?;
+        }
         #[cfg(feature = "sandbox")]
-        ctx.globals().set("fetch", fetch)?;
+        if profile == ModelEffectProfile::Full {
+            ctx.globals().set("fetch", fetch)?;
+        }
         Ok(())
     })
+}
+
+fn install_session_state_globals(
+    context: &Context,
+    effects: ModelEffectDispatcher,
+    result_wrapper: Persistent<Function<'static>>,
+    scratch_put_wrapper: Persistent<Function<'static>>,
+    scratch_get_wrapper: Persistent<Function<'static>>,
+) -> rquickjs::Result<()> {
+    context.with(|ctx| {
+        let result_effects = effects.clone();
+        let result_dispatch = Function::new(ctx.clone(), move |ctx: Ctx<'_>, json: String| {
+            if json.len() > STRUCTURED_RESULT_MAX_BYTES {
+                return Err(effect_error(&ctx, "result", EffectErrorCode::TooLarge));
+            }
+            match result_effects(EffectOperation::Result { json }) {
+                EffectResult::ResultAccepted { .. } => Ok(()),
+                EffectResult::Error(error) => Err(effect_error(&ctx, "result", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let result: Function = result_wrapper.restore(&ctx)?.call((result_dispatch,))?;
+
+        let put_effects = effects.clone();
+        let scratch_put_dispatch = Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, key: String, json: String| {
+                validate_scratch_key_worker(&key)
+                    .map_err(|code| effect_error(&ctx, "scratch_put", code))?;
+                if json.len() > SCRATCH_VALUE_MAX_BYTES {
+                    return Err(effect_error(&ctx, "scratch_put", EffectErrorCode::TooLarge));
+                }
+                match put_effects(EffectOperation::ScratchPut { key, json }) {
+                    EffectResult::ScratchPut => Ok(()),
+                    EffectResult::Error(error) => {
+                        Err(effect_error(&ctx, "scratch_put", error.code))
+                    }
+                    _ => Err(rquickjs::Error::Unknown),
+                }
+            },
+        )?;
+        let scratch_put: Function = scratch_put_wrapper
+            .restore(&ctx)?
+            .call((scratch_put_dispatch,))?;
+
+        let scratch_get_dispatch = Function::new(ctx.clone(), move |ctx: Ctx<'_>, key: String| {
+            validate_scratch_key_worker(&key)
+                .map_err(|code| effect_error(&ctx, "scratch_get", code))?;
+            match effects(EffectOperation::ScratchGet { key }) {
+                EffectResult::ScratchGet { json } => Ok(json),
+                EffectResult::Error(error) => Err(effect_error(&ctx, "scratch_get", error.code)),
+                _ => Err(rquickjs::Error::Unknown),
+            }
+        })?;
+        let scratch_get: Function = scratch_get_wrapper
+            .restore(&ctx)?
+            .call((scratch_get_dispatch,))?;
+
+        ctx.globals().set("result", result)?;
+        ctx.globals().set("scratch_put", scratch_put)?;
+        ctx.globals().set("scratch_get", scratch_get)?;
+        Ok(())
+    })
+}
+
+fn validate_scratch_key_worker(key: &str) -> Result<(), EffectErrorCode> {
+    if key.is_empty()
+        || key.len() > SCRATCH_KEY_MAX_BYTES
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(EffectErrorCode::InvalidTarget);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "skills")]
@@ -333,9 +575,9 @@ fn install_proposal_global(
     effects: ModelEffectDispatcher,
 ) -> rquickjs::Result<()> {
     context.with(|ctx| {
-        let propose_skill = Function::new(ctx.clone(), move |draft: Object<'_>| {
+        let propose_skill = Function::new(ctx.clone(), move |ctx: Ctx<'_>, draft: Object<'_>| {
             let proposal = super::skills::proposal::JsProposal::from_object(&draft)
-                .map_err(|_| effect_error("propose_skill", EffectErrorCode::InvalidTarget))?;
+                .map_err(|_| effect_error(&ctx, "propose_skill", EffectErrorCode::InvalidTarget))?;
             match effects(EffectOperation::ProposeSkill {
                 draft: proposal.into(),
             }) {
@@ -350,8 +592,8 @@ fn install_proposal_global(
                     "status": status.as_str(),
                     "report_id": report_id,
                 }))
-                .map_err(|_| effect_error("propose_skill", EffectErrorCode::BackendFailure)),
-                EffectResult::Error(error) => Err(effect_error("propose_skill", error.code)),
+                .map_err(|_| effect_error(&ctx, "propose_skill", EffectErrorCode::BackendFailure)),
+                EffectResult::Error(error) => Err(effect_error(&ctx, "propose_skill", error.code)),
                 _ => Err(rquickjs::Error::Unknown),
             }
         })?;
@@ -367,6 +609,88 @@ fn validate_path(path: &str) -> Result<(), EffectErrorCode> {
     }
 }
 
+fn validate_read_files_paths(paths: &[String]) -> Result<(), EffectErrorCode> {
+    if paths.is_empty() {
+        return Err(EffectErrorCode::InvalidTarget);
+    }
+    if paths.len() > READ_FILES_MAX_PATHS {
+        return Err(EffectErrorCode::TooLarge);
+    }
+    let mut total = 0_usize;
+    for path in paths {
+        validate_path(path)?;
+        total = total
+            .checked_add(path.len())
+            .ok_or(EffectErrorCode::TooLarge)?;
+        if total > READ_FILES_MAX_PATH_BYTES {
+            return Err(EffectErrorCode::TooLarge);
+        }
+    }
+    Ok(())
+}
+
+fn validate_discovery_pattern(pattern: &str) -> Result<(), EffectErrorCode> {
+    if pattern.is_empty() || pattern.contains('\0') || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES {
+        Err(EffectErrorCode::InvalidTarget)
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_glob_options(options: Option<&Object<'_>>) -> Result<String, EffectErrorCode> {
+    let Some(options) = options else {
+        return Ok(".".to_string());
+    };
+    for key in options.keys::<String>() {
+        let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
+        if key != "path" {
+            return Err(EffectErrorCode::InvalidTarget);
+        }
+    }
+    let path = options
+        .get::<_, Option<String>>("path")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or_else(|| ".".to_string());
+    validate_path(&path)?;
+    Ok(path)
+}
+
+fn parse_grep_options(
+    options: Option<&Object<'_>>,
+) -> Result<(String, GrepOptions), EffectErrorCode> {
+    let Some(options) = options else {
+        return Ok((".".to_string(), GrepOptions::default()));
+    };
+    for key in options.keys::<String>() {
+        let key = key.map_err(|_| EffectErrorCode::InvalidTarget)?;
+        if !matches!(key.as_str(), "path" | "include" | "case_sensitive") {
+            return Err(EffectErrorCode::InvalidTarget);
+        }
+    }
+    let path = options
+        .get::<_, Option<String>>("path")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or_else(|| ".".to_string());
+    validate_path(&path)?;
+    let include = options
+        .get::<_, Option<String>>("include")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?;
+    if let Some(include) = &include {
+        validate_discovery_pattern(include)?;
+    }
+    let case_sensitive = options
+        .get::<_, Option<bool>>("case_sensitive")
+        .map_err(|_| EffectErrorCode::InvalidTarget)?
+        .unwrap_or(true);
+    Ok((
+        path,
+        GrepOptions {
+            include,
+            case_sensitive,
+        },
+    ))
+}
+
 fn validate_spawn(program: &str, arguments: &[String]) -> Result<(), EffectErrorCode> {
     if program.is_empty()
         || program.contains('\0')
@@ -379,7 +703,7 @@ fn validate_spawn(program: &str, arguments: &[String]) -> Result<(), EffectError
         total.checked_add(argument.len())
     });
     if total_bytes.is_none_or(|total| total > SPAWN_ARGUMENTS_MAX_BYTES) {
-        Err(EffectErrorCode::OutputLimit)
+        Err(EffectErrorCode::TooLarge)
     } else {
         Ok(())
     }
@@ -495,19 +819,241 @@ fn fetch_options_error(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("fetch options", "fetch", message.into())
 }
 
-fn effect_error(tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
+fn effect_error(ctx: &Ctx<'_>, tool: &'static str, code: EffectErrorCode) -> rquickjs::Error {
     let code = match code {
         EffectErrorCode::Denied => "denied",
         EffectErrorCode::CapabilityDenied => "capability_denied",
         EffectErrorCode::InvalidTarget => "invalid_target",
+        EffectErrorCode::NotFound => "not_found",
+        EffectErrorCode::IsDirectory => "is_directory",
         EffectErrorCode::Cancelled => "cancelled",
         EffectErrorCode::TimedOut => "timed_out",
-        EffectErrorCode::OutputLimit => "output_limit",
+        EffectErrorCode::TooLarge => "too_large",
         EffectErrorCode::BackendFailure => "backend_failure",
         EffectErrorCode::AuditFailure => "audit_failure",
         EffectErrorCode::OutcomeUnknown => "outcome_unknown",
     };
-    rquickjs::Error::new_from_js_message("parent effect", tool, code)
+    let message = format!("{tool}: {code}");
+    let Ok(exception) = Exception::from_message(ctx.clone(), &message) else {
+        return rquickjs::Error::Unknown;
+    };
+    if exception.as_object().prop("code", code).is_err() {
+        return rquickjs::Error::Unknown;
+    }
+    exception.throw()
+}
+
+#[cfg(test)]
+mod effect_error_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_profile_installs_only_the_three_read_effect_globals() {
+        let runtime = Runtime::new().expect("create runtime");
+        let context = Context::full(&runtime).expect("create context");
+        let effects = Rc::new(|_| -> EffectResult {
+            panic!("global-shape test must not dispatch an effect")
+        }) as ModelEffectDispatcher;
+        install_model_effect_globals(&context, effects, true, ModelEffectProfile::ReadOnly)
+            .expect("install read-only effect globals");
+
+        let observed = context
+            .with(|ctx| {
+                ctx.eval::<String, _>(
+                    "JSON.stringify({\
+                       read_file: typeof read_file, \
+                       list_dir: typeof list_dir, \
+                       grep: typeof grep, \
+                       read_files: typeof read_files, \
+                       glob: typeof glob, \
+                       write_file: typeof write_file, \
+                       fetch: typeof fetch, \
+                       spawn: typeof spawn, \
+                       result: typeof result, \
+                       scratch_put: typeof scratch_put, \
+                       scratch_get: typeof scratch_get\
+                     })",
+                )
+            })
+            .expect("inspect read-only globals");
+        let observed: serde_json::Value = serde_json::from_str(&observed).unwrap();
+        for name in ["read_file", "list_dir", "grep"] {
+            assert_eq!(observed[name], "function", "{name}");
+        }
+        for name in [
+            "read_files",
+            "glob",
+            "write_file",
+            "fetch",
+            "spawn",
+            "result",
+            "scratch_put",
+            "scratch_get",
+        ] {
+            assert_eq!(observed[name], "undefined", "{name}");
+        }
+    }
+
+    #[test]
+    fn discovery_globals_return_typed_bounded_shapes_and_forward_options() {
+        let runtime = Runtime::new().expect("create runtime");
+        let context = Context::full(&runtime).expect("create context");
+        let observed_operations = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let calls = observed_operations.clone();
+        let effects = Rc::new(move |operation: EffectOperation| {
+            calls.borrow_mut().push(operation.clone());
+            match operation {
+                EffectOperation::ListDir { .. } => EffectResult::ListDir {
+                    entries: vec![DirectoryEntry {
+                        name: "src".into(),
+                        kind: DirectoryEntryKind::Directory,
+                        size: 0,
+                    }],
+                    truncated: false,
+                },
+                EffectOperation::Glob { .. } => EffectResult::Glob {
+                    paths: vec!["src/main.rs".into()],
+                    truncated: true,
+                },
+                EffectOperation::Grep { .. } => EffectResult::Grep {
+                    matches: vec![GrepMatch {
+                        path: "src/main.rs".into(),
+                        line: 7,
+                        text: "let needle = true;".into(),
+                    }],
+                    truncated: false,
+                },
+                _ => EffectResult::Error(super::super::protocol::EffectError {
+                    code: EffectErrorCode::BackendFailure,
+                }),
+            }
+        }) as ModelEffectDispatcher;
+        install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
+            .expect("install effect globals");
+
+        let value = context
+            .with(|ctx| {
+                ctx.eval::<String, _>(
+                    "JSON.stringify({\
+                       list: list_dir(), \
+                       globbed: glob('**/*.rs', {path: 'src'}), \
+                       matches: grep('needle', {path: 'src', include: '*.rs', case_sensitive: false}), \
+                       defaults: grep('Needle')\
+                     })",
+                )
+            })
+            .expect("execute discovery globals");
+        let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(value["list"]["entries"][0]["kind"], "directory");
+        assert_eq!(value["globbed"]["paths"][0], "src/main.rs");
+        assert_eq!(value["globbed"]["truncated"], true);
+        assert_eq!(value["matches"]["matches"][0]["line"], 7);
+
+        assert_eq!(
+            *observed_operations.borrow(),
+            vec![
+                EffectOperation::ListDir { path: ".".into() },
+                EffectOperation::Glob {
+                    path: "src".into(),
+                    pattern: "**/*.rs".into(),
+                },
+                EffectOperation::Grep {
+                    path: "src".into(),
+                    pattern: "needle".into(),
+                    options: GrepOptions {
+                        include: Some("*.rs".into()),
+                        case_sensitive: false,
+                    },
+                },
+                EffectOperation::Grep {
+                    path: ".".into(),
+                    pattern: "Needle".into(),
+                    options: GrepOptions::default(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_discovery_options_fail_before_dispatch() {
+        let runtime = Runtime::new().expect("create runtime");
+        let context = Context::full(&runtime).expect("create context");
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        let effects = Rc::new(move |_| {
+            observed.set(observed.get() + 1);
+            EffectResult::Error(super::super::protocol::EffectError {
+                code: EffectErrorCode::BackendFailure,
+            })
+        }) as ModelEffectDispatcher;
+        install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
+            .expect("install effect globals");
+
+        let code = context
+            .with(|ctx| {
+                ctx.eval::<String, _>(
+                    "try { grep('x', {path: '.', surprise: true}) } \
+                     catch (error) { error.code }",
+                )
+            })
+            .expect("catch validation error");
+        assert_eq!(code, "invalid_target");
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn parent_effect_failures_are_plain_errors_with_stable_codes() {
+        for (code, expected) in [
+            (EffectErrorCode::Denied, "denied"),
+            (EffectErrorCode::NotFound, "not_found"),
+            (EffectErrorCode::IsDirectory, "is_directory"),
+            (EffectErrorCode::TooLarge, "too_large"),
+        ] {
+            let runtime = Runtime::new().expect("create runtime");
+            let context = Context::full(&runtime).expect("create context");
+            let effects =
+                Rc::new(move |_| EffectResult::Error(super::super::protocol::EffectError { code }))
+                    as ModelEffectDispatcher;
+            install_model_effect_globals(&context, effects, true, ModelEffectProfile::Full)
+                .expect("install effect globals");
+
+            let observed = context
+                .with(|ctx| {
+                    ctx.eval::<String, _>(
+                        "Object.defineProperty(Error.prototype, 'code', { \
+                           configurable: true, get() { return 'poisoned' }, \
+                           set() { throw new Error('prototype setter called') } \
+                         }); \
+                         try { read_file('fixture'); 'not-thrown' } catch (error) { \
+                         JSON.stringify({ \
+                           isError: error instanceof Error, \
+                           ownsCode: Object.prototype.hasOwnProperty.call(error, 'code'), \
+                           name: error.name, \
+                           message: error.message, \
+                           code: error.code \
+                         }) \
+                         }",
+                    )
+                })
+                .expect("catch parent effect error");
+            let observed: serde_json::Value =
+                serde_json::from_str(&observed).expect("parse caught error fields");
+
+            assert_eq!(observed["isError"], true);
+            assert_eq!(observed["ownsCode"], true);
+            assert_eq!(observed["name"], "Error");
+            assert_eq!(observed["message"], format!("read_file: {expected}"));
+            assert_eq!(observed["code"], expected);
+        }
+    }
+
+    #[test]
+    fn local_size_validation_uses_too_large() {
+        assert_eq!(
+            validate_spawn("program", &["x".repeat(SPAWN_ARGUMENTS_MAX_BYTES)]),
+            Err(EffectErrorCode::TooLarge)
+        );
+    }
 }
 
 /// Worker-owned revocation boundary for all invocation capabilities tied to one fresh runtime.
@@ -538,6 +1084,7 @@ impl Drop for WorkerCapabilityLifecycle {
 const CONSOLE_WRAPPER_SOURCE: &str = r#"
 (emit => {
     const string = String;
+    const stringify = JSON.stringify;
     const uncurryThis = Function.prototype.bind.bind(Function.prototype.call);
     const slice = uncurryThis(String.prototype.slice);
     const charCodeAt = uncurryThis(String.prototype.charCodeAt);
@@ -575,12 +1122,25 @@ const CONSOLE_WRAPPER_SOURCE: &str = r#"
         }
         return bytes;
     }
+    function render(value) {
+        if (value === null || typeof value !== "object") return string(value);
+        let encoded;
+        try { encoded = stringify(value); } catch (_) {}
+        let fallback;
+        try { fallback = string(value); } catch (_) {
+            return typeof encoded === "string" ? encoded : "<unprintable>";
+        }
+        if (typeof encoded === "string" && (encoded !== "{}" || fallback === "[object Object]")) {
+            return encoded;
+        }
+        return fallback;
+    }
     return (...values) => {
         let text = "";
         let remaining = maximum;
         let truncated = false;
         for (let index = 0; index < values.length; index += 1) {
-            const part = string(values[index]);
+            const part = render(values[index]);
             if (index !== 0) {
                 if (remaining === 0) { truncated = true; break; }
                 text += " ";
@@ -852,8 +1412,17 @@ const TRUSTED_BOOTSTRAP_MODULE_NAME: &str = "mini-agent:trusted-bootstrap";
 static TRUSTED_BOOTSTRAP_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
 fn trusted_bootstrap_source() -> String {
+    let session_json_clone = STRICT_CLONE_SOURCE
+        .replace("const maxNodes = 10000;", "const maxNodes = 100000;")
+        .replace("const maxBytes = 65536;", "const maxBytes = 1048576;");
     format!(
         "export const strictClone = {STRICT_CLONE_SOURCE};\n\
+         export const sessionJsonClone = {session_json_clone};\n\
+         const sessionJsonParse = JSON.parse;\n\
+         export const sessionResultWrapper = dispatch => value => dispatch(sessionJsonClone(value));\n\
+         export const scratchPutWrapper = dispatch => (key, value) => dispatch(key, sessionJsonClone(value));\n\
+         export const scratchGetWrapper = dispatch => key => {{ const encoded = dispatch(key); return encoded == null ? null : sessionJsonParse(encoded); }};\n\
+         export const consoleWrapper = {CONSOLE_WRAPPER_SOURCE};\n\
          export const stringGate = {STRING_GATE_SOURCE};\n\
          export const exceptionInspector = {EXCEPTION_INSPECTOR_SOURCE};\n\
          export const asyncCompletionValue = {ASYNC_COMPLETION_VALUE_SOURCE};"
@@ -885,6 +1454,10 @@ fn trusted_bootstrap_bytecode() -> Option<&'static [u8]> {
 
 struct TrustedBootstrapFunctions {
     strict_clone: Persistent<Function<'static>>,
+    session_result_wrapper: Persistent<Function<'static>>,
+    scratch_put_wrapper: Persistent<Function<'static>>,
+    scratch_get_wrapper: Persistent<Function<'static>>,
+    console_wrapper: Persistent<Function<'static>>,
     string_gate: Persistent<Function<'static>>,
     exception_inspector: Persistent<Function<'static>>,
     async_completion_value: Persistent<Function<'static>>,
@@ -903,11 +1476,19 @@ fn load_trusted_bootstrap_functions(
         let (module, evaluation) = module.eval()?;
         evaluation.finish::<()>()?;
         let clone = module.get::<_, Function>("strictClone")?;
+        let session_result_wrapper = module.get::<_, Function>("sessionResultWrapper")?;
+        let scratch_put_wrapper = module.get::<_, Function>("scratchPutWrapper")?;
+        let scratch_get_wrapper = module.get::<_, Function>("scratchGetWrapper")?;
+        let console_wrapper = module.get::<_, Function>("consoleWrapper")?;
         let string_gate = module.get::<_, Function>("stringGate")?;
         let exception_inspector = module.get::<_, Function>("exceptionInspector")?;
         let async_completion_value = module.get::<_, Function>("asyncCompletionValue")?;
         Ok(TrustedBootstrapFunctions {
             strict_clone: Persistent::save(&ctx, clone),
+            session_result_wrapper: Persistent::save(&ctx, session_result_wrapper),
+            scratch_put_wrapper: Persistent::save(&ctx, scratch_put_wrapper),
+            scratch_get_wrapper: Persistent::save(&ctx, scratch_get_wrapper),
+            console_wrapper: Persistent::save(&ctx, console_wrapper),
             string_gate: Persistent::save(&ctx, string_gate),
             exception_inspector: Persistent::save(&ctx, exception_inspector),
             async_completion_value: Persistent::save(&ctx, async_completion_value),
@@ -943,11 +1524,26 @@ mod trusted_bootstrap_bytecode_tests {
             .eval()?;
             evaluation.finish::<()>()?;
             let _: Function = module.get("strictClone")?;
+            let _: Function = module.get("sessionResultWrapper")?;
+            let _: Function = module.get("scratchPutWrapper")?;
+            let _: Function = module.get("scratchGetWrapper")?;
+            let _: Function = module.get("consoleWrapper")?;
             let _: Function = module.get("stringGate")?;
             let _: Function = module.get("exceptionInspector")?;
             let _: Function = module.get("asyncCompletionValue")?;
             Ok(())
         })
+    }
+
+    #[test]
+    fn session_clone_bootstrap_contains_the_declared_expanded_limits() {
+        let source = trusted_bootstrap_source();
+        assert_eq!(source.matches("const maxNodes = 100000;").count(), 1);
+        assert_eq!(source.matches("const maxBytes = 1048576;").count(), 1);
+        assert!(source.contains("export const sessionResultWrapper"));
+        assert!(source.contains("export const scratchPutWrapper"));
+        assert!(source.contains("export const scratchGetWrapper"));
+        assert!(source.contains("export const consoleWrapper"));
     }
 
     fn load_trusted_bootstrap_bytecode_for_benchmark(bytecode: &[u8]) -> rquickjs::Result<()> {
@@ -1305,6 +1901,107 @@ fn run_marked_worker() -> i32 {
     }
 }
 
+#[cfg(feature = "skills")]
+#[derive(Clone)]
+struct CachedSkillArtifact {
+    artifact: Arc<super::skills::SkillArtifact>,
+    bytecode: Arc<super::realm::CompiledArtifactBytecode>,
+}
+
+#[cfg(feature = "skills")]
+const MAX_SKILL_SOURCE_BYTES_PER_STEP: usize = 64 * 1024;
+#[cfg(feature = "skills")]
+const MAX_SKILL_BYTECODE_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(feature = "skills")]
+#[derive(Default)]
+struct WorkerSkillCache {
+    turn_id: Option<String>,
+    artifacts: std::collections::HashMap<String, CachedSkillArtifact>,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Debug)]
+enum SkillCacheError {
+    Artifact,
+    Protocol,
+}
+
+#[cfg(feature = "skills")]
+impl WorkerSkillCache {
+    fn resolve(
+        &mut self,
+        request: &mut RunStep,
+    ) -> Result<Vec<CachedSkillArtifact>, SkillCacheError> {
+        if !request.artifacts.is_empty() && !request.cached_artifact_ids.is_empty() {
+            return Err(SkillCacheError::Protocol);
+        }
+        if request.artifacts.is_empty() && request.cached_artifact_ids.is_empty() {
+            if !request.turn_id.is_empty()
+                && self.turn_id.as_deref() != Some(request.turn_id.as_str())
+            {
+                self.turn_id = Some(request.turn_id.clone());
+                self.artifacts.clear();
+            }
+            return Ok(Vec::new());
+        }
+        if request.turn_id.is_empty() {
+            return Err(SkillCacheError::Protocol);
+        }
+        if !request.artifacts.is_empty() {
+            let artifacts = std::mem::take(&mut request.artifacts);
+            validate_skill_artifacts_bounds(&artifacts).map_err(|_| SkillCacheError::Artifact)?;
+            let mut next = std::collections::HashMap::with_capacity(artifacts.len());
+            let mut ordered = Vec::with_capacity(artifacts.len());
+            let mut bytecode_bytes = 0_usize;
+            for artifact in artifacts {
+                if next.contains_key(&artifact.id) {
+                    return Err(SkillCacheError::Artifact);
+                }
+                let bytecode = super::realm::compile_artifact_bytecode(&artifact)
+                    .map_err(|_| SkillCacheError::Artifact)?;
+                bytecode_bytes = bytecode_bytes
+                    .checked_add(bytecode.len())
+                    .ok_or(SkillCacheError::Artifact)?;
+                if bytecode_bytes > MAX_SKILL_BYTECODE_CACHE_BYTES {
+                    return Err(SkillCacheError::Artifact);
+                }
+                let id = artifact.id.clone();
+                let cached = CachedSkillArtifact {
+                    artifact: Arc::new(artifact),
+                    bytecode: Arc::new(bytecode),
+                };
+                next.insert(id, cached.clone());
+                ordered.push(cached);
+            }
+            self.turn_id = Some(request.turn_id.clone());
+            self.artifacts = next;
+            return Ok(ordered);
+        }
+
+        if self.turn_id.as_deref() != Some(request.turn_id.as_str())
+            || request.cached_artifact_ids.len() > MAX_SKILL_ARTIFACTS_PER_STEP
+        {
+            return Err(SkillCacheError::Protocol);
+        }
+        let identities = std::mem::take(&mut request.cached_artifact_ids);
+        let mut seen = std::collections::HashSet::with_capacity(identities.len());
+        let mut ordered = Vec::with_capacity(identities.len());
+        for identity in identities {
+            if !seen.insert(identity.clone()) {
+                return Err(SkillCacheError::Protocol);
+            }
+            ordered.push(
+                self.artifacts
+                    .get(&identity)
+                    .cloned()
+                    .ok_or(SkillCacheError::Protocol)?,
+            );
+        }
+        Ok(ordered)
+    }
+}
+
 fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     mut input: R,
     mut output: W,
@@ -1357,6 +2054,8 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
         output,
         protocol,
     }));
+    #[cfg(feature = "skills")]
+    let mut skill_cache = WorkerSkillCache::default();
 
     loop {
         let request: ParentWireFrame = {
@@ -1369,8 +2068,27 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
         let mut sequence = request.sequence.checked_add(1).ok_or(())?;
         let message = match request.message {
             ParentFrame::RunStep(step) => {
+                #[cfg(feature = "skills")]
+                let (step, artifacts) = {
+                    let mut step = step;
+                    let artifacts = match skill_cache.resolve(&mut step) {
+                        Ok(artifacts) => artifacts,
+                        Err(SkillCacheError::Artifact) => {
+                            return write_skill_cache_failure(
+                                &transport,
+                                &build,
+                                invocation_id.ok_or(())?,
+                                sequence,
+                            );
+                        }
+                        Err(SkillCacheError::Protocol) => return Err(()),
+                    };
+                    (step, artifacts)
+                };
                 let (result, terminal_sequence) = execute_brokered_run_step(
                     step,
+                    #[cfg(feature = "skills")]
+                    artifacts,
                     limits,
                     transport.clone(),
                     build.clone(),
@@ -1425,6 +2143,37 @@ fn bootstrap<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
         transport.protocol.on_send(&response).map_err(|_| ())?;
         write_terminal(&mut transport.output, &response)?;
     }
+}
+
+#[cfg(feature = "skills")]
+fn write_skill_cache_failure<R: std::io::Read, W: Write>(
+    transport: &Arc<Mutex<WorkerTransport<R, W>>>,
+    build: &BuildIdentity,
+    invocation_id: InvocationId,
+    sequence: u64,
+) -> Result<(), ()> {
+    let response = WireFrame::invocation(
+        build.clone(),
+        invocation_id,
+        sequence,
+        WorkerFrame::StepResult(StepResult {
+            outcome: StepOutcome::Error(JsErrorCode::Internal),
+            console: Vec::new(),
+            diagnostic: Some(Diagnostic {
+                class: DiagnosticClass::Internal,
+                stage: DiagnosticStage::Initialization,
+                script_role: ScriptRole::SkillSource,
+                exception_class: None,
+                line: None,
+                column: None,
+            }),
+            skill_events: Vec::new(),
+            evidence_complete: false,
+        }),
+    );
+    let mut transport = transport.lock().map_err(|_| ())?;
+    transport.protocol.on_send(&response).map_err(|_| ())?;
+    write_terminal(&mut transport.output, &response)
 }
 
 fn write_terminal(output: &mut impl Write, frame: &WorkerWireFrame) -> Result<(), ()> {
@@ -1486,6 +2235,7 @@ mod bootstrap_handshake_tests {
 
 fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send + 'static>(
     request: RunStep,
+    #[cfg(feature = "skills")] artifacts: Vec<CachedSkillArtifact>,
     limits: ExecutionLimits,
     transport: Arc<Mutex<WorkerTransport<R, W>>>,
     build: BuildIdentity,
@@ -1499,6 +2249,8 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     let sequence = Arc::new(Mutex::new(sequence));
     let protocol_failed = Arc::new(AtomicBool::new(false));
     let effect_limit_reached = Arc::new(AtomicBool::new(false));
+    let terminal_requested = Arc::new(AtomicBool::new(false));
+    let terminal_result = Arc::new(Mutex::new(None::<String>));
     let wire_dispatcher: WorkerEffectDispatcher = {
         let effect_build = build.clone();
         let effect_invocation_id = invocation_id.clone();
@@ -1506,6 +2258,8 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
         let sequence = sequence.clone();
         let protocol_failed = protocol_failed.clone();
         let effect_limit_reached = effect_limit_reached.clone();
+        let terminal_requested = terminal_requested.clone();
+        let terminal_result = terminal_result.clone();
         let transport = transport.clone();
         Arc::new(move |grant_id, advisory, operation| {
             if protocol_failed.load(Ordering::Acquire) {
@@ -1528,11 +2282,24 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
                 advisory,
                 operation,
             };
+            let requested_terminal_result =
+                matches!(&request.operation, EffectOperation::Result { .. });
             let result = transport.lock().map_err(|_| ()).and_then(|mut transport| {
                 transport.round_trip(request, &effect_build, &effect_invocation_id, &sequence)
             });
             match result {
                 Ok(result) => {
+                    if requested_terminal_result
+                        && let EffectResult::ResultAccepted { json } = &result
+                    {
+                        let mut accepted = terminal_result
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if accepted.is_none() {
+                            *accepted = Some(json.clone());
+                            terminal_requested.store(true, Ordering::Release);
+                        }
+                    }
                     if matches!(
                         &result,
                         EffectResult::Error(super::protocol::EffectError {
@@ -1593,15 +2360,23 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     };
     let mut terminal = execute_run_step(
         request,
+        #[cfg(feature = "skills")]
+        artifacts,
         limits,
         model_dispatcher,
         wire_dispatcher,
+        terminal_requested,
         #[cfg(feature = "skills")]
         skill_call_authorizer,
     );
     if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
+        if let Some(json) = terminal_result.lock().map_err(|_| ())?.take() {
+            terminal.outcome =
+                StepOutcome::Structured(serde_json::from_str(&json).map_err(|_| ())?);
+            terminal.diagnostic = None;
+        }
         if effect_limit_reached.load(Ordering::Acquire) {
             #[cfg(feature = "skills")]
             {
@@ -1610,6 +2385,7 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
             if matches!(
                 &terminal.outcome,
                 StepOutcome::Value(_)
+                    | StepOutcome::Structured(_)
                     | StepOutcome::Void
                     | StepOutcome::Error(JsErrorCode::Exception)
             ) {
@@ -1714,6 +2490,7 @@ fn backend_failure() -> EffectResult {
 #[cfg(feature = "skills")]
 fn prepare_bound_exports(
     request: &RunStep,
+    artifacts: &[CachedSkillArtifact],
     capabilities: &InvocationCapabilityRuntime,
     events: Arc<Mutex<WorkerEventState>>,
     authorize_call: WorkerSkillCallAuthorizer,
@@ -1726,8 +2503,8 @@ fn prepare_bound_exports(
 > {
     use std::collections::{HashMap, HashSet};
 
-    validate_skill_authority_bounds(request)?;
-    if request.artifacts.is_empty() {
+    validate_skill_cached_artifacts_bounds(artifacts)?;
+    if artifacts.is_empty() {
         return Ok(HashMap::new());
     }
     if request.turn_id.is_empty() || request.tool_call_id.is_empty() {
@@ -1735,7 +2512,8 @@ fn prepare_bound_exports(
     }
     let mut prepared = HashMap::new();
     let mut seen_artifacts = HashSet::new();
-    for artifact in &request.artifacts {
+    for cached in artifacts {
+        let artifact = cached.artifact.as_ref();
         if !seen_artifacts.insert(artifact.id.clone()) {
             return Err(());
         }
@@ -1828,12 +2606,25 @@ fn prepare_bound_exports(
 }
 
 #[cfg(feature = "skills")]
-fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
-    if request.artifacts.len() > MAX_SKILL_ARTIFACTS_PER_STEP {
+fn validate_skill_artifacts_bounds(artifacts: &[super::skills::SkillArtifact]) -> Result<(), ()> {
+    validate_skill_artifact_refs(artifacts.len(), artifacts.iter())
+}
+
+#[cfg(feature = "skills")]
+fn validate_skill_artifact_refs<'a>(
+    count: usize,
+    artifacts: impl IntoIterator<Item = &'a super::skills::SkillArtifact>,
+) -> Result<(), ()> {
+    if count > MAX_SKILL_ARTIFACTS_PER_STEP {
         return Err(());
     }
     let mut expected_grants = 0_usize;
-    for artifact in &request.artifacts {
+    let mut source_bytes = 0_usize;
+    for artifact in artifacts {
+        source_bytes = source_bytes.checked_add(artifact.source.len()).ok_or(())?;
+        if source_bytes > MAX_SKILL_SOURCE_BYTES_PER_STEP {
+            return Err(());
+        }
         if artifact.exports.len() > MAX_SKILL_EXPORTS_PER_ARTIFACT {
             return Err(());
         }
@@ -1851,6 +2642,14 @@ fn validate_skill_authority_bounds(request: &RunStep) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "skills")]
+fn validate_skill_cached_artifacts_bounds(artifacts: &[CachedSkillArtifact]) -> Result<(), ()> {
+    validate_skill_artifact_refs(
+        artifacts.len(),
+        artifacts.iter().map(|cached| cached.artifact.as_ref()),
+    )
 }
 
 #[cfg(all(test, feature = "skills"))]
@@ -1877,27 +2676,18 @@ mod skill_authority_bound_tests {
         .unwrap()
     }
 
-    fn step(artifacts: Vec<SkillArtifact>) -> RunStep {
-        RunStep::new("1".into()).with_skills(
-            artifacts,
-            "bounded-worker-turn".into(),
-            "bounded-worker-call".into(),
-        )
-    }
-
     #[test]
     fn worker_rejects_artifact_export_and_total_grant_overflow_before_preparation() {
         let pure = artifact(1, CapabilityManifest::pure());
         assert!(
-            validate_skill_authority_bounds(&step(vec![pure; MAX_SKILL_ARTIFACTS_PER_STEP + 1]))
-                .is_err()
+            validate_skill_artifacts_bounds(&vec![pure; MAX_SKILL_ARTIFACTS_PER_STEP + 1]).is_err()
         );
 
         let too_many_exports = artifact(
             MAX_SKILL_EXPORTS_PER_ARTIFACT + 1,
             CapabilityManifest::pure(),
         );
-        assert!(validate_skill_authority_bounds(&step(vec![too_many_exports])).is_err());
+        assert!(validate_skill_artifacts_bounds(&[too_many_exports]).is_err());
 
         let four_grants = CapabilityManifest::new(
             CapabilityTier::SideEffecting,
@@ -1921,15 +2711,46 @@ mod skill_authority_bound_tests {
         let grant_heavy = artifact(MAX_SKILL_EXPORTS_PER_ARTIFACT, four_grants);
         let artifact_count =
             MAX_SKILL_CAPABILITY_GRANTS_PER_STEP / (MAX_SKILL_EXPORTS_PER_ARTIFACT * 4) + 1;
-        assert!(validate_skill_authority_bounds(&step(vec![grant_heavy; artifact_count])).is_err());
+        assert!(validate_skill_artifacts_bounds(&vec![grant_heavy; artifact_count]).is_err());
+    }
+
+    #[test]
+    fn worker_cache_resolves_ordered_ids_only_within_the_same_turn() {
+        let first = artifact(1, CapabilityManifest::pure());
+        let first_id = first.id.clone();
+        let mut cache = WorkerSkillCache::default();
+        let mut initial = RunStep::new("1".into()).with_skills(
+            vec![first],
+            "cache-turn".into(),
+            "cache-call-1".into(),
+        );
+        let compiled = cache.resolve(&mut initial).unwrap();
+        assert_eq!(compiled.len(), 1);
+        assert!(initial.artifacts.is_empty());
+        assert!(!compiled[0].bytecode.is_empty());
+
+        let mut reference = RunStep::new("1".into());
+        reference.turn_id = "cache-turn".into();
+        reference.tool_call_id = "cache-call-2".into();
+        reference.cached_artifact_ids = vec![first_id.clone()];
+        let reused = cache.resolve(&mut reference).unwrap();
+        assert!(Arc::ptr_eq(&compiled[0].bytecode, &reused[0].bytecode));
+
+        let mut stale = RunStep::new("1".into());
+        stale.turn_id = "different-turn".into();
+        stale.tool_call_id = "cache-call-3".into();
+        stale.cached_artifact_ids = vec![first_id];
+        assert!(cache.resolve(&mut stale).is_err());
     }
 }
 
 fn execute_run_step(
     request: RunStep,
+    #[cfg(feature = "skills")] artifacts: Vec<CachedSkillArtifact>,
     limits: ExecutionLimits,
     effects: Option<ModelEffectDispatcher>,
     _wire_effects: WorkerEffectDispatcher,
+    terminal_requested: Arc<AtomicBool>,
     #[cfg(feature = "skills")] authorize_skill_call: WorkerSkillCallAuthorizer,
 ) -> StepResult {
     let console = Arc::new(Mutex::new(Vec::new()));
@@ -1951,6 +2772,7 @@ fn execute_run_step(
     #[cfg(feature = "skills")]
     let bindings = match prepare_bound_exports(
         &request,
+        &artifacts,
         &capability_runtime,
         event_state.clone(),
         authorize_skill_call,
@@ -1986,10 +2808,13 @@ fn execute_run_step(
         limits,
         console.clone(),
         effects,
+        terminal_requested,
+        request.spawn_available,
+        request.model_effect_profile,
         #[cfg(feature = "skills")]
         proposal_effects,
         #[cfg(feature = "skills")]
-        &request.artifacts,
+        &artifacts,
         #[cfg(feature = "skills")]
         &bindings,
         #[cfg(feature = "skills")]
@@ -2051,8 +2876,11 @@ fn execute_fresh_step(
     limits: ExecutionLimits,
     console: Arc<Mutex<Vec<ConsoleRecord>>>,
     effects: Option<ModelEffectDispatcher>,
+    terminal_requested: Arc<AtomicBool>,
+    spawn_available: bool,
+    model_effect_profile: ModelEffectProfile,
     #[cfg(feature = "skills")] proposal_effects: Option<ModelEffectDispatcher>,
-    #[cfg(feature = "skills")] artifacts: &[super::skills::SkillArtifact],
+    #[cfg(feature = "skills")] artifacts: &[CachedSkillArtifact],
     #[cfg(feature = "skills")] bindings: &std::collections::HashMap<
         String,
         std::collections::HashMap<String, super::realm::BoundExportInvocation>,
@@ -2068,16 +2896,30 @@ fn execute_fresh_step(
     let deadline = Instant::now() + limits.timeout;
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupt_flag = interrupted.clone();
+    let terminal_interrupt = terminal_requested.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
         let expired = Instant::now() >= deadline;
         if expired {
             interrupt_flag.store(true, Ordering::Relaxed);
         }
-        expired
+        expired || terminal_interrupt.load(Ordering::Acquire)
     })));
 
     let context = Context::full(&runtime).map_err(|error| initialization_failure(error, role))?;
-    install_console(&context, console).map_err(|error| {
+    let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
+        ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
+    })?;
+    let functions = load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
+        classify_error(
+            &context,
+            error,
+            deadline,
+            &interrupted,
+            DiagnosticStage::Initialization,
+            role,
+        )
+    })?;
+    install_console(&context, console, functions.console_wrapper.clone()).map_err(|error| {
         classify_error(
             &context,
             error,
@@ -2088,16 +2930,36 @@ fn execute_fresh_step(
         )
     })?;
     if let Some(effects) = effects {
-        install_model_effect_globals(&context, effects).map_err(|error| {
-            classify_error(
+        if model_effect_profile == ModelEffectProfile::Full {
+            install_session_state_globals(
                 &context,
-                error,
-                deadline,
-                &interrupted,
-                DiagnosticStage::Initialization,
-                role,
+                effects.clone(),
+                functions.session_result_wrapper.clone(),
+                functions.scratch_put_wrapper.clone(),
+                functions.scratch_get_wrapper.clone(),
             )
-        })?;
+            .map_err(|error| {
+                classify_error(
+                    &context,
+                    error,
+                    deadline,
+                    &interrupted,
+                    DiagnosticStage::Initialization,
+                    role,
+                )
+            })?;
+        }
+        install_model_effect_globals(&context, effects, spawn_available, model_effect_profile)
+            .map_err(|error| {
+                classify_error(
+                    &context,
+                    error,
+                    deadline,
+                    &interrupted,
+                    DiagnosticStage::Initialization,
+                    role,
+                )
+            })?;
     }
     #[cfg(feature = "skills")]
     if let Some(proposal_effects) = proposal_effects {
@@ -2112,19 +2974,6 @@ fn execute_fresh_step(
             )
         })?;
     }
-    let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
-        ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
-    })?;
-    let functions = load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
-        classify_error(
-            &context,
-            error,
-            deadline,
-            &interrupted,
-            DiagnosticStage::Initialization,
-            role,
-        )
-    })?;
     let clone = functions.strict_clone;
     let string_gate = functions.string_gate;
     let exception_inspector = functions.exception_inspector;
@@ -2136,7 +2985,8 @@ fn execute_fresh_step(
     #[cfg(feature = "skills")]
     let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
     #[cfg(feature = "skills")]
-    for artifact in artifacts {
+    for cached in artifacts {
+        let artifact = cached.artifact.as_ref();
         let artifact_bindings = bindings.get(&artifact.id).cloned().ok_or_else(|| {
             ClosedFailure::error(
                 JsErrorCode::Internal,
@@ -2144,10 +2994,11 @@ fn execute_fresh_step(
                 ScriptRole::SkillSource,
             )
         })?;
-        let loaded = super::realm::load_artifact_with_bound_exports(
+        let loaded = super::realm::load_artifact_with_bound_exports_bytecode(
             &runtime,
             &context,
             artifact,
+            &cached.bytecode,
             capability_runtime.clone(),
             artifact_bindings,
         )
@@ -2209,9 +3060,11 @@ fn execute_fresh_step(
 fn install_console(
     context: &Context,
     records: Arc<Mutex<Vec<ConsoleRecord>>>,
+    wrapper: Persistent<Function<'static>>,
 ) -> rquickjs::Result<()> {
     context.with(|ctx| {
         let console = Object::new(ctx.clone())?;
+        let wrapper = wrapper.restore(&ctx)?;
         for (name, level) in [
             ("log", ConsoleLevel::Log),
             ("warn", ConsoleLevel::Warn),
@@ -2221,8 +3074,7 @@ fn install_console(
             let emit = Function::new(ctx.clone(), move |text: String, truncated: bool| {
                 record_console(&records, level, text, truncated);
             })?;
-            let wrapper: Function = ctx.eval(CONSOLE_WRAPPER_SOURCE)?;
-            let function: Function = wrapper.call((emit,))?;
+            let function: Function = wrapper.clone().call((emit,))?;
             console.set(name, function)?;
         }
         ctx.globals().set("console", console)
@@ -3072,6 +3924,15 @@ fn execute_verification_fake(
             .read_file(&path)
             .map(|content| EffectResult::ReadFile { content })
             .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::ReadFiles { paths } => paths
+            .iter()
+            .map(|path| fakes.read_file(path))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|contents| EffectResult::ReadFiles { contents })
+            .map_err(|_| CapabilityError::DispatchDenied),
+        EffectOperation::ListDir { .. }
+        | EffectOperation::Glob { .. }
+        | EffectOperation::Grep { .. } => Err(CapabilityError::DispatchDenied),
         EffectOperation::WriteFile { path, content } => fakes
             .write_file(&path, &content)
             .map(|()| EffectResult::WriteFile)
@@ -3097,7 +3958,10 @@ fn execute_verification_fake(
                 .map(|body| EffectResult::Fetch { status: 200, body })
                 .map_err(|_| CapabilityError::DispatchDenied)
         }
-        EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
+        EffectOperation::Result { .. }
+        | EffectOperation::ScratchPut { .. }
+        | EffectOperation::ScratchGet { .. }
+        | EffectOperation::ProposeSkill { .. } => Err(CapabilityError::DispatchDenied),
     }
 }
 
@@ -3108,7 +3972,10 @@ fn verification_scope_allows(
 ) -> bool {
     use super::skills::{CapabilityScope, HostCapability, HttpMethod as SkillHttpMethod};
     match operation {
-        EffectOperation::ReadFile { path } => manifest
+        EffectOperation::ReadFile { path }
+        | EffectOperation::ListDir { path }
+        | EffectOperation::Glob { path, .. }
+        | EffectOperation::Grep { path, .. } => manifest
             .scope(HostCapability::ReadFile)
             .and_then(|scope| match scope {
                 CapabilityScope::ReadFile { workspace_prefixes } => Some(workspace_prefixes),
@@ -3118,6 +3985,19 @@ fn verification_scope_allows(
                 prefixes
                     .iter()
                     .any(|prefix| virtual_path_in_scope(prefix, path))
+            }),
+        EffectOperation::ReadFiles { paths } => manifest
+            .scope(HostCapability::ReadFile)
+            .and_then(|scope| match scope {
+                CapabilityScope::ReadFile { workspace_prefixes } => Some(workspace_prefixes),
+                _ => None,
+            })
+            .is_some_and(|prefixes| {
+                paths.iter().all(|path| {
+                    prefixes
+                        .iter()
+                        .any(|prefix| virtual_path_in_scope(prefix, path))
+                })
             }),
         EffectOperation::WriteFile { path, .. } => manifest
             .scope(HostCapability::WriteFile)
@@ -3159,7 +4039,10 @@ fn verification_scope_allows(
                         })
                 })
         }
-        EffectOperation::ProposeSkill { .. } => false,
+        EffectOperation::Result { .. }
+        | EffectOperation::ScratchPut { .. }
+        | EffectOperation::ScratchGet { .. }
+        | EffectOperation::ProposeSkill { .. } => false,
     }
 }
 

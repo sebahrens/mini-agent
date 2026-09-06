@@ -1,4 +1,4 @@
-use crate::agent::tools::crc::{crc32, crc32_hex};
+use crate::agent::tools::crc::{Crc32, crc32, crc32_hex};
 
 #[test]
 fn test_crc32_empty() {
@@ -23,4 +23,14 @@ fn test_crc32_different() {
     let a = crc32(b"hello");
     let b = crc32(b"world");
     assert_ne!(a, b);
+}
+
+#[test]
+fn incremental_crc32_matches_one_shot_hashing() {
+    let mut crc = Crc32::new();
+    crc.update(b"hello");
+    crc.update(b" ");
+    crc.update(b"world");
+
+    assert_eq!(crc.finalize(), crc32(b"hello world"));
 }

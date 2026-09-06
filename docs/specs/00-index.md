@@ -70,22 +70,21 @@ for status claims. No amendment changes the Phase 6 canonical checklist.
 | Amendment | Owning spec | Bead |
 |-----------|-------------|------|
 | Async evaluation of model script; documented script semantics and limits | Phase 6 | mini-agent-ml1u, mini-agent-7w1l |
-| Closed exception class and validated line/column in diagnostics (protocol v4) | Phase 6 | mini-agent-m2kw |
+| Closed exception class and validated line/column in diagnostics (introduced in protocol v4; retained by v8) | Phase 6 | mini-agent-m2kw |
 | Effect-count exhaustion as a bounded step error | Phase 6 | mini-agent-12cr |
 | Read-only `list_dir`/`glob`/`grep` effects and batched `read_files` | Phase 6 (narrowing per Phase 2) | mini-agent-w2lv, mini-agent-ae65 |
 | Distinct closed denial codes; permission-wait rendering | Phase 6 | mini-agent-dr93, mini-agent-osaj |
 | Typed result channel and parent-owned JSON scratch store (design gate) | Phase 6 | mini-agent-yl18 |
 | Deterministic backend disables dense retrieval; OR/BM25 lexical query | Phase 3 | mini-agent-bfsg, mini-agent-io7h |
 | Skill context outside persisted user text; callable-export manifest | Phase 3 | mini-agent-rd89, mini-agent-4bqq |
+| Bounded model-issued `skills_search` metadata query and tool-boundary refreeze | Phase 3 | mini-agent-a8a0 |
 | Operator surface (import/approve/reject/stats) and seed library | Phase 4 | mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t |
 | Fault-only quarantine, canary ordering, WAL/immediate transactions, corrupt-row skipping | Phase 5 | mini-agent-lugc, mini-agent-840z, mini-agent-pwf2, mini-agent-jj8b |
 
-**Open decision.** The cross-phase invariant "Phase 3 retrieval must be driven by the current
-user prompt before model generation; generated JavaScript is never the retrieval query" remains
-in force. mini-agent-a8a0 proposes a bounded, model-issued `skills_search` effect that returns
-metadata only and never injects source into the frozen turn bundle. Adopting it requires an
-explicit amendment to that invariant in this index; until then it is a proposal, not an accepted
-amendment.
+**Accepted retrieval amendment.** The current user prompt remains the primary initial query and
+generated JavaScript is never an implicit retrieval query. A bounded, explicit model-issued
+`skills_search(query)` may return metadata only and refreeze the bundle at its tool-result boundary;
+it never injects source or grants authority.
 
 ## Feature relationships
 

@@ -142,6 +142,13 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
+        #[cfg(feature = "subagents")]
+        AgentEvent::SubagentStarted { agent_type, source } => {
+            renderer.write_line(
+                &sanitize_output(&format!("⌥ specialist {agent_type} ({source})")),
+                C_TOOL,
+            )?;
+        }
         AgentEvent::ToolResult { id, name, output } => {
             let (_, artifact) = ui
                 .session
@@ -150,7 +157,10 @@ pub async fn handle_agent_event(
                 pending.record_tool_output(path);
             }
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
-            if name == "todo_write" {
+            if crate::agent::runner::is_tool_loop_notice(&output) {
+                // The following ToolLoop event renders the diagnostic with a
+                // dedicated style; keep this event for canonical persistence.
+            } else if name == "todo_write" {
                 renderer.write_line(&sanitize_output(&output), C_TOOL)?;
             } else {
                 let show_details = ui
@@ -190,6 +200,18 @@ pub async fn handle_agent_event(
                 }
             }
         }
+        AgentEvent::ToolLoop { name, message } => {
+            run.was_reasoning = false;
+            finalize_response_segment(renderer, run)?;
+            if run.agent_line_started {
+                renderer.write_line("", Color::White)?;
+                run.agent_line_started = false;
+            }
+            renderer.write_line(
+                &sanitize_output(&format!("◈ loop guard ({name}): {message}")),
+                Color::Yellow,
+            )?;
+        }
         AgentEvent::Verification {
             attempt,
             max,
@@ -222,6 +244,7 @@ pub async fn handle_agent_event(
             response,
             interactions,
         } => {
+            run.pending_compaction_pressure = None;
             handle_agent_done(
                 response,
                 interactions,
@@ -237,9 +260,16 @@ pub async fn handle_agent_event(
         AgentEvent::UsageDelta {
             usage,
             context_complete,
+            ..
         } => {
             let anthropic_native = ui.cfg.is_anthropic_native(&ui.session.provider);
-            apply_usage_delta(ui.session, usage, anthropic_native, context_complete);
+            apply_usage_delta(
+                ui.session,
+                usage,
+                anthropic_native,
+                context_complete,
+                run.request_tool_results_cleared,
+            );
         }
         AgentEvent::Retrying { attempt, max } => {
             run.was_reasoning = false;
@@ -251,13 +281,16 @@ pub async fn handle_agent_event(
             run.response_start_block = None;
             renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
         }
+        AgentEvent::CompactionBoundary { .. } => {}
         AgentEvent::Error(e) => {
             run.was_reasoning = false;
             run.is_running = false;
+            run.pending_compaction_pressure = None;
             if let Some(ss) = ui.status_signals.as_ref() {
                 ss.send_stop();
             }
             run.agent_rx = None;
+            run.compaction_decision_tx = None;
             run.agent_line_started = false;
             finalize_response_segment(renderer, run)?;
             crate::ui::preserve_pending_main_turn_progress(run, ui.session);
@@ -276,6 +309,7 @@ fn apply_usage_delta(
     usage: crate::event::UsageDelta,
     anthropic_native: bool,
     context_complete: bool,
+    cleared_tool_results: usize,
 ) {
     // Real provider-reported usage is the status/context source of truth. Use
     // the cache-inclusive prompt size for native Anthropic cache hits.
@@ -293,7 +327,11 @@ fn apply_usage_delta(
         if real > session.total_estimated_tokens {
             session.total_estimated_tokens = real;
         }
-        session.set_calibration(context_input_tokens, usage.output_tokens);
+        session.set_calibration_with_cleared_tool_results(
+            context_input_tokens,
+            usage.output_tokens,
+            cleared_tool_results,
+        );
     }
 }
 
@@ -384,7 +422,10 @@ async fn handle_agent_done(
 
     if should_auto_compact_between_turns(
         ui.cfg.resolve_compact_enabled(),
-        ui.session.needs_compaction(reserve),
+        ui.session.needs_compaction_after_tool_result_pruning(
+            reserve,
+            ui.cfg.resolve_keep_recent_tool_results(),
+        ),
         loop_running,
     ) {
         let compress_result = handle_compress(None, true, run, renderer, ui, true).await;
@@ -404,6 +445,7 @@ async fn handle_agent_done(
         ss.send_stop();
     }
     run.agent_rx = None;
+    run.compaction_decision_tx = None;
 
     #[cfg(feature = "loop")]
     if let Some(ls) = chain.loop_state.as_mut()
@@ -535,6 +577,7 @@ async fn finish_loop_iteration(
             .rebuild_agent(&ui.session.model, true)
             .await,
     );
+    run.request_tool_results_cleared = 0;
     let runner = run
         .agent
         .as_ref()
@@ -551,6 +594,7 @@ async fn finish_loop_iteration(
             }),
         )
         .await;
+    run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
     run.is_running = true;
@@ -622,8 +666,8 @@ mod tests {
             ..UsageDelta::default()
         };
 
-        apply_usage_delta(&mut session, first, true, true);
-        apply_usage_delta(&mut session, second, true, true);
+        apply_usage_delta(&mut session, first, true, true, 0);
+        apply_usage_delta(&mut session, second, true, true, 0);
 
         assert_eq!(session.total_input_tokens, 30);
         assert_eq!(session.total_output_tokens, 6);
@@ -656,6 +700,7 @@ mod tests {
             },
             true,
             false,
+            0,
         );
         assert_eq!(session.total_output_tokens, 8);
         assert_eq!(
@@ -684,6 +729,7 @@ mod tests {
             },
             true,
             true,
+            0,
         );
 
         assert_eq!(session.total_input_tokens, u64::MAX);

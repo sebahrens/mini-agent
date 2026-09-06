@@ -92,6 +92,7 @@ fn interactive_turn_persists_each_tool_interaction_once() {
         session.messages[2].tool,
         Some(PersistedToolMessage::Result {
             output: "fn main() {}".into(),
+            artifact_path: None,
         })
     );
 }
@@ -145,6 +146,7 @@ fn headless_turn_persists_tool_records_before_assistant_message() {
         session.messages[2].tool,
         Some(PersistedToolMessage::Result {
             output: "fn main() {}".into(),
+            artifact_path: None,
         })
     );
 }

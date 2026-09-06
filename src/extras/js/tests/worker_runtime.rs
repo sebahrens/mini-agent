@@ -341,6 +341,67 @@ async fn worker_runtime_allows_exactly_the_effect_limit() {
 }
 
 #[tokio::test]
+async fn worker_runtime_read_files_uses_one_ordered_effect_request() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(2)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new("read_files(['first.txt', 'second.txt', 'third.txt']).join('|')".into())
+                .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("batched reads should complete");
+
+    assert_eq!(
+        result.outcome,
+        StepOutcome::Value("content:first.txt|content:second.txt|content:third.txt".into())
+    );
+    assert_eq!(*witness.ordinals.lock().unwrap(), vec![0]);
+    assert_eq!(
+        *witness.operations.lock().unwrap(),
+        vec![EffectOperation::ReadFiles {
+            paths: vec!["first.txt".into(), "second.txt".into(), "third.txt".into()],
+        }]
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_runtime_read_files_rejects_invalid_batch_before_dispatch() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let effects = RecordingEffects::default();
+    let witness = effects.clone();
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(3)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "let empty; try { read_files([]); } catch (e) { empty = e.code; } \
+                 let large; try { read_files(Array(257).fill('x')); } catch (e) { large = e.code; } \
+                 `${empty},${large}`"
+                    .into(),
+            )
+            .with_model_grant(grant_id),
+            effects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("invalid batches should be catchable");
+
+    assert_eq!(
+        result.outcome,
+        StepOutcome::Value("invalid_target,too_large".into())
+    );
+    assert!(witness.ordinals.lock().unwrap().is_empty());
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
 async fn worker_runtime_effect_limit_returns_terminal_with_console_and_recovers() {
     let supervisor =
         JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
@@ -1495,6 +1556,7 @@ fn worker_bootstrap_initializes_no_parent_authority_surface() {
 #[derive(Clone, Default)]
 struct RecordingEffects {
     ordinals: Arc<Mutex<Vec<u32>>>,
+    operations: Arc<Mutex<Vec<EffectOperation>>>,
 }
 
 impl InvocationEffectHandler for RecordingEffects {
@@ -1504,9 +1566,21 @@ impl InvocationEffectHandler for RecordingEffects {
         _cancellation: PermCancellation,
     ) -> EffectFuture<'_> {
         self.ordinals.lock().unwrap().push(request.effect_ordinal);
+        self.operations
+            .lock()
+            .unwrap()
+            .push(request.operation.clone());
         Box::pin(async move {
-            EffectResult::ReadFile {
-                content: format!("effect-{}", request.effect_ordinal),
+            match request.operation {
+                EffectOperation::ReadFiles { paths } => EffectResult::ReadFiles {
+                    contents: paths
+                        .into_iter()
+                        .map(|path| format!("content:{path}"))
+                        .collect(),
+                },
+                _ => EffectResult::ReadFile {
+                    content: format!("effect-{}", request.effect_ordinal),
+                },
             }
         })
     }
@@ -2274,6 +2348,56 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
             .unwrap()
             .is_cancelled()
     );
+    assert_eq!(
+        execute_success(&supervisor).await.outcome,
+        StepOutcome::Value("success".into())
+    );
+    launcher.wait_for_live_processes(1).await;
+    supervisor.shutdown_for_test().await.unwrap();
+    launcher.wait_for_live_processes(0).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
+    let (supervisor, launcher) =
+        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(1));
+    let gated = GatedEffects::new();
+    let cancellation = PermCancellation::new();
+    let _permission_prompt = cancellation.begin_permission_prompt();
+    let task_supervisor = supervisor.clone();
+    let task_effects = gated.clone();
+    let task = tokio::spawn(async move {
+        task_supervisor
+            .execute(
+                RunStep::new("effect-pending".into()),
+                task_effects,
+                cancellation,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), gated.wait_started())
+        .await
+        .expect("fake permission-gated effect did not become pending");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    gated.release();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("permission wait escaped the invocation deadline")
+            .unwrap(),
+        Err(WorkerError::PermissionPromptTimedOut)
+    );
+    assert!(
+        gated
+            .cancellation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+
     assert_eq!(
         execute_success(&supervisor).await.outcome,
         StepOutcome::Value("success".into())

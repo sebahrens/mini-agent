@@ -237,11 +237,16 @@ OpenRouter is the default provider and can also be configured directly:
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-..."
 mini-agent -p "Explain this repository's architecture"
+
+# Emit one machine-readable result (final text, changed files, tool/usage stats, and cost)
+mini-agent -p --output json "Update the README example"
 ```
 
 See [Getting started](docs/agent/GET_STARTED.md),
 [provider configuration](docs/agent/PROVIDERS.md), and
-[the complete configuration reference](docs/agent/CONFIG.md).
+[the complete configuration reference](docs/agent/CONFIG.md). Contributors can
+also run the [deterministic harness evaluation](docs/agent/HARNESS_EVAL.md) for
+task-level regression coverage without a live provider.
 
 ## Feature flags
 

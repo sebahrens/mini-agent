@@ -1,7 +1,7 @@
 use compact_str::CompactString;
 
 use crate::agent::tools;
-use crate::cli::Cli;
+use crate::cli::{Cli, OutputFormat};
 use crate::config::{self, Config};
 use crate::context::{self, ContextFiles};
 use crate::extras::status_signals::StatusSignals;
@@ -314,6 +314,8 @@ pub(crate) struct Startup {
     pub arch_msg: Option<String>,
     pub session_resumed: bool,
     pub resume_override_pending: bool,
+    #[cfg(feature = "hooks")]
+    session_start_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRouterModelInfo>;
@@ -348,12 +350,18 @@ fn headless_compaction_plan(
     let reserve = crate::extras::memory::effective_reserve(configured_reserve, memory);
     #[cfg(not(feature = "memory"))]
     let reserve = configured_reserve;
-    if !session.needs_compaction_with_pending(reserve, pending_tokens) {
+    if !session.needs_compaction_with_pending_after_tool_result_pruning(
+        reserve,
+        pending_tokens,
+        cfg.resolve_keep_recent_tool_results(),
+    ) {
         return None;
     }
 
     let keep_recent = cfg.resolve_keep_recent_tokens(session.context_window);
-    let cut_idx = Session::select_compaction_cut(&session.messages, keep_recent);
+    let projected =
+        session.context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results());
+    let cut_idx = Session::select_compaction_cut(&projected, keep_recent);
     if cut_idx == 0 {
         return None;
     }
@@ -393,6 +401,7 @@ async fn compact_headless_session_if_needed(
                     None,
                     input_token_budget,
                     response_token_budget,
+                    &cfg.retry,
                 )
                 .await
         },
@@ -434,7 +443,10 @@ where
 
     eprintln!("auto-compacting headless session...");
     let model = session.model.to_string();
-    let messages = session.messages[..plan.cut_idx].to_vec();
+    let messages = session
+        .context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results())
+        [..plan.cut_idx]
+        .to_vec();
     let previous_summary = session
         .compactions
         .last()
@@ -769,6 +781,8 @@ impl Startup {
             arch_msg: None,
             session_resumed,
             resume_override_pending,
+            #[cfg(feature = "hooks")]
+            session_start_task: None,
         })
     }
 
@@ -825,7 +839,8 @@ impl Startup {
             let qm = config::quick_models_map(&self.cfg);
 
             // Resolve subagent model: subagent_model config > subagent_provider + model > main model
-            let (sub_provider, mut sub_model) = if let Some(sa_model) = &self.cfg.subagent_model {
+            let (mut sub_provider, mut sub_model) = if let Some(sa_model) = &self.cfg.subagent_model
+            {
                 if let Some(q) = qm.get(sa_model.as_str()) {
                     (q.provider.clone(), q.model.clone())
                 } else {
@@ -862,6 +877,7 @@ impl Startup {
                             e,
                             self.provider
                         );
+                        sub_provider = self.provider.clone();
                         sub_model = self.model.clone();
                         self.client.clone()
                     }
@@ -870,7 +886,9 @@ impl Startup {
 
             crate::extras::subagents::init(
                 sub_client,
+                sub_provider.to_string(),
                 sub_model.to_string(),
+                self.cli.api_key.clone(),
                 task_max_turns,
                 self.cfg.clone(),
             );
@@ -1105,15 +1123,20 @@ impl Startup {
             }
         }
 
-        // `SessionStart` fires here once `session_resumed` is known.
+        // `SessionStart` begins once `session_resumed` is known. Interactive
+        // startup joins it only after the independent agent/MCP prebuild has
+        // started, so slow hooks do not serialize those cold-start paths.
         #[cfg(feature = "hooks")]
         {
             let source = if self.session_resumed {
                 "resume"
             } else {
                 "startup"
-            };
-            crate::extras::hooks::dispatch_session_start(source).await;
+            }
+            .to_string();
+            self.session_start_task = Some(tokio::spawn(async move {
+                crate::extras::hooks::dispatch_session_start(&source).await;
+            }));
         }
 
         // ARCHITECTURE.md prompt
@@ -1141,14 +1164,14 @@ impl Startup {
 
         // Default prompt resolution (after prompts may have been regenerated)
         {
-            let default_prompt = self.cfg.default_prompt.as_deref().unwrap_or("code");
-            if let Some(content) = self.context.prompts.get(default_prompt) {
-                let (mode_directive, clean_content) = crate::permission::parse_prompt_mode(content);
-                let mut prompt_text = if mode_directive.is_some() {
-                    clean_content.to_string()
-                } else {
-                    content.clone()
-                };
+            let default_prompt = self
+                .cfg
+                .default_prompt
+                .as_deref()
+                .unwrap_or("code")
+                .to_string();
+            if self.context.activate_prompt(&default_prompt).is_some() {
+                let mut prompt_text = self.context.current_prompt.take().unwrap_or_default();
 
                 let caps: &[&str] = &[
                     #[cfg(feature = "memory")]
@@ -1164,11 +1187,10 @@ impl Startup {
                 }
 
                 self.context.current_prompt = Some(prompt_text);
-                self.context.current_prompt_name = Some(default_prompt.to_string());
 
                 if !self.session_resumed {
                     apply_startup_prompt_model(
-                        default_prompt,
+                        &default_prompt,
                         &self.cfg,
                         &mut self.provider,
                         &mut self.model,
@@ -1180,13 +1202,8 @@ impl Startup {
 
         // --load-prompt overrides the default prompt
         if let Some(ref name) = self.cli.load_prompt {
-            if let Some(content) = self.context.prompts.get(name) {
-                let (mode_directive, clean_content) = crate::permission::parse_prompt_mode(content);
-                let mut prompt_text = if mode_directive.is_some() {
-                    clean_content.to_string()
-                } else {
-                    content.clone()
-                };
+            if self.context.activate_prompt(name).is_some() {
+                let mut prompt_text = self.context.current_prompt.take().unwrap_or_default();
 
                 let caps: &[&str] = &[
                     #[cfg(feature = "memory")]
@@ -1202,7 +1219,6 @@ impl Startup {
                 }
 
                 self.context.current_prompt = Some(prompt_text);
-                self.context.current_prompt_name = Some(name.clone());
 
                 if !self.session_resumed {
                     apply_startup_prompt_model(
@@ -1310,10 +1326,18 @@ impl Startup {
             self.resume_override_pending = false;
         }
         if self.cli.print {
+            #[cfg(feature = "hooks")]
+            if let Some(task) = self.session_start_task.take() {
+                let _ = task.await;
+            }
             self.dispatch_print().await
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
+                #[cfg(feature = "hooks")]
+                if let Some(task) = self.session_start_task.take() {
+                    let _ = task.await;
+                }
                 return self.dispatch_loop().await;
             }
 
@@ -1323,6 +1347,12 @@ impl Startup {
 
     async fn dispatch_print(mut self) -> anyhow::Result<()> {
         let msg = self.cli.message.join(" ");
+        let json_output = self.cli.output_format() == OutputFormat::Json;
+        let change_baseline = if json_output {
+            crate::print::capture_workspace_change_baseline(self.workspace.root()).await
+        } else {
+            None
+        };
         if msg.starts_with('!') {
             if msg
                 .strip_prefix('!')
@@ -1334,7 +1364,31 @@ impl Startup {
                     .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None)
                     .await?;
                 let result = run.rendered_output();
-                println!("{}", result);
+                let rendered_json = if json_output {
+                    let files_changed = crate::print::files_changed_since(
+                        self.workspace.root(),
+                        change_baseline.as_ref(),
+                        &[],
+                    )
+                    .await;
+                    Some(crate::print::render_headless_json(
+                        self.workspace.root(),
+                        &result,
+                        &[],
+                        rig::completion::Usage::default(),
+                        files_changed,
+                        crate::print::HeadlessPricing {
+                            anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
+                            input_token_cost: self.session.input_token_cost,
+                            output_token_cost: self.session.output_token_cost,
+                        },
+                    )?)
+                } else {
+                    None
+                };
+                if !json_output {
+                    println!("{result}");
+                }
                 if !self.cli.no_session {
                     let mut session = self.session;
                     session.add_message(MessageRole::User, &msg);
@@ -1348,6 +1402,9 @@ impl Startup {
                     ) {
                         eprintln!("warning: failed to append chat history entry: {}", e);
                     }
+                }
+                if let Some(json) = rendered_json {
+                    println!("{json}");
                 }
             } else {
                 eprintln!("error: empty command after '!'");
@@ -1388,6 +1445,7 @@ impl Startup {
             let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
             let completion_model = self.client.completion_model(self.model.to_string());
             let read_tracker = self.session.read_tracker.clone();
+            let todo_store = self.session.todos.clone();
             #[cfg(feature = "mcp")]
             let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
                 None
@@ -1407,9 +1465,14 @@ impl Startup {
                 None,
                 self.sandbox.clone(),
                 read_tracker,
+                todo_store,
+                &self.session.id,
+                Some(self.session.tool_result_spills.clone()),
                 true,
                 temperature,
                 extra_body,
+                #[cfg(feature = "js")]
+                self.session.js_session_state.clone(),
                 #[cfg(feature = "skills")]
                 std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
                 #[cfg(feature = "mcp")]
@@ -1431,11 +1494,15 @@ impl Startup {
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_start();
             }
-            let history = crate::agent::runner::convert_history(&self.session);
+            let history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                &self.session,
+                self.cfg.resolve_keep_recent_tool_results(),
+            );
             let response_result = agent
                 .run_print(
                     &msg,
-                    self.cli.pure_stdout,
+                    self.cli.pure_stdout && !json_output,
+                    !json_output,
                     &self.cfg.retry,
                     history,
                     #[cfg(feature = "hooks")]
@@ -1446,6 +1513,28 @@ impl Startup {
                 ss.send_stop();
             }
             let (response, usage, interactions) = response_result?;
+            let rendered_json = if json_output {
+                let files_changed = crate::print::files_changed_since(
+                    self.workspace.root(),
+                    change_baseline.as_ref(),
+                    &interactions,
+                )
+                .await;
+                Some(crate::print::render_headless_json(
+                    self.workspace.root(),
+                    &response,
+                    &interactions,
+                    usage,
+                    files_changed,
+                    crate::print::HeadlessPricing {
+                        anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
+                        input_token_cost: self.session.input_token_cost,
+                        output_token_cost: self.session.output_token_cost,
+                    },
+                )?)
+            } else {
+                None
+            };
             if !self.cli.no_session {
                 let mut session = self.session;
                 // Prompt, then tool calls/results in provider order, then the
@@ -1461,6 +1550,9 @@ impl Startup {
                         timestamp: session.updated_at.clone(),
                     });
             }
+            if let Some(json) = rendered_json {
+                println!("{json}");
+            }
         }
 
         #[cfg(feature = "hooks")]
@@ -1475,6 +1567,7 @@ impl Startup {
         let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         let read_tracker = self.session.read_tracker.clone();
+        let todo_store = self.session.todos.clone();
         #[cfg(feature = "mcp")]
         let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
             None
@@ -1493,9 +1586,14 @@ impl Startup {
             None,
             self.sandbox.clone(),
             read_tracker,
+            todo_store,
+            &self.session.id,
+            Some(self.session.tool_result_spills.clone()),
             true,
             temperature,
             extra_body,
+            #[cfg(feature = "js")]
+            self.session.js_session_state.clone(),
             #[cfg(feature = "skills")]
             std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             #[cfg(feature = "mcp")]
@@ -1533,6 +1631,8 @@ impl Startup {
             arch_msg,
             #[cfg(feature = "advisor")]
             handoff_rx,
+            #[cfg(feature = "hooks")]
+            session_start_task,
             ..
         } = self;
 
@@ -1556,6 +1656,8 @@ impl Startup {
             auto_trigger_msg,
             #[cfg(feature = "advisor")]
             handoff_rx,
+            #[cfg(feature = "hooks")]
+            session_start_task,
         )
         .await?;
 

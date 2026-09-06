@@ -155,33 +155,24 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
 
 #[test]
 fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
-    let (paths, mut store, predecessor, candidate) = fixture();
+    let (paths, store, predecessor, candidate) = fixture();
     let embedder = std::sync::Arc::new(Embedder::new().unwrap());
-    let model = embedder.model_metadata();
-    store
-        .conn_mut()
-        .execute(
-            "INSERT INTO skill_embeddings (
-                skill_id, model_id, model_revision, dimensions,
-                normalized, embedding, created_at
-             ) VALUES (?, ?, ?, ?, 1, x'00', 0)",
-            rusqlite::params![
-                candidate.id,
-                model.model_id,
-                model.model_revision,
-                model.dimensions as i64,
-            ],
-        )
-        .unwrap();
     drop(store);
     let coordinator = IndexCoordinator::open(&paths, embedder).unwrap();
     coordinator.rebuild_and_publish().unwrap();
     assert!(coordinator.lease().unwrap().contains_id(&predecessor.id));
     // A malformed row is now treated as missing and repaired. Keep this test's
-    // publication-failure contract by making the repair write itself fail only
-    // after the initial active generation has been built.
-    SkillStore::open_at(&paths)
-        .unwrap()
+    // publication-failure contract by corrupting the candidate after the initial
+    // generation has been built, then making the repair write itself fail.
+    let mut failure_store = SkillStore::open_at(&paths).unwrap();
+    failure_store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_embeddings SET embedding = x'00' WHERE skill_id = ?",
+            [&candidate.id],
+        )
+        .unwrap();
+    failure_store
         .conn_mut()
         .execute_batch(
             "CREATE TRIGGER fail_embedding_repair
@@ -191,6 +182,7 @@ fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
              END;",
         )
         .unwrap();
+    drop(failure_store);
     let report = coordinator
         .coordinate_mutation(
             std::collections::HashSet::from([predecessor.id.clone()]),

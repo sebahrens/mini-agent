@@ -63,6 +63,10 @@ pub struct McpClientManager {
     /// agent construction, so these are kept behind a mutex and drained
     /// together with `notices` by [`Self::take_notices`].
     tool_notices: Mutex<Vec<CompactString>>,
+    /// Opaque private-storage scope shared by every tool collected from this
+    /// manager. MCP calls do not own a durable mini-agent Session, so their
+    /// oversized result artifacts use a process-manager scope instead.
+    spill_scope: CompactString,
 }
 
 impl McpClientManager {
@@ -73,6 +77,7 @@ impl McpClientManager {
             handles,
             notices: Vec::new(),
             tool_notices: Mutex::new(Vec::new()),
+            spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -81,6 +86,7 @@ impl McpClientManager {
             handles,
             notices,
             tool_notices: Mutex::new(Vec::new()),
+            spill_scope: CompactString::new(uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -242,17 +248,50 @@ impl McpClientManager {
             match result {
                 Ok(tools) => {
                     tracing::debug!("MCP server '{}': {} tools listed", server_name, tools.len(),);
+                    let reached_tool_cap = tools.len() == client::MCP_LIST_TOOLS_MAX_TOOLS;
+                    let mut truncated_descriptions = 0usize;
+                    let mut rejected_schemas = 0usize;
                     for definition in tools {
+                        let (model_description, model_parameters, description_truncated) =
+                            match McpTool::bounded_model_metadata(&definition) {
+                                Ok(metadata) => metadata,
+                                Err(_) => {
+                                    rejected_schemas += 1;
+                                    continue;
+                                }
+                            };
+                        truncated_descriptions += usize::from(description_truncated);
                         all_tools.push(McpTool {
                             server_name: server_name.clone(),
                             trusted_identity,
                             registered_name: CompactString::new(definition.name.as_ref()),
                             definition,
+                            model_description,
+                            model_parameters,
                             peer: peer.clone(),
                             permission: permission.clone(),
                             ask_tx: ask_tx.clone(),
                             call_timeout: timeouts.call,
+                            spill_scope: self.spill_scope.clone(),
                         });
+                    }
+                    if reached_tool_cap {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' tool catalog is limited to at most {} tools",
+                            client::MCP_LIST_TOOLS_MAX_TOOLS,
+                        ));
+                    }
+                    if truncated_descriptions > 0 {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' had {truncated_descriptions} tool description(s) truncated to {} bytes",
+                            tool::MCP_TOOL_DESCRIPTION_MAX_BYTES,
+                        ));
+                    }
+                    if rejected_schemas > 0 {
+                        self.push_tool_notice(format!(
+                            "MCP server '{server_name}' had {rejected_schemas} tool(s) omitted because their input schema was invalid or exceeded {} bytes",
+                            tool::MCP_TOOL_SCHEMA_MAX_BYTES,
+                        ));
                     }
                 }
                 Err(rmcp::ServiceError::Timeout { .. }) => {

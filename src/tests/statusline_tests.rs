@@ -44,6 +44,23 @@ fn default_statusline_shows_core_items() {
 }
 
 #[test]
+fn cache_hit_ratio_uses_normalized_prompt_tokens() {
+    let mut session = Session::new("anthropic", "claude", 200_000, "");
+    session.total_cached_input_tokens = 75;
+    session.total_real_input_tokens = 100;
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("cache_hit_ratio")],
+        }],
+    };
+
+    assert_eq!(
+        line_text(&statusline::build_lines(&spec, &session, &ctx())[0]),
+        "cache:75%"
+    );
+}
+
+#[test]
 fn background_job_count_is_visible_and_cache_bound() {
     let spec = StatusLineConfig {
         lines: vec![StatusLineLine {

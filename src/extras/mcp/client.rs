@@ -35,6 +35,8 @@ pub(crate) const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on `tools/list` pages so a server that keeps returning a cursor cannot
 /// spin the enumeration loop forever within the time budget.
 pub(crate) const MCP_LIST_TOOLS_MAX_PAGES: usize = 64;
+/// Maximum number of model-visible tools accepted from one server.
+pub(crate) const MCP_LIST_TOOLS_MAX_TOOLS: usize = 128;
 const MCP_STDERR_LIMIT: usize = 8 * 1024;
 const MCP_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -372,8 +374,14 @@ pub(crate) async fn list_all_tools_bounded(
             Err(ServiceError::Timeout { .. }) => return Err(ServiceError::Timeout { timeout }),
             Err(error) => return Err(error),
         };
-        tools.extend(result.tools);
+        let reached_tool_cap = extend_tools_capped(&mut tools, result.tools);
         pages += 1;
+        if reached_tool_cap {
+            tracing::debug!(
+                "MCP tools/list stopped after reaching the {MCP_LIST_TOOLS_MAX_TOOLS}-tool cap"
+            );
+            break;
+        }
         match result.next_cursor {
             None => break,
             Some(_) if pages >= MCP_LIST_TOOLS_MAX_PAGES => {
@@ -386,6 +394,12 @@ pub(crate) async fn list_all_tools_bounded(
         }
     }
     Ok(tools)
+}
+
+fn extend_tools_capped(tools: &mut Vec<Tool>, page: Vec<Tool>) -> bool {
+    let remaining = MCP_LIST_TOOLS_MAX_TOOLS.saturating_sub(tools.len());
+    tools.extend(page.into_iter().take(remaining));
+    tools.len() >= MCP_LIST_TOOLS_MAX_TOOLS
 }
 
 /// `tools/call` bounded by `timeout`. On expiry rmcp notifies the server that
@@ -800,5 +814,25 @@ mod tests {
                 .to_string()
                 .contains("username or password")
         );
+    }
+
+    #[test]
+    fn paginated_tool_collection_never_exceeds_the_per_server_cap() {
+        let tool = || {
+            serde_json::from_value::<rmcp::model::Tool>(serde_json::json!({
+                "name": "probe",
+                "inputSchema": {"type": "object"}
+            }))
+            .unwrap()
+        };
+        let mut tools = (0..100).map(|_| tool()).collect::<Vec<_>>();
+
+        assert!(super::extend_tools_capped(
+            &mut tools,
+            (0..100).map(|_| tool()).collect(),
+        ));
+        assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
+        assert!(super::extend_tools_capped(&mut tools, vec![tool()]));
+        assert_eq!(tools.len(), super::MCP_LIST_TOOLS_MAX_TOOLS);
     }
 }

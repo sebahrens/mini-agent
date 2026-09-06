@@ -34,9 +34,9 @@ use crate::context::ContextFiles;
 use crate::event::UserEvent;
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
+use crate::permission::SecurityMode;
 use crate::permission::ask::AskReceiver;
 use crate::permission::checker::PermCheck;
-use crate::permission::{self, SecurityMode};
 use crate::process_creation::StdCommandCreationExt;
 use crate::provider::AnyAgent;
 use crate::session::{MessageRole, Session};
@@ -63,25 +63,51 @@ pub(crate) enum PromptModeOutcome {
     Applied(SecurityMode),
 }
 
-/// Select prompt `name` as the current prompt and apply its `%%mode=`
-/// directive (if any) to the permission checker. The directive line is
-/// stripped from the stored prompt content. Unknown prompt names are a no-op.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MainAgentOutcome {
+    pub(crate) default_prompt: Option<String>,
+    pub(crate) prompt_applied: bool,
+    pub(crate) prompt_mode: PromptModeOutcome,
+}
+
+/// Select a persona for the main loop. If its frontmatter names a prompt mode,
+/// activate that mode through the normal prompt path while keeping the
+/// explicit persona authoritative over a conflicting `%%agent=` directive.
+pub(crate) fn apply_main_agent(
+    name: &str,
+    context: &mut ContextFiles,
+    permission: &Option<PermCheck>,
+) -> Option<MainAgentOutcome> {
+    let default_prompt = context.activate_agent(name)?;
+    let (prompt_applied, prompt_mode) = match default_prompt.as_deref() {
+        Some(prompt) if context.prompts.contains_key(prompt) => {
+            let outcome = apply_prompt_mode(prompt, context, permission);
+            context.current_agent_name = Some(name.to_string());
+            context.current_agent_explicit = true;
+            (true, outcome)
+        }
+        _ => (false, PromptModeOutcome::None),
+    };
+    Some(MainAgentOutcome {
+        default_prompt,
+        prompt_applied,
+        prompt_mode,
+    })
+}
+
+/// Select prompt `name` as the current prompt, compose its optional
+/// `%%agent=` persona, and apply its optional `%%mode=` directive to the
+/// permission checker. Header directives are stripped from the stored prompt
+/// content. Unknown prompt names are a no-op.
 pub(crate) fn apply_prompt_mode(
     name: &str,
     context: &mut ContextFiles,
     permission: &Option<PermCheck>,
 ) -> PromptModeOutcome {
-    let Some(content) = context.prompts.get(name) else {
+    let Some(mode_directive) = context.activate_prompt(name) else {
         return PromptModeOutcome::None;
     };
-    let (mode_directive, clean_content) = permission::parse_prompt_mode(content);
-    context.current_prompt = Some(if mode_directive.is_some() {
-        clean_content.to_string()
-    } else {
-        content.clone()
-    });
-    context.current_prompt_name = Some(name.to_string());
-    apply_mode_directive(mode_directive, permission)
+    apply_mode_directive(mode_directive.as_deref(), permission)
 }
 
 /// Apply an already-parsed `%%mode=` directive to the permission checker.
@@ -116,14 +142,19 @@ pub(crate) fn apply_current_prompt_mode(
     context: &mut ContextFiles,
     permission: &Option<PermCheck>,
 ) {
-    let Some(content) = &context.current_prompt.clone() else {
+    let Some(name) = context.current_prompt_name.clone() else {
         return;
     };
-    let (mode_directive, clean_content) = permission::parse_prompt_mode(content);
-    if mode_directive.is_some() {
-        context.current_prompt = Some(clean_content.to_string());
+    let explicit_agent = context
+        .current_agent_explicit
+        .then(|| context.current_agent_name.clone());
+    let mode_directive = context.activate_prompt(&name).flatten();
+    if let Some(agent) = explicit_agent {
+        context.current_agent_name =
+            agent.filter(|name| context.agent_definitions.contains_key(name));
+        context.current_agent_explicit = true;
     }
-    apply_mode_directive(mode_directive, permission);
+    apply_mode_directive(mode_directive.as_deref(), permission);
 }
 
 pub(super) const C_AGENT: Color = Color::White;
@@ -572,6 +603,14 @@ pub(crate) async fn start_main_run(
 ) {
     #[allow(unused_mut)]
     let mut pending_turn = PendingMainTurn::capture(ui.session, text);
+    #[cfg(feature = "memory")]
+    if ui.context.refresh_memory_if_changed().await {
+        // Any completed/racing prebuild contains the old system preamble.
+        // Dropping the receiver also prevents a late stale result from being
+        // installed after the fresh agent is built below.
+        run.agent = None;
+        *prebuild_rx = None;
+    }
     // Wait for the background prebuild if it hasn't completed yet.
     #[cfg(feature = "mcp")]
     resolve_prebuild(&mut run.agent, &mut ui.mcp_manager, prebuild_rx).await;
@@ -579,16 +618,22 @@ pub(crate) async fn start_main_run(
     resolve_prebuild(&mut run.agent, prebuild_rx).await;
 
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
-    let history = crate::agent::runner::convert_history(ui.session);
+    run.request_tool_results_cleared = ui
+        .session
+        .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
+    let history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+        ui.session,
+        ui.cfg.resolve_keep_recent_tool_results(),
+    );
     #[cfg(feature = "multimodal")]
     let history = {
         let media = pending_turn.take_pending_media(ui.session);
         if media.is_empty() {
             history
         } else {
-            let mut h = history;
+            let mut h = history.to_vec();
             h.extend(crate::agent::runner::media_to_messages(media));
-            h
+            h.into()
         }
     };
     let runner = run
@@ -604,6 +649,7 @@ pub(crate) async fn start_main_run(
             None,
         )
         .await;
+    run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
     run.is_running = true;
@@ -734,44 +780,46 @@ wide ones until pressure subsides.";
 /// (`CompletionCall` usage / context window) crosses
 /// `mid_turn_compact_threshold`, and only when `compact_enabled` is true.
 ///
-/// The pressure event crosses an asynchronous channel, so aborting the in-flight
-/// run is best-effort: a just-returned tool may have started and may be
-/// interrupted after partially applying changes. This turn's observed progress
-/// is recorded as a capped recap message, the session is compacted, and the
-/// agent is respawned on the compacted history with a continuation prompt.
-/// The dominant pressure relief is dropping the aborted run's in-flight tool
-/// context, which the respawn achieves even when the session itself is under the
-/// between-turn limit and `handle_compress` is a no-op.
+/// The runner reaches this function only after it has correlated every
+/// in-flight tool result and emitted the exact structured interaction prefix.
+/// The UI has already persisted those ordered call/result records, so
+/// compaction summarizes the canonical session transcript instead of a capped
+/// presentation trace. No tool future is aborted to create this boundary.
 pub(crate) async fn mid_turn_compact_and_respawn(
     pressure: f64,
+    interactions: &[rig::message::Message],
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     slash: &SlashState,
 ) -> anyhow::Result<()> {
-    // 1. Stop the in-flight run. bash children die via kill_on_drop.
-    if let Some(h) = run.main_abort.take() {
-        h.abort();
-    }
+    // The runner sent the boundary event and returned voluntarily. Dropping
+    // its handle is bookkeeping, not cancellation of a tool or provider call.
+    run.main_abort.take();
     run.is_running = false;
     run.agent_rx = None;
+    run.compaction_decision_tx = None;
+    run.pending_compaction_pressure = None;
     run.was_reasoning = false;
 
-    // 2. Record progress so far. `turn_trace` is a capped/truncated digest, so
-    // this is best-effort continuity, paired with any partial response text.
+    tracing::debug!(
+        structured_interactions = interactions.len(),
+        "compacting at a protocol-complete runner boundary"
+    );
+
+    // Tool calls and results are already exact structured session records.
+    // Preserve only an outstanding prose segment; never synthesize a tool
+    // recap from `turn_trace`.
     let mut recap = String::new();
     if !run.response_buf.trim().is_empty() {
         recap.push_str(run.response_buf.trim());
-        recap.push_str("\n\n");
     }
-    if !run.turn_trace.is_empty() {
-        recap.push_str(
-            "[Best-effort progress before context compaction; the last tool may have been interrupted and its changes may be partial]\n",
-        );
-        for line in run.turn_trace.iter() {
-            recap.push_str(line);
+    if let Some(todo_context) = ui.session.todos.critical_context() {
+        if !recap.is_empty() {
             recap.push('\n');
         }
+        recap.push_str(&todo_context);
+        recap.push('\n');
     }
     let recap = recap.trim();
     if !recap.is_empty() {
@@ -782,12 +830,6 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     run.response_start_block = None;
     run.agent_line_started = false;
 
-    // Unlike the between-turn gate, this announces unconditionally: the relief
-    // here is dropping the aborted run's in-flight tool context via the respawn
-    // below, which always happens even when the `handle_compress` step is a
-    // no-op. So the message describes the restart rather than promising a
-    // summarize step (which may not run and would otherwise leave the user
-    // waiting on a "compressed N messages" line that never comes).
     renderer.write_line(
         &format!(
             "mid-turn context relief, restarting (at {}%)...",
@@ -805,7 +847,13 @@ pub(crate) async fn mid_turn_compact_and_respawn(
 
     // 4. Respawn on the compacted history with the continuation prompt.
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
-    let history = crate::agent::runner::convert_history(ui.session);
+    run.request_tool_results_cleared = ui
+        .session
+        .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
+    let history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+        ui.session,
+        ui.cfg.resolve_keep_recent_tool_results(),
+    );
     let runner = run
         .agent
         .as_ref()
@@ -819,6 +867,7 @@ pub(crate) async fn mid_turn_compact_and_respawn(
             None,
         )
         .await;
+    run.compaction_decision_tx = runner.compaction_decision_tx;
     run.agent_rx = Some(runner.event_rx);
     run.main_abort = Some(runner.abort_handle);
     run.is_running = true;
@@ -846,6 +895,8 @@ pub(crate) fn stop_turn_context_exhausted(
     }
     run.is_running = false;
     run.agent_rx = None;
+    run.compaction_decision_tx = None;
+    run.pending_compaction_pressure = None;
     run.was_reasoning = false;
     run.agent_line_started = false;
     run.turn_trace.clear();
@@ -930,6 +981,7 @@ pub async fn run_interactive(
     ask_rx: Option<AskReceiver>,
     auto_trigger_msg: Option<String>,
     #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
+    #[cfg(feature = "hooks")] session_start_task: Option<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let mut app = app::App::new(
         ui,
@@ -938,6 +990,8 @@ pub async fn run_interactive(
         auto_trigger_msg,
         #[cfg(feature = "advisor")]
         handoff_rx,
+        #[cfg(feature = "hooks")]
+        session_start_task,
     )
     .await?;
     app.run().await?;

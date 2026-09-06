@@ -55,6 +55,7 @@ async fn test_sim_rejects_no_blocks() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some("no blocks here".into()),
             file_crc: None,
             edits: None,
@@ -74,6 +75,7 @@ async fn test_sim_rejects_empty_search() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some("<<<<<<< SEARCH\n=======\nreplacement\n>>>>>>> REPLACE".into()),
             file_crc: None,
             edits: None,
@@ -85,6 +87,29 @@ async fn test_sim_rejects_empty_search() {
 }
 
 #[tokio::test]
+async fn test_sim_rejects_whitespace_only_search() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("whitespace_search.txt");
+    let original = "hello world\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let result = edit::EditTool::new(None, None)
+        .call(EditArgs {
+            path: tmp.path().into(),
+            replace_all: false,
+            block: Some("<<<<<<< SEARCH\n   \t\n=======\nreplacement\n>>>>>>> REPLACE".into()),
+            file_crc: None,
+            edits: None,
+        })
+        .await;
+
+    let msg = result
+        .expect_err("whitespace-only search must be rejected")
+        .to_string();
+    assert!(msg.contains("whitespace-only"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
 async fn test_sim_search_not_found() {
     let _edit_guard = serialize_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("notfound2.txt");
@@ -93,6 +118,7 @@ async fn test_sim_search_not_found() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some(
                 "<<<<<<< SEARCH\nthis does not exist in file\n=======\nreplacement\n>>>>>>> REPLACE"
                     .into(),
@@ -115,6 +141,7 @@ async fn test_sim_single_block_replacement() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some("<<<<<<< SEARCH\nafter\n=======\nmiddle\n>>>>>>> REPLACE".into()),
             file_crc: None,
             edits: None,
@@ -124,6 +151,60 @@ async fn test_sim_single_block_replacement() {
     let content = std::fs::read_to_string(tmp.path()).unwrap();
     assert_eq!(content, "before middle done\n");
     assert!(result.contains("Applied 1 edit(s)"));
+    assert!(result.contains("Resulting excerpt:"));
+    assert!(result.contains("1| before middle done"));
+}
+
+#[tokio::test]
+async fn test_sim_literal_safe_markers_can_edit_standard_marker_lines() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("literal-safe-markers.txt");
+    std::fs::write(
+        tmp.path(),
+        "before\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\nafter\n",
+    )
+    .unwrap();
+    let tool = edit::EditTool::new(None, None);
+
+    tool.call(EditArgs {
+        path: tmp.path().into(),
+        replace_all: false,
+        block: Some(
+            "<<<<<<<<<<< SEARCH\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n===========\nliteral markers remain editable:\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n>>>>>>>>>>> REPLACE"
+                .into(),
+        ),
+        file_crc: None,
+        edits: None,
+    })
+    .await
+    .expect("literal-safe edit should succeed");
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "before\nliteral markers remain editable:\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\nafter\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_markers_must_begin_at_column_zero() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("column-zero-markers.md");
+    std::fs::write(tmp.path(), "heading\n  =======\ntail\n").unwrap();
+    let tool = edit::EditTool::new(None, None);
+
+    tool.call(EditArgs {
+        path: tmp.path().into(),
+        replace_all: false,
+        block: Some(
+            "<<<<<<< SEARCH\nheading\n  =======\ntail\n=======\nupdated\n>>>>>>> REPLACE".into(),
+        ),
+        file_crc: None,
+        edits: None,
+    })
+    .await
+    .expect("indented marker text should be treated as content");
+
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "updated\n");
 }
 
 #[tokio::test]
@@ -135,6 +216,7 @@ async fn test_sim_multi_block_atomic() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some(
                 "\
 <<<<<<< SEARCH
@@ -169,6 +251,7 @@ async fn test_sim_multi_match_returns_error() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: Some("<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE".into()),
             file_crc: None,
             edits: None,
@@ -180,6 +263,33 @@ async fn test_sim_multi_match_returns_error() {
 }
 
 #[tokio::test]
+async fn test_sim_replace_all_replaces_every_exact_occurrence() {
+    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("replace_all.txt");
+    std::fs::write(tmp.path(), "hello one\nkeep\nhello two\n").unwrap();
+    let tool = edit::EditTool::new(None, None);
+
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            replace_all: true,
+            block: Some("<<<<<<< SEARCH\nhello\n=======\ngoodbye\n>>>>>>> REPLACE".into()),
+            file_crc: None,
+            edits: None,
+        })
+        .await
+        .expect("replace_all should accept repeated exact matches");
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "goodbye one\nkeep\ngoodbye two\n"
+    );
+    assert!(result.contains("Applied 2 edit(s)"), "{result}");
+    assert!(result.contains("1| goodbye one"), "{result}");
+    assert!(result.contains("3| goodbye two"), "{result}");
+}
+
+#[tokio::test]
 async fn test_sim_preserves_crlf_line_endings() {
     let _edit_guard = serialize_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("crlf2.txt");
@@ -187,6 +297,7 @@ async fn test_sim_preserves_crlf_line_endings() {
     let tool = edit::EditTool::new(None, None);
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: Some("<<<<<<< SEARCH\nline2\n=======\nmodified\n>>>>>>> REPLACE".into()),
         file_crc: None,
         edits: None,
@@ -237,6 +348,7 @@ async fn test_hash_single_line_edit() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -272,6 +384,7 @@ async fn test_hash_range_edit() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -300,6 +413,7 @@ async fn test_hash_delete_via_empty_text() {
     let tagged = make_tagged_line(2, "remove me");
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: None,
         file_crc: Some(file_crc),
         edits: Some(vec![EditOp {
@@ -326,6 +440,7 @@ async fn test_hash_file_crc_mismatch() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some("deadbeef".into()),
             edits: Some(vec![EditOp {
@@ -354,6 +469,7 @@ async fn test_hash_tag_mismatch() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -380,6 +496,7 @@ async fn test_hash_invalid_tag_format() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -408,6 +525,7 @@ async fn test_hash_crlf_preserved() {
     let tagged = make_tagged_line(2, "line2");
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: None,
         file_crc: Some(file_crc),
         edits: Some(vec![EditOp {
@@ -440,6 +558,7 @@ async fn test_hash_multi_edit_atomic() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![
@@ -469,6 +588,7 @@ async fn sim_edit(tmp: &TempFile, search: &str, replace: &str) -> Result<String,
     let tool = edit::EditTool::new(None, None);
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: Some(format!(
             "<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE"
         )),
@@ -634,6 +754,7 @@ async fn test_hash_range_rejects_descending_lines() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -664,6 +785,7 @@ async fn test_hash_range_rejects_non_contiguous_lines() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -706,6 +828,7 @@ async fn test_hash_rejects_line_zero() {
         let result = tool
             .call(EditArgs {
                 path: tmp.path().into(),
+                replace_all: false,
                 block: None,
                 file_crc: Some(file_crc.clone()),
                 edits: Some(vec![op]),
@@ -732,6 +855,7 @@ async fn test_hash_rejects_overlapping_edits() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc.clone()),
             edits: Some(vec![
@@ -758,6 +882,7 @@ async fn test_hash_rejects_overlapping_edits() {
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![
@@ -782,6 +907,42 @@ async fn test_hash_rejects_overlapping_edits() {
 }
 
 #[tokio::test]
+async fn test_hash_rejects_zero_length_and_nonempty_ranges_at_same_start() {
+    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_blank_overlap.txt");
+    let original = "line1\n\nline3\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let blank = make_tagged_line(2, "");
+
+    let result = edit::EditTool::new(None, None)
+        .call(EditArgs {
+            path: tmp.path().into(),
+            replace_all: false,
+            block: None,
+            file_crc: Some(crc32_hex(original.as_bytes())),
+            edits: Some(vec![
+                EditOp {
+                    line: Some(blank.clone()),
+                    lines: None,
+                    text: "inserted".into(),
+                },
+                EditOp {
+                    line: Some(blank),
+                    lines: None,
+                    text: String::new(),
+                },
+            ]),
+        })
+        .await;
+
+    let msg = result
+        .expect_err("equal-start insertion and deletion must overlap")
+        .to_string();
+    assert!(msg.contains("overlap"), "unexpected error: {msg}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
 async fn test_hash_adjacent_edits_are_allowed() {
     let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_adjacent.txt");
@@ -794,6 +955,7 @@ async fn test_hash_adjacent_edits_are_allowed() {
     let l2 = make_tagged_line(2, "line2");
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: None,
         file_crc: Some(file_crc),
         edits: Some(vec![
@@ -828,6 +990,7 @@ async fn test_hash_multiline_replacement_uses_dominant_crlf() {
 
     tool.call(EditArgs {
         path: tmp.path().into(),
+        replace_all: false,
         block: None,
         file_crc: Some(file_crc),
         edits: Some(vec![EditOp {
@@ -872,6 +1035,7 @@ async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() 
     edit::EditTool::new(None, None)
         .call(EditArgs {
             path: tmp.path().into(),
+            replace_all: false,
             block: None,
             file_crc: Some(file_crc),
             edits: Some(vec![EditOp {
@@ -906,7 +1070,16 @@ async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
     )
     .await
     .expect("fuzzy fallback exceeded its work budget");
-    assert!(result.unwrap_err().contains("not found"));
+    let error = result.unwrap_err();
+    assert!(error.contains("not found"), "{error}");
+    assert!(
+        error.contains("exceeds the bounded fuzzy-match budget"),
+        "{error}"
+    );
+    assert!(
+        error.contains("no closest-match suggestion was computed"),
+        "{error}"
+    );
 }
 
 // ── Non-UTF-8 files must fail closed ────────────────────────────────────

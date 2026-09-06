@@ -519,6 +519,19 @@ fn decode_operation(
 fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError> {
     let value = match result {
         EffectResult::ReadFile { content } => serde_json::Value::String(content),
+        EffectResult::ReadFiles { contents } => serde_json::json!(contents),
+        EffectResult::ListDir { entries, truncated } => serde_json::json!({
+            "entries": entries,
+            "truncated": truncated,
+        }),
+        EffectResult::Glob { paths, truncated } => serde_json::json!({
+            "paths": paths,
+            "truncated": truncated,
+        }),
+        EffectResult::Grep { matches, truncated } => serde_json::json!({
+            "matches": matches,
+            "truncated": truncated,
+        }),
         EffectResult::WriteFile => serde_json::Value::Null,
         EffectResult::Fetch { status, body } => {
             let mut response = serde_json::Map::new();
@@ -541,15 +554,22 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }),
-        EffectResult::ProposalAccepted { .. } => return Err(CapabilityError::DispatchDenied),
+        EffectResult::ResultAccepted { .. }
+        | EffectResult::ScratchPut
+        | EffectResult::ScratchGet { .. }
+        | EffectResult::ProposalAccepted { .. } => {
+            return Err(CapabilityError::DispatchDenied);
+        }
         EffectResult::Error(error) => {
             let _closed_code = match error.code {
                 EffectErrorCode::Denied
                 | EffectErrorCode::CapabilityDenied
                 | EffectErrorCode::InvalidTarget
+                | EffectErrorCode::NotFound
+                | EffectErrorCode::IsDirectory
                 | EffectErrorCode::Cancelled
                 | EffectErrorCode::TimedOut
-                | EffectErrorCode::OutputLimit
+                | EffectErrorCode::TooLarge
                 | EffectErrorCode::BackendFailure
                 | EffectErrorCode::AuditFailure
                 | EffectErrorCode::OutcomeUnknown => error.code,

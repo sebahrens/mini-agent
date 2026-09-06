@@ -165,6 +165,11 @@ reproducing code; focus on structure, relationships, and rationale.
 - User input → InputEditor → event loop → agent.spawn_runner()
 - Runner streams AgentEvent (Token, Reasoning, ToolCall, ToolResult, Done)
 - Events rendered incrementally via Renderer::write_line()
+- Interactive runners acknowledge each provider-usage boundary through a
+  bounded UI handshake. A requested mid-turn compaction lets the current tool
+  batch finish, emits its exact structured interactions, and exits before the
+  next provider call; the UI compacts that canonical session prefix and
+  respawns the continuation without cancelling tool work.
 
 ## Design Decisions
 - Type-erased client/agent via trait objects for provider flexibility
@@ -174,6 +179,11 @@ reproducing code; focus on structure, relationships, and rationale.
   redirected/headless streams are never treated as console handles or mutated. External editors,
   pagers, and support utilities suspend and resume that same lifecycle instead of toggling terminal
   modes independently.
+- The TUI conversation feed caches immutable rendered-row segments per semantic block. Streaming
+  invalidates only the active block and keeps completed markdown rows shared. Completed history is
+  bounded by 4,096 blocks and 16 MiB of display text; a live block is separately bounded to 2 MiB.
+  Truncation is explicit, and retention eviction resets scroll and selection indices before the
+  next viewport draw.
 - mpsc channels for agent events, user events, and permission requests
 
 ## Dependencies

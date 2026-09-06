@@ -88,7 +88,8 @@ Before writing, the tool:
    content;
 5. requires a range selector to list every line in a strictly ascending,
    gap-free span;
-6. rejects overlapping edit ranges; and
+6. rejects overlapping edit ranges, including zero-length and non-empty edits
+   with the same starting byte; and
 7. applies all ranges from the end of the file toward the beginning, then
    publishes the result through the atomic file-write path.
 

@@ -198,7 +198,9 @@ Discovery follows progressive disclosure:
 3. Load a selected `SKILL.md` body only when activated and load referenced resources on demand.
 4. Keep bundled JavaScript as an ordinary Agent Skill resource. It is not inserted into
    `SkillStore`, injected as a global, or made self-learning without the normal immutable proposal,
-   verification, capability, and evidence gates.
+   verification, capability, and evidence gates. An optional bounded `learned-js` frontmatter list
+   references exact identities already resolved through those gates; only active identities are
+   attached when the Agent Skill is selected, within the ordinary learned-skill turn budgets.
 
 MCP remains composable. Agent Skill instructions may tell the model to use configured MCP tools,
 but neither frontmatter nor bundled resources can forge built-in MCP trust or bypass the existing
@@ -339,7 +341,9 @@ candidate/predecessor near-duplicates to the search corpus.
 - Corpora below 10,000 rows use exact contiguous dot-product ranking. Larger corpora use an
   immutable HNSW generation; the exact path remains the recall and regression oracle.
 - SQLite BLOBs are read only when building a new generation, never per query.
-- FTS5/BM25 produces lexical candidates from exact identifiers, exports, descriptions, and tags.
+- The durable active-only `skill_search` FTS5 table produces BM25 lexical candidates from exact
+  identifiers, exports, descriptions, and tags. Immutable generation ID maps filter those results,
+  preserving frozen additions while making removals disappear immediately.
 - Dense and lexical ranks are combined with reciprocal-rank fusion.
 - A dense similarity floor may reduce the result to zero; top-k is a maximum, not a quota.
 - Semantic near-duplicates are collapsed before applying source/manifest budgets.
@@ -390,21 +394,28 @@ pub struct ResolvedSkill {
 ```
 
 The runner resolves one bundle before its initial `stream_chat(prompt, history)` call and stores
-it in a per-agent `SkillTurnContext`. Retries reuse the same bundle. Continuations within the same
-user turn do not re-embed or rerank. A new user prompt creates a new generation-stamped bundle.
+it in a per-agent `SkillTurnContext`. Retries reuse the same bundle. A bounded, model-issued
+`skills_search(query)` may explicitly replace the bundle at a tool-result boundary; otherwise
+continuations within the same user turn do not re-embed or rerank. A new user prompt creates a new
+generation-stamped bundle.
 
 ### Preamble injection
 
-The model-visible prompt is prefixed with a compact non-user-spoofable manifest when the provider
-supports such a channel; otherwise use a clearly delimited trusted context block inserted by the
-runner. The manifest contains no source:
+The model-visible request receives a compact manifest through a per-completion, non-sticky system
+preamble patch. The original user message is passed byte-for-byte as a separate user role, and the
+skill block is neither returned in run history nor persisted in session history. A model-issued
+`skills_search` refreeze updates the next completion's system patch. The manifest contains no
+source:
 
 ```text
 <available_js_skills index_generation="42">
+Each export below is already installed as a callable global inside the `js` tool. Call it directly; do not redefine it.
 - id: <full id>
-  exports: parseJson(text: string): unknown | null
+  export: parseJson :: parseJson(text: string): unknown | null
   capability: pure
   description: Parse JSON safely and return null on syntax error.
+  use: Call `parseJson(/* arguments */)` directly in `js`.
+  example: `const result = parseJson(/* arguments */);`
 </available_js_skills>
 ```
 
@@ -502,7 +513,7 @@ Each item becomes part of the delivered contract when its named bead closes with
 2. **Lexical query semantics** (mini-agent-io7h, delivered). The FTS5 query is an OR over stop-worded,
    IDF-weighted prompt terms ranked by BM25 (or NEAR groups), never an AND over every term. The
    benchmark gains a natural-language prompt case that must match through the lexical channel.
-3. **Skill context delivery** (mini-agent-rd89). The trusted skill context is delivered as a
+3. **Skill context delivery** (mini-agent-rd89, delivered). The trusted skill context is delivered as a
    per-request block outside the persisted user text (system slot or ephemeral block) so it is
    neither spoofable by an unescaped prompt nor accumulated in conversation history.
 4. **Callable-export manifest** (mini-agent-4bqq). The model-visible manifest states that each
@@ -513,8 +524,8 @@ Each item becomes part of the delivered contract when its named bead closes with
    identities instead of source after the first step of a turn. Identity verification still
    precedes every load.
 
-Proposal under decision (not accepted): a bounded model-issued `skills_search(query)` effect
-returning metadata only (mini-agent-a8a0). See the open decision in `00-index.md`.
+Accepted: a bounded model-issued `skills_search(query)` effect returns metadata only and refreezes
+the subsequent request's skill bundle (mini-agent-a8a0, delivered).
 
 ## Acceptance criteria
 
@@ -543,6 +554,8 @@ All must pass under `cargo test --features js,skills`:
       source budgets have fixture tests.
 - [x] The model-visible manifest contains only the frozen selected bundle's metadata and is present
       before the model emits a JS tool call.
+- [x] The trusted manifest is a non-sticky system block; it cannot be forged by a user delimiter
+      and never enters returned or persisted conversation history.
 - [x] Every JS call in one turn receives the same immutable bundle and retries do not re-embed.
 - [x] Skill source and agent source run as separate scripts; an agent error on line N reports line N
       with zero, one, or three selected skills.

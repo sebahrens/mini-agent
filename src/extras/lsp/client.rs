@@ -303,9 +303,9 @@ impl LspClient {
             let workspace_uri = root_uri.clone();
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
-                let mut stdout = stdout;
+                let mut stdout = rpc::FrameReader::new(stdout);
                 loop {
-                    let frame = match rpc::read_frame(&mut stdout).await {
+                    let frame = match stdout.read_frame().await {
                         Ok(Some(f)) => f,
                         Ok(None) => break,
                         Err(e) => {

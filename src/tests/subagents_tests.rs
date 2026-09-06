@@ -27,6 +27,7 @@ mod tests {
         let args: crate::extras::subagents::task_tool::TaskArgs =
             serde_json::from_str(json).unwrap();
         assert_eq!(args.prompts.len(), 2);
+        assert!(args.briefs.is_none());
         assert_eq!(args.prompts[0], "explore auth module");
         assert_eq!(args.prompts[1], "find api routes");
     }
@@ -55,6 +56,39 @@ mod tests {
         let result: Result<crate::extras::subagents::task_tool::TaskArgs, _> =
             serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_args_deserializes_structured_briefs() {
+        let json = r#"{
+            "briefs": [{
+                "objective": "audit authentication",
+                "files": ["src/auth.rs"],
+                "constraints": ["read only"],
+                "expected_sections": ["attack path"]
+            }],
+            "agent_type": "rust-security-review"
+        }"#;
+        let args: crate::extras::subagents::task_tool::TaskArgs =
+            serde_json::from_str(json).unwrap();
+        assert!(args.prompts.is_empty());
+        let briefs = args.briefs.unwrap();
+        assert_eq!(briefs.len(), 1);
+        assert_eq!(briefs[0].objective, "audit authentication");
+        assert_eq!(briefs[0].files, ["src/auth.rs"]);
+    }
+
+    #[test]
+    fn task_args_rejects_ambiguous_or_unknown_handoff_fields() {
+        for json in [
+            r#"{"prompts":["x"],"briefs":[{"objective":"y"}]}"#,
+            r#"{"briefs":[{"objective":"y","unknown":true}]}"#,
+            r#"{"prompts":["x"],"unknown":true}"#,
+        ] {
+            let result: Result<crate::extras::subagents::task_tool::TaskArgs, _> =
+                serde_json::from_str(json);
+            assert!(result.is_err(), "accepted invalid task arguments: {json}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -142,14 +176,14 @@ mod tests {
     }
 
     #[test]
-    fn combine_timeout_result_is_preserved() {
+    fn combine_cancelled_deadline_result_is_preserved() {
         let outputs = vec![(
             0,
             "prompt".into(),
-            "[timeout: subagent exceeded 300s]".into(),
+            "[cancelled: wall-clock deadline of 300s reached]".into(),
         )];
         let combined = crate::extras::subagents::task_tool::combine_results(&outputs);
-        assert!(combined.contains("[timeout: subagent exceeded 300s]"));
+        assert!(combined.contains("[cancelled: wall-clock deadline of 300s reached]"));
     }
 
     #[test]

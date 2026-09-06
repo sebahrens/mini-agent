@@ -112,15 +112,20 @@ starting a session or making a model call. See
 | Command | Description |
 | ------- | ----------- |
 | `/prompt` | List available prompts. |
-| `/prompt <name>` | Activate a named prompt. Also applies `%%mode=` from the prompt file if present (see below). |
+| `/prompt <name>` | Activate a named prompt. Also applies `%%mode=` and `%%agent=` header directives when present (see below). |
 | `/prompt default` | Clear the active prompt. |
+| `/agent` | List main-agent personas resolved for the active workspace. |
+| `/agent <name>` | Apply a persona to the main loop and activate its optional `mode:` prompt. |
+| `/agent default` | Clear the active main-agent persona. |
 
-Prompts may include a `%%mode=<mode>` directive on the **first line** to
-automatically switch the security mode when activated. Valid modes:
+Prompts may start with contiguous `%%mode=<mode>` and `%%agent=<name>`
+directives in either order. They automatically switch the security mode and
+main-agent persona when activated. Valid security modes:
 `standard`, `restrictive`, `readonly`, `planwrite`, `guarded`, `yolo`. Use
 `%%mode=last_user_mode` to restore the mode the user last set via `/mode`
-or startup config. The directive line is stripped from the prompt content
-before it reaches the agent.
+or startup config; `%%agent=default` clears the persona. Directive lines are
+stripped before the prompt reaches the agent. Project prompt directives and
+project persona definitions require the existing project-config trust binding.
 
 Example `ask.md`:
 ```markdown

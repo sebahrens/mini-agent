@@ -341,7 +341,7 @@ may display source and sanitized metadata only through an explicitly authorized 
 
 ---
 
-## Accepted amendments (2026-09-05, pending delivery)
+## Accepted amendments (2026-09-05)
 
 Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harness-design-review.md).
 
@@ -351,10 +351,11 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    revisions. `propose_skill` may be re-registered behind an explicit configuration flag so
    proposals land in the same queue. Every human gate in this phase is preserved; no command
    activates code automatically.
-2. **Seed library and Agent-Skill bridge** (mini-agent-vvud). A shipped set of pure learned
-   skills is verified at build/test time through the normal gate, and an Agent Skill may declare
-   the learned-JS identities that accompany it; declaration never bypasses verification or
-   approval.
+2. **Seed library and Agent-Skill bridge** (mini-agent-vvud, delivered). A shipped set of pure
+   learned skills is verified at build/test time through the normal gate. An Agent Skill may
+   declare up to 32 exact learned-JS identities; import resolves them only after verification and
+   turn selection attaches only active revisions, so declaration never bypasses approval,
+   activation, containment, or learned-skill budgets.
 3. **Stats surface** (mini-agent-i78t). Per-skill selections, invocations, success rate, and
    last-use are readable by the operator.
 

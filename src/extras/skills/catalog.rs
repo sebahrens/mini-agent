@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -46,6 +47,21 @@ pub enum CatalogError {
 pub struct AgentSkillCatalog {
     root: PathBuf,
     generation: u64,
+    signature: Option<CatalogSignature>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct CatalogSignature {
+    entries: Vec<CatalogSignatureEntry>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct CatalogSignatureEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified: Option<SystemTime>,
+    kind: u8,
+    pointer_digest: Option<String>,
 }
 
 impl AgentSkillCatalog {
@@ -53,6 +69,7 @@ impl AgentSkillCatalog {
         Self {
             root: paths.data_dir.join("agent-skills"),
             generation: 0,
+            signature: None,
         }
     }
 
@@ -75,6 +92,9 @@ impl AgentSkillCatalog {
 
     /// Scan installed immutable trees, batch metadata embeddings, and construct one generation.
     pub fn refresh(&mut self, embedder: &Embedder) -> Result<AgentSkillIndex, CatalogError> {
+        // Capture the tree before scanning. An import racing this build changes
+        // the next turn's signature and therefore forces another refresh.
+        let signature = catalog_signature(&self.root)?;
         let mut records = Vec::new();
         if self.root.is_dir() {
             let mut names = fs::read_dir(&self.root)?.collect::<Result<Vec<_>, _>>()?;
@@ -103,12 +123,67 @@ impl AgentSkillCatalog {
             record.embedding = vector;
         }
         self.generation = self.generation.saturating_add(1);
-        Ok(AgentSkillIndex::build(
-            self.generation,
-            embedder.model_metadata().clone(),
-            records,
-        )?)
+        let index =
+            AgentSkillIndex::build(self.generation, embedder.model_metadata().clone(), records)?;
+        self.signature = Some(signature);
+        Ok(index)
     }
+
+    /// Rebuild only after an import or ACTIVE-pointer change is visible.
+    pub fn refresh_if_changed(
+        &mut self,
+        embedder: &Embedder,
+    ) -> Result<Option<AgentSkillIndex>, CatalogError> {
+        let current = catalog_signature(&self.root)?;
+        if self.signature.as_ref() == Some(&current) {
+            return Ok(None);
+        }
+        self.refresh(embedder).map(Some)
+    }
+}
+
+fn signature_entry(path: PathBuf) -> Result<CatalogSignatureEntry, CatalogError> {
+    let metadata = fs::symlink_metadata(&path)?;
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_dir() {
+        1
+    } else {
+        0
+    };
+    let pointer_digest = (path.file_name().is_some_and(|name| name == "ACTIVE")
+        && metadata.is_file())
+    .then(|| fs::read(&path).map(|bytes| sha256_hex(&bytes)))
+    .transpose()?;
+    Ok(CatalogSignatureEntry {
+        path,
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        kind,
+        pointer_digest,
+    })
+}
+
+fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
+    if !root.exists() {
+        return Ok(CatalogSignature {
+            entries: Vec::new(),
+        });
+    }
+    let mut entries = vec![signature_entry(root.to_path_buf())?];
+    let mut names = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    names.sort_by_key(|entry| entry.file_name());
+    for name in names {
+        entries.push(signature_entry(name.path())?);
+        if name.file_type()?.is_dir() {
+            let mut children = fs::read_dir(name.path())?.collect::<Result<Vec<_>, _>>()?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                entries.push(signature_entry(child.path())?);
+            }
+        }
+    }
+    Ok(CatalogSignature { entries })
 }
 
 fn scan_record(
@@ -159,6 +234,7 @@ fn scan_record(
         skill_md_sha256: sha256_hex(&markdown),
         resources,
         allowed_tools: manifest.allowed_tools,
+        learned_js: manifest.learned_js,
         embedding: Vec::new(),
     }))
 }

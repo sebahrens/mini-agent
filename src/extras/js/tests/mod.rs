@@ -271,6 +271,32 @@ async fn tool_description_prefers_javascript_for_computation() {
 }
 
 #[tokio::test]
+async fn tool_result_contract_guides_explicit_json_stringification() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    let rejected = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "({value: undefined})".to_string(),
+        })
+        .await
+        .expect("worker should return a closed invalid-result diagnostic");
+    assert!(rejected.contains("return a string/plain JSON value"));
+    assert!(rejected.contains("JSON.stringify(value)"));
+
+    let explicit = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "JSON.stringify({missing: undefined, nan: NaN, date: new Date(0), map: new Map([['key', 1]]), set: new Set([1]), instance: new (class Item { constructor() { this.value = 7; } })()})".to_string(),
+        })
+        .await
+        .expect("explicit JSON stringification should produce a valid string result");
+    assert_eq!(
+        explicit,
+        r#"{"nan":null,"date":"1970-01-01T00:00:00.000Z","map":{},"set":{},"instance":{"value":7}}"#
+    );
+}
+
+#[tokio::test]
 async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
     use rig::tool::Tool;
     let tool =
@@ -281,6 +307,27 @@ async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
             .description()
             .contains("spawn(program: string, args: string[])")
     );
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "typeof spawn".to_string(),
+        })
+        .await
+        .expect("worker should execute without an unavailable spawn global");
+    assert_eq!(result, "undefined");
+}
+
+#[tokio::test]
+async fn worker_installs_spawn_when_process_tree_ownership_is_available() {
+    use rig::tool::Tool;
+    let tool = make_test_tool();
+
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: "typeof spawn".to_string(),
+        })
+        .await
+        .expect("worker should advertise the serviceable spawn global");
+    assert_eq!(result, "function");
 }
 
 #[cfg(feature = "skills")]
@@ -458,7 +505,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("read call failed");
     assert!(
-        read_result.starts_with("JS TypeError at ")
+        read_result.starts_with("JS exception at ")
             && read_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {read_result}"
     );
@@ -470,7 +517,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("write call failed");
     assert!(
-        write_result.starts_with("JS TypeError at ")
+        write_result.starts_with("JS exception at ")
             && write_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {write_result}"
     );
@@ -487,7 +534,7 @@ async fn test_host_globals_enforce_restrictive_permissions() {
         .await
         .expect("spawn call failed");
     assert!(
-        spawn_result.starts_with("JS TypeError at ")
+        spawn_result.starts_with("JS exception at ")
             && spawn_result.ends_with("(stage: evaluation; script: model)"),
         "unexpected: {spawn_result}"
     );

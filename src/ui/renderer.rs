@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 #[cfg(not(windows))]
 use crate::process_creation::StdCommandCreationExt;
 
-use super::feed::{BlockStyle, Feed, style_from_color};
+use super::feed::{BlockStyle, Feed, FeedLines, style_from_color};
 use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
 use super::utils::{char_display_width, display_width, resolve_color};
@@ -159,6 +159,7 @@ pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) 
 pub struct Renderer {
     spinner_frame: u8,
     feed: Feed,
+    seen_feed_retention_generation: u64,
     partial: CompactString,
     partial_style: BlockStyle,
     scroll_offset: usize,
@@ -209,6 +210,7 @@ impl Renderer {
         Ok(Renderer {
             spinner_frame: 0,
             feed: Feed::new(),
+            seen_feed_retention_generation: 0,
             partial: CompactString::new(""),
             partial_style: BlockStyle::Plain,
             scroll_offset: 0,
@@ -333,13 +335,15 @@ impl Renderer {
         self.max_line_width()
     }
 
-    fn chat_lines(&self, width: usize) -> Arc<Vec<LineEntry>> {
-        let mut lines = self.feed.lines(width);
+    fn chat_lines(&self, width: usize) -> Arc<FeedLines> {
+        let lines = self.feed.lines(width);
         if !self.partial.is_empty() {
             let color = self.partial_style.color();
+            let mut partial = Vec::new();
             for chunk in word_wrap(&self.partial, width) {
-                Arc::make_mut(&mut lines).push(LineEntry { text: chunk, color });
+                partial.push(LineEntry { text: chunk, color });
             }
+            return Arc::new(lines.with_segment(Arc::new(partial)));
         }
         lines
     }
@@ -653,6 +657,7 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
+        self.reconcile_feed_retention();
         if !self.chat_needs_redraw() {
             return Ok(());
         }
@@ -762,6 +767,18 @@ impl Renderer {
         stdout.flush()?;
         self.record_chat_drawn();
         Ok(())
+    }
+
+    pub(crate) fn reconcile_feed_retention(&mut self) {
+        let retention_generation = self.feed.retention_generation();
+        if retention_generation != self.seen_feed_retention_generation {
+            self.seen_feed_retention_generation = retention_generation;
+            self.scroll_offset = 0;
+            self.selection_active = false;
+            self.selection_start = None;
+            self.selection_end = None;
+            self.chat_dirty = true;
+        }
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {

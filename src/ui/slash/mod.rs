@@ -77,6 +77,11 @@ impl SlashCtx<'_> {
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
             read_tracker: &self.session.read_tracker,
+            todo_store: &self.session.todos,
+            tool_output_session_id: &self.session.id,
+            tool_result_spills: &self.session.tool_result_spills,
+            #[cfg(feature = "js")]
+            js_session_state: &self.session.js_session_state,
             #[cfg(feature = "skills")]
             skill_services: self.skill_services,
             #[cfg(feature = "mcp")]
@@ -89,6 +94,7 @@ impl SlashCtx<'_> {
         client: &AnyClient,
         model_id: &str,
         read_tracker: &crate::agent::tools::ReadTracker,
+        todo_store: &crate::agent::tools::TodoStore,
     ) -> AnyAgent {
         AgentBuildCtx {
             cli: self.cli,
@@ -100,6 +106,11 @@ impl SlashCtx<'_> {
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
             read_tracker,
+            todo_store,
+            tool_output_session_id: &self.session.id,
+            tool_result_spills: &self.session.tool_result_spills,
+            #[cfg(feature = "js")]
+            js_session_state: &self.session.js_session_state,
             #[cfg(feature = "skills")]
             skill_services: self.skill_services,
             #[cfg(feature = "mcp")]
@@ -141,7 +152,12 @@ impl SlashCtx<'_> {
             self.client.clone()
         };
         let next_agent = self
-            .build_agent_for_client(&next_client, &session.model, &session.read_tracker)
+            .build_agent_for_client(
+                &next_client,
+                &session.model,
+                &session.read_tracker,
+                &session.todos,
+            )
             .await;
 
         *self.client = next_client;
@@ -401,10 +417,17 @@ pub async fn handle_compress(
         .cfg
         .resolve_reserve_tokens(&ui.session.model, &qm, ui.session.context_window);
     let keep_recent = ui.cfg.resolve_keep_recent_tokens(ui.session.context_window);
+    let keep_recent_tool_results = ui.cfg.resolve_keep_recent_tool_results();
     let max_tokens = ui.session.context_window.saturating_sub(reserve);
     let summarizer_input_budget = summarizer_input_budget(ui.session.context_window, reserve);
 
-    let cut_idx = match plan_tui_compaction(ui.session, auto, max_tokens, keep_recent) {
+    let cut_idx = match plan_tui_compaction(
+        ui.session,
+        auto,
+        max_tokens,
+        keep_recent,
+        keep_recent_tool_results,
+    ) {
         TuiCompactionGate::WithinBudget => return Ok(()),
         // Nothing old enough to summarize (everything is within keep_recent). This
         // is a real physical limit even when forced, so report it for manual runs;
@@ -428,11 +451,13 @@ pub async fn handle_compress(
     renderer.write_line("", crossterm::style::Color::White)?;
 
     let client = &ui.client;
+    let retry_config = &ui.cfg.retry;
     let (first_kept_index, tokens_before) = compact_session_with(
         ui.session,
         cut_idx,
         summarizer_input_budget,
         reserve,
+        keep_recent_tool_results,
         |model, messages, previous_summary, input_budget, response_budget| async move {
             client
                 .compress_messages(
@@ -442,6 +467,7 @@ pub async fn handle_compress(
                     instructions,
                     input_budget,
                     response_budget,
+                    retry_config,
                 )
                 .await
         },
@@ -498,11 +524,16 @@ pub(crate) fn plan_tui_compaction(
     auto: bool,
     max_tokens: u64,
     keep_recent: u64,
+    keep_recent_tool_results: usize,
 ) -> TuiCompactionGate {
-    if auto && session.effective_context_tokens() <= max_tokens {
+    if auto
+        && session.effective_context_tokens_after_tool_result_pruning(keep_recent_tool_results)
+            <= max_tokens
+    {
         return TuiCompactionGate::WithinBudget;
     }
-    match Session::select_compaction_cut(&session.messages, keep_recent) {
+    let projected = session.context_messages_with_pruned_tool_results(keep_recent_tool_results);
+    match Session::select_compaction_cut(&projected, keep_recent) {
         0 => TuiCompactionGate::NothingToSummarize,
         cut_idx => TuiCompactionGate::Cut(cut_idx),
     }
@@ -521,6 +552,7 @@ pub(crate) async fn compact_session_with<S, F>(
     cut_idx: usize,
     input_token_budget: u64,
     response_token_budget: u64,
+    keep_recent_tool_results: usize,
     summarize: S,
     stage_summary: impl FnOnce(&str, usize),
 ) -> anyhow::Result<(usize, u64)>
@@ -529,7 +561,9 @@ where
     F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
 {
     let model = session.model.to_string();
-    let messages = session.messages[..cut_idx].to_vec();
+    let messages = session.context_messages_with_pruned_tool_results(keep_recent_tool_results)
+        [..cut_idx]
+        .to_vec();
     let previous_summary = session
         .compactions
         .last()
@@ -602,7 +636,7 @@ pub async fn handle_slash(
         "/provider" | "/model" | "/models" | "/model-subagent" | "/models-subagent" => {
             providers::handle(&parts, &mut ctx).await
         }
-        "/prompt" | "/theme" | "/regen-prompts" | "/regen-themes" => {
+        "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
         "/reasoning" | "/thinking" | "/mode" | "/toggle" | "/mcp" | "/editsys" | "/advisor" => {
@@ -667,6 +701,7 @@ mod compaction_budget_tests {
     const MAX_TOKENS: u64 = 80;
     // Below the ~4-token estimate of the 16-char tail so exactly two messages are cut.
     const KEEP_RECENT: u64 = 3;
+    const KEEP_RECENT_TOOL_RESULTS: usize = crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS;
 
     #[tokio::test]
     async fn tui_compaction_drains_whole_cut_and_second_pass_is_a_noop() {
@@ -674,7 +709,13 @@ mod compaction_budget_tests {
         let tokens_before_expected =
             session.messages[0].estimated_tokens + session.messages[1].estimated_tokens;
         assert_eq!(
-            plan_tui_compaction(&session, true, MAX_TOKENS, KEEP_RECENT),
+            plan_tui_compaction(
+                &session,
+                true,
+                MAX_TOKENS,
+                KEEP_RECENT,
+                KEEP_RECENT_TOOL_RESULTS,
+            ),
             TuiCompactionGate::Cut(2)
         );
 
@@ -686,6 +727,7 @@ mod compaction_budget_tests {
             2,
             80,
             20,
+            KEEP_RECENT_TOOL_RESULTS,
             |model, messages, previous_summary, input_budget, response_budget| async move {
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(model, "model");
@@ -720,7 +762,13 @@ mod compaction_budget_tests {
         // Between-turn auto-compaction must not fire again now that the
         // session fits: the gate short-circuits before any summarizer call.
         assert_eq!(
-            plan_tui_compaction(&session, true, MAX_TOKENS, KEEP_RECENT),
+            plan_tui_compaction(
+                &session,
+                true,
+                MAX_TOKENS,
+                KEEP_RECENT,
+                KEEP_RECENT_TOOL_RESULTS,
+            ),
             TuiCompactionGate::WithinBudget
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -734,6 +782,7 @@ mod compaction_budget_tests {
             2,
             80,
             20,
+            KEEP_RECENT_TOOL_RESULTS,
             |_, messages, _, _, _| async move {
                 assert_eq!(messages.len(), 2);
                 Ok(("PARTIAL".to_string(), 1usize))
@@ -763,6 +812,7 @@ mod compaction_budget_tests {
             2,
             80,
             20,
+            KEEP_RECENT_TOOL_RESULTS,
             |_, _, _, _, _| async move { Ok(("EMPTY".to_string(), 0usize)) },
             |_, _| panic!("nothing must be staged when nothing is drained"),
         )
@@ -773,21 +823,56 @@ mod compaction_budget_tests {
         assert!(session.compactions.is_empty());
     }
 
+    #[tokio::test]
+    async fn compaction_summarizer_sees_pruned_results_but_their_calls() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..2 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(
+                &id,
+                "read",
+                &serde_json::json!({"path": format!("file-{index}")}),
+            );
+            session.add_tool_result_with_id(&id, "read", &format!("full-output-{index}"));
+        }
+
+        compact_session_with(
+            &mut session,
+            4,
+            9_000,
+            1_000,
+            1,
+            |_, messages, _, _, _| async move {
+                assert_eq!(messages.len(), 4, "tool calls must not be dropped");
+                assert_eq!(messages[0].role, MessageRole::ToolCall);
+                assert_eq!(messages[2].role, MessageRole::ToolCall);
+                assert!(messages[1].content.contains("[result cleared:"));
+                assert!(messages[3].content.contains("full-output-1"));
+                Ok(("PRUNED_SUMMARY".to_string(), 4))
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.messages[0].content, "PRUNED_SUMMARY");
+    }
+
     #[test]
     fn manual_compress_skips_the_budget_gate_but_respects_keep_recent() {
         let mut session = Session::new("openai", "model", 100_000, "");
         session.add_message(MessageRole::User, "old");
         session.add_message(MessageRole::Assistant, "recent");
         assert_eq!(
-            plan_tui_compaction(&session, true, 99_000, 1),
+            plan_tui_compaction(&session, true, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
             TuiCompactionGate::WithinBudget
         );
         assert_eq!(
-            plan_tui_compaction(&session, false, 99_000, 1),
+            plan_tui_compaction(&session, false, 99_000, 1, KEEP_RECENT_TOOL_RESULTS),
             TuiCompactionGate::Cut(1)
         );
         assert_eq!(
-            plan_tui_compaction(&session, false, 99_000, 1_000),
+            plan_tui_compaction(&session, false, 99_000, 1_000, KEEP_RECENT_TOOL_RESULTS,),
             TuiCompactionGate::NothingToSummarize
         );
     }

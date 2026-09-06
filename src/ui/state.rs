@@ -55,6 +55,11 @@ impl<'a> UiContext<'a> {
             ask_tx: &self.ask_tx,
             sandbox: &self.sandbox,
             read_tracker: &self.session.read_tracker,
+            todo_store: &self.session.todos,
+            tool_output_session_id: &self.session.id,
+            tool_result_spills: &self.session.tool_result_spills,
+            #[cfg(feature = "js")]
+            js_session_state: &self.session.js_session_state,
             #[cfg(feature = "skills")]
             skill_services: &self.skill_services,
             #[cfg(feature = "mcp")]
@@ -111,6 +116,11 @@ pub(crate) struct AgentBuildCtx<'a> {
     pub ask_tx: &'a Option<AskSender>,
     pub sandbox: &'a Sandbox,
     pub read_tracker: &'a crate::agent::tools::ReadTracker,
+    pub todo_store: &'a crate::agent::tools::TodoStore,
+    pub tool_output_session_id: &'a str,
+    pub tool_result_spills: &'a crate::session::ToolResultSpillStore,
+    #[cfg(feature = "js")]
+    pub js_session_state: &'a crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")]
     pub skill_services: &'a Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     #[cfg(feature = "mcp")]
@@ -134,9 +144,14 @@ impl AgentBuildCtx<'_> {
             self.ask_tx.clone(),
             self.sandbox.clone(),
             self.read_tracker.clone(),
+            self.todo_store.clone(),
+            self.tool_output_session_id,
+            Some(self.tool_result_spills.clone()),
             reasoning_enabled,
             temperature,
             extra_body,
+            #[cfg(feature = "js")]
+            self.js_session_state.clone(),
             #[cfg(feature = "skills")]
             self.skill_services.clone(),
             #[cfg(feature = "mcp")]
@@ -170,12 +185,13 @@ pub(crate) struct PendingMainTurn {
 }
 
 struct SessionRollback {
-    messages: Vec<crate::session::SessionMessage>,
-    compactions: Vec<crate::session::Compaction>,
+    messages_len: usize,
+    compactions_len: usize,
     updated_at: compact_str::CompactString,
     total_estimated_tokens: u64,
     calibrated_tokens: u64,
     calibrated_msg_count: usize,
+    calibrated_tool_results_cleared: usize,
     rewind_undo: Option<crate::session::RewindUndo>,
     #[cfg(feature = "multimodal")]
     pending_media: Vec<crate::extras::multimodal::MediaAttachment>,
@@ -187,12 +203,13 @@ impl PendingMainTurn {
             prompt: prompt.to_string(),
             session_id: session.id.clone(),
             session_before: SessionRollback {
-                messages: session.messages.clone(),
-                compactions: session.compactions.clone(),
+                messages_len: session.messages.len(),
+                compactions_len: session.compactions.len(),
                 updated_at: session.updated_at.clone(),
                 total_estimated_tokens: session.total_estimated_tokens,
                 calibrated_tokens: session.calibrated_tokens,
                 calibrated_msg_count: session.calibrated_msg_count,
+                calibrated_tool_results_cleared: session.calibrated_tool_results_cleared,
                 rewind_undo: session.rewind_undo.clone(),
                 #[cfg(feature = "multimodal")]
                 pending_media: Vec::new(),
@@ -224,8 +241,8 @@ impl PendingMainTurn {
     ) -> bool {
         !response_buf.trim().is_empty()
             || !turn_trace.is_empty()
-            || session.messages.len() > self.session_before.messages.len().saturating_add(1)
-            || session.compactions.len() != self.session_before.compactions.len()
+            || session.messages.len() > self.session_before.messages_len.saturating_add(1)
+            || session.compactions.len() != self.session_before.compactions_len
             || {
                 #[cfg(feature = "memory")]
                 {
@@ -239,15 +256,11 @@ impl PendingMainTurn {
     }
 
     pub(crate) fn has_recorded_turn_messages(&self, session: &Session) -> bool {
-        session.messages.len() > self.session_before.messages.len().saturating_add(1)
+        session.messages.len() > self.session_before.messages_len.saturating_add(1)
     }
 
     pub(crate) fn finalize_unresolved_tool_calls(&self, session: &mut Session) {
-        let turn_start = self
-            .session_before
-            .messages
-            .len()
-            .min(session.messages.len());
+        let turn_start = self.session_before.messages_len.min(session.messages.len());
         let resolved: std::collections::HashSet<String> = session.messages[turn_start..]
             .iter()
             .filter(|message| message.role == crate::session::MessageRole::ToolResult)
@@ -322,13 +335,19 @@ impl PendingMainTurn {
                 tracing::warn!("failed to remove uncommitted tool output: {error}");
             }
         }
-        session.messages = self.session_before.messages;
-        session.compactions = self.session_before.compactions;
+        session.messages.truncate(self.session_before.messages_len);
+        session
+            .compactions
+            .truncate(self.session_before.compactions_len);
+        session.mark_history_changed();
         session.updated_at = self.session_before.updated_at;
         session.total_estimated_tokens = self.session_before.total_estimated_tokens;
         session.calibrated_tokens = self.session_before.calibrated_tokens;
         session.calibrated_msg_count = self.session_before.calibrated_msg_count;
+        session.calibrated_tool_results_cleared =
+            self.session_before.calibrated_tool_results_cleared;
         session.rewind_undo = self.session_before.rewind_undo;
+        session.read_tracker.clear();
         #[cfg(feature = "multimodal")]
         {
             session.pending_media = self.session_before.pending_media;
@@ -343,6 +362,12 @@ pub(crate) struct AgentRunState {
     pub is_running: bool,
     pub agent_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub main_abort: Option<tokio::task::AbortHandle>,
+    pub compaction_decision_tx:
+        Option<mpsc::Sender<crate::agent::runner::CompactionBoundaryDecision>>,
+    /// Number of oldest live tool results cleared from the history supplied to
+    /// the currently spawned runner. Provider calibration must use this exact
+    /// projection rather than recomputing it after in-turn results are added.
+    pub request_tool_results_cleared: usize,
     #[cfg(feature = "loop")]
     pub(super) active_validation: Option<ActiveValidation>,
     #[cfg(feature = "loop")]
@@ -355,6 +380,7 @@ pub(crate) struct AgentRunState {
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,
+    pub pending_compaction_pressure: Option<f64>,
 }
 
 #[cfg(feature = "loop")]
@@ -401,7 +427,7 @@ impl AgentRunState {
 pub(crate) struct ChainState {
     pub pending: Option<crate::extras::chain::ChainPhase>,
     pub label_msg: Option<String>,
-    pub dot_prompt_restore: Option<String>,
+    pub dot_prompt_restore: Option<crate::context::ActiveContextSelection>,
     pub loop_label: Option<String>,
     #[cfg(feature = "loop")]
     pub loop_state: Option<crate::extras::r#loop::LoopState>,

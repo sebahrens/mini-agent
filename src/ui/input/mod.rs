@@ -57,6 +57,7 @@ pub struct InputEditor {
     pub picker: Option<Picker>,
     monochrome: bool,
     prompt_names: Vec<String>,
+    agent_names: Vec<String>,
     theme_names: Vec<String>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
@@ -78,6 +79,7 @@ impl InputEditor {
             picker: None,
             monochrome: false,
             prompt_names: Vec::new(),
+            agent_names: Vec::new(),
             theme_names: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
@@ -147,6 +149,10 @@ impl InputEditor {
 
     pub fn set_prompt_names(&mut self, names: Vec<String>) {
         self.prompt_names = names;
+    }
+
+    pub fn set_agent_names(&mut self, names: Vec<String>) {
+        self.agent_names = names;
     }
 
     pub fn set_theme_names(&mut self, names: Vec<String>) {

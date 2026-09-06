@@ -5,7 +5,9 @@ use crate::extras::js::skills::embed::SkillDocument;
 use crate::extras::js::skills::index::RetrievalPolicy;
 use crate::extras::js::skills::store::SkillStore;
 use crate::extras::js::skills::turn::SkillRuntime;
-use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
+};
 use crate::extras::skills::import_agent_skill;
 use crate::extras::skills::index::AgentSkillSearchPolicy;
 use crate::paths::AppPaths;
@@ -87,6 +89,137 @@ async fn deterministic_backend_reports_lexical_only_retrieval() {
     assert!(discovery.diagnostics.iter().any(|entry| {
         entry == "semantic_retrieval_unavailable:deterministic_embedding_backend"
     }));
+}
+
+#[tokio::test]
+async fn read_only_child_shares_retrieval_but_freezes_only_active_pure_skills() {
+    let temp = TempPaths::new();
+    let pure = learned_skill();
+    let effectful = SkillArtifact::new(
+        "function effectfulChildSkill(_cap, value) { return value; }".to_string(),
+        "Trim child text with a repository read.".to_string(),
+        vec!["text".to_string(), "trim".to_string(), "child".to_string()],
+        vec![SkillExport {
+            name: "effectfulChildSkill".to_string(),
+            signature: "effectfulChildSkill(value: string): string".to_string(),
+        }],
+        vec!["effectfulChildSkill('x') === 'x'".to_string()],
+        CapabilityManifest::new(
+            CapabilityTier::ReadOnly,
+            vec![CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["src".to_string()],
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&pure).unwrap();
+    store.insert_verified(&effectful).unwrap();
+    drop(store);
+
+    let parent = SkillRuntime::open(&temp.paths, None).unwrap();
+    parent.settle_learned_rebuild_for_test().await;
+    let child = parent.fork_for_read_only_child();
+    assert!(parent.shares_learned_coordinator(&child));
+
+    let discovery = child.prepare_turn("trim child text").await;
+    assert!(
+        discovery
+            .learned_js
+            .skills
+            .iter()
+            .any(|skill| skill.id == pure.id),
+        "pure skill should remain retrievable: {:?}",
+        discovery.diagnostics
+    );
+    assert!(
+        discovery
+            .learned_js
+            .skills
+            .iter()
+            .all(|skill| skill.capability.tier == CapabilityTier::Pure)
+    );
+    assert!(
+        discovery
+            .learned_js
+            .skills
+            .iter()
+            .all(|skill| skill.id != effectful.id)
+    );
+}
+
+#[tokio::test]
+async fn live_runtime_discovers_an_agent_skill_imported_after_open() {
+    let temp = TempPaths::new();
+    let runtime = SkillRuntime::open(&temp.paths, None)
+        .unwrap()
+        .with_test_policies(
+            RetrievalPolicy::default(),
+            AgentSkillSearchPolicy {
+                score_floor: -1.0,
+                ..AgentSkillSearchPolicy::default()
+            },
+        );
+    assert!(
+        runtime
+            .prepare_turn("late imported workflow")
+            .await
+            .selected_agent_digests
+            .is_empty()
+    );
+
+    let source = temp.root.join("late-imported-workflow");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        b"---\nname: late-imported-workflow\ndescription: Handles a late imported workflow.\n---\n\n# Late import\nUse this workflow.\n",
+    )
+    .unwrap();
+    let imported = import_agent_skill(&source, &temp.paths).unwrap();
+
+    let discovery = runtime.prepare_turn("late imported workflow").await;
+    assert_eq!(
+        discovery.selected_agent_digests,
+        vec![imported.identity.digest]
+    );
+    assert!(discovery.trusted_context.contains("# Late import"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_turn_keeps_current_thread_executor_responsive_while_sqlite_waits() {
+    let temp = TempPaths::new();
+    let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
+    runtime.settle_learned_rebuild_for_test().await;
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let holder = runtime
+        .hold_learned_store_lock_for_test(entered_tx, release_rx)
+        .expect("learned coordinator");
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("test must hold the SQLite mutex");
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        release_tx.send(()).unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let (_, timer_elapsed) = tokio::join!(
+        runtime.prepare_turn("keep the async executor responsive"),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            started.elapsed()
+        }
+    );
+    holder.join().unwrap();
+    watchdog.join().unwrap();
+
+    assert!(
+        timer_elapsed < std::time::Duration::from_millis(150),
+        "executor timer was delayed by synchronous SQLite for {timer_elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -177,6 +310,139 @@ async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
 }
 
 #[tokio::test]
+async fn selected_agent_skill_attaches_its_exact_active_learned_js_identity() {
+    let temp = TempPaths::new();
+    let learned = learned_skill();
+    SkillStore::open_at(&temp.paths)
+        .and_then(|mut store| store.insert_verified(&learned))
+        .unwrap();
+
+    let agent_source = temp.root.join("bridge-workflow");
+    fs::create_dir_all(&agent_source).unwrap();
+    fs::write(
+        agent_source.join("SKILL.md"),
+        format!(
+            "---\nname: bridge-workflow\ndescription: Coordinates a bridge workflow.\nlearned-js:\n  - {}\n---\n\n# Bridge workflow\nUse the associated parser.\n",
+            learned.id
+        ),
+    )
+    .unwrap();
+    let imported = import_agent_skill(&agent_source, &temp.paths).unwrap();
+    assert_eq!(imported.manifest.learned_js, vec![learned.id.clone()]);
+
+    let runtime = SkillRuntime::open(&temp.paths, None)
+        .unwrap()
+        .with_test_policies(
+            RetrievalPolicy {
+                dense_score_floor: 2.0,
+                lexical_score_floor: 2.0,
+                ..RetrievalPolicy::default()
+            },
+            AgentSkillSearchPolicy {
+                score_floor: -1.0,
+                ..AgentSkillSearchPolicy::default()
+            },
+        );
+    let discovery = runtime.prepare_turn("coordinate the bridge workflow").await;
+
+    assert_eq!(
+        discovery.selected_agent_digests,
+        vec![imported.identity.digest]
+    );
+    assert_eq!(discovery.learned_js.skills.len(), 1);
+    assert_eq!(discovery.learned_js.skills[0].id, learned.id);
+    assert_eq!(discovery.learned_js.skills[0].rank, 1);
+    assert!(
+        discovery
+            .trusted_context
+            .contains("Call `uniqueLearnedSource(")
+    );
+}
+
+#[tokio::test]
+async fn agent_skill_learned_js_association_never_bypasses_activation() {
+    let temp = TempPaths::new();
+    let learned = learned_skill();
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    store.insert_verified(&learned).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions SET status = 'verified' WHERE id = ?",
+            [&learned.id],
+        )
+        .unwrap();
+
+    let agent_source = temp.root.join("gated-bridge");
+    fs::create_dir_all(&agent_source).unwrap();
+    fs::write(
+        agent_source.join("SKILL.md"),
+        format!(
+            "---\nname: gated-bridge\ndescription: Coordinates a gated bridge workflow.\nlearned-js: [{}]\n---\n\n# Gated bridge\n",
+            learned.id
+        ),
+    )
+    .unwrap();
+    let imported = import_agent_skill(&agent_source, &temp.paths).unwrap();
+    drop(store);
+
+    let runtime = SkillRuntime::open(&temp.paths, None)
+        .unwrap()
+        .with_test_policies(
+            RetrievalPolicy {
+                dense_score_floor: 2.0,
+                lexical_score_floor: 2.0,
+                ..RetrievalPolicy::default()
+            },
+            AgentSkillSearchPolicy {
+                score_floor: -1.0,
+                ..AgentSkillSearchPolicy::default()
+            },
+        );
+    let discovery = runtime
+        .prepare_turn("coordinate the gated bridge workflow")
+        .await;
+
+    assert_eq!(
+        discovery.selected_agent_digests,
+        vec![imported.identity.digest.clone()]
+    );
+    assert!(discovery.learned_js.skills.is_empty());
+    assert!(discovery.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            == &format!(
+                "agent_skill_learned_js_unavailable:{}:{}:not_active",
+                imported.identity.digest, learned.id
+            )
+    }));
+}
+
+#[test]
+fn agent_skill_import_rejects_an_unverified_learned_js_identity_before_installing() {
+    let temp = TempPaths::new();
+    let missing = "a".repeat(64);
+    let agent_source = temp.root.join("missing-bridge");
+    fs::create_dir_all(&agent_source).unwrap();
+    fs::write(
+        agent_source.join("SKILL.md"),
+        format!(
+            "---\nname: missing-bridge\ndescription: References a missing learned capability.\nlearned-js: [{missing}]\n---\nBody\n"
+        ),
+    )
+    .unwrap();
+
+    let error = import_agent_skill(&agent_source, &temp.paths).unwrap_err();
+    assert!(error.to_string().contains("identity is not installed"));
+    assert!(
+        !temp
+            .paths
+            .data_dir
+            .join("agent-skills/missing-bridge")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() {
     let temp = TempPaths::new();
     let learned = learned_skill();
@@ -226,7 +492,7 @@ async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() 
 }
 
 #[tokio::test]
-async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
+async fn prepared_turn_keeps_trusted_manifest_separate_from_the_user_prompt() {
     let temp = TempPaths::new();
     let learned = learned_skill();
     SkillStore::open_at(&temp.paths)
@@ -244,13 +510,12 @@ async fn prepared_prompt_places_trusted_manifest_before_the_user_prompt() {
     runtime.settle_learned_rebuild_for_test().await;
     let prompt = retrieval_document(&learned);
 
-    let prepared = runtime.prepare_prompt(&prompt).await;
+    let discovery = runtime.prepare_turn(&prompt).await;
 
-    let manifest_at = prepared.find("<available_js_skills>").unwrap();
-    let prompt_at = prepared.rfind(&prompt).unwrap();
-    assert!(manifest_at < prompt_at);
-    assert!(prepared.contains(&learned.id));
-    assert!(!prepared.contains("return value.trim()"));
+    assert!(discovery.trusted_context.contains("<available_js_skills>"));
+    assert!(discovery.trusted_context.contains(&learned.id));
+    assert!(!discovery.trusted_context.contains(&prompt));
+    assert!(!discovery.trusted_context.contains("return value.trim()"));
 }
 
 #[tokio::test]
@@ -310,7 +575,13 @@ async fn background_skill_rebuild_returns_early_but_remains_owned() {
         .expect("owned rebuild should finish after its blocking child completes");
     runtime.settle_learned_rebuild_for_test().await;
     let prompt = retrieval_document(&learned);
-    assert!(runtime.prepare_prompt(&prompt).await.contains(&learned.id));
+    assert!(
+        runtime
+            .prepare_turn(&prompt)
+            .await
+            .trusted_context
+            .contains(&learned.id)
+    );
 }
 
 #[tokio::test]

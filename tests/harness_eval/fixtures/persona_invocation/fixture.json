@@ -1,0 +1,14 @@
+{
+  "name": "persona_invocation",
+  "prompt": "Ask the Rust security specialist to audit the fixture and save its verdict.",
+  "max_provider_turns": 3,
+  "max_tool_calls": 2,
+  "max_total_tokens": 390,
+  "initial_files": {
+    "src/lib.rs": "pub fn checked_add(a: u64, b: u64) -> Option<u64> { a.checked_add(b) }\n"
+  },
+  "expected_files": {
+    "src/lib.rs": "pub fn checked_add(a: u64, b: u64) -> Option<u64> { a.checked_add(b) }\n",
+    "audit.txt": "rust-security-review: pass\n"
+  }
+}

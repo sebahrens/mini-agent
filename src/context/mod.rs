@@ -42,6 +42,89 @@ pub(crate) fn load_dir_files(dir: &Path, ext: &str) -> Vec<(String, String)> {
     results
 }
 
+pub(crate) fn load_dir_files_bounded_status(
+    dir: &Path,
+    ext: &str,
+    max_bytes: usize,
+) -> Vec<(String, Result<String, String>)> {
+    let mut results = Vec::new();
+    if dir.exists()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != ext) {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let content = match std::fs::File::open(&path) {
+                Ok(file) => match crate::paths::read_utf8_bounded_status(file, max_bytes) {
+                    Ok(crate::paths::BoundedUtf8Read::Content(content)) => Ok(content),
+                    Ok(crate::paths::BoundedUtf8Read::Oversized) => {
+                        Err(format!("exceeds the {max_bytes}-byte limit"))
+                    }
+                    Ok(crate::paths::BoundedUtf8Read::InvalidUtf8) => {
+                        Err("is not valid UTF-8".to_string())
+                    }
+                    Err(error) => Err(format!("could not be read: {error}")),
+                },
+                Err(error) => Err(format!("could not be opened: {error}")),
+            };
+            results.push((name.to_string(), content));
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod bounded_directory_file_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_directory_loaders_stop_at_limit_plus_one() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-bounded-directory-files-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agents = root.join(".zerostack/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("exact.md"), b"12345678").unwrap();
+        std::fs::write(agents.join("oversized.md"), b"123456789").unwrap();
+        std::fs::write(agents.join("invalid.md"), [0xff, 0xfe]).unwrap();
+
+        let direct_status = load_dir_files_bounded_status(&agents, "md", 8);
+        assert_eq!(direct_status.len(), 3);
+        assert!(direct_status.contains(&("exact".to_string(), Ok("12345678".to_string()))));
+        assert!(direct_status.contains(&(
+            "oversized".to_string(),
+            Err("exceeds the 8-byte limit".to_string())
+        )));
+        assert!(
+            direct_status.contains(&("invalid".to_string(), Err("is not valid UTF-8".to_string())))
+        );
+
+        let workspace = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+        let capability_status = workspace
+            .read_relative_dir_files_bounded_status(Path::new(".zerostack/agents"), "md", 8)
+            .unwrap();
+        assert_eq!(capability_status.len(), 3);
+        assert!(capability_status.contains(&("exact".to_string(), Ok("12345678".to_string()))));
+        assert!(capability_status.contains(&(
+            "oversized".to_string(),
+            Err("exceeds the 8-byte limit".to_string())
+        )));
+        assert!(
+            capability_status
+                .contains(&("invalid".to_string(), Err("is not valid UTF-8".to_string())))
+        );
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub(crate) fn copy_embedded_to(embedded: &Dir, dest: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest)?;
     for file in embedded.files() {
@@ -63,13 +146,18 @@ pub struct ContextFiles {
     pub prompts: HashMap<String, String>,
     pub current_prompt: Option<String>,
     pub current_prompt_name: Option<String>,
+    pub agent_definitions: HashMap<String, agents::AgentDefinition>,
+    pub current_agent_name: Option<String>,
+    /// True when `/agent` (including `/agent default`) is the authority for
+    /// the current persona. Prompt reloads must not overwrite that choice.
+    pub(crate) current_agent_explicit: bool,
     pub themes: HashMap<String, String>,
     pub current_theme_name: Option<String>,
     pub extra_files: Vec<std::path::PathBuf>,
     /// Preloaded file contents keyed by canonical path. Populated at /add time using
     /// spawn_blocking so agent-build paths never perform synchronous filesystem reads.
     pub extra_file_contents: HashMap<PathBuf, Arc<String>>,
-    pub one_shot_restore: Option<String>,
+    pub one_shot_restore: Option<ActiveContextSelection>,
     pub chain_declined: Vec<String>,
     #[cfg(feature = "memory")]
     pub memory: Option<String>,
@@ -77,7 +165,95 @@ pub struct ContextFiles {
     pub architecture: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActiveContextSelection {
+    pub(crate) prompt_name: Option<String>,
+    pub(crate) agent_name: Option<String>,
+    pub(crate) agent_explicit: bool,
+}
+
 impl ContextFiles {
+    pub(crate) fn active_selection(&self) -> ActiveContextSelection {
+        ActiveContextSelection {
+            prompt_name: self.current_prompt_name.clone(),
+            agent_name: self.current_agent_name.clone(),
+            agent_explicit: self.current_agent_explicit,
+        }
+    }
+
+    /// Select a prompt mode, strip its header directives, and compose its
+    /// optional persona with the current main-agent selection. Returns the
+    /// requested security-mode directive for the permission layer.
+    pub(crate) fn activate_prompt(&mut self, name: &str) -> Option<Option<String>> {
+        let content = self.prompts.get(name)?.clone();
+        let directives = prompts::parse_directives(&content);
+        self.current_prompt = Some(directives.content.to_string());
+        self.current_prompt_name = Some(name.to_string());
+        if let Some(agent) = directives.agent {
+            self.current_agent_explicit = false;
+            if agent == "default" {
+                self.current_agent_name = None;
+            } else if self.agent_definitions.contains_key(agent) {
+                self.current_agent_name = Some(agent.to_string());
+            } else {
+                tracing::warn!(
+                    prompt = name,
+                    agent,
+                    "prompt names an unavailable main-agent persona"
+                );
+                self.current_agent_name = None;
+            }
+        }
+        Some(directives.mode.map(str::to_string))
+    }
+
+    /// Select a persona for the main loop and return its optional default
+    /// prompt mode. The caller applies that prompt so model and permission
+    /// mappings stay on the same path as an explicit `/prompt` selection.
+    pub(crate) fn activate_agent(&mut self, name: &str) -> Option<Option<String>> {
+        let mode = self.agent_definitions.get(name)?.mode.clone();
+        self.current_agent_name = Some(name.to_string());
+        self.current_agent_explicit = true;
+        Some(mode)
+    }
+
+    pub(crate) fn restore_selection(&mut self, selection: ActiveContextSelection) {
+        if let Some(name) = selection.prompt_name {
+            let _ = self.activate_prompt(&name);
+        } else {
+            self.current_prompt = None;
+            self.current_prompt_name = None;
+        }
+        self.current_agent_name = selection
+            .agent_name
+            .filter(|name| self.agent_definitions.contains_key(name));
+        self.current_agent_explicit = selection.agent_explicit;
+    }
+
+    #[cfg(feature = "memory")]
+    pub(crate) fn replace_memory_if_changed(&mut self, memory: Option<String>) -> bool {
+        if self.memory == memory {
+            return false;
+        }
+        self.memory = memory;
+        true
+    }
+
+    /// Refresh persistent-memory prompt context without destabilizing the
+    /// provider cache when its rendered content is byte-identical.
+    #[cfg(feature = "memory")]
+    pub(crate) async fn refresh_memory_if_changed(&mut self) -> bool {
+        match tokio::task::spawn_blocking(|| crate::extras::memory::Mem::open().context_block())
+            .await
+        {
+            Ok(memory) => self.replace_memory_if_changed(memory),
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh persistent memory context");
+                false
+            }
+        }
+    }
+
     pub(crate) fn for_workspace_binding(
         &self,
         no_context_files: bool,
@@ -92,6 +268,14 @@ impl ContextFiles {
         context.workspace_root = workspace.root().to_path_buf();
         context.agents = agents;
         context.prompts = prompts::load_for_workspace_binding(workspace);
+        context.agent_definitions = agents::load_for_workspace_binding(workspace);
+        if context
+            .current_agent_name
+            .as_ref()
+            .is_some_and(|name| !context.agent_definitions.contains_key(name))
+        {
+            context.current_agent_name = None;
+        }
         if let Some(name) = &context.current_prompt_name {
             context.current_prompt = context.prompts.get(name).cloned();
         }
@@ -114,6 +298,18 @@ impl ContextFiles {
         context.workspace_root = workspace_root.to_path_buf();
         context.agents = agents;
         context.prompts = prompts::load_for_workspace(workspace_root);
+        let binding = crate::paths::WorkspaceBinding::capture(workspace_root).ok();
+        context.agent_definitions = binding
+            .as_ref()
+            .map(agents::load_for_workspace_binding)
+            .unwrap_or_else(agents::load);
+        if context
+            .current_agent_name
+            .as_ref()
+            .is_some_and(|name| !context.agent_definitions.contains_key(name))
+        {
+            context.current_agent_name = None;
+        }
         if let Some(name) = &context.current_prompt_name {
             context.current_prompt = context.prompts.get(name).cloned();
         }
@@ -141,8 +337,20 @@ impl ContextFiles {
             self.architecture = walk_context_files(Some(workspace_root)).1;
         }
         self.prompts = prompts::load_for_workspace(workspace_root);
+        self.agent_definitions = crate::paths::WorkspaceBinding::capture(workspace_root)
+            .ok()
+            .as_ref()
+            .map(agents::load_for_workspace_binding)
+            .unwrap_or_else(agents::load);
         if let Some(name) = &self.current_prompt_name {
             self.current_prompt = self.prompts.get(name).cloned();
+        }
+        if self
+            .current_agent_name
+            .as_ref()
+            .is_some_and(|name| !self.agent_definitions.contains_key(name))
+        {
+            self.current_agent_name = None;
         }
         self.themes = themes::load();
         self.current_theme_name = crate::session::storage::load_theme_name();
@@ -238,6 +446,12 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     #[cfg(not(feature = "archmd"))]
     let _ = arch_candidate;
     let prompt_map = prompts::load();
+    let workspace_binding =
+        workspace_root.and_then(|root| crate::paths::WorkspaceBinding::capture(root).ok());
+    let agent_definitions = workspace_binding
+        .as_ref()
+        .map(agents::load_for_workspace_binding)
+        .unwrap_or_else(agents::load);
     let theme_map = themes::load();
     let theme_name = crate::session::storage::load_theme_name();
     #[cfg(feature = "memory")]
@@ -251,6 +465,9 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
         prompts: prompt_map,
         current_prompt: None,
         current_prompt_name: None,
+        agent_definitions,
+        current_agent_name: None,
+        current_agent_explicit: false,
         themes: theme_map,
         current_theme_name: theme_name,
         extra_files: Vec::new(),

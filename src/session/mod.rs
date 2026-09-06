@@ -1,17 +1,132 @@
 pub mod chat_history;
 pub mod storage;
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::process_creation::StdCommandCreationExt;
-
 pub const TOOL_RESULT_SAVE_THRESHOLD: usize = 12_000;
 pub const TOOL_RESULT_HEAD_CHARS: usize = 2_000;
 pub const TOOL_RESULT_TAIL_CHARS: usize = 8_000;
+pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 8;
+pub const CLEARED_TOOL_RESULT_NOTICE: &str =
+    "[result cleared: old tool output omitted from the live context; re-run the tool if needed]";
+
+#[derive(Debug)]
+struct PendingToolResultSpill {
+    path: std::path::PathBuf,
+    correlation_ids: Vec<String>,
+    output_key: (String, [u8; 32]),
+}
+
+#[derive(Debug, Default)]
+struct PendingToolResultSpills {
+    by_id: HashMap<String, VecDeque<Arc<PendingToolResultSpill>>>,
+    by_output: HashMap<(String, [u8; 32]), VecDeque<Arc<PendingToolResultSpill>>>,
+}
+
+/// Process-local handoff from the pre-model tool-result hook to transcript
+/// persistence. Correlation IDs are framework-owned, so artifact paths never
+/// need to be recovered by parsing or trusting model-visible tool output.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolResultSpillStore {
+    pending: Arc<Mutex<PendingToolResultSpills>>,
+}
+
+impl ToolResultSpillStore {
+    pub(crate) fn register(
+        &self,
+        internal_call_id: &str,
+        provider_call_id: Option<&str>,
+        tool_name: &str,
+        model_output: &str,
+        path: std::path::PathBuf,
+    ) {
+        let mut correlation_ids = vec![internal_call_id.to_owned()];
+        if let Some(provider_call_id) = provider_call_id
+            && !provider_call_id.is_empty()
+            && provider_call_id != internal_call_id
+        {
+            correlation_ids.push(provider_call_id.to_owned());
+        }
+        let output_key = (tool_name.to_owned(), sha256(model_output));
+        let spill = Arc::new(PendingToolResultSpill {
+            path,
+            correlation_ids: correlation_ids.clone(),
+            output_key: output_key.clone(),
+        });
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for id in correlation_ids {
+            pending
+                .by_id
+                .entry(id)
+                .or_default()
+                .push_back(spill.clone());
+        }
+        pending
+            .by_output
+            .entry(output_key)
+            .or_default()
+            .push_back(spill);
+    }
+
+    fn take(
+        &self,
+        correlation_id: &str,
+        tool_name: &str,
+        output: &str,
+    ) -> Option<std::path::PathBuf> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let spill = if correlation_id.is_empty() {
+            None
+        } else {
+            pending
+                .by_id
+                .get_mut(correlation_id)
+                .and_then(VecDeque::pop_front)
+        }
+        .or_else(|| {
+            pending
+                .by_output
+                .get_mut(&(tool_name.to_owned(), sha256(output)))
+                .and_then(VecDeque::pop_front)
+        })?;
+        for id in &spill.correlation_ids {
+            let mut remove_key = false;
+            if let Some(queue) = pending.by_id.get_mut(id) {
+                queue.retain(|candidate| !Arc::ptr_eq(candidate, &spill));
+                remove_key = queue.is_empty();
+            }
+            if remove_key {
+                pending.by_id.remove(id);
+            }
+        }
+        let mut remove_output_key = false;
+        if let Some(queue) = pending.by_output.get_mut(&spill.output_key) {
+            queue.retain(|candidate| !Arc::ptr_eq(candidate, &spill));
+            remove_output_key = queue.is_empty();
+        }
+        if remove_output_key {
+            pending.by_output.remove(&spill.output_key);
+        }
+        Some(spill.path.clone())
+    }
+}
+
+fn sha256(value: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes()).into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,20 +163,53 @@ pub enum PersistedToolMessage {
     },
     Result {
         output: CompactString,
+        /// Separately persisted full output for a truncated result. Kept in
+        /// the durable session so live-context pruning can retain a recorded
+        /// recovery path without parsing marker-like text from the tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_path: Option<CompactString>,
     },
 }
 
 /// A single-step restore point captured before a conversation rewind, so the
-/// destructive truncation can be undone with `/redo`. Holds the full
-/// message list and the calibration/estimate fields that `truncate_to` mutates,
-/// which is everything needed to put the session back exactly as it was. It is
-/// persisted with private session storage so a restart retains one-step redo.
+/// destructive truncation can be undone with `/redo`. New records hold only
+/// the removed tail; `tail_only = false` preserves compatibility with older
+/// session files that stored a full duplicate message list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewindUndo {
     messages: Vec<SessionMessage>,
+    #[serde(default)]
+    tail_only: bool,
     total_estimated_tokens: u64,
     calibrated_tokens: u64,
     calibrated_msg_count: usize,
+    #[serde(default)]
+    pub(crate) calibrated_tool_results_cleared: usize,
+}
+
+#[derive(Default)]
+struct HistoryConversionCache {
+    entry: std::sync::Mutex<Option<CachedHistoryConversion>>,
+}
+
+struct CachedHistoryConversion {
+    revision: u64,
+    keep_recent_tool_results: usize,
+    messages: std::sync::Arc<[rig::completion::Message]>,
+}
+
+impl std::fmt::Debug for HistoryConversionCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HistoryConversionCache")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for HistoryConversionCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,12 +257,19 @@ pub struct Session {
     pub total_cached_input_tokens: u64,
     #[serde(default)]
     pub total_cache_creation_input_tokens: u64,
+    /// Provider-normalized prompt tokens, including cached tiers exactly once.
+    #[serde(default)]
+    pub total_real_input_tokens: u64,
     pub total_cost: f64,
     pub total_estimated_tokens: u64,
     #[serde(default)]
     pub calibrated_tokens: u64,
     #[serde(default)]
     pub calibrated_msg_count: usize,
+    /// Number of oldest live tool results represented by the provider
+    /// calibration as cleared notices rather than full output.
+    #[serde(default)]
+    pub(crate) calibrated_tool_results_cleared: usize,
     #[serde(default)]
     pub input_token_cost: f64,
     #[serde(default)]
@@ -127,10 +282,25 @@ pub struct Session {
     pub working_dir: CompactString,
     #[serde(default)]
     pub permission_allowlist: Vec<PermissionAllowEntry>,
+    /// Structured task state shared by the active agent tools and persisted
+    /// with this logical session. Cloning a live session intentionally keeps
+    /// the same store so rebuilt agents observe updates immediately.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::agent::tools::TodoStore::is_empty"
+    )]
+    pub todos: crate::agent::tools::TodoStore,
     /// Process-local repeated-read state for this logical session. It is never
     /// persisted; startup recreates it from the active configuration.
     #[serde(skip)]
     pub(crate) read_tracker: crate::agent::tools::ReadTracker,
+    /// Artifact handoff shared by every rebuild of this logical session.
+    #[serde(skip)]
+    pub(crate) tool_result_spills: ToolResultSpillStore,
+    /// Process-local JSON scratch state shared by JavaScript tools across agent rebuilds.
+    #[cfg(feature = "js")]
+    #[serde(skip)]
+    pub(crate) js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "multimodal")]
     #[serde(skip)]
     pub pending_media: Vec<crate::extras::multimodal::MediaAttachment>,
@@ -164,6 +334,12 @@ pub struct Session {
     /// session retains the same one-step undo/redo semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewind_undo: Option<RewindUndo>,
+    /// Process-local Rig history conversion cache. Session clones deliberately
+    /// start empty, and neither the cache nor its revision is persisted.
+    #[serde(skip)]
+    history_conversion_cache: HistoryConversionCache,
+    #[serde(skip)]
+    history_revision: u64,
 }
 
 /// Working-tree summary parsed from `git status --porcelain=v2 --branch`.
@@ -184,6 +360,44 @@ impl GitStatus {
 }
 
 impl Session {
+    pub(crate) fn cached_converted_history(
+        &self,
+        keep_recent_tool_results: usize,
+    ) -> Option<std::sync::Arc<[rig::completion::Message]>> {
+        self.history_conversion_cache
+            .entry
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache.as_ref().and_then(|entry| {
+                    (entry.revision == self.history_revision
+                        && entry.keep_recent_tool_results == keep_recent_tool_results)
+                        .then(|| std::sync::Arc::clone(&entry.messages))
+                })
+            })
+    }
+
+    pub(crate) fn cache_converted_history(
+        &self,
+        keep_recent_tool_results: usize,
+        messages: std::sync::Arc<[rig::completion::Message]>,
+    ) {
+        if let Ok(mut cache) = self.history_conversion_cache.entry.lock() {
+            *cache = Some(CachedHistoryConversion {
+                revision: self.history_revision,
+                keep_recent_tool_results,
+                messages,
+            });
+        }
+    }
+
+    pub(crate) fn mark_history_changed(&mut self) {
+        self.history_revision = self.history_revision.wrapping_add(1);
+        if let Ok(mut cache) = self.history_conversion_cache.entry.lock() {
+            cache.take();
+        }
+    }
+
     /// Start a fresh process-local read history for a newly entered logical
     /// session. Ordinary agent rebuilds must keep cloning the existing tracker;
     /// only startup and explicit session replacement call this initializer.
@@ -233,10 +447,12 @@ impl Session {
             total_output_tokens: 0,
             total_cached_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            total_real_input_tokens: 0,
             total_cost: 0.0,
             total_estimated_tokens: 0,
             calibrated_tokens: 0,
             calibrated_msg_count: 0,
+            calibrated_tool_results_cleared: 0,
             input_token_cost: 0.0,
             output_token_cost: 0.0,
             context_window,
@@ -247,7 +463,11 @@ impl Session {
                 .map(|p| CompactString::new(p.to_string_lossy()))
                 .unwrap_or_default(),
             permission_allowlist: Vec::new(),
+            todos: crate::agent::tools::TodoStore::default(),
             read_tracker: crate::agent::tools::ReadTracker::default(),
+            tool_result_spills: ToolResultSpillStore::default(),
+            #[cfg(feature = "js")]
+            js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
             #[cfg(feature = "multimodal")]
             pending_media: Vec::new(),
             show_cost_always: false,
@@ -256,6 +476,8 @@ impl Session {
             reasoning_enabled: false,
             overhead_tokens: 0,
             rewind_undo: None,
+            history_conversion_cache: HistoryConversionCache::default(),
+            history_revision: 0,
         }
     }
 
@@ -321,23 +543,26 @@ impl Session {
         self.git_branch = Self::detect_git_branch(&self.working_dir);
     }
 
-    /// Refresh [`git_status`](Self::git_status) by running `git status` in
-    /// `working_dir`. Only call this when the statusline actually shows a git
-    /// change/status item: it spawns a subprocess (throttled by the caller).
-    pub fn refresh_git_status(&mut self) {
-        self.git_status = Self::detect_git_status(&self.working_dir);
-    }
-
-    fn detect_git_status(dir: &str) -> Option<GitStatus> {
-        let out = std::process::Command::new("git")
-            .args(["status", "--porcelain=v2", "--branch"])
-            .current_dir(dir)
-            .output_guarded()
+    /// Read working-tree status without blocking the async caller. Executable
+    /// discovery runs on the blocking pool, while the shared Git runner owns
+    /// the child lifetime, output caps, and deadline.
+    pub(crate) async fn detect_git_status(dir: &Path) -> Option<GitStatus> {
+        let runner = tokio::task::spawn_blocking(crate::git::runner::GitRunner::discover)
+            .await
+            .ok()?
             .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(Self::parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+        let result = runner
+            .run(
+                dir,
+                "status",
+                ["status", "--porcelain=v2", "--branch"],
+                crate::git::runner::QUERY_LIMITS,
+            )
+            .await
+            .ok()?;
+        Some(Self::parse_porcelain(&String::from_utf8_lossy(
+            &result.stdout,
+        )))
     }
 
     /// Parse `git status --porcelain=v2 --branch` output into a [`GitStatus`].
@@ -398,6 +623,7 @@ impl Session {
             tool_call_id: tool_call_id.map(CompactString::new),
             tool,
         });
+        self.mark_history_changed();
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(tokens);
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
         // The conversation has moved forward, so the last rewind's restore point
@@ -436,13 +662,17 @@ impl Session {
         name: &str,
         output: &str,
     ) -> (String, Option<std::path::PathBuf>) {
-        let (content, replay_output, artifact) = self.tool_result_content(name, output);
+        let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
+        let artifact_path = artifact
+            .as_ref()
+            .map(|path| CompactString::new(path.to_string_lossy()));
         self.add_message_with_tool_data(
             MessageRole::ToolResult,
             &content,
             (!id.is_empty()).then_some(id),
             Some(PersistedToolMessage::Result {
                 output: CompactString::new(replay_output),
+                artifact_path,
             }),
         );
         (content, artifact)
@@ -460,6 +690,16 @@ impl Session {
         self.total_cache_creation_input_tokens = self
             .total_cache_creation_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
+        self.total_real_input_tokens =
+            self.total_real_input_tokens
+                .saturating_add(Self::real_input_tokens(
+                    anthropic_native,
+                    usage.input_tokens,
+                    usage.total_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_creation_input_tokens,
+                ));
         self.total_cost += crate::pricing::estimate_cost(
             crate::pricing::billable_input_tokens(
                 anthropic_native,
@@ -487,16 +727,20 @@ impl Session {
         name: &str,
         output: &str,
     ) -> (String, Option<std::path::PathBuf>) {
-        let (content, _, artifact) = self.tool_result_content(name, output);
+        let (content, _, artifact) = self.tool_result_content("", name, output);
         self.add_message(MessageRole::ToolResult, &content);
         (content, artifact)
     }
 
     fn tool_result_content(
         &self,
+        id: &str,
         name: &str,
         output: &str,
     ) -> (String, String, Option<std::path::PathBuf>) {
+        if let Some(path) = self.tool_result_spills.take(id, name, output) {
+            return (format!("{name}:\n{output}"), output.to_string(), Some(path));
+        }
         let output_chars = output.chars().count();
         if output_chars <= TOOL_RESULT_SAVE_THRESHOLD {
             return (format!("{name}:\n{output}"), output.to_string(), None);
@@ -569,11 +813,26 @@ impl Session {
     }
 
     pub fn set_calibration(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.set_calibration_with_cleared_tool_results(input_tokens, output_tokens, 0);
+    }
+
+    pub fn set_calibration_with_cleared_tool_results(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cleared_tool_results: usize,
+    ) {
         if input_tokens == 0 {
             return;
         }
         self.calibrated_tokens = input_tokens.saturating_add(output_tokens);
         self.calibrated_msg_count = self.messages.len();
+        let (_, first_live) = self.compacted_context();
+        let live_results = self.messages[first_live..]
+            .iter()
+            .filter(|message| message.role == MessageRole::ToolResult)
+            .count();
+        self.calibrated_tool_results_cleared = cleared_tool_results.min(live_results);
     }
 
     /// Mark messages appended after the most recent provider usage event as
@@ -588,6 +847,7 @@ impl Session {
     pub fn reset_calibration(&mut self) {
         self.calibrated_tokens = 0;
         self.calibrated_msg_count = 0;
+        self.calibrated_tool_results_cleared = 0;
     }
 
     /// Truncate the conversation to `new_len` messages while keeping the context
@@ -606,15 +866,45 @@ impl Session {
         }
         let cal = self.calibrated_msg_count.min(self.messages.len());
         if self.calibrated_tokens > 0 && new_len < cal {
-            let removed: u64 = self.messages[new_len..cal]
+            let (_, first_live) = self.compacted_context();
+            let retained_live_start = first_live.min(new_len);
+            let mut result_ordinal = self.messages[retained_live_start..new_len]
                 .iter()
-                .map(|m| m.estimated_tokens)
-                .sum();
+                .filter(|message| message.role == MessageRole::ToolResult)
+                .count();
+            let removed = self.messages[new_len..cal]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| {
+                    let index = new_len + offset;
+                    let is_live_result =
+                        index >= first_live && message.role == MessageRole::ToolResult;
+                    let tokens = if is_live_result
+                        && result_ordinal < self.calibrated_tool_results_cleared
+                    {
+                        projected_tool_result_tokens(message)
+                    } else {
+                        message.estimated_tokens
+                    };
+                    if is_live_result {
+                        result_ordinal = result_ordinal.saturating_add(1);
+                    }
+                    tokens
+                })
+                .fold(0u64, u64::saturating_add);
             self.calibrated_tokens = self.calibrated_tokens.saturating_sub(removed);
             self.calibrated_msg_count = new_len;
+            let remaining_results = self.messages[retained_live_start..new_len]
+                .iter()
+                .filter(|message| message.role == MessageRole::ToolResult)
+                .count();
+            self.calibrated_tool_results_cleared =
+                self.calibrated_tool_results_cleared.min(remaining_results);
         }
         self.messages.truncate(new_len);
+        self.mark_history_changed();
         self.total_estimated_tokens = self.messages.iter().map(|m| m.estimated_tokens).sum();
+        self.read_tracker.clear();
     }
 
     /// Rewind the conversation to `new_len` messages, capturing a single-step
@@ -631,10 +921,12 @@ impl Session {
         }
         let removed = self.messages.len() - new_len;
         self.rewind_undo = Some(RewindUndo {
-            messages: self.messages.clone(),
+            messages: self.messages[new_len..].to_vec(),
+            tail_only: true,
             total_estimated_tokens: self.total_estimated_tokens,
             calibrated_tokens: self.calibrated_tokens,
             calibrated_msg_count: self.calibrated_msg_count,
+            calibrated_tool_results_cleared: self.calibrated_tool_results_cleared,
         });
         self.truncate_to(new_len);
         removed
@@ -648,10 +940,18 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         match self.rewind_undo.take() {
             Some(u) => {
-                self.messages = u.messages;
+                if u.tail_only {
+                    self.messages.extend(u.messages);
+                } else {
+                    // Compatibility with the pre-tail-only persisted shape.
+                    self.messages = u.messages;
+                }
+                self.mark_history_changed();
                 self.total_estimated_tokens = u.total_estimated_tokens;
                 self.calibrated_tokens = u.calibrated_tokens;
                 self.calibrated_msg_count = u.calibrated_msg_count;
+                self.calibrated_tool_results_cleared = u.calibrated_tool_results_cleared;
+                self.read_tracker.clear();
                 true
             }
             None => false,
@@ -684,6 +984,120 @@ impl Session {
         self.calibrated_tokens.saturating_add(delta)
     }
 
+    /// Clone the durable transcript into the model-visible form used for the
+    /// next request, replacing all but the newest `keep_recent` tool results
+    /// with compact recovery notices. Calls and message identities remain
+    /// intact, and the persisted session is never mutated.
+    pub fn context_messages_with_pruned_tool_results(
+        &self,
+        keep_recent: usize,
+    ) -> Vec<SessionMessage> {
+        let (_, first_live) = self.compacted_context();
+        let mut remaining_to_clear = self.live_tool_result_clear_count(first_live, keep_recent);
+        let mut messages = self.messages.clone();
+
+        for message in &mut messages[first_live..] {
+            if message.role != MessageRole::ToolResult || remaining_to_clear == 0 {
+                continue;
+            }
+            remaining_to_clear -= 1;
+            let (content, notice) = projected_cleared_tool_result(message);
+            message.content = CompactString::new(content);
+            message.estimated_tokens = Self::estimate_tokens(&message.content);
+            if let Some(PersistedToolMessage::Result { output, .. }) = &mut message.tool {
+                *output = CompactString::new(notice);
+            }
+        }
+
+        messages
+    }
+
+    /// Estimated live-context pressure after old tool results are cleared.
+    /// Provider calibration remains the best available absolute anchor; the
+    /// estimator applies the per-message delta in either direction so clearing
+    /// an unusually short result cannot make the gate undercount the request.
+    pub fn effective_context_tokens_after_tool_result_pruning(&self, keep_recent: usize) -> u64 {
+        let (_, first_live) = self.compacted_context();
+        let current_clear = self.live_tool_result_clear_count(first_live, keep_recent);
+        let anchor = self.calibrated_msg_count.min(self.messages.len());
+        let mut effective = if self.calibrated_tokens == 0 {
+            self.overhead_tokens
+        } else {
+            self.calibrated_tokens
+        };
+        let mut result_ordinal = 0usize;
+
+        for (index, message) in self.messages.iter().enumerate() {
+            let is_live_result = index >= first_live && message.role == MessageRole::ToolResult;
+            let current_pruned = is_live_result && result_ordinal < current_clear;
+            let old_pruned = is_live_result
+                && result_ordinal < self.calibrated_tool_results_cleared
+                && index < anchor;
+            let replacement_tokens =
+                (current_pruned || old_pruned).then(|| projected_tool_result_tokens(message));
+            let current_tokens = if current_pruned {
+                replacement_tokens.unwrap_or(message.estimated_tokens)
+            } else {
+                message.estimated_tokens
+            };
+
+            if self.calibrated_tokens == 0 || index >= anchor {
+                effective = effective.saturating_add(current_tokens);
+            } else if old_pruned != current_pruned {
+                let old_tokens = if old_pruned {
+                    replacement_tokens.unwrap_or(message.estimated_tokens)
+                } else {
+                    message.estimated_tokens
+                };
+                effective = apply_token_estimate_delta(effective, old_tokens, current_tokens);
+            }
+
+            if is_live_result {
+                result_ordinal = result_ordinal.saturating_add(1);
+            }
+        }
+        effective
+    }
+
+    pub fn needs_compaction_after_tool_result_pruning(
+        &self,
+        reserve_tokens: u64,
+        keep_recent: usize,
+    ) -> bool {
+        if self.context_window == 0 {
+            return false;
+        }
+        self.effective_context_tokens_after_tool_result_pruning(keep_recent)
+            > self.context_window.saturating_sub(reserve_tokens)
+    }
+
+    pub fn needs_compaction_with_pending_after_tool_result_pruning(
+        &self,
+        reserve_tokens: u64,
+        pending_tokens: u64,
+        keep_recent: usize,
+    ) -> bool {
+        if self.context_window == 0 {
+            return false;
+        }
+        self.effective_context_tokens_after_tool_result_pruning(keep_recent)
+            .saturating_add(pending_tokens)
+            > self.context_window.saturating_sub(reserve_tokens)
+    }
+
+    fn live_tool_result_clear_count(&self, first_live: usize, keep_recent: usize) -> usize {
+        self.messages[first_live..]
+            .iter()
+            .filter(|message| message.role == MessageRole::ToolResult)
+            .count()
+            .saturating_sub(keep_recent)
+    }
+
+    pub(crate) fn tool_results_cleared_for_retention(&self, keep_recent: usize) -> usize {
+        let (_, first_live) = self.compacted_context();
+        self.live_tool_result_clear_count(first_live, keep_recent)
+    }
+
     /// Pick the compaction boundary: `messages[..cut]` get summarized and
     /// `messages[cut..]` are kept as recent context. Walks backward summing
     /// per-message `estimated_tokens` until `keep_recent` is covered.
@@ -710,6 +1124,16 @@ impl Session {
                 break;
             }
             accumulated = accumulated.saturating_add(msg.estimated_tokens);
+        }
+        if cut_idx > 0 && cut_idx < messages.len() {
+            while cut_idx > 0
+                && !matches!(
+                    messages[cut_idx].role,
+                    MessageRole::User | MessageRole::Assistant
+                )
+            {
+                cut_idx -= 1;
+            }
         }
         cut_idx
     }
@@ -764,7 +1188,11 @@ impl Session {
         (None, 0)
     }
 
-    pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+    pub fn compress(&mut self, mut summary: String, first_kept_index: usize, token_savings: u64) {
+        if let Some(todo_context) = self.todos.critical_context() {
+            summary.push_str("\n\n");
+            summary.push_str(&todo_context);
+        }
         let summarized_count = first_kept_index;
         let summary_tokens = Self::estimate_tokens(&summary);
 
@@ -798,6 +1226,8 @@ impl Session {
         // both; the next completed turn re-anchors.
         self.reset_calibration();
         self.rewind_undo = None;
+        self.mark_history_changed();
+        self.read_tracker.clear();
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
 
@@ -818,16 +1248,83 @@ impl Session {
     }
 }
 
-fn format_truncated_tool_output(output: &str, output_chars: usize, path: &Path) -> String {
+pub(crate) fn format_truncated_tool_output(
+    output: &str,
+    output_chars: usize,
+    path: &Path,
+) -> String {
+    format_truncated_tool_output_with_notice(
+        output,
+        output_chars,
+        &format!(
+            "[full output saved to: {}; use the read tool on this path to inspect the complete output]",
+            path.display()
+        ),
+    )
+}
+
+/// Preserve the live context bound even when artifact persistence fails. The
+/// head and tail remain useful, while the notice makes the loss explicit.
+pub(crate) fn format_unpersisted_truncated_tool_output(
+    output: &str,
+    output_chars: usize,
+    error: &str,
+) -> String {
+    format_truncated_tool_output_with_notice(
+        output,
+        output_chars,
+        &format!("[full output could not be saved: {error}]"),
+    )
+}
+
+fn format_truncated_tool_output_with_notice(
+    output: &str,
+    output_chars: usize,
+    notice: &str,
+) -> String {
     let head: String = output.chars().take(TOOL_RESULT_HEAD_CHARS).collect();
     let tail_start = output_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS);
     let tail: String = output.chars().skip(tail_start).collect();
     let omitted = output_chars.saturating_sub(TOOL_RESULT_HEAD_CHARS + TOOL_RESULT_TAIL_CHARS);
 
     format!(
-        "{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n[full output saved to: {}; use the read tool on this path to inspect the complete output]\n\n{tail}",
-        path.display()
+        "{head}\n\n[tool output truncated: {output_chars} characters; {omitted} omitted]\n{notice}\n\n{tail}"
     )
+}
+
+pub fn cleared_tool_result_notice(artifact_path: Option<&str>) -> String {
+    match artifact_path {
+        Some(path) => format!(
+            "[result cleared: old tool output omitted from the live context; read the spill file at {path} or re-run the tool]"
+        ),
+        None => CLEARED_TOOL_RESULT_NOTICE.to_string(),
+    }
+}
+
+fn projected_cleared_tool_result(message: &SessionMessage) -> (String, String) {
+    let artifact_path = match &message.tool {
+        Some(PersistedToolMessage::Result { artifact_path, .. }) => artifact_path.as_deref(),
+        _ => None,
+    };
+    let notice = cleared_tool_result_notice(artifact_path);
+    let content = match message.content.split_once('\n') {
+        Some((label, _)) => format!("{label}\n{notice}"),
+        None => notice.clone(),
+    };
+    (content, notice)
+}
+
+fn projected_tool_result_tokens(message: &SessionMessage) -> u64 {
+    let (content, _) = projected_cleared_tool_result(message);
+    Session::estimate_tokens(&content)
+}
+
+fn apply_token_estimate_delta(value: u64, old: u64, new: u64) -> u64 {
+    if old >= new {
+        value.saturating_sub(old.saturating_sub(new))
+    } else {
+        value.saturating_add(new.saturating_sub(old))
+    }
 }
 
 #[cfg(test)]
@@ -914,5 +1411,163 @@ mod preflight_tests {
         let s = session_with(0, 50, 20);
         assert!(!s.needs_compaction_with_pending(10, 100));
         assert!(!s.is_irreducible_with_pending(10, 100));
+    }
+
+    #[test]
+    fn request_time_tool_result_pruning_keeps_recent_results_and_spill_recovery() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(
+                &id,
+                "read",
+                &serde_json::json!({"path": format!("file-{index}")}),
+            );
+            session.add_tool_result_with_id(
+                &id,
+                "read",
+                &format!("output-{index}-{}", "x".repeat(400)),
+            );
+        }
+        if let Some(PersistedToolMessage::Result { artifact_path, .. }) =
+            &mut session.messages[1].tool
+        {
+            *artifact_path = Some("/trusted/spill/call-0.txt".into());
+        } else {
+            panic!("first result must have structured storage");
+        }
+
+        let durable_first = session.messages[1].clone();
+        let projected = session.context_messages_with_pruned_tool_results(1);
+        let projected_outputs = projected
+            .iter()
+            .filter_map(|message| match &message.tool {
+                Some(PersistedToolMessage::Result { output, .. }) => Some(output.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected_outputs.len(), 3);
+        assert!(projected_outputs[0].contains("/trusted/spill/call-0.txt"));
+        assert_eq!(projected_outputs[1], CLEARED_TOOL_RESULT_NOTICE);
+        assert!(projected_outputs[2].starts_with("output-2-"));
+        assert_eq!(session.messages[1].content, durable_first.content);
+        assert_eq!(session.messages[1].tool, durable_first.tool);
+    }
+
+    #[test]
+    fn compaction_pressure_uses_the_pruned_live_projection() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(&id, "bash", &serde_json::json!({"command": index}));
+            session.add_tool_result_with_id(&id, "bash", &"x".repeat(800));
+        }
+
+        let full = session.effective_context_tokens();
+        let pruned = session.effective_context_tokens_after_tool_result_pruning(1);
+        assert!(pruned < full);
+        let budget = pruned + (full - pruned) / 2;
+        session.context_window = full;
+        let reserve = full - budget;
+
+        assert!(session.needs_compaction(reserve));
+        assert!(!session.needs_compaction_after_tool_result_pruning(reserve, 1));
+        assert!(
+            session.needs_compaction_with_pending_after_tool_result_pruning(
+                reserve,
+                full - pruned,
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn calibrated_pruned_context_is_not_discounted_twice() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            session.add_tool_call_with_id(&id, "bash", &serde_json::json!({"command": index}));
+            session.add_tool_result_with_id(&id, "bash", &"x".repeat(800));
+        }
+
+        let cleared = session.tool_results_cleared_for_retention(1);
+        session.set_calibration_with_cleared_tool_results(1_000, 50, cleared);
+        assert_eq!(
+            session.effective_context_tokens_after_tool_result_pruning(1),
+            1_050,
+            "the provider snapshot already includes the same cleared results"
+        );
+        assert!(
+            session.effective_context_tokens_after_tool_result_pruning(0) < 1_050,
+            "clearing the formerly retained result should reduce the calibrated snapshot"
+        );
+    }
+
+    #[test]
+    fn results_added_after_a_pruned_request_are_not_assumed_to_be_cleared() {
+        let mut session = Session::new("openai", "model", 10_000, "");
+        for index in 0..3 {
+            let id = format!("prior-{index}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": index}));
+            session.add_tool_result_with_id(&id, "read", &"p".repeat(800));
+        }
+        let cleared_in_request = session.tool_results_cleared_for_retention(1);
+        assert_eq!(cleared_in_request, 2);
+
+        // Results produced inside that request remain verbatim in Rig's
+        // continuation context, even when the turn produces more than K of
+        // them. Provider calibration therefore only represents the two
+        // results cleared when the request history was assembled.
+        for index in 0..2 {
+            let id = format!("current-{index}");
+            session.add_tool_call_with_id(&id, "read", &serde_json::json!({"path": index}));
+            session.add_tool_result_with_id(&id, "read", &"c".repeat(800));
+        }
+        session.set_calibration_with_cleared_tool_results(2_000, 50, cleared_in_request);
+
+        let next_turn = session.effective_context_tokens_after_tool_result_pruning(1);
+        assert!(
+            next_turn < 2_050,
+            "the next turn should newly clear the two in-turn results that the calibrated request kept verbatim"
+        );
+    }
+
+    #[test]
+    fn live_spill_handoff_accepts_internal_id_or_exact_output_fallback_once() {
+        let store = ToolResultSpillStore::default();
+        let first = std::path::PathBuf::from("/private/first.txt");
+        store.register("internal-1", None, "grep", "bounded-one", first.clone());
+        assert_eq!(store.take("internal-1", "grep", "bounded-one"), Some(first));
+        assert!(store.take("internal-1", "grep", "bounded-one").is_none());
+
+        let second = std::path::PathBuf::from("/private/second.txt");
+        store.register("internal-2", None, "shell", "bounded-two", second.clone());
+        assert_eq!(
+            store.take("provider-result-id", "shell", "bounded-two"),
+            Some(second)
+        );
+        assert!(store.take("internal-2", "shell", "bounded-two").is_none());
+    }
+
+    #[test]
+    fn failed_live_spill_still_drops_the_oversized_middle() {
+        let output = format!(
+            "{}{}{}",
+            "H".repeat(TOOL_RESULT_HEAD_CHARS),
+            "M".repeat(TOOL_RESULT_SAVE_THRESHOLD),
+            "T".repeat(TOOL_RESULT_TAIL_CHARS),
+        );
+        let bounded = format_unpersisted_truncated_tool_output(
+            &output,
+            output.chars().count(),
+            "storage unavailable",
+        );
+
+        assert!(bounded.starts_with(&"H".repeat(TOOL_RESULT_HEAD_CHARS)));
+        assert!(bounded.ends_with(&"T".repeat(TOOL_RESULT_TAIL_CHARS)));
+        assert!(bounded.contains("storage unavailable"));
+        assert!(!bounded.contains(&"M".repeat(80)));
+        assert!(bounded.chars().count() < TOOL_RESULT_SAVE_THRESHOLD);
     }
 }

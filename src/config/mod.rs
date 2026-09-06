@@ -71,6 +71,11 @@ pub struct Config {
     pub reserve_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_recent_tokens: Option<u64>,
+    /// Number of newest historical tool results kept verbatim in the live
+    /// model context. Older results are replaced by compact recovery notices;
+    /// the durable session and spill files remain unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_tool_results: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_agent_turns: Option<usize>,
     /// Trusted operator command run before a tool-using turn may complete.
@@ -444,6 +449,11 @@ impl Config {
         (context_window / 20)
             .clamp(10_000, 50_000)
             .min(context_window / 4)
+    }
+
+    pub fn resolve_keep_recent_tool_results(&self) -> usize {
+        self.keep_recent_tool_results
+            .unwrap_or(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS)
     }
 
     /// Cumulative per-turn input+output token cap. `None` (default) means no
@@ -850,6 +860,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(explicit.resolve_keep_recent_tokens(1_000_000), 1_234);
+    }
+
+    #[test]
+    fn keep_recent_tool_results_has_a_configurable_default() {
+        assert_eq!(
+            Config::default().resolve_keep_recent_tool_results(),
+            crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS
+        );
+        let explicit = Config {
+            keep_recent_tool_results: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(explicit.resolve_keep_recent_tool_results(), 3);
     }
 
     #[test]

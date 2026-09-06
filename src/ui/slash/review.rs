@@ -59,7 +59,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     };
 
     // Save current prompt for one-shot restoration
-    ctx.context.one_shot_restore = ctx.context.current_prompt_name.clone();
+    ctx.context.one_shot_restore = Some(ctx.context.active_selection());
 
     // Switch to review prompt
     apply_prompt_mode("review", ctx.context, ctx.permission);

@@ -22,20 +22,27 @@ use crate::extras::js::broker::{
 use crate::extras::js::broker::{
     PreparedSkillManifest, SkillCallAuthority, SkillExportAuthoritySpec,
 };
-#[cfg(feature = "sandbox")]
-use crate::extras::js::host::FetchEffectService;
 use crate::extras::js::host::{
-    AllowConfig, FileEffectService, ParentHostEffectService, SpawnEffectService,
+    AllowConfig, FileEffectService, ParentHostEffectService, SPAWN_STDERR_MAX_BYTES,
+    SPAWN_STDOUT_MAX_BYTES, SpawnEffectService,
+};
+#[cfg(feature = "sandbox")]
+use crate::extras::js::host::{
+    FETCH_REQUEST_BODY_MAX_BYTES, FETCH_RESPONSE_BODY_MAX_BYTES, FetchEffectService,
 };
 use crate::extras::js::protocol::{
     ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass, DiagnosticStage, InvocationId,
-    JsErrorCode, JsExceptionClass, RunStep, ScriptRole, StepOutcome, StepResult,
-    source_position_is_valid,
+    JsErrorCode, JsExceptionClass, MAX_EFFECTS_PER_STEP, ModelEffectProfile, RunStep, ScriptRole,
+    StepOutcome, StepResult, source_position_is_valid,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::{
     MAX_SKILL_ARTIFACTS_PER_STEP, MAX_SKILL_CAPABILITY_GRANTS_PER_STEP,
     MAX_SKILL_EXPORTS_PER_ARTIFACT,
+};
+use crate::extras::js::session::{
+    SCRATCH_KEY_MAX_BYTES, SCRATCH_MAX_ENTRIES, SCRATCH_TOTAL_MAX_BYTES, SCRATCH_VALUE_MAX_BYTES,
+    STRUCTURED_RESULT_MAX_BYTES, ScratchStore,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::ProposalEffectService;
@@ -45,8 +52,10 @@ use crate::extras::js::skills::proposal::{
 };
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{
-    PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
-    PermResponseRejection, PermissionBackendFailure, PermissionDenial, STEP_TIMEOUT,
+    MEMORY_LIMIT, PermCancellation, PermOutcome, PermRequest, PermRequestBuildError, PermResponse,
+    PermResponseRejection, PermissionBackendFailure, PermissionDenial, READ_FILE_MAX_BYTES,
+    READ_FILES_MAX_PATHS, READ_FILES_MAX_RESULT_BYTES, STACK_LIMIT, STEP_TIMEOUT,
+    WRITE_FILE_MAX_BYTES,
 };
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
@@ -83,6 +92,7 @@ impl PermissionReply {
 struct PermissionEnvelope {
     request: PermRequest,
     kind: PermissionCheckKind,
+    invocation_cancellation: Option<PermCancellation>,
     reply: PermissionReply,
 }
 
@@ -170,6 +180,7 @@ impl PermissionBridge {
             .send(PermissionEnvelope {
                 request,
                 kind,
+                invocation_cancellation: self.invocation_cancellation.clone(),
                 reply: PermissionReply::Sync(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -179,6 +190,7 @@ impl PermissionBridge {
                 return Err(PermissionBridgeError::Cancelled);
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                self.mark_permission_prompt_timed_out();
                 return Err(PermissionBridgeError::TimedOut);
             };
             match reply_rx.recv_timeout(remaining.min(PERMISSION_WAIT_POLL)) {
@@ -187,7 +199,7 @@ impl PermissionBridge {
                         .accept_response(response)
                         .map_err(PermissionBridgeError::from_rejection)?;
                     cancel_on_drop.disarm();
-                    return PermissionBridgeError::from_outcome(outcome);
+                    return self.finish_outcome(outcome);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -257,6 +269,7 @@ impl PermissionBridge {
             .send(PermissionEnvelope {
                 request,
                 kind,
+                invocation_cancellation: self.invocation_cancellation.clone(),
                 reply: PermissionReply::Async(reply_tx),
             })
             .map_err(|_| self.closed_request_error())?;
@@ -275,6 +288,7 @@ impl PermissionBridge {
                 return Err(PermissionBridgeError::Cancelled);
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                self.mark_permission_prompt_timed_out();
                 return Err(PermissionBridgeError::TimedOut);
             }
         };
@@ -283,7 +297,22 @@ impl PermissionBridge {
             .accept_response(response)
             .map_err(PermissionBridgeError::from_rejection)?;
         cancel_on_drop.disarm();
+        self.finish_outcome(outcome)
+    }
+
+    fn finish_outcome(&self, outcome: PermOutcome) -> Result<(), PermissionBridgeError> {
+        if matches!(outcome, PermOutcome::TimedOut) {
+            self.mark_permission_prompt_timed_out();
+        }
         PermissionBridgeError::from_outcome(outcome)
+    }
+
+    fn mark_permission_prompt_timed_out(&self) {
+        if let Some(cancellation) = &self.invocation_cancellation
+            && cancellation.permission_prompt_pending()
+        {
+            cancellation.mark_permission_prompt_timed_out();
+        }
     }
 
     fn ensure_active(&self) -> Result<(), PermissionBridgeError> {
@@ -503,6 +532,7 @@ async fn process_permission_request(
     let PermissionEnvelope {
         request,
         kind,
+        invocation_cancellation,
         reply,
     } = envelope;
     let request_id = request.id();
@@ -513,9 +543,20 @@ async fn process_permission_request(
         _ = shutdown.cancelled() => PermOutcome::Cancelled,
         _ = cancellation.cancelled() => PermOutcome::Cancelled,
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            if let Some(cancellation) = &invocation_cancellation
+                && cancellation.permission_prompt_pending()
+            {
+                cancellation.mark_permission_prompt_timed_out();
+            }
             PermOutcome::TimedOut
         }
-        outcome = resolve_permission(&request, kind, permission, ask_tx) => outcome,
+        outcome = resolve_permission(
+            &request,
+            kind,
+            permission,
+            ask_tx,
+            invocation_cancellation.as_ref(),
+        ) => outcome,
     };
 
     reply.send(PermResponse::new(request_id, outcome));
@@ -526,6 +567,7 @@ async fn resolve_permission(
     kind: PermissionCheckKind,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
+    invocation_cancellation: Option<&PermCancellation>,
 ) -> PermOutcome {
     let Some(permission) = permission else {
         return PermOutcome::Allowed;
@@ -552,6 +594,8 @@ async fn resolve_permission(
             let Some(ask_tx) = ask_tx else {
                 return PermOutcome::Denied(PermissionDenial::NonInteractive);
             };
+            let _prompt_guard =
+                invocation_cancellation.map(PermCancellation::begin_permission_prompt);
             let (reply_tx, reply_rx) = oneshot::channel();
             if ask_tx
                 .send(AskRequest {
@@ -590,6 +634,7 @@ pub struct JsTool {
     supervisor: Arc<JsWorkerSupervisor>,
     audit: Result<SharedEffectAudit, AuditError>,
     permission_bridge: PermissionBridgeOwner,
+    scratch: ScratchStore,
     #[cfg(feature = "sandbox")]
     runtime: tokio::runtime::Handle,
     #[cfg(feature = "skills")]
@@ -602,6 +647,7 @@ pub struct JsTool {
     telemetry: Option<Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>>,
     #[cfg(feature = "skills")]
     skill_tool_call_ordinal: AtomicU64,
+    profile: ModelEffectProfile,
 }
 
 impl JsTool {
@@ -619,6 +665,20 @@ impl JsTool {
             JsWorkerSupervisor::shared(),
             shared_effect_audit(),
         )
+    }
+
+    /// Construct the code-as-tool surface used by read-only exploration
+    /// subagents. The worker installs only `read_file`, `list_dir`, and `grep`,
+    /// while the parent broker issues only `read_file` authority.
+    pub(crate) fn new_read_only(
+        sandbox: Sandbox,
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        allow_config: AllowConfig,
+    ) -> Self {
+        let mut tool = Self::new(sandbox, permission, ask_tx, allow_config);
+        tool.profile = ModelEffectProfile::ReadOnly;
+        tool
     }
 
     #[cfg(all(feature = "skills", test))]
@@ -656,6 +716,7 @@ impl JsTool {
             supervisor,
             audit,
             permission_bridge,
+            scratch: ScratchStore::default(),
             #[cfg(feature = "sandbox")]
             runtime,
             #[cfg(feature = "skills")]
@@ -670,7 +731,13 @@ impl JsTool {
             telemetry: None,
             #[cfg(feature = "skills")]
             skill_tool_call_ordinal: AtomicU64::new(0),
+            profile: ModelEffectProfile::Full,
         }
+    }
+
+    pub(crate) fn with_scratch_store(mut self, scratch: ScratchStore) -> Self {
+        self.scratch = scratch;
+        self
     }
 
     #[cfg(feature = "skills")]
@@ -773,26 +840,82 @@ impl Tool for JsTool {
     type Output = String;
 
     fn description(&self) -> String {
-        let mut globals = vec![
-            "`read_file(path: string): string` (synchronous). Example: `const text = read_file('src/main.rs');`",
-            "`write_file(path: string, content: string): void` (synchronous). Example: `write_file('out.txt', 'done\\n');`",
-            "`console.log(...values): void`. Example: `console.log('count', 3);`",
-        ];
-        if cfg!(feature = "sandbox") {
-            globals.push(
-                "`fetch(url: string, options?: {method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}): {status: number, text: string}` (synchronous; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {method: 'GET'}); console.log(r.status, r.text);`",
+        if self.profile == ModelEffectProfile::ReadOnly {
+            return format!(
+                "Execute JavaScript for bounded read-only codebase exploration and local \
+                 computation. Code runs as a strict script in a fresh runtime for every call, \
+                 with top-level `await` supported and no persistent JavaScript state. The only \
+                 brokered effect globals are `read_file(path: string): string`, \
+                 `list_dir(path?: string): {{entries: {{name: string, kind: \
+                 'file'|'directory', size: number}}[], truncated: boolean}}`, and \
+                 `grep(pattern: string, options?: {{path?: string, include?: string, \
+                 case_sensitive?: boolean}}): {{matches: {{path: string, line: number, text: \
+                 string}}[], truncated: boolean}}`. `console.log` is available for bounded \
+                 diagnostics. Writer, network, process, session-state, proposal, batch-read, and \
+                 glob globals are absent. Return a string, finite number, boolean, or \
+                 accessor-free plain JSON value. Limits per call: {} s total, {} MiB JavaScript \
+                 heap, {} KiB JavaScript stack, {} KiB result, and {} read effects.",
+                STEP_TIMEOUT.as_secs(),
+                MEMORY_LIMIT / (1024 * 1024),
+                STACK_LIMIT / 1024,
+                MAX_RESULT_BYTES / 1024,
+                MAX_EFFECTS_PER_STEP,
             );
         }
+        let mut globals = vec![
+            format!(
+                "`read_file(path: string): string` (synchronous; max {} MiB). Example: `const text = read_file('src/main.rs');`",
+                READ_FILE_MAX_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "`read_files(paths: string[]): string[]` (synchronous; one brokered batch, max {} paths and {} MiB aggregate JSON content). Example: `const texts = read_files(['README.md', 'SPEC.md']);`",
+                READ_FILES_MAX_PATHS,
+                READ_FILES_MAX_RESULT_BYTES / (1024 * 1024)
+            ),
+            "`list_dir(path?: string): {entries: {name: string, kind: 'file'|'directory', size: number}[], truncated: boolean}` (synchronous; defaults to '.').".to_string(),
+            "`glob(pattern: string, options?: {path?: string}): {paths: string[], truncated: boolean}` (synchronous, recursive, respects ignore files). Example: `const files = glob('**/*.rs').paths;`".to_string(),
+            "`grep(pattern: string, options?: {path?: string, include?: string, case_sensitive?: boolean}): {matches: {path: string, line: number, text: string}[], truncated: boolean}` (synchronous Rust regex search; case-sensitive by default; matched lines only).".to_string(),
+            format!(
+                "`write_file(path: string, content: string): void` (synchronous; max {} MiB). Example: `write_file('out.txt', 'done\\n');`",
+                WRITE_FILE_MAX_BYTES / (1024 * 1024)
+            ),
+            format!(
+                "`result(value): never` (synchronous terminal structured result; strict plain JSON, max {} KiB). Example: `result({{files: 3, ok: true}});`",
+                STRUCTURED_RESULT_MAX_BYTES / 1024
+            ),
+            format!(
+                "`scratch_put(key: string, value): void` / `scratch_get(key: string): JSON|null` (synchronous, parent-owned across fresh runtimes; keys max {} bytes, values max {} MiB, {} MiB/{} entries per session).",
+                SCRATCH_KEY_MAX_BYTES,
+                SCRATCH_VALUE_MAX_BYTES / (1024 * 1024),
+                SCRATCH_TOTAL_MAX_BYTES / (1024 * 1024),
+                SCRATCH_MAX_ENTRIES
+            ),
+            format!(
+                "`console.log(...values): void` (max {} records, {} KiB each, {} KiB total). Example: `console.log('count', 3);`",
+                MAX_CONSOLE_RECORDS,
+                MAX_CONSOLE_RECORD_BYTES / 1024,
+                MAX_CONSOLE_BYTES / 1024
+            ),
+        ];
+        #[cfg(feature = "sandbox")]
+        {
+            globals.push(format!(
+                "`fetch(url: string, options?: {{method?: 'GET'|'POST', headers?: Record<string,string>, body?: string}}): {{status: number, text: string}}` (synchronous; request bodies are POST-only and capped at {} KiB; response body max {} MiB; the result has no `ok`, `headers`, or `json()`). Example: `const r = fetch('https://example.com/data', {{method: 'GET'}}); console.log(r.status, r.text);`",
+                FETCH_REQUEST_BODY_MAX_BYTES / 1024,
+                FETCH_RESPONSE_BODY_MAX_BYTES / (1024 * 1024)
+            ));
+        }
         if self.sandbox.owns_complete_process_tree() {
-            globals.push(
-                "`spawn(program: string, args: string[]): {stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}` (synchronous; `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
-            );
+            globals.push(format!(
+                "`spawn(program: string, args: string[]): {{stdout: string, stderr: string, code: number, timed_out: boolean, stdout_truncated: boolean, stderr_truncated: boolean}}` (synchronous; stdout and stderr max {} MiB each; `args` must be an array and no shell parsing occurs). Example: `const p = spawn('git', ['status', '--short']); console.log(p.code, p.stdout);`",
+                SPAWN_STDOUT_MAX_BYTES.min(SPAWN_STDERR_MAX_BYTES) / (1024 * 1024)
+            ));
         }
         #[cfg(feature = "skills")]
         let mut proposal_guidance = "";
         #[cfg(feature = "skills")]
         if self.proposal_service.is_some() {
-            globals.push("propose_skill(draft)");
+            globals.push("`propose_skill(draft): void` (synchronous)".to_string());
             proposal_guidance = " After a pattern proves repeated and generalizable, curate it with \
                 propose_skill({source, description, exports: [{name, signature}], tests, \
                 capability: {tier, grants}, tags?, predecessor_id?}). Every test must be a \
@@ -807,13 +930,30 @@ impl Tool for JsTool {
         format!(
             "Execute JavaScript code. Prefer this tool for computation, parsing, data \
              transformation, control flow, and cross-platform automation instead of invoking \
-             Python through a shell. Code runs as a strict script in a fresh runtime for every \
-             call, with top-level `await` supported. Host globals are synchronous, so awaiting \
-             them is optional. Available global contracts and examples: {} Returns the last expression \
-             value as a string. A step may issue at most 256 effect calls; the 257th returns a \
-             closed effect-limit error while preserving bounded console output. Runtime failures \
+             Python through a shell. Use read/grep for direct lookup and shell for builds, tests, \
+             version control, or commands that need shell semantics. Code runs as a strict script \
+             in a fresh runtime for every call, with top-level `await` supported; no variables or \
+             other JavaScript state persist between calls. Host globals are synchronous, \
+             so awaiting them is optional. Available global contracts and examples: {} Worked \
+             multi-file aggregate: `const total = read_files(glob('**/*.txt').paths).reduce((n, \
+             text) => n + text.length, 0); total`. Strings, finite numbers, booleans, and \
+             accessor-free plain JSON objects/arrays are valid results. For values containing \
+             `undefined`, NaN/Infinity, holes, accessors, Date, Map, Set, or class instances, end \
+             with `JSON.stringify(value)` or return a string explicitly. Use `result(value)` for \
+             a validated structured result and `scratch_put`/`scratch_get` for JSON values that \
+             must survive the next fresh-runtime call. \
+             Limits per call: {} s total, {} MiB JavaScript heap, {} KiB JavaScript stack, {} KiB \
+             result, and {} effect calls. The next effect returns a closed effect-limit error while \
+             preserving bounded console output. Catchable effect failures are plain `Error` \
+             objects with a stable `.code` such as `not_found`, `is_directory`, `denied`, \
+             `invalid_target`, or `too_large`; messages never include the target. Runtime failures \
              use closed, source-free error classes.{}",
             globals.join(" "),
+            STEP_TIMEOUT.as_secs(),
+            MEMORY_LIMIT / (1024 * 1024),
+            STACK_LIMIT / 1024,
+            MAX_RESULT_BYTES / 1024,
+            MAX_EFFECTS_PER_STEP,
             proposal_guidance,
         )
     }
@@ -845,6 +985,16 @@ impl Tool for JsTool {
         #[cfg(feature = "skills")]
         let skill_bundle = self.skill_turn_context.snapshot();
         #[cfg(feature = "skills")]
+        if self.profile == ModelEffectProfile::ReadOnly
+            && skill_bundle.skills.iter().any(|skill| {
+                skill.capability.tier != crate::extras::js::skills::CapabilityTier::Pure
+            })
+        {
+            return Err(ToolError::Msg(
+                "read-only JS skill bundle contains a non-pure capability".into(),
+            ));
+        }
+        #[cfg(feature = "skills")]
         let skill_tool_call_id = format!(
             "{}:js:{}",
             skill_bundle.turn_id,
@@ -858,12 +1008,17 @@ impl Tool for JsTool {
         let prepared_skill_manifests =
             prepare_skill_manifests(&skill_bundle, call_deadline, cancellation.clone()).await?;
         let grant_expires_at = call_deadline;
-        let mut model_capabilities = std::collections::BTreeSet::from([
-            HostCapability::ReadFile,
-            HostCapability::WriteFile,
-            HostCapability::Fetch,
-        ]);
-        if self.sandbox.owns_complete_process_tree() {
+        let mut model_capabilities = if self.profile == ModelEffectProfile::ReadOnly {
+            std::collections::BTreeSet::from([HostCapability::ReadFile])
+        } else {
+            std::collections::BTreeSet::from([
+                HostCapability::ReadFile,
+                HostCapability::WriteFile,
+                HostCapability::Fetch,
+                HostCapability::SessionState,
+            ])
+        };
+        if self.profile == ModelEffectProfile::Full && self.sandbox.owns_complete_process_tree() {
             model_capabilities.insert(HostCapability::Spawn);
         }
         let grant = InvocationGrant::issue(
@@ -882,20 +1037,23 @@ impl Tool for JsTool {
         #[cfg(feature = "skills")]
         let mut session_capabilities = session_capabilities;
         #[cfg(feature = "skills")]
-        let proposal_grant_id = self.proposal_service.as_ref().map(|_| {
-            let proposal_grant = InvocationGrant::issue(
-                invocation_id.clone(),
-                GrantPrincipal::ModelAuthored {
-                    tool_call_id: skill_tool_call_id.clone(),
-                },
-                std::collections::BTreeSet::from([HostCapability::ProposeSkill]),
-                grant_expires_at,
-            );
-            let id = proposal_grant.grant_id().clone();
-            grants.push(proposal_grant);
-            session_capabilities.insert(HostCapability::ProposeSkill);
-            id
-        });
+        let proposal_grant_id = (self.profile == ModelEffectProfile::Full)
+            .then_some(self.proposal_service.as_ref())
+            .flatten()
+            .map(|_| {
+                let proposal_grant = InvocationGrant::issue(
+                    invocation_id.clone(),
+                    GrantPrincipal::ModelAuthored {
+                        tool_call_id: skill_tool_call_id.clone(),
+                    },
+                    std::collections::BTreeSet::from([HostCapability::ProposeSkill]),
+                    grant_expires_at,
+                );
+                let id = proposal_grant.grant_id().clone();
+                grants.push(proposal_grant);
+                session_capabilities.insert(HostCapability::ProposeSkill);
+                id
+            });
         #[cfg(feature = "skills")]
         let skill_call_authority = build_skill_call_authority(
             &skill_bundle,
@@ -916,7 +1074,8 @@ impl Tool for JsTool {
                 remaining_deadline,
             ),
             SpawnEffectService::new(self.sandbox.clone(), bridge.clone(), remaining_deadline),
-        );
+        )
+        .with_scratch_store(self.scratch.clone());
         #[cfg(feature = "sandbox")]
         let service = service.with_fetch(FetchEffectService::new(
             bridge,
@@ -934,6 +1093,7 @@ impl Tool for JsTool {
             .audit
             .clone()
             .map_err(|_| ToolError::Msg("JS effect audit unavailable".into()))?;
+        let structured_result_receipt = super::session::StructuredResultReceipt::default();
         let broker = InvocationBroker::new(
             invocation_id.clone(),
             grants,
@@ -941,13 +1101,20 @@ impl Tool for JsTool {
             service,
             audit,
         )
-        .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?;
+        .map_err(|_| ToolError::Msg("JS invocation authority unavailable".into()))?
+        .with_structured_result_receipt(structured_result_receipt.clone());
         #[cfg(feature = "skills")]
         let broker = broker.with_skill_call_authority(skill_call_authority);
         #[cfg(feature = "skills")]
         let capability_denials = broker.capability_denial_tracker();
         let model_source = args.code;
-        let run_step = RunStep::new(model_source.clone()).with_model_grant(model_grant_id);
+        let run_step = RunStep::new(model_source.clone())
+            .with_model_grant(model_grant_id)
+            .with_model_effect_profile(self.profile)
+            .with_spawn_available(
+                self.profile == ModelEffectProfile::Full
+                    && self.sandbox.owns_complete_process_tree(),
+            );
         #[cfg(feature = "skills")]
         let run_step = if let Some(grant_id) = proposal_grant_id {
             run_step.with_proposal_grant(grant_id)
@@ -956,43 +1123,48 @@ impl Tool for JsTool {
         };
         #[cfg(feature = "skills")]
         let run_step = run_step.with_skills(
-            skill_bundle
-                .skills
-                .iter()
-                .map(|skill| crate::extras::js::skills::SkillArtifact {
-                    id: skill.id.clone(),
-                    identity_version: skill.identity_version,
-                    abi_version: skill.abi_version,
-                    source: skill.source.clone(),
-                    description: skill.description.clone(),
-                    tags: skill.tags.clone(),
-                    exports: skill.exports.clone(),
-                    tests: skill.tests.clone(),
-                    capability: skill.capability.clone(),
-                })
-                .collect(),
+            Vec::new(),
             skill_bundle.turn_id.clone(),
             skill_tool_call_id.clone(),
         );
-        let response = match self
-            .supervisor
-            .execute_bound_with_deadline(
-                invocation_id,
-                run_step,
-                broker,
-                cancellation,
-                Some(call_deadline),
-            )
-            .await
-        {
+        let invocation_state = cancellation.clone();
+        #[cfg(feature = "skills")]
+        let execution = self.supervisor.execute_bound_with_deadline_and_skills(
+            invocation_id,
+            run_step,
+            skill_bundle.clone(),
+            broker,
+            cancellation,
+            Some(call_deadline),
+        );
+        #[cfg(not(feature = "skills"))]
+        let execution = self.supervisor.execute_bound_with_deadline(
+            invocation_id,
+            run_step,
+            broker,
+            cancellation,
+            Some(call_deadline),
+        );
+        let response = match execution.await {
             Ok(response) => response,
-            Err(WorkerError::TimedOut) => {
-                return Ok("JS error: execution timed out (30s limit exceeded)".into());
+            Err(error) => {
+                return render_worker_execution_error(
+                    error,
+                    invocation_state.permission_prompt_blocked_deadline(),
+                );
             }
-            Err(error) => return Err(worker_tool_error(error)),
         };
         cancel_on_drop.disarm();
         validate_step_result_bounds(&response, &model_source)?;
+        validate_structured_result_receipt(&response, &structured_result_receipt)?;
+        if invocation_state.permission_prompt_blocked_deadline()
+            && matches!(
+                response.outcome,
+                StepOutcome::Error(_) | StepOutcome::Timeout
+            )
+        {
+            return Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string());
+        }
 
         #[cfg(feature = "skills")]
         dispatch_skill_telemetry(
@@ -1192,6 +1364,22 @@ fn worker_tool_error(error: WorkerError) -> ToolError {
     ToolError::Msg(error.to_string())
 }
 
+const PERMISSION_PROMPT_TIMEOUT_MESSAGE: &str = "JS error: permission prompt not answered within the 30s budget; do not retry without a new user decision";
+
+fn render_worker_execution_error(
+    error: WorkerError,
+    permission_prompt_blocked_deadline: bool,
+) -> Result<String, ToolError> {
+    match error {
+        WorkerError::PermissionPromptTimedOut => Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string()),
+        WorkerError::TimedOut if permission_prompt_blocked_deadline => {
+            Ok(PERMISSION_PROMPT_TIMEOUT_MESSAGE.to_string())
+        }
+        WorkerError::TimedOut => Ok("JS error: execution timed out (30s limit exceeded)".into()),
+        error => Err(worker_tool_error(error)),
+    }
+}
+
 /// Parent-side ceilings for worker-supplied result and console payloads.
 ///
 /// They mirror the worker's own bounds (`MAX_RESULT_BYTES`, `MAX_CONSOLE_*`
@@ -1205,10 +1393,15 @@ const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 
 fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Result<(), ToolError> {
     let violation = || worker_tool_error(WorkerError::Protocol);
-    if let StepOutcome::Value(value) = &result.outcome
-        && value.len() > MAX_RESULT_BYTES
-    {
-        return Err(violation());
+    match &result.outcome {
+        StepOutcome::Value(value) if value.len() > MAX_RESULT_BYTES => return Err(violation()),
+        StepOutcome::Structured(value) => {
+            let encoded = serde_json::to_string(value).map_err(|_| violation())?;
+            if encoded.len() > STRUCTURED_RESULT_MAX_BYTES {
+                return Err(violation());
+            }
+        }
+        _ => {}
     }
     if result.console.len() > MAX_CONSOLE_RECORDS {
         return Err(violation());
@@ -1227,13 +1420,35 @@ fn validate_step_result_bounds(result: &StepResult, model_source: &str) -> Resul
     Ok(())
 }
 
+fn validate_structured_result_receipt(
+    result: &StepResult,
+    receipt: &super::session::StructuredResultReceipt,
+) -> Result<(), ToolError> {
+    let violation = || worker_tool_error(WorkerError::Protocol);
+    let accepted = receipt.accepted().map_err(|_| violation())?;
+    match (&result.outcome, accepted) {
+        (StepOutcome::Structured(value), Some(expected)) => {
+            let actual = serde_json::to_string(value).map_err(|_| violation())?;
+            (actual == expected).then_some(()).ok_or_else(violation)
+        }
+        (StepOutcome::Structured(_), None) | (_, Some(_)) => Err(violation()),
+        (_, None) => Ok(()),
+    }
+}
+
 fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(), ()> {
     let Some(diagnostic) = &result.diagnostic else {
-        return matches!(result.outcome, StepOutcome::Value(_) | StepOutcome::Void)
-            .then_some(())
-            .ok_or(());
+        return matches!(
+            result.outcome,
+            StepOutcome::Value(_) | StepOutcome::Structured(_) | StepOutcome::Void
+        )
+        .then_some(())
+        .ok_or(());
     };
-    if matches!(result.outcome, StepOutcome::Value(_) | StepOutcome::Void) {
+    if matches!(
+        result.outcome,
+        StepOutcome::Value(_) | StepOutcome::Structured(_) | StepOutcome::Void
+    ) {
         return Err(());
     }
     let location = match (diagnostic.line, diagnostic.column) {
@@ -1281,7 +1496,7 @@ fn validate_step_diagnostic(result: &StepResult, model_source: &str) -> Result<(
             diagnostic.class == DiagnosticClass::ResourceLimit
                 && diagnostic.exception_class.is_none()
         }
-        StepOutcome::Value(_) | StepOutcome::Void => false,
+        StepOutcome::Value(_) | StepOutcome::Structured(_) | StepOutcome::Void => false,
     };
     valid.then_some(()).ok_or(())
 }
@@ -1295,6 +1510,14 @@ fn render_step_result(result: &StepResult) -> String {
             let mut text = String::with_capacity(value.len());
             render_console(&result.console, &mut text);
             text.push_str(value);
+            text
+        }
+        StepOutcome::Structured(value) => {
+            let value = serde_json::to_string(value)
+                .expect("validated structured result remains serializable");
+            let mut text = String::with_capacity(value.len());
+            render_console(&result.console, &mut text);
+            text.push_str(&value);
             text
         }
         StepOutcome::Void => {
@@ -1337,6 +1560,10 @@ fn render_failure(headline: &str, result: &StepResult) -> String {
 }
 
 fn js_error_headline(code: JsErrorCode, diagnostic: Option<&Diagnostic>) -> String {
+    if code == JsErrorCode::InvalidResult {
+        return "JS error: invalid result; return a string/plain JSON value or end with JSON.stringify(value)"
+            .into();
+    }
     let Some(exception_class) = diagnostic.and_then(|diagnostic| diagnostic.exception_class) else {
         return format!("JS error: {}", js_error_code(code));
     };
@@ -1567,6 +1794,48 @@ mod js_permission_bridge {
             Err(PermissionBridgeError::TimedOut)
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn js_permission_bridge_tracks_only_an_unanswered_user_prompt() {
+        let (ask_tx, mut ask_rx) = tokio_mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(
+            Some(permission(Action::Ask)),
+            Some(ask_tx),
+            Duration::from_millis(50),
+        );
+        let invocation = PermCancellation::new();
+        let bridge = owner.bridge().for_invocation(invocation.clone());
+        let check = tokio::spawn(async move { bridge.check_async("read", "pending.txt").await });
+
+        let request = ask_rx.recv().await.expect("ask request should arrive");
+        assert!(invocation.permission_prompt_pending());
+        assert_eq!(
+            check.await.expect("permission task should not panic"),
+            Err(PermissionBridgeError::TimedOut)
+        );
+        assert!(!invocation.permission_prompt_pending());
+        assert!(invocation.permission_prompt_blocked_deadline());
+        drop(request);
+
+        let noninteractive_owner = PermissionBridgeOwner::new(
+            Some(permission(Action::Ask)),
+            None,
+            Duration::from_millis(50),
+        );
+        let noninteractive_invocation = PermCancellation::new();
+        assert_eq!(
+            noninteractive_owner
+                .bridge()
+                .for_invocation(noninteractive_invocation.clone())
+                .check_async("read", "noninteractive.txt")
+                .await,
+            Err(PermissionBridgeError::Denied(
+                PermissionDenial::NonInteractive
+            ))
+        );
+        assert!(!noninteractive_invocation.permission_prompt_pending());
+        assert!(!noninteractive_invocation.permission_prompt_blocked_deadline());
     }
 
     #[test]
@@ -1965,6 +2234,231 @@ mod js_permission_bridge {
             .expect("call should succeed within single deadline");
         assert_eq!(result, "42");
     }
+
+    #[tokio::test]
+    async fn read_only_tool_profile_reaches_the_worker_and_omits_all_other_globals() {
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let mut tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+        tool.profile = ModelEffectProfile::ReadOnly;
+
+        let observed = tool
+            .call(JsArgs {
+                code: "[typeof read_file, typeof list_dir, typeof grep, \
+                       typeof read_files, typeof glob, typeof write_file, typeof fetch, \
+                       typeof spawn, typeof result, typeof scratch_put, typeof scratch_get] \
+                       .join(',')"
+                    .into(),
+            })
+            .await
+            .expect("read-only JS call");
+        assert_eq!(
+            observed,
+            "function,function,function,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined"
+        );
+        assert_eq!(
+            tool.call(JsArgs {
+                code: "read_file('Cargo.toml').includes('[package]')".into(),
+            })
+            .await
+            .expect("brokered read in read-only JS"),
+            "true"
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_only_tool_rejects_a_non_pure_bundle_before_worker_launch() {
+        use crate::extras::js::skills::turn::{ResolvedSkill, SkillTurnContext, TurnSkillBundle};
+        use crate::extras::js::skills::{CapabilityManifest, CapabilityScope, CapabilityTier};
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let context = Arc::new(SkillTurnContext::new(TurnSkillBundle {
+            turn_id: "read-only-child".to_string(),
+            query_fingerprint: "fixture".to_string(),
+            embedding_model_revision: "fixture".to_string(),
+            index_generation: 1,
+            skills: vec![ResolvedSkill {
+                id: "effectful-fixture".to_string(),
+                identity_version: 2,
+                abi_version: 1,
+                description: "must not enter a read-only child".to_string(),
+                tags: Vec::new(),
+                exports: Vec::new(),
+                tests: Vec::new(),
+                capability: CapabilityManifest::new(
+                    CapabilityTier::ReadOnly,
+                    vec![CapabilityScope::ReadFile {
+                        workspace_prefixes: vec!["src".to_string()],
+                    }],
+                )
+                .unwrap(),
+                source: "".to_string(),
+                score_bits: 1.0_f32.to_bits(),
+                rank: 1,
+                route: None,
+            }],
+        }));
+        let mut tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            shared_effect_audit().expect("test effect audit"),
+        )
+        .with_skill_turn_context(context);
+        tool.profile = ModelEffectProfile::ReadOnly;
+
+        let error = tool
+            .call(JsArgs { code: "1".into() })
+            .await
+            .expect_err("non-pure child bundle must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "read-only JS skill bundle contains a non-pure capability"
+        );
+        assert_eq!(supervisor.generation_for_test().await, None);
+    }
+
+    #[tokio::test]
+    async fn structured_result_and_scratch_survive_a_fresh_runtime_and_agent_rebuild() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let audit = shared_effect_audit().expect("test effect audit");
+        let scratch = ScratchStore::default();
+        let first = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            audit.clone(),
+        )
+        .with_scratch_store(scratch.clone());
+
+        assert_eq!(
+            first
+                .call(JsArgs {
+                    code: "scratch_get('missing') === null".into(),
+                })
+                .await
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            first
+                .call(JsArgs {
+                    code: "scratch_put('turn:1', {items: [1, 2, 3], ok: true}); 'stored'".into(),
+                })
+                .await
+                .unwrap(),
+            "stored"
+        );
+        drop(first);
+
+        let rebuilt = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            audit,
+        )
+        .with_scratch_store(scratch);
+        let started = Instant::now();
+        assert_eq!(
+            rebuilt
+                .call(JsArgs {
+                    code:
+                        "result({kind: 'summary', value: scratch_get('turn:1')}); while (true) {}"
+                            .into(),
+                })
+                .await
+                .unwrap(),
+            r#"{"kind":"summary","value":{"items":[1,2,3],"ok":true}}"#
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "terminal result must interrupt later JavaScript instead of waiting for the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_result_rejects_accessors_before_dispatch() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+        let rendered = tool
+            .call(JsArgs {
+                code: "result(Object.defineProperty({}, 'secret', {get() { throw 'leak'; }}))"
+                    .into(),
+            })
+            .await
+            .unwrap();
+        assert!(rendered.starts_with("JS exception"), "{rendered}");
+        assert!(!rendered.contains("leak"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn structured_result_expands_the_legacy_limit_but_keeps_its_own_cap() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            shared_effect_audit().expect("test effect audit"),
+        );
+
+        let larger_than_legacy = "x".repeat(MAX_RESULT_BYTES + 1024);
+        let literal = serde_json::to_string(&larger_than_legacy).unwrap();
+        let accepted = tool
+            .call(JsArgs {
+                code: format!("result({literal})"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(accepted, literal);
+
+        let oversized = "x".repeat(STRUCTURED_RESULT_MAX_BYTES + 1);
+        let literal = serde_json::to_string(&oversized).unwrap();
+        let rejected = tool
+            .call(JsArgs {
+                code: format!("try {{ result({literal}); }} catch (error) {{ error.code }}"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(rejected, "too_large");
+    }
 }
 
 #[cfg(test)]
@@ -1993,8 +2487,37 @@ mod description_tests {
         assert!(description.contains("timed_out: boolean"));
         assert!(description.contains("`args` must be an array"));
         assert!(description.contains("spawn('git', ['status', '--short'])"));
-        assert!(description.contains("at most 256 effect calls"));
-        assert!(description.contains("257th returns a closed effect-limit error"));
+        assert!(description.contains("30 s total"));
+        assert!(description.contains("64 MiB JavaScript heap"));
+        assert!(description.contains("512 KiB JavaScript stack"));
+        assert!(description.contains("64 KiB result"));
+        assert!(description.contains("256 effect calls"));
+        assert!(description.contains("max 256 records, 8 KiB each, 256 KiB total"));
+        assert!(description.contains("read_file(path: string): string` (synchronous; max 1 MiB)"));
+        assert!(description.contains(
+            "read_files(paths: string[]): string[]` (synchronous; one brokered batch, max 256 paths and 6 MiB aggregate JSON content)"
+        ));
+        assert!(description.contains("list_dir(path?: string)"));
+        assert!(description.contains("glob(pattern: string"));
+        assert!(description.contains("grep(pattern: string"));
+        assert!(
+            description.contains(
+                "write_file(path: string, content: string): void` (synchronous; max 1 MiB)"
+            )
+        );
+        assert!(description.contains("no variables or other JavaScript state persist"));
+        assert!(description.contains("multi-file aggregate"));
+        assert!(description.contains("Use read/grep for direct lookup"));
+        assert!(description.contains("For values containing `undefined`, NaN/Infinity"));
+        assert!(description.contains("end with `JSON.stringify(value)`"));
+        assert!(description.contains("plain `Error` objects with a stable `.code`"));
+        assert!(description.contains("`not_found`, `is_directory`, `denied`"));
+        #[cfg(feature = "sandbox")]
+        {
+            assert!(description.contains("request bodies are POST-only and capped at 256 KiB"));
+            assert!(description.contains("response body max 1 MiB"));
+        }
+        assert!(description.contains("stdout and stderr max 1 MiB each"));
     }
 
     #[tokio::test]
@@ -2006,7 +2529,38 @@ mod description_tests {
             AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
         );
 
-        assert!(!tool.description().contains("spawn(program:"));
+        let description = tool.description();
+        assert!(!description.contains("spawn(program:"));
+        assert!(description.contains("list_dir(path?: string)"));
+        assert!(description.contains("glob(pattern: string"));
+        assert!(description.contains("grep(pattern: string"));
+    }
+
+    #[tokio::test]
+    async fn read_only_description_advertises_only_its_narrow_effect_surface() {
+        let tool = JsTool::new_read_only(
+            Sandbox::new(false, "bwrap").with_complete_process_tree_for_test(),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        );
+        let description = tool.description();
+
+        for present in ["read_file(path", "list_dir(path", "grep(pattern"] {
+            assert!(description.contains(present), "{present}: {description}");
+        }
+        for absent in [
+            "read_files(paths",
+            "glob(pattern",
+            "write_file(path",
+            "fetch(url",
+            "spawn(program",
+            "scratch_put(key",
+            "propose_skill(draft",
+        ] {
+            assert!(!description.contains(absent), "{absent}: {description}");
+        }
+        assert!(description.contains("Writer, network, process, session-state"));
     }
 }
 
@@ -2107,6 +2661,15 @@ mod step_result_rendering {
             render_step_result(&effect_limit),
             "JS error: effect limit exceeded (stage: evaluation; script: model)\n[console.log] before limit"
         );
+        let invalid_result = step(
+            StepOutcome::Error(JsErrorCode::InvalidResult),
+            Vec::new(),
+            Some(diagnostic(DiagnosticStage::ResultConversion)),
+        );
+        assert_eq!(
+            render_step_result(&invalid_result),
+            "JS error: invalid result; return a string/plain JSON value or end with JSON.stringify(value) (stage: result_conversion; script: model)"
+        );
         let oom = step(
             StepOutcome::OutOfMemory,
             Vec::new(),
@@ -2178,6 +2741,27 @@ mod step_result_rendering {
     }
 
     #[test]
+    fn permission_wait_timeout_is_distinct_and_tells_the_model_not_to_retry() {
+        let rendered = render_worker_execution_error(WorkerError::PermissionPromptTimedOut, false)
+            .expect("permission timeout is a closed model-visible result");
+
+        assert_eq!(rendered, PERMISSION_PROMPT_TIMEOUT_MESSAGE);
+        assert!(rendered.contains("permission prompt"));
+        assert!(rendered.contains("do not retry"));
+        assert!(!rendered.contains("execution timed out"));
+        assert_eq!(
+            render_worker_execution_error(WorkerError::TimedOut, true)
+                .expect("sticky prompt attribution must survive the effect boundary"),
+            PERMISSION_PROMPT_TIMEOUT_MESSAGE
+        );
+        assert_eq!(
+            render_worker_execution_error(WorkerError::TimedOut, false)
+                .expect("ordinary execution timeout stays model-visible"),
+            "JS error: execution timed out (30s limit exceeded)"
+        );
+    }
+
+    #[test]
     fn oversized_worker_payloads_are_protocol_errors() {
         let protocol = WorkerError::Protocol.to_string();
         let oversize_value = step(
@@ -2230,6 +2814,32 @@ mod step_result_rendering {
                 .unwrap_err()
                 .to_string(),
             protocol
+        );
+    }
+
+    #[test]
+    fn parent_requires_a_matching_durably_audited_structured_result_receipt() {
+        let structured = step(
+            StepOutcome::Structured(serde_json::json!({"answer": 42})),
+            Vec::new(),
+            None,
+        );
+        let absent = crate::extras::js::session::StructuredResultReceipt::default();
+        assert!(validate_structured_result_receipt(&structured, &absent).is_err());
+
+        let mismatched = crate::extras::js::session::StructuredResultReceipt::default();
+        mismatched.record("{\"answer\":41}".into()).unwrap();
+        assert!(validate_structured_result_receipt(&structured, &mismatched).is_err());
+
+        let matching = crate::extras::js::session::StructuredResultReceipt::default();
+        matching.record("{\"answer\":42}".into()).unwrap();
+        assert!(validate_structured_result_receipt(&structured, &matching).is_ok());
+        assert!(
+            validate_structured_result_receipt(
+                &step(StepOutcome::Void, Vec::new(), None),
+                &matching,
+            )
+            .is_err()
         );
     }
 

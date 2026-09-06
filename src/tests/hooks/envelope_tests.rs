@@ -89,8 +89,10 @@ fn subagent_stop_envelope_carries_agent_type_and_stop_hook_active() {
         EventFields::SubagentStop {
             stop_hook_active: false,
             agent_type: "explore".into(),
+            agent_source: "compiled-in explorer".into(),
         },
     );
     assert_eq!(envelope["agent_type"], "explore");
+    assert_eq!(envelope["agent_source"], "compiled-in explorer");
     assert_eq!(envelope["stop_hook_active"], false);
 }

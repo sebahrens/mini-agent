@@ -1,7 +1,10 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rig::tool::Tool;
+use tokio::io::AsyncReadExt;
 
+use crate::agent::tools::crc::Crc32;
 use crate::agent::tools::{
     AskSender, PermCheck, ReadTracker, ToolError, WriteArgs, check_perm_bound_path, check_perm_path,
 };
@@ -10,10 +13,41 @@ use crate::extras::lsp::LspManager;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
+fn full_text_fingerprint(bytes: &[u8]) -> Result<(u32, usize), ToolError> {
+    std::str::from_utf8(bytes).map_err(|_| {
+        ToolError::Msg(
+            "overwrite=true requires a complete prior read of the current UTF-8 text file"
+                .to_string(),
+        )
+    })?;
+    let mut crc = Crc32::new();
+    let mut lines = 0usize;
+    for raw_line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let mut content_end = raw_line.len();
+        if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
+            content_end -= 1;
+            if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\r') {
+                content_end -= 1;
+            }
+        }
+        let line = &raw_line[..content_end];
+        crc.update(&(line.len() as u64).to_le_bytes());
+        crc.update(line);
+        lines += 1;
+    }
+    Ok((crc.finalize(), lines))
+}
+
+fn overwrite_not_authorized(path: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "Cannot overwrite '{path}': overwrite=true requires a complete current read of the file. Read it from offset 1 through EOF, then retry without any intervening change."
+    ))
+}
+
 fn create_error(path: &str, error: std::io::Error) -> ToolError {
     if error.kind() == std::io::ErrorKind::AlreadyExists {
         ToolError::Msg(format!(
-            "File '{path}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed."
+            "File '{path}' already exists. Use the edit tool for targeted changes. For an intentional full replacement, read the complete current file and then call the write tool with overwrite=true."
         ))
     } else {
         error.into()
@@ -127,7 +161,7 @@ impl Tool for WriteTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Create a new file with the given content. Fails if the file already exists — use edit for existing files. Automatically creates parent directories.".to_string()
+        "Create a new file with the given content. Use edit for targeted changes to existing files. A complete current read permits one guarded full replacement with overwrite=true. Automatically creates parent directories.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -135,7 +169,8 @@ impl Tool for WriteTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
-                "content": { "type": "string", "description": "Content to write to the file" }
+                "content": { "type": "string", "description": "Content to write to the file" },
+                "overwrite": { "type": "boolean", "description": "Replace an existing file only after its complete current contents were read (default false)" }
             },
             "required": ["path", "content"]
         })
@@ -173,9 +208,39 @@ impl Tool for WriteTool {
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "write", workspace, relative)
                     .await?;
-            workspace
-                .create_relative_atomic(relative, args.content.as_bytes())
-                .map_err(|error| create_error(&expanded, error))?;
+            match workspace.open_relative(relative) {
+                Ok(mut existing) => {
+                    if !args.overwrite {
+                        return Err(create_error(
+                            &expanded,
+                            std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                        ));
+                    }
+                    let metadata = existing.metadata()?;
+                    if metadata.len() > self.max_text_file_size {
+                        return Err(overwrite_not_authorized(&expanded));
+                    }
+                    let expected = crate::fs::checked_file_metadata(&existing)?;
+                    let mut current = Vec::with_capacity(metadata.len() as usize);
+                    existing.read_to_end(&mut current)?;
+                    let (crc, lines) = full_text_fingerprint(&current)?;
+                    if !self
+                        .read_tracker
+                        .permits_full_overwrite(&expanded, &metadata, crc, lines)
+                    {
+                        return Err(overwrite_not_authorized(&expanded));
+                    }
+                    workspace.replace_relative_atomic(
+                        relative,
+                        args.content.as_bytes(),
+                        &expected,
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace
+                    .create_relative_atomic(relative, args.content.as_bytes())
+                    .map_err(|error| create_error(&expanded, error))?,
+                Err(error) => return Err(error.into()),
+            }
             self.read_tracker.untrack_read_path(&expanded);
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
             if let Some(msg) = coaching {
@@ -202,13 +267,34 @@ impl Tool for WriteTool {
         )
         .await?;
 
-        if path.exists() {
+        let existing = if path.exists() {
             tracing::warn!("tool write file exists: path={}", expanded);
-            return Err(ToolError::Msg(format!(
-                "File '{}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed.",
-                expanded
-            )));
-        }
+            if !args.overwrite {
+                return Err(create_error(
+                    &expanded,
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
+            let mut file = crate::fs::open_stable_file(path).await?;
+            let metadata = file.metadata().await?;
+            if metadata.len() > self.max_text_file_size {
+                return Err(overwrite_not_authorized(&expanded));
+            }
+            let mut current = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut current).await?;
+            let (crc, lines) = full_text_fingerprint(&current)?;
+            if !self.read_tracker.permits_full_overwrite(
+                &path.to_string_lossy(),
+                &metadata,
+                crc,
+                lines,
+            ) {
+                return Err(overwrite_not_authorized(&expanded));
+            }
+            true
+        } else {
+            false
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -226,9 +312,13 @@ impl Tool for WriteTool {
             )
         })?)
         .await?;
-        crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent)
-            .await
-            .map_err(|error| create_error(&expanded, error))?;
+        if existing {
+            crate::fs::atomic_write_resolved_checked(path, &args.content, approved_parent).await?;
+        } else {
+            crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent)
+                .await
+                .map_err(|error| create_error(&expanded, error))?;
+        }
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
         tracing::debug!("tool write done: path={}, bytes={}", expanded, bytes);
         let mut result = format!("Written {} bytes to {}", bytes, expanded);
@@ -255,6 +345,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::agent::tools::{ReadArgs, ReadTool};
     use crate::permission::checker::PermissionChecker;
     use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 
@@ -305,17 +396,106 @@ mod tests {
             .call(WriteArgs {
                 path: "existing.txt".into(),
                 content: "replacement".into(),
+                overwrite: false,
             })
             .await
             .unwrap_err()
             .to_string();
 
         assert!(error.contains("already exists"), "{error}");
-        assert!(error.contains("Use edit"), "{error}");
+        assert!(error.contains("edit tool"), "{error}");
+        assert!(error.contains("write tool with overwrite=true"), "{error}");
         assert_eq!(
             std::fs::read_to_string(temp.path().join("existing.txt")).unwrap(),
             "original"
         );
+    }
+
+    #[tokio::test]
+    async fn overwrite_requires_and_consumes_a_complete_current_read() {
+        let temp = TempDir::new();
+        let target = temp.path().join("existing.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+
+        let denied = write
+            .call(WriteArgs {
+                path: "existing.txt".into(),
+                content: "replacement\n".into(),
+                overwrite: true,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("complete current read"), "{denied}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+
+        read.call(ReadArgs {
+            path: "existing.txt".into(),
+            offset: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+        write
+            .call(WriteArgs {
+                path: "existing.txt".into(),
+                content: "replacement\n".into(),
+                overwrite: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "replacement\n");
+    }
+
+    #[tokio::test]
+    async fn overwrite_rejects_an_intervening_same_length_change() {
+        let temp = TempDir::new();
+        let target = temp.path().join("existing.txt");
+        std::fs::write(&target, "before\n").unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+
+        read.call(ReadArgs {
+            path: "existing.txt".into(),
+            offset: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+        let original_times = std::fs::metadata(&target).unwrap();
+        std::fs::write(&target, "after!\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(original_times.accessed().unwrap())
+                    .set_modified(original_times.modified().unwrap()),
+            )
+            .unwrap();
+
+        let error = write
+            .call(WriteArgs {
+                path: "existing.txt".into(),
+                content: "unsafe\n".into(),
+                overwrite: true,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("complete current read"), "{error}");
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "after!\n");
     }
 
     #[tokio::test]
@@ -332,6 +512,7 @@ mod tests {
             .call(WriteArgs {
                 path: target.to_string_lossy().into_owned(),
                 content: "must not be written".to_string(),
+                overwrite: false,
             })
             .await
             .expect_err("basename alone must not grant PlanWrite authority");
@@ -358,6 +539,7 @@ mod tests {
         tool.call(WriteArgs {
             path: "plans/PLAN.md".to_string(),
             content: "must not escape".to_string(),
+            overwrite: false,
         })
         .await
         .expect_err("workspace capability must reject a symlinked parent");
@@ -393,6 +575,7 @@ mod tests {
             .call(WriteArgs {
                 path: allowed_link.to_string_lossy().into_owned(),
                 content: "must not be written".to_string(),
+                overwrite: false,
             })
             .await
             .expect_err("the resolved external target must require permission");
@@ -437,6 +620,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
                 content: "must not be written".to_string(),
+                overwrite: false,
             })
             .await
             .expect_err("the resolved external parent must require permission");
@@ -476,6 +660,7 @@ mod tests {
         let call = tool.call(WriteArgs {
             path: link.to_string_lossy().into_owned(),
             content: "checked contents".to_string(),
+            overwrite: false,
         });
         let swap = async {
             let request = ask_rx.recv().await.expect("permission request");

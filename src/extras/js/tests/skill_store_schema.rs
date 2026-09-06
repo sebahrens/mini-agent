@@ -74,6 +74,23 @@ fn minimal_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     )?)
 }
 
+fn pure_number_skill(
+    value: i32,
+    description: &str,
+) -> Result<SkillArtifact, Box<dyn std::error::Error>> {
+    Ok(SkillArtifact::new(
+        format!("function value() {{ return {value}; }}"),
+        description.to_string(),
+        vec![],
+        vec![SkillExport {
+            name: "value".to_string(),
+            signature: "() => number".to_string(),
+        }],
+        vec![format!("value() === {value}")],
+        CapabilityManifest::pure(),
+    )?)
+}
+
 /// Create a skill with ReadOnly capability.
 fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
@@ -758,7 +775,7 @@ fn test_transaction_interruption_recovery() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn test_schema_v1_to_v7_migration_preserves_rows_and_rebuilds_active_only_fts()
+fn test_schema_v1_to_current_migration_preserves_rows_and_rebuilds_active_only_fts()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
@@ -786,7 +803,7 @@ fn test_schema_v1_to_v7_migration_preserves_rows_and_rebuilds_active_only_fts()
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            7
+            crate::extras::js::skills::store::CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             store
@@ -822,7 +839,8 @@ fn test_schema_v1_to_v7_migration_preserves_rows_and_rebuilds_active_only_fts()
 }
 
 #[test]
-fn test_schema_v6_to_v7_adds_active_identity_index() -> Result<(), Box<dyn std::error::Error>> {
+fn test_schema_v6_to_current_adds_active_identity_index() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = temp_app_paths();
     let paths = resolve_test_paths(&temp_dir)?;
     {
@@ -839,7 +857,7 @@ fn test_schema_v6_to_v7_adds_active_identity_index() -> Result<(), Box<dyn std::
             store
                 .conn()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            7
+            crate::extras::js::skills::store::CURRENT_SCHEMA_VERSION
         );
         let index_count: i64 = store.conn().query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -850,6 +868,61 @@ fn test_schema_v6_to_v7_adds_active_identity_index() -> Result<(), Box<dyn std::
         assert_eq!(index_count, 1);
     }
 
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_schema_v7_allows_sibling_canaries_but_only_one_active_successor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    {
+        let store = SkillStore::open_at(&paths)?;
+        store.conn().execute_batch(
+            "DROP INDEX skill_revisions_one_active_successor;
+             CREATE UNIQUE INDEX skill_revisions_one_live_successor
+                 ON skill_revisions(supersedes_id)
+                 WHERE supersedes_id IS NOT NULL
+                   AND status IN ('verified', 'canary', 'active');
+             PRAGMA user_version = 7;",
+        )?;
+    }
+
+    let mut store = SkillStore::open_at(&paths)?;
+    let predecessor = pure_number_skill(1, "migration predecessor")?;
+    let first = pure_number_skill(2, "migration first canary")?;
+    let second = pure_number_skill(3, "migration second canary")?;
+    for skill in [&predecessor, &first, &second] {
+        store.insert_verified(skill)?;
+    }
+    for skill in [&first, &second] {
+        store.conn_mut().execute(
+            "UPDATE skill_revisions
+             SET status = 'canary', supersedes_id = ?, lineage_root_id = ?
+             WHERE id = ?",
+            params![predecessor.id, predecessor.id, skill.id],
+        )?;
+    }
+    store.conn_mut().execute(
+        "UPDATE skill_revisions SET status = 'active' WHERE id = ?",
+        [&first.id],
+    )?;
+    assert!(
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'active' WHERE id = ?",
+                [&second.id],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.schema_version()?,
+        crate::extras::js::skills::store::CURRENT_SCHEMA_VERSION
+    );
+
+    drop(store);
     std::fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }

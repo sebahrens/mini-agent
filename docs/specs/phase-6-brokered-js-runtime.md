@@ -101,7 +101,11 @@ request budget. The runtime installs its memory limit, stack limit, and interrup
 source evaluation. Pending jobs, console output, sanitized typed diagnostics, file/fetch bodies,
 and spawn output are bounded. Arbitrary exception text and stacks are never serialized. The parent
 deadline includes worker IPC and brokered host calls rather than pausing while an effect is
-serviced. Platform process limits are defense in depth and do not replace these runtime limits.
+serviced, including time spent waiting for an interactive permission decision. If that shared
+deadline expires while a permission `Ask` is pending, the parent attributes the terminal failure
+to the unanswered prompt and tells the model not to retry without a new user decision. It does not
+expose the permission target or user-interface payload. Platform process limits are defense in
+depth and do not replace these runtime limits.
 
 The worker handles exactly one invocation at a time. Parent cancellation, timeout, transport
 failure, or shutdown kills and reaps the entire containment/process group; no unsolicited cancel
@@ -144,16 +148,25 @@ retryable admission-infrastructure failure and cannot produce an admission succe
 
 All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
 snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,
-grants, cancellation, and broker for each `JsTool::call`; none of those values is stored in the
-warm process or supervisor. Model switches and network retries therefore reuse the existing tool
-and worker generation, while dropping an agent closes only that build's permission receiver.
+grants, cancellation, and broker for each `JsTool::call`. The supervisor retains no permission,
+grant, cancellation, broker, or callable skill value. It tracks only the current worker/turn's
+advertised artifact identities so later calls can send references. The worker retains the matching
+immutable, identity-checked artifacts and same-process compiled bytecode only for that turn; a new
+turn replaces the cache. Every request still creates a fresh constrained runtime and private
+context and mints fresh one-shot call grants. Model switches and network retries therefore reuse
+the existing tool and worker generation, while dropping an agent closes only that build's
+permission receiver.
+Checked-in console, clone, and realm-wrapper factories are likewise compiled once into
+process-local QuickJS module bytecode and loaded into each fresh context. Those trusted bytes never
+cross disk or IPC, and caching their compilation does not reuse runtime or realm state.
 When learned skills are enabled, `skills/session.rs` separately owns one workspace-bound service
 bundle per logical UI, headless, or ACP session. Rebuilds share that bundle's discovery runtime,
 turn gate/context, proposal budget, and proposal/admission/telemetry workers. Initialization is
 lazy and failure-cached, and a canonical workspace rebind replaces the slot without exposing its
 state to another concurrent ACP session. These parent services never inherit an individual turn's
 cancellation scope; their worker guards are joined when the final session/service owner drops.
-Subagents and `/btw` intentionally keep their exact restricted tool sets and do not receive JS.
+`/btw` keeps its exact restricted tool set and does not receive JS. Exploration subagents may
+receive only the separately specified read-only JS profile below.
 Lifecycle regression tests assert stable process ID and generation across rebuilds plus denial
 under a rebuilt policy, proving that the old policy did not leak into the reused worker.
 
@@ -171,9 +184,26 @@ Rust compiler version. Ordinary local and packaged builds therefore reject a sam
 built from different inputs without relying on Git metadata, network access, timestamps, or random
 values.
 
-Protocol version 4 retains the version 3 launch binding, adds the closed step-level `effect_limit`
-error used when generated code attempts a 257th parent-brokered effect, and reintroduces diagnostic
-line/column positions only for the model script. Version 3 removed response fields that never had
+Protocol version 11 adds a closed `full`/`read_only` model-effect profile to every `RunStep`.
+The read-only profile installs exactly `read_file`, `list_dir`, and `grep`; the parent separately
+issues only `read_file` capability and marks spawn unavailable. Protocol version 8 retains the
+version 7 launch, cache, diagnostic, discovery, and closed-error
+contract and adds the typed `read_files` request/result pair. One request carries 1–256 non-empty
+paths (at most 1 MiB of path text) and returns ordered contents capped at 6 MiB after JSON encoding.
+The parent prepares and authorizes every path before reading any content, then emits one durable
+intent/completion pair for the batch. Version 7 added the typed `list_dir`, `glob`, and `grep`
+operations and their bounded result schemas. Version 6
+added the closed effect codes `not_found`, `is_directory`, `denied`, and `too_large`. The worker exposes a parent
+effect failure to model code as a plain `Error` whose bounded message is `<effect>: <code>` and
+whose own `.code` property carries that same closed code; target text and backend details never
+cross the boundary. Version 5 added ordered, turn-scoped cached-artifact identities to `RunStep`.
+A full artifact bundle is sent once per worker generation/turn; the worker compiles global Script
+bytecode without executing source and accepts later identity-only requests only from that exact
+cache. Full artifacts and references are mutually exclusive, and stale, duplicate, or missing
+identities close the worker protocol. Version 4 added
+the closed step-level `effect_limit` error used when generated code attempts a 257th parent-brokered
+effect and reintroduced diagnostic line/column positions only for the model script. Version 3
+removed response fields that never had
 production data: fetch response headers/truncation and the then-unused diagnostic positions. The
 parent generates a fresh non-nil UUID
 challenge when it constructs that launch's protocol state, sends it in `ParentHello`, and accepts
@@ -230,7 +260,9 @@ spawn, and proposal services whose callable contracts contain no QuickJS types. 
 only decode JavaScript values, call those services, and encode their closed results or errors.
 File services preserve stable path identity across authorization and I/O; fetch preserves exact
 origin and public-address checks plus an outer deadline; spawn passes structured argv to the
-general command sandbox. Spawn permission identity is versioned canonical JSON containing the
+general command sandbox. Capped spawn streams drop an incomplete trailing UTF-8 scalar before
+lossy decoding, so a byte-cap split does not manufacture replacement characters. Spawn permission
+identity is versioned canonical JSON containing the
 program and argument array, so argument boundaries are never collapsed into a shell-like string.
 The broker `SkillProposalDraft` carries the complete bounded identity-v2 proposal shape: source,
 description, export names and signatures, tests, structured capability tier/scopes, tags, and an
@@ -300,6 +332,27 @@ never serves as containment for a brokered command. Learned-skill spawn remains 
 Windows because its stronger executable-manifest contract requires an immutable-executable
 snapshot backend that Windows does not provide.
 
+### Read-only subagent realm
+
+An exploration subagent may receive `js` only when the main JS tool is eligible and the same
+production worker-containment preflight is available. It reuses the process-wide supervisor but
+still sends a distinct `RunStep`; the worker creates and destroys a fresh bounded runtime and
+context exactly as it does for the full profile. No QuickJS state or handle enters the parent.
+
+The authenticated request selects the closed `read_only` effect profile. The worker installs
+`read_file`, `list_dir`, and `grep` and omits `read_files`, `glob`, `write_file`, `fetch`, `spawn`,
+`result`, scratch state, and proposal globals. Independently, the parent issues a model grant and
+session capability set containing only `read_file`; the normal workspace-bound `AllowConfig`,
+permission bridge, deadline, cancellation, and durable audit paths still authorize each read.
+Thus a forged write, fetch, spawn, or session-state request from a compromised worker is denied by
+the broker even though the intended source-level realm has no such callable.
+
+The child shares only immutable discovery indexes and receives its own turn context and locks.
+Retrieval filters active learned-JS rows to `pure` before candidate limits and budgets, disables
+canary substitution, and rejects a non-pure bundle again at `JsTool::call`. Proposal and telemetry
+workers are not delegated. Stored pure source retains its private no-effect initialization realm;
+all protocol-only output, closed diagnostics, limits, and failure semantics remain unchanged.
+
 ## Persistence boundary
 
 The parent is the sole persistence authority. The worker receives no database handle, skill-store
@@ -323,6 +376,12 @@ Stored-skill source initialization is pure. The worker installs neither effect h
 Declared exports are validated only after initialization completes. Proposal drafts and execution
 evidence cross the wire as bounded data; the parent canonicalizes, validates, and persists them
 under the existing lifecycle transaction rules.
+
+Production `RunStep` compilation is also pure: a disposable constrained compiler runtime parses
+the unchanged global Script with `COMPILE_ONLY`, then the worker retains the resulting bytecode in
+its bounded one-turn cache. Bytecode never crosses IPC or disk. Loading it does not relax identity,
+grammar, hardening, private-context, pending-job, export, capability, or fresh-runtime checks.
+The worker accepts at most 64 KiB of source and retains at most 4 MiB of compiled bytes per turn.
 
 ## Verification parity
 
@@ -893,8 +952,8 @@ bounded while the already-approved syscall may finish and the result stays `outc
 receives `spawn` authority only when the configured process sandbox
 owns the complete descendant lifetime independently of process-group membership (currently the
 Linux bwrap PID namespace and the attested Windows AppContainer backend; never macOS Seatbelt).
-Elsewhere spawn fails closed before intent, although the `spawn` global is still installed and
-throws `capability_denied` (mini-agent-7u1n). Within that boundary, spawn
+Elsewhere the authenticated run request marks spawn unavailable and the worker omits the `spawn`
+global. Within the supported boundary, spawn
 cancellation signals the command-specific token, kills the process group and containing namespace,
 reaps the direct child, and then records `outcome_unknown` because the program may already have
 changed external state. Fetch preserves its one outer wall-clock
@@ -978,22 +1037,63 @@ named bead is closed with its tests, the pre-amendment behavior remains the deli
    permission, and durable audit as `read_file`. They return bounded JSON (entries, paths,
    `{path, line, text}` matches) and never file contents beyond the matched line. They are
    available on every platform and do not depend on `spawn` authority.
-5. **Batched effects** (mini-agent-ae65). `read_files([paths])` (and any later batch form)
-   is one effect request carrying one intent and one completion record, while every path is
-   narrowed, permission-checked, and size-bounded individually; a single denied path fails the
+   `list_dir` returns at most 1,000 direct entries; `glob` and `grep` visit at most 100,000 files
+   and return at most 1,000 paths or matches. Each result is also capped at 256 KiB, patterns are
+   capped at 8 KiB, grep skips binary and over-10-MiB files, and each matched line is truncated to
+   500 characters around the match. A `truncated` boolean reports any result, byte, or traversal
+   cap. Traversal is descriptor-bound, ignores symlinks and unsafe file kinds, honors ignore files,
+   and checks the shared invocation cancellation/deadline between entries and file reads.
+5. **Batched effects** (mini-agent-ae65). `read_files([paths])` is one effect request carrying one
+   intent and one completion record, while every path is narrowed, permission-checked, and bounded
+   before any content is read. It accepts 1–256 paths with at most 1 MiB aggregate path text and
+   returns ordered contents capped at 6 MiB after JSON encoding. A single denied path fails the
    batch closed before any read. Audit records within one step may be group-committed as long as
    intent still precedes the first byte of the effect.
 6. **Closed denial codes** (mini-agent-dr93). `EffectErrorCode` gains `not_found`,
    `is_directory`, `denied`, and `too_large`. Codes are chosen by the parent from its own
-   observations and remain free of target text.
+   observations and remain free of target text. A host global throws a plain `Error` with the
+   bounded message `<effect>: <code>` and an own `.code` property, so model code can branch on the
+   code without parsing QuickJS conversion diagnostics.
 7. **Permission-wait rendering** (mini-agent-osaj). When the shared deadline expires while a
-   permission `Ask` is pending, the parent renders the closed code `permission_wait_expired`
-   instead of the compute-timeout template. The deadline itself is unchanged.
-8. **Typed result and scratch store** (mini-agent-yl18, design gate). A `result(value)` terminal
-   effect returning JSON-shaped data with parent-side validation, and `scratch_put(key, json)` /
-   `scratch_get(key)` effects backed by a parent-owned, session-scoped, size-capped, audited
-   JSON store, are accepted in principle. Neither persists QuickJS state; both require a written
-   design against this checklist before implementation.
+   permission `Ask` is pending, the parent renders the closed message `permission prompt not
+   answered within the 30s budget; do not retry without a new user decision` instead of the
+   compute-timeout template. The deadline itself is unchanged, and the message contains neither
+   the permission target nor user-interface data.
+8. **Typed result and scratch store** (mini-agent-yl18). Model-authored steps receive three
+   synchronous globals; stored skills receive none of them. `result(value)` strict-clones `value`
+   through the captured descriptor-only JSON gate and sends the encoded JSON in a typed terminal
+   effect. The parent rejects invalid JSON, values over 256 KiB, more than 100,000 JSON nodes, or
+   nesting deeper than 64 before acknowledging it. The first acknowledged result is terminal:
+   later effects are rejected, script evaluation is interrupted at the next QuickJS interrupt
+   checkpoint, caught exceptions cannot undo it, and the step returns a distinct structured-result
+   outcome without another provider round trip. `undefined`, functions, symbols, accessors,
+   sparse arrays, cycles, non-finite numbers, and unsupported prototypes fail the existing strict
+   clone gate instead of being coerced or dropped. The parent reserializes the parsed value before
+   acknowledgement so the terminal payload never trusts worker-provided JSON spelling.
+
+   `scratch_put(key, value)` and `scratch_get(key)` use typed effects under a model-only
+   `session_state` grant. Keys are 1--128 UTF-8 bytes and contain only ASCII letters, digits,
+   `.`, `_`, `-`, or `:`. Values use the same descriptor-only JSON gate and parent validation,
+   with limits of 1 MiB per value, 4 MiB total encoded values, and 128 entries per logical
+   session/workspace. Replacement is atomic: a rejected write leaves the old entry intact.
+   `scratch_get` returns a fresh decoded JS value, or `null` when absent; it never shares object
+   identity or heap state between runtimes. The store is process-local and deliberately absent
+   from session persistence, exports, compaction, and learned-skill storage. Agent rebuilds borrow
+   the same session owner, workspace rebinding creates an empty store, and independently opened
+   sessions never share values.
+
+   Every result, scratch read, and scratch write consumes one normal effect ordinal and receives
+   the usual durable intent/completion pair. Audit targets contain only a keyed tag of the scratch
+   key plus the operation and encoded byte count; result targets contain only the operation and
+   encoded byte count. Raw keys and JSON values have no audit representation. Validation,
+   capability, cancellation, effect-count, audit-failure, replay, and protocol failures therefore
+   remain fail-closed under the existing broker state machine. These effects perform no external
+   I/O and need no user permission prompt, but they still require the parent-issued model grant.
+   Protocol v10 carries the closed request/result/outcome variants, their bounds, and the
+   parent-attested availability of the model-facing `spawn` global; malformed or
+   oversized payloads are rejected before parsing or mutation. Pure path, diff, and table helpers
+   remain separate future work because they need no authority and do not justify expanding this
+   effect contract.
 
 ## Acceptance matrix
 

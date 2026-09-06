@@ -18,10 +18,10 @@ pub fn zerostack_dir() -> PathBuf {
         .expect("startup workspace must have a project path")
 }
 
-/// Where a loaded prompt came from. Only the source decides whether a
-/// `%%mode=` directive is honored: embedded and user prompts are the user's
-/// own configuration, while `.zerostack/prompts` is repository content that
-/// an untrusted clone controls.
+/// Where a loaded prompt came from. Only the source decides whether prompt
+/// header directives are honored: embedded and user prompts are the user's own
+/// configuration, while `.zerostack/prompts` is repository content that an
+/// untrusted clone controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptSource {
     Embedded,
@@ -35,8 +35,52 @@ pub(crate) struct LoadedPrompt {
     pub(crate) content: String,
 }
 
+/// Header directives shared by prompt modes. Recognized directives must form
+/// one contiguous block at the start of the file and may appear in either
+/// order. Their lines are removed before the prompt reaches the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptDirectives<'a> {
+    pub(crate) mode: Option<&'a str>,
+    pub(crate) agent: Option<&'a str>,
+    pub(crate) content: &'a str,
+}
+
+pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
+    let mut mode = None;
+    let mut agent = None;
+    loop {
+        let line_end = content.find('\n').unwrap_or(content.len());
+        let line = content[..line_end].trim().trim_end_matches('\r');
+        let directive = if let Some(value) = line.strip_prefix("%%mode=") {
+            Some((&mut mode, value.trim()))
+        } else {
+            line.strip_prefix("%%agent=")
+                .map(|value| (&mut agent, value.trim()))
+        };
+        let Some((slot, value)) = directive else {
+            break;
+        };
+        if value.is_empty() {
+            break;
+        }
+        if slot.is_none() {
+            *slot = Some(value);
+        }
+        content = if line_end < content.len() {
+            &content[line_end + 1..]
+        } else {
+            ""
+        };
+    }
+    PromptDirectives {
+        mode,
+        agent,
+        content,
+    }
+}
+
 /// Whether the workspace's project config is bound in the private trust
-/// store. Project prompts may only carry a mode directive when the user has
+/// store. Project prompts may only carry prompt directives when the user has
 /// explicitly trusted this exact project config (see CONFIG.md "Prompt
 /// directives").
 fn project_prompts_trusted(paths: &crate::paths::AppPaths) -> bool {
@@ -81,10 +125,10 @@ fn merge_sources(
 }
 
 /// Reduce sourced prompts to the name-to-content map used by the rest of the
-/// application, applying the project trust policy: a `%%mode=` directive in a
-/// project-sourced prompt is dropped unless the project config is trusted.
-/// `%%mode=last_user_mode` is always kept because it can only restore the
-/// user's own selection.
+/// application, applying the project trust policy. Project-owned directives
+/// cannot select a main persona or change authority unless the project config
+/// is trusted. `%%mode=last_user_mode` is always safe because it only restores
+/// the user's own selection.
 pub(crate) fn apply_project_trust(
     prompts: HashMap<String, LoadedPrompt>,
     project_trusted: bool,
@@ -103,24 +147,32 @@ pub(crate) fn apply_project_trust(
 }
 
 fn neutralize_untrusted_directive(name: &str, content: String) -> String {
-    let stripped = {
-        let (directive, rest) = crate::permission::parse_prompt_mode(&content);
-        match directive {
-            Some(mode) if mode != "last_user_mode" => Some((mode.to_string(), rest.to_string())),
-            _ => None,
-        }
-    };
-    match stripped {
-        Some((mode, rest)) => {
-            tracing::warn!(
-                prompt = name,
-                mode,
-                "ignoring %%mode= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
-            );
-            rest
-        }
-        None => content,
+    let directives = parse_directives(&content);
+    let drop_mode = directives.mode.filter(|mode| *mode != "last_user_mode");
+    let drop_agent = directives.agent;
+    if drop_mode.is_none() && drop_agent.is_none() {
+        return content;
     }
+    if let Some(mode) = drop_mode {
+        tracing::warn!(
+            prompt = name,
+            mode,
+            "ignoring %%mode= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
+        );
+    }
+    if let Some(agent) = drop_agent {
+        tracing::warn!(
+            prompt = name,
+            agent,
+            "ignoring %%agent= directive from untrusted project prompt; trust the project config (.zerostack/config.toml) to enable it"
+        );
+    }
+    let mut neutralized = String::new();
+    if directives.mode == Some("last_user_mode") {
+        neutralized.push_str("%%mode=last_user_mode\n");
+    }
+    neutralized.push_str(directives.content);
+    neutralized
 }
 
 pub fn load() -> HashMap<String, String> {
@@ -328,6 +380,47 @@ mod tests {
         let prompts = td.load();
 
         assert_eq!(prompts["code"], "%%mode=last_user_mode\nBody.");
+    }
+
+    #[test]
+    fn prompt_directives_compose_and_untrusted_project_persona_is_dropped() {
+        let parsed =
+            parse_directives("%%agent=rust-security-review\n%%mode=readonly\nReview the code.");
+        assert_eq!(parsed.agent, Some("rust-security-review"));
+        assert_eq!(parsed.mode, Some("readonly"));
+        assert_eq!(parsed.content, "Review the code.");
+
+        let td = TestDir::new();
+        write_prompt(
+            &td.project_dir(),
+            "review",
+            "%%agent=rust-security-review\n%%mode=last_user_mode\nBody.",
+        );
+        let prompts = td.load();
+        assert_eq!(prompts["review"], "%%mode=last_user_mode\nBody.");
+    }
+
+    #[test]
+    fn trusted_and_user_prompt_persona_directives_are_preserved() {
+        let td = TestDir::new();
+        trust_project(&td);
+        write_prompt(
+            &td.project_dir(),
+            "project-review",
+            "%%agent=rust-security-review\nBody.",
+        );
+        write_prompt(
+            &td.global_dir(),
+            "user-review",
+            "%%agent=rust-maintainer\nBody.",
+        );
+
+        let prompts = td.load();
+        assert_eq!(
+            prompts["project-review"],
+            "%%agent=rust-security-review\nBody."
+        );
+        assert_eq!(prompts["user-review"], "%%agent=rust-maintainer\nBody.");
     }
 
     #[test]

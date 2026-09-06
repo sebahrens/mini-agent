@@ -540,7 +540,11 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
     assert!(content.ends_with(&tail));
     assert!(content.contains("[tool output truncated: 12001 characters; 2001 omitted]"));
     assert!(!content.contains(&"M".repeat(80)));
-    let Some(PersistedToolMessage::Result { output: replay }) = &s.messages[0].tool else {
+    let Some(PersistedToolMessage::Result {
+        output: replay,
+        artifact_path,
+    }) = &s.messages[0].tool
+    else {
         panic!("tool result must retain a structured replay payload")
     };
     assert!(replay.starts_with(&head));
@@ -558,6 +562,7 @@ fn long_tool_result_is_saved_and_truncated_in_session() {
         .split(';')
         .next()
         .unwrap();
+    assert_eq!(artifact_path.as_deref(), Some(path));
     assert!(Path::new(path).starts_with(&env.dir));
     assert_eq!(std::fs::read_to_string(path).unwrap(), output);
 

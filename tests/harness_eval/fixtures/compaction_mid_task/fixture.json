@@ -1,0 +1,13 @@
+{
+  "name": "compaction_mid_task",
+  "prompt": "Continue from the compacted work and mark the state complete.",
+  "max_provider_turns": 2,
+  "max_tool_calls": 1,
+  "max_total_tokens": 260,
+  "initial_files": {
+    "state.txt": "pending\n"
+  },
+  "expected_files": {
+    "state.txt": "complete\n"
+  }
+}

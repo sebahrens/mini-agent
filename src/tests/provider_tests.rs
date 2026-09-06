@@ -2,14 +2,15 @@ use crate::auth::ProviderKind;
 use crate::config::{ApiStyle, CustomProviderConfig};
 use crate::provider::ModelEntry;
 use crate::provider::{
-    AnyClient, compaction_request_limits, compress_messages_with, create_client, expand_env,
-    is_agent_model, merge_extra_body, openrouter_anthropic_routing, resolve_api_style,
+    AnyClient, AnyModel, bound_summary, compaction_request_limits, compress_messages_with,
+    create_client, expand_env, is_agent_model, is_localhost, merge_extra_body,
+    openai_responses_extra_body, openrouter_anthropic_routing, resolve_api_style,
     resolve_provider_config, serialize_conversation, summarize_conversation_bounded,
 };
 use crate::session::{MessageRole, SessionMessage};
 use compact_str::CompactString;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
+use rig::completion::{CompletionModel as _, Prompt};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -25,14 +26,43 @@ fn compaction_limits_reserve_provider_envelope_and_output_headroom() {
         compaction_request_limits(input_budget, response_budget, preamble_bytes);
 
     assert_eq!(output_tokens, response_budget);
-    assert!(
-        prompt_bytes as u64 + preamble_bytes as u64 + 512 + output_tokens
-            <= input_budget + response_budget
+    let expected_input_tokens = input_budget - 512;
+    assert_eq!(
+        prompt_bytes + preamble_bytes,
+        (expected_input_tokens * 13 / 4) as usize
     );
 
     let (prompt_bytes, output_tokens) = compaction_request_limits(128_000, 0, preamble_bytes);
     assert_eq!(output_tokens, 256);
-    assert!(prompt_bytes as u64 + preamble_bytes as u64 + 512 + output_tokens <= 128_000);
+    let expected_input_tokens = 128_000 - output_tokens - 512;
+    assert_eq!(
+        prompt_bytes + preamble_bytes,
+        (expected_input_tokens * 13 / 4) as usize
+    );
+}
+
+#[test]
+fn bounded_summary_preserves_each_structured_section() {
+    let summary = [
+        ("Task", "T"),
+        ("Progress", "P"),
+        ("Key Decisions", "K"),
+        ("Next Steps", "N"),
+    ]
+    .into_iter()
+    .map(|(heading, fill)| format!("## {heading}\n{}\n", fill.repeat(2_000)))
+    .collect::<String>();
+
+    let bounded = bound_summary(&summary, 1_024);
+
+    assert!(bounded.len() <= 1_024);
+    for heading in ["Task", "Progress", "Key Decisions", "Next Steps"] {
+        assert!(
+            bounded.contains(&format!("## {heading}\n")),
+            "missing section {heading}: {bounded}"
+        );
+    }
+    assert!(bounded.contains("...[section truncated]..."));
 }
 
 #[tokio::test]
@@ -303,7 +333,7 @@ async fn bounded_compaction_limits_verbose_rolling_summaries() {
     assert!(prompts.len() > 1);
     assert!(prompts.iter().all(|prompt| prompt.len() <= budget));
     assert!(summary.len() < budget);
-    assert!(summary.contains("summary truncated"));
+    assert!(summary.contains("section truncated"));
 }
 
 #[tokio::test]
@@ -720,12 +750,11 @@ async fn anthropic_custom_base_appends_v1_messages() {
 fn merge_extra_body_combines_routing_and_user_keys() {
     // OpenRouter routing (provider.order) plus a user `plugins` preset must both
     // survive in the request body.
-    let routing = serde_json::json!({
-        "provider": { "order": ["Anthropic"], "allow_fallbacks": true }
-    });
+    let routing = openrouter_anthropic_routing("anthropic/claude-sonnet-4.6").unwrap();
     let user = serde_json::json!({ "plugins": { "preset": "general-budget" } });
     let merged = merge_extra_body(Some(routing), Some(user)).unwrap();
     assert_eq!(merged["provider"]["order"][0], "Anthropic");
+    assert_eq!(merged["cache_control"]["type"], "ephemeral");
     assert_eq!(merged["plugins"]["preset"], "general-budget");
 }
 
@@ -745,6 +774,54 @@ fn merge_extra_body_handles_absent_sides() {
     assert_eq!(merge_extra_body(None, None), None);
 }
 
+#[test]
+fn openai_responses_cache_key_is_stable_per_session_and_user_overridable() {
+    let first = openai_responses_extra_body(None, "session-a").unwrap();
+    let repeated = openai_responses_extra_body(None, "session-a").unwrap();
+    let other = openai_responses_extra_body(None, "session-b").unwrap();
+
+    assert_eq!(first, repeated);
+    assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
+    assert_eq!(first["prompt_cache_key"].as_str().unwrap().len(), 64);
+
+    let overridden = openai_responses_extra_body(
+        Some(serde_json::json!({"prompt_cache_key": "configured", "store": false})),
+        "session-a",
+    )
+    .unwrap();
+    assert_eq!(overridden["prompt_cache_key"], "configured");
+    assert_eq!(overridden["store"], false);
+}
+
+#[test]
+fn local_provider_detection_parses_loopback_unspecified_and_docker_hosts() {
+    for url in [
+        "http://localhost:8000/v1",
+        "https://localhost/v1",
+        "http://api.localhost/v1",
+        "http://127.42.0.1/v1",
+        "http://[::1]:8000/v1",
+        "http://0.0.0.0:8000/v1",
+        "https://[::]:8000/v1",
+        "http://host.docker.internal:11434/v1",
+    ] {
+        assert!(is_localhost(Some(url)), "expected local endpoint: {url}");
+    }
+    for url in [
+        "http://localhost.example/v1",
+        "http://127.0.0.1.example/v1",
+        "https://example.com/v1",
+        "ftp://localhost/model",
+        "not a URL",
+    ] {
+        assert!(
+            !is_localhost(Some(url)),
+            "expected remote/invalid endpoint: {url}"
+        );
+    }
+    assert!(!is_localhost(None));
+}
+
 // --- openrouter_anthropic_routing tests ---
 
 #[test]
@@ -757,6 +834,7 @@ fn pins_anthropic_namespaced_openrouter_models() {
         let extra = openrouter_anthropic_routing(id).expect("should pin {id}");
         assert_eq!(extra["provider"]["order"][0], "Anthropic");
         assert_eq!(extra["provider"]["allow_fallbacks"], true);
+        assert_eq!(extra["cache_control"]["type"], "ephemeral");
     }
 }
 
@@ -792,4 +870,87 @@ fn leaves_non_anthropic_openrouter_models_untouched() {
             "{id} should not be pinned"
         );
     }
+}
+
+#[tokio::test]
+async fn openrouter_anthropic_request_sends_automatic_tail_cache_control() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let (header_end, content_length) = loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "request ended before its headers");
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .expect("request must include Content-Length");
+            break (header_end + 4, content_length);
+        };
+        while request.len() < header_end + content_length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "request ended before its body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        request_tx
+            .send(request[header_end..header_end + content_length].to_vec())
+            .unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+
+    let mut custom = HashMap::new();
+    custom.insert(
+        "openrouter-capture".to_string(),
+        CustomProviderConfig {
+            provider_type: "openrouter".into(),
+            base_url: format!("http://{address}/api/v1"),
+            api_key_env: None,
+            danger_accept_invalid_certs: None,
+            api_style: None,
+            headers: HashMap::new(),
+            timeout_secs: None,
+            model: None,
+        },
+    );
+
+    let client = create_client("openrouter-capture", Some("test-key"), &custom, None).unwrap();
+    let AnyModel::OpenRouter(model, routing) =
+        client.completion_model("anthropic/claude-sonnet-4.6")
+    else {
+        panic!("expected an OpenRouter completion model");
+    };
+    let result = model
+        .completion_request("hello")
+        .preamble("stable system prompt".to_string())
+        .additional_params(routing.unwrap())
+        .send()
+        .await;
+    assert!(result.is_err());
+
+    server.join().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&request_rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+    assert_eq!(body["model"], "anthropic/claude-sonnet-4.6");
+    assert_eq!(body["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["provider"]["order"], serde_json::json!(["Anthropic"]));
+    assert_eq!(body["provider"]["allow_fallbacks"], true);
 }

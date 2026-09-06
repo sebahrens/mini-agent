@@ -186,7 +186,7 @@ fn resolve_context_window_from_quick_model() {
         },
     );
     let cfg = Config::default();
-    // Quick model's 64k wins over the catalog's 128k for deepseek-chat.
+    // Quick model's 64k wins over the baked catalog value for deepseek-chat.
     assert_eq!(
         cfg.resolve_context_window("openrouter", "deepseek/deepseek-chat", &qm),
         64_000
@@ -197,11 +197,14 @@ fn resolve_context_window_from_quick_model() {
         cfg.resolve_context_window("openrouter", "deepseek/deepseek-chat", &qm),
         32_000
     );
-    // Quick model with context_window: None falls through to catalog (128k).
+    // Quick model with context_window: None falls through to the catalog.
     qm.get_mut("test").unwrap().context_window = None;
     let cfg = Config::default();
     let cw = cfg.resolve_context_window("openrouter", "deepseek/deepseek-chat", &qm);
-    assert_eq!(cw, 128_000);
+    assert_eq!(
+        cw,
+        Config::catalog_context_window("openrouter", "deepseek/deepseek-chat").unwrap()
+    );
 }
 
 // ── YAML config reader (replaces the former JSON reader) ───────────────

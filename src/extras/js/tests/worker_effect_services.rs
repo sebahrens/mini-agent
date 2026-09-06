@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::extras::js::audit::EffectAudit;
+use crate::extras::js::audit::{AuditState, EffectAudit};
 use crate::extras::js::broker::{
     GrantPrincipal, HostCapability, InvocationBroker, InvocationGrant,
 };
@@ -15,7 +15,8 @@ use crate::extras::js::protocol::{
 };
 use crate::extras::js::tool::PermissionBridgeOwner;
 use crate::extras::js::types::{
-    EffectServiceError, PermCancellation, WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject,
+    EffectServiceError, PermCancellation, READ_FILE_MAX_BYTES, WRITE_FILE_MAX_BYTES,
+    canonical_spawn_permission_subject,
 };
 use crate::paths::AppPaths;
 use crate::permission::checker::{PermCheck, PermissionChecker};
@@ -271,6 +272,70 @@ async fn worker_effect_services_real_broker_prepares_then_executes_exact_target(
 }
 
 #[tokio::test]
+async fn worker_effect_services_read_files_is_one_ordered_audited_effect() {
+    let directory = TestDirectory::new();
+    let first = directory.0.join("first-secret-path.txt");
+    let second = directory.0.join("second-secret-path.txt");
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    let owner = PermissionBridgeOwner::new(None, None, Duration::from_millis(100));
+    let service = ParentHostEffectService::new(
+        FileEffectService::new(
+            owner.bridge(),
+            AllowConfig::unrestricted(&directory.0),
+            Duration::from_secs(1),
+        ),
+        SpawnEffectService::new(
+            Sandbox::new(false, "bwrap"),
+            owner.bridge(),
+            Duration::from_secs(1),
+        ),
+    );
+    let invocation = InvocationId::new("effect-services-read-files").unwrap();
+    let grant = InvocationGrant::issue(
+        invocation.clone(),
+        GrantPrincipal::ModelAuthored {
+            tool_call_id: "call-batch".to_string(),
+        },
+        BTreeSet::from([HostCapability::ReadFile]),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let request = EffectRequest {
+        effect_ordinal: 0,
+        grant_id: grant.grant_id().clone(),
+        advisory: AdvisoryAttribution::default(),
+        operation: EffectOperation::ReadFiles {
+            paths: vec![
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+            ],
+        },
+    };
+    let mut broker = InvocationBroker::new(
+        invocation,
+        vec![grant],
+        BTreeSet::from([HostCapability::ReadFile]),
+        service,
+        Arc::new(Mutex::new(directory.audit("read-files"))),
+    )
+    .unwrap();
+
+    assert_eq!(
+        broker.dispatch(request, PermCancellation::new()).await,
+        Ok(EffectResult::ReadFiles {
+            contents: vec!["first".into(), "second".into()],
+        })
+    );
+    let records = broker.audit_records_for_test();
+    assert_eq!(records.len(), 2, "one intent/completion pair per batch");
+    assert_eq!(records[0].state, AuditState::Intent);
+    assert_eq!(records[1].state, AuditState::Completed);
+    let persisted = serde_json::to_string(&records).unwrap();
+    assert!(!persisted.contains("first-secret-path.txt"));
+    assert!(!persisted.contains("second-secret-path.txt"));
+}
+
+#[tokio::test]
 async fn worker_effect_services_broker_rejects_unavailable_spawn_before_prompt() {
     let directory = TestDirectory::new();
     let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
@@ -349,7 +414,21 @@ async fn worker_effect_services_file_errors_do_not_poison_next_call() {
                 PermCancellation::new(),
             )
             .await,
-        Err(EffectServiceError::InvalidTarget)
+        Err(EffectServiceError::NotFound)
+    );
+    assert_eq!(
+        service
+            .read(directory.0.to_str().unwrap(), PermCancellation::new(),)
+            .await,
+        Err(EffectServiceError::IsDirectory)
+    );
+    let oversized = directory.0.join("oversized.txt");
+    std::fs::write(&oversized, vec![b'x'; READ_FILE_MAX_BYTES + 1]).unwrap();
+    assert_eq!(
+        service
+            .read(oversized.to_str().unwrap(), PermCancellation::new())
+            .await,
+        Err(EffectServiceError::OutputLimit)
     );
     assert_eq!(
         service

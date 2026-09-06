@@ -1,4 +1,5 @@
 use crate::agent::tools;
+use crate::context::agents::AgentTool;
 use crate::extras::subagents::prompt;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
@@ -19,6 +20,26 @@ pub(crate) struct SubagentAuthorization {
     ask_tx: Option<AskSender>,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     deny_repeated_reads: bool,
+    #[cfg(feature = "js")]
+    read_only_js: Option<ReadOnlyJsAuthorization>,
+}
+
+#[cfg(feature = "js")]
+#[derive(Clone)]
+struct ReadOnlyJsAuthorization {
+    sandbox: crate::sandbox::Sandbox,
+    containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+    allow_config: crate::extras::js::host::AllowConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PersonaExecution {
+    /// `None` installs the complete read-only child tool set. `Some` is always
+    /// a narrowing parsed from trusted persona metadata.
+    pub(crate) tools: Option<Vec<AgentTool>>,
+    /// Provider request parameters resolved from the persona's quick-model
+    /// alias.
+    pub(crate) additional_params: Option<serde_json::Value>,
 }
 
 impl SubagentAuthorization {
@@ -32,6 +53,8 @@ impl SubagentAuthorization {
             ask_tx,
             workspace: None,
             deny_repeated_reads,
+            #[cfg(feature = "js")]
+            read_only_js: None,
         }
     }
 
@@ -43,6 +66,61 @@ impl SubagentAuthorization {
         self
     }
 
+    #[cfg(feature = "js")]
+    pub(crate) fn with_read_only_js(
+        mut self,
+        sandbox: crate::sandbox::Sandbox,
+        containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+        cfg: &crate::config::Config,
+    ) -> Self {
+        let Some(workspace) = self.workspace.clone() else {
+            return self;
+        };
+        let allow_config = crate::extras::js::host::AllowConfig::from_settings(
+            workspace.root(),
+            cfg.js_file_base_dir.as_deref(),
+            cfg.js_read_roots.as_deref(),
+            None,
+            cfg.js_read_unrestricted.unwrap_or(false),
+            false,
+        )
+        .with_workspace_binding(workspace);
+        self.read_only_js = Some(ReadOnlyJsAuthorization {
+            sandbox,
+            containment_status,
+            allow_config,
+        });
+        self
+    }
+
+    #[cfg(feature = "js")]
+    fn read_only_js_tool(
+        &self,
+        #[cfg(feature = "skills")] skill_services: Option<
+            &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+        >,
+    ) -> Option<Box<dyn rig::tool::ToolDyn>> {
+        let authorization = self.read_only_js.as_ref()?;
+        if matches!(
+            authorization.containment_status,
+            crate::sandbox::worker::WorkerContainmentStatus::Unavailable { .. }
+        ) {
+            return None;
+        }
+        let tool = crate::extras::js::tool::JsTool::new_read_only(
+            authorization.sandbox.clone(),
+            self.permission.clone(),
+            self.ask_tx.clone(),
+            authorization.allow_config.clone(),
+        );
+        #[cfg(feature = "skills")]
+        let tool = match skill_services {
+            Some(services) => tool.with_skill_turn_context(services.turn_context()),
+            None => tool,
+        };
+        Some(Box::new(tool))
+    }
+
     fn filesystem_tools(
         &self,
         max_text_file_size: u64,
@@ -50,6 +128,7 @@ impl SubagentAuthorization {
         max_grep_results: u64,
         max_find_results: u64,
         max_list_dir_entries: Option<u64>,
+        selected: Option<&[AgentTool]>,
     ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         let read_tracker = tools::ReadTracker::new(self.deny_repeated_reads);
         let read = tools::ReadTool::new_with_tracker(
@@ -84,12 +163,21 @@ impl SubagentAuthorization {
         } else {
             (read, grep, find, list)
         };
-        vec![
-            Box::new(read),
-            Box::new(grep),
-            Box::new(find),
-            Box::new(list),
-        ]
+        let enabled = |tool| selected.is_none_or(|selected| selected.contains(&tool));
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = Vec::new();
+        if enabled(AgentTool::Read) {
+            tools.push(Box::new(read));
+        }
+        if enabled(AgentTool::Grep) {
+            tools.push(Box::new(grep));
+        }
+        if enabled(AgentTool::FindFiles) {
+            tools.push(Box::new(find));
+        }
+        if enabled(AgentTool::ListDir) {
+            tools.push(Box::new(list));
+        }
+        tools
     }
 }
 
@@ -130,6 +218,10 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     #[cfg(feature = "archmd")] architecture: Option<&str>,
     // Optional specialization prompt prepended before the base explore prompt.
     specialization: Option<&str>,
+    persona: &PersonaExecution,
+    #[cfg(feature = "skills")] skill_services: Option<
+        &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
 ) -> Agent<M> {
     let suffix = crate::session::storage::load_suffix();
     let preamble = build_explore_preamble(
@@ -145,11 +237,59 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
         max_grep_results,
         max_find_results,
         max_list_dir_entries,
+        persona.tools.as_deref(),
     );
     #[cfg(feature = "memory")]
     let tools = {
         let mut tools = tools;
-        tools.extend(subagent_memory_tools(authorization));
+        if persona.tools.as_ref().is_none_or(|selected| {
+            selected.contains(&AgentTool::MemoryRead) || selected.contains(&AgentTool::MemorySearch)
+        }) {
+            let selected = persona.tools.as_deref();
+            tools.extend(
+                subagent_memory_tools(authorization)
+                    .into_iter()
+                    .zip([AgentTool::MemoryRead, AgentTool::MemorySearch])
+                    .filter_map(|(tool, kind)| {
+                        selected
+                            .is_none_or(|selected| selected.contains(&kind))
+                            .then_some(tool)
+                    }),
+            );
+        }
+        tools
+    };
+    #[cfg(feature = "skills")]
+    let tools = {
+        let mut tools = tools;
+        if persona
+            .tools
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&AgentTool::SkillsSearch))
+            && let Some(services) = skill_services
+        {
+            tools.push(Box::new(
+                crate::extras::js::skills::search_tool::SkillsSearchTool::new(
+                    std::sync::Arc::clone(services),
+                ),
+            ));
+        }
+        tools
+    };
+    #[cfg(feature = "js")]
+    let tools = {
+        let mut tools = tools;
+        if persona
+            .tools
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&AgentTool::Js))
+            && let Some(tool) = authorization.read_only_js_tool(
+                #[cfg(feature = "skills")]
+                skill_services,
+            )
+        {
+            tools.push(tool);
+        }
         tools
     };
     let tools = tools::memoize::definitions(tools);
@@ -157,12 +297,28 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     #[cfg(feature = "hooks")]
     let tools = crate::extras::hooks::wrap_from_global(tools, authorization.permission.clone());
 
+    let tools = tools::concurrency::bind(tools);
+
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .default_max_turns(max_turns)
-        .tools(tools);
+        .tools(tools)
+        .add_hook(crate::agent::runner::ToolLoopGuard);
+    #[cfg(feature = "skills")]
+    if let Some(services) = skill_services {
+        builder = builder.add_hook(crate::extras::js::skills::session::SkillContextHook::new(
+            preamble.clone(),
+            std::sync::Arc::clone(services),
+        ));
+    }
+    builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
+        uuid::Uuid::new_v4().to_string(),
+        None,
+    ));
 
-    if let Some(params) = additional_params {
+    if let Some(params) =
+        crate::provider::merge_extra_body(additional_params, persona.additional_params.clone())
+    {
         builder = builder.additional_params(params);
     }
 
@@ -198,6 +354,7 @@ fn build_explore_preamble(
     preamble
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_explore_agent(
     model: AnyModel,
     max_turns: usize,
@@ -205,6 +362,10 @@ pub(crate) async fn build_explore_agent(
     authorization: SubagentAuthorization,
     #[cfg(feature = "archmd")] architecture: Option<String>,
     specialization: Option<String>,
+    persona: PersonaExecution,
+    #[cfg(feature = "skills")] skill_services: Option<
+        std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
+    >,
 ) -> AnyAgent {
     let max_text_file_size = cfg.max_text_file_size.unwrap_or(10 * 1024 * 1024);
     let max_read_lines = cfg.resolve_subagent_max_read_lines();
@@ -228,6 +389,9 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            &persona,
+            #[cfg(feature = "skills")]
+            skill_services.as_ref(),
         )),
         AnyModel::OpenAI(m) => AnyAgentInner::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(build_explore_agent_inner(
@@ -243,6 +407,9 @@ pub(crate) async fn build_explore_agent(
                 #[cfg(feature = "archmd")]
                 arch_ref,
                 spec_ref,
+                &persona,
+                #[cfg(feature = "skills")]
+                skill_services.as_ref(),
             )),
             OpenAiModel::Completions(m) => OpenAiAgent::Completions(build_explore_agent_inner(
                 m,
@@ -257,6 +424,9 @@ pub(crate) async fn build_explore_agent(
                 #[cfg(feature = "archmd")]
                 arch_ref,
                 spec_ref,
+                &persona,
+                #[cfg(feature = "skills")]
+                skill_services.as_ref(),
             )),
         }),
         AnyModel::Anthropic(m) => AnyAgentInner::Anthropic(build_explore_agent_inner(
@@ -272,6 +442,9 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            &persona,
+            #[cfg(feature = "skills")]
+            skill_services.as_ref(),
         )),
         AnyModel::Gemini(m) => AnyAgentInner::Gemini(build_explore_agent_inner(
             m,
@@ -286,6 +459,9 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            &persona,
+            #[cfg(feature = "skills")]
+            skill_services.as_ref(),
         )),
         AnyModel::Ollama(m) => AnyAgentInner::Ollama(build_explore_agent_inner(
             m,
@@ -300,17 +476,41 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
+            &persona,
+            #[cfg(feature = "skills")]
+            skill_services.as_ref(),
         )),
     };
-    AnyAgent::without_skills(inner)
+    AnyAgent::with_runtime(
+        inner,
+        #[cfg(feature = "skills")]
+        skill_services,
+    )
 }
 
 #[cfg(all(test, feature = "js"))]
 mod js_isolation_tests {
-    use super::{SubagentAuthorization, build_explore_agent_inner};
+    use super::{PersonaExecution, SubagentAuthorization, build_explore_agent_inner};
+    use crate::context::agents::AgentTool;
+
+    fn configured_authorization() -> SubagentAuthorization {
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        SubagentAuthorization::new(None, None, true)
+            .with_workspace_binding(Some(workspace.clone()))
+            .with_read_only_js(
+                crate::sandbox::Sandbox::new(false, "bwrap").with_workspace_binding(workspace),
+                crate::sandbox::worker::WorkerContainmentStatus::Available {
+                    backend: crate::sandbox::worker::WorkerBackend::for_current_platform(),
+                    assurance: crate::sandbox::worker::WorkerContainmentAssurance::Enforced,
+                },
+                &crate::config::Config::default(),
+            )
+    }
 
     #[tokio::test]
-    async fn actual_explore_subagent_tool_set_omits_js() {
+    async fn subagent_without_an_authorized_worker_context_omits_js() {
         use rig::test_utils::{MockCompletionModel, MockStreamEvent};
         let model = MockCompletionModel::from_stream_turns(vec![vec![
             MockStreamEvent::text("subagent"),
@@ -329,6 +529,9 @@ mod js_isolation_tests {
             #[cfg(feature = "archmd")]
             None,
             None,
+            &PersonaExecution::default(),
+            #[cfg(feature = "skills")]
+            None,
         );
         let names = agent
             .tool_server_handle
@@ -340,6 +543,179 @@ mod js_isolation_tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "read"));
         assert!(!names.iter().any(|name| name == "js"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn configured_explore_subagent_gets_the_read_only_js_profile() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("subagent"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = build_explore_agent_inner(
+            model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &configured_authorization(),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            &PersonaExecution::default(),
+            #[cfg(feature = "skills")]
+            None,
+        );
+        let definitions = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("subagent tool definitions");
+        let js = definitions
+            .iter()
+            .find(|tool| tool.name == "js")
+            .expect("read-only js tool");
+        assert!(js.description.contains("read_file(path"));
+        assert!(js.description.contains("list_dir(path"));
+        assert!(js.description.contains("grep(pattern"));
+        assert!(!js.description.contains("write_file(path"));
+        assert!(!js.description.contains("fetch(url"));
+        assert!(!js.description.contains("spawn(program"));
+
+        let narrowed_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("subagent"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let narrowed = build_explore_agent_inner(
+            narrowed_model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &configured_authorization(),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            &PersonaExecution {
+                tools: Some(vec![AgentTool::Read]),
+                additional_params: None,
+            },
+            #[cfg(feature = "skills")]
+            None,
+        );
+        let narrowed_names = narrowed
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("narrowed subagent tool definitions")
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(narrowed_names, vec!["read"]);
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_only_subagent_gets_search_without_js_execution() {
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-subagent-skill-search-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::paths::AppPaths::resolve(&crate::paths::PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                crate::paths::PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                crate::paths::PathPlatform::Windows
+            } else {
+                crate::paths::PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.join("config")),
+            data_base: Some(root.join("data")),
+            local_data_base: Some(root.join("local")),
+            state_base: Some(root.join("state")),
+            cache_base: Some(root.join("cache")),
+            workspace_root: None,
+            overrides: Default::default(),
+        })
+        .unwrap();
+        let services = crate::extras::js::skills::session::SkillSessionServices::for_test(&paths);
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("subagent"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = build_explore_agent_inner(
+            model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &SubagentAuthorization::new(None, None, true),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            &PersonaExecution::default(),
+            Some(&services),
+        );
+        let names = agent
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("subagent tool definitions")
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            names.iter().any(|name| name == "skills_search"),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|name| name == "js"), "{names:?}");
+
+        let narrowed_model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("subagent"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let narrowed = build_explore_agent_inner(
+            narrowed_model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &SubagentAuthorization::new(None, None, true),
+            None,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            &PersonaExecution {
+                tools: Some(vec![crate::context::agents::AgentTool::Read]),
+                additional_params: None,
+            },
+            Some(&services),
+        );
+        let narrowed_names = narrowed
+            .tool_server_handle
+            .get_tool_defs(None)
+            .await
+            .expect("narrowed subagent tool definitions")
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(narrowed_names, vec!["read"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -376,7 +752,7 @@ mod tests {
         );
         let spec_pos = preamble.find("You are a Rust async specialist.").unwrap();
         let base_pos = preamble
-            .find("When a specialization appears above this base prompt")
+            .find("A specialization above this base prompt")
             .unwrap();
         assert!(
             spec_pos < base_pos,
@@ -388,8 +764,12 @@ mod tests {
             "the base prompt must not install a second persona"
         );
         assert!(
-            preamble.contains("persona, domain scope"),
-            "the base prompt must make the specialization contract authoritative"
+            preamble.contains("supplies domain heuristics and a return contract"),
+            "the base prompt must define the specialization contract"
+        );
+        assert!(
+            preamble.contains("does not require an exhaustive repository audit"),
+            "the delegated task must bound persona breadth"
         );
         let safety_pos = preamble
             .find("## Non-overridable safety and honesty rules")
@@ -480,7 +860,27 @@ mod tests {
     }
 
     fn filesystem_tools(authorization: &SubagentAuthorization) -> Vec<Box<dyn rig::tool::ToolDyn>> {
-        authorization.filesystem_tools(1024 * 1024, 100, 100, 100, Some(100))
+        authorization.filesystem_tools(1024 * 1024, 100, 100, 100, Some(100), None)
+    }
+
+    #[test]
+    fn persona_tool_selection_only_narrows_the_read_only_set() {
+        use crate::context::agents::AgentTool;
+
+        let authorization = SubagentAuthorization::new(None, None, true);
+        let tools = authorization.filesystem_tools(
+            1024 * 1024,
+            100,
+            100,
+            100,
+            Some(100),
+            Some(&[AgentTool::Read, AgentTool::Grep]),
+        );
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(names, ["read", "grep"]);
+
+        let none = authorization.filesystem_tools(1024 * 1024, 100, 100, 100, Some(100), Some(&[]));
+        assert!(none.is_empty());
     }
 
     fn tool_input(name: &str, path: &Path) -> String {

@@ -7,6 +7,7 @@ use super::draw_picker_list;
 /// Kept in alphabetical order for ease of maintenance.
 const BASE_COMMANDS: &[&str] = &[
     "/add",
+    "/agent",
     "/btw",
     "/clear",
     "/compact",

@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use regex::{Regex, RegexBuilder};
 #[cfg(all(feature = "sandbox", test))]
 use rquickjs::prelude::Opt;
 #[cfg(test)]
@@ -15,6 +17,9 @@ use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use unicode_normalization::UnicodeNormalization;
+
+use crate::agent::tools::find_files::BoundDirectory;
+use crate::agent::tools::grep::{GrepTool, truncate_output_line};
 
 use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, ExecutablePreparationControl,
@@ -24,7 +29,13 @@ use crate::extras::js::broker::{
 };
 #[cfg(target_os = "linux")]
 use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable_controlled};
-use crate::extras::js::protocol::{EffectOperation, EffectResult};
+use crate::extras::js::protocol::{
+    DirectoryEntry, DirectoryEntryKind, EffectOperation, EffectResult, GrepMatch, GrepOptions,
+};
+use crate::extras::js::session::{
+    SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES, ScratchStore, SessionStateError,
+    canonical_json, validate_scratch_key,
+};
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::proposal::{
     JsProposal, PreparedProposalEffect, ProposalEffectService, proposal_service_error,
@@ -36,8 +47,10 @@ use crate::extras::js::types::PermCancellation;
 #[cfg(any(feature = "sandbox", test))]
 use crate::extras::js::types::STEP_TIMEOUT;
 use crate::extras::js::types::{
-    EffectServiceError, READ_FILE_MAX_BYTES, SpawnResult, WRITE_FILE_MAX_BYTES,
-    canonical_spawn_permission_subject, spawn_policy_input,
+    DISCOVERY_MAX_RESULT_BYTES, DISCOVERY_MAX_RESULTS, DISCOVERY_MAX_VISITED_FILES,
+    DISCOVERY_PATTERN_MAX_BYTES, EffectServiceError, GREP_FILE_MAX_BYTES, READ_FILE_MAX_BYTES,
+    READ_FILES_MAX_PATH_BYTES, READ_FILES_MAX_PATHS, READ_FILES_MAX_RESULT_BYTES, SpawnResult,
+    WRITE_FILE_MAX_BYTES, canonical_spawn_permission_subject, spawn_policy_input,
 };
 #[cfg(target_os = "linux")]
 use crate::sandbox::SandboxCommand;
@@ -46,8 +59,6 @@ use crate::sandbox::{CommandCancellation, CommandLimits, CommandOutputLimit, Com
 use crate::sandbox::{Sandbox, SandboxPolicy};
 #[cfg(feature = "sandbox")]
 use reqwest::Url;
-#[cfg(feature = "sandbox")]
-use std::io::Read;
 #[cfg(feature = "sandbox")]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 #[cfg(feature = "sandbox")]
@@ -1292,13 +1303,13 @@ const FETCH_REQUEST_HEADER_MAX_BYTES: usize = 16 * 1024;
 #[cfg(feature = "sandbox")]
 const FETCH_REQUEST_HEADER_MAX_COUNT: usize = 64;
 #[cfg(feature = "sandbox")]
-const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const FETCH_REQUEST_BODY_MAX_BYTES: usize = 256 * 1024;
 #[cfg(feature = "sandbox")]
 const FETCH_RESPONSE_HEADER_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "sandbox")]
 const FETCH_RESPONSE_HEADER_MAX_COUNT: usize = 128;
 #[cfg(feature = "sandbox")]
-const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const FETCH_RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "sandbox")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1857,7 +1868,7 @@ fn map_io_error(error: std::io::Error) -> FetchError {
 #[cfg(test)]
 fn service_host_error(tool: &'static str, error: EffectServiceError) -> rquickjs::Error {
     let access = match tool {
-        "js/read_file" => Some("read"),
+        "js/read_file" | "js/read_files" => Some("read"),
         "js/write_file" => Some("write"),
         _ => None,
     };
@@ -1985,10 +1996,11 @@ fn file_path_error(error: std::io::Error) -> EffectServiceError {
         return EffectServiceError::TargetChanged;
     }
     match error.kind() {
-        std::io::ErrorKind::NotFound
-        | std::io::ErrorKind::InvalidInput
-        | std::io::ErrorKind::NotADirectory
-        | std::io::ErrorKind::IsADirectory => EffectServiceError::InvalidTarget,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            EffectServiceError::NotFound
+        }
+        std::io::ErrorKind::IsADirectory => EffectServiceError::IsDirectory,
+        std::io::ErrorKind::InvalidInput => EffectServiceError::InvalidTarget,
         _ => EffectServiceError::BackendFailure,
     }
 }
@@ -2020,7 +2032,11 @@ async fn resolve_read_target(
 
 async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, EffectServiceError> {
     if !target.identity.is_file() {
-        return Err(EffectServiceError::InvalidTarget);
+        return Err(if target.identity.is_dir() {
+            EffectServiceError::IsDirectory
+        } else {
+            EffectServiceError::InvalidTarget
+        });
     }
     if target.identity.len() > READ_FILE_MAX_BYTES as u64 {
         return Err(EffectServiceError::OutputLimit);
@@ -2034,7 +2050,11 @@ async fn read_approved_file(target: ResolvedReadTarget) -> Result<String, Effect
     crate::fs::ensure_same_file(&target.path, &target.identity, &opened)
         .map_err(file_path_error)?;
     if !opened.is_file() {
-        return Err(EffectServiceError::InvalidTarget);
+        return Err(if opened.is_dir() {
+            EffectServiceError::IsDirectory
+        } else {
+            EffectServiceError::InvalidTarget
+        });
     }
     if opened.len() > READ_FILE_MAX_BYTES as u64 {
         return Err(EffectServiceError::OutputLimit);
@@ -2065,7 +2085,11 @@ async fn resolve_write_target(
                 return Err(EffectServiceError::FinalSymlink);
             }
             if !metadata.is_file() {
-                return Err(EffectServiceError::InvalidTarget);
+                return Err(if metadata.is_dir() {
+                    EffectServiceError::IsDirectory
+                } else {
+                    EffectServiceError::InvalidTarget
+                });
             }
             (
                 tokio::fs::canonicalize(&absolute)
@@ -2420,7 +2444,11 @@ impl FileEffectService {
 async fn read_capability_file(file: std::fs::File) -> Result<String, EffectServiceError> {
     let metadata = file.metadata().map_err(file_path_error)?;
     if !metadata.is_file() {
-        return Err(EffectServiceError::InvalidTarget);
+        return Err(if metadata.is_dir() {
+            EffectServiceError::IsDirectory
+        } else {
+            EffectServiceError::InvalidTarget
+        });
     }
     if metadata.len() > READ_FILE_MAX_BYTES as u64 {
         return Err(EffectServiceError::OutputLimit);
@@ -2848,8 +2876,8 @@ pub(crate) fn register_proposal_global(
     Ok(())
 }
 
-const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
-const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
 const CONSOLE_MAX_BYTES_PER_STEP: usize = 256 * 1024;
 
@@ -3096,7 +3124,7 @@ fn create_sealed_executable_snapshot_named(
             match error {
                 ExecutableCopyError::Read => EffectServiceError::TargetChanged,
                 ExecutableCopyError::Write => EffectServiceError::BackendFailure,
-                ExecutableCopyError::TooLarge => EffectServiceError::InvalidTarget,
+                ExecutableCopyError::TooLarge => EffectServiceError::OutputLimit,
                 ExecutableCopyError::Cancelled => EffectServiceError::Cancelled,
                 ExecutableCopyError::TimedOut => EffectServiceError::TimedOut,
             }
@@ -3349,8 +3377,8 @@ impl SpawnEffectService {
                 | CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
         );
         Ok(SpawnResult {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: decode_spawn_stream(&output.stdout, stdout_truncated),
+            stderr: decode_spawn_stream(&output.stderr, stderr_truncated),
             code: output
                 .exit_status
                 .and_then(|status| status.code())
@@ -3362,11 +3390,355 @@ impl SpawnEffectService {
     }
 }
 
+/// Decode captured process output without manufacturing U+FFFD when the byte cap splits an
+/// otherwise-valid UTF-8 scalar at the end of the stream. Interior invalid bytes remain visibly
+/// lossy, as before; only an incomplete trailing scalar caused by a reported truncation is dropped.
+fn decode_spawn_stream(bytes: &[u8], truncated: bool) -> String {
+    let visible = if truncated {
+        &bytes[..complete_utf8_prefix_len(bytes)]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(visible).into_owned()
+}
+
+fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let Some(mut lead) = bytes.len().checked_sub(1) else {
+        return 0;
+    };
+    while lead > 0 && bytes[lead] & 0b1100_0000 == 0b1000_0000 {
+        lead -= 1;
+    }
+    let width = match bytes[lead] {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    };
+    let observed = bytes.len() - lead;
+    if width > observed
+        && bytes[lead + 1..]
+            .iter()
+            .all(|byte| byte & 0b1100_0000 == 0b1000_0000)
+    {
+        lead
+    } else {
+        bytes.len()
+    }
+}
+
+enum DiscoveryAction {
+    ListDir,
+    Glob {
+        matcher: Regex,
+    },
+    Grep {
+        matcher: Regex,
+        include: Option<(Regex, bool)>,
+    },
+}
+
+struct PreparedDiscoveryEffect {
+    directory: BoundDirectory,
+    relative: Option<PathBuf>,
+    permission_path: PathBuf,
+    output_base: PathBuf,
+    action: DiscoveryAction,
+}
+
+fn compile_discovery_glob(pattern: &str) -> Result<Regex, HostEffectError> {
+    if pattern.is_empty() || pattern.contains('\0') || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES {
+        return Err(HostEffectError::InvalidTarget);
+    }
+    GrepTool::compile_include_glob(pattern)
+        .map(|(matcher, _)| matcher)
+        .map_err(|_| HostEffectError::InvalidTarget)
+}
+
+fn compile_discovery_grep(
+    pattern: &str,
+    options: &GrepOptions,
+) -> Result<DiscoveryAction, HostEffectError> {
+    if pattern.is_empty() || pattern.contains('\0') || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES {
+        return Err(HostEffectError::InvalidTarget);
+    }
+    let matcher = RegexBuilder::new(pattern)
+        .case_insensitive(!options.case_sensitive)
+        .build()
+        .map_err(|_| HostEffectError::InvalidTarget)?;
+    let include = options
+        .include
+        .as_deref()
+        .map(|pattern| {
+            if pattern.is_empty()
+                || pattern.contains('\0')
+                || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES
+            {
+                return Err(HostEffectError::InvalidTarget);
+            }
+            GrepTool::compile_include_glob(pattern).map_err(|_| HostEffectError::InvalidTarget)
+        })
+        .transpose()?;
+    Ok(DiscoveryAction::Grep { matcher, include })
+}
+
+async fn prepare_discovery_root(
+    file: &FileEffectService,
+    path: &str,
+    action: DiscoveryAction,
+    cancellation: PermCancellation,
+) -> Result<(PreparedDiscoveryEffect, Option<String>), HostEffectError> {
+    file.allow_config
+        .workspace_binding()
+        .map(|workspace| workspace.validate())
+        .transpose()
+        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+    let relative_path = Path::new(path);
+    let output_base = file.allow_config.effect_base();
+    if !relative_path.is_absolute()
+        && !path.starts_with('~')
+        && let Some(workspace) = file.allow_config.workspace_binding()
+    {
+        let logical = workspace
+            .logical_relative_path(relative_path)
+            .map_err(file_path_error)?;
+        let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
+        let root = workspace
+            .open_relative_directory_file(relative_path)
+            .map_err(file_path_error)?;
+        let directory = BoundDirectory::from_file(&logical, root).map_err(file_path_error)?;
+        return Ok((
+            PreparedDiscoveryEffect {
+                directory,
+                relative: Some(relative_path.to_path_buf()),
+                permission_path: logical,
+                output_base,
+                action,
+            },
+            workspace_relative,
+        ));
+    }
+
+    let expanded = crate::fs::expand_tilde(path);
+    let absolute = absolute_lexical(&output_base, Path::new(&expanded));
+    let canonical = tokio::select! {
+        result = tokio::fs::canonicalize(absolute) => result.map_err(file_path_error)?,
+        _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+    };
+    let identity = tokio::select! {
+        result = crate::fs::stable_path_metadata(&canonical) => result.map_err(file_path_error)?,
+        _ = cancellation.cancelled() => return Err(HostEffectError::InvocationCancelled),
+    };
+    if !identity.is_dir() {
+        return Err(HostEffectError::InvalidTarget);
+    }
+    let directory = BoundDirectory::open(&canonical, &identity).map_err(file_path_error)?;
+    let workspace_relative = workspace_relative_path(&output_base, &canonical)?;
+    Ok((
+        PreparedDiscoveryEffect {
+            directory,
+            relative: None,
+            permission_path: canonical,
+            output_base,
+            action,
+        },
+        workspace_relative,
+    ))
+}
+
+fn discovery_control_error(error: ExecutablePreparationWaitError) -> EffectServiceError {
+    executable_preparation_service_error(error)
+}
+
+fn discovery_output_path(base: &Path, path: &Path) -> Result<String, EffectServiceError> {
+    match workspace_relative_path(base, path).map_err(|_| EffectServiceError::InvalidTarget)? {
+        Some(relative) => Ok(relative),
+        None => permission_path(path),
+    }
+}
+
+fn discovery_json_string_upper_bound(value: &str) -> usize {
+    value.len().saturating_mul(6).saturating_add(2)
+}
+
+fn execute_discovery(
+    prepared: PreparedDiscoveryEffect,
+    control: &ExecutablePreparationControl,
+) -> Result<EffectResult, EffectServiceError> {
+    control.checkpoint().map_err(discovery_control_error)?;
+    match prepared.action {
+        DiscoveryAction::ListDir => {
+            let (entries, mut truncated) = prepared
+                .directory
+                .list_entries_bounded(DISCOVERY_MAX_RESULTS)
+                .map_err(file_path_error)?;
+            let mut result = Vec::with_capacity(entries.len());
+            let mut bytes = 0_usize;
+            for entry in entries {
+                control.checkpoint().map_err(discovery_control_error)?;
+                let Some(name) = entry.file_name.to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let next_bytes = discovery_json_string_upper_bound(&name).saturating_add(64);
+                if bytes.saturating_add(next_bytes) > DISCOVERY_MAX_RESULT_BYTES {
+                    truncated = true;
+                    break;
+                }
+                bytes += next_bytes;
+                result.push(DirectoryEntry {
+                    name,
+                    kind: if entry.is_directory {
+                        DirectoryEntryKind::Directory
+                    } else {
+                        DirectoryEntryKind::File
+                    },
+                    size: entry.size,
+                });
+            }
+            result.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(EffectResult::ListDir {
+                entries: result,
+                truncated,
+            })
+        }
+        DiscoveryAction::Glob { matcher } => {
+            let root = prepared.directory.approved_root().to_path_buf();
+            let mut walker = prepared.directory.walker().map_err(file_path_error)?;
+            let mut paths = Vec::with_capacity(64);
+            let mut bytes = 0_usize;
+            let mut visited = 0_usize;
+            let mut truncated = false;
+            for entry in &mut walker {
+                control.checkpoint().map_err(discovery_control_error)?;
+                visited += 1;
+                if visited > DISCOVERY_MAX_VISITED_FILES {
+                    truncated = true;
+                    break;
+                }
+                let candidate = entry
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&entry.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !matcher.is_match(&candidate) {
+                    continue;
+                }
+                let path = discovery_output_path(&prepared.output_base, &entry.path)?;
+                let path_bytes = discovery_json_string_upper_bound(&path).saturating_add(8);
+                if paths.len() == DISCOVERY_MAX_RESULTS
+                    || bytes.saturating_add(path_bytes) > DISCOVERY_MAX_RESULT_BYTES
+                {
+                    truncated = true;
+                    break;
+                }
+                bytes = bytes.saturating_add(path_bytes);
+                paths.push(path);
+            }
+            paths.sort();
+            Ok(EffectResult::Glob { paths, truncated })
+        }
+        DiscoveryAction::Grep { matcher, include } => {
+            let root = prepared.directory.approved_root().to_path_buf();
+            let mut walker = prepared.directory.walker().map_err(file_path_error)?;
+            let mut matches = Vec::with_capacity(64);
+            let mut bytes = 0_usize;
+            let mut visited = 0_usize;
+            let mut truncated = false;
+            'files: for entry in &mut walker {
+                control.checkpoint().map_err(discovery_control_error)?;
+                visited += 1;
+                if visited > DISCOVERY_MAX_VISITED_FILES {
+                    truncated = true;
+                    break;
+                }
+                if entry.metadata.len() > GREP_FILE_MAX_BYTES {
+                    continue;
+                }
+                if let Some((include, path_aware)) = &include {
+                    let candidate = if *path_aware {
+                        entry
+                            .path
+                            .strip_prefix(&root)
+                            .unwrap_or(&entry.path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    } else {
+                        entry.file_name.to_string_lossy().into_owned()
+                    };
+                    if !include.is_match(&candidate) {
+                        continue;
+                    }
+                }
+                let capacity = usize::try_from(entry.metadata.len())
+                    .unwrap_or(GREP_FILE_MAX_BYTES as usize)
+                    .min(GREP_FILE_MAX_BYTES as usize);
+                let mut data = Vec::with_capacity(capacity.saturating_add(1));
+                entry
+                    .file
+                    .take(GREP_FILE_MAX_BYTES.saturating_add(1))
+                    .read_to_end(&mut data)
+                    .map_err(file_path_error)?;
+                control.checkpoint().map_err(discovery_control_error)?;
+                if data.len() as u64 > GREP_FILE_MAX_BYTES || GrepTool::is_binary(&data) {
+                    continue;
+                }
+                let Ok(content) = std::str::from_utf8(&data) else {
+                    continue;
+                };
+                let path = discovery_output_path(&prepared.output_base, &entry.path)?;
+                for (line_index, line) in content.lines().enumerate() {
+                    let Some(found) = matcher.find(line) else {
+                        continue;
+                    };
+                    let text = truncate_output_line(line, Some(found.range()));
+                    let next_bytes = discovery_json_string_upper_bound(&path)
+                        .saturating_add(discovery_json_string_upper_bound(&text))
+                        .saturating_add(64);
+                    if matches.len() == DISCOVERY_MAX_RESULTS
+                        || bytes.saturating_add(next_bytes) > DISCOVERY_MAX_RESULT_BYTES
+                    {
+                        truncated = true;
+                        break 'files;
+                    }
+                    bytes += next_bytes;
+                    matches.push(GrepMatch {
+                        path: path.clone(),
+                        line: u64::try_from(line_index)
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1),
+                        text,
+                    });
+                }
+            }
+            matches.sort_by(|left, right| {
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| left.line.cmp(&right.line))
+            });
+            Ok(EffectResult::Grep { matches, truncated })
+        }
+    }
+}
+
 enum PreparedParentEffect {
     Read(PreparedReadEffect),
+    ReadMany(Vec<PreparedReadEffect>),
+    Discovery(PreparedDiscoveryEffect),
     Write {
         target: PreparedWriteEffect,
         content: String,
+    },
+    Result {
+        json: String,
+    },
+    ScratchPut {
+        key: String,
+        json: String,
+    },
+    ScratchGet {
+        key: String,
     },
     Spawn(PreparedSpawnEffect),
     #[cfg(feature = "sandbox")]
@@ -3380,6 +3752,14 @@ enum PreparedParentEffect {
     },
     #[cfg(feature = "skills")]
     Proposal(PreparedProposalEffect),
+}
+
+fn session_state_error(error: SessionStateError) -> HostEffectError {
+    match error {
+        SessionStateError::Invalid => HostEffectError::InvalidTarget,
+        SessionStateError::TooLarge => HostEffectError::OutputLimit,
+        SessionStateError::Unavailable => HostEffectError::BackendFailure,
+    }
 }
 
 fn workspace_relative_path(base: &Path, target: &Path) -> Result<Option<String>, HostEffectError> {
@@ -3409,11 +3789,97 @@ fn workspace_relative_path(base: &Path, target: &Path) -> Result<Option<String>,
     Ok(Some(components.join("/")))
 }
 
+async fn prepare_parent_read(
+    file: &FileEffectService,
+    path: &str,
+    cancellation: PermCancellation,
+) -> Result<(PreparedReadEffect, Option<String>), HostEffectError> {
+    file.allow_config
+        .workspace_binding()
+        .map(|workspace| workspace.validate())
+        .transpose()
+        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
+    let relative = Path::new(path);
+    if !relative.is_absolute()
+        && !path.starts_with('~')
+        && let Some(workspace) = file.allow_config.workspace_binding()
+    {
+        let opened = workspace.open_relative(relative).map_err(file_path_error)?;
+        let logical = workspace
+            .logical_relative_path(relative)
+            .map_err(file_path_error)?;
+        let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
+        return Ok((
+            PreparedReadEffect::Bound {
+                relative: relative.to_path_buf(),
+                file: opened,
+            },
+            workspace_relative,
+        ));
+    }
+    let effect_base = file.allow_config.effect_base();
+    let target = tokio::select! {
+        result = timeout(file.timeout, resolve_read_target(&effect_base, path)) => {
+            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                .map_err(HostEffectError::from)?
+        }
+        _ = cancellation.cancelled() => {
+            return Err(HostEffectError::InvocationCancelled);
+        }
+    };
+    let workspace_relative = workspace_relative_path(&effect_base, &target.path)?;
+    Ok((PreparedReadEffect::Path(target), workspace_relative))
+}
+
+async fn authorize_parent_read(
+    file: &FileEffectService,
+    target: &PreparedReadEffect,
+    bridge: &PermissionBridge,
+    tool: &str,
+) -> Result<String, EffectServiceError> {
+    match target {
+        PreparedReadEffect::Path(target) => {
+            if let AuthorizationDecision::Denied(reason) =
+                file.allow_config.authorize_read(&target.path)
+            {
+                return Err(file_policy_service_error(reason));
+            }
+            let permission_path = permission_path(&target.path)?;
+            bridge
+                .check_path_async(tool, &permission_path)
+                .await
+                .map_err(permission_service_error)?;
+            Ok(permission_path)
+        }
+        PreparedReadEffect::Bound { relative, .. } => {
+            if let AuthorizationDecision::Denied(reason) =
+                file.allow_config.authorize_bound_read(relative)
+            {
+                return Err(file_policy_service_error(reason));
+            }
+            let workspace = file
+                .allow_config
+                .workspace_binding()
+                .ok_or(EffectServiceError::InvalidTarget)?;
+            let logical = workspace
+                .logical_relative_path(relative)
+                .map_err(file_path_error)?;
+            let permission_path = permission_path(&logical)?;
+            bridge
+                .check_bound_path_async(tool, &permission_path)
+                .await
+                .map_err(permission_service_error)?;
+            Ok(permission_path)
+        }
+    }
+}
+
 /// Concrete implementation of the A11 parent effect seam. Authorization
 /// stores a prepared, exact target; execution can only consume that target.
 pub(crate) struct ParentHostEffectService {
     file: FileEffectService,
     spawn: SpawnEffectService,
+    scratch: ScratchStore,
     #[cfg(feature = "sandbox")]
     fetch: Option<FetchEffectService>,
     #[cfg(feature = "skills")]
@@ -3429,6 +3895,7 @@ impl ParentHostEffectService {
         Self {
             file,
             spawn,
+            scratch: ScratchStore::default(),
             #[cfg(feature = "sandbox")]
             fetch: None,
             #[cfg(feature = "skills")]
@@ -3436,6 +3903,11 @@ impl ParentHostEffectService {
             validated: None,
             authorized: None,
         }
+    }
+
+    pub(crate) fn with_scratch_store(mut self, scratch: ScratchStore) -> Self {
+        self.scratch = scratch;
+        self
     }
 
     #[cfg(feature = "sandbox")]
@@ -3468,11 +3940,78 @@ impl ParentEffectService for ParentHostEffectService {
             EffectOperation::ReadFile { path } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
             }
+            EffectOperation::ReadFiles { paths }
+                if paths.is_empty()
+                    || paths
+                        .iter()
+                        .any(|path| path.is_empty() || path.contains('\0')) =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::ReadFiles { paths }
+                if paths.len() > READ_FILES_MAX_PATHS
+                    || paths
+                        .iter()
+                        .try_fold(0usize, |bytes, path| bytes.checked_add(path.len()))
+                        .is_none_or(|bytes| bytes > READ_FILES_MAX_PATH_BYTES) =>
+            {
+                Err(HostEffectError::OutputLimit)
+            }
+            EffectOperation::ListDir { path } if path.is_empty() || path.contains('\0') => {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::Glob { path, pattern }
+                if path.is_empty()
+                    || path.contains('\0')
+                    || pattern.is_empty()
+                    || pattern.contains('\0')
+                    || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
+            EffectOperation::Grep {
+                path,
+                pattern,
+                options,
+            } if path.is_empty()
+                || path.contains('\0')
+                || pattern.is_empty()
+                || pattern.contains('\0')
+                || pattern.len() > DISCOVERY_PATTERN_MAX_BYTES
+                || options.include.as_ref().is_some_and(|include| {
+                    include.is_empty()
+                        || include.contains('\0')
+                        || include.len() > DISCOVERY_PATTERN_MAX_BYTES
+                }) =>
+            {
+                Err(HostEffectError::InvalidTarget)
+            }
             EffectOperation::WriteFile { path, .. } if path.is_empty() || path.contains('\0') => {
                 Err(HostEffectError::InvalidTarget)
             }
             EffectOperation::WriteFile { content, .. } if content.len() > WRITE_FILE_MAX_BYTES => {
                 Err(HostEffectError::OutputLimit)
+            }
+            EffectOperation::Result { json } => {
+                self.validated = Some(PreparedParentEffect::Result {
+                    json: canonical_json(json, STRUCTURED_RESULT_MAX_BYTES)
+                        .map_err(session_state_error)?,
+                });
+                Ok(())
+            }
+            EffectOperation::ScratchPut { key, json } => {
+                validate_scratch_key(key).map_err(session_state_error)?;
+                self.validated = Some(PreparedParentEffect::ScratchPut {
+                    key: key.clone(),
+                    json: canonical_json(json, SCRATCH_VALUE_MAX_BYTES)
+                        .map_err(session_state_error)?,
+                });
+                Ok(())
+            }
+            EffectOperation::ScratchGet { key } => {
+                validate_scratch_key(key).map_err(session_state_error)?;
+                self.validated = Some(PreparedParentEffect::ScratchGet { key: key.clone() });
+                Ok(())
             }
             EffectOperation::Spawn { program, arguments }
                 if program.is_empty()
@@ -3567,51 +4106,63 @@ impl ParentEffectService for ParentHostEffectService {
     ) -> ParentEffectFuture<'a, Result<NormalizedTarget, HostEffectError>> {
         Box::pin(async move {
             self.authorized = None;
-            if !matches!(operation, EffectOperation::ProposeSkill { .. }) {
+            if !matches!(
+                operation,
+                EffectOperation::ProposeSkill { .. }
+                    | EffectOperation::Result { .. }
+                    | EffectOperation::ScratchPut { .. }
+                    | EffectOperation::ScratchGet { .. }
+            ) {
                 self.validated = None;
             }
             match operation {
                 EffectOperation::ReadFile { path } => {
-                    self.file
-                        .allow_config
-                        .workspace_binding()
-                        .map(|workspace| workspace.validate())
-                        .transpose()
-                        .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
-                    let relative = Path::new(path);
-                    if !relative.is_absolute()
-                        && !path.starts_with('~')
-                        && let Some(workspace) = self.file.allow_config.workspace_binding()
-                    {
-                        let file = workspace.open_relative(relative).map_err(file_path_error)?;
-                        let logical = workspace
-                            .logical_relative_path(relative)
-                            .map_err(file_path_error)?;
-                        let workspace_relative =
-                            workspace_relative_path(workspace.root(), &logical)?;
-                        self.validated =
-                            Some(PreparedParentEffect::Read(PreparedReadEffect::Bound {
-                                relative: relative.to_path_buf(),
-                                file,
-                            }));
-                        return Ok(NormalizedTarget::ReadFile { workspace_relative });
+                    let (target, workspace_relative) =
+                        prepare_parent_read(&self.file, path, cancellation).await?;
+                    self.validated = Some(PreparedParentEffect::Read(target));
+                    Ok(NormalizedTarget::ReadFile { workspace_relative })
+                }
+                EffectOperation::ReadFiles { paths } => {
+                    let mut targets = Vec::with_capacity(paths.len());
+                    let mut workspace_relative = Vec::with_capacity(paths.len());
+                    for path in paths {
+                        let (target, relative) =
+                            prepare_parent_read(&self.file, path, cancellation.clone()).await?;
+                        targets.push(target);
+                        workspace_relative.push(relative);
                     }
-                    let effect_base = self.file.allow_config.effect_base();
-                    let target = tokio::select! {
-                        result = timeout(
-                            self.file.timeout,
-                            resolve_read_target(&effect_base, path),
-                        ) => {
-                            result.map_err(|_| HostEffectError::EffectTimedOut)?
-                                .map_err(HostEffectError::from)?
-                        }
-                        _ = cancellation.cancelled() => {
-                            return Err(HostEffectError::InvocationCancelled);
-                        }
+                    self.validated = Some(PreparedParentEffect::ReadMany(targets));
+                    Ok(NormalizedTarget::ReadFiles { workspace_relative })
+                }
+                EffectOperation::ListDir { path } => {
+                    let (prepared, workspace_relative) = prepare_discovery_root(
+                        &self.file,
+                        path,
+                        DiscoveryAction::ListDir,
+                        cancellation,
+                    )
+                    .await?;
+                    self.validated = Some(PreparedParentEffect::Discovery(prepared));
+                    Ok(NormalizedTarget::ReadFile { workspace_relative })
+                }
+                EffectOperation::Glob { path, pattern } => {
+                    let action = DiscoveryAction::Glob {
+                        matcher: compile_discovery_glob(pattern)?,
                     };
-                    let workspace_relative = workspace_relative_path(&effect_base, &target.path)?;
-                    self.validated =
-                        Some(PreparedParentEffect::Read(PreparedReadEffect::Path(target)));
+                    let (prepared, workspace_relative) =
+                        prepare_discovery_root(&self.file, path, action, cancellation).await?;
+                    self.validated = Some(PreparedParentEffect::Discovery(prepared));
+                    Ok(NormalizedTarget::ReadFile { workspace_relative })
+                }
+                EffectOperation::Grep {
+                    path,
+                    pattern,
+                    options,
+                } => {
+                    let action = compile_discovery_grep(pattern, options)?;
+                    let (prepared, workspace_relative) =
+                        prepare_discovery_root(&self.file, path, action, cancellation).await?;
+                    self.validated = Some(PreparedParentEffect::Discovery(prepared));
                     Ok(NormalizedTarget::ReadFile { workspace_relative })
                 }
                 EffectOperation::WriteFile { path, content } => {
@@ -3683,6 +4234,23 @@ impl ParentEffectService for ParentHostEffectService {
                     });
                     Ok(NormalizedTarget::WriteFile { workspace_relative })
                 }
+                EffectOperation::Result { .. }
+                | EffectOperation::ScratchPut { .. }
+                | EffectOperation::ScratchGet { .. }
+                    if matches!(
+                        self.validated.as_ref(),
+                        Some(
+                            PreparedParentEffect::Result { .. }
+                                | PreparedParentEffect::ScratchPut { .. }
+                                | PreparedParentEffect::ScratchGet { .. }
+                        )
+                    ) =>
+                {
+                    Ok(NormalizedTarget::SessionState)
+                }
+                EffectOperation::Result { .. }
+                | EffectOperation::ScratchPut { .. }
+                | EffectOperation::ScratchGet { .. } => Err(HostEffectError::BackendFailure),
                 EffectOperation::Spawn { program, arguments } => {
                     if program.is_empty()
                         || program.contains('\0')
@@ -3776,42 +4344,77 @@ impl ParentEffectService for ParentHostEffectService {
             let (prepared, audit_target) = match prepared {
                 PreparedParentEffect::Read(target) => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let call = authorize_parent_read(&self.file, &target, &bridge, "js/read_file");
+                    let canonical_path = tokio::select! {
+                        result = timeout(self.file.timeout, call) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?
+                        }
+                        _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                    };
+                    (
+                        PreparedParentEffect::Read(target),
+                        AuthorizedTarget::ReadFile { canonical_path },
+                    )
+                }
+                PreparedParentEffect::ReadMany(targets) => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
                     let call = async {
-                        match &target {
-                            PreparedReadEffect::Path(target) => {
-                                if let AuthorizationDecision::Denied(reason) =
-                                    self.file.allow_config.authorize_read(&target.path)
-                                {
-                                    return Err(file_policy_service_error(reason));
-                                }
-                                let permission_path = permission_path(&target.path)?;
-                                bridge
-                                    .check_path_async("js/read_file", &permission_path)
-                                    .await
-                                    .map_err(permission_service_error)?;
-                                Ok::<_, EffectServiceError>(permission_path)
+                        let mut canonical_paths = Vec::with_capacity(targets.len());
+                        for target in &targets {
+                            canonical_paths.push(
+                                authorize_parent_read(&self.file, target, &bridge, "js/read_files")
+                                    .await?,
+                            );
+                        }
+                        Ok::<_, EffectServiceError>(canonical_paths)
+                    };
+                    let canonical_paths = tokio::select! {
+                        result = timeout(self.file.timeout, call) => {
+                            result.map_err(|_| HostEffectError::EffectTimedOut)?
+                                .map_err(HostEffectError::from)?
+                        }
+                        _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
+                    };
+                    (
+                        PreparedParentEffect::ReadMany(targets),
+                        AuthorizedTarget::ReadFiles { canonical_paths },
+                    )
+                }
+                PreparedParentEffect::Discovery(target) => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let tool = match &target.action {
+                        DiscoveryAction::ListDir => "js/list_dir",
+                        DiscoveryAction::Glob { .. } => "js/glob",
+                        DiscoveryAction::Grep { .. } => "js/grep",
+                    };
+                    let call = async {
+                        if let Some(relative) = &target.relative {
+                            if let AuthorizationDecision::Denied(reason) =
+                                self.file.allow_config.authorize_bound_read(relative)
+                            {
+                                return Err(file_policy_service_error(reason));
                             }
-                            PreparedReadEffect::Bound { relative, .. } => {
-                                if let AuthorizationDecision::Denied(reason) =
-                                    self.file.allow_config.authorize_bound_read(relative)
-                                {
-                                    return Err(file_policy_service_error(reason));
-                                }
-                                let workspace = self
-                                    .file
-                                    .allow_config
-                                    .workspace_binding()
-                                    .ok_or(EffectServiceError::InvalidTarget)?;
-                                let logical = workspace
-                                    .logical_relative_path(relative)
-                                    .map_err(file_path_error)?;
-                                let permission_path = permission_path(&logical)?;
-                                bridge
-                                    .check_bound_path_async("js/read_file", &permission_path)
-                                    .await
-                                    .map_err(permission_service_error)?;
-                                Ok(permission_path)
+                            let permission_path = permission_path(&target.permission_path)?;
+                            bridge
+                                .check_bound_path_async(tool, &permission_path)
+                                .await
+                                .map_err(permission_service_error)?;
+                            Ok::<_, EffectServiceError>(permission_path)
+                        } else {
+                            if let AuthorizationDecision::Denied(reason) = self
+                                .file
+                                .allow_config
+                                .authorize_read(&target.permission_path)
+                            {
+                                return Err(file_policy_service_error(reason));
                             }
+                            let permission_path = permission_path(&target.permission_path)?;
+                            bridge
+                                .check_path_async(tool, &permission_path)
+                                .await
+                                .map_err(permission_service_error)?;
+                            Ok(permission_path)
                         }
                     };
                     let canonical_path = tokio::select! {
@@ -3822,7 +4425,7 @@ impl ParentEffectService for ParentHostEffectService {
                         _ = bridge.cancelled() => return Err(HostEffectError::InvocationCancelled),
                     };
                     (
-                        PreparedParentEffect::Read(target),
+                        PreparedParentEffect::Discovery(target),
                         AuthorizedTarget::ReadFile { canonical_path },
                     )
                 }
@@ -3879,6 +4482,39 @@ impl ParentEffectService for ParentHostEffectService {
                         AuthorizedTarget::WriteFile { canonical_path },
                     )
                 }
+                PreparedParentEffect::Result { json } => {
+                    let encoded_bytes = json.len();
+                    (
+                        PreparedParentEffect::Result { json },
+                        AuthorizedTarget::SessionState {
+                            operation: "result",
+                            key: None,
+                            encoded_bytes,
+                        },
+                    )
+                }
+                PreparedParentEffect::ScratchPut { key, json } => {
+                    let encoded_bytes = json.len();
+                    (
+                        PreparedParentEffect::ScratchPut {
+                            key: key.clone(),
+                            json,
+                        },
+                        AuthorizedTarget::SessionState {
+                            operation: "scratch_put",
+                            key: Some(key),
+                            encoded_bytes,
+                        },
+                    )
+                }
+                PreparedParentEffect::ScratchGet { key } => (
+                    PreparedParentEffect::ScratchGet { key: key.clone() },
+                    AuthorizedTarget::SessionState {
+                        operation: "scratch_get",
+                        key: Some(key),
+                        encoded_bytes: 0,
+                    },
+                ),
                 PreparedParentEffect::Spawn(target) => {
                     if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
                         return Err(HostEffectError::BackendFailure);
@@ -3952,6 +4588,42 @@ impl ParentEffectService for ParentHostEffectService {
                         .map_err(HostEffectError::from)?;
                     Ok(EffectResult::ReadFile { content })
                 }
+                PreparedParentEffect::ReadMany(targets) => {
+                    let bridge = self.file.permission_bridge.for_host_call(cancellation);
+                    let mut contents = Vec::with_capacity(targets.len());
+                    let mut encoded_bytes = 2usize;
+                    for target in targets {
+                        let content = self
+                            .file
+                            .execute_read(target, bridge.clone())
+                            .await
+                            .map_err(HostEffectError::from)?;
+                        let item_bytes = serde_json::to_string(&content)
+                            .map_err(|_| HostEffectError::BackendFailure)?
+                            .len();
+                        encoded_bytes = encoded_bytes
+                            .checked_add(item_bytes)
+                            .and_then(|bytes| bytes.checked_add(usize::from(!contents.is_empty())))
+                            .ok_or(HostEffectError::OutputLimit)?;
+                        if encoded_bytes > READ_FILES_MAX_RESULT_BYTES {
+                            return Err(HostEffectError::OutputLimit);
+                        }
+                        contents.push(content);
+                    }
+                    Ok(EffectResult::ReadFiles { contents })
+                }
+                PreparedParentEffect::Discovery(target) => {
+                    let deadline = Instant::now()
+                        .checked_add(self.file.timeout)
+                        .ok_or(HostEffectError::EffectTimedOut)?;
+                    run_executable_preparation(deadline, cancellation, move |control| {
+                        execute_discovery(target, &control)
+                    })
+                    .await
+                    .map_err(executable_preparation_service_error)
+                    .map_err(HostEffectError::from)?
+                    .map_err(HostEffectError::from)
+                }
                 PreparedParentEffect::Write { target, content } => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
                     self.file
@@ -3960,6 +4632,14 @@ impl ParentEffectService for ParentHostEffectService {
                         .map_err(HostEffectError::from)?;
                     Ok(EffectResult::WriteFile)
                 }
+                PreparedParentEffect::Result { json } => Ok(EffectResult::ResultAccepted { json }),
+                PreparedParentEffect::ScratchPut { key, json } => {
+                    self.scratch.put(key, json).map_err(session_state_error)?;
+                    Ok(EffectResult::ScratchPut)
+                }
+                PreparedParentEffect::ScratchGet { key } => Ok(EffectResult::ScratchGet {
+                    json: self.scratch.get(&key).map_err(session_state_error)?,
+                }),
                 PreparedParentEffect::Spawn(target) => {
                     let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
                     let result = self
@@ -4154,6 +4834,21 @@ mod tests {
     use crate::permission::ask::{AskSender, UserDecision};
     use crate::permission::checker::{PermCheck, PermissionChecker};
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    #[test]
+    fn truncated_spawn_stream_drops_only_an_incomplete_trailing_utf8_scalar() {
+        assert_eq!(decode_spawn_stream(b"ok \xf0\x9f", true), "ok ");
+        assert_eq!(decode_spawn_stream(b"ok \xf0\x9f\x98\x80", true), "ok 😀");
+        assert_eq!(
+            decode_spawn_stream(b"bad \xff then \xe2\x82", true),
+            "bad � then "
+        );
+    }
+
+    #[test]
+    fn untruncated_spawn_stream_keeps_lossy_decode_for_incomplete_bytes() {
+        assert_eq!(decode_spawn_stream(b"ok \xf0\x9f", false), "ok �");
+    }
 
     struct TempDir(PathBuf);
 
@@ -5062,6 +5757,194 @@ mod tests {
         (broker, request, sender, owner)
     }
 
+    #[cfg(any(unix, feature = "sandbox", feature = "skills"))]
+    #[tokio::test]
+    async fn brokered_discovery_is_workspace_bound_filtered_bounded_and_audited() {
+        let directory = TempDir::new();
+        let workspace_root = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace_root.join("src/nested")).unwrap();
+        std::fs::create_dir_all(workspace_root.join("ignored")).unwrap();
+        std::fs::write(workspace_root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(
+            workspace_root.join("src/main.rs"),
+            "fn main() { let Needle = true; }\n",
+        )
+        .unwrap();
+        let long_match = format!("{}needle{}\n", "a".repeat(600), "z".repeat(600));
+        std::fs::write(workspace_root.join("src/nested/lib.rs"), long_match).unwrap();
+        std::fs::write(workspace_root.join("src/readme.txt"), "needle\n").unwrap();
+        std::fs::write(workspace_root.join("ignored/secret.rs"), "needle secret\n").unwrap();
+        std::fs::create_dir_all(workspace_root.join("many")).unwrap();
+        for index in 0..=DISCOVERY_MAX_RESULTS {
+            std::fs::write(
+                workspace_root.join(format!("many/{index:04}.txt")),
+                "bounded\n",
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = directory.path().join("outside.rs");
+            std::fs::write(&outside, "needle outside\n").unwrap();
+            symlink(outside, workspace_root.join("src/escape.rs")).unwrap();
+        }
+
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let permission = host_permission(workspace_root.clone(), Action::Allow, Action::Allow);
+        let owner = PermissionBridgeOwner::new(Some(permission), None, STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace_root).with_workspace_binding(workspace),
+                Duration::from_secs(2),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(2),
+            ),
+        );
+        let invocation = InvocationId::new("discovery-effects").unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "discovery-call".into(),
+            },
+            BTreeSet::from([HostCapability::ReadFile]),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let audit_root = directory.path().join("audit-discovery");
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let mut broker = InvocationBroker::new(
+            invocation,
+            vec![grant.clone()],
+            BTreeSet::from([HostCapability::ReadFile]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        let request = |effect_ordinal, operation| EffectRequest {
+            effect_ordinal,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation,
+        };
+
+        let listed = broker
+            .dispatch(
+                request(0, EffectOperation::ListDir { path: "src".into() }),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let EffectResult::ListDir { entries, truncated } = listed else {
+            panic!("unexpected list result: {listed:?}");
+        };
+        assert!(!truncated);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main.rs", "nested", "readme.txt"]
+        );
+
+        let globbed = broker
+            .dispatch(
+                request(
+                    1,
+                    EffectOperation::Glob {
+                        path: ".".into(),
+                        pattern: "**/*.rs".into(),
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            globbed,
+            EffectResult::Glob {
+                paths: vec!["src/main.rs".into(), "src/nested/lib.rs".into()],
+                truncated: false,
+            }
+        );
+
+        let searched = broker
+            .dispatch(
+                request(
+                    2,
+                    EffectOperation::Grep {
+                        path: ".".into(),
+                        pattern: "needle".into(),
+                        options: GrepOptions {
+                            include: Some("**/*.rs".into()),
+                            case_sensitive: false,
+                        },
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let EffectResult::Grep { matches, truncated } = searched else {
+            panic!("unexpected grep result: {searched:?}");
+        };
+        assert!(!truncated);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].path, "src/main.rs");
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[1].path, "src/nested/lib.rs");
+        assert!(matches[1].text.contains("needle"));
+        assert!(matches[1].text.chars().count() <= 502);
+        assert!(
+            matches
+                .iter()
+                .all(|matched| !matched.text.contains("secret"))
+        );
+
+        let capped = broker
+            .dispatch(
+                request(
+                    3,
+                    EffectOperation::Glob {
+                        path: "many".into(),
+                        pattern: "*.txt".into(),
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let EffectResult::Glob { paths, truncated } = capped else {
+            panic!("unexpected capped glob result: {capped:?}");
+        };
+        assert_eq!(paths.len(), DISCOVERY_MAX_RESULTS);
+        assert!(truncated);
+        assert!(serde_json::to_vec(&paths).unwrap().len() < DISCOVERY_MAX_RESULT_BYTES);
+
+        let records = broker.audit_records_for_test();
+        assert_eq!(records.len(), 8);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.capability == "read_file")
+        );
+    }
+
     #[cfg(feature = "skills")]
     fn scoped_host_broker(
         directory: &TempDir,
@@ -5095,10 +5978,17 @@ mod tests {
             operation,
         };
         let capability = match &request.operation {
-            EffectOperation::ReadFile { .. } => HostCapability::ReadFile,
+            EffectOperation::ReadFile { .. }
+            | EffectOperation::ReadFiles { .. }
+            | EffectOperation::ListDir { .. }
+            | EffectOperation::Glob { .. }
+            | EffectOperation::Grep { .. } => HostCapability::ReadFile,
             EffectOperation::WriteFile { .. } => HostCapability::WriteFile,
             EffectOperation::Fetch { .. } => HostCapability::Fetch,
             EffectOperation::Spawn { .. } => HostCapability::Spawn,
+            EffectOperation::Result { .. }
+            | EffectOperation::ScratchPut { .. }
+            | EffectOperation::ScratchGet { .. } => HostCapability::SessionState,
             EffectOperation::ProposeSkill { .. } => HostCapability::ProposeSkill,
         };
         let audit_root = directory.path().join(format!("audit-{tag}"));
@@ -5129,6 +6019,98 @@ mod tests {
         )
         .unwrap();
         (broker, request)
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn discovery_prefix_denial_precedes_permission_and_traversal() {
+        let directory = TempDir::new();
+        let workspace_root = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace_root.join("allowed")).unwrap();
+        std::fs::create_dir_all(workspace_root.join("denied")).unwrap();
+        std::fs::write(workspace_root.join("denied/secret.txt"), "secret").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let permission = host_permission(workspace_root.clone(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace_root).with_workspace_binding(workspace),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "discovery-prefix-denied",
+            service,
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["allowed".into()],
+            },
+            EffectOperation::Glob {
+                path: "denied".into(),
+                pattern: "*.txt".into(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::ManifestDenied)
+        );
+        assert!(ask_rx.try_recv().is_err());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
+    }
+
+    #[cfg(feature = "skills")]
+    #[tokio::test]
+    async fn read_files_checks_every_manifest_path_before_permission_or_execution() {
+        let directory = TempDir::new();
+        let workspace_root = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace_root.join("allowed")).unwrap();
+        std::fs::create_dir_all(workspace_root.join("denied")).unwrap();
+        std::fs::write(workspace_root.join("allowed/public.txt"), "public").unwrap();
+        std::fs::write(workspace_root.join("denied/secret.txt"), "secret").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let permission = host_permission(workspace_root.clone(), Action::Ask, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(2);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(&workspace_root).with_workspace_binding(workspace),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(1),
+            ),
+        );
+        let (mut broker, request) = scoped_host_broker(
+            &directory,
+            "read-files-prefix-denied",
+            service,
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["allowed".into()],
+            },
+            EffectOperation::ReadFiles {
+                paths: vec!["allowed/public.txt".into(), "denied/secret.txt".into()],
+            },
+            true,
+        );
+
+        assert_eq!(
+            broker.dispatch(request, PermCancellation::new()).await,
+            Err(HostEffectError::ManifestDenied)
+        );
+        assert!(ask_rx.try_recv().is_err());
+        assert_eq!(broker.audit_records_for_test().len(), 1);
     }
 
     #[cfg(all(feature = "skills", unix))]
@@ -5575,7 +6557,7 @@ mod tests {
                 &control,
                 c"mini-agent-spawn-oversized-test"
             ),
-            Err(EffectServiceError::InvalidTarget)
+            Err(EffectServiceError::OutputLimit)
         ));
         let after = open_spawn_snapshot_count(name);
         assert_eq!(after, before, "failed snapshot capture leaked a descriptor");
@@ -6952,6 +7934,7 @@ mod tests {
             .call(crate::agent::tools::WriteArgs {
                 path: "gold-eiffel.js".to_string(),
                 content: "export const source = 'native';\n".to_string(),
+                overwrite: false,
             })
             .await
             .unwrap();

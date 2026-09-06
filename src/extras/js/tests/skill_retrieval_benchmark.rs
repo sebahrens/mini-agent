@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 
 use crate::extras::js::skills::embed::{Embedder, SkillDocument};
+#[cfg(feature = "skills-embed")]
+use crate::extras::js::skills::embed::{EmbeddingBackend, ModelMetadata, fastembed_backend};
 use crate::extras::js::skills::index::{ImmutableSkillIndex, RetrievalPolicy, SkillIndex};
 use crate::extras::js::skills::store::{SkillRecordMetadata, SkillStore, StoredEmbedding};
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -596,6 +598,37 @@ async fn skill_retrieval_benchmark_smoke() {
     run_benchmark(2_000, 8, "ci-smoke").await;
 }
 
+#[test]
+fn checked_retrieval_results_separate_fidelity_from_semantic_relevance() {
+    let deterministic: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../docs/benchmarks/results/skill-retrieval-deterministic-v2-smoke-2026-09-05.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        deterministic["model"]["revision"],
+        Embedder::new().unwrap().model_metadata().model_revision
+    );
+    assert!(
+        deterministic["relevance"]["scope"]
+            .as_str()
+            .is_some_and(|scope| scope.contains("HNSW fidelity only"))
+    );
+
+    let semantic: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../docs/benchmarks/results/skill-semantic-relevance-2026-09-05.json"
+    ))
+    .unwrap();
+    assert_eq!(semantic["method"]["self_queries"], 0);
+    assert_eq!(semantic["method"]["lexical_candidates"], 0);
+    assert!(semantic["relevance"]["top1_rate"].as_f64().unwrap() >= 0.75);
+    assert!(
+        semantic["relevance"]["mean_reciprocal_rank"]
+            .as_f64()
+            .unwrap()
+            >= 0.85
+    );
+}
+
 #[tokio::test]
 #[ignore = "set ZS_SKILL_BENCH_FULL=1 to run the 100,000-revision audit"]
 async fn skill_retrieval_benchmark() {
@@ -609,4 +642,232 @@ async fn skill_retrieval_benchmark() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(100_000);
     run_benchmark(corpus_size, 500, &format!("full-{corpus_size}")).await;
+}
+
+#[cfg(feature = "skills-embed")]
+#[test]
+#[ignore = "downloads and runs the real BGE model; set MINI_AGENT_SKILL_RELEVANCE=1"]
+fn skill_retrieval_real_backend_relevance() {
+    assert_eq!(
+        std::env::var("MINI_AGENT_SKILL_RELEVANCE").as_deref(),
+        Ok("1"),
+        "the real-backend relevance audit requires MINI_AGENT_SKILL_RELEVANCE=1"
+    );
+    let cases = [
+        (
+            "parse_json",
+            "Decode JSON documents into structured values",
+            "read a JSON payload",
+        ),
+        (
+            "parse_csv",
+            "Decode comma separated tabular records",
+            "load rows from a CSV file",
+        ),
+        (
+            "slugify",
+            "Create URL safe slugs from human readable text",
+            "turn a title into a web address fragment",
+        ),
+        (
+            "dedupe",
+            "Remove duplicate items while retaining the original order",
+            "keep only the first copy of each list value",
+        ),
+        (
+            "retry_delay",
+            "Calculate capped exponential retry backoff durations",
+            "how long should the next network retry wait",
+        ),
+        (
+            "chunk_text",
+            "Split long text into bounded overlapping chunks",
+            "divide a large document into smaller passages",
+        ),
+        (
+            "redact_secrets",
+            "Mask credentials and sensitive tokens in diagnostic text",
+            "hide API keys before logging an error",
+        ),
+        (
+            "markdown_links",
+            "Extract link destinations from Markdown source",
+            "find every URL referenced by a markdown page",
+        ),
+        (
+            "semver_sort",
+            "Order semantic software versions by precedence",
+            "sort package releases from oldest to newest",
+        ),
+        (
+            "group_records",
+            "Group object records by a selected field",
+            "bucket rows that share the same category",
+        ),
+        (
+            "clamp_number",
+            "Constrain a numeric value to an inclusive range",
+            "keep a number between minimum and maximum bounds",
+        ),
+        (
+            "normalize_email",
+            "Canonicalize an email address for comparison",
+            "make two differently cased email addresses comparable",
+        ),
+    ];
+    let backend = fastembed_backend::FastembedBackend::new().expect("initialize BGE backend");
+    let temp = TempPaths::new("real-relevance");
+    let mut store = SkillStore::open_at(&temp.paths).unwrap();
+    let artifacts = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (name, description, _))| {
+            SkillArtifact::new(
+                format!("function {name}(value) {{ return value; }}"),
+                (*description).to_string(),
+                vec![],
+                vec![SkillExport {
+                    name: (*name).to_string(),
+                    signature: format!("{name}(value: unknown): unknown"),
+                }],
+                vec![format!("{name}({index}) === {index}")],
+                CapabilityManifest::pure(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let transaction = store.conn_mut().transaction().unwrap();
+    for artifact in &artifacts {
+        let exports = serde_json::to_string(
+            &artifact
+                .exports
+                .iter()
+                .map(|export| (&export.name, &export.signature))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let capability = serde_json::json!({
+            "abi_version": artifact.abi_version,
+            "manifest": artifact.capability,
+        })
+        .to_string();
+        transaction
+            .execute(
+                "INSERT INTO skill_revisions (
+                    id, identity_version, source, description, tags_json, exports_json,
+                    tests_json, capability_json, status, supersedes_id, superseded_by_id,
+                    row_version, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, NULL, 1, 0, 0)",
+                params![
+                    artifact.id,
+                    artifact.identity_version,
+                    artifact.source,
+                    artifact.description,
+                    serde_json::to_string(&artifact.tags).unwrap(),
+                    exports,
+                    serde_json::to_string(&artifact.tests).unwrap(),
+                    capability,
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    let documents = artifacts.iter().map(document).collect::<Vec<_>>();
+    let vectors = backend.embed_documents(&documents).unwrap();
+    let model = ModelMetadata {
+        model_id: backend.model_id().to_string(),
+        model_revision: backend.model_revision().to_string(),
+        dimensions: backend.dimensions(),
+        normalized: backend.normalized(),
+    };
+    let rows = artifacts
+        .iter()
+        .cloned()
+        .zip(vectors)
+        .map(|(artifact, values)| {
+            let skill_id = artifact.id.clone();
+            (
+                artifact,
+                StoredEmbedding {
+                    skill_id,
+                    model_id: model.model_id.clone(),
+                    model_revision: model.model_revision.clone(),
+                    dimensions: model.dimensions,
+                    normalized: model.normalized,
+                    values,
+                },
+                SkillRecordMetadata {
+                    status: "active".into(),
+                    quarantine_reason: None,
+                    supersedes_id: None,
+                    superseded_by_id: None,
+                    row_version: 1,
+                },
+            )
+        })
+        .collect();
+    let index = ImmutableSkillIndex::build(1, model.clone(), store.database_path(), rows).unwrap();
+    let policy = RetrievalPolicy {
+        max_skills: 10,
+        dense_candidate_limit: 12,
+        lexical_candidate_limit: 0,
+        dense_score_floor: -1.0,
+        ..RetrievalPolicy::default()
+    };
+    let mut top_one = 0usize;
+    let mut reciprocal_rank = 0.0f64;
+    let mut observations = Vec::new();
+    for (expected_index, (_, _, query)) in cases.iter().enumerate() {
+        let query_vector = backend.embed_query(query).unwrap();
+        let results = index.search("", &query_vector, &policy).unwrap();
+        let rank = results
+            .iter()
+            .position(|result| result.artifact.id == artifacts[expected_index].id)
+            .map(|rank| rank + 1);
+        top_one += usize::from(rank == Some(1));
+        reciprocal_rank += rank.map_or(0.0, |rank| 1.0 / rank as f64);
+        observations.push(serde_json::json!({
+            "query": query,
+            "expected": cases[expected_index].0,
+            "rank": rank,
+        }));
+    }
+    let top_one_rate = top_one as f64 / cases.len() as f64;
+    let mean_reciprocal_rank = reciprocal_rank / cases.len() as f64;
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "benchmark": "mini-agent-skill-semantic-relevance",
+        "profile": "debug",
+        "model": {
+            "id": model.model_id,
+            "revision": model.model_revision,
+            "dimensions": model.dimensions,
+            "normalized": model.normalized,
+        },
+        "method": {
+            "documents": cases.len(),
+            "queries": cases.len(),
+            "query_kind": "held-out natural-language paraphrase",
+            "lexical_candidates": 0,
+            "self_queries": 0,
+        },
+        "relevance": {
+            "top1_rate": top_one_rate,
+            "mean_reciprocal_rank": mean_reciprocal_rank,
+            "observations": observations,
+        },
+    });
+    let output = std::env::var_os("MINI_AGENT_SKILL_RELEVANCE_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("mini-agent-skill-semantic-relevance.json"));
+    fs::write(&output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    println!("{}", serde_json::to_string(&report).unwrap());
+    assert!(
+        top_one_rate >= 0.75,
+        "semantic top-1 rate {top_one_rate:.3} is below 0.75"
+    );
+    assert!(
+        mean_reciprocal_rank >= 0.85,
+        "semantic MRR {mean_reciprocal_rank:.3} is below 0.85"
+    );
 }

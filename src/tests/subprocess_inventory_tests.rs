@@ -1330,13 +1330,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-INTERNAL-VERIFICATION",
     ),
-    ("src/session/mod.rs", ".output()", 1, "TC-INTERNAL-GIT"),
-    (
-        "src/session/mod.rs",
-        "let out = std::process::Command::new(\"git\")",
-        1,
-        "TC-INTERNAL-GIT",
-    ),
     (
         "src/ui/app.rs",
         "let mut command = tokio::process::Command::new(\"lazygit\");",
@@ -1479,6 +1472,133 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/grep.rs",
+        "assert!(!output.contains(&long_line));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(&context_line));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(\"root.rs\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.contains(\"src/lib.rs\"), \"{output}\");",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"lib.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"root.rs\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert_eq!(output.matches(\"two.txt\").count(), 1, \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(!output.contains(\"needle again\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
+        "output.lines().any(|line| line.ends_with(\"two.txt:2\")),",
+        1,
+        "NON-PROCESS",
+    ),
+    ("src/agent/tools/grep.rs", "output", 4, "NON-PROCESS"),
+    (
+        "src/agent/tools/grep.rs",
+        "assert!(output.starts_with(\"3 results\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "output.contains(\"requested offset 6 is past EOF at line 2\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(!output.contains(\"lines 6-2\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"two\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"three\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(!output.contains(\"four\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"more lines are available\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/read.rs",
+        "assert!(output.contains(\"offset 5\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"completed before deadline\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"too late\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"also too late\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"never started\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/grep.rs",
         "assert!(!output.contains(\"must_not_be_returned\"));",
         1,
         "NON-PROCESS",
@@ -1535,7 +1655,19 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/bash.rs",
-        "assert_eq!(output, \"stdout\\nstderr\\nExit code: 7\");",
+        "assert_eq!(output, \"[stdout]\\nstdout\\n[stderr]\\nstderr\\nExit code: 7\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "assert!(output.ends_with(\"Exit code: 9\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "render_termination(Some(status)).as_deref(),",
         1,
         "NON-PROCESS",
     ),
@@ -1548,6 +1680,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/bash.rs",
         "assert_eq!(output.stdout.len(), limits.stdout_bytes);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/bash.rs",
+        "output.exit_status,",
         1,
         "NON-PROCESS",
     ),
@@ -1566,12 +1704,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/agent/tools/bash.rs",
         "tracing::warn!(\"tool shell stopped before completion: {:?}\", output.status);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
-        "assert!(!output.contains(\"0 more\"));",
         1,
         "NON-PROCESS",
     ),
@@ -1601,7 +1733,55 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/find_files.rs",
-        "assert!(output.contains(\"unknown number of additional entries\"));",
+        "assert!(output.contains(\"1 additional entries\"));",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "output.contains(dir.path().join(\"root.rs\").to_string_lossy().as_ref()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "output.contains(",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"child.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"a.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.contains(\"b.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"m.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(!output.contains(\"z.txt\"), \"{output}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/agent/tools/find_files.rs",
+        "assert!(output.starts_with(\"4 files found (showing first 2):\"));",
         1,
         "NON-PROCESS",
     ),
@@ -1727,24 +1907,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  route: {:?}\", route.route_kind);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  route_fingerprint: {}\", route.route_fingerprint);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
-        "let _ = writeln!(output, \"  route_policy: {}\", route.policy_version);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/js/skills/turn.rs",
         "let _ = writeln!(output, \"  score: {:.6}\", skill.score());",
         1,
         "NON-PROCESS",
@@ -1779,7 +1941,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/extras/js/skills/turn.rs", "output,", 5, "NON-PROCESS"),
+    ("src/extras/js/skills/turn.rs", "output,", 4, "NON-PROCESS"),
     (
         "src/extras/js/supervisor.rs",
         "output = future => Ok(output),",
@@ -2108,6 +2270,22 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "de107f2c0dc302621f93592167955ba5a4b893704e701a03dd8e3add083f7dc4",
                 1,
             ),
+            (
+                "ddb27fae640c819d13689c66dfcac4db416d10dc75c58e505f8b8c4215719778",
+                1,
+            ),
+            (
+                "526130c218c3b072fc65d134de57cf71cc78267fb6194aa15fc9604a13f70066",
+                1,
+            ),
+            (
+                "211556a02c9cc9dc12d72aafac79816ad580db70ca45a597c1ffc6200e574e34",
+                1,
+            ),
+            (
+                "5d4508a51dba0c790ffef62f8414b6d39fa90438f85d1b8f85c76e0cf2b18238",
+                1,
+            ),
         ],
     ),
     (
@@ -2157,6 +2335,42 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "3462a253774a87b69c35808079213817cbb63784594c3b6c36e1cf0d433edd76",
                 1,
             ),
+            (
+                "c6dfc12dd72d884545ffce046f3ff316401aa8864ab7ac426babce371076e0e1",
+                1,
+            ),
+            (
+                "0de524ec980ae25a2e89c050a7a176bdd8e0cd52f79156f09212a32885ba79e3",
+                1,
+            ),
+            (
+                "2acef44899035b4fe1ebe5cd51e6ac1bb258bf09bf04e6bbfac41750c0fa413f",
+                1,
+            ),
+            (
+                "6ed6b28463166006497c66c9247ea156068ac1b3331cd763aa86fb11e08f93bd",
+                1,
+            ),
+            (
+                "6598de95de2f8df009925a1dff68903fdd3a439e8ddf26f902bb1c207833535e",
+                1,
+            ),
+            (
+                "27dc418559b47c51f40c8b885af3a4c69b9772ab2c3a72bae4408ad8ae751f3f",
+                1,
+            ),
+            (
+                "b6db8c610fa3f1db24a5037afbf75e853908e2475b22500fe22b882990ed0555",
+                1,
+            ),
+            (
+                "77032623138c5140bbf56ea2124c216b497181cd48be0ac857f6e706156c4337",
+                1,
+            ),
+            (
+                "2a407b198400d179b7a2386736bc49d07e5bc4cb88a2d948eeec7ffbc31beaa7",
+                1,
+            ),
         ],
     ),
     (
@@ -2200,6 +2414,91 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "f9bb10578ae06a1346990778eb26b16f15fbed1f8f35faef03215060ce6723e5",
+                1,
+            ),
+            (
+                "033a7ee1d169afb06684962734123560b7792bc0e4c5f7fb6da63084635b97c3",
+                1,
+            ),
+            (
+                "590aff96addd2539535fda11afb4bc10d0711c7497a7af93bab9910a7d9ec930",
+                1,
+            ),
+            (
+                "ff3b43196033b3cb4287ed716424d712c238f131a79e3e7994ef950a3ad2da71",
+                1,
+            ),
+            (
+                "12d39ec0d2f309c72aa23d4b2aea0c69683bac46292bc008819ea5a08668a100",
+                2,
+            ),
+            (
+                "b1dd47ca1808c93ffce820571bc616dd9bbab0ff00a6d30a036997aa5b7cd074",
+                1,
+            ),
+            (
+                "aacff8364b7c19920bb65dc2fee6777b3970b83c489120632dc29a7f75319f6a",
+                1,
+            ),
+            (
+                "d8bc746640594ad8677988f759e17acba24b7b65f84bddbe9ab0eb3c87fea94c",
+                1,
+            ),
+            (
+                "8c145fa86d2c2af2f6271fb1346753b3d2a26349f1910729d7deda388fa48fea",
+                1,
+            ),
+            (
+                "eb01710697adef617d3b9c5e6adffdafb27387e6f9314f65d69c3eec0916ec57",
+                1,
+            ),
+            (
+                "3674e3a0675136a0f470c7cdbca81210d48240febf669d68bbce6c8ba9f4b56d",
+                1,
+            ),
+            (
+                "78dbcfd88f653fc234da51d227836690c8b565af55dcb5a4bb8033e6e1e9b2d2",
+                1,
+            ),
+            (
+                "cc98982a13f5283c58b9e73e437cbe92fd3433b13ffcb4044d7e84c1680f7192",
+                1,
+            ),
+            (
+                "54ab2fb39f30fd9d5c739fc08f4baeeecf57a21e6a6fb8cc411b1457a835ae82",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/agent/tools/read.rs",
+        &[
+            (
+                "d644a582ab03230393d8aa9e710728df802952c882e3acd19fefccb68ef16bfe",
+                1,
+            ),
+            (
+                "8c5480aa4c05e0a79e3efb3aff15f396119c8f782131f0a63b4897af118f1455",
+                1,
+            ),
+            (
+                "4ad0b02fe087ed6b7e90581f16576153cc14c43368790acbfe70bcac2dc955df",
+                1,
+            ),
+            (
+                "67fe1eca2ff8a4b47915f814626f5cf7f0f96438e1d83be6dc8ed38caa2ed0d2",
+                1,
+            ),
+            (
+                "b6e695c20bf9ede9e3659632a9a667e3fa7498031117a6a9938ab61d39946487",
+                1,
+            ),
+            (
+                "9ac084e54227f3dcf8902a1744b06dfefc01910a1a1443ef6b65477a31ec972d",
+                1,
+            ),
+            (
+                "ff352e17dc49e58a4943cb8618000ddddfca2fb4e4b0e8e420a8e09c46f35001",
                 1,
             ),
         ],
@@ -2431,6 +2730,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             (
                 "ed11a97886914baeefe43d2157c89851a90e5f5bb1af6d4d0d4545046d5c8fc9",
                 1,
+            ),
+            (
+                "b5b1fd8ecd14c3b459885cace1c89d97456db2d65fb24b23305042f2207f7d95",
+                4,
             ),
         ],
     ),
@@ -3273,7 +3576,6 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
-    ("src/session/mod.rs", "TC-INTERNAL-GIT"),
     ("src/ui/input/mod.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/renderer.rs", "TC-SUPPORT-UTILITY"),
     ("src/ui/slash/memory.rs", "TC-SUPPORT-UTILITY"),

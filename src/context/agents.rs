@@ -5,6 +5,96 @@ use include_dir::{Dir, include_dir};
 
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/data/agents");
 const MAX_AGENT_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_AGENT_DESCRIPTION_CHARS: usize = 160;
+const MAX_AGENT_MODEL_CHARS: usize = 256;
+const MAX_PROJECT_NOTES_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentTool {
+    Read,
+    Grep,
+    FindFiles,
+    ListDir,
+    #[cfg(feature = "js")]
+    Js,
+    #[cfg(feature = "skills")]
+    SkillsSearch,
+    #[cfg(feature = "memory")]
+    MemoryRead,
+    #[cfg(feature = "memory")]
+    MemorySearch,
+}
+
+impl AgentTool {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Grep => "grep",
+            Self::FindFiles => "find_files",
+            Self::ListDir => "list_dir",
+            #[cfg(feature = "js")]
+            Self::Js => "js",
+            #[cfg(feature = "skills")]
+            Self::SkillsSearch => "skills_search",
+            #[cfg(feature = "memory")]
+            Self::MemoryRead => "memory_read",
+            #[cfg(feature = "memory")]
+            Self::MemorySearch => "memory_search",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "read" => Some(Self::Read),
+            "grep" => Some(Self::Grep),
+            "glob" | "find" | "find_files" | "findfiles" => Some(Self::FindFiles),
+            "list" | "list_dir" | "listdir" => Some(Self::ListDir),
+            #[cfg(feature = "js")]
+            "js" | "javascript" => Some(Self::Js),
+            #[cfg(feature = "skills")]
+            "skills_search" | "skillssearch" => Some(Self::SkillsSearch),
+            #[cfg(feature = "memory")]
+            "memory_read" | "memoryread" => Some(Self::MemoryRead),
+            #[cfg(feature = "memory")]
+            "memory_search" | "memorysearch" => Some(Self::MemorySearch),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl AgentEffort {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AgentMetadata {
+    mode: Option<String>,
+    description: Option<String>,
+    tools: Option<Vec<AgentTool>>,
+    model: Option<String>,
+    effort: Option<AgentEffort>,
+    unknown_keys: Vec<String>,
+}
+
+type NormalizedAgentDefinition = (String, String, AgentMetadata);
 
 fn valid_agent_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -16,16 +106,32 @@ fn valid_agent_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn normalize_agent_definition(name: String, prompt: String) -> Option<(String, String)> {
-    if !valid_agent_name(&name) || prompt.len() > MAX_AGENT_PROMPT_BYTES {
-        return None;
+fn normalize_agent_definition(
+    name: String,
+    prompt: String,
+) -> Result<NormalizedAgentDefinition, &'static str> {
+    if !valid_agent_name(&name) {
+        return Err("filename stem is not a valid agent type");
+    }
+    if prompt.len() > MAX_AGENT_PROMPT_BYTES {
+        return Err("definition exceeds the 256 KiB limit");
     }
     let prompt = prompt.strip_prefix('\u{feff}').unwrap_or(&prompt);
     let Some(first_line_end) = prompt.find('\n') else {
-        return (prompt.trim_end_matches('\r') != "---").then(|| (name, prompt.to_string()));
+        return (!prompt.trim().is_empty() && prompt.trim_end_matches('\r') != "---")
+            .then(|| (name, prompt.to_string(), AgentMetadata::default()))
+            .ok_or_else(|| {
+                if prompt.trim_end_matches('\r') == "---" {
+                    "frontmatter is unterminated"
+                } else {
+                    "prompt body is empty"
+                }
+            });
     };
     if prompt[..first_line_end].trim_end_matches('\r') != "---" {
-        return Some((name, prompt.to_string()));
+        return (!prompt.trim().is_empty())
+            .then(|| (name, prompt.to_string(), AgentMetadata::default()))
+            .ok_or("prompt body is empty");
     }
 
     let yaml_start = first_line_end + 1;
@@ -40,25 +146,143 @@ fn normalize_agent_definition(name: String, prompt: String) -> Option<(String, S
         }
         offset += line.len();
     }
-    let (yaml_end, body_start) = (yaml_end?, body_start?);
-    let metadata: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&prompt[yaml_start..yaml_end]).ok()?;
-    let mapping = metadata.as_mapping()?;
+    let (Some(yaml_end), Some(body_start)) = (yaml_end, body_start) else {
+        return Err("frontmatter is unterminated");
+    };
+    let metadata: serde_yaml_ng::Value = serde_yaml_ng::from_str(&prompt[yaml_start..yaml_end])
+        .map_err(|_| "frontmatter is not valid YAML")?;
+    let mapping = metadata
+        .as_mapping()
+        .ok_or("frontmatter must be a YAML mapping")?;
     if let Some(declared_name) = mapping.get(serde_yaml_ng::Value::String("name".into()))
         && declared_name.as_str() != Some(&name)
     {
-        return None;
+        return Err("frontmatter name does not match the filename stem");
     }
+    let mode = mapping
+        .get(serde_yaml_ng::Value::String("mode".into()))
+        .map(|value| {
+            let mode = value.as_str().ok_or("frontmatter mode must be a string")?;
+            valid_agent_name(mode)
+                .then(|| mode.to_string())
+                .ok_or("frontmatter mode is not a valid prompt name")
+        })
+        .transpose()?;
+    let description = mapping
+        .get(serde_yaml_ng::Value::String("description".into()))
+        .map(|value| {
+            let description = value
+                .as_str()
+                .ok_or("frontmatter description must be a string")?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if description.is_empty() {
+                return Err("frontmatter description must not be empty");
+            }
+            if description.chars().count() > MAX_AGENT_DESCRIPTION_CHARS {
+                return Err("frontmatter description exceeds the 160 character limit");
+            }
+            Ok(description)
+        })
+        .transpose()?;
+    let tools = mapping
+        .get(serde_yaml_ng::Value::String("tools".into()))
+        .map(parse_agent_tools)
+        .transpose()?;
+    let model = mapping
+        .get(serde_yaml_ng::Value::String("model".into()))
+        .map(|value| {
+            let model = value
+                .as_str()
+                .ok_or("frontmatter model must be a string")?
+                .trim();
+            if model.is_empty() {
+                return Err("frontmatter model must not be empty");
+            }
+            if model.chars().count() > MAX_AGENT_MODEL_CHARS || model.chars().any(char::is_control)
+            {
+                return Err("frontmatter model is invalid or exceeds the 256 character limit");
+            }
+            Ok(model.to_string())
+        })
+        .transpose()?;
+    let effort = mapping
+        .get(serde_yaml_ng::Value::String("effort".into()))
+        .map(|value| match value.as_str() {
+            Some("low") => Ok(AgentEffort::Low),
+            Some("medium") => Ok(AgentEffort::Medium),
+            Some("high") => Ok(AgentEffort::High),
+            Some(_) => Err("frontmatter effort must be low, medium, or high"),
+            None => Err("frontmatter effort must be a string"),
+        })
+        .transpose()?;
+    let known_keys = ["name", "mode", "description", "tools", "model", "effort"];
+    let mut unknown_keys = mapping
+        .keys()
+        .filter_map(serde_yaml_ng::Value::as_str)
+        .filter(|key| !known_keys.contains(key))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if mapping.keys().any(|key| key.as_str().is_none()) {
+        return Err("frontmatter keys must be strings");
+    }
+    unknown_keys.sort_unstable();
     let body = prompt[body_start..].trim_start_matches(['\r', '\n']);
-    (!body.trim().is_empty()).then(|| (name, body.to_string()))
+    (!body.trim().is_empty())
+        .then(|| {
+            (
+                name,
+                body.to_string(),
+                AgentMetadata {
+                    mode,
+                    description,
+                    tools,
+                    model,
+                    effort,
+                    unknown_keys,
+                },
+            )
+        })
+        .ok_or("prompt body is empty")
+}
+
+fn parse_agent_tools(value: &serde_yaml_ng::Value) -> Result<Vec<AgentTool>, &'static str> {
+    let names = if let Some(list) = value.as_sequence() {
+        list.iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .ok_or("frontmatter tools entries must be strings")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if let Some(list) = value.as_str() {
+        list.split(',').map(str::trim).collect()
+    } else {
+        return Err("frontmatter tools must be a comma-separated string or string list");
+    };
+
+    let mut tools = Vec::with_capacity(names.len());
+    for name in names {
+        if name.is_empty() {
+            return Err("frontmatter tools contains an empty tool name");
+        }
+        let tool = AgentTool::parse(name)
+            .ok_or("frontmatter tools contains a tool outside the read-only subagent set")?;
+        if !tools.contains(&tool) {
+            tools.push(tool);
+        }
+    }
+    Ok(tools)
 }
 
 fn normalize_agent_definitions(
     definitions: impl IntoIterator<Item = (String, String)>,
-) -> Vec<(String, String)> {
+) -> Vec<NormalizedAgentDefinition> {
     definitions
         .into_iter()
-        .filter_map(|(name, prompt)| normalize_agent_definition(name, prompt))
+        .filter_map(|(name, prompt)| normalize_agent_definition(name, prompt).ok())
         .collect()
 }
 
@@ -72,26 +296,61 @@ pub enum AgentDefinitionSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentDefinition {
     pub prompt: String,
+    /// Optional prompt mode selected when this persona becomes the main agent.
+    pub mode: Option<String>,
+    /// Optional bounded description used by the task tool's `agent_type` schema.
+    pub(crate) description: Option<String>,
+    /// Optional narrowing of the read-only tools installed in specialist children.
+    pub(crate) tools: Option<Vec<AgentTool>>,
+    /// Optional raw model id or configured quick-model alias for specialist children.
+    pub(crate) model: Option<String>,
+    /// Optional exploration-effort tier that narrows the global child turn cap.
+    pub(crate) effort: Option<AgentEffort>,
     pub source: AgentDefinitionSource,
+    project_notes_path: Option<PathBuf>,
+    ignored_definition_notices: Vec<String>,
 }
 
 fn merge_definitions(
     agents: &mut HashMap<String, AgentDefinition>,
-    definitions: impl IntoIterator<Item = (String, String)>,
+    definitions: impl IntoIterator<Item = NormalizedAgentDefinition>,
     source: AgentDefinitionSource,
 ) {
-    for (name, prompt) in definitions {
+    for (name, prompt, metadata) in definitions {
+        warn_unknown_keys(&name, &source, &metadata.unknown_keys);
         agents.insert(
             name,
             AgentDefinition {
                 prompt,
+                mode: metadata.mode,
+                description: metadata.description,
+                tools: metadata.tools,
+                model: metadata.model,
+                effort: metadata.effort,
                 source: source.clone(),
+                project_notes_path: None,
+                ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
             },
         );
     }
 }
 
 impl AgentDefinition {
+    #[cfg(test)]
+    pub(crate) fn for_test(prompt: &str, mode: Option<&str>) -> Self {
+        Self {
+            prompt: prompt.to_string(),
+            mode: mode.map(str::to_string),
+            description: None,
+            tools: None,
+            model: None,
+            effort: None,
+            source: AgentDefinitionSource::Embedded,
+            project_notes_path: None,
+            ignored_definition_notices: Vec::new(),
+        }
+    }
+
     pub fn project_override_path(&self, name: &str) -> Option<PathBuf> {
         match &self.source {
             AgentDefinitionSource::ProjectOverride { directory } => {
@@ -102,14 +361,90 @@ impl AgentDefinition {
     }
 
     pub(crate) fn source_description(&self, name: &str) -> String {
-        match &self.source {
+        let source = match &self.source {
             AgentDefinitionSource::Embedded => "compiled-in default".to_string(),
             AgentDefinitionSource::UserGlobal => "user-global configuration".to_string(),
             AgentDefinitionSource::ProjectOverride { directory } => format!(
                 "trusted project override {}",
                 directory.join(format!("{name}.md")).display()
             ),
+        };
+        match &self.project_notes_path {
+            Some(path) => format!("{source} with trusted project notes {}", path.display()),
+            None => source,
         }
+    }
+
+    pub(crate) fn result_notice(&self, name: &str) -> Option<String> {
+        let mut notices = self.ignored_definition_notices.clone();
+        if let Some(path) = self.project_override_path(name) {
+            notices.push(format!(
+                "[specialist source: project override {}]",
+                path.display()
+            ));
+        }
+        if let Some(path) = &self.project_notes_path {
+            notices.push(format!(
+                "[specialist notes: trusted project file {}]",
+                path.display()
+            ));
+        }
+        (!notices.is_empty()).then(|| notices.join("\n"))
+    }
+
+    fn one_line_description(&self) -> String {
+        if let Some(description) = &self.description {
+            return description.clone();
+        }
+        let first_paragraph = self
+            .prompt
+            .split("\n\n")
+            .find(|paragraph| !paragraph.trim().is_empty())
+            .unwrap_or("Specialized read-only investigation")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sentence_end = first_paragraph
+            .find(". ")
+            .map(|index| index + 1)
+            .unwrap_or(first_paragraph.len());
+        let sentence = &first_paragraph[..sentence_end];
+        let mut chars = sentence.chars();
+        let description = chars
+            .by_ref()
+            .take(MAX_AGENT_DESCRIPTION_CHARS)
+            .collect::<String>();
+        if chars.next().is_some() {
+            format!("{}…", description.trim_end())
+        } else {
+            description
+        }
+    }
+}
+
+fn unknown_key_notices(keys: &[String]) -> Vec<String> {
+    if keys.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "[specialist metadata: unknown frontmatter keys ignored: {}]",
+            keys.join(", ")
+        )]
+    }
+}
+
+fn warn_unknown_keys(name: &str, source: &AgentDefinitionSource, keys: &[String]) {
+    if !keys.is_empty() {
+        tracing::warn!(
+            agent_type = name,
+            source = %match source {
+                AgentDefinitionSource::Embedded => "compiled-in default".to_string(),
+                AgentDefinitionSource::UserGlobal => "user-global configuration".to_string(),
+                AgentDefinitionSource::ProjectOverride { directory } => directory.display().to_string(),
+            },
+            unknown_keys = %keys.join(", "),
+            "ignoring unknown specialist frontmatter keys"
+        );
     }
 }
 
@@ -122,18 +457,146 @@ fn project_definitions_trusted(paths: &crate::paths::AppPaths) -> bool {
 
 fn merge_project_definitions(
     agents: &mut HashMap<String, AgentDefinition>,
-    definitions: impl IntoIterator<Item = (String, String)>,
+    definitions: impl IntoIterator<Item = (String, Result<String, String>)>,
     directory: PathBuf,
     trusted: bool,
 ) {
     if !trusted {
         return;
     }
-    merge_definitions(
+    let mut agent_definitions = Vec::new();
+    let mut project_notes = None;
+    for (name, content) in definitions {
+        if name == ".notes" {
+            project_notes = Some(content);
+        } else {
+            agent_definitions.push((name, content));
+        }
+    }
+    merge_external_definitions(
         agents,
-        normalize_agent_definitions(definitions),
-        AgentDefinitionSource::ProjectOverride { directory },
+        agent_definitions,
+        &directory,
+        AgentDefinitionSource::ProjectOverride {
+            directory: directory.clone(),
+        },
+        "project",
     );
+    if let Some(notes) = project_notes {
+        append_project_notes(agents, notes, &directory.join(".notes.md"));
+    }
+}
+
+fn append_project_notes(
+    agents: &mut HashMap<String, AgentDefinition>,
+    content: Result<String, String>,
+    path: &Path,
+) {
+    let notes = match content {
+        Ok(notes) if notes.len() <= MAX_PROJECT_NOTES_BYTES => notes,
+        Ok(_) => {
+            let reason = format!("exceeds the {MAX_PROJECT_NOTES_BYTES}-byte limit");
+            warn_and_record_ignored_notes(agents, path, &reason);
+            return;
+        }
+        Err(reason) => {
+            warn_and_record_ignored_notes(agents, path, &reason);
+            return;
+        }
+    };
+    let notes = notes.strip_prefix('\u{feff}').unwrap_or(&notes).trim();
+    if notes.is_empty() {
+        warn_and_record_ignored_notes(agents, path, "file is empty");
+        return;
+    }
+
+    let addition = format!("\n\n---\n\n## Project notes\n\n{notes}");
+    for (name, definition) in agents.iter_mut() {
+        if definition.prompt.len().saturating_add(addition.len()) > MAX_AGENT_PROMPT_BYTES {
+            let reason = "combined persona and project notes exceed the 256 KiB prompt limit";
+            tracing::warn!(
+                agent_type = name,
+                definition = %path.display(),
+                reason,
+                "ignoring project notes for specialist"
+            );
+            definition.ignored_definition_notices.push(format!(
+                "[specialist notes ignored: {} ({reason})]",
+                path.display()
+            ));
+            continue;
+        }
+        definition.prompt.push_str(&addition);
+        definition.project_notes_path = Some(path.to_path_buf());
+    }
+}
+
+fn warn_and_record_ignored_notes(
+    agents: &mut HashMap<String, AgentDefinition>,
+    path: &Path,
+    reason: &str,
+) {
+    tracing::warn!(
+        definition = %path.display(),
+        reason,
+        "ignoring invalid project specialist notes"
+    );
+    for definition in agents.values_mut() {
+        definition.ignored_definition_notices.push(format!(
+            "[specialist notes ignored: {} ({reason})]",
+            path.display()
+        ));
+    }
+}
+
+fn merge_external_definitions(
+    agents: &mut HashMap<String, AgentDefinition>,
+    definitions: impl IntoIterator<Item = (String, Result<String, String>)>,
+    directory: &Path,
+    source: AgentDefinitionSource,
+    source_label: &str,
+) {
+    for (name, content) in definitions {
+        let path = directory.join(format!("{name}.md"));
+        let normalized = content.and_then(|prompt| {
+            normalize_agent_definition(name.clone(), prompt).map_err(str::to_string)
+        });
+        match normalized {
+            Ok((name, prompt, metadata)) => {
+                warn_unknown_keys(&name, &source, &metadata.unknown_keys);
+                agents.insert(
+                    name,
+                    AgentDefinition {
+                        prompt,
+                        mode: metadata.mode,
+                        description: metadata.description,
+                        tools: metadata.tools,
+                        model: metadata.model,
+                        effort: metadata.effort,
+                        source: source.clone(),
+                        project_notes_path: None,
+                        ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
+                    },
+                );
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    agent_type = name,
+                    definition = %path.display(),
+                    source = source_label,
+                    reason,
+                    "ignoring invalid specialist definition"
+                );
+                if let Some(fallback) = agents.get_mut(&name) {
+                    let fallback_source = fallback.source_description(&name);
+                    fallback.ignored_definition_notices.push(format!(
+                        "[specialist source: {source_label} definition ignored: {} ({reason}); using {fallback_source}]",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition> {
@@ -143,10 +606,16 @@ fn load_base(paths: &crate::paths::AppPaths) -> HashMap<String, AgentDefinition>
         normalize_agent_definitions(crate::context::load_embedded_files(&EMBEDDED, "md")),
         AgentDefinitionSource::Embedded,
     );
-    merge_definitions(
+    merge_external_definitions(
         &mut agents,
-        normalize_agent_definitions(crate::context::load_dir_files(&paths.agents_dir(), "md")),
+        crate::context::load_dir_files_bounded_status(
+            &paths.agents_dir(),
+            "md",
+            MAX_AGENT_PROMPT_BYTES,
+        ),
+        &paths.agents_dir(),
         AgentDefinitionSource::UserGlobal,
+        "user",
     );
     agents
 }
@@ -163,7 +632,11 @@ pub fn load() -> HashMap<String, AgentDefinition> {
     {
         merge_project_definitions(
             &mut agents,
-            crate::context::load_dir_files(&project_dir, "md"),
+            crate::context::load_dir_files_bounded_status(
+                &project_dir,
+                "md",
+                MAX_AGENT_PROMPT_BYTES,
+            ),
             project_dir,
             true,
         );
@@ -186,8 +659,11 @@ pub(crate) fn load_for_workspace_binding(
         .map(|paths| project_definitions_trusted(&paths))
         .unwrap_or(false);
     if trusted
-        && let Ok(definitions) =
-            workspace.read_relative_dir_files(Path::new(".zerostack/agents"), "md")
+        && let Ok(definitions) = workspace.read_relative_dir_files_bounded_status(
+            Path::new(".zerostack/agents"),
+            "md",
+            MAX_AGENT_PROMPT_BYTES,
+        )
     {
         merge_project_definitions(&mut agents, definitions, project_dir, true);
     }
@@ -212,6 +688,21 @@ pub(crate) fn available_names_for_workspace(
     names
 }
 
+pub(crate) fn available_schema_entries_for_workspace(
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> Vec<(String, String)> {
+    let agents = match workspace {
+        Some(workspace) => load_for_workspace_binding(workspace),
+        None => load(),
+    };
+    let mut entries = agents
+        .into_iter()
+        .map(|(name, definition)| (name, definition.one_line_description()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
 pub(crate) fn lookup_for_workspace(
     name: &str,
     workspace: Option<&crate::paths::WorkspaceBinding>,
@@ -220,6 +711,38 @@ pub(crate) fn lookup_for_workspace(
         Some(workspace) => load_for_workspace_binding(workspace).remove(name),
         None => lookup(name),
     }
+}
+
+/// Describe the highest-precedence file that may define `name` without
+/// reading or parsing any persona contents. Permission prompts use this before
+/// a task delegation is authorized; full definition loading happens only
+/// after approval.
+pub(crate) fn source_hint_for_workspace(
+    name: &str,
+    workspace: Option<&crate::paths::WorkspaceBinding>,
+) -> String {
+    let paths = crate::paths::process_paths().expect("startup must initialize application paths");
+    if let Some(workspace) = workspace {
+        let trusted = paths
+            .with_workspace_root(workspace.root())
+            .map(|paths| project_definitions_trusted(&paths))
+            .unwrap_or(false);
+        let path = workspace
+            .root()
+            .join(".zerostack/agents")
+            .join(format!("{name}.md"));
+        if trusted && path.is_file() {
+            return format!("trusted project override {}", path.display());
+        }
+    }
+    let user_path = paths.agents_dir().join(format!("{name}.md"));
+    if user_path.is_file() {
+        return format!("user-global configuration {}", user_path.display());
+    }
+    if EMBEDDED.get_file(format!("{name}.md")).is_some() {
+        return "compiled-in default".to_string();
+    }
+    "unresolved agent type".to_string()
 }
 
 #[cfg(test)]
@@ -234,23 +757,50 @@ mod tests {
     }
 
     #[test]
+    fn embedded_personas_are_bounded_task_scoped_and_caveats_first() {
+        const SHIPPED_PERSONA_TOKEN_BUDGET: u64 = 2_000;
+
+        for (name, prompt) in crate::context::load_embedded_files(&EMBEDDED, "md") {
+            let estimated = crate::session::Session::estimate_tokens(&prompt);
+            assert!(
+                estimated <= SHIPPED_PERSONA_TOKEN_BUDGET,
+                "embedded persona {name} costs about {estimated} tokens"
+            );
+            let caveats = prompt
+                .find("## Caveats first")
+                .unwrap_or_else(|| panic!("embedded persona {name} must lead with caveats"));
+            assert!(
+                caveats < 1_000,
+                "embedded persona {name} buries caveats after {caveats} bytes"
+            );
+            assert!(
+                prompt.contains("delegated objective"),
+                "embedded persona {name} must keep its checklist task-scoped"
+            );
+        }
+    }
+
+    #[test]
     fn custom_agent_frontmatter_is_validated_and_not_injected() {
         let normalized = normalize_agent_definition(
             "review".into(),
             "---\nname: review\ndescription: metadata only\n---\n\nTrusted body\n".into(),
         )
         .unwrap();
-        assert_eq!(normalized, ("review".into(), "Trusted body\n".into()));
-        assert!(normalize_agent_definition("README".into(), "body".into()).is_none());
+        assert_eq!(normalized.0, "review");
+        assert_eq!(normalized.1, "Trusted body\n");
+        assert_eq!(normalized.2.description.as_deref(), Some("metadata only"));
+        assert!(normalize_agent_definition("README".into(), "body".into()).is_err());
         assert!(
             normalize_agent_definition("review".into(), "---\nname: different\n---\nbody".into())
-                .is_none()
+                .is_err()
         );
         assert!(
             normalize_agent_definition("review".into(), "---\ninvalid: [\n---\nbody".into())
-                .is_none()
+                .is_err()
         );
-        assert!(normalize_agent_definition("review".into(), "---".into()).is_none());
+        assert!(normalize_agent_definition("review".into(), "---".into()).is_err());
+        assert!(normalize_agent_definition("review".into(), " \r\n".into()).is_err());
         assert_eq!(
             normalize_agent_definition(
                 "review".into(),
@@ -260,6 +810,69 @@ mod tests {
             .1,
             "body"
         );
+        let with_mode = normalize_agent_definition(
+            "review".into(),
+            "---\nname: review\nmode: review-security\n---\nbody".into(),
+        )
+        .unwrap();
+        assert_eq!(with_mode.2.mode.as_deref(), Some("review-security"));
+        assert!(
+            normalize_agent_definition(
+                "review".into(),
+                "---\nname: review\nmode: ../../escape\n---\nbody".into(),
+            )
+            .is_err()
+        );
+
+        let configured = normalize_agent_definition(
+            "review".into(),
+            "---\nname: review\ndescription: Focused review\ntools: Read, Grep, Glob\nmodel: fast\neffort: medium\nfuture-key: ignored\n---\nbody".into(),
+        )
+        .unwrap();
+        assert_eq!(configured.2.description.as_deref(), Some("Focused review"));
+        assert_eq!(
+            configured.2.tools,
+            Some(vec![AgentTool::Read, AgentTool::Grep, AgentTool::FindFiles])
+        );
+        assert_eq!(configured.2.model.as_deref(), Some("fast"));
+        assert_eq!(configured.2.effort, Some(AgentEffort::Medium));
+        assert_eq!(configured.2.unknown_keys, vec!["future-key"]);
+        #[cfg(feature = "skills")]
+        assert_eq!(
+            normalize_agent_definition(
+                "review".into(),
+                "---\nname: review\ntools: SkillsSearch\n---\nbody".into(),
+            )
+            .unwrap()
+            .2
+            .tools,
+            Some(vec![AgentTool::SkillsSearch])
+        );
+        #[cfg(feature = "js")]
+        assert_eq!(
+            normalize_agent_definition(
+                "review".into(),
+                "---\nname: review\ntools: JavaScript\n---\nbody".into(),
+            )
+            .unwrap()
+            .2
+            .tools,
+            Some(vec![AgentTool::Js])
+        );
+        assert!(
+            normalize_agent_definition(
+                "review".into(),
+                "---\nname: review\ntools: Read, Bash\n---\nbody".into(),
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_agent_definition(
+                "review".into(),
+                "---\nname: review\nmode: [review]\n---\nbody".into(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -267,12 +880,16 @@ mod tests {
         let mut agents = HashMap::new();
         merge_definitions(
             &mut agents,
-            [("review".to_string(), "embedded".to_string())],
+            [(
+                "review".to_string(),
+                "embedded".to_string(),
+                AgentMetadata::default(),
+            )],
             AgentDefinitionSource::Embedded,
         );
         merge_project_definitions(
             &mut agents,
-            [("review".to_string(), "project".to_string())],
+            [("review".to_string(), Ok("project".to_string()))],
             PathBuf::from("/workspace/.zerostack/agents"),
             false,
         );
@@ -283,7 +900,7 @@ mod tests {
 
         merge_project_definitions(
             &mut agents,
-            [("review".to_string(), "project".to_string())],
+            [("review".to_string(), Ok("project".to_string()))],
             PathBuf::from("/workspace/.zerostack/agents"),
             true,
         );
@@ -307,14 +924,118 @@ mod tests {
     }
 
     #[test]
+    fn trusted_project_notes_append_without_replacing_personas() {
+        let mut agents = HashMap::new();
+        merge_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                "generic persona".to_string(),
+                AgentMetadata::default(),
+            )],
+            AgentDefinitionSource::Embedded,
+        );
+        let directory = PathBuf::from("/workspace/.zerostack/agents");
+
+        merge_project_definitions(
+            &mut agents,
+            [(
+                ".notes".to_string(),
+                Ok("Repository-specific review guidance".to_string()),
+            )],
+            directory.clone(),
+            true,
+        );
+
+        let definition = agents.get("review").unwrap();
+        assert!(definition.prompt.starts_with("generic persona"));
+        assert!(definition.prompt.contains("## Project notes"));
+        assert!(
+            definition
+                .prompt
+                .ends_with("Repository-specific review guidance")
+        );
+        assert_eq!(definition.source, AgentDefinitionSource::Embedded);
+        assert_eq!(
+            definition.source_description("review"),
+            "compiled-in default with trusted project notes /workspace/.zerostack/agents/.notes.md"
+        );
+        assert!(
+            definition
+                .result_notice("review")
+                .unwrap()
+                .contains("[specialist notes: trusted project file")
+        );
+
+        let original = definition.prompt.clone();
+        merge_project_definitions(
+            &mut agents,
+            [(
+                ".notes".to_string(),
+                Ok("untrusted replacement".to_string()),
+            )],
+            directory,
+            false,
+        );
+        assert_eq!(agents["review"].prompt, original);
+    }
+
+    #[test]
+    fn oversized_project_notes_are_ignored_with_a_visible_notice() {
+        let mut agents = HashMap::new();
+        merge_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                "generic persona".to_string(),
+                AgentMetadata::default(),
+            )],
+            AgentDefinitionSource::Embedded,
+        );
+        merge_project_definitions(
+            &mut agents,
+            [(
+                ".notes".to_string(),
+                Ok("x".repeat(MAX_PROJECT_NOTES_BYTES + 1)),
+            )],
+            PathBuf::from("/workspace/.zerostack/agents"),
+            true,
+        );
+
+        let definition = &agents["review"];
+        assert_eq!(definition.prompt, "generic persona");
+        assert!(definition.project_notes_path.is_none());
+        assert!(
+            definition
+                .result_notice("review")
+                .unwrap()
+                .contains("specialist notes ignored")
+        );
+    }
+
+    #[test]
     fn permission_source_descriptions_cover_non_project_layers() {
         let embedded = AgentDefinition {
             prompt: "embedded".into(),
+            mode: None,
+            description: None,
+            tools: None,
+            model: None,
+            effort: None,
             source: AgentDefinitionSource::Embedded,
+            project_notes_path: None,
+            ignored_definition_notices: Vec::new(),
         };
         let user = AgentDefinition {
             prompt: "user".into(),
+            mode: None,
+            description: None,
+            tools: None,
+            model: None,
+            effort: None,
             source: AgentDefinitionSource::UserGlobal,
+            project_notes_path: None,
+            ignored_definition_notices: Vec::new(),
         };
 
         assert_eq!(embedded.source_description("review"), "compiled-in default");
@@ -322,6 +1043,118 @@ mod tests {
             user.source_description("review"),
             "user-global configuration"
         );
+        let long = AgentDefinition {
+            prompt: format!("You are a specialist with {}", "detail ".repeat(80)),
+            mode: None,
+            description: None,
+            tools: None,
+            model: None,
+            effort: None,
+            source: AgentDefinitionSource::Embedded,
+            project_notes_path: None,
+            ignored_definition_notices: Vec::new(),
+        };
+        let description = long.one_line_description();
+        assert!(description.ends_with('…'));
+        assert!(description.chars().count() <= MAX_AGENT_DESCRIPTION_CHARS + 1);
+    }
+
+    #[test]
+    fn invalid_user_definition_keeps_fallback_and_records_a_result_notice() {
+        let mut agents = HashMap::new();
+        merge_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                "embedded".to_string(),
+                AgentMetadata::default(),
+            )],
+            AgentDefinitionSource::Embedded,
+        );
+
+        merge_external_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                Ok("---\nname: wrong\n---\nbody".into()),
+            )],
+            Path::new("/config/agents"),
+            AgentDefinitionSource::UserGlobal,
+            "user",
+        );
+
+        let resolved = agents.get("review").unwrap();
+        assert_eq!(resolved.prompt, "embedded");
+        assert_eq!(resolved.source, AgentDefinitionSource::Embedded);
+        let notice = resolved.result_notice("review").unwrap();
+        assert!(notice.starts_with("[specialist source: user definition ignored:"));
+        assert!(notice.contains("/config/agents/review.md"));
+        assert!(notice.contains("frontmatter name does not match"));
+        assert!(notice.contains("using compiled-in default"));
+
+        merge_project_definitions(
+            &mut agents,
+            [("review".to_string(), Ok("valid project".into()))],
+            PathBuf::from("/workspace/.zerostack/agents"),
+            true,
+        );
+        let project = agents.get("review").unwrap();
+        assert_eq!(project.prompt, "valid project");
+        let project_notice = project.result_notice("review").unwrap();
+        assert!(project_notice.starts_with("[specialist source: project override"));
+        assert!(!project_notice.contains("definition ignored"));
+    }
+
+    #[test]
+    fn unknown_frontmatter_keys_are_visible_but_do_not_drop_the_definition() {
+        let mut agents = HashMap::new();
+        merge_external_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                Ok("---\nname: review\ndescription: Explicit schema text\nfuture-option: true\n---\nbody".into()),
+            )],
+            Path::new("/config/agents"),
+            AgentDefinitionSource::UserGlobal,
+            "user",
+        );
+
+        let definition = agents.get("review").unwrap();
+        assert_eq!(definition.prompt, "body");
+        assert_eq!(definition.one_line_description(), "Explicit schema text");
+        assert_eq!(
+            definition.result_notice("review").as_deref(),
+            Some("[specialist metadata: unknown frontmatter keys ignored: future-option]")
+        );
+    }
+
+    #[test]
+    fn unreadable_project_definition_keeps_fallback_and_records_a_result_notice() {
+        let mut agents = HashMap::new();
+        merge_definitions(
+            &mut agents,
+            [(
+                "review".to_string(),
+                "embedded".to_string(),
+                AgentMetadata::default(),
+            )],
+            AgentDefinitionSource::Embedded,
+        );
+
+        merge_project_definitions(
+            &mut agents,
+            [("review".to_string(), Err("exceeds the 8-byte limit".into()))],
+            PathBuf::from("/workspace/.zerostack/agents"),
+            true,
+        );
+
+        let resolved = agents.get("review").unwrap();
+        assert_eq!(resolved.prompt, "embedded");
+        let notice = resolved.result_notice("review").unwrap();
+        assert!(notice.starts_with("[specialist source: project definition ignored:"));
+        assert!(notice.contains("/workspace/.zerostack/agents/review.md"));
+        assert!(notice.contains("exceeds the 8-byte limit"));
+        assert!(notice.contains("using compiled-in default"));
     }
 
     #[test]
@@ -355,91 +1188,71 @@ mod tests {
     #[test]
     fn embedded_specialists_respect_read_only_execution_contracts() {
         let azure = embedded_prompt("azure-cloud-architect");
-        assert!(azure.contains("stated and verified constraints support that decision"));
-        assert!(azure.contains("**Constraints assumed**"));
-        assert!(
-            azure.find("**Unknown constraints").unwrap() < azure.find("**Architecture**").unwrap()
-        );
+        assert!(azure.contains("verified workload constraints"));
+        assert!(azure.contains("Lead with unknown and assumed constraints"));
+        assert!(azure.contains("Never fabricate prices or SLAs"));
 
         let informatica = embedded_prompt("informatica-mapplet-to-fabric-sql");
-        assert!(informatica.contains("**Queries not executed**"));
-        assert!(informatica.contains("caller or operator to run"));
-        assert!(informatica.contains("Documentation snapshot: **2026-08-31**"));
-        assert!(informatica.contains("design hypothesis"));
-        assert!(
-            informatica
-                .find("**Assumptions requiring human confirmation**")
-                .unwrap()
-                < informatica.find("**The T-SQL**").unwrap()
-        );
+        assert!(informatica.contains("Never emit plausible SQL"));
+        assert!(informatica.contains("required human decisions"));
+        assert!(informatica.contains("current Microsoft documentation"));
 
         let security = embedded_prompt("rust-security-review");
-        assert!(security.contains("Recommend that the calling agent run `cargo deny check`"));
-        assert!(security.contains("do not claim that command was executed"));
-        assert!(security.contains("enumerate every call path into hook subprocess execution"));
-        assert!(security.contains("newly added caller is gated"));
+        assert!(security.contains("source-to-sink path"));
+        assert!(security.contains("Do not claim a dependency vulnerability"));
+        assert!(security.contains("concrete attacker capability"));
 
         let concurrency = embedded_prompt("rust-async-concurrency");
-        assert!(concurrency.contains("read-only source investigation"));
-        assert!(concurrency.contains("never assume a runtime flavor"));
-        assert!(concurrency.contains("source inspection alone cannot answer"));
+        assert!(concurrency.contains("read-only, source-backed investigations"));
+        assert!(concurrency.contains("never assume Tokio defaults"));
+        assert!(concurrency.contains("Source inspection cannot prove runtime timing"));
 
         let unsafe_audit = embedded_prompt("rust-unsafe-code-audit");
-        assert!(unsafe_audit.contains("recommend that the calling agent add and run"));
-        assert!(unsafe_audit.contains("do not claim to have compiled or executed it"));
-        assert!(unsafe_audit.contains("canonical Phase 6 security invariants"));
+        assert!(unsafe_audit.contains("full precondition chain"));
+        assert!(unsafe_audit.contains("State which exact check remains unrun"));
+        assert!(unsafe_audit.contains("verify ABI/calling convention"));
 
         let vscode = embedded_prompt("vscode-extension-developer");
-        assert!(vscode.contains("Treat `editors/vscode/` as the only stable location"));
-        assert!(vscode.contains("grepping for `workspace.isTrusted`"));
-        assert!(!vscode.contains("editors/vscode/src/extension.ts"));
+        assert!(vscode.contains("Never imply that you launched VS Code"));
+        assert!(vscode.contains("workspace.isTrusted"));
+        assert!(vscode.contains("spawn without a shell"));
 
         let rust_maintainer = embedded_prompt("rust-maintainer");
-        assert!(rust_maintainer.contains("delegate Tokio cancel-safety"));
-        assert!(rust_maintainer.contains("Derive every command from the repository's actual"));
-        assert!(rust_maintainer.contains("State explicitly which checks you cannot run"));
-        assert!(rust_maintainer.contains("Do not claim to have compiled, tested, or executed"));
-        assert!(
-            rust_maintainer
-                .find("Caveats and unverified assumptions")
-                .unwrap()
-                < rust_maintainer
-                    .find("Lifecycle investigation method")
-                    .unwrap()
-        );
+        assert!(rust_maintainer.contains("Route material async, unsafe, or security questions"));
+        assert!(rust_maintainer.contains("Read repository instructions and manifests"));
+        assert!(rust_maintainer.contains("Never imply that you compiled or executed"));
 
         let python_maintainer = embedded_prompt("python-maintainer");
-        assert!(python_maintainer.contains("Derive every command from the repository's actual"));
-        assert!(python_maintainer.contains("Do not claim to have executed code"));
-        assert!(python_maintainer.contains("You do not assume any specific framework"));
-        assert!(
-            python_maintainer
-                .contains("Derive the interpreter and tool invocation from what you find")
-        );
-        assert!(
-            python_maintainer
-                .find("Caveats and unverified assumptions")
-                .unwrap()
-                < python_maintainer
-                    .find("Lifecycle investigation method")
-                    .unwrap()
-        );
+        assert!(python_maintainer.contains("Do not assume a framework"));
+        assert!(python_maintainer.contains("Never imply that you ran Python"));
+        assert!(python_maintainer.contains("Derive versions and commands"));
 
         let node_ts_maintainer = embedded_prompt("node-typescript-maintainer");
-        assert!(node_ts_maintainer.contains("hand those off explicitly"));
-        assert!(node_ts_maintainer.contains("Do not claim to have executed code"));
-        assert!(node_ts_maintainer.contains("You do not assume npm, ESM, or React"));
-        assert!(
-            node_ts_maintainer
-                .contains("Derive the package manager and script invocations from what you find")
-        );
-        assert!(
-            node_ts_maintainer
-                .find("Caveats and unverified assumptions")
-                .unwrap()
-                < node_ts_maintainer
-                    .find("Lifecycle investigation method")
-                    .unwrap()
-        );
+        assert!(node_ts_maintainer.contains("VS Code API and vsce-specific work belongs"));
+        assert!(node_ts_maintainer.contains("Do not assume npm, ESM, TypeScript, React"));
+        assert!(node_ts_maintainer.contains("Never imply that you ran scripts"));
+
+        for (name, prompt) in crate::context::load_embedded_files(&EMBEDDED, "md") {
+            assert!(prompt.contains("read-only"), "{name} must stay read-only");
+            for repository_marker in [
+                "mini-agent",
+                "zerostack",
+                "Phase 6",
+                "src/extras/",
+                "editors/vscode",
+                "ACP stdio",
+                "JsTool",
+            ] {
+                assert!(
+                    !prompt.contains(repository_marker),
+                    "embedded persona {name} contains repository-specific marker {repository_marker}"
+                );
+            }
+            assert!(
+                prompt.find("## Caveats first").unwrap()
+                    < prompt.find("## Return contract").unwrap(),
+                "{name} must put caveats before its deliverable"
+            );
+        }
     }
 }

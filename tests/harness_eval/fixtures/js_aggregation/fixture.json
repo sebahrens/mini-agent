@@ -1,0 +1,16 @@
+{
+  "name": "js_aggregation",
+  "prompt": "Aggregate both JSON files and write the total.",
+  "max_provider_turns": 2,
+  "max_tool_calls": 1,
+  "max_total_tokens": 260,
+  "initial_files": {
+    "data/a.json": "[2,3]\n",
+    "data/b.json": "[5,7]\n"
+  },
+  "expected_files": {
+    "data/a.json": "[2,3]\n",
+    "data/b.json": "[5,7]\n",
+    "total.txt": "17\n"
+  }
+}

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use compact_str::CompactString;
 
 use crate::config;
@@ -14,6 +14,13 @@ fn default_sandbox_backend() -> String {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "mini-agent", version, about = "Minimal coding agent")]
 pub struct Cli {
@@ -25,6 +32,16 @@ pub struct Cli {
         help = "With -p: also print tool calls/results to stdout"
     )]
     pub pure_stdout: bool,
+
+    #[arg(
+        long = "output",
+        value_name = "FORMAT",
+        value_enum,
+        requires = "print",
+        conflicts_with = "pure_stdout",
+        help = "With -p: output format (text or json)"
+    )]
+    pub output: Option<OutputFormat>,
 
     #[arg(long = "load-prompt", help = "Load a named prompt (same as /prompt)")]
     pub load_prompt: Option<String>,
@@ -50,6 +67,23 @@ pub struct Cli {
         help = "Execute an offline JavaScript runtime self-check and exit"
     )]
     pub js_runtime_check: bool,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-stats",
+        conflicts_with_all = [
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill"
+        ],
+        help = "Print learned-skill usage and estimated round trips saved, then exit"
+    )]
+    pub learned_skill_stats: bool,
 
     #[cfg(feature = "skills")]
     #[arg(
@@ -531,6 +565,23 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn output_format(&self) -> OutputFormat {
+        self.output.unwrap_or_default()
+    }
+
+    pub fn is_headless(&self) -> bool {
+        self.print || {
+            #[cfg(feature = "loop")]
+            {
+                self.loop_mode
+            }
+            #[cfg(not(feature = "loop"))]
+            {
+                false
+            }
+        }
+    }
+
     pub fn resolve_quick_model<'a>(
         &self,
         cfg: &'a config::Config,
@@ -626,6 +677,7 @@ impl Cli {
             "find_files",
             "list_dir",
             "todo_write",
+            "todo_read",
             "shell",
             "bash",
             #[cfg(feature = "js")]
@@ -795,12 +847,36 @@ fn canonical_tool_name(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
-    #[cfg(feature = "skills")]
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
-    use super::{Cli, default_sandbox_backend};
+    use super::{Cli, OutputFormat, default_sandbox_backend};
     use crate::config;
+
+    #[test]
+    fn print_output_format_defaults_to_text_and_accepts_json() {
+        let text = Cli::try_parse_from(["mini-agent", "-p", "hello"]).unwrap();
+        assert_eq!(text.output_format(), OutputFormat::Text);
+
+        let json = Cli::try_parse_from(["mini-agent", "-p", "--output", "json", "hello"]).unwrap();
+        assert_eq!(json.output_format(), OutputFormat::Json);
+        assert!(json.is_headless());
+    }
+
+    #[test]
+    fn structured_output_requires_print_and_conflicts_with_pure_stdout() {
+        assert!(Cli::try_parse_from(["mini-agent", "--output", "json"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "-p",
+                "--output",
+                "json",
+                "--pure-stdout",
+                "hello",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn command_name_matches_canonical_cargo_binary() {
@@ -1000,5 +1076,14 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["mini-agent", "--install-learned-skill-seeds"]).is_ok());
+        assert!(Cli::try_parse_from(["mini-agent", "--learned-skill-stats"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--learned-skill-stats",
+                "--install-learned-skill-seeds",
+            ])
+            .is_err()
+        );
     }
 }

@@ -65,57 +65,76 @@ impl EditTool {
 
 // ── V1: Similarity (SEARCH/REPLACE) ──────────────────────────────────────
 
+#[derive(Clone, Copy)]
+struct BlockMarkers {
+    search: &'static str,
+    separator: &'static str,
+    replace: &'static str,
+}
+
+const STANDARD_BLOCK_MARKERS: BlockMarkers = BlockMarkers {
+    search: "<<<<<<< SEARCH",
+    separator: "=======",
+    replace: ">>>>>>> REPLACE",
+};
+const LITERAL_SAFE_BLOCK_MARKERS: BlockMarkers = BlockMarkers {
+    search: "<<<<<<<<<<< SEARCH",
+    separator: "===========",
+    replace: ">>>>>>>>>>> REPLACE",
+};
+
 fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
     let mut blocks = Vec::new();
-    let mut in_block = false;
+    let mut markers: Option<BlockMarkers> = None;
     let mut search_lines: Vec<String> = Vec::new();
     let mut replace_lines: Vec<String> = Vec::new();
     let mut phase: u8 = 0;
 
     for line in raw.lines() {
-        match line.trim() {
-            "<<<<<<< SEARCH" => {
-                if in_block {
-                    return Err(ToolError::Msg(
-                        "Nested SEARCH/REPLACE block detected. Close each block with >>>>>>> REPLACE before starting a new one.".to_string(),
-                    ));
-                }
-                in_block = true;
+        if markers.is_none() {
+            markers = if line == STANDARD_BLOCK_MARKERS.search {
+                Some(STANDARD_BLOCK_MARKERS)
+            } else if line == LITERAL_SAFE_BLOCK_MARKERS.search {
+                Some(LITERAL_SAFE_BLOCK_MARKERS)
+            } else {
+                None
+            };
+            if markers.is_some() {
                 search_lines.clear();
                 replace_lines.clear();
                 phase = 1;
             }
-            "=======" if phase == 1 => {
-                phase = 2;
+            continue;
+        }
+
+        let active = markers.expect("active block markers");
+        if phase == 1 && line == active.separator {
+            phase = 2;
+        } else if phase == 2 && line == active.replace {
+            let search = search_lines.join("\n");
+            if search.trim().is_empty() {
+                return Err(ToolError::Msg(format!(
+                    "Block {} has empty search text (or whitespace-only text). Each block must have a non-whitespace SEARCH section.",
+                    blocks.len() + 1
+                )));
             }
-            ">>>>>>> REPLACE" if phase == 2 => {
-                let search = search_lines.join("\n");
-                if search.is_empty() {
-                    return Err(ToolError::Msg(format!(
-                        "Block {} has empty search text. Each block must have a non-empty SEARCH section.",
-                        blocks.len() + 1
-                    )));
-                }
-                blocks.push(EditBlock {
-                    search,
-                    replace: replace_lines.join("\n"),
-                });
-                in_block = false;
-                phase = 0;
-            }
-            _ if phase == 1 => {
-                search_lines.push(line.to_string());
-            }
-            _ if phase == 2 => {
-                replace_lines.push(line.to_string());
-            }
-            _ => {}
+            blocks.push(EditBlock {
+                search,
+                replace: replace_lines.join("\n"),
+            });
+            markers = None;
+            phase = 0;
+        } else if phase == 1 {
+            search_lines.push(line.to_string());
+        } else {
+            replace_lines.push(line.to_string());
         }
     }
 
-    if in_block {
+    if markers.is_some() {
         return Err(ToolError::Msg(
-            "Unclosed SEARCH/REPLACE block. Each block must end with >>>>>>> REPLACE.".to_string(),
+            "Unclosed SEARCH/REPLACE block. End it with the REPLACE marker matching the opening marker width."
+                .to_string(),
         ));
     }
 
@@ -136,6 +155,7 @@ enum MatchResult {
     FuzzyApply(usize, usize, f64),
     AmbiguousFuzzy((usize, f64), (usize, f64)),
     FuzzySuggest(usize, f64, String),
+    FuzzyBudgetExceeded,
     NotFound,
 }
 
@@ -238,7 +258,7 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     for start in 0..candidate_count {
         fuzzy_cells = fuzzy_cells.saturating_add(search_chars.saturating_mul(window_chars));
         if fuzzy_cells > MAX_FUZZY_DISTANCE_CELLS {
-            return MatchResult::NotFound;
+            return MatchResult::FuzzyBudgetExceeded;
         }
         if start + window_size < line_chars.len() {
             window_chars = window_chars
@@ -327,6 +347,7 @@ async fn handle_similarity(
     path: &str,
     block: &str,
     content: &str,
+    replace_all: bool,
 ) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     let blocks = parse_blocks(block)?;
     let line_ending = dominant_line_ending(content);
@@ -352,7 +373,16 @@ async fn handle_similarity(
         match find_best_match(content, &search) {
             MatchResult::Exact(pos) => {
                 let count = count_exact_matches(content, &search);
-                if count > 1 {
+                if replace_all {
+                    resolved.extend(content.match_indices(&search).map(|(byte_start, _)| {
+                        ResolvedSim {
+                            byte_start,
+                            byte_end: byte_start + search.len(),
+                            replace: replace.clone(),
+                            note: String::new(),
+                        }
+                    }));
+                } else if count > 1 {
                     let line_starts: Vec<usize> = std::iter::once(0)
                         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
                         .collect();
@@ -378,13 +408,14 @@ async fn handle_similarity(
                         path,
                         match_info.join("\n"),
                     )));
+                } else {
+                    resolved.push(ResolvedSim {
+                        byte_start: pos,
+                        byte_end: pos + search.len(),
+                        replace: replace.clone(),
+                        note: String::new(),
+                    });
                 }
-                resolved.push(ResolvedSim {
-                    byte_start: pos,
-                    byte_end: pos + search.len(),
-                    replace: replace.clone(),
-                    note: String::new(),
-                });
             }
             MatchResult::Normalized(start, end) => {
                 resolved.push(ResolvedSim {
@@ -434,6 +465,12 @@ async fn handle_similarity(
                     preview,
                 )));
             }
+            MatchResult::FuzzyBudgetExceeded => {
+                return Err(ToolError::Msg(format!(
+                    "{label}search text not found exactly or after whitespace normalization in '{}'. The file/search combination exceeds the bounded fuzzy-match budget, so no closest-match suggestion was computed. Read a narrower region, copy the exact text, and retry the edit.",
+                    path,
+                )));
+            }
             MatchResult::NotFound => {
                 return Err(ToolError::Msg(format!(
                     "{label}search text not found in '{}'.\nRead the file and copy the exact text for the SEARCH block, ensuring whitespace and indentation match.",
@@ -454,6 +491,91 @@ async fn handle_similarity(
     }
 
     Ok((notes, ranges))
+}
+
+fn final_edit_spans(ranges: &[(usize, usize, String)]) -> Vec<(usize, usize)> {
+    let mut ordered: Vec<_> = ranges.iter().collect();
+    ordered.sort_by_key(|(start, _, _)| *start);
+
+    let mut delta = 0isize;
+    ordered
+        .into_iter()
+        .map(|(start, end, replacement)| {
+            let final_start = if delta >= 0 {
+                start.saturating_add(delta as usize)
+            } else {
+                start.saturating_sub(delta.unsigned_abs())
+            };
+            let final_end = final_start.saturating_add(replacement.len());
+            delta = delta.saturating_add(replacement.len() as isize - (end - start) as isize);
+            (final_start, final_end)
+        })
+        .collect()
+}
+
+fn clipped_result_line(text: &str) -> String {
+    const MAX_LINE_CHARS: usize = 300;
+    let mut chars = text.chars();
+    let clipped: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
+fn resulting_excerpts(content: &str, edits: &[(usize, usize)]) -> String {
+    const CONTEXT_LINES: usize = 2;
+    const MAX_EXCERPTS: usize = 3;
+    const MAX_LINES_PER_EXCERPT: usize = 12;
+
+    if edits.is_empty() {
+        return String::new();
+    }
+    if content.is_empty() {
+        return "\n\nResulting excerpt:\n(file is empty)".to_string();
+    }
+
+    let spans = line_spans(content);
+    let width = spans.len().to_string().len();
+    let mut rendered = String::new();
+    for (excerpt_index, (start, end)) in edits.iter().take(MAX_EXCERPTS).enumerate() {
+        let start_line = spans
+            .iter()
+            .position(|span| *start < span.full_end)
+            .unwrap_or_else(|| spans.len().saturating_sub(1));
+        let end_byte = end.saturating_sub(1).max(*start);
+        let end_line = spans
+            .iter()
+            .position(|span| end_byte < span.full_end)
+            .unwrap_or_else(|| spans.len().saturating_sub(1));
+        let window_start = start_line.saturating_sub(CONTEXT_LINES);
+        let requested_end = end_line.saturating_add(CONTEXT_LINES + 1).min(spans.len());
+        let window_end = requested_end.min(window_start.saturating_add(MAX_LINES_PER_EXCERPT));
+
+        if excerpt_index == 0 {
+            rendered.push_str("\n\nResulting excerpt:");
+        } else {
+            rendered.push_str("\n\nNext edited region:");
+        }
+        for (line_index, span) in spans[window_start..window_end].iter().enumerate() {
+            let line_number = window_start + line_index + 1;
+            rendered.push_str(&format!(
+                "\n{line_number:>width$}| {}",
+                clipped_result_line(span.text)
+            ));
+        }
+        if window_end < requested_end || end_line >= window_end {
+            rendered.push_str("\n… excerpt truncated …");
+        }
+    }
+    if edits.len() > MAX_EXCERPTS {
+        rendered.push_str(&format!(
+            "\n\n… {} additional edited region(s) omitted …",
+            edits.len() - MAX_EXCERPTS
+        ));
+    }
+    rendered
 }
 
 // ── V2: Hashedit (tag-based) ────────────────────────────────────────────
@@ -657,8 +779,8 @@ fn reject_overlapping_ranges(
     ordered.sort();
     for pair in ordered.windows(2) {
         let (a_start, a_end, a_idx) = pair[0];
-        let (b_start, b_end, b_idx) = pair[1];
-        if b_start < a_end || (a_start == b_start && a_end == b_end) {
+        let (b_start, _b_end, b_idx) = pair[1];
+        if b_start < a_end || a_start == b_start {
             let (first, second) = if a_idx < b_idx {
                 (pair[0], pair[1])
             } else {
@@ -689,7 +811,7 @@ impl Tool for EditTool {
 
     fn description(&self) -> String {
         match edit_system() {
-            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Each block finds exact text and replaces it. Multiple blocks in one call are applied atomically. If the search text is not an exact match, whitespace normalization and fuzzy matching are attempted as fallbacks.".to_string(),
+            EditSystem::Similarity => "Edit a file using aider-style SEARCH/REPLACE blocks. Markers must start at column 0. Use the 11-character literal-safe markers when the content itself contains <<<<<<< SEARCH, =======, or >>>>>>> REPLACE lines. Each block finds exact text and replaces it; multiple blocks are atomic. Set replace_all to replace every exact occurrence. If exact matching fails, whitespace normalization and fuzzy matching are attempted for one target.".to_string(),
             EditSystem::Hashedit => "Edit a file using tag-based line references. Copy tagged lines from read output. Edit is CAS-guarded via file-level CRC-32 hash. All edits in one call are applied atomically.".to_string(),
         }
     }
@@ -700,7 +822,8 @@ impl Tool for EditTool {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
-                    "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file." }
+                    "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks. Markers must begin at column 0. Standard form:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nIf searched or replacement content contains any standard marker as a full line, use literal-safe markers instead:\n<<<<<<<<<<< SEARCH\ncontent including <<<<<<< SEARCH or =======\n===========\nreplacement including >>>>>>> REPLACE\n>>>>>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file." },
+                    "replace_all": { "type": "boolean", "default": false, "description": "Replace every exact, non-overlapping occurrence of each SEARCH block. When false, each SEARCH block must identify one unique target." }
                 },
                 "required": ["path", "block"]
             }),
@@ -814,15 +937,17 @@ impl Tool for EditTool {
 
         // Determine mode: V1 (block) or V2 (edits)
         let (notes, mut ranges) = if let Some(ref block) = args.block {
-            handle_similarity(&path, block, &content).await?
+            handle_similarity(&path, block, &content, args.replace_all).await?
         } else if let (Some(file_crc), Some(edits)) = (&args.file_crc, &args.edits) {
+            if args.replace_all {
+                return Err(ToolError::Msg(
+                    "'replace_all' is only supported with SEARCH/REPLACE blocks.".to_string(),
+                ));
+            }
             handle_hashedit(&path, file_crc, edits, &content).await?
-        } else if args.block.is_some() {
-            // block was Some but empty or parse failed — handle_similarity already errored
-            unreachable!()
         } else {
             return Err(ToolError::Msg(
-                "Provide either 'block' (SEARCH/REPLACE) or 'file_crc'+'edits' (hashedit). Use /editsys to check the current mode."
+                "Provide either 'block' (SEARCH/REPLACE) or 'file_crc'+'edits' (hashedit). Inspect the edit tool schema and the latest read output to choose the active format."
                     .to_string(),
             ));
         };
@@ -835,6 +960,8 @@ impl Tool for EditTool {
             "Edit"
         };
         reject_overlapping_ranges(&ranges, &content, edit_label)?;
+
+        let resulting_spans = final_edit_spans(&ranges);
 
         // Apply last-to-first so earlier byte positions remain valid
         ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
@@ -852,6 +979,7 @@ impl Tool for EditTool {
         }
 
         let output = modified;
+        let excerpts = resulting_excerpts(&output, &resulting_spans);
 
         if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
             workspace.replace_relative_atomic(relative, output.as_bytes(), expected)?;
@@ -883,6 +1011,7 @@ impl Tool for EditTool {
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }
+        result.push_str(&excerpts);
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);
         }
@@ -911,7 +1040,7 @@ impl Tool for EditTool {
 
 #[cfg(test)]
 mod match_excerpt_tests {
-    use super::bounded_match_excerpt;
+    use super::{bounded_match_excerpt, resulting_excerpts};
 
     #[test]
     fn non_exact_match_excerpt_is_bounded_on_character_boundaries() {
@@ -921,6 +1050,18 @@ mod match_excerpt_tests {
         assert_eq!(excerpt.chars().count(), 241);
         assert!(excerpt.ends_with('…'));
         assert_eq!(excerpt.trim_end_matches('…'), "é".repeat(240));
+    }
+
+    #[test]
+    fn resulting_excerpt_is_bounded_on_character_boundaries() {
+        let content = format!("before\n{}\nafter\n", "é".repeat(400));
+        let start = "before\n".len();
+        let excerpt = resulting_excerpts(&content, &[(start, start + "é".len() * 400)]);
+
+        assert!(excerpt.contains("1| before"));
+        assert!(excerpt.contains(&format!("2| {}…", "é".repeat(300))));
+        assert!(excerpt.contains("3| after"));
+        assert!(!excerpt.contains(&"é".repeat(301)));
     }
 }
 
@@ -988,6 +1129,7 @@ mod tests {
         let error = tool
             .call(EditArgs {
                 path: allowed_link.to_string_lossy().into_owned(),
+                replace_all: false,
                 block: Some(
                     "<<<<<<< SEARCH\noriginal contents\n=======\nmodified contents\n>>>>>>> REPLACE"
                         .to_string(),
@@ -1035,6 +1177,7 @@ mod tests {
 
         let call = tool.call(EditArgs {
             path: link.to_string_lossy().into_owned(),
+            replace_all: false,
             block: Some(
                 "<<<<<<< SEARCH\noriginal checked contents\n=======\nmodified checked contents\n>>>>>>> REPLACE"
                     .to_string(),

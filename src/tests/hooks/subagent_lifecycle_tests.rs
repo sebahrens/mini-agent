@@ -47,34 +47,47 @@ fn ctx() -> HookCtx {
 #[tokio::test]
 async fn subagent_start_with_no_hooks_returns_no_context() {
     let dispatcher = Arc::new(HookDispatcher::from_config(&HashMap::new()).unwrap());
-    let extra = gate_subagent_start(&dispatcher, &ctx(), "explore").await;
+    let extra = gate_subagent_start(&dispatcher, &ctx(), "explore", "compiled-in explorer").await;
     assert!(extra.is_none());
 }
 
 #[tokio::test]
-async fn subagent_start_matches_cc_style_agent_type_name() {
+async fn subagent_start_matches_resolved_specialist_type_name() {
     let dispatcher = dispatcher_with(
         "SubagentStart",
-        Some("Explore"),
+        Some("rust-security-review"),
         vec![handler(
             r#"echo '{"additionalContext":"extra background"}'"#,
         )],
     );
-    let extra = gate_subagent_start(&dispatcher, &ctx(), "explore").await;
+    let extra = gate_subagent_start(
+        &dispatcher,
+        &ctx(),
+        "rust-security-review",
+        "compiled-in default",
+    )
+    .await;
     assert_eq!(extra.as_deref(), Some("extra background"));
 }
 
 #[tokio::test]
 async fn subagent_start_no_decision_returns_no_context() {
     let dispatcher = dispatcher_with("SubagentStart", None, vec![handler("true")]);
-    let extra = gate_subagent_start(&dispatcher, &ctx(), "explore").await;
+    let extra = gate_subagent_start(&dispatcher, &ctx(), "explore", "compiled-in explorer").await;
     assert!(extra.is_none());
 }
 
 #[tokio::test]
 async fn subagent_stop_no_hooks_releases() {
     let dispatcher = Arc::new(HookDispatcher::from_config(&HashMap::new()).unwrap());
-    let gate = gate_subagent_stop(&dispatcher, &ctx(), "explore", false).await;
+    let gate = gate_subagent_stop(
+        &dispatcher,
+        &ctx(),
+        "explore",
+        "compiled-in explorer",
+        false,
+    )
+    .await;
     assert!(matches!(gate, SubagentStopGate::Release));
 }
 
@@ -87,7 +100,14 @@ async fn subagent_stop_block_forces_continuation_with_reason() {
             r#"echo '{"decision":"block","reason":"keep digging"}'"#,
         )],
     );
-    let gate = gate_subagent_stop(&dispatcher, &ctx(), "explore", false).await;
+    let gate = gate_subagent_stop(
+        &dispatcher,
+        &ctx(),
+        "explore",
+        "compiled-in explorer",
+        false,
+    )
+    .await;
     match gate {
         SubagentStopGate::Continue { reason } => assert_eq!(reason, "keep digging"),
         SubagentStopGate::Release => panic!("expected Continue"),

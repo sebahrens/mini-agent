@@ -611,8 +611,9 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
         format!("\n\n…[section omitted: {title}]")
     }
 
-    /// The block injected into the system prompt every turn, assembled from up
-    /// to four sections in priority order (highest first): scratchpad open
+    /// The block refreshed at each user-turn boundary and injected into the
+    /// system prompt when its content changes, assembled from up to four
+    /// sections in priority order (highest first): scratchpad open
     /// items, the newest selected daily log, long-term memory (MEMORY.md), and
     /// the second-newest selected daily log. See `recent_daily_logs` for how
     /// the two daily logs are chosen. Notes are deliberately excluded.

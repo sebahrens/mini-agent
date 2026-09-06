@@ -28,8 +28,8 @@ use crate::extras::js::broker::{SkillCallAuthority, SkillExportAuthoritySpec};
 #[cfg(feature = "skills")]
 use crate::extras::js::protocol::SkillCallRequest;
 use crate::extras::js::protocol::{
-    AdvisoryAttribution, EffectErrorCode, EffectRequest, HttpMethod, InvocationId, RunStep,
-    SkillProposalDraft, StepOutcome,
+    AdvisoryAttribution, EffectErrorCode, EffectRequest, GrepOptions, HttpMethod, InvocationId,
+    RunStep, SkillProposalDraft, StepOutcome,
 };
 #[cfg(feature = "skills")]
 use crate::extras::js::skills::{
@@ -178,12 +178,21 @@ impl ParentEffectService for RecordingService {
 
 fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, HostEffectError> {
     match operation {
-        EffectOperation::ReadFile { path } => Ok(NormalizedTarget::ReadFile {
+        EffectOperation::ReadFiles { paths } => Ok(NormalizedTarget::ReadFiles {
+            workspace_relative: paths.iter().cloned().map(Some).collect(),
+        }),
+        EffectOperation::ReadFile { path }
+        | EffectOperation::ListDir { path }
+        | EffectOperation::Glob { path, .. }
+        | EffectOperation::Grep { path, .. } => Ok(NormalizedTarget::ReadFile {
             workspace_relative: Some(path.clone()),
         }),
         EffectOperation::WriteFile { path, .. } => Ok(NormalizedTarget::WriteFile {
             workspace_relative: Some(path.clone()),
         }),
+        EffectOperation::Result { .. }
+        | EffectOperation::ScratchPut { .. }
+        | EffectOperation::ScratchGet { .. } => Ok(NormalizedTarget::SessionState),
         EffectOperation::Fetch { url, method, .. } => {
             let url = reqwest::Url::parse(url).map_err(|_| HostEffectError::InvalidTarget)?;
             Ok(NormalizedTarget::Fetch {
@@ -205,7 +214,13 @@ fn normalized_target(operation: &EffectOperation) -> Result<NormalizedTarget, Ho
 
 fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
     match operation {
-        EffectOperation::ReadFile { path } => AuthorizedTarget::ReadFile {
+        EffectOperation::ReadFiles { paths } => AuthorizedTarget::ReadFiles {
+            canonical_paths: paths.clone(),
+        },
+        EffectOperation::ReadFile { path }
+        | EffectOperation::ListDir { path }
+        | EffectOperation::Glob { path, .. }
+        | EffectOperation::Grep { path, .. } => AuthorizedTarget::ReadFile {
             canonical_path: path.clone(),
         },
         EffectOperation::WriteFile { path, .. } => AuthorizedTarget::WriteFile {
@@ -221,6 +236,21 @@ fn authorized_target(operation: &EffectOperation) -> AuthorizedTarget {
         },
         EffectOperation::Spawn { program, .. } => AuthorizedTarget::Spawn {
             resolved_executable: program.clone(),
+        },
+        EffectOperation::Result { json } => AuthorizedTarget::SessionState {
+            operation: "result",
+            key: None,
+            encoded_bytes: json.len(),
+        },
+        EffectOperation::ScratchPut { key, json } => AuthorizedTarget::SessionState {
+            operation: "scratch_put",
+            key: Some(key.clone()),
+            encoded_bytes: json.len(),
+        },
+        EffectOperation::ScratchGet { key } => AuthorizedTarget::SessionState {
+            operation: "scratch_get",
+            key: Some(key.clone()),
+            encoded_bytes: 0,
         },
         EffectOperation::ProposeSkill { .. } => AuthorizedTarget::ProposeSkill,
     }
@@ -317,6 +347,71 @@ fn operation_cases(invocation_id: &InvocationId) -> Vec<OperationCase> {
             },
             advisory: AdvisoryAttribution::default(),
         },
+        OperationCase {
+            name: "scratch_put",
+            operation: EffectOperation::ScratchPut {
+                key: "turn:1".into(),
+                json: "[1,2,3]".into(),
+            },
+            capability: HostCapability::SessionState,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-put".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+        OperationCase {
+            name: "scratch_get",
+            operation: EffectOperation::ScratchGet {
+                key: "turn:1".into(),
+            },
+            capability: HostCapability::SessionState,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-get".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
+        OperationCase {
+            name: "list_dir",
+            operation: EffectOperation::ListDir {
+                path: "docs".into(),
+            },
+            capability: HostCapability::ReadFile,
+            principal: skill("list"),
+            advisory: advisory("list"),
+        },
+        OperationCase {
+            name: "glob",
+            operation: EffectOperation::Glob {
+                path: "docs".into(),
+                pattern: "**/*.md".into(),
+            },
+            capability: HostCapability::ReadFile,
+            principal: skill("glob"),
+            advisory: advisory("glob"),
+        },
+        OperationCase {
+            name: "grep",
+            operation: EffectOperation::Grep {
+                path: "docs".into(),
+                pattern: "needle".into(),
+                options: GrepOptions::default(),
+            },
+            capability: HostCapability::ReadFile,
+            principal: skill("grep"),
+            advisory: advisory("grep"),
+        },
+        // Terminal operations belong last in fixtures that exercise one live invocation.
+        OperationCase {
+            name: "result",
+            operation: EffectOperation::Result {
+                json: "{\"ok\":true}".into(),
+            },
+            capability: HostCapability::SessionState,
+            principal: GrantPrincipal::ModelAuthored {
+                tool_call_id: "tool-call-result".into(),
+            },
+            advisory: AdvisoryAttribution::default(),
+        },
     ]
 }
 
@@ -325,7 +420,25 @@ fn success_for(operation: &EffectOperation) -> EffectResult {
         EffectOperation::ReadFile { .. } => EffectResult::ReadFile {
             content: "contents".into(),
         },
+        EffectOperation::ReadFiles { paths } => EffectResult::ReadFiles {
+            contents: paths.iter().map(|_| "contents".into()).collect(),
+        },
+        EffectOperation::ListDir { .. } => EffectResult::ListDir {
+            entries: Vec::new(),
+            truncated: false,
+        },
+        EffectOperation::Glob { .. } => EffectResult::Glob {
+            paths: Vec::new(),
+            truncated: false,
+        },
+        EffectOperation::Grep { .. } => EffectResult::Grep {
+            matches: Vec::new(),
+            truncated: false,
+        },
         EffectOperation::WriteFile { .. } => EffectResult::WriteFile,
+        EffectOperation::Result { json } => EffectResult::ResultAccepted { json: json.clone() },
+        EffectOperation::ScratchPut { .. } => EffectResult::ScratchPut,
+        EffectOperation::ScratchGet { .. } => EffectResult::ScratchGet { json: None },
         EffectOperation::Fetch { .. } => EffectResult::Fetch {
             status: 200,
             body: "ok".into(),
@@ -406,7 +519,9 @@ fn manifest_for(case: &OperationCase, allow_target: bool) -> CapabilityManifest 
         HostCapability::Spawn => CapabilityScope::Spawn {
             programs: vec![if allow_target { "printf" } else { "echo" }.into()],
         },
-        HostCapability::ProposeSkill => unreachable!("skill manifests cannot propose skills"),
+        HostCapability::SessionState | HostCapability::ProposeSkill => {
+            unreachable!("skill manifests cannot grant agent-only capabilities")
+        }
     };
     CapabilityManifest::new(CapabilityTier::SideEffecting, vec![grant]).unwrap()
 }
@@ -561,7 +676,7 @@ async fn scoped_capability_intersection_enforces_manifest_before_session_permiss
     let invocation_id = invocation("inv-scoped-cross-product");
     for case in operation_cases(&invocation_id)
         .into_iter()
-        .filter(|case| case.capability != HostCapability::ProposeSkill)
+        .filter(|case| matches!(case.principal, GrantPrincipal::Skill { .. }))
     {
         let allowed = scoped_skill_grant(
             &case,
@@ -1718,9 +1833,50 @@ async fn worker_broker_grants_never_allow_a_skill_to_propose_another_skill() {
         artifact_id: Some("artifact-proposer".into()),
         export: Some("propose".into()),
     };
-    let skill_grant = grant(
+    // Construct the impossible grant directly to prove the broker remains
+    // fail-closed even if a compromised caller bypasses manifest issuance.
+    let skill_grant = InvocationGrant::issue(
+        invocation_id.clone(),
+        case.principal.clone(),
+        BTreeSet::from([HostCapability::ProposeSkill]),
+        Instant::now() + Duration::from_secs(30),
+    );
+
+    assert_denied_before_execute(
         &case,
-        &invocation_id,
+        HostEffectError::CapabilityDenied,
+        skill_grant,
+        invocation_id,
+        HostCapability::all(),
+        ServiceFailures::default(),
+        PermCancellation::new(),
+        |_| {},
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn worker_broker_grants_never_allow_a_skill_to_use_session_state() {
+    let invocation_id = invocation("inv-skill-session-state");
+    let mut case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.name == "result")
+        .unwrap();
+    case.principal = GrantPrincipal::Skill {
+        artifact_id: "artifact-session-state".into(),
+        export: "result".into(),
+        invocation_id: invocation_id.to_string(),
+    };
+    case.advisory = AdvisoryAttribution {
+        artifact_id: Some("artifact-session-state".into()),
+        export: Some("result".into()),
+    };
+    // Construct the impossible grant directly to prove the broker remains
+    // fail-closed even if a compromised caller bypasses manifest issuance.
+    let skill_grant = InvocationGrant::issue(
+        invocation_id.clone(),
+        case.principal.clone(),
+        BTreeSet::from([HostCapability::SessionState]),
         Instant::now() + Duration::from_secs(30),
     );
 
@@ -2196,8 +2352,24 @@ fn audit_bytes(owner: &EffectAuditPathOwner) -> Vec<u8> {
 
 fn raw_effect_fragments(operation: &EffectOperation) -> Vec<&str> {
     match operation {
-        EffectOperation::ReadFile { path } => vec![path],
+        EffectOperation::ReadFile { path } | EffectOperation::ListDir { path } => vec![path],
+        EffectOperation::ReadFiles { paths } => paths.iter().map(String::as_str).collect(),
+        EffectOperation::Glob { path, pattern } => vec![path, pattern],
+        EffectOperation::Grep {
+            path,
+            pattern,
+            options,
+        } => {
+            let mut fragments = vec![path.as_str(), pattern.as_str()];
+            if let Some(include) = &options.include {
+                fragments.push(include);
+            }
+            fragments
+        }
         EffectOperation::WriteFile { path, content } => vec![path, content],
+        EffectOperation::Result { json } => vec![json],
+        EffectOperation::ScratchPut { key, json } => vec![key, json],
+        EffectOperation::ScratchGet { key } => vec![key],
         EffectOperation::Fetch { .. } => vec!["example.test", "/api"],
         EffectOperation::Spawn { program, arguments } => {
             let mut fragments = vec![program.as_str()];
@@ -2521,9 +2693,14 @@ async fn js_effect_audit_ordering_records_attempt_outcomes_and_denies_replay() {
                 .await
                 .is_ok()
         );
+        let expected_replay = if case.name == "result" {
+            HostEffectError::InvocationTerminal
+        } else {
+            HostEffectError::AuditFailure
+        };
         assert_eq!(
             broker.dispatch(effect, PermCancellation::new()).await,
-            Err(HostEffectError::AuditFailure),
+            Err(expected_replay),
             "{} duplicate was accepted",
             case.name
         );
@@ -2553,6 +2730,8 @@ async fn js_effect_audit_ordering_completion_append_failure_recovers_unknown() {
             Arc::new(Mutex::new(audit)),
         )
         .unwrap();
+        let receipt = crate::extras::js::session::StructuredResultReceipt::default();
+        broker = broker.with_structured_result_receipt(receipt.clone());
         broker.fail_next_completion_durability_for_test(AuditFailurePoint::Append);
 
         assert_eq!(
@@ -2566,6 +2745,9 @@ async fn js_effect_audit_ordering_completion_append_failure_recovers_unknown() {
         assert_eq!(service_record.lock().unwrap().effects, 1);
         assert_eq!(broker.audit_records_for_test().len(), 1);
         assert_eq!(broker.audit_records_for_test()[0].state, AuditState::Intent);
+        if case.name == "result" {
+            assert_eq!(receipt.accepted().unwrap(), None);
+        }
         drop(broker);
 
         let recovered = EffectAudit::open(owner).unwrap();

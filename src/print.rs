@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write as IoWrite};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
-use rig::completion::Message;
+use rig::completion::{Message, Usage};
 use rig::message::{AssistantContent, ToolResultContent, UserContent};
+use serde::Serialize;
 
 use crate::cli;
 use crate::config;
@@ -18,6 +21,230 @@ const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 /// non-ASCII ids, where a byte slice (`&id[..8]`) would panic.
 pub(crate) fn short_session_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspacePathState {
+    status: [u8; 2],
+    size: Option<u64>,
+    modified_nanos: Option<u128>,
+    kind: Option<u8>,
+}
+
+/// A bounded Git view of workspace paths that differ from `HEAD`. The
+/// metadata fields let a later snapshot notice another edit to a path that
+/// was already dirty when the headless run started.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceChangeBaseline {
+    paths: BTreeMap<String, WorkspacePathState>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct HeadlessToolCalls {
+    pub total: u64,
+    pub by_name: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct HeadlessJsonOutput {
+    pub result: String,
+    pub files_changed: Vec<String>,
+    pub tool_calls: HeadlessToolCalls,
+    pub usage: Usage,
+    pub cost: f64,
+    pub stop_reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadlessPricing {
+    pub anthropic_native: bool,
+    pub input_token_cost: f64,
+    pub output_token_cost: f64,
+}
+
+fn parse_git_status(output: &[u8]) -> BTreeMap<String, [u8; 2]> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            if record.len() < 4 || record[2] != b' ' {
+                return None;
+            }
+            let path = String::from_utf8_lossy(&record[3..]).into_owned();
+            (!path.is_empty()).then_some((path, [record[0], record[1]]))
+        })
+        .collect()
+}
+
+fn workspace_path_state(root: &Path, path: &str, status: [u8; 2]) -> WorkspacePathState {
+    let metadata = std::fs::symlink_metadata(root.join(path)).ok();
+    let kind = metadata.as_ref().map(|metadata| {
+        let file_type = metadata.file_type();
+        if file_type.is_file() {
+            1
+        } else if file_type.is_dir() {
+            2
+        } else if file_type.is_symlink() {
+            3
+        } else {
+            4
+        }
+    });
+    WorkspacePathState {
+        status,
+        size: metadata.as_ref().map(std::fs::Metadata::len),
+        modified_nanos: metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos()),
+        kind,
+    }
+}
+
+/// Capture the paths currently dirty in Git. Failure (including a non-Git
+/// workspace) is deliberately non-fatal: explicit mutation tool targets can
+/// still populate the JSON result.
+pub(crate) async fn capture_workspace_change_baseline(
+    root: &Path,
+) -> Option<WorkspaceChangeBaseline> {
+    let runner = crate::git::runner::GitRunner::discover().ok()?;
+    let output = runner
+        .run(
+            root,
+            "headless-output-status",
+            [
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
+            crate::git::runner::QUERY_LIMITS,
+        )
+        .await
+        .ok()?;
+    let root = root.to_path_buf();
+    let statuses = parse_git_status(&output.stdout);
+    let paths = tokio::task::spawn_blocking(move || {
+        statuses
+            .into_iter()
+            .map(|(path, status)| {
+                let state = workspace_path_state(&root, &path, status);
+                (path, state)
+            })
+            .collect()
+    })
+    .await
+    .ok()?;
+    Some(WorkspaceChangeBaseline { paths })
+}
+
+fn normalize_tool_path(root: &Path, raw: &str) -> Option<String> {
+    let path = Path::new(raw);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let relative: PathBuf = if path.is_absolute() {
+        path.strip_prefix(root).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then(|| normalized.to_string_lossy().into_owned())
+}
+
+fn interaction_summary(
+    root: &Path,
+    interactions: &[Message],
+) -> (HeadlessToolCalls, BTreeSet<String>) {
+    let mut by_name = BTreeMap::<String, u64>::new();
+    let mut files = BTreeSet::new();
+    for interaction in interactions {
+        let Message::Assistant { content, .. } = interaction else {
+            continue;
+        };
+        for item in content.iter() {
+            let AssistantContent::ToolCall(call) = item else {
+                continue;
+            };
+            *by_name.entry(call.function.name.clone()).or_default() += 1;
+            if matches!(call.function.name.as_str(), "write" | "edit")
+                && let Some(path) = call
+                    .function
+                    .arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|path| normalize_tool_path(root, path))
+            {
+                files.insert(path);
+            }
+        }
+    }
+    let total = by_name.values().copied().sum();
+    (HeadlessToolCalls { total, by_name }, files)
+}
+
+pub(crate) async fn files_changed_since(
+    root: &Path,
+    baseline: Option<&WorkspaceChangeBaseline>,
+    interactions: &[Message],
+) -> Vec<String> {
+    let (_, mut files) = interaction_summary(root, interactions);
+    let after = capture_workspace_change_baseline(root).await;
+    if let (Some(before), Some(after)) = (baseline, after.as_ref()) {
+        for path in before.paths.keys().chain(after.paths.keys()) {
+            if before.paths.get(path) != after.paths.get(path) {
+                files.insert(path.clone());
+            }
+        }
+    }
+    files.into_iter().collect()
+}
+
+pub(crate) fn render_headless_json(
+    root: &Path,
+    result: &str,
+    interactions: &[Message],
+    usage: Usage,
+    files_changed: Vec<String>,
+    pricing: HeadlessPricing,
+) -> serde_json::Result<String> {
+    let (tool_calls, explicit_files) = interaction_summary(root, interactions);
+    let files_changed = files_changed
+        .into_iter()
+        .chain(explicit_files)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let billable_input = crate::pricing::billable_input_tokens(
+        pricing.anthropic_native,
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    let cost = crate::pricing::estimate_cost(
+        billable_input,
+        usage.output_tokens,
+        pricing.input_token_cost,
+        pricing.output_token_cost,
+    );
+    let cost = if cost.is_finite() { cost } else { 0.0 };
+    serde_json::to_string(&HeadlessJsonOutput {
+        result: result.to_string(),
+        files_changed,
+        tool_calls,
+        usage,
+        cost,
+        stop_reason: "completed",
+    })
 }
 
 /// Persist one completed headless (`-p`) turn in the same record order the
@@ -558,9 +785,14 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
 mod tests {
     use std::io;
 
+    use rig::OneOrMany;
+    use rig::completion::{Message, Usage};
+    use rig::message::AssistantContent;
+
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, javascript_worker_compiled_entry, write_output,
+        installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
+        render_headless_json, write_output,
     };
 
     struct BrokenPipeWriter;
@@ -595,6 +827,124 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    #[test]
+    fn git_status_parser_preserves_nul_delimited_paths() {
+        let parsed = parse_git_status(b" M src/main.rs\0?? path with spaces\nline.rs\0");
+        assert_eq!(parsed.get("src/main.rs"), Some(b" M"));
+        assert_eq!(parsed.get("path with spaces\nline.rs"), Some(b"??"));
+    }
+
+    #[test]
+    fn headless_json_reports_tool_stats_files_usage_and_invocation_cost() {
+        let root = std::env::temp_dir().join("mini-agent-headless-json-test");
+        let absolute_edit = root.join("src/lib.rs").to_string_lossy().into_owned();
+        let interactions = vec![
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "read-1",
+                    "read",
+                    serde_json::json!({"path": "src/lib.rs"}),
+                )),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "edit-1",
+                    "edit",
+                    serde_json::json!({"path": absolute_edit}),
+                )),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "write-1",
+                    "write",
+                    serde_json::json!({"path": "./docs/report.md"}),
+                )),
+            },
+        ];
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_tokens: 1_500,
+            cached_input_tokens: 100,
+            cache_creation_input_tokens: 200,
+            ..Usage::default()
+        };
+
+        let rendered = render_headless_json(
+            &root,
+            "finished",
+            &interactions,
+            usage,
+            vec!["git-only.rs".to_string()],
+            super::HeadlessPricing {
+                anthropic_native: true,
+                input_token_cost: 3.0,
+                output_token_cost: 15.0,
+            },
+        )
+        .expect("headless JSON should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).expect("headless output should be one JSON value");
+
+        assert_eq!(value["result"], "finished");
+        assert_eq!(value["stop_reason"], "completed");
+        assert_eq!(value["tool_calls"]["total"], 3);
+        assert_eq!(value["tool_calls"]["by_name"]["edit"], 1);
+        assert_eq!(value["tool_calls"]["by_name"]["read"], 1);
+        assert_eq!(value["tool_calls"]["by_name"]["write"], 1);
+        assert_eq!(value["usage"]["total_tokens"], 1_500);
+        assert_eq!(
+            value["files_changed"],
+            serde_json::json!(["docs/report.md", "git-only.rs", "src/lib.rs"])
+        );
+        assert!((value["cost"].as_f64().unwrap() - 0.01128).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn workspace_change_snapshot_reports_only_invocation_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-headless-change-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let runner = crate::git::runner::GitRunner::discover().expect("Git should be available");
+        runner
+            .run(
+                &root,
+                "headless-output-test-init",
+                ["init", "--quiet"],
+                crate::git::runner::LOCAL_MUTATION_LIMITS,
+            )
+            .await
+            .expect("temporary repository should initialize");
+
+        let clean = super::capture_workspace_change_baseline(&root).await;
+        std::fs::write(root.join("new file.rs"), "one").unwrap();
+        assert_eq!(
+            super::files_changed_since(&root, clean.as_ref(), &[]).await,
+            ["new file.rs"]
+        );
+
+        let already_dirty = super::capture_workspace_change_baseline(&root).await;
+        assert!(
+            super::files_changed_since(&root, already_dirty.as_ref(), &[])
+                .await
+                .is_empty(),
+            "an unchanged pre-existing dirty path is not attributed to this run"
+        );
+        std::fs::write(root.join("new file.rs"), "longer content").unwrap();
+        assert_eq!(
+            super::files_changed_since(&root, already_dirty.as_ref(), &[]).await,
+            ["new file.rs"],
+            "metadata detects another edit to a path that was already dirty"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

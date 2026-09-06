@@ -1,11 +1,13 @@
 use std::io;
 use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::Color;
+use rig::message::Message;
 use tokio::sync::mpsc;
 
 use crate::config;
@@ -17,7 +19,7 @@ use crate::sandbox::CommandCancellation;
 use crate::sandbox::{
     CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
 };
-use crate::session::{MessageRole, Session};
+use crate::session::{GitStatus, MessageRole, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
@@ -49,6 +51,24 @@ use super::{C_PERM, apply_current_prompt_mode};
 
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
+
+#[derive(Debug)]
+struct GitStatusRefresh {
+    working_dir: PathBuf,
+    snapshot: Option<GitStatus>,
+}
+
+fn apply_git_status_refresh(
+    session: &mut Session,
+    workspace_root: &Path,
+    refresh: GitStatusRefresh,
+) -> bool {
+    if refresh.working_dir != workspace_root {
+        return false;
+    }
+    session.git_status = refresh.snapshot;
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MidTurnPressureAction {
@@ -133,6 +153,48 @@ mod ctrl_h_tests {
     }
 }
 
+#[cfg(test)]
+mod git_status_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn late_refresh_cannot_replace_status_after_a_workspace_switch() {
+        let mut session = Session::new("openai", "model", 128_000, "");
+        session.git_status = Some(GitStatus {
+            modified: 1,
+            ..GitStatus::default()
+        });
+        let cached = session.git_status.clone();
+
+        assert!(!apply_git_status_refresh(
+            &mut session,
+            Path::new("/current"),
+            GitStatusRefresh {
+                working_dir: PathBuf::from("/previous"),
+                snapshot: Some(GitStatus {
+                    untracked: 9,
+                    ..GitStatus::default()
+                }),
+            },
+        ));
+        assert_eq!(session.git_status, cached);
+
+        let current = GitStatus {
+            staged: 2,
+            ..GitStatus::default()
+        };
+        assert!(apply_git_status_refresh(
+            &mut session,
+            Path::new("/current"),
+            GitStatusRefresh {
+                working_dir: PathBuf::from("/current"),
+                snapshot: Some(current.clone()),
+            },
+        ));
+        assert_eq!(session.git_status, Some(current));
+    }
+}
+
 pub(crate) fn interrupt_target(
     btw_inflight: usize,
     validation_active: bool,
@@ -158,6 +220,9 @@ pub(crate) struct App<'a> {
     renderer: Renderer,
     input: InputEditor,
     last_branch_check: std::time::Instant,
+    git_status_tx: mpsc::Sender<GitStatusRefresh>,
+    git_status_rx: mpsc::Receiver<GitStatusRefresh>,
+    git_status_in_flight: bool,
     ask_rx: Option<mpsc::Receiver<crate::permission::ask::AskRequest>>,
     #[cfg(feature = "advisor")]
     handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
@@ -194,6 +259,7 @@ impl<'a> App<'a> {
         ask_rx: Option<mpsc::Receiver<crate::permission::ask::AskRequest>>,
         auto_trigger_msg: Option<String>,
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
+        #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
         let terminal_guard = TerminalGuard::new()?;
 
@@ -201,9 +267,6 @@ impl<'a> App<'a> {
         crate::ui::statusline::init(ui.cfg);
 
         ui.session.refresh_git_branch();
-        if crate::ui::statusline::needs_git_status() {
-            ui.session.refresh_git_status();
-        }
         let last_branch_check = std::time::Instant::now();
 
         let mut renderer = Renderer::new()?;
@@ -232,6 +295,7 @@ impl<'a> App<'a> {
         let mut input = InputEditor::new();
         input.set_monochrome(ui.cli.no_color);
         input.set_prompt_names(ui.context.prompts.keys().cloned().collect());
+        input.set_agent_names(ui.context.agent_definitions.keys().cloned().collect());
         input.set_theme_names(ui.context.themes.keys().cloned().collect());
         if let Some(editor) = &ui.cfg.editor {
             input.set_editor(editor.clone());
@@ -383,6 +447,13 @@ impl<'a> App<'a> {
             }
         }
 
+        #[cfg(feature = "hooks")]
+        if auto_trigger_msg.is_some()
+            && let Some(task) = session_start_task.take()
+        {
+            let _ = task.await;
+        }
+
         if let Some(ref trigger_msg) = auto_trigger_msg {
             for line in trigger_msg.lines() {
                 let safe_line = sanitize_output(line);
@@ -391,7 +462,14 @@ impl<'a> App<'a> {
             renderer.write_line("", Color::White)?;
 
             event_handler::ensure_agent(&mut run.agent, &mut ui, slash.reasoning_enabled).await;
-            let initial_turn = AutoTriggerTurn::prepare(ui.session, trigger_msg);
+            run.request_tool_results_cleared = ui
+                .session
+                .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
+            let initial_turn = AutoTriggerTurn::prepare(
+                ui.session,
+                trigger_msg,
+                ui.cfg.resolve_keep_recent_tool_results(),
+            );
             let (prompt, history, pending_turn) = initial_turn.into_runner_inputs();
             let runner = run
                 .agent
@@ -406,6 +484,7 @@ impl<'a> App<'a> {
                     None,
                 )
                 .await;
+            run.compaction_decision_tx = runner.compaction_decision_tx;
             run.agent_rx = Some(runner.event_rx);
             run.main_abort = Some(runner.abort_handle);
             run.is_running = true;
@@ -424,6 +503,10 @@ impl<'a> App<'a> {
         let (prebuild_task, prebuild_scope) = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
             let session_model = ui.session.model.to_string();
+            let tool_output_session_id = ui.session.id.to_string();
+            let tool_result_spills = ui.session.tool_result_spills.clone();
+            #[cfg(feature = "js")]
+            let js_session_state = ui.session.js_session_state.clone();
             let cli_clone = ui.cli.clone();
             let cfg_clone = ui.cfg.clone();
             let context_clone = ui.context.clone();
@@ -432,6 +515,7 @@ impl<'a> App<'a> {
             let ask_tx_clone = ui.ask_tx.clone();
             let sandbox_clone = ui.sandbox.clone();
             let read_tracker_clone = ui.session.read_tracker.clone();
+            let todo_store_clone = ui.session.todos.clone();
             #[cfg(feature = "skills")]
             let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
@@ -469,6 +553,11 @@ impl<'a> App<'a> {
                             ask_tx: &ask_tx_clone,
                             sandbox: &sandbox_clone,
                             read_tracker: &read_tracker_clone,
+                            todo_store: &todo_store_clone,
+                            tool_output_session_id: &tool_output_session_id,
+                            tool_result_spills: &tool_result_spills,
+                            #[cfg(feature = "js")]
+                            js_session_state: &js_session_state,
                             #[cfg(feature = "skills")]
                             skill_services: &skill_services_clone,
                             #[cfg(feature = "mcp")]
@@ -489,9 +578,15 @@ impl<'a> App<'a> {
             (None, None)
         };
 
-        let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
+        #[cfg(feature = "hooks")]
+        if let Some(task) = session_start_task.take() {
+            let _ = task.await;
+        }
 
-        Ok(Self {
+        let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
+        let (git_status_tx, git_status_rx) = mpsc::channel(1);
+
+        let mut app = Self {
             ui,
             run,
             chain,
@@ -499,6 +594,9 @@ impl<'a> App<'a> {
             renderer,
             input,
             last_branch_check,
+            git_status_tx,
+            git_status_rx,
+            git_status_in_flight: false,
             ask_rx,
             #[cfg(feature = "advisor")]
             handoff_rx,
@@ -519,7 +617,28 @@ impl<'a> App<'a> {
             prebuild_task,
             prebuild_scope,
             terminal_guard,
-        })
+        };
+        app.request_git_status_refresh();
+        Ok(app)
+    }
+
+    fn request_git_status_refresh(&mut self) {
+        if self.git_status_in_flight || !crate::ui::statusline::needs_git_status() {
+            return;
+        }
+
+        let working_dir = self.ui.workspace.root().to_path_buf();
+        let tx = self.git_status_tx.clone();
+        self.git_status_in_flight = true;
+        tokio::spawn(async move {
+            let snapshot = Session::detect_git_status(&working_dir).await;
+            let _ = tx
+                .send(GitStatusRefresh {
+                    working_dir,
+                    snapshot,
+                })
+                .await;
+        });
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
@@ -541,13 +660,19 @@ impl<'a> App<'a> {
             self.ui.session.reasoning_enabled = self.slash.reasoning_enabled;
             if self.last_branch_check.elapsed() >= Duration::from_secs(1) {
                 self.ui.session.refresh_git_branch();
-                if crate::ui::statusline::needs_git_status() {
-                    self.ui.session.refresh_git_status();
-                }
+                self.request_git_status_refresh();
                 self.last_branch_check = std::time::Instant::now();
             }
 
             tokio::select! {
+                Some(refresh) = self.git_status_rx.recv() => {
+                    self.git_status_in_flight = false;
+                    if apply_git_status_refresh(self.ui.session, self.ui.workspace.root(), refresh) {
+                        self.refresh()?;
+                    } else {
+                        self.request_git_status_refresh();
+                    }
+                }
                 Some(ev) = self.user_rx.recv() => {
                     match self.handle_user_event(ev).await? {
                         ControlFlow::Break(()) => break,
@@ -1030,6 +1155,10 @@ impl<'a> App<'a> {
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
         let terminal_error = matches!(&event, AgentEvent::Error(_));
+        let compaction_boundary_interactions = match &event {
+            AgentEvent::CompactionBoundary { interactions } => Some(interactions.clone()),
+            _ => None,
+        };
         let failed_turn_has_progress =
             terminal_error && pending_main_turn_has_progress(&self.run, self.ui.session);
         match &event {
@@ -1065,8 +1194,12 @@ impl<'a> App<'a> {
             AgentEvent::Done { .. } => {
                 self.run.turn_trace.clear();
                 self.run.awaiting_compaction_relief = false;
+                self.run.pending_compaction_pressure = None;
             }
-            AgentEvent::Error(_) => self.run.awaiting_compaction_relief = false,
+            AgentEvent::Error(_) => {
+                self.run.awaiting_compaction_relief = false;
+                self.run.pending_compaction_pressure = None;
+            }
             _ => {}
         }
 
@@ -1082,9 +1215,17 @@ impl<'a> App<'a> {
                 ..
             }
         );
+        let awaits_compaction_decision = matches!(
+            &event,
+            AgentEvent::UsageDelta {
+                awaits_compaction_decision: true,
+                ..
+            }
+        );
         let mid_turn_observation = if let AgentEvent::UsageDelta {
             usage,
             context_complete: true,
+            awaits_compaction_decision: true,
         } = &event
             && self.run.is_running
             && !loop_running
@@ -1144,6 +1285,7 @@ impl<'a> App<'a> {
                 self.ui.sandbox.kill_active();
                 self.run.is_running = false;
                 self.run.agent_rx = None;
+                self.run.compaction_decision_tx = None;
                 self.run.agent_line_started = false;
                 self.run.response_buf.clear();
                 self.run.response_start_block = None;
@@ -1168,11 +1310,43 @@ impl<'a> App<'a> {
             self.input.load_text(&text);
         }
 
-        match mid_turn_pressure_action(
+        if let Some(interactions) = compaction_boundary_interactions {
+            let pressure = self.run.pending_compaction_pressure.take().ok_or_else(|| {
+                anyhow::anyhow!("runner reached an unrequested compaction boundary")
+            })?;
+            if let Err(error) = self.mid_turn_compact(pressure, &interactions).await {
+                self.fail_pending_main_turn();
+                return Err(error);
+            }
+            self.run.awaiting_compaction_relief = true;
+            self.refresh()?;
+            return Ok(());
+        }
+
+        let pressure_action = mid_turn_pressure_action(
             self.run.awaiting_compaction_relief,
             context_complete_usage_delta && mid_turn_observation.is_some(),
             mid_turn_pressure.is_some(),
-        ) {
+        );
+        // On irreducible pressure, leave the runner parked on its decision
+        // receive and abort it below; acknowledging Continue would race the
+        // hard stop against the next tool batch.
+        if awaits_compaction_decision
+            && pressure_action != MidTurnPressureAction::StopContextExhausted
+            && let Some(decision_tx) = self.run.compaction_decision_tx.as_ref()
+        {
+            let decision = if pressure_action == MidTurnPressureAction::Compact {
+                crate::agent::runner::CompactionBoundaryDecision::Compact
+            } else {
+                crate::agent::runner::CompactionBoundaryDecision::Continue
+            };
+            if decision_tx.send(decision).await.is_err() && self.run.is_running {
+                self.fail_pending_main_turn();
+                return Err(anyhow::anyhow!("agent compaction boundary channel closed"));
+            }
+        }
+
+        match pressure_action {
             MidTurnPressureAction::StopContextExhausted => {
                 let (real_input_tokens, threshold, _) =
                     mid_turn_pressure.expect("over-threshold action requires measured pressure");
@@ -1185,11 +1359,11 @@ impl<'a> App<'a> {
             MidTurnPressureAction::Compact => {
                 let (_, _, pressure) =
                     mid_turn_pressure.expect("over-threshold action requires measured pressure");
-                if let Err(error) = self.mid_turn_compact(pressure).await {
-                    self.fail_pending_main_turn();
-                    return Err(error);
-                }
-                self.run.awaiting_compaction_relief = true;
+                self.run.pending_compaction_pressure = Some(pressure);
+                self.renderer.write_line(
+                    "context relief requested; waiting for the current tool batch to finish...",
+                    Color::DarkGrey,
+                )?;
             }
             MidTurnPressureAction::ClearReliefLatch => {
                 self.run.awaiting_compaction_relief = false;
@@ -1233,18 +1407,14 @@ impl<'a> App<'a> {
         }
 
         if !self.run.is_running
-            && let Some(restore_name) = self.chain.dot_prompt_restore.take()
+            && let Some(selection) = self.chain.dot_prompt_restore.take()
         {
-            self.ui.context.current_prompt = self.ui.context.prompts.get(&restore_name).cloned();
-            self.ui.context.current_prompt_name = if self.ui.context.current_prompt.is_some() {
-                Some(restore_name)
-            } else {
-                None
-            };
+            self.ui.context.restore_selection(selection);
             if let Some(perm) = &self.ui.permission {
                 let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
                 guard.restore_user_mode();
             }
+            self.run.agent = None;
         }
 
         if !self.run.is_running
@@ -1317,8 +1487,10 @@ impl<'a> App<'a> {
         self.ui.sandbox.kill_active();
         self.run.is_running = false;
         self.run.agent_rx = None;
+        self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
+        self.run.pending_compaction_pressure = None;
         self.run.pending_inputs.clear();
         self.run.agent_line_started = false;
         self.run.response_buf.clear();
@@ -1354,8 +1526,10 @@ impl<'a> App<'a> {
             ss.send_stop();
         }
         self.run.agent_rx = None;
+        self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
+        self.run.pending_compaction_pressure = None;
         self.run.pending_inputs.clear();
         let failed_prompt = (!preserve_progress)
             .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
@@ -1371,17 +1545,13 @@ impl<'a> App<'a> {
         if let Some(text) = failed_prompt {
             self.input.load_text(&text);
         }
-        if let Some(restore_name) = self.chain.dot_prompt_restore.take() {
-            self.ui.context.current_prompt = self.ui.context.prompts.get(&restore_name).cloned();
-            self.ui.context.current_prompt_name = if self.ui.context.current_prompt.is_some() {
-                Some(restore_name)
-            } else {
-                None
-            };
+        if let Some(selection) = self.chain.dot_prompt_restore.take() {
+            self.ui.context.restore_selection(selection);
             if let Some(perm) = &self.ui.permission {
                 let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
                 guard.restore_user_mode();
             }
+            self.run.agent = None;
         }
         if preserve_progress {
             self.settle_success_transaction();
@@ -1527,7 +1697,7 @@ impl<'a> App<'a> {
             let prompt_name = prompt_name.trim();
             let msg = msg.trim();
             if !prompt_name.is_empty() && self.ui.context.prompts.contains_key(prompt_name) {
-                self.chain.dot_prompt_restore = self.ui.context.current_prompt_name.clone();
+                self.chain.dot_prompt_restore = Some(self.ui.context.active_selection());
                 apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
                 apply_prompt_model(
                     prompt_name,
@@ -1632,10 +1802,11 @@ impl<'a> App<'a> {
         }
         let id = self.btw_next_id;
         self.btw_next_id = self.btw_next_id.wrapping_add(1);
-        let snapshot = crate::agent::runner::build_btw_snapshot(
+        let snapshot = crate::agent::runner::build_btw_snapshot_with_tool_result_retention(
             self.ui.session,
             &self.run.turn_trace,
             self.run.is_running,
+            self.ui.cfg.resolve_keep_recent_tool_results(),
         );
         let model = self
             .ui
@@ -1652,6 +1823,8 @@ impl<'a> App<'a> {
             &self.ui.workspace,
             &self.ui.permission,
             &self.ui.ask_tx,
+            &self.ui.session.id,
+            self.ui.session.tool_result_spills.clone(),
             self.slash.reasoning_enabled,
             temperature,
             extra_body,
@@ -1930,7 +2103,15 @@ impl<'a> App<'a> {
                     .unwrap_or("")
                     .to_string();
                 self.ensure_agent().await;
-                let history = crate::agent::runner::convert_history(self.ui.session);
+                self.run.request_tool_results_cleared =
+                    self.ui.session.tool_results_cleared_for_retention(
+                        self.ui.cfg.resolve_keep_recent_tool_results(),
+                    );
+                let history =
+                    crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                        self.ui.session,
+                        self.ui.cfg.resolve_keep_recent_tool_results(),
+                    );
                 let runner = self
                     .run
                     .agent
@@ -1945,6 +2126,7 @@ impl<'a> App<'a> {
                         None,
                     )
                     .await;
+                self.run.compaction_decision_tx = runner.compaction_decision_tx;
                 self.run.agent_rx = Some(runner.event_rx);
                 self.run.main_abort = Some(runner.abort_handle);
                 self.run.is_running = true;
@@ -2039,6 +2221,7 @@ impl<'a> App<'a> {
                         (ls.build_prompt(), ls.iteration_label(), ls.active)
                     };
                     self.ensure_agent().await;
+                    self.run.request_tool_results_cleared = 0;
                     let runner = self
                         .run
                         .agent
@@ -2056,6 +2239,7 @@ impl<'a> App<'a> {
                             }),
                         )
                         .await;
+                    self.run.compaction_decision_tx = runner.compaction_decision_tx;
                     self.run.agent_rx = Some(runner.event_rx);
                     self.run.main_abort = Some(runner.abort_handle);
                     self.run.is_running = true;
@@ -2131,9 +2315,14 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    async fn mid_turn_compact(&mut self, pressure: f64) -> anyhow::Result<()> {
+    async fn mid_turn_compact(
+        &mut self,
+        pressure: f64,
+        interactions: &[Message],
+    ) -> anyhow::Result<()> {
         mid_turn_compact_and_respawn(
             pressure,
+            interactions,
             &mut self.renderer,
             &mut self.run,
             &mut self.ui,
@@ -2763,20 +2952,29 @@ pub(crate) async fn retire_scoped_task(
 
 struct AutoTriggerTurn {
     prompt: String,
-    history: Vec<rig::completion::Message>,
+    history: std::sync::Arc<[rig::completion::Message]>,
     pending_turn: PendingMainTurn,
 }
 
 impl AutoTriggerTurn {
-    fn prepare(session: &Session, prompt: &str) -> Self {
+    fn prepare(session: &Session, prompt: &str, keep_recent_tool_results: usize) -> Self {
         Self {
             prompt: prompt.to_string(),
-            history: crate::agent::runner::convert_history(session),
+            history: crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                session,
+                keep_recent_tool_results,
+            ),
             pending_turn: PendingMainTurn::capture(session, prompt),
         }
     }
 
-    fn into_runner_inputs(self) -> (String, Vec<rig::completion::Message>, PendingMainTurn) {
+    fn into_runner_inputs(
+        self,
+    ) -> (
+        String,
+        std::sync::Arc<[rig::completion::Message]>,
+        PendingMainTurn,
+    ) {
         (self.prompt, self.history, self.pending_turn)
     }
 }
@@ -2792,7 +2990,11 @@ mod initial_turn_tests {
     #[test]
     fn initial_turn_keeps_current_prompt_separate_until_runner_starts() {
         let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
-        let turn = AutoTriggerTurn::prepare(&session, "current prompt");
+        let turn = AutoTriggerTurn::prepare(
+            &session,
+            "current prompt",
+            crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+        );
         let (prompt, history, pending_turn) = turn.into_runner_inputs();
 
         assert_eq!(prompt, "current prompt");
@@ -2816,12 +3018,16 @@ mod initial_turn_tests {
         session.add_message(MessageRole::User, "prior question");
         session.add_message(MessageRole::Assistant, "prior answer");
 
-        let turn = AutoTriggerTurn::prepare(&session, "new question");
+        let turn = AutoTriggerTurn::prepare(
+            &session,
+            "new question",
+            crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+        );
         let (prompt, history, pending_turn) = turn.into_runner_inputs();
 
         assert_eq!(prompt, "new question");
         assert_eq!(
-            history,
+            history.as_ref(),
             vec![
                 Message::user("prior question"),
                 Message::assistant("prior answer")
@@ -2877,10 +3083,28 @@ mod initial_turn_tests {
         expected.total_cache_creation_input_tokens = 5;
         expected.total_cost = 1.25;
         expected.permission_allowlist = session.permission_allowlist.clone();
+        assert!(
+            session
+                .read_tracker
+                .track_read("secret.txt", 0, 100)
+                .is_none()
+        );
+        assert!(
+            session
+                .read_tracker
+                .track_read("secret.txt", 0, 100)
+                .is_some()
+        );
         let restored = crate::ui::rollback_pending_main_turn(&mut run, &mut session);
 
         assert_eq!(restored.as_deref(), Some("retry me"));
         assert!(run.pending_turn.is_none());
+        assert!(
+            session
+                .read_tracker
+                .track_read("secret.txt", 0, 100)
+                .is_none()
+        );
         assert_eq!(
             serde_json::to_value(&session).unwrap(),
             serde_json::to_value(&expected).unwrap()

@@ -52,11 +52,25 @@ pub struct IndexCoordinator {
     store: Mutex<SkillStore>,
     embedder: Arc<Embedder>,
     published: RwLock<Arc<ImmutableSkillIndex>>,
+    routing_key_cache: RwLock<Option<CachedRoutingKey>>,
+    generation_build: Mutex<()>,
     hydrated: AtomicBool,
     rebuild_in_flight: AtomicBool,
     rebuild_backoff: Mutex<RebuildBackoff>,
     #[cfg(test)]
     rebuild_starts: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRoutingKey {
+    generation: u64,
+    key: [u8; 32],
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutingContext {
+    pub(crate) key: [u8; 32],
+    pub(crate) candidates: HashMap<String, (super::SkillArtifact, CanaryCandidate)>,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +89,29 @@ impl Drop for RebuildFlightGuard<'_> {
 }
 
 impl IndexCoordinator {
+    /// Resolve exact Agent-Skill associations without changing lifecycle state.
+    ///
+    /// Only identity-valid active revisions are returned. Verified or canary
+    /// revisions remain unavailable until the existing human approval and
+    /// explicit activation path publishes them.
+    pub(crate) fn resolve_active_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<Option<super::SkillArtifact>>, CoordinatorError> {
+        let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        ids.iter()
+            .map(|id| {
+                let Some(metadata) = store.metadata(id)? else {
+                    return Ok(None);
+                };
+                if metadata.status != "active" {
+                    return Ok(None);
+                }
+                store.get(id).map_err(CoordinatorError::from)
+            })
+            .collect()
+    }
+
     pub fn open(paths: &AppPaths, embedder: Arc<Embedder>) -> Result<Self, CoordinatorError> {
         let mut store = SkillStore::open_at(paths)?;
         let model = embedder.model_metadata().clone();
@@ -102,6 +139,8 @@ impl IndexCoordinator {
             store: Mutex::new(store),
             embedder,
             published: RwLock::new(empty),
+            routing_key_cache: RwLock::new(None),
+            generation_build: Mutex::new(()),
             hydrated: AtomicBool::new(false),
             rebuild_in_flight: AtomicBool::new(false),
             rebuild_backoff: Mutex::new(RebuildBackoff::default()),
@@ -158,8 +197,34 @@ impl IndexCoordinator {
         true
     }
 
+    /// Resolve routing state for all selected skills in one blocking database
+    /// operation. Callers must run this method on a blocking worker.
+    pub(crate) fn routing_context(
+        &self,
+        active_ids: &[String],
+        expected_generation: u64,
+    ) -> Result<Option<RoutingContext>, CoordinatorError> {
+        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        let state = store.generation_state()?;
+        if state.applied_generation != expected_generation
+            || state.desired_generation != expected_generation
+        {
+            return Ok(None);
+        }
+
+        let key = self.routing_key_for_generation(&mut store, expected_generation)?;
+        let mut candidates = HashMap::with_capacity(active_ids.len());
+        for active_id in active_ids {
+            if let Some(candidate) = self.replacement_candidate_locked(&store, active_id)? {
+                candidates.insert(active_id.clone(), candidate);
+            }
+        }
+        Ok(Some(RoutingContext { key, candidates }))
+    }
+
     /// Resolve one eligible replacement canary against the exact applied
-    /// generation used by a turn. Root canaries are excluded by construction.
+    /// generation. Synchronous callers must keep this off async executors;
+    /// turn preparation uses [`Self::routing_context`] instead.
     pub fn replacement_candidate(
         &self,
         active_id: &str,
@@ -172,6 +237,17 @@ impl IndexCoordinator {
         {
             return Ok(None);
         }
+        self.replacement_candidate_locked(&store, active_id)
+    }
+
+    /// Resolve one eligible replacement canary. Root canaries are excluded by
+    /// construction. The caller holds the store lock and has already verified
+    /// that the requested generation is still current.
+    fn replacement_candidate_locked(
+        &self,
+        store: &SkillStore,
+        active_id: &str,
+    ) -> Result<Option<(super::SkillArtifact, CanaryCandidate)>, CoordinatorError> {
         let active_lineage: Option<String> = store
             .connection()
             .query_row(
@@ -188,9 +264,18 @@ impl IndexCoordinator {
         let candidate_id: Option<String> = store
             .connection()
             .query_row(
-                "SELECT id FROM skill_revisions
-                 WHERE supersedes_id = ? AND lineage_root_id = ? AND status = 'canary'
-                 ORDER BY id LIMIT 1",
+                "SELECT r.id FROM skill_revisions AS r
+                 WHERE r.supersedes_id = ?
+                   AND r.lineage_root_id = ?
+                   AND r.status = 'canary'
+                 ORDER BY (
+                     SELECT COUNT(*) FROM skill_events AS e
+                      WHERE e.skill_id = r.id
+                        AND e.event_kind = 'invoked'
+                        AND e.production = 1
+                        AND e.evidence_complete = 1
+                 ), r.created_at, r.id
+                 LIMIT 1",
                 [active_id, active_lineage.as_str()],
                 |row| row.get(0),
             )
@@ -220,9 +305,20 @@ impl IndexCoordinator {
         Ok(Some((artifact, candidate)))
     }
 
-    pub fn routing_key(&self) -> Result<[u8; 32], CoordinatorError> {
+    fn routing_key_for_generation(
+        &self,
+        store: &mut SkillStore,
+        generation: u64,
+    ) -> Result<[u8; 32], CoordinatorError> {
         use sha2::{Digest, Sha256};
-        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        if let Some(cached) = *self
+            .routing_key_cache
+            .read()
+            .map_err(|_| CoordinatorError::Poisoned)?
+            && cached.generation == generation
+        {
+            return Ok(cached.key);
+        }
         let existing: Option<Vec<u8>> = store
             .connection()
             .query_row(
@@ -258,9 +354,22 @@ impl IndexCoordinator {
                     .map_err(StoreError::from)?
             }
         };
-        bytes.try_into().map_err(|_| {
-            StoreError::Constraint("canary routing key has an invalid length".to_string()).into()
-        })
+        let key = bytes.try_into().map_err(|_| {
+            StoreError::Constraint("canary routing key has an invalid length".to_string())
+        })?;
+        *self
+            .routing_key_cache
+            .write()
+            .map_err(|_| CoordinatorError::Poisoned)? = Some(CachedRoutingKey { generation, key });
+        Ok(key)
+    }
+
+    /// Load the durable routing key. Synchronous callers must keep this off
+    /// async executors; turn preparation uses the generation-cached context.
+    pub fn routing_key(&self) -> Result<[u8; 32], CoordinatorError> {
+        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        let generation = store.generation_state()?.applied_generation;
+        self.routing_key_for_generation(&mut store, generation)
     }
 
     /// Commit a lifecycle mutation, publish removals under the new-turn gate,
@@ -271,6 +380,12 @@ impl IndexCoordinator {
         removed_ids: HashSet<String>,
         mutation: impl FnOnce(&mut SkillStore) -> Result<(R, u64), E>,
     ) -> Result<(R, PublicationReport), CoordinatedMutationError<E>> {
+        // Serialize additive builds without monopolizing `store` while the
+        // embedding backend performs CPU work or blocking network I/O.
+        let _generation_build = self
+            .generation_build
+            .lock()
+            .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
         let mut store = self
             .store
             .lock()
@@ -291,9 +406,13 @@ impl IndexCoordinator {
         if let Err(error) = removal_acknowledgement {
             return Err(CoordinatedMutationError::Publication(error.into()));
         }
+        drop(store);
 
-        match build_generation(&mut store, &self.embedder, generation) {
+        match self.build_generation(generation) {
             Ok(snapshot) => {
+                let mut store = self.store.lock().map_err(|_| {
+                    CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
+                })?;
                 store
                     .mark_generation_applied_with_mode(generation, "full", None)
                     .map_err(CoordinatorError::from)
@@ -316,6 +435,9 @@ impl IndexCoordinator {
             Err(error) => {
                 self.record_rebuild_failure(&error);
                 let diagnostic = error.to_string();
+                let mut store = self.store.lock().map_err(|_| {
+                    CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
+                })?;
                 store
                     .mark_generation_applied_with_mode(
                         generation,
@@ -381,29 +503,53 @@ impl IndexCoordinator {
     }
 
     fn rebuild_and_publish_inner(&self) -> Result<u64, CoordinatorError> {
+        let _generation_build = self
+            .generation_build
+            .lock()
+            .map_err(|_| CoordinatorError::Poisoned)?;
         let model = self.embedder.model_metadata().clone();
-        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
-        let state = store.generation_state()?;
-        let generation = if state.desired_generation > state.applied_generation {
-            state.desired_generation
-        } else {
-            store.request_generation(
-                &model.model_id,
-                &model.model_revision,
-                model.dimensions,
-                model.normalized,
-            )?
+        let (generation, acknowledge_generation, initial, backfill, database_path) = {
+            let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+            let state = store.generation_state()?;
+            let hydration_only = !self.hydrated.load(Ordering::Acquire)
+                && state.applied_generation > 0
+                && state.desired_generation == state.applied_generation
+                && state.publication_mode == "full";
+            let (generation, acknowledge_generation) =
+                if state.desired_generation > state.applied_generation {
+                    (state.desired_generation, true)
+                } else if hydration_only {
+                    (state.applied_generation, false)
+                } else {
+                    (
+                        store.request_generation(
+                            &model.model_id,
+                            &model.model_revision,
+                            model.dimensions,
+                            model.normalized,
+                        )?,
+                        true,
+                    )
+                };
+            let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
+            let backfill = store.embedding_backfill_rows(&model.model_id, &model.model_revision)?;
+            (
+                generation,
+                acknowledge_generation,
+                initial,
+                backfill,
+                store.database_path().to_path_buf(),
+            )
         };
 
-        let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
-        let missing = initial
+        let missing = backfill
             .iter()
-            .filter(|(_, embedding, _)| {
+            .filter(|(_, embedding)| {
                 embedding
                     .as_ref()
                     .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
             })
-            .map(|(artifact, _, _)| (artifact.id.clone(), skill_document(artifact)))
+            .map(|(artifact, _)| (artifact.id.clone(), skill_document(artifact)))
             .collect::<Vec<_>>();
         for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
             let documents = batch
@@ -422,6 +568,7 @@ impl IndexCoordinator {
                 .zip(vectors)
                 .map(|((skill_id, _), vector)| (skill_id.clone(), vector))
                 .collect::<Vec<_>>();
+            let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
             store.store_embedding_batch(
                 &model.model_id,
                 &model.model_revision,
@@ -431,17 +578,22 @@ impl IndexCoordinator {
             )?;
         }
 
+        let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
         let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
         ensure_generation_current(&store, generation)?;
         let snapshot = Arc::new(ImmutableSkillIndex::build_without_ann(
             generation,
             model,
-            store.database_path(),
+            &database_path,
             rows,
         )?);
         // Durable state must acknowledge this exact generation before readers can
         // observe it. If persistence fails, the prior Arc remains published.
-        store.mark_generation_applied(generation)?;
+        if acknowledge_generation {
+            store.mark_generation_applied(generation)?;
+        } else {
+            ensure_generation_current(&store, generation)?;
+        }
         {
             let mut published = self
                 .published
@@ -469,6 +621,60 @@ impl IndexCoordinator {
             }
         }
         Ok(generation)
+    }
+
+    fn build_generation(&self, generation: u64) -> Result<ImmutableSkillIndex, CoordinatorError> {
+        let model = self.embedder.model_metadata().clone();
+        let (initial, backfill, database_path) = {
+            let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+            ensure_generation_current(&store, generation)?;
+            (
+                store.snapshot_rows(&model.model_id, &model.model_revision)?,
+                store.embedding_backfill_rows(&model.model_id, &model.model_revision)?,
+                store.database_path().to_path_buf(),
+            )
+        };
+        let missing = backfill
+            .iter()
+            .filter(|(_, embedding)| {
+                embedding
+                    .as_ref()
+                    .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
+            })
+            .map(|(artifact, _)| (artifact.id.clone(), skill_document(artifact)))
+            .collect::<Vec<_>>();
+        for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
+            let documents = batch
+                .iter()
+                .map(|(_, document)| document.clone())
+                .collect::<Vec<_>>();
+            let vectors = self.embedder.embed_documents(&documents)?;
+            if vectors.len() != batch.len() {
+                return Err(EmbeddingError::InvalidConfiguration(
+                    "embedding backend returned the wrong batch size".to_string(),
+                )
+                .into());
+            }
+            let embeddings = batch
+                .iter()
+                .zip(vectors)
+                .map(|((skill_id, _), vector)| (skill_id.clone(), vector))
+                .collect::<Vec<_>>();
+            self.store
+                .lock()
+                .map_err(|_| CoordinatorError::Poisoned)?
+                .store_embedding_batch(
+                    &model.model_id,
+                    &model.model_revision,
+                    model.dimensions,
+                    model.normalized,
+                    &embeddings,
+                )?;
+        }
+        let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        let rows = refresh_snapshot_embeddings(&store, &model, initial)?;
+        ensure_generation_current(&store, generation)?;
+        ImmutableSkillIndex::build(generation, model, &database_path, rows).map_err(Into::into)
     }
 
     fn rebuild_backoff_active(&self) -> Result<bool, CoordinatorError> {
@@ -519,6 +725,20 @@ impl IndexCoordinator {
         self.rebuild_in_flight.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_store_lock_for_test(
+        self: &Arc<Self>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        let coordinator = Arc::clone(self);
+        std::thread::spawn(move || {
+            let _store = coordinator.store.lock().expect("test store lock");
+            entered.send(()).expect("announce held test store lock");
+            release.recv().expect("release held test store lock");
+        })
+    }
+
     /// Retire durable state before publishing removal to readers.
     pub fn retire_and_publish(
         &self,
@@ -557,53 +777,6 @@ impl IndexCoordinator {
         *published = filtered;
         acknowledgement.map(|()| generation).map_err(Into::into)
     }
-}
-
-fn build_generation(
-    store: &mut SkillStore,
-    embedder: &Embedder,
-    generation: u64,
-) -> Result<ImmutableSkillIndex, CoordinatorError> {
-    let model = embedder.model_metadata().clone();
-    ensure_generation_current(store, generation)?;
-    let initial = store.snapshot_rows(&model.model_id, &model.model_revision)?;
-    let missing = initial
-        .iter()
-        .filter(|(_, embedding, _)| {
-            embedding
-                .as_ref()
-                .is_none_or(|embedding| !embedding_is_compatible(embedding, &model))
-        })
-        .map(|(artifact, _, _)| (artifact.id.clone(), skill_document(artifact)))
-        .collect::<Vec<_>>();
-    for batch in missing.chunks(EMBEDDING_BATCH_SIZE) {
-        let documents = batch
-            .iter()
-            .map(|(_, document)| document.clone())
-            .collect::<Vec<_>>();
-        let vectors = embedder.embed_documents(&documents)?;
-        if vectors.len() != batch.len() {
-            return Err(EmbeddingError::InvalidConfiguration(
-                "embedding backend returned the wrong batch size".to_string(),
-            )
-            .into());
-        }
-        let embeddings = batch
-            .iter()
-            .zip(vectors)
-            .map(|((skill_id, _), vector)| (skill_id.clone(), vector))
-            .collect::<Vec<_>>();
-        store.store_embedding_batch(
-            &model.model_id,
-            &model.model_revision,
-            model.dimensions,
-            model.normalized,
-            &embeddings,
-        )?;
-    }
-    let rows = refresh_snapshot_embeddings(store, &model, initial)?;
-    ensure_generation_current(store, generation)?;
-    ImmutableSkillIndex::build(generation, model, store.database_path(), rows).map_err(Into::into)
 }
 
 fn ensure_generation_current(store: &SkillStore, generation: u64) -> Result<(), StoreError> {

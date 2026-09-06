@@ -7,9 +7,9 @@ use rig::completion::CompletionModel;
 use smallvec::SmallVec;
 
 use crate::agent::prompt::{
-    EDIT_TOOL_PROMPT, FIND_FILES_TOOL_PROMPT, GREP_TOOL_PROMPT, JS_TOOL_PROMPT,
-    LIST_DIR_TOOL_PROMPT, READ_TOOL_PROMPT, SYSTEM_PROMPT, TASK_TOOL_PROMPT, TODO_TOOL_PROMPT,
-    WRITE_TOOL_PROMPT,
+    EDIT_TOOL_PROMPT, FIND_FILES_TOOL_PROMPT, GREP_TOOL_PROMPT, HEADLESS_SYSTEM_PROMPT,
+    JS_TOOL_PROMPT, LIST_DIR_TOOL_PROMPT, READ_TOOL_PROMPT, SYSTEM_PROMPT, TASK_TOOL_PROMPT,
+    TODO_TOOL_PROMPT, WRITE_TOOL_PROMPT,
 };
 use crate::agent::tools;
 use crate::cli::Cli;
@@ -42,6 +42,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "find_files"
             | "list_dir"
             | "todo_write"
+            | "todo_read"
             | "shell"
             | "job_status"
             | "bash"
@@ -54,6 +55,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "memory_search"
             | "advisor"
             | "lsp_diagnostics"
+            | "skills_search"
     )
 }
 
@@ -107,6 +109,7 @@ pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String
         context,
         reasoning_enabled,
         Some(context.workspace_root.as_path()),
+        false,
     )
 }
 
@@ -114,6 +117,7 @@ pub(crate) fn build_preamble_for_workspace(
     context: &ContextFiles,
     reasoning_enabled: bool,
     workspace_root: Option<&Path>,
+    headless: bool,
 ) -> String {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
@@ -122,6 +126,12 @@ pub(crate) fn build_preamble_for_workspace(
     };
     let suffix = crate::session::storage::load_suffix();
     let context_agents = context.agents.as_deref().unwrap_or("");
+    let main_agent_persona = context
+        .current_agent_name
+        .as_ref()
+        .and_then(|name| context.agent_definitions.get(name))
+        .map(|definition| definition.prompt.as_str())
+        .unwrap_or("");
     #[cfg(feature = "archmd")]
     let context_architecture = context.architecture.as_deref().unwrap_or("");
     let context_prompt = context.current_prompt.as_deref().unwrap_or("");
@@ -129,9 +139,20 @@ pub(crate) fn build_preamble_for_workspace(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
+    let system_prompt = if headless {
+        HEADLESS_SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+    };
+
     let total_len = reasoning_prefix.len()
-        + SYSTEM_PROMPT.len()
+        + system_prompt.len()
         + 1
+        + if main_agent_persona.is_empty() {
+            0
+        } else {
+            2 + main_agent_persona.len()
+        }
         + if context.agents.is_some() {
             2 + context_agents.len()
         } else {
@@ -179,8 +200,12 @@ pub(crate) fn build_preamble_for_workspace(
 
     let mut preamble = String::with_capacity(total_len);
     preamble.push_str(reasoning_prefix);
-    preamble.push_str(SYSTEM_PROMPT);
+    preamble.push_str(system_prompt);
     preamble.push('\n');
+    if !main_agent_persona.is_empty() {
+        preamble.push_str("\n\n");
+        preamble.push_str(main_agent_persona);
+    }
     if !context_agents.is_empty() {
         preamble.push_str("\n\n");
         preamble.push_str(context_agents);
@@ -219,9 +244,10 @@ fn build_registered_preamble(
     workspace_root: &Path,
     sandbox: &Sandbox,
     registered_tools: &[&str],
+    headless: bool,
 ) -> String {
     let mut preamble =
-        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root));
+        build_preamble_for_workspace(context, reasoning_enabled, Some(workspace_root), headless);
     let has = |name: &str| registered_tools.contains(&name);
     if has("js") {
         preamble.push_str(JS_TOOL_PROMPT);
@@ -244,7 +270,7 @@ fn build_registered_preamble(
     if has("list_dir") {
         preamble.push_str(LIST_DIR_TOOL_PROMPT);
     }
-    if has("todo_write") {
+    if has("todo_write") || has("todo_read") {
         preamble.push_str(TODO_TOOL_PROMPT);
     }
     if has("task") {
@@ -292,6 +318,7 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "find_files",
         "list_dir",
         "todo_write",
+        "todo_read",
     ];
     names.push("git");
     if registered_shell_capability(cli, cfg, sandbox).is_some() {
@@ -301,6 +328,8 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
         names.push("js");
+        #[cfg(feature = "skills")]
+        names.push("skills_search");
     }
     #[cfg(feature = "subagents")]
     if cfg.task_enabled.unwrap_or(true) {
@@ -344,6 +373,7 @@ pub fn estimate_overhead(
         &context.workspace_root,
         sandbox,
         &registered_tools,
+        cli.is_headless(),
     );
     crate::session::Session::estimate_tokens(&preamble)
 }
@@ -372,7 +402,9 @@ pub(crate) fn filter_tools_by_allowlist(
         .filter(|tool| {
             let name = tool.name();
             let name = canonical_tool_name(name.as_ref());
-            allowed.contains(name) || (name == "job_status" && allowed.contains("shell"))
+            allowed.contains(name)
+                || (name == "job_status" && allowed.contains("shell"))
+                || (name == "todo_read" && allowed.contains("todo_write"))
         })
         .collect()
 }
@@ -387,6 +419,7 @@ fn register_js_tool(
     cfg: &Config,
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     workspace: Arc<crate::paths::WorkspaceBinding>,
+    scratch: crate::extras::js::session::ScratchStore,
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -399,6 +432,7 @@ fn register_js_tool(
         cfg,
         containment_status,
         workspace,
+        scratch,
         #[cfg(feature = "skills")]
         skill_services,
     );
@@ -414,6 +448,7 @@ fn register_js_tool_with_status(
     cfg: &Config,
     containment_status: crate::sandbox::worker::WorkerContainmentStatus,
     workspace: Arc<crate::paths::WorkspaceBinding>,
+    scratch: crate::extras::js::session::ScratchStore,
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -446,10 +481,12 @@ fn register_js_tool_with_status(
         cfg.js_fetch_allow_http.unwrap_or(false),
     );
     #[cfg(feature = "skills")]
-    let mut js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config);
+    let mut js_tool =
+        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
 
     #[cfg(not(feature = "skills"))]
-    let js_tool = JsTool::new(sandbox, permission, ask_tx, allow_config);
+    let js_tool =
+        JsTool::new(sandbox, permission, ask_tx, allow_config).with_scratch_store(scratch);
 
     #[cfg(feature = "skills")]
     if let Some(services) = skill_services {
@@ -476,6 +513,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     read_tracker: tools::ReadTracker,
+    todo_store: tools::TodoStore,
+    tool_output_session_id: &str,
+    tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     // Provider-specific extra body params (e.g. OpenRouter `provider.order` to
@@ -484,6 +524,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     additional_params: Option<serde_json::Value>,
     #[cfg(feature = "js")]
     js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+    #[cfg(feature = "js")] js_scratch: crate::extras::js::session::ScratchStore,
     #[cfg(feature = "skills")] skill_services: Option<
         Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -566,10 +607,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             tools::ListDirTool::new(permission.clone(), ask_tx.clone(), max_list_dir_entries)
                 .with_workspace_binding(workspace.clone()),
         ));
-        base_tools.push(Box::new(tools::WriteTodoList::new(
+        base_tools.push(Box::new(tools::WriteTodoList::new_with_store(
             permission.clone(),
             ask_tx.clone(),
+            todo_store.clone(),
         )));
+        base_tools.push(Box::new(tools::ReadTodoList::new(todo_store)));
         // Structured Git is intentionally available only when the git-worktree
         // feature is compiled in; it has no shell/raw-argv escape hatch.
         #[cfg(feature = "git-worktree")]
@@ -606,6 +649,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 cfg.deny_repeated_reads.unwrap_or(true),
             )
             .with_workspace_binding(workspace.clone());
+            #[cfg(feature = "js")]
+            let task_tool = if js_tool_enabled {
+                task_tool.with_read_only_js(sandbox.clone(), js_worker_containment_status.clone())
+            } else {
+                task_tool
+            };
+            #[cfg(feature = "skills")]
+            let task_tool = task_tool.with_skill_services(skill_services.clone());
             #[cfg(feature = "archmd")]
             let task_tool = task_tool.with_architecture(context.architecture.clone());
             all_tools.push(Box::new(task_tool));
@@ -671,6 +722,13 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             )));
         }
 
+        #[cfg(feature = "skills")]
+        if let Some(services) = &skill_services {
+            all_tools.push(Box::new(
+                crate::extras::js::skills::search_tool::SkillsSearchTool::new(Arc::clone(services)),
+            ));
+        }
+
         #[cfg(feature = "js")]
         if js_tool_enabled {
             register_js_tool(
@@ -681,8 +739,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 cfg,
                 js_worker_containment_status,
                 workspace.clone(),
+                js_scratch,
                 #[cfg(feature = "skills")]
-                skill_services,
+                skill_services.clone(),
             );
         }
 
@@ -691,6 +750,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
         #[cfg(feature = "hooks")]
         let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
+
+        let all_tools = tools::concurrency::bind(all_tools);
 
         Some(all_tools)
     };
@@ -706,11 +767,24 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         workspace_root,
         &sandbox,
         &registered_tools,
+        cli.is_headless(),
     );
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .max_tokens(cli.resolve_max_tokens(cfg))
-        .default_max_turns(cli.resolve_max_agent_turns(cfg));
+        .default_max_turns(cli.resolve_max_agent_turns(cfg))
+        .add_hook(crate::agent::runner::ToolLoopGuard);
+    #[cfg(feature = "skills")]
+    if let Some(services) = skill_services {
+        builder = builder.add_hook(crate::extras::js::skills::session::SkillContextHook::new(
+            preamble.clone(),
+            services,
+        ));
+    }
+    builder = builder.add_hook(crate::agent::runner::ToolResultSpillHook::new(
+        tool_output_session_id,
+        tool_result_spills,
+    ));
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
     }
@@ -766,6 +840,8 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     workspace: &Arc<crate::paths::WorkspaceBinding>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
+    tool_output_session_id: &str,
+    tool_result_spills: crate::session::ToolResultSpillStore,
     _reasoning_enabled: bool,
     temperature: Option<f64>,
     // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
@@ -864,12 +940,18 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
         ),
     ];
     let read_tools = tools::memoize::definitions(read_tools);
+    let read_tools = tools::concurrency::bind(read_tools);
 
     let mut builder = AgentBuilder::new(model)
         .preamble(&preamble)
         .default_max_turns(BTW_MAX_TURNS)
         .max_tokens(max_tokens)
-        .tools(read_tools);
+        .tools(read_tools)
+        .add_hook(crate::agent::runner::ToolLoopGuard)
+        .add_hook(crate::agent::runner::ToolResultSpillHook::new(
+            tool_output_session_id,
+            Some(tool_result_spills),
+        ));
 
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
@@ -903,6 +985,9 @@ mod extra_file_tests {
             prompts: HashMap::new(),
             current_prompt: None,
             current_prompt_name: None,
+            agent_definitions: HashMap::new(),
+            current_agent_name: None,
+            current_agent_explicit: false,
             themes: HashMap::new(),
             current_theme_name: None,
             extra_files: Vec::new(),
@@ -955,7 +1040,7 @@ mod extra_file_tests {
         ctx.extra_files.push(fake_path.clone());
         ctx.extra_file_contents
             .insert(fake_path, Arc::new("preloaded content".to_string()));
-        let preamble = super::build_preamble_for_workspace(&ctx, false, None);
+        let preamble = super::build_preamble_for_workspace(&ctx, false, None, false);
         assert!(
             preamble.contains("preloaded content"),
             "preamble must use cached content, not attempt a disk read"
@@ -969,9 +1054,54 @@ mod extra_file_tests {
         let mut ctx = empty_ctx();
         ctx.extra_files.push(path.clone());
         // No entry in extra_file_contents — forces fallback read path
-        let preamble = super::build_preamble_for_workspace(&ctx, false, None);
+        let preamble = super::build_preamble_for_workspace(&ctx, false, None, false);
         std::fs::remove_file(&path).ok();
         assert!(preamble.contains("fallback content"));
+    }
+
+    #[test]
+    fn main_agent_persona_and_prompt_mode_are_composed_in_the_preamble() {
+        let mut context = empty_ctx();
+        context.agent_definitions.insert(
+            "rust-review".into(),
+            crate::context::agents::AgentDefinition::for_test(
+                "MAIN_PERSONA_MARKER",
+                Some("review"),
+            ),
+        );
+        context.current_agent_name = Some("rust-review".into());
+        context.current_prompt = Some("PROMPT_MODE_MARKER".into());
+
+        let preamble = super::build_preamble_for_workspace(&context, false, None, false);
+
+        let persona = preamble.find("MAIN_PERSONA_MARKER").unwrap();
+        let mode = preamble.find("PROMPT_MODE_MARKER").unwrap();
+        assert!(persona < mode);
+        assert_eq!(preamble.matches("MAIN_PERSONA_MARKER").count(), 1);
+    }
+
+    #[test]
+    fn headless_preamble_replaces_the_interactive_response_contract() {
+        let context = empty_ctx();
+        let interactive = super::build_preamble_for_workspace(
+            &context,
+            false,
+            Some(std::path::Path::new(".")),
+            false,
+        );
+        let headless = super::build_preamble_for_workspace(
+            &context,
+            false,
+            Some(std::path::Path::new(".")),
+            true,
+        );
+
+        assert!(interactive.contains("Ask only when a missing choice"));
+        assert!(interactive.contains("## Completion"));
+        assert!(headless.contains("Do not end with a question"));
+        assert!(headless.contains("reasonable low-risk assumptions"));
+        assert!(headless.contains("In iterative loop mode"));
+        assert!(!headless.to_ascii_lowercase().contains("ask the user"));
     }
 }
 
@@ -997,6 +1127,9 @@ mod js_tests {
             prompts: HashMap::new(),
             current_prompt: None,
             current_prompt_name: None,
+            agent_definitions: HashMap::new(),
+            current_agent_name: None,
+            current_agent_explicit: false,
             themes: HashMap::new(),
             current_theme_name: None,
             extra_files: Vec::new(),
@@ -1045,10 +1178,14 @@ mod js_tests {
             None,
             sandbox,
             crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            "builder-test",
+            None,
             false,
             None,
             None,
             crate::sandbox::worker::containment_status(),
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "mcp")]
@@ -1073,6 +1210,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["shell"],
+            false,
         );
         assert!(preamble.contains("Run POSIX shell commands"));
         let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
@@ -1095,6 +1233,7 @@ mod js_tests {
             workspace.root(),
             &missing,
             &["read"],
+            false,
         );
         assert!(!missing_preamble.contains("shell commands"));
         assert!(!missing_preamble.contains("run commands"));
@@ -1114,8 +1253,14 @@ mod js_tests {
             ..crate::cli::Cli::default()
         };
         assert!(registered_shell_capability(&no_tools, &cfg, &sandbox).is_none());
-        let no_tools_preamble =
-            build_registered_preamble(&empty_context(), false, workspace.root(), &sandbox, &[]);
+        let no_tools_preamble = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &[],
+            false,
+        );
         assert!(!no_tools_preamble.contains("shell commands"));
         assert!(!no_tools_preamble.contains("**js**"));
         assert!(!no_tools_preamble.contains("**read**"));
@@ -1140,6 +1285,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["read"],
+            false,
         );
         assert!(!read_only_preamble.contains("shell commands"));
         assert!(read_only_preamble.contains("**read**"));
@@ -1156,12 +1302,63 @@ mod js_tests {
         );
     }
 
+    #[tokio::test]
+    async fn prompt_cache_prefix_is_byte_stable_across_consecutive_turns() {
+        let workspace = workspace_binding();
+        let sandbox = shell_sandbox();
+        let cli = crate::cli::Cli::default();
+        let context = empty_context();
+        let agent = test_main_agent(&cli, sandbox.clone(), workspace.clone()).await;
+
+        let first_definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        let first_names = first_definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let first_preamble = build_registered_preamble(
+            &context,
+            false,
+            workspace.root(),
+            &sandbox,
+            &first_names,
+            false,
+        );
+        let first_tools = serde_json::to_vec(&first_definitions).unwrap();
+
+        // A completed turn without an explicit context invalidation reuses the
+        // same agent. Reading its request prefix again must yield identical
+        // bytes so provider prompt caching can hit.
+        let second_definitions = agent.tool_server_handle.get_tool_defs(None).await.unwrap();
+        let second_names = second_definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        let second_preamble = build_registered_preamble(
+            &context,
+            false,
+            workspace.root(),
+            &sandbox,
+            &second_names,
+            false,
+        );
+        let second_tools = serde_json::to_vec(&second_definitions).unwrap();
+
+        assert_eq!(first_preamble.as_bytes(), second_preamble.as_bytes());
+        assert_eq!(first_tools, second_tools);
+    }
+
     #[test]
     fn registered_preamble_names_only_registered_execution_tools() {
         let workspace = workspace_binding();
         let sandbox = shell_sandbox();
-        let js =
-            build_registered_preamble(&empty_context(), false, workspace.root(), &sandbox, &["js"]);
+        let js = build_registered_preamble(
+            &empty_context(),
+            false,
+            workspace.root(),
+            &sandbox,
+            &["js"],
+            false,
+        );
         assert!(js.contains("**js**"));
         assert!(js.contains("Use Python only when the user requests"));
         assert!(!js.contains("**bash**"));
@@ -1173,6 +1370,7 @@ mod js_tests {
             workspace.root(),
             &sandbox,
             &["github_search"],
+            false,
         );
         assert!(!mcp_only.contains("**js**"));
         assert!(!mcp_only.contains("**read**"));
@@ -1186,6 +1384,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["read"],
+                false,
             );
             assert!(!without_lsp.contains("lsp_diagnostics"));
             let with_lsp = build_registered_preamble(
@@ -1194,6 +1393,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["lsp_diagnostics"],
+                false,
             );
             assert!(with_lsp.contains("lsp_diagnostics"));
             assert!(!with_lsp.contains("after supported file changes"));
@@ -1205,6 +1405,7 @@ mod js_tests {
                 workspace.root(),
                 &sandbox,
                 &["lsp_diagnostics", "edit"],
+                false,
             );
             assert!(with_lsp_and_edit.contains("after supported file changes"));
         }
@@ -1220,6 +1421,7 @@ mod js_tests {
             "find_files",
             "list_dir",
             "todo_write",
+            "todo_read",
             "bash",
             "job_status",
             "js",
@@ -1230,6 +1432,7 @@ mod js_tests {
             "memory_search",
             "advisor",
             "lsp_diagnostics",
+            "skills_search",
         ] {
             assert!(is_reserved_builtin_tool_name(name), "{name}");
         }
@@ -1253,6 +1456,7 @@ mod js_tests {
                 assurance: WorkerContainmentAssurance::Enforced,
             },
             workspace,
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -1283,6 +1487,7 @@ mod js_tests {
                 reason: "backend probe failed".into(),
             },
             workspace_binding(),
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -1304,6 +1509,7 @@ mod js_tests {
                 assurance: WorkerContainmentAssurance::Enforced,
             },
             workspace_binding(),
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
         );
@@ -1335,10 +1541,14 @@ mod js_tests {
             None,
             Sandbox::new(false, "bwrap"),
             crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            "builder-test",
+            None,
             false,
             None,
             None,
             containment_status.clone(),
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "mcp")]
@@ -1418,10 +1628,14 @@ mod js_tests {
             None,
             Sandbox::new(false, "bwrap"),
             crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            "builder-test",
+            None,
             false,
             None,
             None,
             crate::sandbox::worker::containment_status(),
+            crate::extras::js::session::ScratchStore::default(),
             #[cfg(feature = "skills")]
             None,
             #[cfg(feature = "mcp")]
@@ -1458,6 +1672,8 @@ mod js_tests {
             &workspace,
             &None,
             &None,
+            "btw-test",
+            crate::session::ToolResultSpillStore::default(),
             false,
             None,
             None,

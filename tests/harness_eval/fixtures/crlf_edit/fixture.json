@@ -1,0 +1,13 @@
+{
+  "name": "crlf_edit",
+  "prompt": "Update the title while preserving this repository's line endings.",
+  "max_provider_turns": 2,
+  "max_tool_calls": 1,
+  "max_total_tokens": 260,
+  "initial_files": {
+    "settings.ini": "title = old\r\ncount = 1\r\n"
+  },
+  "expected_files": {
+    "settings.ini": "title = new\r\ncount = 1\r\n"
+  }
+}

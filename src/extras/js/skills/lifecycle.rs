@@ -1420,14 +1420,14 @@ fn validate_lineage(
     }
 
     if next == LifecycleStatus::Active {
-        let live_successors: i64 = tx.query_row(
+        let active_successors: i64 = tx.query_row(
             "SELECT COUNT(*) FROM skill_revisions
              WHERE supersedes_id = ? AND id <> ?
-               AND status IN ('verified', 'canary', 'active')",
+               AND status = 'active'",
             params![revision.supersedes_id, revision.id],
             |row| row.get(0),
         )?;
-        if live_successors > 0 {
+        if active_successors > 0 {
             return Err(LifecycleError::LineageFork);
         }
     }

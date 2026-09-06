@@ -10,6 +10,7 @@ use rig::client::{CompletionClient, ModelListingClient};
 use rig::completion::{CompletionModel, Message};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 use rig::streaming::StreamingChat;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::agent::builder;
@@ -51,7 +52,16 @@ pub(crate) fn compaction_request_limits(
     let bounded_input_tokens = input_token_budget
         .saturating_sub(borrowed_output_headroom)
         .saturating_sub(PROVIDER_ENVELOPE_TOKEN_RESERVE);
-    let request_budget = bounded_input_tokens.try_into().unwrap_or(usize::MAX);
+    // Match the session estimator's conservative 3.25 narrow-text characters
+    // per token instead of treating one byte as one token. This keeps code/JSON
+    // safely below the provider window without needlessly forcing up to sixteen
+    // tiny rolling requests.
+    let request_budget = bounded_input_tokens
+        .saturating_mul(13)
+        .checked_div(4)
+        .unwrap_or(u64::MAX)
+        .try_into()
+        .unwrap_or(usize::MAX);
     (
         request_budget.saturating_sub(preamble_bytes),
         max_output_tokens,
@@ -133,9 +143,9 @@ pub(crate) fn default_model_for_provider(
         }
     }
     let m = match provider {
-        "anthropic" => "claude-sonnet-4-6",
-        "openai" => "gpt-5.1",
-        "gemini" | "google" => "gemini-2.5-pro",
+        "anthropic" => "claude-sonnet-5",
+        "openai" => "gpt-5.5",
+        "gemini" | "google" => "gemini-3.7-flash",
         "openrouter" => "openrouter/auto", // OpenRouter's always-valid auto-router
         "ollama" => "llama3.1",
         _ => return None,
@@ -193,14 +203,14 @@ pub enum AnyClient {
 }
 
 /// Extra OpenRouter request body params that pin a Claude model to the
-/// Anthropic direct route, or `None` for any non-Claude model.
+/// Anthropic direct route and enable automatic conversation-tail caching, or
+/// `None` for any non-Claude model.
 ///
-/// `cache_control` breakpoints (used for prompt caching) are only honored on
-/// OpenRouter's Anthropic direct route; the Bedrock and Vertex routes silently
-/// drop them. So for Claude models we force `provider.order = ["Anthropic"]`
-/// (keeping `allow_fallbacks: true` so the request still succeeds if Anthropic
-/// is momentarily unavailable). Every other OpenRouter model caches
-/// automatically and is left untouched.
+/// OpenRouter's top-level `cache_control` advances the cache boundary to the
+/// last cacheable block as a conversation grows. Automatic caching is supported
+/// only on OpenRouter's Anthropic direct route, so Claude requests also force
+/// `provider.order = ["Anthropic"]`. Every other OpenRouter model keeps its
+/// provider-native automatic caching behavior and is left untouched.
 ///
 /// OpenRouter namespaces Claude under `anthropic/`, optionally with a leading
 /// `~` marking a floating "-latest" alias (e.g. `~anthropic/claude-sonnet-latest`).
@@ -209,7 +219,8 @@ pub(crate) fn openrouter_anthropic_routing(model_id: &str) -> Option<serde_json:
     let slug = model_id.strip_prefix('~').unwrap_or(model_id);
     slug.starts_with("anthropic/").then(|| {
         serde_json::json!({
-            "provider": { "order": ["Anthropic"], "allow_fallbacks": true }
+            "provider": { "order": ["Anthropic"], "allow_fallbacks": true },
+            "cache_control": { "type": "ephemeral" }
         })
     })
 }
@@ -232,6 +243,24 @@ pub(crate) fn merge_extra_body(
         // Non-object base (shouldn't happen for routing) — user value takes over.
         (Some(_), extra) => extra,
     }
+}
+
+/// Adds an opaque, stable per-session routing key for OpenAI Responses prompt caching. Explicit
+/// user configuration retains precedence over the generated default.
+pub(crate) fn openai_responses_extra_body(
+    extra: Option<serde_json::Value>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    use std::fmt::Write as _;
+
+    let mut prompt_cache_key = String::with_capacity(64);
+    for byte in Sha256::digest(session_id.as_bytes()) {
+        write!(&mut prompt_cache_key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    merge_extra_body(
+        Some(serde_json::json!({"prompt_cache_key": prompt_cache_key})),
+        extra,
+    )
 }
 
 impl AnyClient {
@@ -261,6 +290,7 @@ impl AnyClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn compress_messages(
         &self,
         model_name: &str,
@@ -269,6 +299,7 @@ impl AnyClient {
         instructions: Option<&str>,
         input_token_budget: u64,
         response_token_budget: u64,
+        retry_config: &RetryConfig,
     ) -> anyhow::Result<(String, usize)> {
         let preamble = summarizer_preamble();
         // Without a provider tokenizer, one UTF-8 byte per configured token is
@@ -288,10 +319,17 @@ impl AnyClient {
                 prompt_budget,
                 |summary_prompt| {
                     let preamble = preamble.clone();
+                    let retry_config = retry_config.clone();
                     async move {
                         let model = self.completion_model(model_name.to_string());
-                        summarize_with_model(model, summary_prompt, preamble, max_output_tokens)
-                            .await
+                        summarize_with_model(
+                            model,
+                            summary_prompt,
+                            preamble,
+                            max_output_tokens,
+                            retry_config,
+                        )
+                        .await
                     }
                 },
             ),
@@ -384,8 +422,8 @@ fn suffix_at_most(value: &str, max_bytes: usize) -> &str {
     &value[start..]
 }
 
-fn bound_summary(value: &str, max_bytes: usize) -> String {
-    const MARKER: &str = "\n...[summary truncated]...\n";
+pub(crate) fn bound_summary(value: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n...[section truncated]...\n";
 
     if value.len() <= max_bytes {
         return value.to_string();
@@ -394,10 +432,37 @@ fn bound_summary(value: &str, max_bytes: usize) -> String {
         return prefix_at_most(MARKER, max_bytes).to_string();
     }
 
-    let content_budget = max_bytes - MARKER.len();
-    let head = prefix_at_most(value, content_budget / 2);
-    let tail = suffix_at_most(value, content_budget.saturating_sub(head.len()));
-    format!("{head}{MARKER}{tail}")
+    let mut starts = vec![0usize];
+    for (index, _) in value.match_indices("\n## ") {
+        starts.push(index + 1);
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.len() == 1 {
+        let head = prefix_at_most(value, max_bytes - MARKER.len());
+        return format!("{head}{MARKER}");
+    }
+
+    let sections = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(value.len());
+            &value[*start..end]
+        })
+        .collect::<Vec<_>>();
+    let mut rendered = String::with_capacity(max_bytes);
+    for (index, section) in sections.iter().enumerate() {
+        let remaining_sections = sections.len() - index;
+        let allowance = max_bytes.saturating_sub(rendered.len()) / remaining_sections;
+        if section.len() <= allowance {
+            rendered.push_str(section);
+        } else if allowance > MARKER.len() {
+            rendered.push_str(prefix_at_most(section, allowance - MARKER.len()));
+            rendered.push_str(MARKER);
+        }
+    }
+    rendered
 }
 
 fn compaction_payload_budgets(
@@ -783,20 +848,29 @@ async fn summarize_with_model(
     prompt: String,
     preamble: String,
     max_output_tokens: u64,
+    retry_config: RetryConfig,
 ) -> anyhow::Result<String> {
     match model {
-        AnyModel::OpenRouter(m, _) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
+        AnyModel::OpenRouter(m, _) => {
+            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+        }
         AnyModel::OpenAI(m) => match m {
             OpenAiModel::Responses(m) => {
-                run_summarizer(m, prompt, preamble, max_output_tokens).await
+                run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
             }
             OpenAiModel::Completions(m) => {
-                run_summarizer(m, prompt, preamble, max_output_tokens).await
+                run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
             }
         },
-        AnyModel::Anthropic(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
-        AnyModel::Gemini(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
-        AnyModel::Ollama(m) => run_summarizer(m, prompt, preamble, max_output_tokens).await,
+        AnyModel::Anthropic(m) => {
+            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+        }
+        AnyModel::Gemini(m) => {
+            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+        }
+        AnyModel::Ollama(m) => {
+            run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
+        }
     }
 }
 
@@ -805,6 +879,7 @@ async fn run_summarizer<M>(
     prompt: String,
     preamble: String,
     max_output_tokens: u64,
+    retry_config: &RetryConfig,
 ) -> anyhow::Result<String>
 where
     M: CompletionModel + 'static,
@@ -816,7 +891,7 @@ where
         .build();
 
     let agent_ref = &agent;
-    let mut stream = retry::retry_stream_chat(&RetryConfig::default(), move || {
+    let mut stream = retry::retry_stream_chat(retry_config, move || {
         let p = prompt.clone();
         async move {
             agent_ref
@@ -949,7 +1024,7 @@ impl AnyAgent {
         self
     }
 
-    fn with_runtime(
+    pub(crate) fn with_runtime(
         inner: AnyAgentInner,
         #[cfg(feature = "skills")] skills: Option<
             std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
@@ -995,28 +1070,30 @@ fn spawn_blocked_runner(
         cleanup.settle().await;
     });
     runner::PausedAgentRunner::new(
-        AgentRunner {
-            event_rx,
-            abort_handle: join.abort_handle(),
-        },
+        AgentRunner::without_compaction(event_rx, join.abort_handle()),
         start_tx,
         work_scope,
     )
 }
 
 impl AnyAgent {
-    pub async fn run_print(
+    pub async fn run_print<H>(
         &self,
         prompt: &str,
         pure_stdout: bool,
+        emit_stdout: bool,
         retry_config: &RetryConfig,
         // Prior turns from a resumed session; see `runner::run_print`. Empty
         // for a fresh session.
-        history: Vec<Message>,
+        history: H,
         // `--loop` iteration/active state; see `runner::run_print`. `None`
         // for plain `-p` one-shot runs.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)> {
+    ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
+        let history = history.into();
         #[cfg(feature = "skills")]
         let _turn_guard = if self.skills.is_some() {
             Some(self.turn_gate.lock().await)
@@ -1037,6 +1114,7 @@ impl AnyAgent {
                     a,
                     &prompt,
                     pure_stdout,
+                    emit_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
@@ -1052,6 +1130,7 @@ impl AnyAgent {
                         a,
                         &prompt,
                         pure_stdout,
+                        emit_stdout,
                         retry_config,
                         self.turn_token_budget,
                         history,
@@ -1066,6 +1145,7 @@ impl AnyAgent {
                         a,
                         &prompt,
                         pure_stdout,
+                        emit_stdout,
                         retry_config,
                         self.turn_token_budget,
                         history,
@@ -1081,6 +1161,7 @@ impl AnyAgent {
                     a,
                     &prompt,
                     pure_stdout,
+                    emit_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
@@ -1095,6 +1176,7 @@ impl AnyAgent {
                     a,
                     &prompt,
                     pure_stdout,
+                    emit_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
@@ -1109,6 +1191,7 @@ impl AnyAgent {
                     a,
                     &prompt,
                     pure_stdout,
+                    emit_stdout,
                     retry_config,
                     self.turn_token_budget,
                     history,
@@ -1192,38 +1275,44 @@ impl AnyAgent {
     /// before spawning: its outcome decides whether the runner spawns at all
     /// (a hook can block the prompt outright) and, if so, with what prompt
     /// (a hook can rewrite it).
-    pub async fn spawn_runner(
+    pub async fn spawn_runner<H>(
         self,
         prompt: String,
-        history: Vec<Message>,
+        history: H,
         retry_config: RetryConfig,
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> AgentRunner {
+    ) -> AgentRunner
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
         self.spawn_runner_paused(
             prompt,
-            history,
+            history.into(),
             retry_config,
             #[cfg(feature = "hooks")]
             loop_info,
         )
         .await
-        .start()
+        .start_interactive()
     }
 
     /// Builds an agent runner behind a start barrier. ACP uses this to publish
     /// cancellation ownership and the abort handle before model/tool execution.
-    pub(crate) async fn spawn_runner_paused(
+    pub(crate) async fn spawn_runner_paused<H>(
         self,
         prompt: String,
-        history: Vec<Message>,
+        history: H,
         retry_config: RetryConfig,
         // `--loop` iteration/active state; see `runner::spawn_agent`. `None`
         // outside loop mode.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> runner::PausedAgentRunner {
+    ) -> runner::PausedAgentRunner
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
         self.spawn_runner_paused_in_scope(
             prompt,
-            history,
+            history.into(),
             retry_config,
             #[cfg(feature = "hooks")]
             loop_info,
@@ -1232,14 +1321,18 @@ impl AnyAgent {
         .await
     }
 
-    pub(crate) async fn spawn_runner_paused_in_scope(
+    pub(crate) async fn spawn_runner_paused_in_scope<H>(
         self,
         prompt: String,
-        history: Vec<Message>,
+        history: H,
         retry_config: RetryConfig,
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
         work_scope: std::sync::Arc<runner::AgentWorkScope>,
-    ) -> runner::PausedAgentRunner {
+    ) -> runner::PausedAgentRunner
+    where
+        H: Into<std::sync::Arc<[Message]>>,
+    {
+        let history = history.into();
         #[cfg(feature = "hooks")]
         let prompt = match work_scope
             .run(crate::extras::hooks::dispatch_user_prompt_submit(prompt))
@@ -1448,12 +1541,28 @@ pub(crate) fn build_http_client(
     builder.build().map_err(Into::into)
 }
 
-fn is_localhost(url: Option<&str>) -> bool {
-    url.is_some_and(|u| {
-        u.starts_with("http://localhost")
-            || u.starts_with("http://127.")
-            || u.starts_with("http://[::1]")
-    })
+pub(crate) fn is_localhost(url: Option<&str>) -> bool {
+    let Some(url) = url.and_then(|value| reqwest::Url::parse(value).ok()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = address_host.parse::<std::net::IpAddr>() {
+        return address.is_loopback() || address.is_unspecified();
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .strip_suffix(".localhost")
+            .is_some_and(|prefix| !prefix.is_empty())
+        || host.eq_ignore_ascii_case("host.docker.internal")
 }
 
 /// Determines which API style the OpenAI family should use:
@@ -1609,11 +1718,15 @@ async fn build_openai_agent(
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
+    tool_output_session_id: &str,
+    tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
     #[cfg(feature = "js")]
     js_worker_containment_status: crate::sandbox::worker::WorkerContainmentStatus,
+    #[cfg(feature = "js")] js_scratch: crate::extras::js::session::ScratchStore,
     #[cfg(feature = "skills")] skill_services: Option<
         std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
@@ -1631,11 +1744,16 @@ async fn build_openai_agent(
                 ask_tx,
                 sandbox,
                 read_tracker,
+                todo_store.clone(),
+                tool_output_session_id,
+                tool_result_spills.clone(),
                 reasoning_enabled,
                 temperature,
-                extra_body,
+                openai_responses_extra_body(extra_body, tool_output_session_id),
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
+                #[cfg(feature = "js")]
+                js_scratch.clone(),
                 #[cfg(feature = "skills")]
                 skill_services.clone(),
                 #[cfg(feature = "mcp")]
@@ -1654,11 +1772,16 @@ async fn build_openai_agent(
                 ask_tx,
                 sandbox,
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 extra_body,
                 #[cfg(feature = "js")]
                 js_worker_containment_status,
+                #[cfg(feature = "js")]
+                js_scratch,
                 #[cfg(feature = "skills")]
                 skill_services,
                 #[cfg(feature = "mcp")]
@@ -1680,9 +1803,13 @@ pub async fn build_agent_in_workspace(
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
+    tool_output_session_id: &str,
+    tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")] skill_service_owner: std::sync::Arc<
         crate::extras::js::skills::session::SkillServiceOwner,
     >,
@@ -1694,6 +1821,8 @@ pub async fn build_agent_in_workspace(
     #[cfg(feature = "js")]
     let js_worker_containment_status =
         resolve_js_worker_containment(js_tool_eligible, crate::sandbox::worker::containment_status);
+    #[cfg(feature = "js")]
+    let js_scratch = js_session_state.for_workspace(workspace.root());
     #[cfg(feature = "skills")]
     let skills = resolve_skill_services(
         js_tool_eligible,
@@ -1717,11 +1846,16 @@ pub async fn build_agent_in_workspace(
                 ask_tx,
                 sandbox.clone(),
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 merge_extra_body(routing, extra_body),
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
+                #[cfg(feature = "js")]
+                js_scratch.clone(),
                 #[cfg(feature = "skills")]
                 skills.clone(),
                 #[cfg(feature = "mcp")]
@@ -1740,11 +1874,16 @@ pub async fn build_agent_in_workspace(
                 ask_tx,
                 sandbox.clone(),
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 extra_body,
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
+                #[cfg(feature = "js")]
+                js_scratch.clone(),
                 #[cfg(feature = "skills")]
                 skills.clone(),
                 #[cfg(feature = "mcp")]
@@ -1763,11 +1902,16 @@ pub async fn build_agent_in_workspace(
                 ask_tx,
                 sandbox.clone(),
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 extra_body,
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
+                #[cfg(feature = "js")]
+                js_scratch.clone(),
                 #[cfg(feature = "skills")]
                 skills.clone(),
                 #[cfg(feature = "mcp")]
@@ -1786,11 +1930,16 @@ pub async fn build_agent_in_workspace(
                 ask_tx,
                 sandbox.clone(),
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 extra_body,
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
+                #[cfg(feature = "js")]
+                js_scratch.clone(),
                 #[cfg(feature = "skills")]
                 skills.clone(),
                 #[cfg(feature = "mcp")]
@@ -1809,11 +1958,16 @@ pub async fn build_agent_in_workspace(
                 ask_tx,
                 sandbox,
                 read_tracker,
+                todo_store,
+                tool_output_session_id,
+                tool_result_spills,
                 reasoning_enabled,
                 temperature,
                 extra_body,
                 #[cfg(feature = "js")]
                 js_worker_containment_status,
+                #[cfg(feature = "js")]
+                js_scratch,
                 #[cfg(feature = "skills")]
                 skills.clone(),
                 #[cfg(feature = "mcp")]
@@ -1960,6 +2114,8 @@ pub fn build_btw_agent(
     workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
+    tool_output_session_id: &str,
+    tool_result_spills: crate::session::ToolResultSpillStore,
     reasoning_enabled: bool,
     temperature: Option<f64>,
     extra_body: Option<serde_json::Value>,
@@ -1974,6 +2130,8 @@ pub fn build_btw_agent(
                 workspace,
                 permission,
                 ask_tx,
+                tool_output_session_id,
+                tool_result_spills.clone(),
                 reasoning_enabled,
                 temperature,
                 merge_extra_body(routing, extra_body),
@@ -1988,9 +2146,11 @@ pub fn build_btw_agent(
                 workspace,
                 permission,
                 ask_tx,
+                tool_output_session_id,
+                tool_result_spills.clone(),
                 reasoning_enabled,
                 temperature,
-                extra_body,
+                openai_responses_extra_body(extra_body, tool_output_session_id),
             )),
             OpenAiModel::Completions(m) => {
                 OpenAiAgent::Completions(builder::build_btw_agent_inner(
@@ -2001,6 +2161,8 @@ pub fn build_btw_agent(
                     workspace,
                     permission,
                     ask_tx,
+                    tool_output_session_id,
+                    tool_result_spills.clone(),
                     reasoning_enabled,
                     temperature,
                     extra_body,
@@ -2015,6 +2177,8 @@ pub fn build_btw_agent(
             workspace,
             permission,
             ask_tx,
+            tool_output_session_id,
+            tool_result_spills.clone(),
             reasoning_enabled,
             temperature,
             extra_body,
@@ -2027,6 +2191,8 @@ pub fn build_btw_agent(
             workspace,
             permission,
             ask_tx,
+            tool_output_session_id,
+            tool_result_spills.clone(),
             reasoning_enabled,
             temperature,
             extra_body,
@@ -2039,6 +2205,8 @@ pub fn build_btw_agent(
             workspace,
             permission,
             ask_tx,
+            tool_output_session_id,
+            tool_result_spills,
             reasoning_enabled,
             temperature,
             extra_body,

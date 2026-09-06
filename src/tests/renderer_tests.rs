@@ -310,7 +310,7 @@ fn chat_margin_reduces_content_width() {
 }
 
 mod dirty {
-    use crate::ui::feed::BlockStyle;
+    use crate::ui::feed::{BlockStyle, Feed};
     use crate::ui::renderer::{BottomRedrawPlan, BottomSnapshot, PromptSnapshot, Renderer};
 
     fn bottom_snapshot() -> BottomSnapshot {
@@ -351,6 +351,29 @@ mod dirty {
         r.mark_chat_clean();
         r.feed_mut().push_block(BlockStyle::Plain, "hello");
         assert!(r.chat_needs_redraw());
+    }
+
+    #[test]
+    fn feed_retention_resets_scroll_and_selection_indices() {
+        let mut r = Renderer::new().unwrap();
+        let (max_blocks, _, _) = Feed::retention_limits_for_test();
+        for index in 0..max_blocks {
+            r.feed_mut()
+                .push_line(BlockStyle::Plain, format!("line {index}"));
+        }
+        r.scroll_line_up();
+        assert!(r.is_scrolling());
+        r.selection_active = true;
+        r.selection_start = Some(2);
+        r.selection_end = Some(4);
+        r.feed_mut().push_line(BlockStyle::Plain, "evicts line 0");
+
+        r.reconcile_feed_retention();
+
+        assert!(!r.is_scrolling());
+        assert!(!r.selection_active);
+        assert_eq!(r.selection_start, None);
+        assert_eq!(r.selection_end, None);
     }
 
     #[test]

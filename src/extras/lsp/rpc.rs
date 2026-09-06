@@ -2,7 +2,7 @@
 //! the server's stdio. Hand-rolled to keep the dependency tree at `lsp-types`
 //! only. Unit-tested over `tokio::io::duplex` — no live server needed.
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -21,9 +21,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std::
     w.flush().await
 }
 
-/// Reads one framed JSON-RPC message. Returns `Ok(None)` on a clean EOF
-/// before any header byte (server exited); an error on EOF mid-message.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+/// Persistent buffered reader for LSP frames.
+///
+/// Keeping the buffer across frames avoids one underlying pipe read per header byte and preserves
+/// any bytes read ahead from the next frame.
+pub struct FrameReader<R> {
+    inner: BufReader<R>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::new(reader),
+        }
+    }
+
+    /// Reads one framed JSON-RPC message. Returns `Ok(None)` on a clean EOF before any header byte
+    /// (server exited); an error on EOF mid-message.
+    pub async fn read_frame(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        read_frame(&mut self.inner).await
+    }
+}
+
+async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut headers = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
@@ -92,4 +112,66 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
     let mut body = vec![0u8; content_length];
     r.read_exact(&mut body).await?;
     Ok(Some(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    use super::*;
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let remaining = &self.bytes[self.offset..];
+            let count = remaining.len().min(buffer.remaining());
+            buffer.put_slice(&remaining[..count]);
+            self.offset += count;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_reader_buffers_headers_and_read_ahead_across_frames() {
+        let first = br#"{"id":1}"#;
+        let second = br#"{"id":2}"#;
+        let bytes = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            first.len(),
+            std::str::from_utf8(first).unwrap(),
+            second.len(),
+            std::str::from_utf8(second).unwrap()
+        )
+        .into_bytes();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            bytes,
+            offset: 0,
+            reads: reads.clone(),
+        };
+        let mut reader = FrameReader::new(source);
+
+        assert_eq!(reader.read_frame().await.unwrap().unwrap(), first);
+        assert_eq!(reader.read_frame().await.unwrap().unwrap(), second);
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "both small frames should be served from one buffered pipe read"
+        );
+    }
 }
