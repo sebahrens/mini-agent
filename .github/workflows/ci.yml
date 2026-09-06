@@ -259,17 +259,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Test (${{ matrix.features }}) on Linux
-        if: >-
-          matrix.os != 'macos-latest' &&
-          !contains(matrix.features, 'js')
-        run: >-
-          cargo test --locked ${{ matrix.features }} --
-          --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
-
-      - name: Test (${{ matrix.features }}) on Linux with process-global worker isolation
-        if: >-
-          matrix.os != 'macos-latest' &&
-          contains(matrix.features, 'js')
+        if: matrix.os != 'macos-latest'
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
