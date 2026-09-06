@@ -300,6 +300,10 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "task_json_library_axis_uses_real_store_and_records_oracles",
             linux_step,
         )
+        self.assertIn(
+            "--skip extras::js::tests::skill_runtime_binding",
+            linux_step,
+        )
 
         macos_step = body.split(
             "name: Test (${{ matrix.features }}) on macOS with process-global worker isolation",
@@ -309,10 +313,22 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("-- --test-threads=1", macos_step)
         self.assertIn(f"--skip {full_path}", macos_step)
         self.assertIn(
+            "--skip extras::js::tests::skill_runtime_binding",
+            macos_step,
+        )
+        self.assertIn(
             "--skip tests::harness_eval_tests::"
             "task_json_library_axis_uses_real_store_and_records_oracles",
             macos_step,
         )
+
+        binding_step = body.split(
+            "name: Test skill runtime binding in a fresh process", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("contains(matrix.features, 'skills')", binding_step)
+        self.assertIn("RUST_MIN_STACK: 8388608", binding_step)
+        self.assertIn("extras::js::tests::skill_runtime_binding", binding_step)
+        self.assertIn("-- --test-threads=1", binding_step)
 
         isolated_step = body.split(
             "name: Test macOS agent-rebuild worker reuse in a fresh process", 1

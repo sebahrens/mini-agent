@@ -263,6 +263,7 @@ jobs:
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+          --skip extras::js::tests::skill_runtime_binding
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
         if: matrix.os == 'macos-latest'
@@ -270,6 +271,15 @@ jobs:
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+          --skip extras::js::tests::skill_runtime_binding
+
+      - name: Test skill runtime binding in a fresh process
+        if: contains(matrix.features, 'skills')
+        env:
+          RUST_MIN_STACK: 8388608
+        run: >-
+          cargo test --locked ${{ matrix.features }}
+          extras::js::tests::skill_runtime_binding -- --test-threads=1
 
       - name: Test macOS agent-rebuild worker reuse in a fresh process
         if: >-

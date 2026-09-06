@@ -3185,7 +3185,7 @@ mod protocol_tests {
     #[tokio::test]
     async fn cancellation_reaps_configured_async_user_prompt_hook() {
         use crate::extras::hooks::dispatcher::HookDispatcher;
-        use crate::extras::hooks::settings::{HookGroup, HookHandler, HooksConfig};
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
 
         let workspace = ProtocolTempDir::new();
         let pid_file = workspace.path().join("hook.pid");
@@ -3207,7 +3207,7 @@ mod protocol_tests {
                     is_async: true,
                     condition: None,
                     once: false,
-                    trust: Default::default(),
+                    trust: HookTrust::Trusted,
                     env: Default::default(),
                 }],
             }],
