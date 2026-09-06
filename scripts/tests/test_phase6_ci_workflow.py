@@ -355,6 +355,21 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "task_json_library_axis_uses_real_store_and_records_oracles",
             main_step,
         )
+        self.assertIn(
+            "--skip extras::acp::protocol_tests::"
+            "cancellation_reaps_configured_async_user_prompt_hook",
+            main_step,
+        )
+        hook_step = all_features.split(
+            "name: Test all-features async hook cancellation in a fresh process", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("--all-features", hook_step)
+        self.assertIn(
+            "extras::acp::protocol_tests::"
+            "cancellation_reaps_configured_async_user_prompt_hook",
+            hook_step,
+        )
+        self.assertIn("-- --exact --test-threads=1", hook_step)
         isolated_step = all_features.split(
             "name: Test all-features task-level skill eval in a fresh process", 1
         )[1].split("- name:", 1)[0]

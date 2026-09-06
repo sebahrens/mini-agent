@@ -317,6 +317,13 @@ jobs:
         run: >-
           cargo test --locked --all-features -- --test-threads=1
           --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+          --skip extras::acp::protocol_tests::cancellation_reaps_configured_async_user_prompt_hook
+
+      - name: Test all-features async hook cancellation in a fresh process
+        run: >-
+          cargo test --locked --all-features
+          extras::acp::protocol_tests::cancellation_reaps_configured_async_user_prompt_hook
+          -- --exact --test-threads=1
 
       - name: Test all-features task-level skill eval in a fresh process
         run: >-
