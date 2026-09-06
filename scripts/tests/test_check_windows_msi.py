@@ -48,6 +48,31 @@ class WindowsMsiPolicyTests(unittest.TestCase):
 
             self.assertTrue(any("msiexec.exe" in error for error in errors))
 
+    def test_payload_files_require_separate_auto_guid_components(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(REPOSITORY / "packaging/windows", root / "packaging/windows")
+            workflow = root / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            shutil.copy(REPOSITORY / ".github/workflows/release.yml", workflow)
+            shutil.copy(REPOSITORY / ".github/workflows/ci.yml", workflow.parent / "ci.yml")
+            source = root / "packaging/windows/mini-agent.wxs"
+            source.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    """        </Component>
+        <Component Id="MiniAgentVsixComponent" Guid="*" Bitness="always64">
+""",
+                    "",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            errors = check_windows_msi.validate(root)
+
+            self.assertTrue(any("exactly one file" in error for error in errors))
+            self.assertTrue(any("MiniAgentVsixComponent" in error for error in errors))
+
     def test_release_must_wait_for_msiexec(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

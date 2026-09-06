@@ -92,6 +92,14 @@ def validate(root: Path) -> list[str]:
         "NoticeText": ("$(var.RepositoryRoot)\\NOTICE", "NOTICE.txt"),
         "SourceDirections": ("$(var.RepositoryRoot)\\SOURCE.md", None),
     }
+    expected_components = {
+        "MiniAgentExe": "MiniAgentExeComponent",
+        "MiniAgentVsix": "MiniAgentVsixComponent",
+        "InstallVsCodeExtensionScript": "InstallVsCodeExtensionScriptComponent",
+        "LicenseText": "LicenseTextComponent",
+        "NoticeText": "NoticeTextComponent",
+        "SourceDirections": "SourceDirectionsComponent",
+    }
     for file_id, (source_name, installed_name) in expected_files.items():
         attributes = files.get(file_id)
         _require(errors, attributes is not None, f"MSI payload is missing {file_id}")
@@ -107,6 +115,42 @@ def validate(root: Path) -> list[str]:
                     attributes.get("Name") == installed_name,
                     f"MSI payload {file_id} has the wrong installed name",
                 )
+
+    components = {
+        component.attrib.get("Id"): component
+        for component in source.findall(".//wix:Component", NS)
+    }
+    for file_id, component_id in expected_components.items():
+        component = components.get(component_id)
+        _require(
+            errors,
+            component is not None,
+            f"MSI payload {file_id} is missing single-file component {component_id}",
+        )
+        if component is not None:
+            component_files = component.findall("wix:File", NS)
+            _require(
+                errors,
+                component.attrib.get("Guid") == "*" and len(component_files) == 1,
+                f"MSI component {component_id} must use an auto GUID with exactly one file",
+            )
+            _require(
+                errors,
+                len(component_files) == 1
+                and component_files[0].attrib.get("Id") == file_id,
+                f"MSI payload {file_id} must be owned by {component_id}",
+            )
+
+    component_refs = {
+        item.attrib.get("Id")
+        for item in source.findall(".//wix:Feature/wix:ComponentRef", NS)
+    }
+    for component_id in expected_components.values():
+        _require(
+            errors,
+            component_id in component_refs,
+            f"MSI feature must install component {component_id}",
+        )
 
     action = source.find(".//wix:CustomAction[@Id='InstallVsCodeExtension']", NS)
     _require(errors, action is not None, "MSI must define the VS Code install custom action")

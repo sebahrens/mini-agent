@@ -19,19 +19,34 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="mini-agent">
-        <Component Id="MiniAgentPayload" Guid="*" Bitness="always64">
+        <Component Id="MiniAgentExeComponent" Guid="*" Bitness="always64">
           <File Id="MiniAgentExe" Source="$(var.BinaryPath)" Name="mini-agent.exe" KeyPath="yes" Checksum="yes" />
+        </Component>
+        <Component Id="MiniAgentVsixComponent" Guid="*" Bitness="always64">
           <File Id="MiniAgentVsix" Source="$(var.VsixPath)" Name="mini-agent-win32-x64.vsix" />
+        </Component>
+        <Component Id="InstallVsCodeExtensionScriptComponent" Guid="*" Bitness="always64">
           <File Id="InstallVsCodeExtensionScript" Source="install-vscode-extension.cmd" />
+        </Component>
+        <Component Id="LicenseTextComponent" Guid="*" Bitness="always64">
           <File Id="LicenseText" Source="$(var.RepositoryRoot)\LICENSE" Name="LICENSE.txt" />
+        </Component>
+        <Component Id="NoticeTextComponent" Guid="*" Bitness="always64">
           <File Id="NoticeText" Source="$(var.RepositoryRoot)\NOTICE" Name="NOTICE.txt" />
+        </Component>
+        <Component Id="SourceDirectionsComponent" Guid="*" Bitness="always64">
           <File Id="SourceDirections" Source="$(var.RepositoryRoot)\SOURCE.md" />
         </Component>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="Complete" Title="mini-agent" Level="1">
-      <ComponentRef Id="MiniAgentPayload" />
+      <ComponentRef Id="MiniAgentExeComponent" />
+      <ComponentRef Id="MiniAgentVsixComponent" />
+      <ComponentRef Id="InstallVsCodeExtensionScriptComponent" />
+      <ComponentRef Id="LicenseTextComponent" />
+      <ComponentRef Id="NoticeTextComponent" />
+      <ComponentRef Id="SourceDirectionsComponent" />
     </Feature>
 
     <SetProperty
