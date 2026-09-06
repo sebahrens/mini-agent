@@ -1038,7 +1038,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        "let output = Command::new(executable)",
+        "let mut command = Command::new(executable);",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -1051,6 +1051,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "Command::new(\"/private/tmp/mini-agent-definitely-missing-guardian-executable\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(\"/usr/bin/true\");",
         1,
         "TEST-ONLY",
     ),
@@ -3125,7 +3131,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        "let output = Command::new(executable)",
+        "let mut command = Command::new(executable);",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -3138,6 +3144,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "Command::new(\"/private/tmp/mini-agent-definitely-missing-guardian-executable\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut command = Command::new(\"/usr/bin/true\");",
         1,
         "TEST-ONLY",
     ),

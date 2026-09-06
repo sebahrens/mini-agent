@@ -240,6 +240,11 @@ jobs:
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
+    env:
+      # Rust test threads default to a 2 MiB stack. The combined hooks +
+      # skills debug configuration builds larger async test futures on both
+      # hosted platforms; production workers retain their explicit 8 MiB stack.
+      RUST_MIN_STACK: 8388608
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -259,11 +264,6 @@ jobs:
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
         if: matrix.os == 'macos-latest'
-        env:
-          # Rust test threads default to a 2 MiB stack. The combined hooks +
-          # skills debug configuration has larger async test futures, while
-          # production QuickJS workers already use their explicit 8 MiB stack.
-          RUST_MIN_STACK: 8388608
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
@@ -303,6 +303,8 @@ jobs:
   all-features:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: 8388608
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

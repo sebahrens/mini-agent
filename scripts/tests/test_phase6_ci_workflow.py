@@ -333,6 +333,14 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("-- --exact --test-threads=1", task_step)
 
+    def test_large_async_test_futures_have_a_cross_platform_stack_budget(self) -> None:
+        matrix_header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
+        all_features_header = job_body(self.workflow, "all-features").split(
+            "    steps:\n", 1
+        )[0]
+        for header in (matrix_header, all_features_header):
+            self.assertIn("RUST_MIN_STACK: 8388608", header)
+
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("kernel.apparmor_restrict_unprivileged_userns", linux)

@@ -621,15 +621,19 @@ pub(super) fn maybe_run_guardian() -> Option<ExitCode> {
 }
 
 pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
-    if std::env::var_os(HOSTED_PARENT_DEATH_MARKER).as_deref()
-        == Some(std::ffi::OsStr::new(HOSTED_PARENT_DEATH_MARKER_VALUE))
-    {
-        run_parent_death_canary_child();
-    }
-    if std::env::var_os(super::MACOS_HOSTED_LIFECYCLE_MARKER).as_deref()
-        != Some(std::ffi::OsStr::new(HOSTED_LIFECYCLE_MARKER_VALUE))
-    {
+    let parent_death = std::env::var_os(HOSTED_PARENT_DEATH_MARKER).as_deref()
+        == Some(std::ffi::OsStr::new(HOSTED_PARENT_DEATH_MARKER_VALUE));
+    let hosted_lifecycle = std::env::var_os(super::MACOS_HOSTED_LIFECYCLE_MARKER).as_deref()
+        == Some(std::ffi::OsStr::new(HOSTED_LIFECYCLE_MARKER_VALUE));
+    if !parent_death && !hosted_lifecycle {
         return None;
+    }
+    if initialize_hosted_process_paths().is_err() {
+        eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=path_setup");
+        return Some(ExitCode::FAILURE);
+    }
+    if parent_death {
+        run_parent_death_canary_child();
     }
     Some(match run_hosted_containment_matrix() {
         Ok(()) => {
@@ -638,6 +642,15 @@ pub(super) fn maybe_run_hosted_lifecycle() -> Option<ExitCode> {
         }
         Err(_) => ExitCode::FAILURE,
     })
+}
+
+fn initialize_hosted_process_paths() -> io::Result<()> {
+    let workspace_root = std::env::current_dir()?;
+    let paths = crate::paths::AppPaths::from_process(Some(workspace_root))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    crate::paths::install_process_paths(&paths)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    crate::paths::prepare_storage_roots(&paths)
 }
 
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
@@ -763,15 +776,11 @@ fn run_hosted_containment_matrix() -> io::Result<()> {
 fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> io::Result<()> {
     let publication_root =
         publication_root().map_err(|error| io::Error::other(error.to_string()))?;
-    let output = Command::new(executable)
-        .env_clear()
-        .env(HOSTED_PARENT_DEATH_MARKER, HOSTED_PARENT_DEATH_MARKER_VALUE)
-        .env(HOSTED_WORKSPACE_SENTINEL, &probes.workspace)
-        .env(HOSTED_SKILL_SENTINEL, &probes.skill)
-        .env(HOSTED_CREDENTIAL_SENTINEL, &probes.credential)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+    let process_paths =
+        crate::paths::process_paths().map_err(|error| io::Error::other(error.to_string()))?;
+    let mut command = Command::new(executable);
+    configure_parent_death_canary_command(&mut command, probes, &process_paths);
+    let output = command
         .output()
         .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;
     if !output.status.success() || output.stdout.len() > 96 {
@@ -837,6 +846,28 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn configure_parent_death_canary_command(
+    command: &mut Command,
+    probes: &HostedProbePaths,
+    process_paths: &crate::paths::AppPaths,
+) {
+    command
+        .env_clear()
+        .env(HOSTED_PARENT_DEATH_MARKER, HOSTED_PARENT_DEATH_MARKER_VALUE)
+        .env(HOSTED_WORKSPACE_SENTINEL, &probes.workspace)
+        .env(HOSTED_SKILL_SENTINEL, &probes.skill)
+        .env(HOSTED_CREDENTIAL_SENTINEL, &probes.credential)
+        .env("ZS_CONFIG_DIR", &process_paths.config_dir)
+        .env("ZS_DATA_DIR", &process_paths.data_dir)
+        .env("ZS_LOCAL_DATA_DIR", &process_paths.local_data_dir)
+        .env("ZS_STATE_DIR", &process_paths.state_dir)
+        .env("ZS_CACHE_DIR", &process_paths.cache_dir)
+        .env("ZS_CREDENTIALS_DIR", &process_paths.credentials_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 }
 
 #[repr(C)]
@@ -4179,6 +4210,61 @@ mod tests {
     #[test]
     fn macos_hosted_lifecycle_marker_is_exact() {
         assert_eq!(HOSTED_LIFECYCLE_MARKER_VALUE, "production-binary-v1");
+    }
+
+    #[test]
+    fn parent_death_canary_receives_only_exact_inputs_and_resolved_storage_roots() {
+        let probes = HostedProbePaths {
+            workspace: PathBuf::from("/workspace-sentinel"),
+            skill: PathBuf::from("/skill-sentinel"),
+            credential: PathBuf::from("/credential-sentinel"),
+            root: PathBuf::new(),
+            skill_directory: PathBuf::new(),
+            credential_directory: PathBuf::new(),
+        };
+        let paths = crate::paths::AppPaths {
+            config_dir: PathBuf::from("/resolved/config"),
+            data_dir: PathBuf::from("/resolved/data"),
+            local_data_dir: PathBuf::from("/resolved/local-data"),
+            state_dir: PathBuf::from("/resolved/state"),
+            cache_dir: PathBuf::from("/resolved/cache"),
+            credentials_dir: PathBuf::from("/resolved/credentials"),
+            project_dir: Some(PathBuf::from("/resolved/project")),
+        };
+        let mut command = Command::new("/usr/bin/true");
+        configure_parent_death_canary_command(&mut command, &probes, &paths);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(environment.len(), 10);
+        for (name, expected) in [
+            (
+                HOSTED_PARENT_DEATH_MARKER,
+                Path::new(HOSTED_PARENT_DEATH_MARKER_VALUE),
+            ),
+            (HOSTED_WORKSPACE_SENTINEL, probes.workspace.as_path()),
+            (HOSTED_SKILL_SENTINEL, probes.skill.as_path()),
+            (HOSTED_CREDENTIAL_SENTINEL, probes.credential.as_path()),
+            ("ZS_CONFIG_DIR", paths.config_dir.as_path()),
+            ("ZS_DATA_DIR", paths.data_dir.as_path()),
+            ("ZS_LOCAL_DATA_DIR", paths.local_data_dir.as_path()),
+            ("ZS_STATE_DIR", paths.state_dir.as_path()),
+            ("ZS_CACHE_DIR", paths.cache_dir.as_path()),
+            ("ZS_CREDENTIALS_DIR", paths.credentials_dir.as_path()),
+        ] {
+            assert_eq!(
+                environment
+                    .get(std::ffi::OsStr::new(name))
+                    .and_then(Option::as_deref),
+                Some(expected.as_os_str()),
+                "unexpected canary environment for {name}"
+            );
+        }
+        assert!(!environment.contains_key(std::ffi::OsStr::new(
+            super::super::MACOS_HOSTED_LIFECYCLE_MARKER
+        )));
     }
 
     #[test]
