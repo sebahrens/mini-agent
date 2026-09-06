@@ -17,6 +17,31 @@ opt-in, verified library of reusable agent-authored JavaScript skills.
 The result is still a practical coding agent, but its action space is no longer limited to a pile of
 one-off shell commands.
 
+## TL;DR — what users need to know
+
+mini-agent is a small, local-first Rust coding agent for the terminal. It combines the everyday
+agent features inherited from ZeroStack with a contained QuickJS runtime, so the model can use short
+JavaScript programs to coordinate work without turning JavaScript into ambient filesystem, network,
+or process authority.
+
+| Area | What it means for you |
+|---|---|
+| Interfaces | Use the interactive terminal UI for ongoing work, `mini-agent -p` for one-shot prompts, or `mini-agent -p --output json` for automation. ACP support lets compatible editors and clients drive the same agent. |
+| Models | OpenRouter is the default; OpenAI, Anthropic, Gemini, Ollama, and custom providers are supported. Model credentials remain parent-side and are not exposed to contained JavaScript workers. |
+| Core workflow | The model reads and edits files, searches code, runs permission-controlled commands, uses structured local Git operations, and can delegate bounded work to subagents. Sessions, compaction, prompts, memory, loops, MCP tools, and Git worktrees cover longer-running repository work; hooks and LSP integration are optional. |
+| JavaScript actions | The model can filter, parse, loop, branch, and combine tool results inside one bounded QuickJS program. There is no Node.js sidecar, package manager, `require()`, `import()`, or direct OS API. A fresh JavaScript runtime is created for every request. |
+| Permissions and effects | Rust owns every JavaScript external effect. Brokered file, fetch, process, and skill operations are typed, scope-narrowed, permission-checked, bounded, and audited by the parent process. Approval of one operation does not grant unrelated authority. |
+| Sandboxing | Linux, macOS, and Windows use different native containment backends behind the same JavaScript contract. Startup includes live platform checks; if mini-agent cannot prove the required boundary, the affected capability fails closed instead of silently running uncontained. |
+| Learned skills | The optional `skills` build can turn useful JavaScript into immutable, content-addressed local skills. Proposals do not activate themselves: verification, explicit human approval, evidence, promotion, quarantine, repair, and rollback are separate lifecycle stages. |
+| Default versus optional | Release binaries include JavaScript execution, sandboxing, MCP, ACP, subagents, worktrees, loops, memory, and the other default features. Learned-skill storage is not included in release archives; install from source with `--features skills` to enable it. |
+| Data and operation | Configuration, sessions, memory, and learned skills are local. The contained JavaScript worker has no direct network access; providers, MCP services, hooks, and shell or fetch operations follow their separately visible configuration, permission, and containment policies. |
+
+The shortest mental model is: **the model decides, JavaScript coordinates, Rust authorizes and
+executes, and the OS contains**. Start with `mini-agent --setup`, then run `mini-agent`; use the
+[quick start](#quick-start) for installation and the
+[configuration guide](docs/agent/CONFIG.md) when you want to change providers, permissions,
+sandboxing, or optional integrations.
+
 ## Why ZeroStack is the right foundation
 
 ZeroStack proves that a capable coding agent does not need to be a large desktop application. Its
