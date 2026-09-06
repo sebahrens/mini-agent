@@ -1,3 +1,4 @@
+use crate::extras::js::skills::policy::{TaskOutcomeEvidence, TaskOutcomeSource};
 use crate::extras::js::skills::retention::RetentionService;
 use crate::extras::js::skills::telemetry::{
     EventBatch, SkillEvent, SkillEventKind, TelemetryDispatcher, TelemetryIngestor,
@@ -139,6 +140,100 @@ fn telemetry_dispatch_retries_busy_writer_without_dropping_batch() {
 
     drop(dispatcher);
     drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn task_outcome_is_ordered_after_invocations_and_ignores_uninvoked_skills() {
+    let (root, store, skill) = fixture();
+    let paths = paths(&root);
+    let other = SkillArtifact::new(
+        "function other() { return true; }".into(),
+        "Uninvoked fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "other".into(),
+            signature: "() => bool".into(),
+        }],
+        vec!["other()".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    // Keep the original connection open while adding the second candidate.
+    other.verify_identity().unwrap();
+    drop(store);
+    let mut setup = SkillStore::open_at(&paths).unwrap();
+    setup.insert_verified(&other).unwrap();
+    drop(setup);
+
+    let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();
+    let invocation = stable_invocation_id("task-turn", "tool", &skill.id, "run", 0);
+    let event = |kind, outcome, latency| SkillEvent {
+        invocation_id: Some(invocation.clone()),
+        skill_id: skill.id.clone(),
+        turn_id: "task-turn".into(),
+        tool_call_id: Some("tool".into()),
+        kind,
+        export_name: Some("run".into()),
+        outcome,
+        latency_us: latency,
+        retrieval_score: Some(1.0),
+        retrieval_rank: Some(0),
+        query_fingerprint: Some("query".into()),
+        index_generation: 0,
+        evidence_complete: true,
+        production: true,
+        argument_shape: None,
+        created_at: 2_000_000_000,
+    };
+    dispatcher
+        .try_dispatch(
+            EventBatch::new(vec![
+                event(SkillEventKind::Invoked, None, None),
+                event(SkillEventKind::Returned, Some("fulfilled".into()), Some(5)),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    dispatcher
+        .record_task_outcome(TaskOutcomeEvidence {
+            turn_id: "task-turn".into(),
+            skill_ids: vec![skill.id.clone(), other.id.clone()],
+            verify_passed: true,
+            attempt: 1,
+            source: TaskOutcomeSource::VerifyCommand("abc123".into()),
+            production: true,
+            created_at: 2_000_000_001,
+        })
+        .unwrap();
+    let check = SkillStore::open_at(&paths).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let rows: Vec<(String, i64, String)> = loop {
+        let rows = {
+            let mut statement = check
+                .conn()
+                .prepare(
+                    "SELECT link.skill_id, outcome.verify_passed, outcome.source_kind
+                     FROM skill_task_outcomes AS outcome
+                     JOIN skill_task_outcome_links AS link
+                       ON link.evidence_id = outcome.evidence_id
+                     ORDER BY link.skill_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        if !rows.is_empty() || Instant::now() >= deadline {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(rows, vec![(skill.id, 1, "verify_command".into())]);
+    drop(dispatcher);
+    drop(check);
     std::fs::remove_dir_all(root).unwrap();
 }
 

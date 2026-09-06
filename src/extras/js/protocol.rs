@@ -471,12 +471,23 @@ pub(crate) enum VerificationCaseKind {
     Embedded,
     Mutation {
         export_name: String,
+        mutation: VerificationMutation,
     },
     Inherited,
     HeldOut {
         expected: VerificationExpectedValue,
         fake_files: std::collections::BTreeMap<String, String>,
+        fake_spawns: Vec<super::skills::fakes::FakeSpawnFixture>,
+        fake_fetches: Vec<super::skills::fakes::FakeFetchFixture>,
     },
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VerificationMutation {
+    Throw,
+    ReturnNull,
 }
 
 #[cfg(feature = "skills")]
@@ -728,6 +739,7 @@ pub(crate) enum EffectResult {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProposalStatus {
     Pending,
+    Deferred,
     Verified,
     Rejected,
     AwaitingApproval,
@@ -738,6 +750,7 @@ impl ProposalStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Deferred => "deferred",
             Self::Verified => "verified",
             Self::Rejected => "rejected",
             Self::AwaitingApproval => "awaiting_approval",

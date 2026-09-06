@@ -1,3 +1,4 @@
+use crate::extras::js::skills::fakes::{FakeSpawnFixture, FakeSpawnResponse};
 use crate::extras::js::skills::held_out::{
     ExpectedJsValue, HeldOutCase, HeldOutError, HeldOutSelector, HeldOutSuiteDraft,
     TranscriptExpectation, evaluate, select_suites,
@@ -57,13 +58,18 @@ fn pure_suite(expected: &str) -> HeldOutSuiteDraft {
     HeldOutSuiteDraft {
         selector: HeldOutSelector {
             tags: vec!["normalize".to_string()],
-            exports: vec!["normalize".to_string()],
+            exports: vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: unknown): string".to_string(),
+            }],
             capability_tier: Some("pure".to_string()),
         },
         cases: vec![HeldOutCase {
             expression: "normalize('\\tvalue\\n')".to_string(),
             expected: ExpectedJsValue::String(expected.to_string()),
             fake_files: BTreeMap::new(),
+            fake_spawns: vec![],
+            fake_fetches: vec![],
             transcript: TranscriptExpectation::default(),
         }],
     }
@@ -119,6 +125,48 @@ fn skill_held_out_evaluator_missing_or_failing_suite_blocks_admission() {
 }
 
 #[test]
+fn held_out_selectors_require_scope_and_exact_export_contracts() {
+    let empty = HeldOutSuiteDraft {
+        selector: HeldOutSelector::default(),
+        cases: vec![HeldOutCase {
+            expression: "true".to_string(),
+            expected: ExpectedJsValue::Boolean(true),
+            fake_files: BTreeMap::new(),
+            fake_spawns: vec![],
+            fake_fetches: vec![],
+            transcript: TranscriptExpectation::default(),
+        }],
+    };
+    assert!(matches!(
+        empty.validate(),
+        Err(HeldOutError::InvalidSuite(_))
+    ));
+
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let wrong_contract = HeldOutSuiteDraft {
+        selector: HeldOutSelector {
+            tags: vec!["normalize".to_string()],
+            exports: vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: string): number".to_string(),
+            }],
+            capability_tier: Some("pure".to_string()),
+        },
+        cases: empty.cases,
+    };
+    wrong_contract
+        .import(
+            &mut store,
+            &AdminIdentity::authenticated("reviewer").unwrap(),
+            10,
+        )
+        .unwrap();
+    assert!(select_suites(&store, &pure_artifact()).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
@@ -149,6 +197,8 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
             expression: "fakeIsPresent('fixtures/hidden/input')".to_string(),
             expected: ExpectedJsValue::String("held-out-secret".to_string()),
             fake_files,
+            fake_spawns: vec![],
+            fake_fetches: vec![],
             transcript: TranscriptExpectation {
                 reads: 1,
                 read_paths: vec!["fixtures/hidden/input".to_string()],
@@ -162,6 +212,67 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     let serialized = serde_json::to_string(&report).unwrap();
     assert!(!serialized.contains("held-out-secret"));
     assert!(!serialized.contains("fixtures/hidden/input"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn hidden_spawn_fixture_rejects_a_skill_that_fingerprints_default_fakes() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let artifact = SkillArtifact::new(
+        "function accepts(cap) { const response = cap.spawn('printf', ['check']); return response.code === 0 && response.stdout.startsWith('simulated '); }".to_string(),
+        "Try to recognize the verifier's default spawn response.".to_string(),
+        vec!["fake-probe".to_string()],
+        vec![SkillExport {
+            name: "accepts".to_string(),
+            signature: "accepts(): boolean".to_string(),
+        }],
+        vec!["accepts() === true".to_string()],
+        test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])
+            .expect("manifest"),
+    )
+    .expect("artifact");
+    let suite = HeldOutSuiteDraft {
+        selector: HeldOutSelector {
+            tags: vec!["fake-probe".to_string()],
+            exports: vec![SkillExport {
+                name: "accepts".to_string(),
+                signature: "accepts(): boolean".to_string(),
+            }],
+            capability_tier: Some("side_effecting".to_string()),
+        },
+        cases: vec![HeldOutCase {
+            expression: "accepts()".to_string(),
+            expected: ExpectedJsValue::Boolean(true),
+            fake_files: BTreeMap::new(),
+            fake_spawns: vec![FakeSpawnFixture {
+                program: "printf".to_string(),
+                args: vec!["check".to_string()],
+                response: FakeSpawnResponse {
+                    stdout: String::new(),
+                    stderr: "permission denied".to_string(),
+                    code: 17,
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            }],
+            fake_fetches: vec![],
+            transcript: TranscriptExpectation {
+                spawns: 1,
+                spawn_programs: vec!["printf".to_string()],
+                ..TranscriptExpectation::default()
+            },
+        }],
+    };
+    let admin = AdminIdentity::authenticated("reviewer").unwrap();
+    suite.import(&mut store, &admin, 10).expect("import");
+
+    let result = evaluate(&store, &artifact, None);
+    assert!(
+        matches!(result, Err(HeldOutError::CaseFailed { .. })),
+        "fingerprinting skill must fail its hidden case, got {result:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -185,7 +296,7 @@ fn skill_held_out_evaluator_inherits_predecessor_regressions() {
     .expect("candidate");
     assert!(matches!(
         evaluate(&store, &candidate, Some(&predecessor)),
-        Err(HeldOutError::Inherited(_))
+        Err(HeldOutError::InheritedTestsRemoved)
     ));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -204,7 +315,10 @@ fn skill_held_out_evaluator_runs_predecessor_tests_against_unchanged_candidate_i
         "Same implementation with a distinct embedded regression.".to_string(),
         vec!["normalize".to_string()],
         predecessor.exports.clone(),
-        vec!["normalize(' y ') === 'y'".to_string()],
+        vec![
+            predecessor.tests[0].clone(),
+            "normalize(' y ') === 'y'".to_string(),
+        ],
         CapabilityManifest::pure(),
     )
     .expect("candidate");
@@ -212,6 +326,54 @@ fn skill_held_out_evaluator_runs_predecessor_tests_against_unchanged_candidate_i
 
     evaluate(&store, &candidate, Some(&predecessor))
         .expect("predecessor scripts must run without rewriting candidate identity");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_held_out_evaluator_requires_all_ancestor_tests() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let admin = AdminIdentity::authenticated("reviewer").unwrap();
+    pure_suite("value")
+        .import(&mut store, &admin, 10)
+        .expect("suite");
+    let root_artifact = pure_artifact();
+    let child = SkillArtifact::new(
+        root_artifact.source.clone(),
+        "Normalize with a second regression.".to_string(),
+        root_artifact.tags.clone(),
+        root_artifact.exports.clone(),
+        vec![
+            root_artifact.tests[0].clone(),
+            "normalize(' child ') === 'child'".to_string(),
+        ],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    store.insert_verified(&root_artifact).unwrap();
+    store.insert_verified(&child).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE skill_revisions
+             SET supersedes_id = ?1, lineage_root_id = ?1 WHERE id = ?2",
+            rusqlite::params![root_artifact.id, child.id],
+        )
+        .unwrap();
+    let grandchild = SkillArtifact::new(
+        child.source.clone(),
+        "Normalize after dropping the root regression.".to_string(),
+        child.tags.clone(),
+        child.exports.clone(),
+        vec![child.tests[1].clone()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        evaluate(&store, &grandchild, Some(&child)),
+        Err(HeldOutError::InheritedTestsRemoved)
+    ));
     let _ = std::fs::remove_dir_all(root);
 }
 

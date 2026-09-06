@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
+use super::policy::{
+    DirectOutcome, InvocationEvidence, PromotionContext, PromotionDecision, PromotionPolicy,
+    TaskOutcomeEvidence, TaskOutcomeSource, evaluate_promotion_with_task_outcomes,
+};
 use super::store::{ApprovalAuthorizationRequest, approval_manifest_digest};
 use super::store::{ApprovalTransition, SkillStore, StoreError, consume_approval_authorization};
 
@@ -327,6 +331,8 @@ pub enum LifecycleError {
     NotLineageRoot,
     #[error("privileged activation/supersession requires its dedicated atomic service")]
     PrivilegedTransition,
+    #[error("stored evidence does not qualify this replacement for promotion: {0}")]
+    PromotionHeld(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -567,7 +573,7 @@ impl<'a> LifecycleService<'a> {
         }
 
         ensure_policy_exists(&tx, &request.snapshot.policy_version)?;
-        ensure_snapshot_evidence(&tx, &request.snapshot, false)?;
+        ensure_snapshot_evidence(&tx, &request.snapshot, false, None)?;
         let current = read_revision(&tx, &request.skill_id)?;
         if current.status == LifecycleStatus::Rejected {
             return Err(LifecycleError::RejectedIsTerminal);
@@ -757,7 +763,7 @@ impl<'a> LifecycleService<'a> {
             return Ok(replayed);
         }
         ensure_policy_exists(&tx, &snapshot.policy_version)?;
-        ensure_snapshot_evidence(&tx, snapshot, false)?;
+        ensure_snapshot_evidence(&tx, snapshot, false, None)?;
         let revision = read_revision(&tx, skill_id)?;
         if revision.supersedes_id.is_some() || revision.lineage_root_id != revision.id {
             return Err(LifecycleError::NotLineageRoot);
@@ -998,7 +1004,14 @@ impl<'a> LifecycleService<'a> {
         }
 
         ensure_policy_exists(&tx, &request.snapshot.policy_version)?;
-        ensure_snapshot_evidence(&tx, &request.snapshot, true)?;
+        let promoting = candidate_to == LifecycleStatus::Active
+            && predecessor_to == LifecycleStatus::Superseded;
+        ensure_snapshot_evidence(
+            &tx,
+            &request.snapshot,
+            true,
+            promoting.then_some("qualified"),
+        )?;
         let candidate = read_revision(&tx, &request.candidate_id)?;
         let predecessor = read_revision(&tx, &request.predecessor_id)?;
         if candidate.status != candidate_from || predecessor.status != predecessor_from {
@@ -1038,6 +1051,9 @@ impl<'a> LifecycleService<'a> {
                 actual: desired,
             });
         }
+        if promoting {
+            revalidate_promotion(&tx, request, &candidate, &predecessor, desired)?;
+        }
         let next_generation = desired + 1;
         let candidate_next = candidate.row_version + 1;
         let predecessor_next = predecessor.row_version + 1;
@@ -1054,6 +1070,8 @@ impl<'a> LifecycleService<'a> {
                 candidate.row_version,
             ],
         )?;
+        let superseded_by_id =
+            (predecessor_to == LifecycleStatus::Superseded).then_some(candidate.id.as_str());
         tx.execute(
             "UPDATE skill_revisions
              SET status = ?, row_version = ?, superseded_by_id = ?, updated_at = ?
@@ -1061,7 +1079,7 @@ impl<'a> LifecycleService<'a> {
             params![
                 predecessor_to.as_token(),
                 predecessor_next,
-                candidate.id,
+                superseded_by_id,
                 created_at,
                 predecessor.id,
                 predecessor_from.as_token(),
@@ -1226,25 +1244,218 @@ fn ensure_policy_exists(tx: &Transaction<'_>, version: &str) -> Result<(), Lifec
     }
 }
 
+fn revalidate_promotion(
+    tx: &Transaction<'_>,
+    request: &ReplacementTransitionRequest,
+    candidate_revision: &RevisionState,
+    predecessor_revision: &RevisionState,
+    desired_generation: i64,
+) -> Result<(), LifecycleError> {
+    let policy_json: String = tx.query_row(
+        "SELECT policy_json FROM skill_policy_versions WHERE policy_version = ?",
+        [&request.snapshot.policy_version],
+        |row| row.get(0),
+    )?;
+    let policy: PromotionPolicy = serde_json::from_str(&policy_json).map_err(|error| {
+        LifecycleError::PromotionHeld(format!("invalid durable policy: {error}"))
+    })?;
+    if policy.version != request.snapshot.policy_version {
+        return Err(LifecycleError::PromotionHeld(
+            "durable policy version mismatch".to_string(),
+        ));
+    }
+
+    let candidate = read_artifact_for_policy(tx, &request.candidate_id)?;
+    let predecessor = read_artifact_for_policy(tx, &request.predecessor_id)?;
+    let capability_increased = !super::admission::capability_is_non_escalating(
+        &candidate.capability,
+        &predecessor.capability,
+    );
+    let unresolved_negative_feedback: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM skill_feedback
+             WHERE skill_id = ? AND state = 'active'
+               AND feedback_kind IN ('negative', 'severe')
+         )",
+        [&request.candidate_id],
+        |row| row.get(0),
+    )?;
+    let context = PromotionContext {
+        candidate_id: request.candidate_id.clone(),
+        predecessor_id: Some(request.predecessor_id.clone()),
+        capability_tier: candidate.capability.tier,
+        capability_increased,
+        // A canary can only be produced by the admission transaction after
+        // inherited and held-out verification pass. The status is re-read in
+        // this same transaction above, so callers cannot assert these gates.
+        inherited_tests_passed: candidate_revision.status == LifecycleStatus::Canary,
+        held_out_tests_passed: candidate_revision.status == LifecycleStatus::Canary,
+        unresolved_negative_feedback,
+        identity_valid: candidate.verify_identity().is_ok()
+            && predecessor.verify_identity().is_ok(),
+        row_version_current: candidate_revision.row_version == request.candidate_row_version
+            && predecessor_revision.row_version == request.predecessor_row_version,
+        generation_current: desired_generation == request.snapshot.index_generation,
+    };
+    let candidate_events = read_invocation_evidence(tx, &request.candidate_id, &policy)?;
+    let predecessor_events = read_invocation_evidence(tx, &request.predecessor_id, &policy)?;
+    let task_outcomes = read_task_outcomes(tx, &request.candidate_id, &policy)?;
+    let evaluation = evaluate_promotion_with_task_outcomes(
+        &policy,
+        &context,
+        &candidate_events,
+        &predecessor_events,
+        &task_outcomes,
+    )
+    .map_err(|error| LifecycleError::PromotionHeld(error.to_string()))?;
+    if evaluation.decision != PromotionDecision::Promote {
+        return Err(LifecycleError::PromotionHeld(evaluation.reasons.join(",")));
+    }
+    Ok(())
+}
+
+fn read_artifact_for_policy(
+    tx: &Transaction<'_>,
+    skill_id: &str,
+) -> Result<super::SkillArtifact, LifecycleError> {
+    let row = tx
+        .query_row(
+            "SELECT id, identity_version, source, description, tags_json,
+                    exports_json, tests_json, capability_json, status
+             FROM skill_revisions WHERE id = ?",
+            [skill_id],
+            super::store::read_artifact_row,
+        )
+        .optional()?;
+    match row {
+        Some(Ok(artifact)) => Ok(artifact),
+        Some(Err(error)) => Err(error.into()),
+        None => Err(StoreError::NotFound(skill_id.to_string()).into()),
+    }
+}
+
+fn read_invocation_evidence(
+    tx: &Transaction<'_>,
+    skill_id: &str,
+    policy: &PromotionPolicy,
+) -> Result<Vec<InvocationEvidence>, LifecycleError> {
+    let mut statement = tx.prepare(
+        "SELECT terminal.invocation_id, terminal.turn_id, terminal.event_kind,
+                COALESCE(terminal.latency_us, 0),
+                invoked.production AND terminal.production,
+                invoked.evidence_complete AND terminal.evidence_complete,
+                terminal.created_at
+         FROM skill_events AS terminal
+         JOIN skill_events AS invoked
+           ON invoked.invocation_id = terminal.invocation_id
+          AND invoked.skill_id = terminal.skill_id
+          AND invoked.event_kind = 'invoked'
+         WHERE terminal.skill_id = ?
+           AND terminal.event_kind IN (
+               'returned', 'threw', 'timed_out', 'oom', 'capability_denied'
+           )
+           AND terminal.created_at BETWEEN ? AND ?
+         ORDER BY terminal.event_id",
+    )?;
+    let mut rows = statement.query(params![skill_id, policy.window_start, policy.window_end])?;
+    let mut evidence = Vec::new();
+    while let Some(row) = rows.next()? {
+        let event_kind: String = row.get(2)?;
+        let outcome = match event_kind.as_str() {
+            "returned" => DirectOutcome::Success,
+            "threw" => DirectOutcome::Throw,
+            "timed_out" => DirectOutcome::Timeout,
+            "oom" => DirectOutcome::Oom,
+            "capability_denied" => DirectOutcome::CapabilityDenied,
+            _ => continue,
+        };
+        let latency_us: i64 = row.get(3)?;
+        evidence.push(InvocationEvidence {
+            invocation_id: row.get(0)?,
+            skill_id: skill_id.to_string(),
+            turn_id: row.get(1)?,
+            outcome,
+            latency_us: u64::try_from(latency_us).map_err(|_| {
+                LifecycleError::PromotionHeld("negative durable latency".to_string())
+            })?,
+            production: row.get(4)?,
+            observability_complete: row.get(5)?,
+            created_at: row.get(6)?,
+        });
+    }
+    Ok(evidence)
+}
+
+fn read_task_outcomes(
+    tx: &Transaction<'_>,
+    skill_id: &str,
+    policy: &PromotionPolicy,
+) -> Result<Vec<TaskOutcomeEvidence>, LifecycleError> {
+    let mut statement = tx.prepare(
+        "SELECT outcome.turn_id, outcome.verify_passed, outcome.attempt,
+                outcome.source_kind, outcome.source_id, outcome.production,
+                outcome.created_at
+         FROM skill_task_outcomes AS outcome
+         JOIN skill_task_outcome_links AS link
+           ON link.evidence_id = outcome.evidence_id
+         WHERE link.skill_id = ? AND outcome.created_at BETWEEN ? AND ?
+         ORDER BY outcome.created_at, outcome.evidence_id",
+    )?;
+    let mut rows = statement.query(params![skill_id, policy.window_start, policy.window_end])?;
+    let mut outcomes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let source_kind: String = row.get(3)?;
+        let source_id: Option<String> = row.get(4)?;
+        let source = match (source_kind.as_str(), source_id) {
+            ("verify_command", Some(id)) => TaskOutcomeSource::VerifyCommand(id),
+            ("oracle", Some(id)) => TaskOutcomeSource::Oracle(id),
+            ("no_verify_command", None) => TaskOutcomeSource::NoVerifyCommand,
+            _ => {
+                return Err(LifecycleError::PromotionHeld(
+                    "invalid durable task-outcome source".to_string(),
+                ));
+            }
+        };
+        let attempt: i64 = row.get(2)?;
+        outcomes.push(TaskOutcomeEvidence {
+            turn_id: row.get(0)?,
+            skill_ids: vec![skill_id.to_string()],
+            verify_passed: row.get(1)?,
+            attempt: u32::try_from(attempt).map_err(|_| {
+                LifecycleError::PromotionHeld("invalid durable task-outcome attempt".to_string())
+            })?,
+            source,
+            production: row.get(5)?,
+            created_at: row.get(6)?,
+        });
+    }
+    Ok(outcomes)
+}
+
 fn ensure_snapshot_evidence(
     tx: &Transaction<'_>,
     snapshot: &EvidenceSnapshot,
     require_evidence: bool,
+    required_kind: Option<&str>,
 ) -> Result<(), LifecycleError> {
     if require_evidence && snapshot.evidence_ids.is_empty() {
         return Err(LifecycleError::UnknownEvidence);
     }
     for evidence_id in &snapshot.evidence_ids {
-        let evidence_skill: Option<String> = tx
+        let evidence: Option<(String, String)> = tx
             .query_row(
-                "SELECT skill_id FROM skill_evidence
+                "SELECT skill_id, evidence_kind FROM skill_evidence
                  WHERE evidence_id = ? AND policy_version = ?",
                 params![evidence_id, snapshot.policy_version],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if evidence_skill.as_deref() != Some(snapshot.artifact_id.as_str())
-            && evidence_skill.as_deref() != snapshot.predecessor_id.as_deref()
+        let Some((evidence_skill, evidence_kind)) = evidence else {
+            return Err(LifecycleError::UnknownEvidence);
+        };
+        if (evidence_skill != snapshot.artifact_id
+            && Some(evidence_skill.as_str()) != snapshot.predecessor_id.as_deref())
+            || required_kind.is_some_and(|kind| evidence_kind != kind)
         {
             return Err(LifecycleError::UnknownEvidence);
         }

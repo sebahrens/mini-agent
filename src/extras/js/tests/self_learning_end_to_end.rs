@@ -7,6 +7,7 @@ use crate::extras::js::skills::lifecycle::{
     CoordinatedLifecycle, EvidenceSnapshot, HumanApproval, LifecycleService,
     ReplacementTransitionRequest,
 };
+use crate::extras::js::skills::policy::PromotionPolicy;
 use crate::extras::js::skills::privacy::Redactor;
 use crate::extras::js::skills::repair::{
     ExpectedBehavior, RepairInput, create_record, persist_record, submit_repair_proposal,
@@ -52,6 +53,33 @@ fn artifact(value: i32, description: &str) -> SkillArtifact {
         CapabilityManifest::pure(),
     )
     .unwrap()
+}
+
+fn insert_successful_invocations(store: &mut SkillStore, skill_id: &str, prefix: char) {
+    for index in 0..25 {
+        let invocation_id = format!("{prefix}{index:063x}");
+        let turn_id = format!("promotion-{prefix}-{index}");
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_events (
+                     invocation_id, skill_id, turn_id, event_kind, export_name,
+                     latency_us, index_generation, evidence_complete, production, created_at
+                 ) VALUES (?, ?, ?, 'invoked', 'run', NULL, 0, 1, 1, 3)",
+                rusqlite::params![invocation_id, skill_id, turn_id],
+            )
+            .unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_events (
+                     invocation_id, skill_id, turn_id, event_kind, export_name,
+                     latency_us, index_generation, evidence_complete, production, created_at
+                 ) VALUES (?, ?, ?, 'returned', 'run', 100, 0, 1, 1, 3)",
+                rusqlite::params![invocation_id, skill_id, turn_id],
+            )
+            .unwrap();
+    }
 }
 
 #[test]
@@ -182,7 +210,14 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
     let first_approval =
         HumanApproval::verified("phase4-root-approval", "owner", "root-report", 1).unwrap();
     let mut lifecycle = LifecycleService::new(&mut store);
-    lifecycle.register_policy("phase5-v1", "{}", 0).unwrap();
+    let promotion_policy = PromotionPolicy::conservative("phase5-v1", 0, 200);
+    lifecycle
+        .register_policy(
+            "phase5-v1",
+            &serde_json::to_string(&promotion_policy).unwrap(),
+            0,
+        )
+        .unwrap();
     lifecycle
         .record_root_canary_approval(&root_artifact.id, &first_approval, 1)
         .unwrap();
@@ -236,6 +271,8 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
             rusqlite::params![root_artifact.id, root_artifact.id, candidate.id],
         )
         .unwrap();
+    insert_successful_invocations(&mut store, &candidate.id, 'a');
+    insert_successful_invocations(&mut store, &root_artifact.id, 'b');
     let vector = embedder
         .embed_documents(std::slice::from_ref(&candidate.description))
         .unwrap()

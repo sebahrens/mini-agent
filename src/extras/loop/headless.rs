@@ -13,6 +13,10 @@ use crate::provider::AnyAgent;
 use crate::sandbox::Sandbox;
 use crate::session::Session;
 
+fn hook_loop_active(iteration: u32, max_iterations: Option<u32>) -> bool {
+    max_iterations.is_none_or(|max| iteration < max)
+}
+
 async fn await_validation_or_interrupt<F>(
     operation: loop_mod::validation::ValidationOperation,
     interrupt: F,
@@ -100,7 +104,7 @@ pub(crate) async fn run_headless_loop(
                 #[cfg(feature = "hooks")]
                 Some(crate::extras::hooks::LoopInfo {
                     iteration: state.iteration,
-                    active: state.active,
+                    active: hook_loop_active(state.iteration, state.max_iterations),
                 }),
             )
             .await
@@ -115,8 +119,7 @@ pub(crate) async fn run_headless_loop(
                 if let Some(ss) = status_signals.as_ref() {
                     ss.send_stop();
                 }
-                eprintln!("[loop] error in iteration {}: {}", state.iteration, e);
-                break;
+                return Err(e);
             }
         };
 
@@ -185,6 +188,13 @@ mod tests {
         let mut session = Session::new("provider", "model", 128_000, "");
         session.add_message(crate::session::MessageRole::User, "prior turn");
         assert_eq!(iteration_history(&session, &Config::default()).len(), 1);
+    }
+
+    #[test]
+    fn final_bounded_iteration_is_not_reported_as_looping() {
+        assert!(hook_loop_active(1, Some(2)));
+        assert!(!hook_loop_active(2, Some(2)));
+        assert!(hook_loop_active(99, None));
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 use crate::extras::js::skills::CapabilityTier;
 use crate::extras::js::skills::policy::{
     DirectOutcome, InvocationEvidence, PromotionContext, PromotionDecision, PromotionPolicy,
-    evaluate_promotion, nearest_rank_percentile, wilson_upper,
+    TaskOutcomeEvidence, TaskOutcomeSource, evaluate_promotion,
+    evaluate_promotion_with_task_outcomes, nearest_rank_percentile, wilson_upper,
 };
 
 fn calls(skill: &str, count: usize, failures: usize, latency: u64) -> Vec<InvocationEvidence> {
@@ -137,4 +138,72 @@ fn exact_boundaries_use_nearest_rank_and_wilson_confidence() {
     )
     .unwrap();
     assert_eq!(severe.decision, PromotionDecision::Hold);
+}
+
+#[test]
+fn configured_task_outcome_gate_cannot_fall_back_to_invocation_counts() {
+    let mut policy = PromotionPolicy::conservative("v1", 0, 200);
+    policy.min_verified_task_passes = Some(1);
+    let candidate_id = "a".repeat(64);
+    let mut promotion_context = context();
+    promotion_context.candidate_id = candidate_id.clone();
+    let candidate = calls(&candidate_id, 100, 0, 100);
+    let predecessor = calls("predecessor", 100, 0, 100);
+
+    let without_outcome =
+        evaluate_promotion(&policy, &promotion_context, &candidate, &predecessor).unwrap();
+    assert_eq!(without_outcome.decision, PromotionDecision::Hold);
+    assert!(
+        without_outcome
+            .reasons
+            .contains(&"insufficient_verified_task_passes".to_string())
+    );
+
+    let verified = TaskOutcomeEvidence {
+        turn_id: "candidate-turn-0".into(),
+        skill_ids: vec![candidate_id],
+        verify_passed: true,
+        attempt: 1,
+        source: TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
+        production: true,
+        created_at: 100,
+    };
+    let result = evaluate_promotion_with_task_outcomes(
+        &policy,
+        &promotion_context,
+        &candidate,
+        &predecessor,
+        &[verified],
+    )
+    .unwrap();
+    assert_eq!(result.decision, PromotionDecision::Promote);
+    assert_eq!(result.verified_task_passes, 1);
+}
+
+#[test]
+fn no_verify_command_is_auditable_but_never_counts_as_a_pass() {
+    let mut policy = PromotionPolicy::conservative("v1", 0, 200);
+    policy.min_verified_task_passes = Some(1);
+    let candidate_id = "a".repeat(64);
+    let mut promotion_context = context();
+    promotion_context.candidate_id = candidate_id.clone();
+    let no_verify = TaskOutcomeEvidence {
+        turn_id: "candidate-turn-0".into(),
+        skill_ids: vec![candidate_id.clone()],
+        verify_passed: true,
+        attempt: 1,
+        source: TaskOutcomeSource::NoVerifyCommand,
+        production: true,
+        created_at: 100,
+    };
+    let result = evaluate_promotion_with_task_outcomes(
+        &policy,
+        &promotion_context,
+        &calls(&candidate_id, 100, 0, 100),
+        &calls("predecessor", 100, 0, 100),
+        &[no_verify],
+    )
+    .unwrap();
+    assert_eq!(result.decision, PromotionDecision::Hold);
+    assert_eq!(result.verified_task_passes, 0);
 }

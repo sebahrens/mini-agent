@@ -12,7 +12,7 @@ pub mod rpc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +29,9 @@ use client::{DiagStore, LspClient};
 /// stay fast; servers that don't republish identical diagnostics just time
 /// out and reuse the previous (identical) set.
 const DIAG_WAIT: Duration = Duration::from_millis(1000);
+const SERVER_RETRY_BASE: Duration = Duration::from_secs(1);
+const SERVER_RETRY_MAX: Duration = Duration::from_secs(60);
+const SERVER_FAILURE_COUNT_MAX: u32 = 7;
 
 /// Max diagnostics lines appended to a tool result.
 pub(crate) const MAX_DIAG_LINES: usize = 20;
@@ -61,6 +64,9 @@ struct Inner {
     /// server name → currently live client. Failed or stopped clients are not
     /// retained so a later edit can restart a repaired server.
     clients: tokio::sync::Mutex<HashMap<String, Arc<LspClient>>>,
+    /// Consecutive startup/crash failures. A broken server is not relaunched
+    /// for every edit; successful initialization clears its entry.
+    failures: Mutex<HashMap<String, ServerFailureState>>,
     diags: DiagStore,
     diag_notify: Arc<Notify>,
     #[cfg(test)]
@@ -69,6 +75,32 @@ struct Inner {
     peak_bindings: Arc<AtomicUsize>,
     #[cfg(test)]
     test_synced_documents: Arc<std::sync::Mutex<HashMap<String, client::SyncedDocument>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServerFailureState {
+    consecutive: u32,
+    retry_after: Instant,
+}
+
+impl ServerFailureState {
+    fn next(previous: Option<Self>, now: Instant) -> Self {
+        let consecutive = previous
+            .map_or(1, |failure| failure.consecutive.saturating_add(1))
+            .min(SERVER_FAILURE_COUNT_MAX);
+        let multiplier = 1_u32 << consecutive.saturating_sub(1);
+        let cooldown = SERVER_RETRY_BASE
+            .saturating_mul(multiplier)
+            .min(SERVER_RETRY_MAX);
+        Self {
+            consecutive,
+            retry_after: now + cooldown,
+        }
+    }
+
+    fn cooling_down(self, now: Instant) -> bool {
+        now < self.retry_after
+    }
 }
 
 static LIVE_MANAGERS: OnceLock<Mutex<Vec<Weak<Inner>>>> = OnceLock::new();
@@ -159,6 +191,7 @@ impl LspManager {
             workspace,
             servers,
             clients: tokio::sync::Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
             diags: DiagStore::default(),
             diag_notify: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -220,11 +253,16 @@ impl LspManager {
         }
         if let Some(old) = clients.remove(name) {
             old.shutdown().await;
+            self.record_server_failure(name);
             self.inner
                 .diags
                 .lock()
                 .unwrap()
                 .retain(|_, diagnostics| diagnostics.server != name.as_str());
+        }
+        if self.server_is_cooling_down(name) {
+            tracing::debug!("lsp[{name}]: restart suppressed during failure cooldown");
+            return None;
         }
         let spawned = LspClient::spawn(
             name,
@@ -234,9 +272,42 @@ impl LspManager {
             self.inner.diags.clone(),
             self.inner.diag_notify.clone(),
         )
-        .await?;
+        .await;
+        let Some(spawned) = spawned else {
+            self.record_server_failure(name);
+            return None;
+        };
+        self.inner
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(name);
         clients.insert(name.clone(), spawned.clone());
         Some(spawned)
+    }
+
+    fn server_is_cooling_down(&self, name: &str) -> bool {
+        self.inner
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .is_some_and(|failure| failure.cooling_down(Instant::now()))
+    }
+
+    fn record_server_failure(&self, name: &str) {
+        let mut failures = self
+            .inner
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = ServerFailureState::next(failures.get(name).copied(), Instant::now());
+        tracing::debug!(
+            "lsp[{name}]: failure {} recorded; retry after {:?}",
+            next.consecutive,
+            next.retry_after
+        );
+        failures.insert(name.to_string(), next);
     }
 
     /// Syncs a file's disk content with its language server (no-op when no
@@ -762,4 +833,34 @@ fn format_diag_line(location_prefix: &str, d: &lsp_types::Diagnostic) -> String 
         format!("{location_prefix}:{line}:{col}")
     };
     format!("\n  {where_} {severity}: {message}")
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn server_failure_cooldown_backs_off_and_caps() {
+        let now = Instant::now();
+        let first = ServerFailureState::next(None, now);
+        let second = ServerFailureState::next(Some(first), now);
+        let capped = (0..16).fold(second, |failure, _| {
+            ServerFailureState::next(Some(failure), now)
+        });
+
+        assert_eq!(first.consecutive, 1);
+        assert_eq!(
+            first.retry_after.duration_since(now),
+            Duration::from_secs(1)
+        );
+        assert_eq!(second.consecutive, 2);
+        assert_eq!(
+            second.retry_after.duration_since(now),
+            Duration::from_secs(2)
+        );
+        assert_eq!(capped.consecutive, SERVER_FAILURE_COUNT_MAX);
+        assert_eq!(capped.retry_after.duration_since(now), SERVER_RETRY_MAX);
+        assert!(capped.cooling_down(now));
+        assert!(!capped.cooling_down(capped.retry_after));
+    }
 }

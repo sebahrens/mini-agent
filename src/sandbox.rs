@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-use crate::process_creation::TokioCommandCreationExt;
+use crate::process_creation::{StdCommandCreationExt, TokioCommandCreationExt};
 
 #[cfg(feature = "js")]
 pub(crate) mod worker;
@@ -30,7 +30,7 @@ const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
 type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
-type SeatbeltProfileKey = (String, String, bool);
+type SeatbeltProfileKey = (String, String, String, String, bool);
 type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub struct Sandbox {
     cached_essential_env: EssentialEnvironmentCache,
     /// Canonicalized cache directory computed once per instance.
     cached_cache_dir: Arc<Mutex<Option<Arc<PathBuf>>>>,
-    /// Cached seatbelt profiles keyed by escaped workspace/cache and network policy.
+    /// Cached Seatbelt profiles keyed by escaped workspace/cache/private roots and network policy.
     cached_seatbelt_profiles: SeatbeltProfileCache,
     #[cfg(test)]
     complete_process_tree_for_test: bool,
@@ -344,6 +344,10 @@ pub(crate) struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: CommandStatus,
+    /// The direct child completed, but inherited output pipes proved that a
+    /// descendant escaped the owned process group. The direct result remains
+    /// authoritative; callers can surface this containment warning separately.
+    pub descendants_escaped: bool,
 }
 
 const MAX_CONCURRENT_BACKGROUND_JOBS: usize = 8;
@@ -389,6 +393,7 @@ pub(crate) struct BackgroundJobSnapshot {
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub descendants_escaped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +402,7 @@ struct BackgroundJobTerminal {
     exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    descendants_escaped: bool,
 }
 
 #[derive(Debug)]
@@ -569,7 +575,7 @@ impl ExplicitShellRun {
         }
         let rendered = rendered.trim().to_string();
         let boundary = self.audit.boundary.label();
-        let status = match self.output.status {
+        let mut status = match self.output.status {
             CommandStatus::Completed if self.succeeded() => None,
             CommandStatus::Completed => Some(match self.output.exit_status.as_ref() {
                 Some(status) => match status.code() {
@@ -596,6 +602,15 @@ impl ExplicitShellRun {
             )),
             CommandStatus::Failed => Some(format!("explicit shell failed; boundary={boundary}")),
         };
+        if self.output.descendants_escaped {
+            let warning = format!(
+                "descendants escaped process-group cleanup; direct command result preserved; boundary={boundary}"
+            );
+            status = Some(match status {
+                Some(status) => format!("{status}; {warning}"),
+                None => warning,
+            });
+        }
         match (rendered.is_empty(), status) {
             (true, Some(status)) => format!("[{status}]"),
             (false, Some(status)) => format!("{rendered}\n[{status}]"),
@@ -640,12 +655,20 @@ impl OwnedSupportCommandAudit {
 
 #[cfg(target_os = "linux")]
 static BWRAP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static BWRAP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static SEATBELT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static SEATBELT_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+fn cached_backend_availability(cache: &OnceLock<bool>, probe: impl FnOnce() -> bool) -> bool {
+    *cache.get_or_init(probe)
+}
 
 #[cfg(target_os = "linux")]
 fn bwrap_exists() -> bool {
-    bwrap_path().is_some()
+    cached_backend_availability(&BWRAP_AVAILABLE, probe_bwrap)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -660,6 +683,38 @@ fn bwrap_path() -> Option<&'static Path> {
         .as_deref()
 }
 
+#[cfg(target_os = "linux")]
+fn probe_bwrap() -> bool {
+    let Some(bwrap) = bwrap_path() else {
+        return false;
+    };
+    let Some(probe_executable) = find_trusted_system_executable("true") else {
+        return false;
+    };
+    let mut command = std::process::Command::new(bwrap);
+    command
+        .env_clear()
+        .args([
+            "--clearenv",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+        ])
+        .arg(probe_executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    bounded_backend_probe(command)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn bwrap_path() -> Option<&'static Path> {
     None
@@ -667,7 +722,7 @@ fn bwrap_path() -> Option<&'static Path> {
 
 #[cfg(target_os = "macos")]
 fn seatbelt_exists() -> bool {
-    seatbelt_path().is_some()
+    cached_backend_availability(&SEATBELT_AVAILABLE, probe_seatbelt)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -683,6 +738,50 @@ fn seatbelt_path() -> Option<&'static Path> {
             is_trusted_system_path(&path).then_some(path)
         })
         .as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn probe_seatbelt() -> bool {
+    let Some(seatbelt) = seatbelt_path() else {
+        return false;
+    };
+    let probe_executable = Path::new("/usr/bin/true");
+    if !is_trusted_system_path(probe_executable) {
+        return false;
+    }
+    let mut command = std::process::Command::new(seatbelt);
+    command
+        .env_clear()
+        .args([
+            "-p",
+            "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n(deny network*)",
+        ])
+        .arg(probe_executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    bounded_backend_probe(command)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bounded_backend_probe(mut command: std::process::Command) -> bool {
+    let Ok(mut child) = command.spawn_guarded() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -704,6 +803,8 @@ pub(crate) const HOOK_SANDBOX_READY_MARKER: &[u8] = b"MINI_AGENT_HOOK_SANDBOX_RE
 const HOOK_SANDBOX_READY_SCRIPT: &str = r#"if [ ! -x "$0" ]; then exit 126; fi
 printf 'MINI_AGENT_HOOK_SANDBOX_READY/1\n' >&2
 exec "$0" "$@""#;
+const CLOSE_WORKSPACE_AUTHORITY_SCRIPT: &str = r#"exec 197<&-
+exec "$@""#;
 
 fn zerobox_path() -> Option<&'static Path> {
     ZEROBOX_PATH
@@ -720,9 +821,9 @@ fn zerobox_exists() -> bool {
 pub enum SandboxPolicy {
     /// Sandboxing was not requested; commands run unsandboxed intentionally.
     Disabled,
-    /// Sandboxing was requested and the backend binary is present.
+    /// Sandboxing was requested and a cached real backend preflight passed.
     RequiredAndAvailable,
-    /// Sandboxing was requested but the backend binary is missing.
+    /// Sandboxing was requested but the backend is absent or its preflight failed.
     /// Any launch attempt must be blocked — no silent fallback.
     RequiredButUnavailable,
 }
@@ -940,6 +1041,7 @@ impl Drop for OutputCommandLifecycleGuard {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
+                descendants_escaped: false,
             });
         }
         self.process.disarm();
@@ -1076,7 +1178,7 @@ impl Sandbox {
     }
 
     /// Explicit three-state policy derived from the requested configuration
-    /// and the actual availability of the backend binary.
+    /// and the cached result of a real backend preflight.
     pub fn policy(&self) -> SandboxPolicy {
         if !self.enabled {
             return SandboxPolicy::Disabled;
@@ -1089,6 +1191,13 @@ impl Sandbox {
             "appcontainer" => windows::is_available(),
             _ => false,
         };
+        self.policy_from_backend_availability(available)
+    }
+
+    fn policy_from_backend_availability(&self, available: bool) -> SandboxPolicy {
+        if !self.enabled {
+            return SandboxPolicy::Disabled;
+        }
         if available {
             SandboxPolicy::RequiredAndAvailable
         } else {
@@ -1097,7 +1206,11 @@ impl Sandbox {
     }
 
     pub fn capability_matrix(&self) -> SandboxCapabilityMatrix {
-        match self.policy() {
+        self.capability_matrix_for_policy(self.policy())
+    }
+
+    fn capability_matrix_for_policy(&self, policy: SandboxPolicy) -> SandboxCapabilityMatrix {
+        match policy {
             SandboxPolicy::Disabled => SandboxCapabilityMatrix {
                 backend: self.backend.clone(),
                 status: "disabled",
@@ -1105,12 +1218,7 @@ impl Sandbox {
                 filesystem_writes: "host permissions inherited",
                 process_namespace: "host namespaces inherited",
                 devices: "host devices inherited",
-                environment: match self.disabled_reason {
-                    DisabledSandboxReason::UserTrustedBypass => "parent environment inherited",
-                    DisabledSandboxReason::UnavailableDefaultFallback => {
-                        "cleared, then populated from a non-credential allow-list"
-                    }
-                },
+                environment: "cleared, then populated from a non-credential allow-list",
                 network: "host network inherited",
                 requested_network_policy: "not requested",
             },
@@ -1133,8 +1241,8 @@ impl Sandbox {
                 SandboxCapabilityMatrix {
                     backend: self.backend.clone(),
                     status: "required-and-available",
-                    filesystem_reads: "workspace, application cache, explicit read-only runtime assets, and proc kernel metadata",
-                    filesystem_writes: "workspace, application cache, and private ephemeral /tmp only",
+                    filesystem_reads: "workspace, dedicated sandbox cache, explicit read-only runtime assets, and proc kernel metadata",
+                    filesystem_writes: "workspace, dedicated sandbox cache, and private ephemeral /tmp only",
                     process_namespace: "user, PID, IPC, UTS, and cgroup namespaces isolated",
                     devices: "minimal synthetic /dev",
                     environment: "cleared, then populated from a non-credential allow-list",
@@ -1147,7 +1255,7 @@ impl Sandbox {
                     backend: self.backend.clone(),
                     status: "required-and-available",
                     filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
-                    filesystem_writes: "workspace, application cache, shared temporary directory, and /dev/null only",
+                    filesystem_writes: "workspace, dedicated sandbox cache, shared temporary directory, and /dev/null only",
                     process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
                     devices: "host-readable devices remain readable; writes are limited to /dev/null",
                     environment: "cleared, then populated from a non-credential allow-list",
@@ -1403,13 +1511,17 @@ impl Sandbox {
         }
         let paths = crate::paths::process_paths()
             .map_err(|error| format!("sandbox: application paths are unavailable: {error}"))?;
-        std::fs::create_dir_all(&paths.cache_dir).map_err(|error| {
+        let sandbox_cache = paths.cache_dir.join("sandbox-runtime");
+        std::fs::create_dir_all(&sandbox_cache).map_err(|error| {
             format!(
-                "sandbox: failed to create application cache {}: {error}",
-                paths.cache_dir.display()
+                "sandbox: failed to create dedicated sandbox cache {}: {error}",
+                sandbox_cache.display()
             )
         })?;
-        let cache_dir = Arc::new(canonical_non_root(&paths.cache_dir, "application cache")?);
+        let cache_dir = Arc::new(canonical_non_root(
+            &sandbox_cache,
+            "dedicated sandbox cache",
+        )?);
         *cached = Some(cache_dir.clone());
         Ok(cache_dir)
     }
@@ -1425,8 +1537,20 @@ impl Sandbox {
     ) -> Result<Arc<str>, String> {
         let workspace_str = seatbelt_string_literal(workspace, "working directory")?;
         let cache_str = seatbelt_string_literal(cache, "application cache")?;
+        let app_paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
+            format!("sandbox: failed to resolve private application paths: {error}")
+        })?;
+        let credentials_str =
+            seatbelt_string_literal(&app_paths.credentials_dir, "credential directory")?;
+        let config_str = seatbelt_string_literal(&app_paths.config_dir, "configuration directory")?;
 
-        let cache_key = (workspace_str.clone(), cache_str.clone(), deny_network);
+        let cache_key = (
+            workspace_str.clone(),
+            cache_str.clone(),
+            credentials_str.clone(),
+            config_str.clone(),
+            deny_network,
+        );
         let mut profiles = self
             .cached_seatbelt_profiles
             .lock()
@@ -1445,6 +1569,9 @@ impl Sandbox {
             r#"(version 1)
 (deny default)
 (allow process*)
+(deny file-read*
+    (subpath "{credentials_str}")
+    (subpath "{config_str}"))
 (allow file-read*)
 (allow file-write*
     (subpath "{workspace_str}")
@@ -1522,13 +1649,13 @@ impl Sandbox {
                 let mut cmd = Command::new(&self.shell);
                 cmd.arg(&self.shell_command_arg).arg(command);
                 cmd.current_dir(&requested_cwd);
-                if self.disabled_reason == DisabledSandboxReason::UnavailableDefaultFallback {
-                    cmd.env_clear();
-                    for (key, value) in self.get_essential_env() {
-                        cmd.env(key, value);
-                    }
+                // Model-authored commands never inherit provider credentials,
+                // even when the operator explicitly disables OS containment.
+                cmd.env_clear();
+                for (key, value) in self.get_essential_env() {
+                    cmd.env(key, value);
                 }
-                configure_child_lifetime(&mut cmd);
+                configure_model_child_lifetime(&mut cmd);
                 self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd);
             }
@@ -1577,7 +1704,7 @@ impl Sandbox {
             cmd.arg(&self.shell_command_arg);
             cmd.arg(command);
             cmd.current_dir(&cwd);
-            configure_child_lifetime(&mut cmd);
+            configure_model_child_lifetime(&mut cmd);
             self.bind_workspace_cwd(&mut cmd)?;
             return Ok(cmd);
         }
@@ -1983,7 +2110,7 @@ impl Sandbox {
             .arg(&self.shell_command_arg)
             .arg(command);
         cmd.current_dir(cwd);
-        configure_child_lifetime(&mut cmd);
+        configure_model_child_lifetime(&mut cmd);
         Ok(cmd)
     }
 
@@ -1997,14 +2124,24 @@ impl Sandbox {
         let mut cmd = self.build_bwrap_base_command(bwrap, cwd, cache_dir);
         let sandbox_cwd = self.sandbox_cwd(cwd);
         append_bwrap_isolation(&mut cmd, &sandbox_cwd);
-        cmd.args([
-            "--die-with-parent",
-            "--",
-            &self.shell,
-            &self.shell_command_arg,
-            command,
-        ]);
-        configure_child_lifetime(&mut cmd);
+        cmd.args(["--new-session", "--die-with-parent", "--"]);
+        if self.workspace_binding.is_some() {
+            // bwrap needs fd 197 while constructing the workspace bind, but
+            // the model process must not inherit that authority into the new
+            // mount namespace.  Close it in the first in-sandbox process.
+            cmd.arg(&self.shell)
+                .arg(&self.shell_command_arg)
+                .arg(CLOSE_WORKSPACE_AUTHORITY_SCRIPT)
+                .arg("mini-agent-workspace-launcher")
+                .arg(&self.shell)
+                .arg(&self.shell_command_arg)
+                .arg(command);
+        } else {
+            cmd.arg(&self.shell)
+                .arg(&self.shell_command_arg)
+                .arg(command);
+        }
+        configure_model_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -2031,9 +2168,14 @@ impl Sandbox {
         ]);
         let sandbox_cwd = self.sandbox_cwd(cwd);
         append_bwrap_isolation(&mut cmd, &sandbox_cwd);
-        cmd.args(["--die-with-parent", "--", SNAPSHOT_EXECUTABLE_PATH]);
+        cmd.args([
+            "--new-session",
+            "--die-with-parent",
+            "--",
+            SNAPSHOT_EXECUTABLE_PATH,
+        ]);
         cmd.args(arguments);
-        configure_child_lifetime(&mut cmd);
+        configure_model_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -2121,6 +2263,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: error.into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 };
                 audit_explicit_shell(&audit, &output);
                 let run = ExplicitShellRun { audit, output };
@@ -2247,6 +2390,7 @@ impl Sandbox {
                     exit_code: None,
                     stdout: Vec::new(),
                     stderr: format!("background command failed: {error}").into_bytes(),
+                    descendants_escaped: false,
                 },
             };
             finish_background_job(&owner, &task_id, terminal);
@@ -2337,6 +2481,7 @@ impl Sandbox {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
+                descendants_escaped: false,
             });
         }
         let cmd = match self.wrap_command(&command) {
@@ -2347,6 +2492,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: error.into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 });
             }
         };
@@ -2386,6 +2532,7 @@ impl Sandbox {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
+                descendants_escaped: false,
             });
         }
         self.output_command_with_limits_scoped(command, limits, Some(cancellation.subscribe()))
@@ -2406,6 +2553,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: error.into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 });
             }
         };
@@ -2466,6 +2614,7 @@ impl Sandbox {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
+                descendants_escaped: false,
             });
         }
         self.output_built_command_with_limits_scoped(
@@ -2530,6 +2679,7 @@ impl Sandbox {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: CommandStatus::Cancelled,
+                descendants_escaped: false,
             };
             if let Some(audit) = &audit {
                 audit.emit(&output);
@@ -2540,6 +2690,9 @@ impl Sandbox {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         if input.is_some() {
             cmd.stdin(Stdio::piped());
+        } else {
+            // Captured/model-authored commands never own the user's terminal.
+            cmd.stdin(Stdio::null());
         }
         let mut child = match cmd.spawn_guarded() {
             Ok(child) => child,
@@ -2549,6 +2702,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: format!("failed to spawn command: {error}").into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 };
                 if let Some(audit) = &audit {
                     audit.emit(&output);
@@ -2606,8 +2760,9 @@ impl Sandbox {
                 // before it exits, so there is no live tree left to terminate.
                 if let Some(pid) = pid
                     && !(cfg!(windows) && self.backend == "appcontainer")
+                    && !(cfg!(target_os = "linux") && self.backend == "bwrap")
                 {
-                    kill_process_group(pid);
+                    kill_process_group_if_live(pid);
                 }
                 let command_status = if self.take_cancelled(pid) {
                     CommandStatus::Cancelled
@@ -2644,12 +2799,16 @@ impl Sandbox {
             }
         };
 
-        if finish_pipe_readers(stdout_handle, stderr_handle)
+        let readers_finished = finish_pipe_readers(stdout_handle, stderr_handle)
             .await
-            .is_err()
-            && command_status == CommandStatus::Completed
-        {
-            command_status = CommandStatus::Failed;
+            .is_ok();
+        let (classified_status, descendants_escaped) =
+            classify_pipe_completion(command_status, readers_finished);
+        command_status = classified_status;
+        if descendants_escaped {
+            tracing::warn!(
+                "sandbox: direct command completed but a descendant escaped process-group cleanup"
+            );
         }
         if command_status == CommandStatus::Completed
             && let Ok(error) = reader_error_rx.try_recv()
@@ -2673,6 +2832,7 @@ impl Sandbox {
             stdout,
             stderr,
             status: command_status,
+            descendants_escaped,
         };
         lifecycle.finish(&output);
         let _ = response_tx.send(output);
@@ -2693,6 +2853,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: format!("failed to spawn support command: {error}").into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 };
                 audit.emit(&output);
                 let _ = response_tx.send(output);
@@ -2712,6 +2873,7 @@ impl Sandbox {
                     stdout: Vec::new(),
                     stderr: error.into_bytes(),
                     status: CommandStatus::Failed,
+                    descendants_escaped: false,
                 };
                 audit.emit(&output);
                 let _ = response_tx.send(output);
@@ -2729,7 +2891,7 @@ impl Sandbox {
         let (exit_status, status) = match termination {
             CommandTermination::Exited(Ok(status)) => {
                 if let Some(pid) = pid {
-                    kill_process_group(pid);
+                    kill_process_group_if_live(pid);
                 }
                 let command_status = if self.take_cancelled(pid) {
                     CommandStatus::Cancelled
@@ -2762,6 +2924,7 @@ impl Sandbox {
             stdout: Vec::new(),
             stderr: Vec::new(),
             status,
+            descendants_escaped: false,
         };
         audit.emit(&output);
         let _ = response_tx.send(output);
@@ -2848,6 +3011,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
         CommandStatus::OutputLimitExceeded(_) => "output-limit",
         CommandStatus::Failed => "failed",
     };
+    let descendants_escaped = output.descendants_escaped;
     if succeeded {
         tracing::info!(
             target: "zerostack::audit::explicit_shell",
@@ -2856,6 +3020,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
             cwd = %audit.cwd.display(),
             boundary = audit.boundary.label(),
             outcome,
+            descendants_escaped,
             "explicit user shell ended after process cleanup"
         );
     } else {
@@ -2866,6 +3031,7 @@ fn audit_explicit_shell(audit: &ExplicitShellAudit, output: &CommandOutput) {
             cwd = %audit.cwd.display(),
             boundary = audit.boundary.label(),
             outcome,
+            descendants_escaped,
             "explicit user shell ended after process cleanup"
         );
     }
@@ -2882,6 +3048,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
         CommandStatus::OutputLimitExceeded(_) => "output-limit",
         CommandStatus::Failed => "failed",
     };
+    let descendants_escaped = output.descendants_escaped;
     if succeeded {
         tracing::info!(
             target: "zerostack::audit::support_utility",
@@ -2890,6 +3057,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
             cwd = %audit.cwd.display(),
             boundary = audit.metadata.boundary,
             outcome,
+            descendants_escaped,
             "support utility completed after process cleanup"
         );
     } else {
@@ -2900,6 +3068,7 @@ fn audit_support_command(audit: &OwnedSupportCommandAudit, output: &CommandOutpu
             cwd = %audit.cwd.display(),
             boundary = audit.metadata.boundary,
             outcome,
+            descendants_escaped,
             "support utility ended after process cleanup"
         );
     }
@@ -2962,6 +3131,7 @@ fn background_terminal(output: CommandOutput) -> BackgroundJobTerminal {
         exit_code: output.exit_status.and_then(|status| status.code()),
         stdout: output.stdout,
         stderr: output.stderr,
+        descendants_escaped: output.descendants_escaped,
     }
 }
 
@@ -2994,6 +3164,7 @@ fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJob
             exit_code: terminal.exit_code,
             stdout: terminal.stdout.clone(),
             stderr: terminal.stderr.clone(),
+            descendants_escaped: terminal.descendants_escaped,
         };
     }
     let (stdout, stderr) = job
@@ -3012,6 +3183,7 @@ fn snapshot_background_job(id: &str, job: &BackgroundJobRecord) -> BackgroundJob
         exit_code: None,
         stdout,
         stderr,
+        descendants_escaped: false,
     }
 }
 
@@ -3219,6 +3391,16 @@ where
     })
 }
 
+fn classify_pipe_completion(
+    direct_status: CommandStatus,
+    readers_finished: bool,
+) -> (CommandStatus, bool) {
+    (
+        direct_status,
+        !readers_finished && direct_status == CommandStatus::Completed,
+    )
+}
+
 async fn finish_pipe_readers(
     mut stdout: tokio::task::JoinHandle<()>,
     mut stderr: tokio::task::JoinHandle<()>,
@@ -3265,6 +3447,25 @@ pub(crate) fn configure_child_lifetime(cmd: &mut Command) {
     cmd.process_group(0);
 }
 
+#[cfg_attr(unix, allow(unsafe_code))]
+fn configure_model_child_lifetime(cmd: &mut Command) {
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A fresh session both preserves pid-as-process-group ownership for
+        // killpg and prevents access to mini-agent's controlling terminal.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 pub(crate) fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -3292,6 +3493,34 @@ pub(crate) fn kill_process_group(pid: u32) {
     }
     #[cfg(windows)]
     windows::terminate_helper(pid);
+}
+
+/// Best-effort post-reap cleanup. Unlike the primary kill path, this first
+/// verifies that the process group still has a live member and therefore
+/// avoids signalling an already-empty, potentially recycled pgid.
+pub(crate) fn kill_process_group_if_live(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        let Ok(group) = i32::try_from(pid) else {
+            return;
+        };
+        if group <= 0 {
+            return;
+        }
+        match killpg(Pid::from_raw(group), None) {
+            Ok(()) | Err(Errno::EPERM) => kill_process_group(pid),
+            Err(Errno::ESRCH) => {}
+            Err(error) => {
+                tracing::warn!("sandbox: failed to inspect post-reap process group {pid}: {error}")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 fn essential_env() -> Vec<(&'static str, String)> {
@@ -3389,6 +3618,67 @@ mod sandbox_tests {
         Sandbox::new(true, "__no_such_backend_exists__")
     }
 
+    #[test]
+    fn backend_availability_probe_is_cached_once() {
+        let cache = OnceLock::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+
+        assert!(!cached_backend_availability(&cache, probe));
+        assert!(!cached_backend_availability(&cache, probe));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_backend_preflight_is_folded_into_required_policy() {
+        let sandbox = Sandbox::new(true, "bwrap");
+        assert_eq!(
+            sandbox.policy_from_backend_availability(false),
+            SandboxPolicy::RequiredButUnavailable
+        );
+        assert_eq!(
+            sandbox.policy_from_backend_availability(true),
+            SandboxPolicy::RequiredAndAvailable
+        );
+        assert_eq!(
+            Sandbox::new(false, "bwrap").policy_from_backend_availability(true),
+            SandboxPolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn inherited_pipe_timeout_preserves_the_direct_completion_result() {
+        assert_eq!(
+            classify_pipe_completion(CommandStatus::Completed, false),
+            (CommandStatus::Completed, true)
+        );
+        assert_eq!(
+            classify_pipe_completion(CommandStatus::TimedOut, false),
+            (CommandStatus::TimedOut, false)
+        );
+        assert_eq!(
+            classify_pipe_completion(CommandStatus::Completed, true),
+            (CommandStatus::Completed, false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicitly_disabled_model_sandbox_still_strips_ambient_secrets() {
+        const SECRET: &str = "MINI_AGENT_MODEL_SECRET_TEST";
+        let _environment = crate::tests::ScopedProcessEnv::set(&[(
+            SECRET,
+            Some(OsString::from("must-not-cross-model-boundary")),
+        )]);
+        let result = disabled()
+            .output_command(&format!("test -z \"${{{SECRET}+x}}\""))
+            .await;
+        assert!(result.unwrap().status.success());
+    }
+
     fn background_record(sequence: u64, terminal: bool) -> BackgroundJobRecord {
         BackgroundJobRecord {
             sequence,
@@ -3400,6 +3690,7 @@ mod sandbox_tests {
                 exit_code: Some(0),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
+                descendants_escaped: false,
             }),
             stop_requested: false,
             changed: Arc::new(Notify::new()),
@@ -4415,19 +4706,24 @@ mod sandbox_tests {
 
     #[test]
     fn windows_capability_copy_reports_explicit_roots_and_default_network_denial() {
-        let source = include_str!("sandbox.rs");
-        assert!(source.contains(
+        let matrix = Sandbox::new(true, "appcontainer")
+            .capability_matrix_for_policy(SandboxPolicy::RequiredAndAvailable);
+
+        assert_eq!(matrix.backend, "appcontainer");
+        assert_eq!(matrix.status, "required-and-available");
+        assert_eq!(
+            matrix.network,
             "AppContainer network capabilities are empty; IP network access is denied by default"
-        ));
-        assert!(source.contains(
-            "explicit user-file roots plus pre-existing resources readable to ALL APPLICATION PACKAGES; read confidentiality is not claimed"
-        ));
-        assert!(source.contains(
-            "the sandbox adds write access only for the canonical workspace and explicit roots; pre-existing ALL APPLICATION PACKAGES grants remain ambient"
-        ));
-        assert!(source.contains("default-deny AppContainer with no network capability"));
-        let forbidden_registry_claim = ["registry isolation", " is enforced"].concat();
-        assert!(!source.contains(&forbidden_registry_claim));
+        );
+        assert_eq!(
+            matrix.requested_network_policy,
+            "default-deny AppContainer with no network capability"
+        );
+        assert!(matrix.filesystem_reads.contains("explicit user-file roots"));
+        assert!(matrix.filesystem_reads.contains("ALL APPLICATION PACKAGES"));
+        assert!(matrix.filesystem_writes.contains("canonical workspace"));
+        assert!(!matrix.filesystem_reads.contains("registry isolation"));
+        assert!(!matrix.filesystem_writes.contains("registry isolation"));
     }
 
     #[test]
@@ -4487,6 +4783,7 @@ mod sandbox_tests {
 
         for flag in [
             "--clearenv",
+            "--new-session",
             "--unshare-user",
             "--unshare-pid",
             "--unshare-ipc",
@@ -4529,6 +4826,64 @@ mod sandbox_tests {
             matrix.requested_network_policy,
             BWRAP_REQUESTED_NETWORK_POLICY
         );
+    }
+
+    #[test]
+    fn bound_bwrap_command_closes_workspace_authority_before_model_shell() {
+        let binding = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(binding);
+        let command = sandbox.build_bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            "printf sandboxed",
+            Path::new("/proc/self/fd/197"),
+            Path::new("/cache/mini-agent"),
+        );
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == CLOSE_WORKSPACE_AUTHORITY_SCRIPT),
+            "the first in-sandbox process must close fd 197"
+        );
+        let close = args
+            .iter()
+            .position(|arg| arg == CLOSE_WORKSPACE_AUTHORITY_SCRIPT)
+            .unwrap();
+        let model_command = args
+            .iter()
+            .position(|arg| arg == "printf sandboxed")
+            .unwrap();
+        assert!(close < model_command);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn bound_bwrap_model_process_has_no_authority_fd_or_terminal_stdin() {
+        let binding = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(binding);
+        let output = sandbox
+            .output_command_with_limits(
+                "test ! -e /proc/self/fd/197 && test \"$(readlink /proc/self/fd/0)\" = /dev/null",
+                DEFAULT_COMMAND_LIMITS,
+            )
+            .await
+            .unwrap();
+        let command_status = output.status;
+        let exit_succeeded = output.exit_status.is_some_and(|value| value.success());
+        let stderr = output.stderr;
+
+        assert_eq!(command_status, CommandStatus::Completed);
+        assert!(exit_succeeded);
+        assert!(stderr.is_empty(), "{stderr:?}");
     }
 
     #[test]
@@ -4581,7 +4936,7 @@ mod sandbox_tests {
             backend: "seatbelt".to_string(),
             status: "required-and-available",
             filesystem_reads: "host-readable files remain readable (Seatbelt read confinement is not claimed)",
-            filesystem_writes: "workspace, application cache, shared temporary directory, and /dev/null only",
+            filesystem_writes: "workspace, dedicated sandbox cache, shared temporary directory, and /dev/null only",
             process_namespace: "no namespace isolation; child processes inherit the Seatbelt profile",
             devices: "host-readable devices remain readable; writes are limited to /dev/null",
             environment: "cleared, then populated from a non-credential allow-list",
@@ -4646,7 +5001,10 @@ printf LINUX_SANDBOX_POLICY_PASS
             workspace_probe_name = workspace_probe_name,
         );
 
-        let sandbox = Sandbox::new(true, "bwrap");
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let sandbox = Sandbox::new(true, "bwrap").with_workspace_binding(workspace);
         let mut command = sandbox.wrap_command(&script).unwrap();
         command.env("MINI_AGENT_SANDBOX_SECRET", "must-not-cross-clearenv");
         let output = sandbox
@@ -4709,8 +5067,12 @@ printf LINUX_SANDBOX_POLICY_PASS
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_policy_enforces_real_backend() {
-        if !seatbelt_exists() {
+        if seatbelt_path().is_none() {
             panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+        if !seatbelt_exists() {
+            eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
+            return;
         }
 
         let unique = uuid::Uuid::new_v4();
@@ -4981,10 +5343,18 @@ printf {pass_token}
         // Build the same profile manually (simulating what would happen without caching)
         let workspace_str = seatbelt_string_literal(&workspace, "working directory").unwrap();
         let cache_str = seatbelt_string_literal(&cache_dir, "application cache").unwrap();
+        let app_paths = crate::paths::AppPaths::from_process(None).unwrap();
+        let credentials_str =
+            seatbelt_string_literal(&app_paths.credentials_dir, "credential directory").unwrap();
+        let config_str =
+            seatbelt_string_literal(&app_paths.config_dir, "configuration directory").unwrap();
         let uncached_profile = format!(
             r#"(version 1)
 (deny default)
 (allow process*)
+(deny file-read*
+    (subpath "{credentials_str}")
+    (subpath "{config_str}"))
 (allow file-read*)
 (allow file-write*
     (subpath "{workspace_str}")
@@ -5000,6 +5370,8 @@ printf {pass_token}
             uncached_profile,
             "cached profile must be byte-identical to uncached profile built from same inputs"
         );
+        assert!(cached_profile.contains(&format!("(subpath \"{credentials_str}\")")));
+        assert!(cached_profile.contains(&format!("(subpath \"{config_str}\")")));
 
         // A second call must yield the same profile text. Pointer identity is
         // deliberately not asserted: `get_seatbelt_profile` hands back an owned

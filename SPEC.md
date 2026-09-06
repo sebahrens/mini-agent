@@ -20,6 +20,22 @@ result channel, and a parent-owned JSON scratch store. Skills-enabled builds als
 local-owner lifecycle commands; trusted `enable_skill_proposals = true` configuration exposes
 `propose_skill` and starts the proposal/admission workers.
 
+## Delivered 2026-09-06 reconciliation
+
+Round-two hardening closes the general-command TTY and inherited-descriptor paths, resolves
+sandboxed-hook executable readiness, narrows general cache/config/credential exposure, binds hook
+trust to event and matcher, and preserves truthful descendant-cleanup outcomes. Replacement
+approval now persists lineage, duplicate checks exclude only the named predecessor, scoped
+capabilities cannot escalate, admission leases cover verification, and rollback clears stale
+forward links.
+
+Schema version 11 adds task outcomes sourced from completion verification or evaluator oracles and
+linked to learned skills actually invoked in the same turn. Production status is constructor-owned;
+gym/evaluation contexts can only downgrade it. Policy versions that require verified-task passes
+do not fall back to invocation-count promotion. The operator Skill Gym and paired task-json harness
+exercise this machinery with non-production evidence; the distiller, live nightly A/B, and
+evidence-derived retrieval labels remain deferred.
+
 ## Foundation — paths and persistence
 
 Normative specification: [`platform-paths.md`](docs/specs/platform-paths.md)

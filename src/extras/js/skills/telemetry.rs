@@ -608,11 +608,18 @@ pub struct TelemetryIngestor<'a> {
 }
 
 pub struct TelemetryDispatcher {
-    tx: Option<SyncSender<EventBatch>>,
+    tx: Option<SyncSender<TelemetryCommand>>,
+    #[cfg(test)]
+    test_batch_tx: Option<SyncSender<EventBatch>>,
     observability_lost: Arc<AtomicU64>,
     busy_retries: Arc<AtomicU64>,
     join: Option<std::thread::JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
+}
+
+enum TelemetryCommand {
+    Events(EventBatch),
+    TaskOutcome(super::policy::TaskOutcomeEvidence),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -672,7 +679,18 @@ impl TelemetryDispatcher {
             .name("skill-telemetry".into())
             .spawn(move || {
                 let _work_guard = work_guard;
-                while let Ok(batch) = rx.recv() {
+                while let Ok(command) = rx.recv() {
+                    let TelemetryCommand::Events(batch) = command else {
+                        if let TelemetryCommand::TaskOutcome(outcome) = command
+                            && ingest_task_outcome(&mut store, &outcome).is_err()
+                        {
+                            worker_observability_lost.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(
+                                "skill task-outcome ingestion failed; evidence was excluded"
+                            );
+                        }
+                        continue;
+                    };
                     match ingest_retrying_busy(&mut store, &batch, &worker_busy_retries) {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
@@ -696,6 +714,8 @@ impl TelemetryDispatcher {
             .map_err(|_| DispatchError::Disconnected)?;
         Ok(Self {
             tx: Some(tx),
+            #[cfg(test)]
+            test_batch_tx: None,
             observability_lost,
             busy_retries,
             join: Some(join),
@@ -717,15 +737,110 @@ impl TelemetryDispatcher {
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {
+        #[cfg(test)]
+        if let Some(tx) = &self.test_batch_tx {
+            return tx.try_send(batch).map_err(|error| match error {
+                TrySendError::Full(_) => DispatchError::Saturated,
+                TrySendError::Disconnected(_) => DispatchError::Disconnected,
+            });
+        }
         self.tx
             .as_ref()
             .ok_or(DispatchError::Disconnected)?
-            .try_send(batch)
+            .try_send(TelemetryCommand::Events(batch))
             .map_err(|error| match error {
                 TrySendError::Full(_) => DispatchError::Saturated,
                 TrySendError::Disconnected(_) => DispatchError::Disconnected,
             })
     }
+
+    pub(crate) fn record_task_outcome(
+        &self,
+        outcome: super::policy::TaskOutcomeEvidence,
+    ) -> Result<(), DispatchError> {
+        outcome
+            .validate()
+            .map_err(|_| DispatchError::Disconnected)?;
+        self.tx
+            .as_ref()
+            .ok_or(DispatchError::Disconnected)?
+            .try_send(TelemetryCommand::TaskOutcome(outcome))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => DispatchError::Saturated,
+                TrySendError::Disconnected(_) => DispatchError::Disconnected,
+            })
+    }
+}
+
+fn ingest_task_outcome(
+    store: &mut SkillStore,
+    outcome: &super::policy::TaskOutcomeEvidence,
+) -> Result<(), TelemetryError> {
+    use super::policy::TaskOutcomeSource;
+    outcome
+        .validate()
+        .map_err(|_| TelemetryError::InvalidEvent)?;
+    let tx = store
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (source_kind, source_id) = match &outcome.source {
+        TaskOutcomeSource::VerifyCommand(id) => ("verify_command", Some(id.as_str())),
+        TaskOutcomeSource::Oracle(id) => ("oracle", Some(id.as_str())),
+        TaskOutcomeSource::NoVerifyCommand => ("no_verify_command", None),
+    };
+    let mut attributed_skills = Vec::new();
+    for skill_id in &outcome.skill_ids {
+        let invoked: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM skill_events
+                 WHERE skill_id = ?1 AND turn_id = ?2 AND event_kind = 'invoked'
+                   AND production = ?3 AND evidence_complete = 1
+             )",
+            params![skill_id, outcome.turn_id, i64::from(outcome.production)],
+            |row| row.get(0),
+        )?;
+        if !invoked {
+            continue;
+        }
+        attributed_skills.push(skill_id);
+    }
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "version": 2,
+        "turn_id": outcome.turn_id,
+        "verify_passed": outcome.verify_passed,
+        "attempt": outcome.attempt,
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "production": outcome.production,
+        "created_at": outcome.created_at,
+    }))
+    .map_err(|_| TelemetryError::InvalidEvent)?;
+    let evidence_id = crate::hex::encode_lower(Sha256::digest(canonical));
+    tx.execute(
+        "INSERT OR IGNORE INTO skill_task_outcomes (
+             evidence_id, turn_id, verify_passed, attempt,
+             source_kind, source_id, production, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            evidence_id,
+            outcome.turn_id,
+            i64::from(outcome.verify_passed),
+            i64::from(outcome.attempt),
+            source_kind,
+            source_id,
+            i64::from(outcome.production),
+            outcome.created_at,
+        ],
+    )?;
+    for skill_id in attributed_skills {
+        tx.execute(
+            "INSERT OR IGNORE INTO skill_task_outcome_links (evidence_id, skill_id)
+             VALUES (?1, ?2)",
+            params![evidence_id, skill_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn ingest_retrying_busy(
@@ -852,7 +967,8 @@ impl TelemetryDispatcher {
     #[cfg(test)]
     pub(crate) fn from_sender_for_test(tx: SyncSender<EventBatch>) -> Self {
         Self {
-            tx: Some(tx),
+            tx: None,
+            test_batch_tx: Some(tx),
             observability_lost: Arc::new(AtomicU64::new(0)),
             busy_retries: Arc::new(AtomicU64::new(0)),
             join: None,

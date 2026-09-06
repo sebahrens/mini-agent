@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::extras::hooks::dispatcher::HookDispatcher;
 use crate::extras::hooks::envelope::EventFields;
 use crate::extras::hooks::settings::{HookGroup, HookHandler, HooksConfig};
-use crate::extras::hooks::{Decision, HookCtx, Verdict};
+use crate::extras::hooks::{Decision, HookCtx, Verdict, gate_brokered_pre_tool_use_with};
 
 fn handler(command: &str) -> HookHandler {
     HookHandler {
@@ -68,9 +68,16 @@ fn config_with(event: &str, matcher: Option<&str>, handlers: Vec<HookHandler>) -
 }
 
 #[test]
-fn invalid_regex_matcher_fails_at_load_time() {
-    let config = config_with("PreToolUse", Some("(unclosed"), vec![handler("true")]);
-    assert!(HookDispatcher::from_config(&config).is_err());
+fn invalid_regex_matcher_isolated_from_valid_guard_groups() {
+    let mut config = config_with("PreToolUse", Some("(unclosed"), vec![handler("false")]);
+    config.get_mut("PreToolUse").unwrap().push(HookGroup {
+        matcher: Some("bash".into()),
+        hooks: vec![handler("true")],
+    });
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let handlers = dispatcher.handlers_for("PreToolUse", "bash");
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].args.as_ref().unwrap()[1], "true");
 }
 
 #[test]
@@ -176,6 +183,27 @@ async fn dispatch_returns_continue_without_running_anything_when_no_handler_matc
 
     assert_eq!(decision.verdict, Verdict::Defer);
     assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn brokered_js_spawn_is_visible_to_pre_tool_use_guards() {
+    let config = config_with(
+        "PreToolUse",
+        Some("js_spawn"),
+        vec![handler(
+            r#"echo '{"permissionDecision":"deny","reason":"blocked spawn"}'"#,
+        )],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let result = gate_brokered_pre_tool_use_with(
+        &dispatcher,
+        &ctx(),
+        "js_spawn",
+        serde_json::json!({"program": "rm", "arguments": ["-rf", "target"]}),
+    )
+    .await;
+
+    assert_eq!(result, Err("blocked spawn".to_string()));
 }
 
 #[tokio::test]
@@ -323,7 +351,6 @@ async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisi
     let config = config_with("Stop", None, vec![background]);
     let dispatcher = HookDispatcher::from_config(&config).unwrap();
 
-    let started = std::time::Instant::now();
     let decision = dispatcher
         .dispatch(
             "Stop",
@@ -339,8 +366,8 @@ async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisi
 
     assert_eq!(decision, Decision::Continue);
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(150),
-        "async:true dispatch must not wait for the handler"
+        !marker.exists(),
+        "async:true dispatch must return before the blocked handler completes"
     );
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while std::fs::read_to_string(&marker).unwrap_or_default() != "complete" {
@@ -439,7 +466,13 @@ async fn dispatch_post_tool_use_failure_runs_but_cannot_change_outcome() {
         .dispatch_post_tool_use_failure(&ctx(), "bash", serde_json::json!({}), "boom")
         .await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PostToolUseFailure hook did not publish its marker");
     assert!(marker.exists());
 }
 

@@ -96,7 +96,10 @@ publish an immediate immutable visibility mask without rebuilding the graph; pur
 persistent vectors, and a purged identity is tombstoned so it cannot be resurrected. The
 `--purge-learned-skill` operator command invokes the coordinated privacy-purge path.
 Use `--learned-skill-stats` to print per-revision status, invocation count, direct success rate,
-last-use Unix timestamp, declared effect methods, and an estimated saved-round-trip lower bound.
+last-use Unix timestamp, `tasks_with`, `passed_with`, `pass_rate_without`, declared effect methods,
+and an estimated saved-round-trip lower bound. Task columns use normalized task-outcome evidence:
+the no-skill baseline matches the verifier-command hash or oracle ID and excludes outcomes where
+that skill was present.
 The estimate credits only successful calls with more than one distinct declared effect method;
 raw effect arguments and counts are intentionally not retained in skill telemetry.
 Agent Skill instructions and learned capabilities never bypass the existing MCP, filesystem,
@@ -153,6 +156,17 @@ above. Feedback commands require kind, reason, and caller-chosen idempotency key
 invocation ID attributes feedback to one exact invocation. Severe authenticated feedback can
 immediately quarantine an eligible canary or active revision through the normal coordinated
 lifecycle path.
+
+Completion verification records a task outcome after a turn, linked only to learned skills with a
+durable invocation event in that turn. Sources are a hashed `verify_command`, an evaluator oracle
+ID, or explicit `no_verify_command`. Production status comes from the session constructor;
+`MINI_AGENT_GYM=1` only downgrades evidence. A promotion policy that opts into verified-task
+evidence cannot fall back to invocation counts when the task threshold is unmet.
+
+The operator Skill Gym is documented in [GYM.md](GYM.md). It exercises paired no-library/library
+tasks and the real lifecycle/store boundary, but its evidence is non-production. There is no
+shipped successful-step distiller: converting recorded JavaScript into a `propose_skill` draft is
+deferred work, and a gym report never changes lifecycle state by itself.
 
 ## Current limits
 

@@ -10,10 +10,12 @@ use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleError, LifecycleService,
 };
 use crate::extras::js::skills::store::{
-    AdminIdentity, MAX_EVALUATION_ATTEMPTS, ProposalStatus, SkillStore,
+    AdminIdentity, EnqueueStatus, MAX_EVALUATION_ATTEMPTS, ProposalStatus, SkillStore,
 };
 use crate::extras::js::skills::verify::worker_error;
-use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+use crate::extras::js::skills::{
+    CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, SkillArtifact, SkillExport,
+};
 use crate::extras::js::supervisor::WorkerError;
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use std::collections::BTreeMap;
@@ -68,13 +70,18 @@ fn suite() -> HeldOutSuiteDraft {
     HeldOutSuiteDraft {
         selector: HeldOutSelector {
             tags: vec!["normalize".to_string()],
-            exports: vec!["normalize".to_string()],
+            exports: vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: unknown): string".to_string(),
+            }],
             capability_tier: Some("pure".to_string()),
         },
         cases: vec![HeldOutCase {
             expression: "normalize('\\tvalue\\n')".to_string(),
             expected: ExpectedJsValue::String("value".to_string()),
             fake_files: BTreeMap::new(),
+            fake_spawns: vec![],
+            fake_fetches: vec![],
             transcript: TranscriptExpectation::default(),
         }],
     }
@@ -118,6 +125,7 @@ fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
         .expect("proposal remains queued");
     assert_eq!(proposal.status, ProposalStatus::Pending);
     assert_eq!(proposal.attempt_count, 0);
+    assert_eq!(proposal.infrastructure_attempt_count, 1);
     assert_eq!(proposal.next_attempt_at, Some(21));
     assert_eq!(proposal.lease_owner, None);
     assert_eq!(proposal.lease_expires_at, None);
@@ -131,31 +139,60 @@ fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
 }
 
 #[test]
-fn verification_scheduler_cancellation_never_exhausts_artifact_retry_budget() {
+fn verification_scheduler_cancellation_parks_after_bounded_infrastructure_retries() {
     let (root, _paths, mut evaluator, artifact) = evaluator(true);
 
-    for attempt in 0..=MAX_EVALUATION_ATTEMPTS {
+    let mut now = 20;
+    for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
         evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
-        let now = 20 + i64::from(attempt) * 2;
         let error = evaluator
             .evaluate_next(now)
             .expect_err("scheduler cancellation must remain infrastructure-only");
         assert!(matches!(error, AdmissionError::Retryable(_)));
+        let proposal = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.infrastructure_attempt_count, attempt);
+        if attempt < MAX_EVALUATION_ATTEMPTS {
+            now = proposal.next_attempt_at.expect("bounded retry remains due");
+        }
     }
 
     let proposal = evaluator
         .store()
         .get_proposal(&artifact.id)
         .unwrap()
-        .expect("proposal remains queued after repeated infrastructure failures");
-    assert_eq!(proposal.status, ProposalStatus::Pending);
+        .expect("proposal remains parked after repeated infrastructure failures");
+    assert_eq!(proposal.status, ProposalStatus::Deferred);
     assert_eq!(proposal.attempt_count, 0);
+    assert_eq!(
+        proposal.infrastructure_attempt_count,
+        MAX_EVALUATION_ATTEMPTS
+    );
+    assert_eq!(proposal.next_attempt_at, None);
     assert_eq!(proposal.report_id, None);
-    assert_eq!(proposal.reason_code, None);
+    assert_eq!(
+        proposal.reason_code.as_deref(),
+        Some("evaluation_infrastructure_deferred")
+    );
     assert_eq!(
         evaluator.store().revision_status(&artifact.id).unwrap(),
         Some("pending".to_string())
     );
+    let reopened = evaluator
+        .store_mut()
+        .enqueue_proposal(&artifact, None, now.saturating_add(1))
+        .expect("byte-identical resubmission reopens deferred infrastructure work");
+    assert_eq!(reopened.status, EnqueueStatus::Pending);
+    let proposal = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert_eq!(proposal.infrastructure_attempt_count, 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -239,6 +276,144 @@ fn skill_admission_gate_evaluates_then_human_approves_exactly_one_canary() {
     assert_eq!(packet.report_id, report.report_id);
     assert!(!format!("{packet:?}").contains("function normalize"));
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn replacement_with_unchanged_contract_is_admitted_with_lineage() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    suite()
+        .import(
+            &mut store,
+            &AdminIdentity::authenticated("suite-admin").unwrap(),
+            5,
+        )
+        .expect("suite");
+    let predecessor = artifact();
+    store
+        .insert_verified(&predecessor)
+        .expect("active predecessor");
+    let replacement = SkillArtifact::new(
+        "function normalize(_cap, v) { return (`${v}`).trim(); }".to_string(),
+        predecessor.description.clone(),
+        predecessor.tags.clone(),
+        predecessor.exports.clone(),
+        predecessor.tests.clone(),
+        predecessor.capability.clone(),
+    )
+    .expect("replacement");
+    store
+        .enqueue_proposal(&replacement, Some(&predecessor.id), 10)
+        .expect("replacement proposal");
+    let mut evaluator =
+        AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-replacement")
+            .expect("evaluator");
+
+    let report = evaluator
+        .evaluate_next(20)
+        .expect("evaluation")
+        .expect("report");
+    assert_eq!(report.outcome, "passed");
+    let outcome = evaluator
+        .review_and_admit(
+            &replacement.id,
+            &Approver {
+                now: 21,
+                packet: Mutex::new(None),
+            },
+            21,
+        )
+        .expect("approval");
+    assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+
+    let (status, supersedes_id, lineage_root_id, evaluation_report_id): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = evaluator
+        .store()
+        .conn()
+        .query_row(
+            "SELECT status, supersedes_id, lineage_root_id, evaluation_report_id
+             FROM skill_revisions WHERE id = ?1",
+            [&replacement.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "canary");
+    assert_eq!(supersedes_id.as_deref(), Some(predecessor.id.as_str()));
+    assert_eq!(lineage_root_id.as_deref(), Some(predecessor.id.as_str()));
+    assert_eq!(
+        evaluation_report_id.as_deref(),
+        Some(report.report_id.as_str())
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn replacement_capabilities_may_narrow_but_never_widen() {
+    use crate::extras::js::skills::admission::capability_is_non_escalating;
+
+    let predecessor = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["src".into(), "tests".into()],
+            },
+            CapabilityScope::Fetch {
+                origins: vec!["https://example.com".into(), "https://example.org".into()],
+                methods: vec![HttpMethod::Get, HttpMethod::Post],
+            },
+            CapabilityScope::Spawn {
+                programs: vec!["git".into(), "printf".into()],
+            },
+        ],
+    )
+    .unwrap();
+    let narrowed = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![
+            CapabilityScope::ReadFile {
+                workspace_prefixes: vec!["src/extras".into()],
+            },
+            CapabilityScope::Fetch {
+                origins: vec!["https://example.com".into()],
+                methods: vec![HttpMethod::Get],
+            },
+            CapabilityScope::Spawn {
+                programs: vec!["git".into()],
+            },
+        ],
+    )
+    .unwrap();
+    assert!(capability_is_non_escalating(&narrowed, &predecessor));
+
+    let widened_path = CapabilityManifest::new(
+        CapabilityTier::ReadOnly,
+        vec![CapabilityScope::ReadFile {
+            workspace_prefixes: vec!["source".into()],
+        }],
+    )
+    .unwrap();
+    assert!(!capability_is_non_escalating(&widened_path, &predecessor));
+    let widened_method = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Fetch {
+            origins: vec!["https://example.com".into()],
+            methods: vec![HttpMethod::Get, HttpMethod::Post],
+        }],
+    )
+    .unwrap();
+    let get_only = CapabilityManifest::new(
+        CapabilityTier::SideEffecting,
+        vec![CapabilityScope::Fetch {
+            origins: vec!["https://example.com".into()],
+            methods: vec![HttpMethod::Get],
+        }],
+    )
+    .unwrap();
+    assert!(!capability_is_non_escalating(&widened_method, &get_only));
 }
 
 #[test]
@@ -503,7 +678,7 @@ impl EmbeddingBackend for UnavailableEmbedding {
 }
 
 #[test]
-fn skill_admission_gate_retry_budget_ends_in_stable_rejection() {
+fn skill_admission_gate_embedding_outage_parks_without_rejecting_identity() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     suite()
@@ -521,21 +696,33 @@ fn skill_admission_gate_retry_budget_ends_in_stable_rejection() {
     let mut evaluator =
         AdmissionEvaluator::new(store, embedder, "retry-worker").expect("evaluator");
 
-    for attempt in 1..8 {
-        let error = evaluator
-            .evaluate_next(i64::from(attempt) * 1_000)
-            .expect_err("retryable outage");
+    let mut now = 1_000;
+    for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
+        let error = evaluator.evaluate_next(now).expect_err("retryable outage");
         assert!(matches!(error, AdmissionError::Retryable(_)));
+        let proposal = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.infrastructure_attempt_count, attempt);
+        if attempt < MAX_EVALUATION_ATTEMPTS {
+            now = proposal.next_attempt_at.expect("retry due time");
+        }
     }
-    let report = evaluator
-        .evaluate_next(8_000)
-        .expect("final attempt")
-        .expect("rejection report");
-    assert_eq!(report.outcome, "rejected");
-    assert_eq!(report.reason_code.as_deref(), Some("embedding_unavailable"));
+    let proposal = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Deferred);
+    assert_eq!(
+        proposal.reason_code.as_deref(),
+        Some("evaluation_infrastructure_deferred")
+    );
     assert_eq!(
         evaluator.store().revision_status(&artifact.id).unwrap(),
-        Some("rejected".to_string())
+        Some("pending".to_string())
     );
     let _ = std::fs::remove_dir_all(root);
 }

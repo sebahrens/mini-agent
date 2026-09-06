@@ -92,20 +92,41 @@ mod tests {
 
     #[test]
     fn explore_prompt_only_advertises_registered_tools() {
-        // Every tool named in the prompt must be registered by
-        // SubagentAuthorization::filesystem_tools (and optionally memory tools).
-        // Advertising a nonexistent tool wastes model turns.
-        for name in ["read", "grep", "find_files", "list_dir"] {
+        let authorization =
+            crate::extras::subagents::builder::SubagentAuthorization::new(None, None, true);
+        let registered = authorization
+            .filesystem_tools(1024, 100, 100, 100, Some(100), None)
+            .into_iter()
+            .map(|tool| tool.name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            registered,
+            ["find_files", "grep", "list_dir", "read"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        for name in &registered {
             assert!(
                 EXPLORE_PROMPT.contains(&format!("**{name}**")),
                 "prompt must document registered tool {name}"
             );
         }
-        // These must NOT appear — they are not registered for subagents.
-        for absent in ["**todo**", "**task**", "**write**", "**edit**", "**bash**"] {
-            assert!(
-                !EXPLORE_PROMPT.contains(absent),
-                "prompt must not advertise unregistered tool: {absent}"
+        for advertised in [
+            "read",
+            "grep",
+            "find_files",
+            "list_dir",
+            "todo",
+            "task",
+            "write",
+            "edit",
+            "shell",
+        ] {
+            assert_eq!(
+                EXPLORE_PROMPT.contains(&format!("**{advertised}**")),
+                registered.contains(advertised),
+                "prompt and registered tool set disagree for {advertised}"
             );
         }
     }

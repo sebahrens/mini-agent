@@ -610,7 +610,7 @@ mod tests {
             PermissionChecker::new(
                 &PermissionConfigs::from(config),
                 SecurityMode::Restrictive,
-                Some(std::env::current_dir().unwrap()),
+                Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
                 Some(vec!["restrictive".to_string()]),
             )
             .expect("valid permission test configuration"),
@@ -670,11 +670,10 @@ mod tests {
         cancellation.cancel();
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), scope.wait_idle())
-                .await
-                .is_err(),
-            "turn settlement must not detach an in-flight GrepTool file read"
+        assert_eq!(
+            scope.active_children(),
+            1,
+            "turn settlement must retain the in-flight GrepTool file read"
         );
 
         release_read.release();

@@ -571,7 +571,24 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         percentile(&total, 0.95),
         report_path.display()
     );
-    if corpus_size == 100_000 {
+    if corpus_size < 100_000 {
+        assert!(
+            search_p99_us <= 50_000.0,
+            "smoke retrieval p99 regressed above 50ms: {search_p99_us:.1}us"
+        );
+        assert!(
+            recall_at_ten >= 0.95 && rebuild_recall_at_ten >= 0.95,
+            "smoke ANN fidelity regressed: initial={recall_at_ten:.3} rebuild={rebuild_recall_at_ten:.3}"
+        );
+        assert!(
+            top_one_hits as f64 / self_query_count.max(1) as f64 >= 0.95,
+            "smoke self-query top-1 fidelity regressed"
+        );
+        assert!(
+            build_us <= 30_000_000.0 && rebuild_us <= 30_000_000.0,
+            "smoke build exceeded 30s: build={build_us:.0}us rebuild={rebuild_us:.0}us"
+        );
+    } else {
         assert!(
             search_p99_us <= 5000.0 && recall_at_ten >= 0.95,
             "full retrieval gate failed: p99={search_p99_us:.1}us recall@10={recall_at_ten:.3}"

@@ -144,7 +144,7 @@ fn make_test_tool_with_permissions_and_process_tree(
         sandbox,
         permission,
         ask_tx,
-        AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+        AllowConfig::unrestricted(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
         std::sync::Arc::new(JsWorkerSupervisor::with_launcher_for_test(
             TestWorkerLauncher::internal_worker_process(),
         )),
@@ -388,7 +388,7 @@ async fn test_read_write_roundtrip() {
     use rig::tool::Tool;
     let tool = make_test_tool();
 
-    let path = std::env::temp_dir().join("zs_test_roundtrip.txt");
+    let path = std::env::temp_dir().join(format!("zs-test-roundtrip-{}.txt", uuid::Uuid::new_v4()));
     let path_str = path.to_string_lossy().to_string();
 
     let write_code = format!(

@@ -1533,7 +1533,12 @@ async fn js_worker_resource_benchmark() -> Result<(), Box<dyn std::error::Error>
     let json = serde_json::to_string_pretty(&report)?;
     let output = std::env::var_os("MINI_AGENT_JS_WORKER_BENCH_OUTPUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("mini-agent-js-worker-benchmark.json"));
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "mini-agent-js-worker-benchmark-{}.json",
+                uuid::Uuid::new_v4()
+            ))
+        });
     fs::write(&output, format!("{json}\n"))?;
     println!("JS_WORKER_BENCHMARK_OUTPUT={}", output.display());
     println!("{json}");

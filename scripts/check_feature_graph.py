@@ -87,6 +87,11 @@ FEATURE_ROWS = (
     # Opt-in extras that neither the default set nor another focused row
     # compiles; `lsp` is the only member that activates optional packages.
     row("extras", "hooks,advisor,lsp,multimodal,pdf", LSP_PACKAGES),
+    row(
+        "hooks-js-subagents-skills",
+        "hooks,js,subagents,skills,sandbox",
+        SKILLS_PACKAGES,
+    ),
     row("js-skills", "js,skills", SKILLS_PACKAGES),
     row("skills-embed", "skills-embed", EMBED_PACKAGES),
     row("skills-embed-dynamic", "skills-embed-dynamic", EMBED_PACKAGES),
@@ -108,6 +113,7 @@ TEST_MATRIX_ROWS = (
     "mcp",
     "acp",
     "extras",
+    "hooks-js-subagents-skills",
     "js-skills",
     "full",
 )
@@ -118,6 +124,7 @@ CLIPPY_MATRIX_ROWS = (
     "sandbox",
     "acp",
     "extras",
+    "hooks-js-subagents-skills",
     "js-skills",
     "full",
 )

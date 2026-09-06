@@ -9,7 +9,7 @@
     "predecessor_id": null
   },
   "held_out_suites": [{
-    "selector": {"tags": ["seed", "csv"], "exports": ["parseCsv"], "capability_tier": "pure"},
+    "selector": {"tags": ["seed", "csv"], "exports": [{"name": "parseCsv", "signature": "(text: string) => string[][]"}], "capability_tier": "pure"},
     "cases": [{"expression": "parseCsv('name,note\\nmini,\"a \"\"quote\"\"\"')[1][1]", "expected": {"type": "string", "value": "a \"quote\""}, "fake_files": {}, "transcript": {}}]
   }]
 }

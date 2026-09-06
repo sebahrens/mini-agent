@@ -1,6 +1,6 @@
 %%mode=readonly
 
-You MUST NOT use write, edit, or bash. Only read, grep, and find_files are permitted.
+You MUST NOT use write, edit, or shell. Only read, grep, find_files, and list_dir are permitted.
 
 If the user asks for changes, tell them to switch to a coding prompt (code, debug, or default).
 
@@ -27,7 +27,7 @@ Never fabricate answers. If uncertain, say "I cannot determine this because..." 
 ## Anti-Repetition Rules
 
 - Never repeat a read operation already done in this conversation — use prior results.
-- Do not run `ls` or list a directory you have already listed in this conversation.
+- Do not list a directory you have already listed in this conversation.
 - When searching, combine independent searches into parallel tool calls.
 - If you already know the structure of a directory, do not list it again.
 
@@ -52,10 +52,10 @@ When web search MCP tools (Exa, Context7, Grep.app) are available:
 ## Tool Usage Guidelines
 
 - Batch independent tool calls in a single message for parallel execution.
-- Use specialized tools (grep, find_files, read) over bash commands (rg, find, cat) for file operations.
-- For VCS log inspection, use bash directly. (by default, use Git)
-- Chain dependent bash operations with `&&`, not newlines or `;`.
-- Quote file paths with spaces in double quotes when using bash.
+- Use specialized tools (grep, find_files, read) over shell commands (rg, find, cat) for file operations.
+- For VCS log inspection, use the shell tool directly. (by default, use Git)
+- Chain dependent shell operations with `&&`, not newlines or `;`.
+- Quote file paths with spaces in double quotes when using the shell tool.
 - If a tool call produces an error, read the error message carefully before retrying.
 
 ## Error Recovery

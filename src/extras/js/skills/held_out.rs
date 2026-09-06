@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-use super::fakes::{FAKES_VERSION, FakeTranscript};
+use super::fakes::{FAKES_VERSION, FakeFetchFixture, FakeSpawnFixture, FakeTranscript};
 use super::store::{AdminIdentity, HeldOutSuiteRecord, SkillStore, StoreError};
 use super::verify::{
     VERIFIER_VERSION, VerificationError, verify_held_out_case, verify_inherited_cases, verify_skill,
 };
-use super::{CapabilityTier, SkillArtifact};
+use super::{CapabilityTier, SkillArtifact, SkillExport};
 
-const SUITE_FORMAT_VERSION: u32 = 1;
+const SUITE_FORMAT_VERSION: u32 = 2;
 const MAX_CASES: usize = 64;
 const MAX_EXPRESSION_BYTES: usize = 4 * 1024;
 const MAX_FAKE_FILES: usize = 32;
@@ -33,7 +33,7 @@ pub(crate) struct HeldOutSelector {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub exports: Vec<String>,
+    pub exports: Vec<SkillExport>,
     #[serde(default)]
     pub capability_tier: Option<String>,
 }
@@ -72,6 +72,10 @@ pub(crate) struct HeldOutCase {
     pub expected: ExpectedJsValue,
     #[serde(default)]
     pub fake_files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub fake_spawns: Vec<FakeSpawnFixture>,
+    #[serde(default)]
+    pub fake_fetches: Vec<FakeFetchFixture>,
     #[serde(default)]
     pub transcript: TranscriptExpectation,
 }
@@ -182,12 +186,10 @@ fn selector_matches(selector: &HeldOutSelector, artifact: &SkillArtifact) -> boo
         .tags
         .iter()
         .all(|tag| artifact.tags.contains(&tag.trim().to_lowercase()))
-        && selector.exports.iter().all(|required| {
-            artifact
-                .exports
-                .iter()
-                .any(|export| export.name == *required)
-        })
+        && selector
+            .exports
+            .iter()
+            .all(|required| artifact.exports.iter().any(|export| export == required))
         && selector
             .capability_tier
             .as_deref()
@@ -200,21 +202,36 @@ fn validate_suite(suite: &HeldOutSuiteDraft) -> Result<(), HeldOutError> {
             "suite must contain between 1 and 64 cases".to_string(),
         ));
     }
+    if suite.selector.tags.is_empty()
+        && suite.selector.exports.is_empty()
+        && suite.selector.capability_tier.is_none()
+    {
+        return Err(HeldOutError::InvalidSuite(
+            "selector must constrain tags, exports, or capability tier".to_string(),
+        ));
+    }
     if suite.selector.tags.len() > MAX_SELECTOR_VALUES
         || suite.selector.exports.len() > MAX_SELECTOR_VALUES
-        || suite
-            .selector
-            .tags
-            .iter()
-            .chain(&suite.selector.exports)
-            .any(|value| {
-                value.trim().is_empty()
-                    || value.len() > MAX_SELECTOR_VALUE_BYTES
-                    || value.contains('\0')
-            })
+        || suite.selector.tags.iter().any(|value| {
+            value.trim().is_empty()
+                || value.len() > MAX_SELECTOR_VALUE_BYTES
+                || value.contains('\0')
+        })
     {
         return Err(HeldOutError::InvalidSuite(
             "selector contains too many values".to_string(),
+        ));
+    }
+    if suite.selector.exports.iter().any(|export| {
+        export.name.trim().is_empty()
+            || export.signature.trim().is_empty()
+            || export.name.len() > MAX_SELECTOR_VALUE_BYTES
+            || export.signature.len() > MAX_SELECTOR_VALUE_BYTES
+            || export.name.contains('\0')
+            || export.signature.contains('\0')
+    }) {
+        return Err(HeldOutError::InvalidSuite(
+            "selector contains an invalid export contract".to_string(),
         ));
     }
     if let Some(tier) = suite.selector.capability_tier.as_deref()
@@ -243,6 +260,32 @@ fn validate_suite(suite: &HeldOutSuiteDraft) -> Result<(), HeldOutError> {
         {
             return Err(HeldOutError::InvalidSuite(
                 "held-out fake file fixture is invalid".to_string(),
+            ));
+        }
+        if case.fake_spawns.len() > MAX_TRANSCRIPT_CALLS
+            || case.fake_fetches.len() > MAX_TRANSCRIPT_CALLS
+            || case.fake_spawns.iter().any(|fixture| {
+                fixture.program.trim().is_empty()
+                    || fixture.program.len() > MAX_TRANSCRIPT_VALUE_BYTES
+                    || fixture.program.contains('\0')
+                    || fixture.args.len() > 64
+                    || fixture
+                        .args
+                        .iter()
+                        .any(|arg| arg.len() > MAX_TRANSCRIPT_VALUE_BYTES || arg.contains('\0'))
+                    || fixture.response.stdout.len() > MAX_FAKE_FILE_BYTES
+                    || fixture.response.stderr.len() > MAX_FAKE_FILE_BYTES
+            })
+            || case.fake_fetches.iter().any(|fixture| {
+                fixture.url.trim().is_empty()
+                    || fixture.url.len() > MAX_TRANSCRIPT_VALUE_BYTES
+                    || fixture.url.contains('\0')
+                    || !matches!(fixture.method.as_str(), "GET" | "POST")
+                    || fixture.response.body.len() > MAX_FAKE_FILE_BYTES
+            })
+        {
+            return Err(HeldOutError::InvalidSuite(
+                "held-out fake effect fixture is invalid".to_string(),
             ));
         }
         if matches!(&case.expected, ExpectedJsValue::String(value) if value.len() > MAX_EXPECTED_STRING_BYTES)
@@ -305,51 +348,73 @@ pub(crate) fn evaluate(
         .map_err(|error| HeldOutError::Identity(error.to_string()))?;
     verify_skill(artifact).map_err(HeldOutError::Embedded)?;
 
-    if let Some(predecessor) = predecessor {
-        predecessor
-            .verify_identity()
-            .map_err(|error| HeldOutError::Identity(error.to_string()))?;
-        verify_inherited_cases(artifact, &predecessor.tests).map_err(HeldOutError::Inherited)?;
+    let lineage = match predecessor {
+        Some(predecessor) => match store.lineage_artifacts(&predecessor.id) {
+            Ok(lineage) => lineage,
+            // Pure evaluator callers may supply an immutable predecessor that
+            // has not been persisted. The admission path always persists it.
+            Err(StoreError::NotFound(_)) => vec![predecessor.clone()],
+            Err(error) => return Err(error.into()),
+        },
+        None => Vec::new(),
+    };
+    let mut inherited_tests = Vec::new();
+    for ancestor in &lineage {
+        for test in &ancestor.tests {
+            if !inherited_tests.contains(test) {
+                inherited_tests.push(test.clone());
+            }
+        }
+    }
+    if inherited_tests
+        .iter()
+        .any(|test| !artifact.tests.contains(test))
+    {
+        return Err(HeldOutError::InheritedTestsRemoved);
+    }
+    if !inherited_tests.is_empty() {
+        verify_inherited_cases(artifact, &inherited_tests).map_err(HeldOutError::Inherited)?;
     }
 
     let mut suites = select_suites(store, artifact)?;
-    if let Some(predecessor) = predecessor {
-        for inherited_suite in select_suites(store, predecessor)? {
+    for ancestor in &lineage {
+        for inherited_suite in select_suites(store, ancestor)? {
             if !suites.iter().any(|suite| suite.id == inherited_suite.id) {
                 suites.push(inherited_suite);
             }
         }
-        suites.sort_by(|left, right| left.id.cmp(&right.id));
     }
-    if suites.len() > MAX_MATCHED_SUITES
-        || suites
-            .iter()
-            .try_fold(0usize, |count, suite| count.checked_add(suite.cases.len()))
-            .is_none_or(|count| count > MAX_MATCHED_CASES)
-    {
-        return Err(HeldOutError::InvalidSuite(
-            "too many held-out suites or cases matched one proposal".to_string(),
-        ));
-    }
+    suites.sort_by(|left, right| left.id.cmp(&right.id));
+    suites.truncate(MAX_MATCHED_SUITES);
     if suites.is_empty() {
         return Err(HeldOutError::SuiteRequired);
     }
     let mut case_reports = Vec::new();
     let mut suite_hashes = Vec::with_capacity(suites.len());
+    let mut remaining_cases = MAX_MATCHED_CASES;
     for suite in suites {
+        if remaining_cases == 0 {
+            break;
+        }
         suite_hashes.push(suite.content_hash.clone());
-        for (case_index, case) in suite.cases.iter().enumerate() {
-            let transcript =
-                verify_held_out_case(artifact, &case.expression, &case.expected, &case.fake_files)
-                    .map_err(|error| match error {
-                        VerificationError::InfrastructureUnavailable(_) => {
-                            HeldOutError::Infrastructure(error)
-                        }
-                        _ => HeldOutError::CaseFailed {
-                            suite_id: suite.id.clone(),
-                            case_index,
-                        },
-                    })?;
+        for (case_index, case) in suite.cases.iter().take(remaining_cases).enumerate() {
+            let transcript = verify_held_out_case(
+                artifact,
+                &case.expression,
+                &case.expected,
+                &case.fake_files,
+                &case.fake_spawns,
+                &case.fake_fetches,
+            )
+            .map_err(|error| match error {
+                VerificationError::InfrastructureUnavailable(_) => {
+                    HeldOutError::Infrastructure(error)
+                }
+                _ => HeldOutError::CaseFailed {
+                    suite_id: suite.id.clone(),
+                    case_index,
+                },
+            })?;
             if !transcript_matches(&case.transcript, &transcript) {
                 return Err(HeldOutError::TranscriptMismatch {
                     suite_id: suite.id,
@@ -361,6 +426,7 @@ pub(crate) fn evaluate(
                 case_index,
                 passed: true,
             });
+            remaining_cases -= 1;
         }
     }
 
@@ -430,6 +496,8 @@ pub(crate) enum HeldOutError {
     Embedded(VerificationError),
     #[error("inherited_regression_failed")]
     Inherited(VerificationError),
+    #[error("inherited_regression_failed: candidate removed an ancestor test")]
+    InheritedTestsRemoved,
     #[error("verification infrastructure unavailable")]
     Infrastructure(VerificationError),
     #[error("held_out_failed for suite {suite_id} case {case_index}")]

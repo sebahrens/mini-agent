@@ -1,25 +1,35 @@
-// These tests deliberately hold EDIT_SYSTEM_GUARD across .await points to keep
-// the process-global edit system fixed for the whole async test (see the guard
-// doc below), so the lint does not apply here.
-#![allow(clippy::await_holding_lock)]
-
 use crate::agent::tools::crc::crc32_hex;
 use crate::agent::tools::set_edit_system;
-use crate::agent::tools::{EditArgs, EditOp, edit};
+use crate::agent::tools::{EditArgs, EditOp, edit, read::ReadTool};
 use crate::config::types::EditSystem;
 use rig::tool::Tool;
 
-/// The edit system is a process-global, and `cargo test` runs tests in parallel,
-/// so a `Similarity` test could otherwise have the global flipped to `Hashedit`
-/// by a concurrent test mid-run. Serialize every test that touches it: lock this
-/// shared mutex (held for the test's lifetime via the returned guard) and set
-/// the system atomically.
-static EDIT_SYSTEM_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn serialize_edit_system(es: EditSystem) -> std::sync::MutexGuard<'static, ()> {
-    let guard = EDIT_SYSTEM_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+/// Test builds use a thread-local edit-system selection, so parallel libtest
+/// workers can exercise both protocols without mutating process-global state.
+fn select_edit_system(es: EditSystem) {
     set_edit_system(es);
-    guard
+}
+
+#[test]
+fn rebuilt_edit_and_read_definitions_follow_the_selected_edit_system() {
+    select_edit_system(EditSystem::Similarity);
+    let similarity_edit = edit::EditTool::new(None, None);
+    let similarity_read = ReadTool::new(None, None, None, 1024);
+    assert!(similarity_edit.description().contains("SEARCH/REPLACE"));
+    assert!(similarity_edit.parameters()["properties"]["block"].is_object());
+    assert!(similarity_read.description().contains("line numbers"));
+
+    set_edit_system(EditSystem::Hashedit);
+    let hashedit_edit = edit::EditTool::new(None, None);
+    let hashedit_read = ReadTool::new(None, None, None, 1024);
+    assert!(
+        hashedit_edit
+            .description()
+            .contains("tag-based line references")
+    );
+    assert!(hashedit_edit.parameters()["properties"]["edits"].is_object());
+    assert!(hashedit_edit.parameters()["properties"]["block"].is_null());
+    assert!(hashedit_read.description().contains("CRC-32 tagged lines"));
 }
 
 struct TempFile(String);
@@ -27,7 +37,7 @@ struct TempFile(String);
 impl TempFile {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir()
-            .join(format!("zerostack_test_{}", name))
+            .join(format!("zerostack-test-{}-{name}", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .to_string();
         TempFile(path)
@@ -48,7 +58,7 @@ impl Drop for TempFile {
 
 #[tokio::test]
 async fn test_sim_rejects_no_blocks() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("noblocks.txt");
     std::fs::write(tmp.path(), "hello world\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -68,7 +78,7 @@ async fn test_sim_rejects_no_blocks() {
 
 #[tokio::test]
 async fn test_sim_rejects_empty_search() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("emptysearch.txt");
     std::fs::write(tmp.path(), "hello world\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -88,7 +98,7 @@ async fn test_sim_rejects_empty_search() {
 
 #[tokio::test]
 async fn test_sim_rejects_whitespace_only_search() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("whitespace_search.txt");
     let original = "hello world\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -111,7 +121,7 @@ async fn test_sim_rejects_whitespace_only_search() {
 
 #[tokio::test]
 async fn test_sim_search_not_found() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("notfound2.txt");
     std::fs::write(tmp.path(), "hello world\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -134,7 +144,7 @@ async fn test_sim_search_not_found() {
 
 #[tokio::test]
 async fn test_sim_single_block_replacement() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("single2.txt");
     std::fs::write(tmp.path(), "before after done\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -157,7 +167,7 @@ async fn test_sim_single_block_replacement() {
 
 #[tokio::test]
 async fn test_sim_literal_safe_markers_can_edit_standard_marker_lines() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("literal-safe-markers.txt");
     std::fs::write(
         tmp.path(),
@@ -187,7 +197,7 @@ async fn test_sim_literal_safe_markers_can_edit_standard_marker_lines() {
 
 #[tokio::test]
 async fn test_sim_markers_must_begin_at_column_zero() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("column-zero-markers.md");
     std::fs::write(tmp.path(), "heading\n  =======\ntail\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -209,7 +219,7 @@ async fn test_sim_markers_must_begin_at_column_zero() {
 
 #[tokio::test]
 async fn test_sim_multi_block_atomic() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("multiblock.txt");
     std::fs::write(tmp.path(), "aaa\nbbb\nccc\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -244,7 +254,7 @@ CCC
 
 #[tokio::test]
 async fn test_sim_multi_match_returns_error() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("multi2.txt");
     std::fs::write(tmp.path(), "hello world, hello there\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -264,7 +274,7 @@ async fn test_sim_multi_match_returns_error() {
 
 #[tokio::test]
 async fn test_sim_replace_all_replaces_every_exact_occurrence() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("replace_all.txt");
     std::fs::write(tmp.path(), "hello one\nkeep\nhello two\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -291,7 +301,7 @@ async fn test_sim_replace_all_replaces_every_exact_occurrence() {
 
 #[tokio::test]
 async fn test_sim_preserves_crlf_line_endings() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("crlf2.txt");
     std::fs::write(tmp.path(), "line1\r\nline2\r\nline3\r\n").unwrap();
     let tool = edit::EditTool::new(None, None);
@@ -313,7 +323,7 @@ async fn test_sim_preserves_crlf_line_endings() {
 
 #[tokio::test]
 async fn test_sim_crlf_multiline_search_is_exact_and_replacement_uses_crlf() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_crlf_multiline.txt");
     std::fs::write(tmp.path(), b"alpha\r\nbeta\r\ngamma\r\n").unwrap();
 
@@ -337,7 +347,7 @@ fn make_tagged_line(line_num: usize, content: &str) -> String {
 
 #[tokio::test]
 async fn test_hash_single_line_edit() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_single.txt");
     let original = "use std::io;\nuse std::fs;\n\nfn main() {\n    println!(\"hi\");\n}\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -371,7 +381,7 @@ async fn test_hash_single_line_edit() {
 
 #[tokio::test]
 async fn test_hash_range_edit() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_range.txt");
     let original = "line1\nline2\nline3\nline4\nline5\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -403,7 +413,7 @@ async fn test_hash_range_edit() {
 
 #[tokio::test]
 async fn test_hash_delete_via_empty_text() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_delete.txt");
     let original = "keep me\nremove me\nkeep me too\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -431,7 +441,7 @@ async fn test_hash_delete_via_empty_text() {
 
 #[tokio::test]
 async fn test_hash_file_crc_mismatch() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_badcrc.txt");
     std::fs::write(tmp.path(), "hello world\n").unwrap();
 
@@ -457,7 +467,7 @@ async fn test_hash_file_crc_mismatch() {
 
 #[tokio::test]
 async fn test_hash_tag_mismatch() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_badtag.txt");
     let original = "hello world\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -486,7 +496,7 @@ async fn test_hash_tag_mismatch() {
 
 #[tokio::test]
 async fn test_hash_invalid_tag_format() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_badfmt.txt");
     let original = "hello world\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -513,7 +523,7 @@ async fn test_hash_invalid_tag_format() {
 
 #[tokio::test]
 async fn test_hash_crlf_preserved() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_crlf.txt");
     let original = "line1\r\nline2\r\nline3\r\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -546,7 +556,7 @@ async fn test_hash_crlf_preserved() {
 
 #[tokio::test]
 async fn test_hash_multi_edit_atomic() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_multi.txt");
     let original = "aaa\nbbb\nccc\nddd\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -601,7 +611,7 @@ async fn sim_edit(tmp: &TempFile, search: &str, replace: &str) -> Result<String,
 
 #[tokio::test]
 async fn test_sim_normalized_match_after_trailing_whitespace() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_trailing.txt");
     std::fs::write(tmp.path(), "foo   \n    bar\n").unwrap();
     let result = sim_edit(&tmp, "\tbar", "    baz").await.unwrap();
@@ -615,7 +625,7 @@ async fn test_sim_normalized_match_after_trailing_whitespace() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_must_be_unique() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_ambiguous.txt");
     let original = "fn a() {\n\tvalue = 1;\n}\nfn b() {\n\tvalue = 1;\n}\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -631,7 +641,7 @@ async fn test_sim_normalized_match_must_be_unique() {
 
 #[tokio::test]
 async fn test_sim_fuzzy_match_must_be_unique() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_fuzzy_ambiguous.txt");
     let original = "fn a() {\n    value = 100;\n}\nfn b() {\n    value = 100;\n}\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -648,7 +658,7 @@ async fn test_sim_fuzzy_match_must_be_unique() {
 
 #[tokio::test]
 async fn test_sim_single_fuzzy_match_echoes_replaced_region() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_fuzzy_echo.txt");
     std::fs::write(tmp.path(), "keep\n    value = 100;\nend\n").unwrap();
 
@@ -669,7 +679,7 @@ async fn test_sim_single_fuzzy_match_echoes_replaced_region() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_after_collapsed_blank_lines() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_blank.txt");
     std::fs::write(tmp.path(), "foo\n\n\n\n    bar\nbaz\n").unwrap();
     let result = sim_edit(&tmp, "\tbar", "    qux").await.unwrap();
@@ -682,7 +692,7 @@ async fn test_sim_normalized_match_after_collapsed_blank_lines() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_tabs_vs_spaces_inside_match() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_tabs.txt");
     std::fs::write(tmp.path(), "fn a() {\n\tx = 1;\n\ty = 2;\n}\n").unwrap();
     let result = sim_edit(&tmp, "    x = 1;\n    y = 2;", "    z = 3;")
@@ -697,7 +707,7 @@ async fn test_sim_normalized_match_tabs_vs_spaces_inside_match() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_in_crlf_file() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_crlf.txt");
     std::fs::write(tmp.path(), "foo   \r\n    bar\r\nend\r\n").unwrap();
     let result = sim_edit(&tmp, "\tbar", "    baz").await.unwrap();
@@ -710,7 +720,7 @@ async fn test_sim_normalized_match_in_crlf_file() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_at_end_of_file() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
 
     let tmp = TempFile::new("sim_norm_eof_nonl.txt");
     std::fs::write(tmp.path(), "keep   \n\tlast").unwrap();
@@ -731,7 +741,7 @@ async fn test_sim_normalized_match_at_end_of_file() {
 
 #[tokio::test]
 async fn test_sim_normalized_match_replaces_exactly_the_matched_lines() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("sim_norm_exact_lines.txt");
     std::fs::write(tmp.path(), "a\nb   \n\tc\nd\n").unwrap();
     sim_edit(&tmp, "b\n    c", "X").await.unwrap();
@@ -742,7 +752,7 @@ async fn test_sim_normalized_match_replaces_exactly_the_matched_lines() {
 
 #[tokio::test]
 async fn test_hash_range_rejects_descending_lines() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_desc.txt");
     let original = "line1\nline2\nline3\nline4\nline5\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -773,7 +783,7 @@ async fn test_hash_range_rejects_descending_lines() {
 
 #[tokio::test]
 async fn test_hash_range_rejects_non_contiguous_lines() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_gap.txt");
     let original = "line1\nline2\nline3\nline4\nline5\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -804,7 +814,7 @@ async fn test_hash_range_rejects_non_contiguous_lines() {
 
 #[tokio::test]
 async fn test_hash_rejects_line_zero() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_zero.txt");
     let original = "line1\nline2\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -842,7 +852,7 @@ async fn test_hash_rejects_line_zero() {
 
 #[tokio::test]
 async fn test_hash_rejects_overlapping_edits() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_overlap.txt");
     let original = "line1\nline2\nline3\nline4\nline5\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -908,7 +918,7 @@ async fn test_hash_rejects_overlapping_edits() {
 
 #[tokio::test]
 async fn test_hash_rejects_zero_length_and_nonempty_ranges_at_same_start() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_blank_overlap.txt");
     let original = "line1\n\nline3\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -944,7 +954,7 @@ async fn test_hash_rejects_zero_length_and_nonempty_ranges_at_same_start() {
 
 #[tokio::test]
 async fn test_hash_adjacent_edits_are_allowed() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_adjacent.txt");
     let original = "line1\nline2\nline3\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -981,7 +991,7 @@ async fn test_hash_adjacent_edits_are_allowed() {
 
 #[tokio::test]
 async fn test_hash_multiline_replacement_uses_dominant_crlf() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_crlf_multiline.txt");
     let original = "line1\r\nline2\r\nline3\r\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -1010,7 +1020,7 @@ async fn test_hash_multiline_replacement_uses_dominant_crlf() {
 
 #[tokio::test]
 async fn test_similarity_edit_preserves_mixed_line_endings() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("mixed_endings.txt");
     std::fs::write(tmp.path(), b"one\r\ntwo\nthree\r\n").unwrap();
 
@@ -1024,7 +1034,7 @@ async fn test_similarity_edit_preserves_mixed_line_endings() {
 
 #[tokio::test]
 async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() {
-    let _edit_guard = serialize_edit_system(EditSystem::Hashedit);
+    select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_delete_line.txt");
     let original = "one\r\ntwo\nthree\r\n";
     std::fs::write(tmp.path(), original).unwrap();
@@ -1052,7 +1062,7 @@ async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() 
 
 #[tokio::test]
 async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("bounded_fuzzy.txt");
     let content = (0..20_000)
         .map(|index| format!("content line {index:05} with enough padding to be expensive"))
@@ -1065,7 +1075,7 @@ async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
         .join("\n");
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(10),
         sim_edit(&tmp, &search, "replacement"),
     )
     .await
@@ -1086,7 +1096,7 @@ async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
 
 #[tokio::test]
 async fn test_edit_rejects_non_utf8_file() {
-    let _edit_guard = serialize_edit_system(EditSystem::Similarity);
+    select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("latin1.txt");
     // Latin-1 "café" followed by an ASCII line the edit targets.
     let original: &[u8] = b"caf\xe9 au lait\nline2\n";

@@ -23,10 +23,13 @@ use super::store::{
     approval_manifest_digest,
 };
 use super::verify::{TestResult, VerificationError};
-use super::{CapabilityManifest, SkillArtifact, SkillExport};
+use super::{CapabilityManifest, CapabilityScope, SkillArtifact, SkillExport};
 
 const LEASE_SECONDS: i64 = 30;
-const EVALUATION_LEASE_SECONDS: i64 = 15 * 60;
+// One evaluation can run the 64-case held-out cap plus embedded and inherited
+// verification at the 30-second worker deadline. Size the lease for that
+// documented worst case with cleanup margin so another worker cannot reclaim it.
+const EVALUATION_LEASE_SECONDS: i64 = 40 * 60;
 const MAX_RETRY_BACKOFF_SECONDS: i64 = 300;
 const MAX_AUTH_AGE_SECONDS: i64 = 300;
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(100);
@@ -126,7 +129,17 @@ impl AdmissionEvaluator {
                 Err(AdmissionError::Retryable(error))
             }
             Err(EvaluationFailure::Infrastructure { error }) => {
-                let exponent = lease.attempt.saturating_sub(1).min(8);
+                if lease.infrastructure_attempts.saturating_add(1) >= MAX_EVALUATION_ATTEMPTS {
+                    self.store.defer_infrastructure_proposal(
+                        &lease.proposal_id,
+                        &self.worker_id,
+                        lease.row_version,
+                        "evaluation_infrastructure_deferred",
+                        now,
+                    )?;
+                    return Err(AdmissionError::Retryable(error));
+                }
+                let exponent = lease.infrastructure_attempts.min(8);
                 let delay = (1i64 << exponent).min(MAX_RETRY_BACKOFF_SECONDS);
                 self.store.retry_infrastructure_proposal(
                     &lease.proposal_id,
@@ -168,7 +181,7 @@ impl AdmissionEvaluator {
             ));
         }
         if self
-            .is_policy_duplicate(&artifact)
+            .is_policy_duplicate(&artifact, lease.predecessor_id.as_deref())
             .map_err(classify_store)?
         {
             return Err(deterministic(
@@ -200,6 +213,12 @@ impl AdmissionEvaluator {
                     &error,
                     "inherited_regression_failed",
                     "predecessor regression failed",
+                ));
+            }
+            Err(HeldOutError::InheritedTestsRemoved) => {
+                return Err(deterministic(
+                    "inherited_regression_failed",
+                    "candidate removed an inherited test",
                 ));
             }
             Err(HeldOutError::Embedded(error)) => {
@@ -241,14 +260,12 @@ impl AdmissionEvaluator {
         let embeddings = self
             .embedder
             .embed_documents(&[document])
-            .map_err(|error| EvaluationFailure::Retryable {
-                code: "embedding_unavailable",
+            .map_err(|error| EvaluationFailure::Infrastructure {
                 error: error.to_string(),
             })?;
         let embedding = embeddings
             .first()
-            .ok_or_else(|| EvaluationFailure::Retryable {
-                code: "embedding_unavailable",
+            .ok_or_else(|| EvaluationFailure::Infrastructure {
                 error: "embedding result missing".to_string(),
             })?;
         let metadata = self.embedder.model_metadata().clone();
@@ -261,9 +278,10 @@ impl AdmissionEvaluator {
                 &artifact.id,
                 &metadata.model_id,
                 &metadata.model_revision,
-                u32::try_from(metadata.dimensions).map_err(|_| EvaluationFailure::Retryable {
-                    code: "embedding_unavailable",
-                    error: "embedding dimensions overflow".to_string(),
+                u32::try_from(metadata.dimensions).map_err(|_| {
+                    EvaluationFailure::Infrastructure {
+                        error: "embedding dimensions overflow".to_string(),
+                    }
                 })?,
                 metadata.normalized,
                 &embedding_bytes,
@@ -289,8 +307,12 @@ impl AdmissionEvaluator {
         Ok(report)
     }
 
-    fn is_policy_duplicate(&self, artifact: &SkillArtifact) -> Result<bool, StoreError> {
-        self.store.has_policy_duplicate(artifact)
+    fn is_policy_duplicate(
+        &self,
+        artifact: &SkillArtifact,
+        predecessor_id: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.store.has_policy_duplicate(artifact, predecessor_id)
     }
 
     pub(crate) fn review_and_admit<R: HumanReviewer>(
@@ -471,7 +493,7 @@ impl AdmissionEvaluator {
         {
             return Err(AdmissionError::StaleReview);
         }
-        if self.is_policy_duplicate(artifact)? {
+        if self.is_policy_duplicate(artifact, proposal.predecessor_id.as_deref())? {
             return Err(AdmissionError::StaleReview);
         }
         let held_out = evaluate(&self.store, artifact, predecessor.as_ref())
@@ -686,15 +708,73 @@ fn skill_document(artifact: &SkillArtifact) -> String {
         .render()
 }
 
-fn capability_is_non_escalating(
+pub(crate) fn capability_is_non_escalating(
     candidate: &CapabilityManifest,
     predecessor: &CapabilityManifest,
 ) -> bool {
     candidate.tier <= predecessor.tier
-        && candidate
-            .grants
+        && candidate.grants.iter().all(|candidate_scope| {
+            predecessor
+                .grants
+                .iter()
+                .any(|predecessor_scope| scope_is_subset(candidate_scope, predecessor_scope))
+        })
+}
+
+fn scope_is_subset(candidate: &CapabilityScope, predecessor: &CapabilityScope) -> bool {
+    match (candidate, predecessor) {
+        (
+            CapabilityScope::ReadFile {
+                workspace_prefixes: candidate,
+            },
+            CapabilityScope::ReadFile {
+                workspace_prefixes: predecessor,
+            },
+        )
+        | (
+            CapabilityScope::WriteFile {
+                workspace_prefixes: candidate,
+            },
+            CapabilityScope::WriteFile {
+                workspace_prefixes: predecessor,
+            },
+        ) => candidate.iter().all(|candidate| {
+            predecessor.iter().any(|predecessor| {
+                candidate == predecessor
+                    || candidate
+                        .strip_prefix(predecessor)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        }),
+        (
+            CapabilityScope::Fetch {
+                origins: candidate_origins,
+                methods: candidate_methods,
+            },
+            CapabilityScope::Fetch {
+                origins: predecessor_origins,
+                methods: predecessor_methods,
+            },
+        ) => {
+            candidate_origins
+                .iter()
+                .all(|origin| predecessor_origins.contains(origin))
+                && candidate_methods
+                    .iter()
+                    .all(|method| predecessor_methods.contains(method))
+        }
+        (
+            CapabilityScope::Spawn {
+                programs: candidate,
+            },
+            CapabilityScope::Spawn {
+                programs: predecessor,
+            },
+        ) => candidate
             .iter()
-            .all(|grant| predecessor.grants.contains(grant))
+            .all(|program| predecessor.contains(program)),
+        _ => false,
+    }
 }
 
 fn success_report(
@@ -799,8 +879,7 @@ fn classify_store(error: StoreError) -> EvaluationFailure {
         StoreError::IdentityValidation(_) | StoreError::CorruptRow(_) => {
             deterministic("identity_invalid", "stored artifact is corrupt")
         }
-        other => EvaluationFailure::Retryable {
-            code: "evaluation_infrastructure_unavailable",
+        other => EvaluationFailure::Infrastructure {
             error: other.to_string(),
         },
     }
@@ -1004,5 +1083,17 @@ mod scheduler_tests {
             "embedded verification failed",
         );
         assert!(matches!(failure, EvaluationFailure::Infrastructure { .. }));
+    }
+
+    #[test]
+    fn evaluation_lease_covers_the_bounded_held_out_worst_case() {
+        const MAX_HELD_OUT_CASES: i64 = 64;
+        const WORKER_CASE_DEADLINE_SECONDS: i64 = 30;
+        const {
+            assert!(
+                EVALUATION_LEASE_SECONDS
+                    >= MAX_HELD_OUT_CASES * WORKER_CASE_DEADLINE_SECONDS + 5 * 60
+            );
+        }
     }
 }

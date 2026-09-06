@@ -287,6 +287,7 @@ async fn worker_fault_matrix_recycles_resource_protocol_process_and_cancellation
     ));
     let cancellation = PermCancellation::new();
     let task_supervisor = supervisor.clone();
+    let active_supervisor = supervisor.clone();
     let task_cancellation = cancellation.clone();
     let effects = MatrixEffects::default();
     let witness = effects.clone();
@@ -295,7 +296,17 @@ async fn worker_fault_matrix_recycles_resource_protocol_process_and_cancellation
             .execute(RunStep::new("deadline".into()), effects, task_cancellation)
             .await
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while active_supervisor
+            .active_generation_for_test()
+            .await
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker invocation never became active");
     cancellation.cancel();
     assert_eq!(task.await.unwrap(), Err(WorkerError::Cancelled));
     assert_eq!(witness.terminals(), vec![AuthorityTerminal::Recycled]);

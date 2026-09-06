@@ -1,7 +1,7 @@
 # Phase 6 — Brokered Cross-Platform JavaScript Runtime
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -1096,6 +1096,28 @@ bead is closed with its required regression tests, so all items are part of the 
    Pure path, diff, and table helpers
    remain separate future work because they need no authority and do not justify expanding this
    effect contract.
+
+## Delivered general-process and hook hardening (2026-09-06)
+
+These changes harden processes that the parent launches around the brokered worker; they do not
+change the worker's canonical containment checklist.
+
+1. Linux `bwrap` receives workspace-authority descriptor 197 only while constructing its bind.
+   The first in-sandbox launcher closes that descriptor before executing model code. The wrapper
+   also requests `--new-session`; captured commands receive null stdin unless an internal caller
+   explicitly supplies input, and Unix model children create a fresh session before exec. Thus a
+   model command cannot read or modify the controlling terminal.
+2. Linux and macOS backend availability is the cached result of a bounded real launch probe, not
+   executable presence. A sandboxed hook's bare executable (including the fixed `sh` used for an
+   `if` condition) is resolved to an absolute path before readiness validation, so valid hooks do
+   not fail merely because their configuration used `PATH` lookup.
+3. The macOS general-command Seatbelt profile explicitly denies mini-agent's resolved config and
+   credential roots before its broad host-readable rule. Linux and macOS bind only the dedicated
+   `cache_dir/sandbox-runtime` subtree, never the complete application cache.
+4. Model-authored commands receive the minimal non-credential environment even when OS
+   containment is explicitly disabled. Direct-child completion remains authoritative if inherited
+   pipes reveal a descendant outside the owned group; that condition is surfaced and audited
+   rather than rewritten as a false direct-child failure.
 
 ## Acceptance matrix
 

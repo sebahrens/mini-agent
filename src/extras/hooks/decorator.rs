@@ -9,6 +9,8 @@ use crate::permission::checker::PermCheck;
 use super::dispatcher::HookDispatcher;
 use super::{Decision, HookCtx, Verdict, session_context};
 
+static HOOK_PERMISSION_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The only rig-typed file in the hook system (see design D1/D2): wraps a
 /// `ToolDyn` so `PreToolUse`/`PostToolUseFailure` run around the inner call.
 /// Overrides `call` only, per rig 0.39's `ToolDyn` surface.
@@ -76,6 +78,10 @@ impl ToolDyn for HookedTool {
                 .dispatch_pre_tool_use(&ctx, &tool_name, tool_input.clone())
                 .await;
 
+            let permission_token =
+                HOOK_PERMISSION_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut scoped_permission = false;
+
             match pre.verdict {
                 Verdict::Deny => {
                     let reason = pre.reason.unwrap_or_else(|| "denied by hook".to_string());
@@ -96,7 +102,8 @@ impl ToolDyn for HookedTool {
                     if let Some(perm) = &self.permission {
                         perm.lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .force_ask_once(tool_name.clone());
+                            .force_ask_once_scoped(tool_name.clone(), permission_token);
+                        scoped_permission = true;
                     }
                 }
                 // Suppresses the inner tool's own permission prompt for only
@@ -106,7 +113,8 @@ impl ToolDyn for HookedTool {
                     if let Some(perm) = &self.permission {
                         perm.lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .allow_once(tool_name.clone());
+                            .allow_once_scoped(tool_name.clone(), permission_token);
+                        scoped_permission = true;
                     }
                 }
                 Verdict::Defer => {}
@@ -120,7 +128,20 @@ impl ToolDyn for HookedTool {
                 None => args,
             };
 
-            let result = self.inner.call(call_args).await;
+            let result = if scoped_permission {
+                crate::permission::checker::scope_hook_permission(
+                    permission_token,
+                    self.inner.call(call_args),
+                )
+                .await
+            } else {
+                self.inner.call(call_args).await
+            };
+            if scoped_permission && let Some(perm) = &self.permission {
+                perm.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clear_hook_one_shot(permission_token);
+            }
 
             match &result {
                 Ok(response) => {

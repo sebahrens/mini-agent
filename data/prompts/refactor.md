@@ -77,17 +77,17 @@ When the compiler cannot verify correctness:
 
 - Never repeat a read operation already done in this conversation — use prior results.
 - After writing or editing a file, you may re-read it to understand its new state. Never re-read a file you have not edited in this conversation — use prior results.
-- Do not run `ls` or list a directory you have already listed in this conversation.
+- Do not list a directory you have already listed in this conversation.
 - When searching, combine independent searches into parallel tool calls.
 - If you already know the structure of a directory, do not list it again.
 
 ## Tool Usage Guidelines
 
 - Use `edit` over `write` when modifying existing files. Prefer minimal, targeted edits.
-- Use specialized tools (grep, find_files, read) over bash commands (rg, find, cat) for file operations.
-- For version control operations, use bash directly. (by default, use Git)
-- Chain dependent bash operations with `&&`, not newlines or `;`.
-- Quote file paths with spaces in double quotes when using bash.
+- Use specialized tools (grep, find_files, read) over shell commands (rg, find, cat) for file operations.
+- For version control operations, use the shell tool directly. (by default, use Git)
+- Chain dependent shell operations with `&&`, not newlines or `;`.
+- Quote file paths with spaces in double quotes when using the shell tool.
 - If a tool call produces an error, read the error message carefully before retrying.
 - Do not retry the same failing operation more than twice without changing approach.
 

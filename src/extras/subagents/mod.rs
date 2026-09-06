@@ -48,8 +48,14 @@ where
     F: FnOnce(&SubagentConfig) -> R,
 {
     let guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-    let cfg = guard.as_ref().ok_or(ConfigNotInitialized)?;
-    Ok(f(cfg))
+    with_config_value(guard.as_ref(), f)
+}
+
+fn with_config_value<F, R>(config: Option<&SubagentConfig>, f: F) -> Result<R, ConfigNotInitialized>
+where
+    F: FnOnce(&SubagentConfig) -> R,
+{
+    config.map(f).ok_or(ConfigNotInitialized)
 }
 
 pub fn init(
@@ -93,11 +99,7 @@ mod tests {
 
     #[test]
     fn with_config_without_init_returns_error() {
-        let previous = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).take();
-
-        let result = with_config(|_| ());
-
-        *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+        let result = with_config_value(None, |_| ());
         assert!(matches!(result, Err(ConfigNotInitialized)));
     }
 }

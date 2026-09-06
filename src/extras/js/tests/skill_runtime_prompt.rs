@@ -84,6 +84,12 @@ async fn deterministic_backend_reports_lexical_only_retrieval() {
     let temp = TempPaths::new();
     let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
 
+    assert_eq!(
+        runtime.learned_dense_candidate_limit_for_test(),
+        0,
+        "deterministic embeddings must not enter semantic admission or retrieval"
+    );
+
     let discovery = runtime.prepare_turn("parse this JSON document").await;
 
     assert!(discovery.diagnostics.iter().any(|entry| {

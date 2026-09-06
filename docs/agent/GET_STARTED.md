@@ -102,7 +102,7 @@ A quick model can be added in the configuration by doing something like:
 ```
 [quick_models.fast]
 provider = "openrouter"
-model = "deepseek/deepseek-v4-flash"
+model = "deepseek/deepseek-v4-pro"
 ```
 
 From there, you can use the `model` field in the configuration file to set the default model, or use `/models` to use an interactive picker directly in the agent.

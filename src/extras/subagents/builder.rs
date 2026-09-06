@@ -121,7 +121,7 @@ impl SubagentAuthorization {
         Some(Box::new(tool))
     }
 
-    fn filesystem_tools(
+    pub(crate) fn filesystem_tools(
         &self,
         max_text_file_size: u64,
         max_read_lines: u64,

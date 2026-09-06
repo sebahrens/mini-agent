@@ -65,6 +65,8 @@ pub struct LoopInfo {
 }
 
 static PROCESS_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ACTIVE_SESSION_CONTEXT: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
 static ACTIVE_WORKSPACE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 static ACTIVE_PERMISSION_MODE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -96,13 +98,63 @@ pub(crate) fn active_workspace() -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+pub(crate) fn set_active_session(session_id: &str) {
+    let session_path = crate::session::storage::session_path(session_id)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    *ACTIVE_SESSION_CONTEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((session_id.to_string(), session_path));
+}
+
 /// Best-effort session identity for `HookCtx` until the session-lifecycle
 /// seam supplies zerostack's real session id/path.
 pub(crate) fn session_context() -> (String, String) {
+    if let Some(context) = ACTIVE_SESSION_CONTEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return context;
+    }
     let session_id = PROCESS_SESSION_ID
         .get_or_init(|| uuid::Uuid::new_v4().to_string())
         .clone();
     (session_id, String::new())
+}
+
+/// Runs a brokered host effect through the same process-wide PreToolUse guard
+/// rail as ordinary rig tools. `Ask` fails closed because the broker's normal
+/// permission check remains the only owner of interactive approval state.
+pub(crate) async fn gate_brokered_pre_tool_use(
+    tool_name: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let Some(dispatcher) = get_dispatcher() else {
+        return Ok(input);
+    };
+    gate_brokered_pre_tool_use_with(&dispatcher, &best_effort_ctx(), tool_name, input).await
+}
+
+pub(crate) async fn gate_brokered_pre_tool_use_with(
+    dispatcher: &dispatcher::HookDispatcher,
+    ctx: &HookCtx,
+    tool_name: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let decision = dispatcher
+        .dispatch_pre_tool_use(ctx, tool_name, input.clone())
+        .await;
+    match decision.verdict {
+        Verdict::Deny => Err(decision
+            .reason
+            .unwrap_or_else(|| "denied by hook".to_string())),
+        Verdict::Ask => Err(decision
+            .reason
+            .unwrap_or_else(|| "hook requires explicit approval".to_string())),
+        Verdict::Allow | Verdict::Defer => Ok(decision.updated_input.unwrap_or(input)),
+    }
 }
 
 static DISPATCHER: std::sync::Mutex<Option<std::sync::Arc<dispatcher::HookDispatcher>>> =

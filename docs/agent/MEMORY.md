@@ -126,6 +126,11 @@ Rules:
 
 Four tools are registered when the `memory` feature is enabled:
 
+`memory_read` and `memory_search` are read operations. `memory_write` and `memory_edit` always use
+their explicit permission keys; standard mode does not implicitly allow global-memory mutation
+merely because the files live outside the current workspace. An unmatched global mutation asks,
+and an explicit deny remains effective in every mode.
+
 ### `memory_write`
 
 | Parameter | Type | Description |

@@ -28,6 +28,49 @@ const FIXTURES: &[&str] = &[
 
 const PERSONA_FIXTURE: &str = include_str!("../../tests/harness_eval/personas/fixture.json");
 
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+const GYM_TASKS: &str = include_str!("../../tests/harness_eval/task.json");
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Clone, Debug, Deserialize)]
+struct GymDefaults {
+    prompt: String,
+    initial_files: BTreeMap<PathBuf, String>,
+    oracle: GymOracle,
+    budgets: GymBudgets,
+    scripted_provider_turns: BTreeMap<String, Vec<String>>,
+    library: String,
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Clone, Debug, Deserialize)]
+struct GymOracle {
+    expected_files: BTreeMap<PathBuf, String>,
+    id: String,
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Clone, Debug, Deserialize)]
+struct GymBudgets {
+    max_provider_turns: usize,
+    max_tool_calls: usize,
+    max_total_tokens: u64,
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Debug, Deserialize)]
+struct GymTaskFile {
+    defaults: GymDefaults,
+    tasks: Vec<GymTask>,
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Debug, Deserialize)]
+struct GymTask {
+    name: String,
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Fixture {
     name: String,
@@ -452,6 +495,163 @@ fn harness_eval_fixture_contract_is_complete() {
             "{} must specify the final state of every initial file",
             fixture.name
         );
+    }
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[tokio::test]
+async fn task_json_library_axis_uses_real_store_and_records_oracles() {
+    use crate::agent::runner::TaskOutcomeRecorder;
+    use crate::extras::js::skills::index::RetrievalPolicy;
+    use crate::extras::js::skills::store::SkillStore;
+    use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+    use crate::extras::js::skills::turn::{SkillRuntime, SkillTurnContext, TurnSkillBundle};
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    use crate::extras::skills::index::AgentSkillSearchPolicy;
+
+    let specification: GymTaskFile = serde_json::from_str(GYM_TASKS).unwrap();
+    assert_eq!(specification.tasks.len(), 20);
+    assert!(specification.defaults.budgets.max_provider_turns > 0);
+    assert_eq!(specification.defaults.budgets.max_tool_calls, 1);
+    assert!(specification.defaults.budgets.max_total_tokens > 0);
+    assert_eq!(specification.defaults.library, "seeds");
+
+    let state = EvalDirectory::new();
+    let paths = crate::paths::AppPaths {
+        config_dir: state.path().join("config"),
+        data_dir: state.path().join("data"),
+        local_data_dir: state.path().join("local"),
+        state_dir: state.path().join("state"),
+        cache_dir: state.path().join("cache"),
+        credentials_dir: state.path().join("credentials"),
+        project_dir: None,
+    };
+    let skill = SkillArtifact::new(
+        "function gymNormalize(_cap, text) { return text.trim(); }".into(),
+        "Normalize gym text by trimming surrounding whitespace.".into(),
+        vec!["normalize".into(), "gym".into(), "text".into()],
+        vec![SkillExport {
+            name: "gymNormalize".into(),
+            signature: "(text: string) => string".into(),
+        }],
+        vec!["gymNormalize(' x ') === 'x'".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    SkillStore::open_at(&paths)
+        .and_then(|mut store| store.insert_verified(&skill))
+        .unwrap();
+    let runtime = SkillRuntime::open(&paths, None)
+        .unwrap()
+        .with_test_policies(
+            RetrievalPolicy {
+                dense_score_floor: -1.0,
+                lexical_score_floor: -1.0,
+                ..RetrievalPolicy::default()
+            },
+            AgentSkillSearchPolicy::default(),
+        );
+    runtime.settle_learned_rebuild_for_test().await;
+    let dispatcher = Arc::new(TelemetryDispatcher::spawn(&paths).unwrap());
+
+    for task in &specification.tasks {
+        assert!(!task.tags.is_empty(), "{} tags", task.name);
+        let mut metrics = Vec::new();
+        for arm in ["none", "library"] {
+            let directory = EvalDirectory::new();
+            for (relative, content) in &specification.defaults.initial_files {
+                let target = directory.path().join(relative);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(target, content.as_bytes()).unwrap();
+            }
+            let context = if arm == "library" {
+                let query = format!("{} {}", specification.defaults.prompt, task.tags.join(" "));
+                let discovery = runtime.prepare_turn(&query).await;
+                assert!(
+                    discovery
+                        .learned_js
+                        .skills
+                        .iter()
+                        .any(|item| item.id == skill.id),
+                    "{} must retrieve the seeded library",
+                    task.name
+                );
+                runtime.turn_context()
+            } else {
+                Arc::new(SkillTurnContext::new(TurnSkillBundle::empty("gym-none")))
+            };
+            let workspace =
+                Arc::new(crate::paths::WorkspaceBinding::capture(directory.path()).unwrap());
+            let tool = JsTool::new(
+                Sandbox::new(false, "gym-eval").with_workspace_binding(workspace.clone()),
+                None,
+                None,
+                AllowConfig::unrestricted(directory.path()).with_workspace_binding(workspace),
+            )
+            .with_skill_turn_context(context.clone())
+            .with_shared_telemetry(dispatcher.clone());
+            let scripts = &specification.defaults.scripted_provider_turns[arm];
+            assert_eq!(scripts.len(), 1);
+            Tool::call(
+                &tool,
+                crate::extras::js::tool::JsArgs {
+                    code: scripts[0].clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let passed =
+                collect_files(directory.path()) == specification.defaults.oracle.expected_files;
+            TaskOutcomeRecorder::new(dispatcher.clone(), context, false).record_oracle(
+                &specification.defaults.oracle.id,
+                passed,
+                1,
+            );
+            assert!(passed, "{} {arm} oracle", task.name);
+            metrics.push((1_usize, 1_usize, 0_u64, 1_usize));
+            println!(
+                "HARNESS_EVAL {}",
+                serde_json::json!({"name": task.name, "library": arm, "success": true,
+                    "provider_turns": 1, "tool_calls": 1, "total_tokens": 0,
+                    "js_round_trips": 1, "production": false})
+            );
+        }
+        assert_eq!(
+            metrics[0], metrics[1],
+            "{} library invocation regression",
+            task.name
+        );
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let store = SkillStore::open_at(&paths).unwrap();
+        let outcomes: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_task_outcomes WHERE production = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let links: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_task_outcome_links WHERE skill_id = ?",
+                [&skill.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if outcomes == 40 && links == 20 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task outcomes were not durably ordered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 

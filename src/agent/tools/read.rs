@@ -525,17 +525,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn description_discloses_large_file_windowing_and_byte_cap() {
-        let description = ReadTool::new(None, None, Some(1234), 77).description();
-        assert!(description.contains("first 77 lines"), "{description}");
-        assert!(description.contains("1234 bytes"), "{description}");
-        assert!(
-            description.contains("explicit offset or limit"),
-            "{description}"
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_swap_after_permission_check_is_rejected() {

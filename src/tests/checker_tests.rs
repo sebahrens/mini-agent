@@ -10,7 +10,9 @@ fn default_modes() -> Option<Vec<String>> {
 }
 
 fn test_workspace() -> std::path::PathBuf {
-    std::env::current_dir().unwrap().canonicalize().unwrap()
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap()
 }
 
 fn workspace_path(relative: &str) -> String {

@@ -2,8 +2,8 @@ use crate::permission::checker::{CheckResult, PermissionChecker};
 use crate::permission::{PermissionConfigs, SecurityMode};
 use crate::session::MessageRole;
 use crate::session::storage::{
-    atomic_write, delete_session, find_sessions_by_prefix, load_session_exact, load_suffix,
-    save_session, save_tool_output, suffix_path, tool_output_dir,
+    atomic_write, delete_session, find_recent_sessions_for_workspace, find_sessions_by_prefix,
+    load_session_exact, load_suffix, save_session, save_tool_output, suffix_path, tool_output_dir,
 };
 use crate::session::{
     PermissionAllowEntry, PersistedToolMessage, Session, TOOL_RESULT_HEAD_CHARS,
@@ -102,6 +102,28 @@ fn save_and_find_session_by_prefix() {
     assert_eq!(found[0].id, s.id);
     assert_eq!(found[0].model.as_str(), "gpt-4");
     drop(env);
+}
+
+#[test]
+fn recent_session_lookup_is_scoped_to_the_captured_workspace() {
+    let env = setup_test_env();
+    let first = env.dir.join("first-workspace");
+    let second = env.dir.join("second-workspace");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let first = std::fs::canonicalize(first).unwrap();
+    let second = std::fs::canonicalize(second).unwrap();
+
+    let mut first_session = Session::new("openai", "gpt-4", 128_000, "first");
+    first_session.working_dir = first.to_string_lossy().into_owned().into();
+    save_session(&first_session).unwrap();
+    let mut second_session = Session::new("openai", "gpt-4", 128_000, "second");
+    second_session.working_dir = second.to_string_lossy().into_owned().into();
+    save_session(&second_session).unwrap();
+
+    let found = find_recent_sessions_for_workspace(1, &first).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, first_session.id);
 }
 
 #[test]

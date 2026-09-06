@@ -44,6 +44,12 @@ language paraphrases against twelve skill documents; none is a self-query. The 2
 achieved **91.7% top-1** and **0.958 MRR**. Its durable record is
 [`results/skill-semantic-relevance-2026-09-05.json`](results/skill-semantic-relevance-2026-09-05.json).
 
+Those twelve curated paraphrase labels are benchmark fixtures, not task-outcome-derived labels.
+The delivered task-outcome schema can associate verified work with actually invoked skills, but a
+pipeline that turns those observations into retrieval relevance judgments and reports
+precision/recall@k per embedding backend is deferred (`mini-agent-n5j6`). Until that work ships,
+do not describe production task evidence as the source of the semantic result above.
+
 ## Latest reference result
 
 The historical 2026-07-31 debug-profile run used an Intel Core i7-1068NG7 (8 logical CPUs), 32 GiB

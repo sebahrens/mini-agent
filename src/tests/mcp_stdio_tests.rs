@@ -434,7 +434,16 @@ async fn call_fixture_tool(manager: &McpClientManager) -> serde_json::Value {
         .await
         .expect("fixture tool call timed out")
         .expect("fixture tool call failed");
-    serde_json::from_str(&output).expect("fixture tool output must be JSON")
+    parse_fixture_output(&output)
+}
+
+fn parse_fixture_output(output: &str) -> serde_json::Value {
+    let body = output
+        .strip_prefix("[mcp output begins]\n> ")
+        .and_then(|output| output.strip_suffix("\n[mcp output ends]"))
+        .unwrap_or(output)
+        .replace("\n> ", "\n");
+    serde_json::from_str(&body).expect("fixture tool output must be JSON")
 }
 
 async fn shutdown(manager: McpClientManager) {
@@ -1191,7 +1200,7 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
         .call("{}".to_string())
         .await
         .expect("alpha is allowed");
-    let payload: serde_json::Value = serde_json::from_str(&alpha_output).unwrap();
+    let payload = parse_fixture_output(&alpha_output);
     assert_eq!(payload["args"][0], "alpha");
 
     let beta_error = tools

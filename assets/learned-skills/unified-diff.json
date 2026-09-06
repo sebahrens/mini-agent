@@ -9,7 +9,7 @@
     "predecessor_id": null
   },
   "held_out_suites": [{
-    "selector": {"tags": ["seed", "diff"], "exports": ["unifiedDiff"], "capability_tier": "pure"},
+    "selector": {"tags": ["seed", "diff"], "exports": [{"name": "unifiedDiff", "signature": "(before: string, after: string, label?: string) => string"}], "capability_tier": "pure"},
     "cases": [{"expression": "unifiedDiff('one','two','demo.txt').includes('@@ -1,1 +1,1 @@')", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
   }]
 }

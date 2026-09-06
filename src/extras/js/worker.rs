@@ -3675,14 +3675,25 @@ fn execute_isolated_skill_verification_case(
     let role = verification_case_role(&case.kind);
     let fakes =
         FakeHostGlobals::with_transcript_budget(artifact.capability.clone(), transcript_budget);
-    if let VerificationCaseKind::HeldOut { fake_files, .. } = &case.kind
+    if let VerificationCaseKind::HeldOut {
+        fake_files,
+        fake_spawns,
+        fake_fetches,
+        ..
+    } = &case.kind
         && (fake_files.len() > 32
             || fake_files.iter().any(|(path, contents)| {
                 path.is_empty() || path.len() > 4 * 1024 || contents.len() > 64 * 1024
             })
             || fake_files
                 .iter()
-                .any(|(path, contents)| fakes.seed_file(path, contents).is_err()))
+                .any(|(path, contents)| fakes.seed_file(path, contents).is_err())
+            || fake_spawns
+                .iter()
+                .any(|fixture| fakes.seed_spawn(fixture).is_err())
+            || fake_fetches
+                .iter()
+                .any(|fixture| fakes.seed_fetch(fixture).is_err()))
     {
         return VerificationCaseResult {
             case_id: case.case_id.clone(),
@@ -3761,8 +3772,11 @@ fn execute_isolated_skill_verification_case(
         inspector: &exception_inspector,
         model_source: None,
     };
-    let mutated_export = match &case.kind {
-        VerificationCaseKind::Mutation { export_name } => Some(export_name.as_str()),
+    let mutation = match &case.kind {
+        VerificationCaseKind::Mutation {
+            export_name,
+            mutation,
+        } => Some((export_name.as_str(), *mutation)),
         _ => None,
     };
     let loaded = match super::realm::load_artifact_with_bound_exports_for_verification(
@@ -3771,7 +3785,7 @@ fn execute_isolated_skill_verification_case(
         artifact,
         capabilities.clone(),
         bindings,
-        mutated_export,
+        mutation,
     ) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -3939,13 +3953,13 @@ fn execute_verification_fake(
             .map_err(|_| CapabilityError::DispatchDenied),
         EffectOperation::Spawn { program, arguments } => fakes
             .spawn(&program, &arguments)
-            .map(|_| EffectResult::Spawn {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-                timed_out: false,
-                stdout_truncated: false,
-                stderr_truncated: false,
+            .map(|response| EffectResult::Spawn {
+                stdout: response.stdout,
+                stderr: response.stderr,
+                exit_code: response.code,
+                timed_out: response.timed_out,
+                stdout_truncated: response.stdout_truncated,
+                stderr_truncated: response.stderr_truncated,
             })
             .map_err(|_| CapabilityError::DispatchDenied),
         EffectOperation::Fetch { url, method, .. } => {
@@ -3955,7 +3969,10 @@ fn execute_verification_fake(
             };
             fakes
                 .fetch(&url, method)
-                .map(|body| EffectResult::Fetch { status: 200, body })
+                .map(|response| EffectResult::Fetch {
+                    status: response.status,
+                    body: response.body,
+                })
                 .map_err(|_| CapabilityError::DispatchDenied)
         }
         EffectOperation::Result { .. }

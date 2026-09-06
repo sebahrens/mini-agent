@@ -175,6 +175,10 @@ pub struct SkillRuntime {
 }
 
 impl SkillRuntime {
+    pub(crate) fn learned_dense_candidate_limit_for_test(&self) -> usize {
+        self.learned_policy.dense_candidate_limit
+    }
+
     /// Build both typed indexes off the request path. A failure in one domain leaves the other.
     pub fn open(
         paths: &AppPaths,

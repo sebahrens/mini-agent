@@ -164,6 +164,12 @@ use `explore` and the compiled-in explorer source. The TUI also renders a
 specialist-start line containing the same type and source before nested child
 tool activity.
 
+Returned specialist text is always rendered inside explicit
+`[subagent output begins]`/`[subagent output ends]` markers with every line quoted. Text that looks
+like a host failure, spill-file path, or specialist-source marker therefore remains untrusted child
+content and cannot impersonate task-runner metadata. Hook permission mode is scoped to the child
+dispatch and restored afterward; concurrent sessions do not share that mutable scope.
+
 The filename stem is the `agent_type` value and must be 1–64 lowercase ASCII
 letters, digits, or hyphens, without leading, trailing, or repeated hyphens.
 An optional YAML frontmatter block may configure the persona:

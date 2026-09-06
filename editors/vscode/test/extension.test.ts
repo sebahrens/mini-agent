@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
   gatedFolderPick: vi.fn(),
+  showQuickPick: vi.fn(),
   instances: [] as Array<{
     workspaceFolder: unknown;
     start: ReturnType<typeof vi.fn>;
@@ -22,6 +23,7 @@ vi.mock('vscode', () => ({
   },
   window: {
     showWarningMessage: vi.fn(),
+    showQuickPick: state.showQuickPick,
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
   },
@@ -35,6 +37,29 @@ vi.mock('vscode', () => ({
     joinPath: vi.fn(() => ({ fsPath: '/bundled/mini-agent' })),
   },
   ThemeIcon: class ThemeIcon {},
+  CancellationTokenSource: class CancellationTokenSource {
+    private cancelled = false;
+    private listeners: Array<() => void> = [];
+    readonly token: {
+      readonly isCancellationRequested: boolean;
+      onCancellationRequested: (listener: () => void) => { dispose: ReturnType<typeof vi.fn> };
+    };
+    constructor() {
+      const source = this;
+      this.token = {
+        get isCancellationRequested() { return source.cancelled; },
+        onCancellationRequested: (listener: () => void) => {
+          this.listeners.push(listener);
+          return { dispose: vi.fn() };
+        },
+      };
+    }
+    cancel(): void {
+      this.cancelled = true;
+      for (const listener of this.listeners) { listener(); }
+    }
+    dispose(): void { this.listeners = []; }
+  },
 }));
 
 vi.mock('../src/chat', () => ({
@@ -131,5 +156,30 @@ describe('extension session creation', () => {
 
     await expect(extension.discardSession()).rejects.toThrow('stop failed');
     expect(active?.dispose).toHaveBeenCalledOnce();
+  });
+});
+
+describe('permission cancellation', () => {
+  const request = {
+    sessionId: 'session-1',
+    toolCall: { toolCallId: 'call-1', title: 'bash', rawInput: 'cargo test' },
+    options: [
+      { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+    ],
+  } as never;
+
+  it('resolves cancelled and cancels the picker when the turn aborts', async () => {
+    state.showQuickPick.mockReturnValueOnce(new Promise(() => undefined));
+    const extension = await import('../src/extension');
+    const cancellation = new AbortController();
+    const result = extension.requestPermission(request, cancellation.signal);
+
+    cancellation.abort();
+
+    await expect(result).resolves.toEqual({ outcome: { outcome: 'cancelled' } });
+    expect(state.showQuickPick).toHaveBeenCalledOnce();
+    const token = state.showQuickPick.mock.calls[0]?.[2];
+    expect(token?.isCancellationRequested).toBe(true);
   });
 });

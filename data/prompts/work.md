@@ -64,7 +64,7 @@ pandoc ch1.md ch2.md ch3.md -o book.pdf --toc
 
 ### python — Complex Scripts and Automation
 
-When bash isn't enough, Python handles the heavy lifting. No coding projects — just quick scripts for data processing, API calls, file manipulation, and automation.
+When shell commands aren't enough, Python handles the heavy lifting. No coding projects — just quick scripts for data processing, API calls, file manipulation, and automation.
 
 ```bash
 # Quick CSV analysis: sum and average of a column

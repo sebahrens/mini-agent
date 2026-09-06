@@ -201,9 +201,18 @@ compact retained events, and irreversibly purge a revision. Setting
 bounded proposal/admission workers. Every approval and activation gate above remains separate;
 importing or proposing code never activates it automatically.
 
+The local CLI's separate approval and root-activation actions use one `local-owner` identity; they
+are two deliberate gates, not a claim that two independent people reviewed the skill.
+
 Over time, the agent spends fewer tokens rediscovering reliable transformations and gains
 domain-specific tools shaped by the repository it actually works in. The library becomes a compact
 record of executable know-how rather than a growing prompt full of prose recipes.
+
+Completion verification now records whether real work passed and which learned revisions were
+actually invoked; operators can compare those task counts with matched no-skill baselines in
+`--learned-skill-stats`. The [Skill Gym](docs/agent/GYM.md) runs isolated paired library/no-library
+episodes for evaluation, always as non-production evidence. It does not auto-author skills,
+approve them, or bypass the human lifecycle gates.
 
 ## Quick start
 

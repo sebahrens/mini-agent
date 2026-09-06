@@ -412,11 +412,48 @@ fn production_worker_args() -> &'static [&'static str] {
 }
 
 fn publication_root() -> Result<PathBuf, WorkerLaunchError> {
-    let root = std::env::temp_dir().join(format!(
+    let paths = crate::paths::process_paths().map_err(|error| WorkerLaunchError::Io {
+        backend: BACKEND,
+        source: io::Error::other(error.to_string()),
+    })?;
+    publication_root_from(&paths.local_data_dir)
+}
+
+fn publication_root_from(local_data_dir: &Path) -> Result<PathBuf, WorkerLaunchError> {
+    if local_data_dir.starts_with("/private/tmp") {
+        return Err(WorkerLaunchError::Io {
+            backend: BACKEND,
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker publication root must not use shared /private/tmp storage",
+            ),
+        });
+    }
+    std::fs::create_dir_all(local_data_dir).map_err(|source| WorkerLaunchError::Io {
+        backend: BACKEND,
+        source,
+    })?;
+    let local_data_dir = local_data_dir
+        .canonicalize()
+        .map_err(|source| WorkerLaunchError::Io {
+            backend: BACKEND,
+            source,
+        })?;
+    if local_data_dir.starts_with("/private/tmp") {
+        return Err(WorkerLaunchError::Io {
+            backend: BACKEND,
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker publication root resolves into shared /private/tmp storage",
+            ),
+        });
+    }
+    let root = local_data_dir.join(format!(
         "mini-agent-js-worker-publications-{}",
         current_uid()
     ));
     let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     builder.mode(0o700);
     match builder.create(&root) {
         Ok(()) => {}
@@ -4059,6 +4096,13 @@ mod tests {
                 .unwrap()
                 .contains("sandbox-exec")
         );
+    }
+
+    #[test]
+    fn publication_root_refuses_shared_private_tmp() {
+        let error = publication_root_from(Path::new("/private/tmp/mini-agent-state"))
+            .expect_err("shared temporary storage must not host worker images");
+        assert!(error.to_string().contains("shared /private/tmp"));
     }
 
     #[test]

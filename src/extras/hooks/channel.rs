@@ -1,5 +1,16 @@
 use super::subprocess::{HookOutput, HookStatus};
 
+const BLOCK_REASON_MAX_BYTES: usize = 8 * 1024;
+
+fn safe_reason(bytes: &[u8]) -> String {
+    let (mut reason, truncated) =
+        crate::extras::validation::sanitize_bytes(bytes, BLOCK_REASON_MAX_BYTES);
+    if truncated {
+        reason.push_str("…[hook reason truncated]");
+    }
+    reason
+}
+
 /// Normalized result of interpreting one hook's raw process output via the
 /// exit-code and stdout-JSON channels, per the hook-dispatch spec's
 /// "exit-code and stdout-JSON contract" requirement.
@@ -31,7 +42,7 @@ pub(crate) fn interpret_hook_output(output: &HookOutput) -> ChannelResult {
         HookStatus::OutputLimitExceeded(_) => return ChannelResult::OutputLimitExceeded,
         HookStatus::PolicyDenied => {
             return ChannelResult::PolicyDenied {
-                reason: String::from_utf8_lossy(&output.stderr).into_owned(),
+                reason: safe_reason(&output.stderr),
             };
         }
         HookStatus::Completed | HookStatus::Failed => {}
@@ -48,12 +59,27 @@ pub(crate) fn interpret_hook_output(output: &HookOutput) -> ChannelResult {
                 );
             }
             ChannelResult::Block {
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stderr: safe_reason(&output.stderr),
             }
         }
         other => ChannelResult::Error {
             exit_code: other,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: safe_reason(&output.stderr),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hook_reasons_are_control_sanitized_and_bounded() {
+        let mut input = b"blocked\x1b[31m\x07".to_vec();
+        input.extend(std::iter::repeat_n(b'x', super::BLOCK_REASON_MAX_BYTES * 2));
+        let reason = super::safe_reason(&input);
+
+        assert!(!reason.contains('\x1b'));
+        assert!(!reason.contains('\x07'));
+        assert!(reason.ends_with("[hook reason truncated]"));
+        assert!(reason.len() < super::BLOCK_REASON_MAX_BYTES + 64);
     }
 }

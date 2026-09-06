@@ -8,11 +8,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Changed
 
-- Documented the 2026-09-05 harness design review (epic `mini-agent-5ana`): spec index 1.4.0,
-  Phase 6 1.1.0, Phase 3 1.3.0, Phase 4 1.3.0, and Phase 5 1.2.0 gain *Accepted amendments
-  (2026-09-05, pending delivery)* sections; agent docs now state the current limits of the
-  `js` surface, learned-skill retrieval, subagent personas, memory refresh, and the shell
-  deadline. No runtime behavior changed.
+- Delivered the 2026-09-05 harness review amendments across brokered JavaScript containment,
+  learned-skill identity, admission, retrieval, telemetry, lifecycle operations, and
+  publication. The owning specifications now record these as delivered amendments.
+- Added background lifecycle jobs and explicit learned-skill operator commands, top-level
+  `await` support, a completion-verification gate, structured history persistence,
+  `skills_search`, and WAL-backed skill storage.
+- Hardened model-command containment, hook and permission scoping, replacement lineage,
+  promotion evidence, and task-outcome attribution following the 2026-09-06 review.
+- Added the deterministic paired `task.json` learned-library regression harness and operator Skill
+  Gym scripts for isolated task mining, seed-library preparation, paired runs, and non-production
+  outcome reporting. Added task utility columns to learned-skill statistics.
+- Fixed LSP workspace rebinding and bounded diagnostics, ACP cancellation ownership, VS Code
+  request cancellation, session/history persistence, and parallel-test shared-state races.
 
 ## [1.8.0] - 2026-09-06
 

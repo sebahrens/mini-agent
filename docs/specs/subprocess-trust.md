@@ -1,7 +1,7 @@
 # Subprocess Trust Classes and Launch Contracts
 
 - **Document role**: normative cross-cutting specification
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: contract delivered; hardening gaps remain tracked separately
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -10,6 +10,16 @@ The corpus authority and conflict rules are defined in [`00-index.md`](00-index.
 controls how mini-agent selects a subprocess boundary and records the authority crossing that
 boundary. [`phase-2-sandbox.md`](phase-2-sandbox.md) continues to control the concrete `bwrap` and
 Seatbelt capability matrices for model-generated actions.
+
+## 2026-09-06 inventory reconciliation
+
+The `TC-MODEL-ACTION` row includes the delivered general-profile hardening: captured commands use
+null stdin, Unix creates a fresh session, Linux `bwrap` closes the workspace-authority descriptor
+inside the namespace before model exec, and only `cache_dir/sandbox-runtime` is mounted as cache.
+The macOS profile denies the resolved mini-agent configuration and credential directories. Backend
+readiness is a bounded real probe. Sandboxed hook executables, including an `if` condition's fixed
+shell, are resolved before the same readiness check. These rules apply whether the launch began in
+the shell tool, a brokered JS `spawn`, or a hook; none grants worker-containment authority.
 
 ## Core invariant
 

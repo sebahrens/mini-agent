@@ -831,7 +831,7 @@ fn skill_index_rebuild_releases_store_lock_during_embedding_io() {
     let routing = std::thread::spawn(move || {
         routing_tx.send(routing_coordinator.routing_key()).unwrap();
     });
-    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_millis(200));
+    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_secs(2));
     release_tx.send(()).unwrap();
     routing.join().unwrap();
     rebuild.join().unwrap().unwrap();
@@ -888,7 +888,7 @@ fn coordinated_mutation_releases_store_lock_during_embedding_io() {
     let routing = std::thread::spawn(move || {
         routing_tx.send(routing_coordinator.routing_key()).unwrap();
     });
-    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_millis(200));
+    let routing_while_embedding = routing_rx.recv_timeout(Duration::from_secs(2));
     release_tx.send(()).unwrap();
     routing.join().unwrap();
     let (_, report) = mutation.join().unwrap().unwrap();

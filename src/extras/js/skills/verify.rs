@@ -9,17 +9,18 @@ use std::time::Duration;
 
 use crate::extras::js::protocol::{
     Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationCase,
-    VerificationCaseKind, VerificationExpectedValue, VerificationResult, VerifyArtifact,
+    VerificationCaseKind, VerificationExpectedValue, VerificationMutation, VerificationResult,
+    VerifyArtifact,
 };
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
 use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
 
-use super::fakes::{FAKES_VERSION, FakeTranscript};
+use super::fakes::{FAKES_VERSION, FakeFetchFixture, FakeSpawnFixture, FakeTranscript};
 use super::held_out::ExpectedJsValue;
 use super::{CapabilityManifest, SkillArtifact};
 
 /// Version of the verification algorithm. Bumping this invalidates existing reports.
-pub const VERIFIER_VERSION: u32 = 3;
+pub const VERIFIER_VERSION: u32 = 4;
 
 /// Timeout for one whole worker verification request.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,18 +103,26 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
             kind: VerificationCaseKind::Embedded,
         })
         .collect::<Vec<_>>();
-    cases.extend(skill.exports.iter().map(|export| VerificationCase {
-        case_id: format!("mutation-{}", export.name),
-        script: String::new(),
-        kind: VerificationCaseKind::Mutation {
-            export_name: export.name.clone(),
-        },
-    }));
+    for export in &skill.exports {
+        for (label, mutation) in [
+            ("throw", VerificationMutation::Throw),
+            ("return-null", VerificationMutation::ReturnNull),
+        ] {
+            cases.push(VerificationCase {
+                case_id: format!("mutation-{label}-{}", export.name),
+                script: String::new(),
+                kind: VerificationCaseKind::Mutation {
+                    export_name: export.name.clone(),
+                    mutation,
+                },
+            });
+        }
+    }
     let result = verify_in_worker(VerifyArtifact {
         artifact: skill.clone(),
         cases,
     })?;
-    validate_worker_result(&result, embedded_count + skill.exports.len())?;
+    validate_worker_result(&result, embedded_count + skill.exports.len() * 2)?;
 
     if let Some(source_failure) = result.cases.iter().find(|case| {
         !case.passed
@@ -143,8 +152,12 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
     }
 
     let mut mutation_outcomes = Vec::with_capacity(skill.exports.len());
-    for (export, case) in skill.exports.iter().zip(&result.cases[embedded_count..]) {
-        if !case.passed {
+    for (export, cases) in skill
+        .exports
+        .iter()
+        .zip(result.cases[embedded_count..].chunks_exact(2))
+    {
+        if let Some(case) = cases.iter().find(|case| !case.passed) {
             return Err(VerificationError::MutationPassFailed {
                 export: export.name.clone(),
                 reason: case
@@ -217,6 +230,8 @@ pub(crate) fn verify_held_out_case(
     expression: &str,
     expected: &ExpectedJsValue,
     fake_files: &BTreeMap<String, String>,
+    fake_spawns: &[FakeSpawnFixture],
+    fake_fetches: &[FakeFetchFixture],
 ) -> Result<FakeTranscript, VerificationError> {
     let result = verify_in_worker(VerifyArtifact {
         artifact: skill.clone(),
@@ -226,6 +241,8 @@ pub(crate) fn verify_held_out_case(
             kind: VerificationCaseKind::HeldOut {
                 expected: expected.into(),
                 fake_files: fake_files.clone(),
+                fake_spawns: fake_spawns.to_vec(),
+                fake_fetches: fake_fetches.to_vec(),
             },
         }],
     })?;

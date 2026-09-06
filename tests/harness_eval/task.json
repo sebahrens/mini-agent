@@ -1,0 +1,35 @@
+{
+  "defaults": {
+    "prompt": "Normalize this gym text with the available library and write output.txt.",
+    "initial_files": {"input.txt": "  value  \n"},
+    "oracle": {"expected_files": {"input.txt": "  value  \n", "output.txt": "value\n"}, "id": "expected-files-v1"},
+    "budgets": {"max_provider_turns": 2, "max_tool_calls": 1, "max_total_tokens": 300},
+    "scripted_provider_turns": {
+      "none": ["write_file('output.txt', read_file('input.txt').trim() + '\\n'); 'ok'"],
+      "library": ["write_file('output.txt', gymNormalize(read_file('input.txt')) + '\\n'); 'ok'"]
+    },
+    "library": "seeds"
+  },
+  "tasks": [
+    {"name": "crlf_normalization", "tags": ["history", "line-endings"]},
+    {"name": "dependency_bump_lock_line", "tags": ["history", "lockfile"]},
+    {"name": "test_output_summary", "tags": ["history", "tests"]},
+    {"name": "permission_path_normalization", "tags": ["history", "permissions"]},
+    {"name": "tool_output_boundary", "tags": ["history", "security"]},
+    {"name": "worker_timeout_cleanup", "tags": ["history", "containment"]},
+    {"name": "hook_payload_normalization", "tags": ["history", "hooks"]},
+    {"name": "session_filename_portability", "tags": ["history", "sessions"]},
+    {"name": "grep_result_truncation", "tags": ["history", "tools"]},
+    {"name": "subagent_result_order", "tags": ["history", "subagents"]},
+    {"name": "cargo_add_feature", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_remove_feature", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_default_features", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_target_dependency", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_lock_checksum", "tags": ["cargo", "lockfile"]},
+    {"name": "cargo_lock_dependency", "tags": ["cargo", "lockfile"]},
+    {"name": "cargo_package_metadata", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_workspace_member", "tags": ["cargo", "workspace"]},
+    {"name": "cargo_profile_setting", "tags": ["cargo", "manifest"]},
+    {"name": "cargo_platform_section", "tags": ["cargo", "manifest"]}
+  ]
+}

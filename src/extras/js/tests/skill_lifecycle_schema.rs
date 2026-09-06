@@ -47,7 +47,7 @@ fn artifact(label: &str) -> SkillArtifact {
             name: "run".to_string(),
             signature: "() => string".to_string(),
         }],
-        vec!["run() !== ''".to_string()],
+        vec![format!("run() === {label:?}")],
         CapabilityManifest::pure(),
     )
     .expect("valid artifact")

@@ -354,10 +354,75 @@ pub(crate) fn is_tool_loop_notice(output: &str) -> bool {
 
 #[derive(Clone)]
 pub(crate) struct CompletionVerification {
-    command: CompactString,
+    command: Option<CompactString>,
     sandbox: crate::sandbox::Sandbox,
     limits: crate::sandbox::CommandLimits,
     max_attempts: u32,
+    #[cfg(feature = "skills")]
+    task_outcomes: Option<TaskOutcomeRecorder>,
+}
+
+#[cfg(feature = "skills")]
+#[derive(Clone)]
+pub(crate) struct TaskOutcomeRecorder {
+    dispatcher: Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+    production: bool,
+}
+
+#[cfg(feature = "skills")]
+impl TaskOutcomeRecorder {
+    pub(crate) fn new(
+        dispatcher: Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+        turn_context: Arc<crate::extras::js::skills::turn::SkillTurnContext>,
+        production: bool,
+    ) -> Self {
+        Self {
+            dispatcher,
+            turn_context,
+            production,
+        }
+    }
+
+    fn record(
+        &self,
+        verify_passed: bool,
+        attempt: u32,
+        source: crate::extras::js::skills::policy::TaskOutcomeSource,
+    ) {
+        let bundle = self.turn_context.snapshot();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|value| i64::try_from(value.as_secs()).ok());
+        let Some(created_at) = created_at else {
+            return;
+        };
+        let evidence = crate::extras::js::skills::policy::TaskOutcomeEvidence {
+            turn_id: bundle.turn_id.clone(),
+            skill_ids: bundle.skills.iter().map(|skill| skill.id.clone()).collect(),
+            verify_passed,
+            attempt: attempt.max(1),
+            source,
+            production: self.production,
+            created_at,
+        };
+        if self.dispatcher.record_task_outcome(evidence).is_err() {
+            self.dispatcher
+                .record_observability_lost("task_outcome_dispatch_failed");
+        }
+    }
+
+    /// Record a deterministic eval/gym oracle without treating it as
+    /// production evidence. Callers choose the production bit when building
+    /// the recorder; ordinary harnesses must pass `false`.
+    pub(crate) fn record_oracle(&self, oracle_id: &str, passed: bool, attempt: u32) {
+        self.record(
+            passed,
+            attempt,
+            crate::extras::js::skills::policy::TaskOutcomeSource::Oracle(oracle_id.to_string()),
+        );
+    }
 }
 
 impl CompletionVerification {
@@ -370,7 +435,7 @@ impl CompletionVerification {
             return None;
         }
         Some(Self {
-            command: CompactString::new(command),
+            command: Some(CompactString::new(command)),
             sandbox,
             limits: crate::sandbox::CommandLimits {
                 timeout: cfg.resolve_verify_timeout(),
@@ -379,13 +444,82 @@ impl CompletionVerification {
                 combined_bytes: 1536 * 1024,
             },
             max_attempts: cfg.resolve_verify_max_attempts(),
+            #[cfg(feature = "skills")]
+            task_outcomes: None,
         })
     }
 
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_task_outcomes(
+        configured: Option<Self>,
+        cfg: &crate::config::Config,
+        sandbox: crate::sandbox::Sandbox,
+        recorder: TaskOutcomeRecorder,
+    ) -> Self {
+        configured
+            .unwrap_or_else(|| Self {
+                command: None,
+                sandbox,
+                limits: crate::sandbox::CommandLimits {
+                    timeout: cfg.resolve_verify_timeout(),
+                    stdout_bytes: 1024 * 1024,
+                    stderr_bytes: 1024 * 1024,
+                    combined_bytes: 1536 * 1024,
+                },
+                max_attempts: cfg.resolve_verify_max_attempts(),
+                task_outcomes: None,
+            })
+            .with_task_outcome_recorder(recorder)
+    }
+
+    #[cfg(feature = "skills")]
+    fn with_task_outcome_recorder(mut self, recorder: TaskOutcomeRecorder) -> Self {
+        self.task_outcomes = Some(recorder);
+        self
+    }
+
+    fn has_command(&self) -> bool {
+        self.command.is_some()
+    }
+
+    #[cfg(feature = "skills")]
+    fn record_verify_outcome(&self, passed: bool, attempt: u32) {
+        use sha2::{Digest, Sha256};
+        let Some(recorder) = &self.task_outcomes else {
+            return;
+        };
+        let Some(command) = &self.command else {
+            return;
+        };
+        let hash = crate::hex::encode_lower(Sha256::digest(command.as_bytes()));
+        recorder.record(
+            passed,
+            attempt,
+            crate::extras::js::skills::policy::TaskOutcomeSource::VerifyCommand(hash),
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    fn record_no_verify_command(&self) {
+        if let Some(recorder) = &self.task_outcomes {
+            recorder.record(
+                false,
+                1,
+                crate::extras::js::skills::policy::TaskOutcomeSource::NoVerifyCommand,
+            );
+        }
+    }
+
     async fn run(&self) -> crate::extras::validation::ValidationResult {
-        crate::extras::validation::start_with_limits(&self.sandbox, &self.command, self.limits)
-            .wait()
-            .await
+        crate::extras::validation::start_with_limits(
+            &self.sandbox,
+            self.command
+                .as_deref()
+                .expect("completion verification command checked before run"),
+            self.limits,
+        )
+        .wait()
+        .await
     }
 }
 
@@ -2329,12 +2463,18 @@ where
                         }
 
                         if terminal_was_streamed || !response_text.is_empty() {
-                            if workspace_may_have_changed
+                            let verification_ran = workspace_may_have_changed
+                                && completion_verification
+                                    .as_ref()
+                                    .is_some_and(CompletionVerification::has_command);
+                            if verification_ran
                                 && let Some(verification) = completion_verification.as_ref()
                             {
                                 verification_attempt = verification_attempt.saturating_add(1);
                                 let result = verification.run().await;
                                 let passed = result.succeeded();
+                                #[cfg(feature = "skills")]
+                                verification.record_verify_outcome(passed, verification_attempt);
                                 let diagnostic = result.render_tail(VERIFICATION_DIAGNOSTIC_CHARS);
                                 let _ = event_tx
                                     .send(AgentEvent::Verification {
@@ -2380,6 +2520,12 @@ where
                                 tracing::warn!(
                                     "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
                                 );
+                            }
+                            #[cfg(feature = "skills")]
+                            if !verification_ran
+                                && let Some(verification) = completion_verification.as_ref()
+                            {
+                                verification.record_no_verify_command();
                             }
                             let _ = event_tx
                                 .send(AgentEvent::Done {
@@ -2951,12 +3097,17 @@ where
                         continue_turn = true;
                         break;
                     }
-                    if workspace_may_have_changed
-                        && let Some(verification) = completion_verification.as_ref()
+                    let verification_ran = workspace_may_have_changed
+                        && completion_verification
+                            .as_ref()
+                            .is_some_and(CompletionVerification::has_command);
+                    if verification_ran && let Some(verification) = completion_verification.as_ref()
                     {
                         verification_attempt = verification_attempt.saturating_add(1);
                         let result = verification.run().await;
                         let passed = result.succeeded();
+                        #[cfg(feature = "skills")]
+                        verification.record_verify_outcome(passed, verification_attempt);
                         let diagnostic = result.render_tail(VERIFICATION_DIAGNOSTIC_CHARS);
                         eprintln!(
                             "verification {} ({verification_attempt}/{})",
@@ -3000,6 +3151,13 @@ where
                                 "hooks: Stop block cap ({MAX_STOP_BLOCKS}) reached without progress; forcing release"
                             );
                         }
+                    }
+                    #[cfg(feature = "skills")]
+                    if !continue_turn
+                        && !verification_ran
+                        && let Some(verification) = completion_verification.as_ref()
+                    {
+                        verification.record_no_verify_command();
                     }
                     break;
                 }

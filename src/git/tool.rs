@@ -729,6 +729,7 @@ fn render_mutation_result(
         stdout,
         stderr,
         status: command_status,
+        ..
     } = output;
     serde_json::json!({
         "operation": operation,
@@ -953,6 +954,7 @@ mod tests {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 status: crate::sandbox::CommandStatus::TimedOut,
+                descendants_escaped: false,
             },
         );
 

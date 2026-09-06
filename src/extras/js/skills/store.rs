@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
 pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
@@ -61,6 +61,7 @@ pub(crate) const MAX_EVALUATION_ATTEMPTS: u32 = 8;
 pub(crate) enum ProposalStatus {
     Pending,
     Evaluating,
+    Deferred,
     Verified,
     Rejected,
     AwaitingApproval,
@@ -72,6 +73,7 @@ impl ProposalStatus {
         match self {
             Self::Pending => "pending",
             Self::Evaluating => "evaluating",
+            Self::Deferred => "deferred",
             Self::Verified => "verified",
             Self::Rejected => "rejected",
             Self::AwaitingApproval => "awaiting_approval",
@@ -83,6 +85,7 @@ impl ProposalStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "evaluating" => Ok(Self::Evaluating),
+            "deferred" => Ok(Self::Deferred),
             "verified" => Ok(Self::Verified),
             "rejected" => Ok(Self::Rejected),
             "awaiting_approval" => Ok(Self::AwaitingApproval),
@@ -97,6 +100,7 @@ impl ProposalStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnqueueStatus {
     Pending,
+    Deferred,
     Verified,
     Rejected,
     AwaitingApproval,
@@ -118,6 +122,7 @@ pub(crate) struct ProposalRecord {
     pub predecessor_id: Option<String>,
     pub status: ProposalStatus,
     pub attempt_count: u32,
+    pub infrastructure_attempt_count: u32,
     pub next_attempt_at: Option<i64>,
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<i64>,
@@ -132,6 +137,7 @@ pub(crate) struct ProposalLease {
     pub skill_id: String,
     pub predecessor_id: Option<String>,
     pub attempt: u32,
+    pub infrastructure_attempts: u32,
     pub row_version: u64,
     pub lease_expires_at: i64,
 }
@@ -516,6 +522,44 @@ impl SkillStore {
         }
     }
 
+    /// Return a predecessor and every immutable ancestor in its replacement
+    /// lineage. Admission uses this to make inherited tests cumulative rather
+    /// than forgetting everything before the immediately previous revision.
+    pub(crate) fn lineage_artifacts(
+        &self,
+        predecessor_id: &str,
+    ) -> Result<Vec<SkillArtifact>, StoreError> {
+        let mut statement = self.db.prepare(
+            "WITH RECURSIVE ancestors(
+                 id, identity_version, source, description, tags_json,
+                 exports_json, tests_json, capability_json, status, supersedes_id
+             ) AS (
+                 SELECT id, identity_version, source, description, tags_json,
+                        exports_json, tests_json, capability_json, status, supersedes_id
+                 FROM skill_revisions WHERE id = ?1
+                 UNION
+                 SELECT r.id, r.identity_version, r.source, r.description, r.tags_json,
+                        r.exports_json, r.tests_json, r.capability_json, r.status, r.supersedes_id
+                 FROM skill_revisions r
+                 JOIN ancestors a ON a.supersedes_id = r.id
+             )
+             SELECT id, identity_version, source, description, tags_json,
+                    exports_json, tests_json, capability_json, status
+             FROM ancestors",
+        )?;
+        let rows = statement.query_map([predecessor_id], read_artifact_row)?;
+        let mut artifacts = Vec::new();
+        for row in rows {
+            let artifact = row??;
+            artifact.verify_identity()?;
+            artifacts.push(artifact);
+        }
+        if artifacts.is_empty() {
+            return Err(StoreError::NotFound(predecessor_id.to_string()));
+        }
+        Ok(artifacts)
+    }
+
     /// List all active retrievable skills with identity validation.
     ///
     /// In Phase 3, only 'active' status rows are retrievable. Recomputes identity
@@ -563,10 +607,23 @@ impl SkillStore {
     pub(crate) fn has_policy_duplicate(
         &self,
         artifact: &SkillArtifact,
+        predecessor_id: Option<&str>,
     ) -> Result<bool, StoreError> {
         let normalized_description = artifact.description.trim().to_lowercase();
+        let excluded_lineage = predecessor_id
+            .map(|id| {
+                self.db
+                    .query_row(
+                        "SELECT COALESCE(lineage_root_id, id) FROM skill_revisions WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
         let mut statement = self.db.prepare(
-            "SELECT id, description, exports_json
+            "SELECT id, description, exports_json, COALESCE(lineage_root_id, id)
              FROM skill_revisions
              WHERE status = 'active' AND identity_version = 2 AND id <> ?",
         )?;
@@ -575,10 +632,14 @@ impl SkillStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (_id, description, exports_json) = row?;
+            let (_id, description, exports_json, lineage_root_id) = row?;
+            if excluded_lineage.as_deref() == Some(lineage_root_id.as_str()) {
+                continue;
+            }
             if description.trim().to_lowercase() == normalized_description
                 && deserialize_exports(&exports_json)? == artifact.exports
             {
@@ -1191,7 +1252,7 @@ impl SkillStore {
                 .query_row(
                     "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
                             next_attempt_at, lease_owner, lease_expires_at, report_id,
-                            reason_code, row_version
+                            reason_code, row_version, infrastructure_attempt_count
                      FROM skill_proposals WHERE skill_id = ?1",
                     [&artifact.id],
                     read_proposal_row,
@@ -1202,6 +1263,26 @@ impl SkillStore {
                 return Err(StoreError::Constraint(
                     "an existing proposal cannot be rebound to a different predecessor".to_string(),
                 ));
+            }
+            if record.status == ProposalStatus::Deferred {
+                let changed = tx.execute(
+                    "UPDATE skill_proposals
+                     SET status = 'pending', attempt_count = 0,
+                         infrastructure_attempt_count = 0, next_attempt_at = ?1,
+                         reason_code = NULL, row_version = row_version + 1, updated_at = ?1
+                     WHERE proposal_id = ?2 AND status = 'deferred' AND row_version = ?3",
+                    params![now, record.proposal_id, sql_version(record.row_version)?],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::Stale(record.proposal_id));
+                }
+                tx.commit()?;
+                return Ok(EnqueueResult {
+                    proposal_id: record.proposal_id,
+                    skill_id: record.skill_id,
+                    status: EnqueueStatus::Pending,
+                    report_id: None,
+                });
             }
             let status = enqueue_status(record.status)?;
             tx.commit()?;
@@ -1240,7 +1321,7 @@ impl SkillStore {
             .query_row(
                 "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
                         next_attempt_at, lease_owner, lease_expires_at, report_id,
-                        reason_code, row_version
+                        reason_code, row_version, infrastructure_attempt_count
                  FROM skill_proposals WHERE proposal_id = ?1",
                 [proposal_id],
                 read_proposal_row,
@@ -1266,9 +1347,10 @@ impl SkillStore {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let candidate: Option<(String, String, Option<String>, u32, i64)> = tx
+        let candidate: Option<(String, String, Option<String>, u32, u32, i64)> = tx
             .query_row(
-                "SELECT proposal_id, skill_id, predecessor_id, attempt_count, row_version
+                "SELECT proposal_id, skill_id, predecessor_id, attempt_count,
+                        infrastructure_attempt_count, row_version
                  FROM skill_proposals
                  WHERE attempt_count < ?1
                    AND (
@@ -1286,11 +1368,19 @@ impl SkillStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((proposal_id, skill_id, predecessor_id, attempt_count, row_version)) = candidate
+        let Some((
+            proposal_id,
+            skill_id,
+            predecessor_id,
+            attempt_count,
+            infrastructure_attempt_count,
+            row_version,
+        )) = candidate
         else {
             tx.commit()?;
             return Ok(None);
@@ -1331,6 +1421,7 @@ impl SkillStore {
             skill_id,
             predecessor_id,
             attempt,
+            infrastructure_attempts: infrastructure_attempt_count,
             row_version: next_version as u64,
             lease_expires_at,
         }))
@@ -1409,12 +1500,52 @@ impl SkillStore {
             "UPDATE skill_proposals
              SET status = 'pending', attempt_count = CASE
                      WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                 infrastructure_attempt_count = infrastructure_attempt_count + 1,
                  next_attempt_at = ?1, lease_owner = NULL, lease_expires_at = NULL,
                  row_version = row_version + 1, updated_at = ?2
              WHERE proposal_id = ?3 AND status = 'evaluating'
                AND lease_owner = ?4 AND row_version = ?5",
             params![
                 next_attempt_at,
+                now,
+                proposal_id,
+                worker,
+                sql_version(row_version)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Park a proposal after repeated infrastructure failures without rejecting
+    /// its immutable revision. An authenticated reevaluation request or a
+    /// byte-identical resubmission can reopen it once infrastructure is healthy.
+    pub(crate) fn defer_infrastructure_proposal(
+        &mut self,
+        proposal_id: &str,
+        worker: &str,
+        row_version: u64,
+        reason_code: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        if reason_code.trim().is_empty() {
+            return Err(StoreError::Constraint(
+                "infrastructure deferral reason is required".to_string(),
+            ));
+        }
+        let changed = self.db.execute(
+            "UPDATE skill_proposals
+             SET status = 'deferred', attempt_count = CASE
+                     WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                 infrastructure_attempt_count = infrastructure_attempt_count + 1,
+                 next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                 reason_code = ?1, row_version = row_version + 1, updated_at = ?2
+             WHERE proposal_id = ?3 AND status = 'evaluating'
+               AND lease_owner = ?4 AND row_version = ?5",
+            params![
+                reason_code,
                 now,
                 proposal_id,
                 worker,
@@ -1930,7 +2061,7 @@ impl SkillStore {
             .query_row(
                 "SELECT proposal_id, skill_id, predecessor_id, status, attempt_count,
                         next_attempt_at, lease_owner, lease_expires_at, report_id,
-                        reason_code, row_version
+                        reason_code, row_version, infrastructure_attempt_count
                  FROM skill_proposals WHERE proposal_id = ?1",
                 [&input.proposal_id],
                 read_proposal_row,
@@ -1987,11 +2118,36 @@ impl SkillStore {
             .checked_add(1)
             .ok_or_else(|| StoreError::Constraint("generation overflow".to_string()))?;
 
+        let lineage_root_id = proposal
+            .predecessor_id
+            .as_deref()
+            .map(|predecessor_id| {
+                tx.query_row(
+                    "SELECT COALESCE(lineage_root_id, id)
+                     FROM skill_revisions
+                     WHERE id = ?1 AND status IN ('active', 'canary', 'quarantined')",
+                    [predecessor_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::Stale(predecessor_id.to_string()))
+            })
+            .transpose()?;
         let revision_changed = tx.execute(
             "UPDATE skill_revisions
-             SET status = 'canary', row_version = row_version + 1, updated_at = ?1
-             WHERE id = ?2 AND status = 'verified' AND row_version = ?3",
-            params![now, input.skill_id, artifact_version],
+             SET status = 'canary', supersedes_id = ?1,
+                 lineage_root_id = COALESCE(?2, id), evaluation_report_id = ?3,
+                 row_version = row_version + 1, updated_at = ?4
+             WHERE id = ?5 AND status = 'verified' AND row_version = ?6
+               AND supersedes_id IS NULL AND lineage_root_id IS NULL",
+            params![
+                proposal.predecessor_id,
+                lineage_root_id,
+                input.report_id,
+                now,
+                input.skill_id,
+                artifact_version
+            ],
         )?;
         if revision_changed != 1 {
             return Err(StoreError::Stale(input.skill_id.clone()));
@@ -2168,30 +2324,44 @@ impl SkillStore {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let skill_id: String = tx
+        let (skill_id, status): (String, String) = tx
             .query_row(
-                "SELECT skill_id FROM skill_proposals
-                 WHERE proposal_id = ?1 AND status = 'verified'
-                   AND reason_code = 'held_out_suite_required' AND row_version = ?2",
+                "SELECT skill_id, status FROM skill_proposals
+                 WHERE proposal_id = ?1 AND row_version = ?2
+                   AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
+                        OR (status = 'deferred'
+                            AND reason_code = 'evaluation_infrastructure_deferred'))",
                 params![proposal_id, sql_version(expected_row_version)?],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
         let proposal_changed = tx.execute(
             "UPDATE skill_proposals
-             SET status = 'pending', next_attempt_at = ?1, report_id = NULL,
+             SET status = 'pending', infrastructure_attempt_count = 0,
+                 next_attempt_at = ?1, report_id = NULL,
                  reason_code = NULL, row_version = row_version + 1, updated_at = ?1
-             WHERE proposal_id = ?2 AND status = 'verified'
-               AND reason_code = 'held_out_suite_required' AND row_version = ?3",
+             WHERE proposal_id = ?2 AND row_version = ?3
+               AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
+                    OR (status = 'deferred'
+                        AND reason_code = 'evaluation_infrastructure_deferred'))",
             params![now, proposal_id, sql_version(expected_row_version)?],
         )?;
-        let revision_changed = tx.execute(
-            "UPDATE skill_revisions
-             SET status = 'pending', row_version = row_version + 1, updated_at = ?1
-             WHERE id = ?2 AND status = 'verified'",
-            params![now, skill_id],
-        )?;
+        let revision_changed = if status == "verified" {
+            tx.execute(
+                "UPDATE skill_revisions
+                 SET status = 'pending', row_version = row_version + 1, updated_at = ?1
+                 WHERE id = ?2 AND status = 'verified'",
+                params![now, skill_id],
+            )?
+        } else {
+            usize::from(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM skill_revisions
+                     WHERE id = ?1 AND status = 'pending')",
+                [&skill_id],
+                |row| row.get::<_, bool>(0),
+            )?)
+        };
         if proposal_changed != 1 || revision_changed != 1 {
             return Err(StoreError::Stale(proposal_id.to_string()));
         }
@@ -2363,6 +2533,14 @@ fn ensure_column(
         )?;
     }
     Ok(())
+}
+
+fn table_has_column(db: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|existing| existing == column))
 }
 
 /// Run idempotent schema migrations.
@@ -3306,11 +3484,204 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    // Migration 8 -> 9: verification/oracle outcomes attributed to skills
+    // that were durably invoked in the same turn.
+    if current_version < 9 {
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS skill_task_outcomes (
+                 evidence_id   TEXT PRIMARY KEY,
+                 turn_id       TEXT NOT NULL,
+                 skill_id      TEXT NOT NULL,
+                 verify_passed INTEGER NOT NULL CHECK (verify_passed IN (0, 1)),
+                 attempt       INTEGER NOT NULL CHECK (attempt > 0),
+                 source_kind   TEXT NOT NULL CHECK (
+                     source_kind IN ('verify_command', 'oracle', 'no_verify_command')
+                 ),
+                 source_id     TEXT,
+                 production    INTEGER NOT NULL CHECK (production IN (0, 1)),
+                 created_at    INTEGER NOT NULL,
+                 UNIQUE (turn_id, skill_id, attempt, source_kind, source_id),
+                 FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE CASCADE
+             );
+             PRAGMA user_version = 9;
+             COMMIT;",
+        )?;
+        if table_has_column(db, "skill_task_outcomes", "skill_id")? {
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS skill_task_outcomes_skill_time_idx
+                 ON skill_task_outcomes(skill_id, created_at, turn_id)",
+                [],
+            )?;
+        }
+    }
+
+    // Migration 9 -> 10: store each task outcome once, including no-library
+    // baselines, and keep skill attribution in a separate join table.
+    if current_version < 10 {
+        if table_has_column(db, "skill_task_outcomes", "skill_id")? {
+            db.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE skill_task_outcomes RENAME TO skill_task_outcomes_v9;
+                 CREATE TABLE skill_task_outcomes (
+                     evidence_id   TEXT PRIMARY KEY,
+                     turn_id       TEXT NOT NULL,
+                     verify_passed INTEGER NOT NULL CHECK (verify_passed IN (0, 1)),
+                     attempt       INTEGER NOT NULL CHECK (attempt > 0),
+                     source_kind   TEXT NOT NULL CHECK (
+                         source_kind IN ('verify_command', 'oracle', 'no_verify_command')
+                     ),
+                     source_id     TEXT,
+                     production    INTEGER NOT NULL CHECK (production IN (0, 1)),
+                     created_at    INTEGER NOT NULL,
+                     UNIQUE (turn_id, attempt, source_kind, source_id)
+                 );
+                 CREATE TABLE skill_task_outcome_links (
+                     evidence_id TEXT NOT NULL,
+                     skill_id    TEXT NOT NULL,
+                     PRIMARY KEY (evidence_id, skill_id),
+                     FOREIGN KEY (evidence_id) REFERENCES skill_task_outcomes(evidence_id)
+                         ON DELETE CASCADE,
+                     FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                         ON DELETE CASCADE
+                 );
+                 INSERT OR IGNORE INTO skill_task_outcomes (
+                     evidence_id, turn_id, verify_passed, attempt, source_kind,
+                     source_id, production, created_at
+                 )
+                 SELECT evidence_id, turn_id, verify_passed, attempt, source_kind,
+                        source_id, production, created_at
+                 FROM skill_task_outcomes_v9;
+                 INSERT OR IGNORE INTO skill_task_outcome_links (evidence_id, skill_id)
+                 SELECT evidence_id, skill_id FROM skill_task_outcomes_v9;
+                 DROP TABLE skill_task_outcomes_v9;
+                 COMMIT;",
+            )?;
+        }
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS skill_task_outcomes (
+                 evidence_id   TEXT PRIMARY KEY,
+                 turn_id       TEXT NOT NULL,
+                 verify_passed INTEGER NOT NULL CHECK (verify_passed IN (0, 1)),
+                 attempt       INTEGER NOT NULL CHECK (attempt > 0),
+                 source_kind   TEXT NOT NULL CHECK (
+                     source_kind IN ('verify_command', 'oracle', 'no_verify_command')
+                 ),
+                 source_id     TEXT,
+                 production    INTEGER NOT NULL CHECK (production IN (0, 1)),
+                 created_at    INTEGER NOT NULL,
+                 UNIQUE (turn_id, attempt, source_kind, source_id)
+             );
+             CREATE TABLE IF NOT EXISTS skill_task_outcome_links (
+                 evidence_id TEXT NOT NULL,
+                 skill_id    TEXT NOT NULL,
+                 PRIMARY KEY (evidence_id, skill_id),
+                 FOREIGN KEY (evidence_id) REFERENCES skill_task_outcomes(evidence_id)
+                     ON DELETE CASCADE,
+                 FOREIGN KEY (skill_id) REFERENCES skill_revisions(id)
+                     ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS skill_task_outcomes_source_idx
+                 ON skill_task_outcomes(source_kind, source_id, production, created_at);
+             CREATE INDEX IF NOT EXISTS skill_task_outcome_links_skill_idx
+                 ON skill_task_outcome_links(skill_id, evidence_id);
+             PRAGMA user_version = 10;
+             COMMIT;",
+        )?;
+    }
+
+    // Migration 10 -> 11: infrastructure failures are parked separately from
+    // deterministic rejection and have their own bounded retry counter.
+    if current_version < 11 {
+        db.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        let migration = db.execute_batch(
+            "CREATE TABLE skill_proposals_v11 (
+                 proposal_id      TEXT PRIMARY KEY,
+                 skill_id         TEXT NOT NULL UNIQUE,
+                 predecessor_id   TEXT,
+                 proposed_at      INTEGER NOT NULL,
+                 status           TEXT NOT NULL DEFAULT 'pending',
+                 attempt_count    INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_at  INTEGER,
+                 lease_owner      TEXT,
+                 lease_expires_at INTEGER,
+                 report_id        TEXT,
+                 reason_code      TEXT,
+                 row_version      INTEGER NOT NULL DEFAULT 1,
+                 created_at       INTEGER NOT NULL,
+                 updated_at       INTEGER NOT NULL,
+                 infrastructure_attempt_count INTEGER NOT NULL DEFAULT 0,
+                 FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                 FOREIGN KEY (predecessor_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                 CHECK (status IN (
+                     'pending','evaluating','deferred','verified','rejected',
+                     'awaiting_approval','approved'
+                 )),
+                 CHECK (attempt_count >= 0 AND attempt_count <= 8),
+                 CHECK (infrastructure_attempt_count >= 0
+                        AND infrastructure_attempt_count <= 8),
+                 CHECK (row_version > 0),
+                 CHECK (
+                     (status = 'evaluating' AND lease_owner IS NOT NULL
+                                              AND lease_expires_at IS NOT NULL)
+                     OR
+                     (status <> 'evaluating' AND lease_owner IS NULL
+                                               AND lease_expires_at IS NULL)
+                 ),
+                 CHECK (
+                     (status IN ('rejected','awaiting_approval','approved')
+                      AND report_id IS NOT NULL)
+                     OR
+                     (status NOT IN ('rejected','awaiting_approval','approved'))
+                 ),
+                 CHECK ((status = 'rejected' AND reason_code IS NOT NULL)
+                        OR status <> 'rejected'),
+                 CHECK ((status = 'deferred'
+                         AND reason_code = 'evaluation_infrastructure_deferred')
+                        OR status <> 'deferred')
+             );
+             INSERT INTO skill_proposals_v11 (
+                 proposal_id, skill_id, predecessor_id, proposed_at, status,
+                 attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                 report_id, reason_code, row_version, created_at, updated_at,
+                 infrastructure_attempt_count
+             )
+             SELECT proposal_id, skill_id, predecessor_id, proposed_at, status,
+                    attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                    report_id, reason_code, row_version, created_at, updated_at, 0
+               FROM skill_proposals;
+             DROP TABLE skill_proposals;
+             ALTER TABLE skill_proposals_v11 RENAME TO skill_proposals;
+             CREATE INDEX skill_proposals_due_idx
+                 ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
+             CREATE INDEX skill_proposals_skill_idx ON skill_proposals(skill_id);
+             PRAGMA user_version = 11;",
+        );
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+                return Err(StoreError::Sqlite(error));
+            }
+        }
+        let foreign_key_error: Option<String> = db
+            .prepare("PRAGMA foreign_key_check")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .next()
+            .transpose()?;
+        if let Some(table) = foreign_key_error {
+            return Err(StoreError::Constraint(format!(
+                "schema migration left a foreign-key violation in {table}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
 /// Read a skill artifact row from the database.
-fn read_artifact_row(row: &Row) -> rusqlite::Result<Result<SkillArtifact, StoreError>> {
+pub(super) fn read_artifact_row(row: &Row) -> rusqlite::Result<Result<SkillArtifact, StoreError>> {
     let id: String = row.get(0)?;
     let identity_version: u32 = row.get(1)?;
     let source: String = row.get(2)?;
@@ -3376,6 +3747,7 @@ fn read_proposal_row(row: &Row) -> rusqlite::Result<ProposalRecord> {
         predecessor_id: row.get(2)?,
         status,
         attempt_count: attempt_count as u32,
+        infrastructure_attempt_count: row.get(11)?,
         next_attempt_at: row.get(5)?,
         lease_owner: row.get(6)?,
         lease_expires_at: row.get(7)?,
@@ -3447,6 +3819,7 @@ fn sql_version(version: u64) -> Result<i64, StoreError> {
 fn enqueue_status(status: ProposalStatus) -> Result<EnqueueStatus, StoreError> {
     match status {
         ProposalStatus::Pending | ProposalStatus::Evaluating => Ok(EnqueueStatus::Pending),
+        ProposalStatus::Deferred => Ok(EnqueueStatus::Deferred),
         ProposalStatus::Verified => Ok(EnqueueStatus::Verified),
         ProposalStatus::Rejected => Ok(EnqueueStatus::Rejected),
         ProposalStatus::AwaitingApproval => Ok(EnqueueStatus::AwaitingApproval),

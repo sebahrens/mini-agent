@@ -62,7 +62,7 @@ impl OwnedStdioTransport {
     fn terminate_tree(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.process_group.take() {
-            crate::sandbox::kill_process_group(pid);
+            crate::sandbox::kill_process_group_if_live(pid);
         }
         #[cfg(not(unix))]
         self.process_group.take();
@@ -93,9 +93,9 @@ impl Transport<RoleClient> for OwnedStdioTransport {
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
             let result = self.inner.graceful_shutdown().await;
-            // A direct server may exit while a descendant that closed all MCP
-            // pipes survives. Terminate the still-owned group after graceful
-            // direct-child cleanup, before this transport can be forgotten.
+            // A descendant may still own the group after the direct child is
+            // reaped. The post-reap helper checks membership before signalling
+            // so an empty/recycled pgid is not killed blindly.
             self.terminate_tree();
             result
         }
@@ -339,6 +339,7 @@ impl McpClientHandle {
 /// per RPC through [`PeerRequestOptions`] instead.
 pub(crate) fn http_client(connect_timeout: Duration) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .build()
         .map_err(|error| anyhow::anyhow!("MCP HTTP client construction failed: {error}"))
@@ -719,11 +720,53 @@ fn is_restricted_ipv4(address: Ipv4Addr) -> bool {
 mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
     use super::{
-        bounded_lossy_diagnostic, delegated_environment, parse_mcp_server_url, stdio_command,
-        validate_mcp_server_url, validate_resolved_addresses,
+        bounded_lossy_diagnostic, delegated_environment, http_client, parse_mcp_server_url,
+        stdio_command, validate_mcp_server_url, validate_resolved_addresses,
     };
+
+    #[tokio::test]
+    async fn http_transport_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        let bind = || match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("loopback bind failed: {error}"),
+        };
+        let Some(target) = bind() else {
+            return;
+        };
+        target.set_nonblocking(true).unwrap();
+        let Some(redirect) = bind() else {
+            return;
+        };
+        let redirect_url = format!("http://{}", redirect.local_addr().unwrap());
+        let target_url = format!("http://{}", target.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let response = http_client(Duration::from_secs(1))
+            .unwrap()
+            .get(redirect_url)
+            .send()
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
 
     #[test]
     fn stdio_command_resolves_path_lookup_before_spawn() {

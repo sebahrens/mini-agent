@@ -52,6 +52,8 @@ struct SessionHistory {
 }
 
 impl SessionHistory {
+    const EMERGENCY_RECAP: &'static str = "Earlier ACP turns were evicted because automatic summarization was unavailable; retained recent turns remain authoritative.";
+
     fn snapshot(&self) -> Vec<Message> {
         self.snapshot_with_tool_result_retention(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS)
     }
@@ -171,13 +173,24 @@ impl SessionHistory {
             cumulative_messages.push(serialized.len());
         }
 
-        let (summary, messages_included) = summarize(serialized, self.summary.clone()).await?;
+        let (summary, messages_included) = match summarize(serialized, self.summary.clone()).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(%error, "ACP history summarization failed; evicting oldest complete turns");
+                self.emergency_compact();
+                return Ok(());
+            }
+        };
         let turns_included = cumulative_messages
             .iter()
             .take_while(|count| **count <= messages_included)
             .count();
         if turns_included == 0 {
-            anyhow::bail!("ACP compaction did not cover one complete oldest turn");
+            tracing::warn!(
+                "ACP history summary did not cover a complete turn; evicting oldest complete turns"
+            );
+            self.emergency_compact();
+            return Ok(());
         }
         for _ in 0..turns_included {
             if let Some(turn) = self.turns.pop_front() {
@@ -186,6 +199,16 @@ impl SessionHistory {
         }
         self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
         Ok(())
+    }
+
+    fn emergency_compact(&mut self) {
+        self.summary = Some(Self::EMERGENCY_RECAP.to_string());
+        while self.needs_compaction() {
+            let Some(turn) = self.turns.pop_front() else {
+                break;
+            };
+            self.serialized_bytes = self.serialized_bytes.saturating_sub(turn.serialized_bytes);
+        }
     }
 }
 
@@ -762,9 +785,8 @@ async fn connect_agent(
                 async move {
                     tracing::warn!("ACP unhandled dispatch message");
                     match dispatch {
-                        Dispatch::Request(_, responder) => responder.respond_with_error(
-                            agent_client_protocol::util::internal_error("Unhandled ACP message"),
-                        ),
+                        Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found()),
                         Dispatch::Notification(_) => Ok(()),
                         Dispatch::Response(response, router) => {
                             router.route_with_result(response)
@@ -908,6 +930,15 @@ async fn handle_close_session(
 fn canonical_session_workspace(
     path: &Path,
 ) -> Result<crate::paths::WorkspaceBinding, agent_client_protocol::Error> {
+    if !path.is_absolute() {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            format!(
+                "invalid ACP session cwd '{}': path must be absolute",
+                path.display()
+            ),
+        ));
+    }
     crate::paths::WorkspaceBinding::capture(path).map_err(|error| {
         agent_client_protocol::Error::new(
             -32602,
@@ -944,15 +975,7 @@ async fn handle_prompt(
 
     tracing::info!("ACP prompt for session {}", session_id);
 
-    let prompt_text = req
-        .prompt
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(t) => Some(t.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt_text = render_prompt_blocks(&req.prompt)?;
 
     let snapshot = {
         let sessions = state.sessions.lock().await;
@@ -1076,6 +1099,62 @@ async fn handle_prompt(
     })
 }
 
+fn render_prompt_blocks(blocks: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
+    let mut rendered = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text) => rendered.push(text.text.clone()),
+            ContentBlock::ResourceLink(resource) => {
+                let mut link = format!("[resource: {}]({})", resource.name, resource.uri);
+                if let Some(description) = resource.description.as_deref()
+                    && !description.trim().is_empty()
+                {
+                    link.push('\n');
+                    link.push_str(description);
+                }
+                rendered.push(link);
+            }
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(text) => {
+                    rendered.push(format!("[embedded resource: {}]\n{}", text.uri, text.text))
+                }
+                EmbeddedResourceResource::BlobResourceContents(_) => {
+                    return Err(agent_client_protocol::Error::new(
+                        -32602,
+                        "binary embedded resources are not supported in ACP prompts",
+                    ));
+                }
+                _ => {
+                    return Err(agent_client_protocol::Error::new(
+                        -32602,
+                        "unsupported embedded resource in ACP prompt",
+                    ));
+                }
+            },
+            ContentBlock::Image(_) | ContentBlock::Audio(_) => {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    "image and audio ACP prompts are not supported",
+                ));
+            }
+            _ => {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    "unsupported ACP prompt content block",
+                ));
+            }
+        }
+    }
+    let rendered = rendered.join("\n");
+    if rendered.trim().is_empty() {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            "ACP prompt must contain non-empty text or a resource link",
+        ));
+    }
+    Ok(rendered)
+}
+
 // --- Permission Bridge ---
 
 async fn drive_permission_bridge(
@@ -1105,18 +1184,33 @@ async fn drive_permission_bridge(
             .as_deref()
             .unwrap_or(&ask.input)
             .to_string();
+        let synthetic_tool_call_id = ask.tool_call_id.is_none();
         let tool_call_id = ToolCallId::new(
             ask.tool_call_id
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         );
+        let content = vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+            ask.input.clone(),
+        )))];
+        if synthetic_tool_call_id {
+            let announced = ToolCall::new(tool_call_id.clone(), ask.tool.to_string())
+                .content(content.clone())
+                .raw_input(Some(serde_json::Value::String(ask.input.clone())));
+            if let Err(error) = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCall(announced),
+            )) {
+                tracing::warn!("ACP failed to announce synthetic permission tool call: {error}");
+                let _ = ask.reply.send(UserDecision::Deny);
+                continue;
+            }
+        }
         let tool_call = ToolCallUpdate::new(
             tool_call_id,
             ToolCallUpdateFields::new()
                 .title(ask.tool.to_string())
-                .content(vec![ToolCallContent::from(ContentBlock::Text(
-                    TextContent::new(ask.input.clone()),
-                ))]),
+                .content(content),
         );
         let options = vec![
             PermissionOption::new(
@@ -1208,6 +1302,8 @@ async fn run_prompt(
     if let Err(error) = workspace.validate() {
         return respond_prompt_failure(session_id, responder, cx, registration, error.to_string());
     }
+    #[cfg(feature = "hooks")]
+    crate::extras::hooks::set_active_workspace(workspace.root());
     #[cfg(feature = "memory")]
     let context = {
         let mut refreshed = (*context).clone();
@@ -2038,6 +2134,36 @@ mod history_tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_or_incomplete_summary_cannot_wedge_acp_history() {
+        for incomplete in [false, true] {
+            let mut history = SessionHistory::default();
+            history.commit_completed_turn(
+                &"oversized".repeat(MAX_ACP_HISTORY_BYTES),
+                vec![Message::assistant("old answer")],
+            );
+            assert!(history.needs_compaction());
+            let result = history
+                .compact_with(|_, _| async move {
+                    if incomplete {
+                        Ok(("did not cover a turn".to_string(), 0))
+                    } else {
+                        anyhow::bail!("summarizer unavailable")
+                    }
+                })
+                .await;
+            assert!(result.is_ok());
+            assert!(!history.needs_compaction());
+            assert_eq!(
+                history.snapshot(),
+                vec![Message::assistant(format!(
+                    "[Recap of earlier ACP turns]\n{}",
+                    SessionHistory::EMERGENCY_RECAP
+                ))]
+            );
+        }
+    }
+
     #[test]
     fn initialize_truthfully_does_not_advertise_load_session() {
         assert!(!acp_capabilities().load_session);
@@ -2121,6 +2247,24 @@ mod protocol_tests {
     #[test]
     fn initialize_always_advertises_the_implemented_v1_protocol() {
         assert_eq!(acp_protocol_version(), ProtocolVersion::V1);
+    }
+
+    #[test]
+    fn prompt_blocks_render_required_resource_links_and_reject_empty_input() {
+        let rendered = render_prompt_blocks(&[
+            ContentBlock::Text(TextContent::new("inspect this")),
+            ContentBlock::ResourceLink(
+                ResourceLink::new("report", "file:///workspace/report.md")
+                    .description(Some("the generated report".to_string())),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "inspect this\n[resource: report](file:///workspace/report.md)\nthe generated report"
+        );
+        assert!(render_prompt_blocks(&[]).is_err());
+        assert!(render_prompt_blocks(&[ContentBlock::Text(TextContent::new("  "))]).is_err());
     }
 
     fn fixture_state(prompt_fixture: PromptFixture) -> Arc<AcpState> {
@@ -3818,6 +3962,7 @@ mod workspace_tests {
         let file = first.join("sentinel.txt");
         assert!(canonical_session_workspace(&file).is_err());
         assert!(canonical_session_workspace(&first.join("missing")).is_err());
+        assert!(canonical_session_workspace(Path::new("relative/workspace")).is_err());
     }
 
     #[tokio::test]

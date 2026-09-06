@@ -18,7 +18,7 @@ Write tests for new non-TUI production code and update `docs/` when adding modul
 
 ## JS engine implementation
 
-The integration lives at `src/extras/js/`. The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here. Design changes accepted but not yet delivered live under **Accepted amendments (2026-09-05, pending delivery)** in the owning spec and in `docs/specs/00-index.md`; implement only what is listed there, and close the named bead with its tests before describing the change as delivered.
+The integration lives at `src/extras/js/`. The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here. Delivered changes from the review are recorded under **Delivered amendments (2026-09-05)** in the owning spec and in `docs/specs/00-index.md`; preserve those contracts and close each named bead with its tests before describing later changes as delivered.
 
 ## Feature gate
 

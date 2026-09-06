@@ -782,8 +782,9 @@ impl ProposalEffectService {
         &self,
         proposal: JsProposal,
     ) -> Result<ProposalEffectResult, ProposalError> {
+        let prepared = self.authorize_reserved(proposal)?;
         self.reserve_attempt()?;
-        self.execute_reserved(proposal)
+        self.execute_prepared(prepared)
     }
 
     /// Cancellation-aware parent API. Cancellation before dispatch is exact;
@@ -798,10 +799,10 @@ impl ProposalEffectService {
         if cancellation.is_cancelled() {
             return Err(EffectServiceError::Cancelled);
         }
-        self.reserve_attempt().map_err(proposal_service_error)?;
         let prepared = self
             .authorize_reserved(proposal)
             .map_err(proposal_service_error)?;
+        self.reserve_attempt().map_err(proposal_service_error)?;
         if cancellation.is_cancelled() {
             return Err(EffectServiceError::Cancelled);
         }
@@ -869,6 +870,7 @@ impl ProposalEffectService {
             .enqueue(prepared.artifact, prepared.predecessor_id)?;
         let status = match result.status {
             super::store::EnqueueStatus::Pending => ProposalStatus::Pending,
+            super::store::EnqueueStatus::Deferred => ProposalStatus::Deferred,
             super::store::EnqueueStatus::Verified => ProposalStatus::Verified,
             super::store::EnqueueStatus::Rejected => ProposalStatus::Rejected,
             super::store::EnqueueStatus::AwaitingApproval => ProposalStatus::AwaitingApproval,

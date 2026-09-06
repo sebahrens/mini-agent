@@ -97,7 +97,11 @@ pub(crate) fn confirm_untrusted_hook(description: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn hook_confirmation_description(handler: &HookHandler) -> String {
+fn hook_confirmation_description(
+    event: &str,
+    matcher: Option<&str>,
+    handler: &HookHandler,
+) -> String {
     let argv = std::iter::once(handler.command.as_deref())
         .chain(handler.args.iter().flatten().map(|arg| Some(arg.as_str())))
         .collect::<Vec<_>>();
@@ -112,8 +116,10 @@ fn hook_confirmation_description(handler: &HookHandler) -> String {
     let env_binding = serde_json::to_vec(&handler.env)
         .expect("serializing hook environment bindings cannot fail");
     let env_binding_sha256 = crate::hex::encode_lower(Sha256::digest(env_binding));
+    let event = serde_json::to_string(event).expect("serializing hook event cannot fail");
+    let matcher = serde_json::to_string(&matcher).expect("serializing hook matcher cannot fail");
     let policy = format!(
-        "subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}"
+        "event={event}; matcher={matcher}; subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}"
     );
 
     match handler.condition.as_deref() {
@@ -194,7 +200,11 @@ fn filter_trusted_project_hooks(
                         "hooks: skipping unconfirmed project hook for event {event:?} \
                          (headless; run interactively once to confirm)"
                     );
-                } else if confirm(&hook_confirmation_description(&handler)) {
+                } else if confirm(&hook_confirmation_description(
+                    &event,
+                    group.matcher.as_deref(),
+                    &handler,
+                )) {
                     trusted_hashes.insert(hash);
                     kept_handlers.push(handler);
                 } else {
@@ -337,4 +347,27 @@ pub(crate) fn load_dispatcher(
         &confirm_untrusted_hook,
         sandbox_backend,
     )
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_displays_event_and_matcher_that_are_bound_by_the_hash() {
+        let handler = HookHandler {
+            kind: "command".into(),
+            command: Some("guard".into()),
+            args: Some(vec![]),
+            timeout: None,
+            is_async: false,
+            condition: None,
+            once: false,
+            trust: super::super::settings::HookTrust::Sandboxed,
+            env: Default::default(),
+        };
+        let description = hook_confirmation_description("PreToolUse", Some("bash"), &handler);
+        assert!(description.contains("event=\"PreToolUse\""));
+        assert!(description.contains("matcher=\"bash\""));
+    }
 }

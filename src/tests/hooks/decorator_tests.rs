@@ -247,7 +247,13 @@ async fn post_tool_use_failure_observes_but_cannot_change_the_outcome() {
     let err = result.expect_err("inner tool always fails");
     assert!(err.to_string().contains("inner tool blew up"));
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PostToolUseFailure decorator hook did not publish its marker");
     assert!(marker.exists());
 }
 
@@ -402,6 +408,25 @@ async fn allow_verdict_suppresses_the_prompt_for_the_inner_tools_own_check() {
 
     let result = wrapped[0].call("ls -la".to_string()).await;
     assert_eq!(result.unwrap(), "ls -la");
+}
+
+#[tokio::test]
+async fn unused_hook_allow_is_cleared_when_the_owning_call_finishes() {
+    let dispatcher = dispatcher_with(
+        "PreToolUse",
+        vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
+    );
+    let perm = permission_restrictive();
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
+    let wrapped = wrap_all(tools, dispatcher, perm.clone());
+
+    wrapped[0].call("first".into()).await.unwrap();
+    let later = perm
+        .unwrap()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .check("echo_tool", "different call");
+    assert_eq!(later, crate::permission::checker::CheckResult::Ask);
 }
 
 #[test]

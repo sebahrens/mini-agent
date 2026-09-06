@@ -58,7 +58,11 @@ fn copy_to_clipboard_does_not_panic() {
 #[test]
 #[cfg(not(windows))]
 fn copy_to_clipboard_empty_string() {
-    copy_to_clipboard("").expect("copy should succeed");
+    let outcome = copy_to_clipboard("").expect("copy should succeed");
+    assert!(matches!(
+        outcome,
+        ClipboardCopyOutcome::Confirmed | ClipboardCopyOutcome::FallbackRequested
+    ));
 }
 
 #[test]

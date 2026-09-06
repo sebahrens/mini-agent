@@ -212,7 +212,7 @@ async function createSession(
   return created;
 }
 
-async function requestPermission(
+export async function requestPermission(
   request: acp.RequestPermissionRequest,
   signal: AbortSignal,
 ): Promise<acp.RequestPermissionResponse> {
@@ -220,19 +220,35 @@ async function requestPermission(
     return { outcome: { outcome: 'cancelled' } };
   }
 
-  interface PermissionItem extends vscode.MessageItem { readonly optionIndex: number }
+  interface PermissionItem extends vscode.QuickPickItem { readonly optionIndex: number }
   const items = request.options.map((option, index): PermissionItem => ({
-    title: permissionOptionTitle(request, option),
-    isCloseAffordance: option.kind.startsWith('reject'),
+    label: permissionOptionTitle(request, option),
     optionIndex: index,
   }));
   // The detail shows the actual command/input (content text blocks and rawInput),
   // not just the tool name, so "Allow always" never persists an unseen rule.
-  const selected = await vscode.window.showWarningMessage(
-    `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
-    { modal: true, detail: buildPermissionDetail(request) },
-    ...items,
-  );
+  const cancellation = new vscode.CancellationTokenSource();
+  let resolveAbort!: (value: undefined) => void;
+  const aborted = new Promise<undefined>(resolve => { resolveAbort = resolve; });
+  const onAbort = (): void => {
+    cancellation.cancel();
+    resolveAbort(undefined);
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  let selected: PermissionItem | undefined;
+  try {
+    selected = await Promise.race([
+      vscode.window.showQuickPick(items, {
+        title: `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
+        placeHolder: buildPermissionDetail(request),
+        ignoreFocusOut: true,
+      }, cancellation.token),
+      aborted,
+    ]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    cancellation.dispose();
+  }
   if (!selected || signal.aborted) { return { outcome: { outcome: 'cancelled' } }; }
   const option = request.options[selected.optionIndex];
   if (!option) { return { outcome: { outcome: 'cancelled' } }; }

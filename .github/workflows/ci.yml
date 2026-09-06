@@ -57,7 +57,7 @@ jobs:
         run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
 
       - name: Test harness evaluation CI policy
-        run: python3 -m unittest scripts.tests.test_harness_eval_ci
+        run: python3 -m unittest scripts.tests.test_harness_eval_ci scripts.tests.test_gym
 
       - name: Test VS Code CI policy
         run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
@@ -66,7 +66,9 @@ jobs:
         run: |
           python3 -m unittest \
             scripts.tests.test_check_package_metadata \
-            scripts.tests.test_extract_changelog
+            scripts.tests.test_extract_changelog \
+            scripts.tests.test_release_artifacts \
+            scripts.tests.test_smoke_package_compliance
 
       - name: Test Windows MSI policy
         run: |
@@ -100,6 +102,24 @@ jobs:
         run: |
           python3 -m unittest scripts.tests.test_check_workspace_boundaries
           python3 scripts/check_workspace_boundaries.py
+
+  harness-regression:
+    if: github.event_name == 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # The deterministic five-task suite uses scripted providers and bounded
+      # per-fixture turn/tool/token budgets, so it is cheap enough to gate PRs.
+      - name: Run bounded deterministic harness evaluation
+        run: |
+          cargo test --locked harness_regression_eval -- --ignored --nocapture
+          cargo test --locked --no-default-features \
+            --features js,skills,sandbox,subagents \
+            task_json_library_axis_uses_real_store_and_records_oracles -- --nocapture
 
   package-compliance-smoke:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
@@ -176,6 +196,7 @@ jobs:
           # Opt-in extras that neither the default set nor any focused row
           # compiles. Kept as one row so they get at least one strict lint pass.
           - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
+          - "--no-default-features --features hooks,js,subagents,skills,sandbox"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ubuntu-latest
@@ -215,13 +236,9 @@ jobs:
           # Opt-in extras that neither the default set nor any focused row
           # compiles: hooks, advisor, LSP, multimodal, and PDF ingestion.
           - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
+          - "--no-default-features --features hooks,js,subagents,skills,sandbox"
           - "--no-default-features --features js,skills"
           - "--no-default-features --features mcp,js,sandbox,skills,memory"
-        exclude:
-          # ACP's TCP authentication tests are covered on Linux. The macOS
-          # hosted runner has a known socket scheduling hang in this suite.
-          - os: macos-latest
-            features: "--no-default-features --features acp"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -236,18 +253,21 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      # Several JS tests launch authenticated child copies of the libtest binary. Running those
-      # process-global worker fixtures concurrently can make an unrelated child lose its protocol
-      # transport under hosted-runner load, so keep the full Linux matrix deterministic too.
-      - name: Test (${{ matrix.features }}) on Linux with process-global worker isolation
+      - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest'
-        run: cargo test --locked ${{ matrix.features }} -- --test-threads=1
+        run: cargo test --locked ${{ matrix.features }}
 
       - name: Test (${{ matrix.features }}) on macOS with process-global worker isolation
         if: matrix.os == 'macos-latest'
+        env:
+          # Rust test threads default to a 2 MiB stack. The combined hooks +
+          # skills debug configuration has larger async test futures, while
+          # production QuickJS workers already use their explicit 8 MiB stack.
+          RUST_MIN_STACK: 8388608
         run: >-
           cargo test --locked ${{ matrix.features }} -- --test-threads=1
           --skip extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
+          --skip tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
 
       - name: Test macOS agent-rebuild worker reuse in a fresh process
         if: >-
@@ -258,6 +278,18 @@ jobs:
           extras::js::tool::js_permission_bridge::js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver
           -- --exact --test-threads=1
 
+      - name: Test macOS task-level skill eval in a fresh process
+        if: >-
+          matrix.os == 'macos-latest' &&
+          contains(matrix.features, 'skills') &&
+          contains(matrix.features, 'sandbox')
+        env:
+          RUST_MIN_STACK: 8388608
+        run: >-
+          cargo test --locked ${{ matrix.features }}
+          tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles
+          -- --exact --test-threads=1
+
       - name: Validate deterministic skill retrieval benchmark metrics
         if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
         run: cargo test --locked --no-default-features --features js,skills skill_retrieval_benchmark_smoke -- --nocapture
@@ -266,13 +298,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.features == '--no-default-features --features js,skills'
         run: cargo test --locked --no-default-features --features js,skills phase5_operations_benchmark
 
-  # The local ONNX/BGE embedding backend. Kept out of the required matrix because
-  # ort-sys ships no prebuilt binaries for every host (notably x86_64-apple-darwin)
-  # and downloading the runtime makes the job slow and network-dependent. Failure
-  # here signals that `skills-embed` needs attention; it does not block the build.
-  skills-embed-optional:
+  # The local ONNX/BGE embedding backend and the complete feature union run on
+  # Linux, where ort-sys publishes a supported runtime artifact.
+  all-features:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -280,8 +309,31 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Test (--no-default-features --features skills-embed)
-        run: cargo test --locked --no-default-features --features skills-embed
+      - name: Test all features
+        run: cargo test --locked --all-features
+
+  parallel-test-smoke:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - name: Test the default suite with the standard parallel runner
+        run: cargo test --locked
+
+  windows-default-tests:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    continue-on-error: true
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
+      - name: Test the Windows default feature suite
+        run: cargo test --locked
 
   linux-sandbox-policy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
@@ -305,7 +357,12 @@ jobs:
           fi
 
       - name: Test Linux sandbox capability policy
-        run: cargo test --locked linux_sandbox_policy
+        shell: bash
+        run: |
+          cargo test --locked linux_sandbox_policy
+          cargo test --locked \
+            sandbox::sandbox_tests::bound_bwrap_model_process_has_no_authority_fd_or_terminal_stdin \
+            -- --exact --ignored --nocapture
 
       - name: Test shared sandbox module
         # Keep the trailing Rust module separator inside a YAML block scalar.

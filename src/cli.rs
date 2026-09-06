@@ -250,7 +250,7 @@ pub struct Cli {
     #[arg(short = 'r', long = "resume", help = "List recent sessions")]
     pub resume: bool,
 
-    #[arg(long = "session", help = "Load session by ID prefix")]
+    #[arg(long = "session", help = "Load session by ID prefix or exact name")]
     pub session: Option<String>,
 
     #[arg(
@@ -372,7 +372,7 @@ pub struct Cli {
 
     #[arg(
         long = "yolo",
-        help = "Allow all operations except destructive bash commands"
+        help = "Allow all operations except destructive shell commands"
     )]
     pub yolo: bool,
 
@@ -417,7 +417,7 @@ pub struct Cli {
 
     #[arg(
         long = "shell",
-        help = "Shell for the bash compatibility tool: bash/sh, or PowerShell/pwsh on Windows"
+        help = "Executable for the shell tool: bash/sh, or PowerShell/pwsh on Windows"
     )]
     pub shell: Option<String>,
 
@@ -430,7 +430,7 @@ pub struct Cli {
     #[arg(
         long = "no-context-files",
         short = 'n',
-        help = "Disable AGENTS.md and ARCHITECTURE.md loading"
+        help = "Disable AGENTS.md, CLAUDE.md, and ARCHITECTURE.md loading"
     )]
     pub no_context_files: bool,
 

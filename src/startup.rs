@@ -645,7 +645,9 @@ impl Startup {
         let mut session_resumed = false;
 
         if cli.continue_session && cli.session.is_none() {
-            session = require_recent_session(session::storage::find_recent_sessions(1))?;
+            session = require_recent_session(
+                session::storage::find_recent_sessions_for_workspace(1, workspace.root()),
+            )?;
             session_resumed = true;
         }
 
@@ -1128,6 +1130,7 @@ impl Startup {
         // started, so slow hooks do not serialize those cold-start paths.
         #[cfg(feature = "hooks")]
         {
+            crate::extras::hooks::set_active_session(&self.session.id);
             let source = if self.session_resumed {
                 "resume"
             } else {

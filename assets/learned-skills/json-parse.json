@@ -9,7 +9,7 @@
     "predecessor_id": null
   },
   "held_out_suites": [{
-    "selector": {"tags": ["seed", "json"], "exports": ["parseJson"], "capability_tier": "pure"},
+    "selector": {"tags": ["seed", "json"], "exports": [{"name": "parseJson", "signature": "(text: string) => unknown"}], "capability_tier": "pure"},
     "cases": [{"expression": "parseJson('{\"nested\":{\"ok\":true}}').nested.ok", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
   }]
 }

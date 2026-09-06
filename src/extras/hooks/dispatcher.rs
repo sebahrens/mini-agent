@@ -228,7 +228,13 @@ impl HookDispatcher {
         for (event, groups) in config {
             let mut entries = Vec::with_capacity(groups.len());
             for group in groups {
-                let matcher = CompiledMatcher::compile(&group.matcher)?;
+                let matcher = match CompiledMatcher::compile(&group.matcher) {
+                    Ok(matcher) => matcher,
+                    Err(error) => {
+                        tracing::warn!("{error}; skipping only this hook matcher group");
+                        continue;
+                    }
+                };
                 entries.push(MatcherEntry {
                     matcher,
                     handlers: group.hooks.clone(),

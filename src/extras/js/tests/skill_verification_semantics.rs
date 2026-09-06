@@ -249,14 +249,15 @@ mod tests {
         let s = skill(
             "function real_export() { return true; }",
             vec!["real_export()"],
-            vec![("real_export", "(): boolean"), ("missing", "(): boolean")], // missing is declared but not defined
+            vec![("missing", "(): boolean"), ("real_export", "(): boolean")], // missing is declared but not defined
             CapabilityTier::Pure,
             vec![],
         );
         let result = verify_skill(&s);
-        // Either returns an error or returns a report - the important thing is
-        // that the mutation pass will catch unexercised exports
-        assert!(result.is_ok() || result.is_err());
+        assert!(matches!(
+            result,
+            Err(VerificationError::SourceEvaluationFailed(_))
+        ));
     }
 
     // Note: Export type validation tests are skipped because rquickjs's
@@ -278,6 +279,19 @@ mod tests {
         let report = verify_skill(&s).unwrap();
         assert_eq!(report.test_results.len(), 3);
         assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
+    }
+
+    #[test]
+    fn time_and_randomness_are_identically_unavailable_to_skills() {
+        let s = skill(
+            "function inspect() { return [typeof Date, typeof Math.random, typeof performance].join(','); }",
+            vec!["inspect() === 'undefined,undefined,undefined'"],
+            vec![("inspect", "(): string")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+        let report = verify_skill(&s).expect("hardened deterministic globals verify");
+        assert_eq!(report.test_results, vec![TestResult::Passed]);
     }
 
     #[test]
@@ -357,6 +371,46 @@ mod tests {
     }
 
     #[test]
+    fn assertion_free_export_call_does_not_satisfy_mutation_coverage() {
+        let s = skill(
+            "function run() { return 42; }",
+            vec!["(run(), true)"],
+            vec![("run", "(): number")],
+            CapabilityTier::Pure,
+            vec![],
+        );
+
+        let result = verify_skill(&s);
+        assert!(
+            matches!(
+                &result,
+                Err(VerificationError::MutationPassFailed { export, .. }) if export == "run"
+            ),
+            "unexpected verification result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_coverage_observes_calls_through_another_export() {
+        let s = skill(
+            "function inner(value) { return value + 1; } function outer(_cap, value) { return inner(value); }",
+            vec!["outer(1) === 2"],
+            vec![
+                ("inner", "(value: number): number"),
+                ("outer", "(value: number): number"),
+            ],
+            CapabilityTier::Pure,
+            vec![],
+        );
+
+        let report = verify_skill(&s).expect("indirectly called export should be covered");
+        assert_eq!(
+            report.mutation_outcomes,
+            vec![MutationOutcome::Detected, MutationOutcome::Detected]
+        );
+    }
+
+    #[test]
     fn test_mutation_undetected_when_export_unused() {
         let s = skill(
             "function unused() { return 42; }",
@@ -418,7 +472,7 @@ mod tests {
         assert_eq!(report.identity_version, s.identity_version);
         assert_eq!(report.capability, s.capability);
         assert!(report.verifier_version > 0);
-        assert_eq!(report.fakes_version, 2);
+        assert_eq!(report.fakes_version, 3);
         assert!(report.memory_limit > 0);
         assert!(report.stack_limit > 0);
     }

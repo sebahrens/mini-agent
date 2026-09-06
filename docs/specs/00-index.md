@@ -1,7 +1,7 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.5.0
+- **Specification version**: 1.6.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -39,6 +39,22 @@ planning context only; it cannot override the cited section.
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
+
+### Skill Gym and task-outcome evidence
+
+The Skill Gym is a delivered operator/evaluation surface layered on Phases 3--5, not a new
+authority-bearing runtime phase. [`../agent/GYM.md`](../agent/GYM.md) owns its operational task
+format and scripts. Phase 5 owns durable task-outcome evidence and promotion semantics; Phase 3
+owns retrieval; Phase 4 owns proposal, verification, and human admission; the deterministic
+harness owns the paired `none`/`library` regression axis. Gym and harness sessions explicitly mark
+their evidence non-production. The operator lifecycle episode uses only the shipped import,
+approve, activate, feedback, and purge surface and verifies store/index invariants after each
+step.
+
+The offline successful-step distiller, nightly live-model library-level A/B, and evidence-derived
+retrieval labels are deferred follow-ups (`mini-agent-4qtz`, `mini-agent-aa5i`, and
+`mini-agent-n5j6`). They are not part of the delivered loop and must not be inferred from the
+scripts or benchmark records.
 
 Prior research artifacts superseded by this index:
 
@@ -79,11 +95,16 @@ amendment changes the Phase 6 canonical checklist.
 | Bounded model-issued `skills_search` metadata query and tool-boundary refreeze | Phase 3 | mini-agent-a8a0 |
 | Operator surface (import/approve/reject/stats) and seed library | Phase 4 | mini-agent-p0h1, mini-agent-vvud, mini-agent-i78t |
 | Fault-only quarantine, canary ordering, WAL/immediate transactions, corrupt-row skipping | Phase 5 | mini-agent-lugc, mini-agent-840z, mini-agent-pwf2, mini-agent-jj8b |
+| Task-outcome evidence, utility statistics, paired task fixtures, and operator Skill Gym | Phase 5 + evaluation tooling | mini-agent-lkff, mini-agent-t8p4, mini-agent-32hz, mini-agent-iwxi, mini-agent-b0b8, mini-agent-mna1, mini-agent-mtu2 |
+| Round-2 process, hook, permission, lineage, and lifecycle hardening | Phase 2/4/5/6 + subprocess trust | mini-agent-qchz, mini-agent-agqn, mini-agent-r4sf, mini-agent-knzj, mini-agent-a97k, mini-agent-eqa8 |
 
 **Accepted retrieval amendment.** The current user prompt remains the primary initial query and
 generated JavaScript is never an implicit retrieval query. A bounded, explicit model-issued
 `skills_search(query)` may return metadata only and refreeze the bundle at its tool-result boundary;
 it never injects source or grants authority.
+
+This retrieval amendment is delivered. The model-issued query is explicit, bounded, metadata-only,
+and cannot install, approve, activate, or widen a skill.
 
 ## Feature relationships
 

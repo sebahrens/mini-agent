@@ -50,6 +50,53 @@ pub struct InvocationEvidence {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum TaskOutcomeSource {
+    VerifyCommand(String),
+    Oracle(String),
+    NoVerifyCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutcomeEvidence {
+    pub turn_id: String,
+    /// Parent-selected candidates. The ordered telemetry worker persists only
+    /// entries with a durable `invoked` event for this turn.
+    pub skill_ids: Vec<String>,
+    pub verify_passed: bool,
+    pub attempt: u32,
+    pub source: TaskOutcomeSource,
+    pub production: bool,
+    pub created_at: i64,
+}
+
+impl TaskOutcomeEvidence {
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.turn_id.is_empty()
+            || self.turn_id.len() > 128
+            || self.skill_ids.len() > 64
+            || self.skill_ids.iter().collect::<BTreeSet<_>>().len() != self.skill_ids.len()
+            || self.attempt == 0
+            || self.created_at < 0
+            || self.skill_ids.iter().any(|id| {
+                id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || matches!(
+                &self.source,
+                TaskOutcomeSource::VerifyCommand(id) | TaskOutcomeSource::Oracle(id)
+                    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_whitespace)
+            )
+        {
+            return Err(PolicyError::InvalidTaskOutcome);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromotionPolicy {
     pub version: String,
@@ -60,6 +107,10 @@ pub struct PromotionPolicy {
     pub absolute_p95_latency_us: u64,
     pub window_start: i64,
     pub window_end: i64,
+    /// When set, promotion requires this many distinct successful verified
+    /// task outcomes and cannot fall back to invocation-count sufficiency.
+    #[serde(default)]
+    pub min_verified_task_passes: Option<usize>,
 }
 
 impl PromotionPolicy {
@@ -73,6 +124,7 @@ impl PromotionPolicy {
             absolute_p95_latency_us: 5_000_000,
             window_start,
             window_end,
+            min_verified_task_passes: None,
         }
     }
 
@@ -85,6 +137,7 @@ impl PromotionPolicy {
             || self.max_candidate_latency_ratio < 1.0
             || self.absolute_p95_latency_us == 0
             || self.window_start > self.window_end
+            || self.min_verified_task_passes == Some(0)
         {
             return Err(PolicyError::InvalidConfiguration);
         }
@@ -132,6 +185,8 @@ pub struct PromotionEvaluation {
     pub predecessor_id: Option<String>,
     pub candidate: QualifiedStatistics,
     pub predecessor: Option<QualifiedStatistics>,
+    pub verified_task_passes: usize,
+    pub verified_task_failures: usize,
     pub decision: PromotionDecision,
     pub reasons: Vec<String>,
     pub canonical_inputs: String,
@@ -143,6 +198,8 @@ pub enum PolicyError {
     InvalidConfiguration,
     #[error("evidence contains an invocation ID conflict")]
     InvocationConflict,
+    #[error("invalid task-outcome evidence")]
+    InvalidTaskOutcome,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -153,7 +210,26 @@ pub fn evaluate_promotion(
     candidate_events: &[InvocationEvidence],
     predecessor_events: &[InvocationEvidence],
 ) -> Result<PromotionEvaluation, PolicyError> {
+    evaluate_promotion_with_task_outcomes(
+        policy,
+        context,
+        candidate_events,
+        predecessor_events,
+        &[],
+    )
+}
+
+pub fn evaluate_promotion_with_task_outcomes(
+    policy: &PromotionPolicy,
+    context: &PromotionContext,
+    candidate_events: &[InvocationEvidence],
+    predecessor_events: &[InvocationEvidence],
+    task_outcomes: &[TaskOutcomeEvidence],
+) -> Result<PromotionEvaluation, PolicyError> {
     policy.validate()?;
+    for outcome in task_outcomes {
+        outcome.validate()?;
+    }
     let candidate = qualify(policy, &context.candidate_id, candidate_events)?;
     let predecessor = context
         .predecessor_id
@@ -164,6 +240,31 @@ pub fn evaluate_promotion(
     let mut reasons = Vec::new();
     let mut decision = PromotionDecision::Promote;
     let lineage_root = context.predecessor_id.is_none();
+    let relevant_task_outcomes = task_outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome.production
+                && outcome
+                    .skill_ids
+                    .iter()
+                    .any(|id| id == &context.candidate_id)
+                && outcome.created_at >= policy.window_start
+                && outcome.created_at <= policy.window_end
+                && !matches!(outcome.source, TaskOutcomeSource::NoVerifyCommand)
+        })
+        .collect::<Vec<_>>();
+    let verified_task_passes = relevant_task_outcomes
+        .iter()
+        .filter(|outcome| outcome.verify_passed)
+        .map(|outcome| outcome.turn_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let verified_task_failures = relevant_task_outcomes
+        .iter()
+        .filter(|outcome| !outcome.verify_passed)
+        .map(|outcome| outcome.turn_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
     if lineage_root {
         decision = PromotionDecision::HumanReview;
         reasons.push("lineage_root_requires_second_human_activation".to_string());
@@ -188,7 +289,12 @@ pub fn evaluate_promotion(
     // prompt-time canary evidence. Its separate two-human gate revalidates the
     // artifact and evaluation report without fabricating replacement metrics.
     if !lineage_root {
-        if candidate.distinct_turns < policy.min_distinct_turns {
+        if let Some(required) = policy.min_verified_task_passes {
+            if verified_task_passes < required {
+                decision = PromotionDecision::Hold;
+                reasons.push("insufficient_verified_task_passes".to_string());
+            }
+        } else if candidate.distinct_turns < policy.min_distinct_turns {
             decision = PromotionDecision::Hold;
             reasons.push("insufficient_distinct_turns".to_string());
         }
@@ -225,13 +331,22 @@ pub fn evaluate_promotion(
         }
     }
 
-    let canonical_inputs = canonical_inputs(policy, context, &candidate, predecessor.as_ref())?;
+    let canonical_inputs = canonical_inputs(
+        policy,
+        context,
+        &candidate,
+        predecessor.as_ref(),
+        verified_task_passes,
+        verified_task_failures,
+    )?;
     Ok(PromotionEvaluation {
         policy_version: policy.version.clone(),
         candidate_id: context.candidate_id.clone(),
         predecessor_id: context.predecessor_id.clone(),
         candidate,
         predecessor,
+        verified_task_passes,
+        verified_task_failures,
         decision,
         reasons,
         canonical_inputs,
@@ -329,6 +444,8 @@ fn canonical_inputs(
     context: &PromotionContext,
     candidate: &QualifiedStatistics,
     predecessor: Option<&QualifiedStatistics>,
+    verified_task_passes: usize,
+    verified_task_failures: usize,
 ) -> Result<String, PolicyError> {
     #[derive(Serialize)]
     struct Inputs<'a> {
@@ -337,6 +454,8 @@ fn canonical_inputs(
         context: &'a PromotionContext,
         candidate: &'a QualifiedStatistics,
         predecessor: Option<&'a QualifiedStatistics>,
+        verified_task_passes: usize,
+        verified_task_failures: usize,
         gates: BTreeSet<&'static str>,
     }
     let gates = BTreeSet::from([
@@ -354,6 +473,8 @@ fn canonical_inputs(
         context,
         candidate,
         predecessor,
+        verified_task_passes,
+        verified_task_failures,
         gates,
     })?)
 }

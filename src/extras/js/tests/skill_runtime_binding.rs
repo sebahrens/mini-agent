@@ -473,6 +473,7 @@ async fn production_runner_emits_parent_bound_invocation_evidence() {
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     let tool = make_test_tool()
         .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
+        .with_skill_production(true)
         .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
 
     assert_eq!(

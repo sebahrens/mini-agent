@@ -193,6 +193,33 @@ fn propose_skill_host_budget_is_per_session_and_exact() {
 }
 
 #[test]
+fn malformed_proposals_do_not_consume_the_session_budget() {
+    let (root, paths) = paths();
+    let store = SkillStore::open_at(&paths).expect("store");
+    let worker =
+        ProposalQueue::start_store_worker(store, 2, Duration::from_secs(1)).expect("worker");
+    let service =
+        ProposalEffectService::new(ProposalHost::new(worker.sender(), AttemptBudget::new(1)));
+    let mut malformed = proposal("");
+    malformed.tests.clear();
+
+    for _ in 0..3 {
+        assert!(matches!(
+            service.execute(malformed.clone()),
+            Err(ProposalError::InvalidField { .. })
+        ));
+    }
+    assert!(service.execute(proposal("")).is_ok());
+    assert!(matches!(
+        service.execute(proposal("-second")),
+        Err(ProposalError::BudgetExhausted)
+    ));
+    drop(service);
+    drop(worker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn propose_skill_backpressure_and_timeout_are_bounded() {
     let (sender, _receiver) = ProposalQueue::bounded(1, Duration::from_millis(5));
     let artifact = proposal("").validate_and_canonicalize().unwrap();

@@ -274,7 +274,7 @@ Example (YAML):
 
 ```yaml
 provider: openrouter
-model: deepseek/deepseek-v4-flash
+model: deepseek/deepseek-v4-pro
 max_tokens: 16384
 temperature: 0.7
 context_window: 128000
@@ -329,7 +329,7 @@ The same config in TOML:
 
 ```toml
 provider = "openrouter"
-model = "deepseek-v4-flash"
+model = "deepseek/deepseek-v4-pro"
 max_tokens = 16384
 temperature = 0.7
 context_window = 128000
@@ -403,7 +403,7 @@ Accepted top-level keys:
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
-| `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-flash`.                                                                                                                          |
+| `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-pro`.                                                                                                                            |
 | `max_tokens`              | integer | Maximum tokens for a single model response (the per-request output cap sent to the provider). Default: `16384`. This never limits a whole turn; see `turn_token_budget`.     |
 | `turn_token_budget`       | integer | Optional cumulative fail-closed cap for one agentic turn: the sum of input+output tokens across every completion call the turn makes. Unset by default (no cap; turns are still bounded by `max_agent_turns`). Deliberately separate from `max_tokens` — a multi-tool-call turn legitimately accumulates many responses' worth of prompt tokens. |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `200`.                                                                                                                           |
@@ -419,7 +419,7 @@ Accepted top-level keys:
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. When unset globally, falls back to the active quick model's `reserve_tokens` field, then to a default that scales with the context window: `window/10`, never below `16384` (so one maximal response cannot overshoot the window) and never above half the window. Examples: 128k window → 16384, 1M window → 100000. |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. When unset, scales with the context window: `window/20` clamped to `[10000, 50000]` and at most a quarter of the window. Examples: 128k window → 10000, 1M window → 50000.                          |
 | `keep_recent_tool_results` | integer | Number of newest historical tool results kept verbatim when a turn or restarted turn assembles its model history. Older results are replaced with a short recovery notice while their calls, durable session records, and spill files remain intact. Default: `8`; set a larger value to retain more output. |
-| `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. Default: `1048576` (1 MiB). |
+| `max_text_file_size`      | integer | Maximum write size and maximum raw text returned by one `read` call. A larger file can be read only with an explicit `offset` or `limit`, and the selected line window must fit this byte cap. The resolved config default is `1048576` (1 MiB); subagent construction has a defensive `10485760` (10 MiB) fallback only when handed an unresolved config with this field absent. |
 | `max_read_lines`          | integer | Default maximum lines returned by one `read` call. Default: `2000`. |
 | `max_bash_output_lines`   | integer | Line cap for shell tool output returned to the model, applied to successful output and to the partial output embedded in timeout/output-limit errors. Longer output keeps its head and tail around an `[... N lines omitted ...]` marker. Default: `2000`. Set `0` to disable line truncation (the 1 MiB per-stream / 1.5 MiB combined byte limits still apply). |
 | `max_grep_results`        | integer | Maximum grep matches returned to the main agent. Default: `150`. |
@@ -437,7 +437,7 @@ Accepted top-level keys:
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
-| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` is optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
+| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
 | `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
 | `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
@@ -447,13 +447,14 @@ Accepted top-level keys:
 | `permission-deny`         | object  | Map of tool names to lists of glob patterns to deny. Works alongside the `permission` field. See below.     |
 | `restrictive`             | boolean | Select restrictive permission mode (ask for every operation). Overridden by `accept_all`/`yolo` if those are also true.                                                     |
 | `accept_all`              | boolean | Select standard permission mode with auto-allow within CWD (equivalent to `default_permission_mode = "standard"`). Overridden by `yolo` if true.                            |
-| `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
+| `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive shell commands).                                                                                                           |
 | `permission-modes`        | array   | List of mode names that apply configured `allow` and `ask` rules. Default: `["guarded", "standard", "yolo"]`. Configured `deny` and `external_directory` deny rules are security baselines and remain active in every mode. |
 | `sandbox`                 | boolean | Enforce the configured **general subprocess** sandbox for Bash and parent-brokered JS `spawn`. Default: `true`. Precedence is `--no-sandbox` (disable) > `--sandbox` (explicitly require) > this config value > the default. On non-Windows hosts, an unavailable backend inherited only from the default warns and runs unsandboxed. While sandboxing remains enabled, `--sandbox`, `sandbox = true`, or selecting a backend through the CLI/config fails closed if that backend is unavailable. This setting never disables the mandatory broker-only JS worker containment. |
 | `sandbox-backend`         | string  | General-process backend. Defaults to `bwrap` on Linux, the system-provided `seatbelt` at `/usr/bin/sandbox-exec` on supported macOS hosts, and `appcontainer` on Windows (`restricted-token` is a compatibility alias). Setting this key or passing `--sandbox-backend` makes an enabled sandbox request explicit and fail-closed. Windows availability requires the cached native AppContainer production preflight. Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by interrupted earlier preflights. The new run phase is limited to five seconds, whole-tree reaping receives up to five seconds, and profile/ACL recovery then receives a fresh five-second ceiling. Failure remains closed unless `--no-sandbox` explicitly opts out. The backend adds package-SID workspace read/write plus read/execute grants for the application cache, exact selected executable, and explicitly configured AppContainer roots; ambient `PATH`, home, Cargo, and Rustup roots are never inferred. As a regular AppContainer it retains standard Windows system resources and any pre-existing object accessible to `ALL APPLICATION PACKAGES`; such an existing ACL can include write authority, so universal filesystem isolation is not claimed. It uses private profile storage, grants no network capability, and retains the private desktop plus bounded creation-time Job. Hosted observations describe the reference runner, not every host's ACL visibility; broader registry/device/session isolation is not claimed. `zerobox` is explicit and backend-defined. None of these profiles launches or describes the broker-only JS worker. |
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
+
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
 | `js-file-base-dir`        | path    | Base used to resolve relative JS file roots. Relative values resolve from the captured startup workspace; absent uses that workspace directly. |
 | `js-read-roots`           | array   | Explicit read roots for brokered JS file effects, resolved from `js-file-base-dir`. |
@@ -469,9 +470,9 @@ Accepted top-level keys:
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees; requires `git-worktree`. |
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
-| `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` env var, then `editor`, then `nano`).                                                                                        |
+| `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. |
-| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
+| `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
 | `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, zerostack automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, recommended MCPs are auto-configured (see below).                                                   |
 | `enable-exa-mcp`          | boolean | Auto-configure the Exa Web Search MCP server. Default: `true`.                                                                                                         |
@@ -495,6 +496,18 @@ Accepted top-level keys:
 | `lsp`                     | object  | Language-server configuration; requires `lsp`. See LSP below. |
 | `advisor`                 | object  | Advisor configuration; requires `advisor`. See Advisor below. |
 | `colors`                  | object  | Background color overrides for the TUI. See the colors section below.                                                                                                       |
+
+The macOS general-command Seatbelt profile permits reads from ordinary
+host-readable paths needed by developer tools, but explicitly denies the
+resolved mini-agent configuration and credential directories. It therefore
+protects mini-agent's own stored API keys and MCP OAuth tokens, but does not
+claim universal filesystem confidentiality. Linux and macOS expose only the dedicated
+`<cache_dir>/sandbox-runtime` subtree to general sandboxed commands.
+
+Skill Gym has no `gym.toml` key or production configuration namespace. Its scripts use command-line
+arguments and task JSON, set `MINI_AGENT_GYM=1`, and override `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`,
+`ZS_STATE_DIR`, and `ZS_CACHE_DIR`. See [GYM.md](GYM.md). Task-outcome production status is not a
+user-widenable setting.
 
 JavaScript worker containment is a runtime prerequisite, not a user-selected sandbox mode.
 `--print-config` reports its backend, assurance, and availability separately from the general
@@ -1117,7 +1130,7 @@ permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, 
 `find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
 `git/show`, `git/stage`, `git/unstage`, `git/commit`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
-`{server_name}:{tool_name}` as the matched input. Use `"*"` for the default action,
+`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the default action,
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
@@ -1145,8 +1158,9 @@ only when the entry is byte-for-byte equal to the complete script; glob and
 regex expansion never widens a Bash allow. For example, an allow entry
 `echo *` authorizes the literal script `echo *`, but not `echo hello`, pipelines,
 redirects, substitutions, command lists, subshells, or background jobs that
-start with `echo`. Bash `ask` and `deny` entries remain pattern-based so broad
-safeguards still work. An unmatched Bash script asks in `guarded` and
+start with `echo`. Bash `ask` and `deny` entries remain pattern-based as
+best-effort workflow guardrails; shell syntax can reshape equivalent commands,
+so these patterns are not a containment boundary. An unmatched Bash script asks in `guarded` and
 `standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
 
 `planwrite` is read-only except for the narrow built-in plan-file exception:

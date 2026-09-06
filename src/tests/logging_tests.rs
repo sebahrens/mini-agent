@@ -65,7 +65,9 @@ fn test_build_stderr_filter_log_level() {
 #[test]
 fn test_build_stderr_filter_invalid_log_level_does_not_panic() {
     let cli = parse_cli(&["--log-level", "invalid"]);
-    let _filter = logging::build_stderr_filter(&cli);
+    let filter = logging::build_stderr_filter(&cli).to_string();
+    assert!(filter.contains("warn"));
+    assert!(!filter.contains("invalid"));
 }
 
 #[test]

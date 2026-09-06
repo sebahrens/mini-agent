@@ -216,7 +216,7 @@ fn format_task_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Stri
 /// Suggests a permission allow pattern for a tool+input combination.
 pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
     match tool {
-        "bash" => input.to_string(),
+        "bash" | "shell" => input.to_string(),
         "lsp_diagnostics" => {
             let expanded = crate::fs::expand_tilde(input);
             let path = std::path::Path::new(&expanded);
@@ -240,7 +240,11 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
             let first = input.split_whitespace().next().unwrap_or("*");
             format!("{}*", first)
         }
-        _ => "*".to_string(),
+        // Permission inputs for non-path tools are already canonical keys
+        // (for example `mcp_tool:{server}:{tool}` or `git:commit`).  Grant
+        // exactly that operation; a generated wildcard here would silently
+        // widen one approval to every operation in the tool family.
+        _ => input.to_string(),
     }
 }
 
@@ -264,6 +268,17 @@ mod tests {
         let script = "echo  hello\nprintf 'done\\n'";
 
         assert_eq!(suggest_pattern("bash", script), script);
+        assert_eq!(suggest_pattern("shell", script), script);
+    }
+
+    #[test]
+    fn non_path_suggestions_are_exact_permission_keys() {
+        assert_eq!(
+            suggest_pattern("mcp_tool", "mcp_tool:context7:search_docs"),
+            "mcp_tool:context7:search_docs"
+        );
+        assert_eq!(suggest_pattern("git", "git:commit"), "git:commit");
+        assert_eq!(suggest_pattern("task", "task:review"), "task:review");
     }
 
     #[test]

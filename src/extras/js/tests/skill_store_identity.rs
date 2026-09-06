@@ -101,8 +101,13 @@ fn skill_store_duplicate_policy_reads_metadata_without_artifact_bodies() {
     )
     .unwrap();
 
-    assert!(store.has_policy_duplicate(&duplicate).unwrap());
-    assert!(!store.has_policy_duplicate(&distinct).unwrap());
+    assert!(store.has_policy_duplicate(&duplicate, None).unwrap());
+    assert!(
+        !store
+            .has_policy_duplicate(&duplicate, Some(&existing.id))
+            .unwrap()
+    );
+    assert!(!store.has_policy_duplicate(&distinct, None).unwrap());
 }
 
 #[test]

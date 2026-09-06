@@ -120,6 +120,8 @@ fn verify_artifact(
         kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
             expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
             fake_files: Default::default(),
+            fake_spawns: Default::default(),
+            fake_fetches: Default::default(),
         },
     }));
     WireFrame::invocation(
@@ -1998,7 +2000,12 @@ async fn worker_runtime_nested_fetch_getter_serializes_monotonic_effects() {
             enumerable: true,
             get() { read_file("nested.txt"); return "GET"; }
         });
-        JSON.stringify(fetch("https://example.com", options));
+        const response = fetch("https://example.com", options);
+        JSON.stringify({
+            status: typeof response.status,
+            text: typeof response.text,
+            json: typeof response.json
+        });
         "#
         .into(),
     )
@@ -2011,7 +2018,7 @@ async fn worker_runtime_nested_fetch_getter_serializes_monotonic_effects() {
 
     assert_eq!(
         result.outcome,
-        StepOutcome::Value(r#"{"status":200,"text":"done"}"#.into())
+        StepOutcome::Value(r#"{"status":"number","text":"string","json":"undefined"}"#.into())
     );
     assert_eq!(*observed.lock().unwrap(), vec![0, 1]);
     supervisor.shutdown_for_test().await.unwrap();
@@ -2577,6 +2584,8 @@ fn held_out_verification() -> VerifyArtifact {
             kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
                 expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
                 fake_files: Default::default(),
+                fake_spawns: Default::default(),
+                fake_fetches: Default::default(),
             },
         }],
     }
@@ -2869,6 +2878,8 @@ fn verification_with_source(source: &str) -> VerifyArtifact {
             kind: crate::extras::js::protocol::VerificationCaseKind::HeldOut {
                 expected: crate::extras::js::protocol::VerificationExpectedValue::Boolean(true),
                 fake_files: Default::default(),
+                fake_spawns: Default::default(),
+                fake_fetches: Default::default(),
             },
         }],
     }

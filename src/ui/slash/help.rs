@@ -324,6 +324,27 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         "  Ctrl+V                 paste Unicode clipboard text",
     );
     write_result(ctx.renderer, "  Ctrl+R                 toggle reasoning");
+    write_result(
+        ctx.renderer,
+        "  Ctrl+G                 edit input in $EDITOR",
+    );
+    write_result(ctx.renderer, "  Ctrl+H                 launch lazygit");
+    write_result(
+        ctx.renderer,
+        "  Ctrl+W/U/K             delete word/before/after cursor",
+    );
+    write_result(
+        ctx.renderer,
+        "  Ctrl+A/E/B/F           move line edge/character",
+    );
+    write_result(
+        ctx.renderer,
+        "  Alt+B/F/D              move word/delete next word",
+    );
+    write_result(
+        ctx.renderer,
+        "  Ctrl+Y / Alt+Y         yank/rotate kill ring",
+    );
     write_result(ctx.renderer, "  Ctrl+C / Ctrl+D        interrupt/quit");
     write_result(ctx.renderer, "  mouse scroll           scroll chat");
 }

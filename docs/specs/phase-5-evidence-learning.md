@@ -1,7 +1,7 @@
 # Phase 5 — Evidence-Based Self-Learning
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.3.0
+- **Specification version**: 1.4.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -514,6 +514,26 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    rebuild on every turn, and repeated rebuild failures back off.
 5. **Canary embeddings** (mini-agent-c8q6, delivered). Rebuilds backfill canary rows so an embedding model
    change cannot silently un-route them.
+
+## 12b. Delivered task-outcome and lifecycle hardening (2026-09-06)
+
+1. **Task outcomes.** Schema version 11 records one bounded outcome for a completed turn with the
+   exact invoked learned-skill IDs, pass/fail, attempt, timestamp, and a closed source:
+   `verify_command` plus its SHA-256 identity, an evaluator `oracle` ID, or explicit
+   `no_verify_command`. Production is derived by the session constructor; setting
+   `MINI_AGENT_GYM=1` can only downgrade it. Gym and deterministic-evaluation evidence is therefore
+   retained for analysis but cannot qualify for production promotion.
+2. **Promotion gate.** When a policy version sets `min_verified_task_passes`, promotion counts
+   distinct production turns in the window where the candidate was actually invoked and a real
+   verifier/oracle passed. That policy cannot fall through to the historical 25-invocation path.
+   Verification failure is a signal for review and statistics, never an automatic quarantine
+   trigger; behavioral quarantine remains fault-only.
+3. **Operator utility.** `--learned-skill-stats` reports `tasks_with`, `passed_with`, and
+   `pass_rate_without`. The baseline is matched by verifier-command hash or oracle ID and includes
+   only outcomes where the compared skill was absent, so unlike arms are not silently combined.
+4. **Lifecycle safety.** Rollback clears the reactivated predecessor's stale
+   `superseded_by_id`; replacement capability scopes must be a true subset of predecessor scopes;
+   and long admission evaluation renews its durable lease before executing the contained suite.
 
 ## 13. Acceptance criteria
 

@@ -4,6 +4,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::store::SkillStore;
 
+const MAX_POLICY_ATTEMPTS: i64 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionLease {
     pub decision_id: String,
@@ -11,6 +13,12 @@ pub struct DecisionLease {
     pub policy_version: String,
     pub attempts: u32,
     pub lease_expires_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome {
+    Scheduled(i64),
+    DeadLettered,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,7 +158,7 @@ impl<'a> PolicyScheduler<'a> {
         base_backoff_seconds: i64,
         max_backoff_seconds: i64,
         error_code: &str,
-    ) -> Result<i64, SchedulerError> {
+    ) -> Result<RetryOutcome, SchedulerError> {
         if decision_id.is_empty()
             || owner.is_empty()
             || error_code.is_empty()
@@ -172,6 +180,21 @@ impl<'a> PolicyScheduler<'a> {
             )
             .optional()?
             .ok_or(SchedulerError::StaleLease)?;
+        if attempts >= MAX_POLICY_ATTEMPTS {
+            let changed = self.store.connection_mut().execute(
+                "UPDATE skill_decision_jobs
+                 SET completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                     last_error_code = ?
+                 WHERE decision_id = ? AND lease_owner = ?
+                   AND completed_at IS NULL AND lease_expires_at > ?",
+                params![now, error_code, decision_id, owner, now],
+            )?;
+            return if changed == 1 {
+                Ok(RetryOutcome::DeadLettered)
+            } else {
+                Err(SchedulerError::StaleLease)
+            };
+        }
         let exponent = u32::try_from(attempts.saturating_sub(1).min(30))
             .map_err(|_| SchedulerError::InvalidLease)?;
         let delay = base_backoff_seconds
@@ -187,7 +210,7 @@ impl<'a> PolicyScheduler<'a> {
             params![due_at, error_code, decision_id, owner, now],
         )?;
         if changed == 1 {
-            Ok(due_at)
+            Ok(RetryOutcome::Scheduled(due_at))
         } else {
             Err(SchedulerError::StaleLease)
         }

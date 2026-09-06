@@ -1317,7 +1317,7 @@ mod tests {
             PermissionChecker::new(
                 &PermissionConfigs::from(config),
                 SecurityMode::Restrictive,
-                Some(std::env::current_dir().unwrap()),
+                Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
                 Some(vec!["restrictive".to_string()]),
             )
             .expect("valid permission test configuration"),

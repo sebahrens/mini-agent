@@ -13,9 +13,7 @@ fn test_crc32_hello() {
 
 #[test]
 fn test_crc32_deterministic() {
-    let a = crc32(b"same string");
-    let b = crc32(b"same string");
-    assert_eq!(a, b);
+    assert_eq!(crc32(b"same string"), 0xE78408EA);
 }
 
 #[test]

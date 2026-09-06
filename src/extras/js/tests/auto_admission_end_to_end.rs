@@ -1,4 +1,5 @@
 use crate::extras::js::host::AllowConfig;
+use crate::extras::js::skills::SkillExport;
 use crate::extras::js::skills::admission::{
     AdmissionEvaluator, AdmissionWorker, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision,
     ReviewOutcome, ReviewPacket,
@@ -63,13 +64,18 @@ fn import_suite(store: &mut SkillStore) {
     HeldOutSuiteDraft {
         selector: HeldOutSelector {
             tags: vec!["normalize".to_string()],
-            exports: vec!["normalize".to_string()],
+            exports: vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: unknown): string".to_string(),
+            }],
             capability_tier: Some("pure".to_string()),
         },
         cases: vec![HeldOutCase {
             expression: "normalize('\\tvalue\\n')".to_string(),
             expected: ExpectedJsValue::String("value".to_string()),
             fake_files: BTreeMap::new(),
+            fake_spawns: vec![],
+            fake_fetches: vec![],
             transcript: TranscriptExpectation::default(),
         }],
     }

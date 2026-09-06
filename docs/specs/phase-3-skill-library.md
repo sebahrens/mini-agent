@@ -507,8 +507,8 @@ Every named bead is closed with regression tests; each item is part of the deliv
 
 1. **Backend-aware dense retrieval** (mini-agent-bfsg, delivered). The `Deterministic` embedding
    backend carries no semantic meaning. When it is the active backend, dense retrieval is disabled
-   (lexical channel only) for both learned-JS and Agent-Skill indexes, and startup reports that
-   semantic retrieval is unavailable. Score floors are per backend; a floor that admits random
+   (lexical channel only) for both learned-JS and Agent-Skill indexes, and each skill-runtime open
+   adds a diagnostic that semantic retrieval is unavailable. Score floors are per backend; a floor that admits random
    vectors is a defect.
 2. **Lexical query semantics** (mini-agent-io7h, delivered). The FTS5 query is an OR over stop-worded,
    IDF-weighted prompt terms ranked by BM25 (or NEAR groups), never an AND over every term. The

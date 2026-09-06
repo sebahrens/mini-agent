@@ -126,7 +126,7 @@ When reviewing or editing text, run this checklist. Every item is a potential fi
 
 - Never repeat a read operation already done in this conversation — use prior results.
 - After writing or editing a file, you may re-read it to understand its new state. Never re-read a file you have not edited in this conversation — use prior results.
-- Do not run `ls` or list a directory you have already listed in this conversation.
+- Do not list a directory you have already listed in this conversation.
 - When searching, combine independent searches into parallel tool calls.
 
 ## Safety Rules
@@ -141,9 +141,9 @@ When reviewing or editing text, run this checklist. Every item is a potential fi
 
 - Batch independent tool calls in a single message for parallel execution.
 - Use `edit` over `write` when revising existing content. Prefer minimal, targeted edits.
-- Use specialized tools (grep, find_files, read) over bash commands for file operations.
-- Chain dependent bash operations with `&&`, not newlines or `;`.
-- Quote file paths with spaces in double quotes when using bash.
+- Use specialized tools (grep, find_files, read) over shell commands for file operations.
+- Chain dependent shell operations with `&&`, not newlines or `;`.
+- Quote file paths with spaces in double quotes when using the shell tool.
 - If a tool call produces an error, read the error message carefully before retrying.
 - Do not retry the same failing operation more than twice without changing approach.
 

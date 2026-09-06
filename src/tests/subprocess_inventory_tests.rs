@@ -1130,6 +1130,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/extras/mcp/client.rs", ".spawn()", 1, "TC-MCP-STDIO"),
     (
         "src/extras/mcp/client.rs",
+        "assert_eq!(response.status(), reqwest::StatusCode::FOUND);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/client.rs",
         "mut stderr: tokio::process::ChildStderr,",
         1,
         "TC-MCP-STDIO",
@@ -1151,6 +1157,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "let mut cmd = Command::new(&self.shell);",
         1,
         "TC-MODEL-ACTION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = std::process::Command::new(bwrap);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = std::process::Command::new(seatbelt);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-INTERNAL-VERIFICATION",
     ),
     (
         "src/sandbox.rs",
@@ -2762,6 +2786,13 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         )],
     ),
     (
+        "src/extras/mcp/client.rs",
+        &[(
+            "6b211d8f8be30409f924287de2e683de0270d27a917d5308932c7e693216b759",
+            1,
+        )],
+    ),
+    (
         "src/sandbox.rs",
         &[
             (
@@ -3038,6 +3069,30 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/extras/mcp/client.rs",
+        "assert_eq!(response.status(), reqwest::StatusCode::FOUND);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = std::process::Command::new(bwrap);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut command = std::process::Command::new(seatbelt);",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
+    (
+        "src/sandbox.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-INTERNAL-VERIFICATION",
+    ),
     (
         "src/sandbox.rs",
         "std::mem::drop(runtime.spawn(async move {",
@@ -4104,6 +4159,22 @@ fn bypass(command: &mut std::process::Command) -> std::io::Result<()> {
 #[test]
 fn current_subprocess_inventory_accepts_exact_broker_and_rejects_cross_family_classes() {
     validate_current_class_assignments().expect("current subprocess classes must be allowed");
+
+    let mut relabeled = checked_inventory();
+    let site = relabeled
+        .iter()
+        .find(|((path, _, _), class)| {
+            path == "src/agent/tools/bash.rs" && **class != "TC-LIFECYCLE-HELPER"
+        })
+        .map(|(site, _)| site.clone())
+        .expect("bash inventory contains a non-lifecycle site");
+    relabeled.insert(site, "TC-LIFECYCLE-HELPER");
+    let error = validate_class_assignments(&relabeled)
+        .expect_err("cross-family relabeling must be rejected");
+    assert!(
+        error.contains("cannot own"),
+        "unexpected rejection: {error}"
+    );
 }
 
 #[test]

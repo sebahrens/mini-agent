@@ -27,6 +27,10 @@ fn loop_test_data_dir() -> LoopTestDataDir {
     }
 }
 
+fn unique_plan_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("zerostack-{label}-{}", uuid::Uuid::new_v4()))
+}
+
 // --- LoopState tests ---
 
 #[test]
@@ -138,14 +142,14 @@ fn test_summary_truncation_constant() {
 
 #[test]
 fn test_plan_exists_on_nonexistent() {
-    let tmp = std::env::temp_dir().join("zerostack_test_plan_nonexistent.md");
+    let tmp = unique_plan_path("plan-nonexistent.md");
     let _ = std::fs::remove_file(&tmp);
     assert!(!plan::plan_exists(&tmp));
 }
 
 #[test]
 fn test_plan_exists_on_existing() {
-    let tmp = std::env::temp_dir().join("zerostack_test_plan_exists.md");
+    let tmp = unique_plan_path("plan-exists.md");
     std::fs::write(&tmp, "# Test plan").unwrap();
     assert!(plan::plan_exists(&tmp));
     let _ = std::fs::remove_file(&tmp);
@@ -153,7 +157,7 @@ fn test_plan_exists_on_existing() {
 
 #[test]
 fn test_read_plan_returns_content() {
-    let tmp = std::env::temp_dir().join("zerostack_test_read_plan.md");
+    let tmp = unique_plan_path("read-plan.md");
     std::fs::write(&tmp, "item 1\nitem 2").unwrap();
     let content = plan::read_plan(&tmp);
     assert_eq!(content, Some("item 1\nitem 2".to_string()));
@@ -162,14 +166,14 @@ fn test_read_plan_returns_content() {
 
 #[test]
 fn test_read_plan_nonexistent_returns_none() {
-    let tmp = std::env::temp_dir().join("zerostack_test_read_nonexistent.md");
+    let tmp = unique_plan_path("read-nonexistent.md");
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(plan::read_plan(&tmp), None);
 }
 
 #[test]
 fn test_delete_plan_removes_file() {
-    let tmp = std::env::temp_dir().join("zerostack_test_delete_plan.md");
+    let tmp = unique_plan_path("delete-plan.md");
     std::fs::write(&tmp, "data").unwrap();
     assert!(tmp.exists());
     plan::delete_plan(&tmp);
@@ -178,32 +182,20 @@ fn test_delete_plan_removes_file() {
 
 #[test]
 fn test_delete_plan_nonexistent_does_not_panic() {
-    let tmp = std::env::temp_dir().join("zerostack_test_delete_nonexistent.md");
+    let tmp = unique_plan_path("delete-nonexistent.md");
     let _ = std::fs::remove_file(&tmp);
     plan::delete_plan(&tmp); // should not panic
 }
 
 #[tokio::test]
 async fn test_handle_startup_no_plan_returns_false() {
-    let tmp = std::env::temp_dir().join("zerostack_test_startup_nonexistent.md");
+    let tmp = unique_plan_path("startup-nonexistent.md");
     let _ = std::fs::remove_file(&tmp);
     let result = plan::handle_startup(&tmp).await.unwrap();
     assert!(!result);
 }
 
 // --- transcript tests ---
-
-#[test]
-fn test_transcript_dir_contains_session_id() {
-    // We can't easily test the full path, but we can test it doesn't panic
-    // with a typical session id
-    let dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from(".zerostack"))
-        .join("zerostack")
-        .join("loops")
-        .join("test-session-123");
-    assert!(dir.ends_with("test-session-123"));
-}
 
 #[test]
 fn test_save_iteration_creates_file() {

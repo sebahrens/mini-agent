@@ -142,6 +142,14 @@ impl Tool for ShellTool {
 
         let output_len = output.stdout.len() + output.stderr.len();
         let mut result = render_streams(&output.stdout, &output.stderr);
+        if output.descendants_escaped {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(
+                "[status: descendants_escaped; direct command result preserved; containment cleanup incomplete]",
+            );
+        }
         if let Some(termination) = termination {
             if !result.is_empty() && !result.ends_with('\n') {
                 result.push('\n');
@@ -270,6 +278,11 @@ fn render_background_job(snapshot: BackgroundJobSnapshot, max_output_lines: Opti
     );
     if let Some(exit_code) = snapshot.exit_code {
         result.push_str(&format!("\nExit code: {exit_code}"));
+    }
+    if snapshot.descendants_escaped {
+        result.push_str(
+            "\nContainment warning: descendants escaped process-group cleanup; direct command result preserved",
+        );
     }
     let output = bound_output_lines(
         render_streams(&snapshot.stdout, &snapshot.stderr),

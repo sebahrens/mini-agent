@@ -30,6 +30,19 @@ class with line/column, read-only discovery and batched effects, distinct denial
 result channel) and to skill retrieval and operator commands. All named delivery beads are closed;
 the owning phase specs record the delivered contract and regression coverage.
 
+## Delivered 2026-09-06 hardening and evaluation
+
+The general model-command boundary now nulls inherited stdin, creates a fresh Unix session, closes
+Linux's temporary workspace-authority descriptor before model exec, and narrows writable cache
+access to `sandbox-runtime`. Backend readiness uses real bounded probes; macOS denies mini-agent's
+private configuration and credential roots. Hook executable resolution, permission scoping,
+replacement lineage/capability checks, rollback cleanup, renewable admission leases, and
+task-outcome attribution are covered by regression tests.
+
+The Skill Gym and the task-json harness are evaluation clients of the existing Phase 3--5
+services. They use isolated AppPaths and non-production evidence. They are not another execution
+boundary or an automatic promotion path.
+
 ## Execution and trust boundary
 
 ```text

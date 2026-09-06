@@ -21,14 +21,37 @@ use std::sync::Mutex;
 
 use crate::config::types::EditSystem;
 
+#[cfg(not(test))]
 static EDIT_SYSTEM: Mutex<EditSystem> = Mutex::new(EditSystem::Similarity);
 
+// Tests select both edit protocols and run in parallel. Keeping the test
+// selection thread-local prevents one libtest worker from changing another
+// worker's tool schema or call semantics.
+#[cfg(test)]
+thread_local! {
+    static TEST_EDIT_SYSTEM: std::cell::Cell<EditSystem> = const {
+        std::cell::Cell::new(EditSystem::Similarity)
+    };
+}
+
+#[cfg(not(test))]
 pub(crate) fn set_edit_system(es: EditSystem) {
     *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner()) = es;
 }
 
+#[cfg(test)]
+pub(crate) fn set_edit_system(es: EditSystem) {
+    TEST_EDIT_SYSTEM.set(es);
+}
+
+#[cfg(not(test))]
 pub(crate) fn edit_system() -> EditSystem {
     *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn edit_system() -> EditSystem {
+    TEST_EDIT_SYSTEM.get()
 }
 
 /// Resolve a tool path against the immutable workspace selected when the

@@ -9,6 +9,11 @@ fn session_dir() -> PathBuf {
     app_paths().sessions_dir()
 }
 
+pub(crate) fn session_path(session_id: &str) -> anyhow::Result<PathBuf> {
+    crate::paths::validate_portable_component(session_id)?;
+    Ok(session_dir().join(format!("{session_id}.json")))
+}
+
 pub fn tool_output_dir(session_id: &str) -> PathBuf {
     app_paths()
         .tool_outputs_dir()
@@ -81,8 +86,7 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     }
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
-    crate::paths::validate_portable_component(&session.id)?;
-    let path = dir.join(format!("{}.json", session.id));
+    let path = session_path(&session.id)?;
     let json = serde_json::to_string(session)?;
     let json_len = json.len();
     atomic_write(&path, &json)?;
@@ -289,6 +293,27 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
         sessions.len(),
     );
     Ok(sessions)
+}
+
+/// Return recent sessions whose persisted workspace is exactly the captured
+/// workspace. `--continue` uses this instead of silently importing history and
+/// approvals from whichever project happened to run most recently.
+pub fn find_recent_sessions_for_workspace(
+    limit: usize,
+    workspace: &Path,
+) -> anyhow::Result<Vec<Session>> {
+    let workspace = std::fs::canonicalize(workspace)?;
+    let mut matches = Vec::new();
+    for session in find_recent_sessions(usize::MAX)? {
+        let saved = Path::new(session.working_dir.as_str());
+        if std::fs::canonicalize(saved).ok().as_deref() == Some(workspace.as_path()) {
+            matches.push(session);
+            if matches.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(matches)
 }
 
 pub fn agents_path() -> PathBuf {

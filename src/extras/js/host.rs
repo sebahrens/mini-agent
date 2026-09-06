@@ -3239,22 +3239,54 @@ impl SpawnEffectService {
         if self.sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
             return Err(EffectServiceError::BackendFailure);
         }
+        #[cfg(feature = "hooks")]
+        let (program, arguments) = {
+            let gated = crate::extras::hooks::gate_brokered_pre_tool_use(
+                "js_spawn",
+                serde_json::json!({ "program": program, "arguments": arguments }),
+            )
+            .await
+            .map_err(|reason| {
+                tracing::warn!(reason, "hooks: js_spawn blocked by PreToolUse");
+                EffectServiceError::PermissionDenied
+            })?;
+            let program = gated
+                .get("program")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(EffectServiceError::InvalidTarget)?
+                .to_string();
+            let arguments = gated
+                .get("arguments")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(EffectServiceError::InvalidTarget)?
+                .iter()
+                .map(|argument| {
+                    argument
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or(EffectServiceError::InvalidTarget)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (program, arguments)
+        };
+        #[cfg(not(feature = "hooks"))]
+        let (program, arguments) = (program.to_string(), arguments.to_vec());
         if program.is_empty()
             || program.contains('\0')
             || arguments.iter().any(|arg| arg.contains('\0'))
-            || (Path::new(program).is_absolute() && !Path::new(program).is_file())
+            || (Path::new(&program).is_absolute() && !Path::new(&program).is_file())
         {
             return Err(EffectServiceError::InvalidTarget);
         }
-        let subject = canonical_spawn_permission_subject(program, arguments)?;
-        let policy_input = spawn_policy_input(program, arguments);
+        let subject = canonical_spawn_permission_subject(&program, &arguments)?;
+        let policy_input = spawn_policy_input(&program, &arguments);
         bridge
             .check_structured_async("bash", &subject, policy_input)
             .await
             .map_err(permission_service_error)?;
         PreparedSpawnEffect::capture_async(
-            program.to_string(),
-            arguments.to_vec(),
+            program,
+            arguments,
             self.sandbox.supports_immutable_executable_snapshot(),
             deadline,
             cancellation,
@@ -4086,6 +4118,29 @@ impl ParentEffectService for ParentHostEffectService {
             let EffectOperation::Spawn { program, arguments } = operation else {
                 return Ok(());
             };
+            #[cfg(feature = "hooks")]
+            {
+                let original = serde_json::json!({
+                    "program": program,
+                    "arguments": arguments,
+                });
+                let gated =
+                    crate::extras::hooks::gate_brokered_pre_tool_use("js_spawn", original.clone())
+                        .await
+                        .map_err(|reason| {
+                            tracing::warn!(
+                                reason,
+                                "hooks: brokered js_spawn blocked by PreToolUse"
+                            );
+                            HostEffectError::PermissionDenied
+                        })?;
+                if gated != original {
+                    tracing::warn!(
+                        "hooks: brokered js_spawn rewrite rejected because the grant is bound to the original target"
+                    );
+                    return Err(HostEffectError::InvalidTarget);
+                }
+            }
             let bridge = self.spawn.permission_bridge.for_host_call(cancellation);
             let subject = canonical_spawn_permission_subject(program, arguments)
                 .map_err(HostEffectError::from)?;
@@ -8743,6 +8798,11 @@ mod tests {
     #[cfg(all(feature = "sandbox", target_os = "macos"))]
     #[tokio::test]
     async fn spawn_uses_real_macos_seatbelt_write_boundary() {
+        let sandbox = Sandbox::new(true, "seatbelt");
+        if sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
+            eprintln!("skipping real macOS JS spawn test because Seatbelt preflight is denied");
+            return;
+        }
         let outside_marker = std::env::current_dir()
             .unwrap()
             .parent()
@@ -8760,11 +8820,8 @@ mod tests {
         let bridge = owner.bridge();
         let result = tokio::task::spawn_blocking(move || {
             let _owner = owner;
-            make_spawn(Sandbox::new(true, "seatbelt"), bridge, runtime)(
-                "bash".to_string(),
-                vec!["-c".to_string(), script],
-            )
-            .expect("Seatbelt-wrapped JS spawn should complete")
+            make_spawn(sandbox, bridge, runtime)("bash".to_string(), vec!["-c".to_string(), script])
+                .expect("Seatbelt-wrapped JS spawn should complete")
         })
         .await
         .expect("spawn Seatbelt integration test task panicked");

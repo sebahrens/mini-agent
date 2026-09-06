@@ -47,10 +47,19 @@ fn send_stop_writes_expected_message() {
 
 #[test]
 fn nonexistent_socket_does_not_panic() {
-    let ss = StatusSignals::new("/tmp/definitely_nonexistent_status_socket_12345".to_string());
+    let socket = std::env::temp_dir().join(format!(
+        "mini-agent-missing-status-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let ss = StatusSignals::new(socket.to_string_lossy().to_string());
     ss.send_start();
     ss.send_stop();
     ss.send_git_conflict();
+    assert!(
+        !socket.exists(),
+        "signals must not create a missing endpoint"
+    );
 }
 
 #[test]

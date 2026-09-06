@@ -55,6 +55,13 @@ pub mod turn;
 pub mod verify;
 pub mod visibility;
 
+/// Gym subprocesses are explicitly marked by the local training driver.
+/// The marker can only exclude evidence from production promotion decisions;
+/// it cannot manufacture qualifying evidence.
+pub(crate) fn evidence_is_production_session() -> bool {
+    std::env::var_os("MINI_AGENT_GYM").is_none()
+}
+
 /// Version of the canonical serialization scheme. Bumping this changes every identity.
 pub const IDENTITY_VERSION: u32 = 2;
 
@@ -90,6 +97,9 @@ pub const SKILL_REALM_HARDENING_JS: &str = r#"
       });
     }
   }
+  Object.defineProperty(Math, 'random', {
+    value: undefined, writable: false, configurable: false
+  });
   for (const value of objects) Object.freeze(value);
   Object.defineProperty(globalThis, 'eval', {
     value: undefined, writable: false, configurable: false
@@ -97,6 +107,14 @@ pub const SKILL_REALM_HARDENING_JS: &str = r#"
   Object.defineProperty(globalThis, 'Function', {
     value: undefined, writable: false, configurable: false
   });
+  Object.defineProperty(globalThis, 'Date', {
+    value: undefined, writable: false, configurable: false
+  });
+  if (typeof performance !== 'undefined') {
+    Object.defineProperty(globalThis, 'performance', {
+      value: undefined, writable: false, configurable: false
+    });
+  }
 })()
 "#;
 

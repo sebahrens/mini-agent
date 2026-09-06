@@ -731,6 +731,7 @@ mod tests {
             stdout: vec![],
             stderr: stderr.to_vec(),
             status,
+            descendants_escaped: false,
         }
     }
 

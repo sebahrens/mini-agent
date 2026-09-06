@@ -390,6 +390,26 @@ async fn run_hook_with_policy_and_limits(
             }
         };
         resolved.to_string_lossy().into_owned()
+    } else if program_path.components().count() == 1 {
+        let search_path = policy
+            .env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"));
+        match which::which_in(&program, search_path.as_deref(), &project_dir) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => {
+                return HookOutput {
+                    started: false,
+                    exit_code: None,
+                    stdout: Vec::new(),
+                    stderr: format!("failed to resolve hook executable {program:?}: {error}")
+                        .into_bytes(),
+                    status: HookStatus::PolicyDenied,
+                    diagnostics: policy.launch_denied_diagnostics(),
+                };
+            }
+        }
     } else {
         program
     };
@@ -691,6 +711,8 @@ pub(crate) async fn run_shell_condition(
     let (shell, flag) = if cfg!(windows) {
         ("powershell", "-Command")
     } else {
+        // The common hook launcher resolves this bare name to an absolute
+        // executable before constructing the sandbox command.
         ("sh", "-c")
     };
     let args = vec![flag.to_string(), condition.to_string()];

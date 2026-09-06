@@ -291,11 +291,10 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "js_supervisor_agent_rebuild_reuses_worker_and_stops_old_permission_receiver"
         )
         linux_step = body.split(
-            "name: Test (${{ matrix.features }}) on Linux with process-global worker isolation",
-            1,
+            "name: Test (${{ matrix.features }}) on Linux", 1
         )[1].split("- name:", 1)[0]
         self.assertIn("matrix.os != 'macos-latest'", linux_step)
-        self.assertIn("-- --test-threads=1", linux_step)
+        self.assertNotIn("--test-threads=1", linux_step)
         self.assertNotIn("--skip", linux_step)
 
         macos_step = body.split(
@@ -305,6 +304,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("matrix.os == 'macos-latest'", macos_step)
         self.assertIn("-- --test-threads=1", macos_step)
         self.assertIn(f"--skip {full_path}", macos_step)
+        self.assertIn(
+            "--skip tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            macos_step,
+        )
 
         isolated_step = body.split(
             "name: Test macOS agent-rebuild worker reuse in a fresh process", 1
@@ -315,6 +319,19 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("contains(matrix.features, 'skills')", isolated_step)
         self.assertIn(full_path, isolated_step)
         self.assertIn("-- --exact --test-threads=1", isolated_step)
+
+        task_step = body.split(
+            "name: Test macOS task-level skill eval in a fresh process", 1
+        )[1].split("- name:", 1)[0]
+        self.assertIn("matrix.os == 'macos-latest'", task_step)
+        self.assertIn("contains(matrix.features, 'skills')", task_step)
+        self.assertIn("contains(matrix.features, 'sandbox')", task_step)
+        self.assertIn(
+            "tests::harness_eval_tests::"
+            "task_json_library_axis_uses_real_store_and_records_oracles",
+            task_step,
+        )
+        self.assertIn("-- --exact --test-threads=1", task_step)
 
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")

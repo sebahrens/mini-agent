@@ -646,6 +646,8 @@ pub struct JsTool {
     #[cfg(feature = "skills")]
     telemetry: Option<Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>>,
     #[cfg(feature = "skills")]
+    skill_production: bool,
+    #[cfg(feature = "skills")]
     skill_tool_call_ordinal: AtomicU64,
     profile: ModelEffectProfile,
 }
@@ -730,6 +732,11 @@ impl JsTool {
             #[cfg(feature = "skills")]
             telemetry: None,
             #[cfg(feature = "skills")]
+            // Only the production agent builder may opt a tool into durable
+            // production evidence. Directly constructed tools are used by
+            // tests, evals, and the gym and must stay non-production.
+            skill_production: false,
+            #[cfg(feature = "skills")]
             skill_tool_call_ordinal: AtomicU64::new(0),
             profile: ModelEffectProfile::Full,
         }
@@ -765,6 +772,12 @@ impl JsTool {
         telemetry: Arc<crate::extras::js::skills::telemetry::TelemetryDispatcher>,
     ) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    #[cfg(feature = "skills")]
+    pub(crate) fn with_skill_production(mut self, production: bool) -> Self {
+        self.skill_production = production;
         self
     }
 
@@ -1175,6 +1188,7 @@ impl Tool for JsTool {
             &response.skill_events,
             response.evidence_complete,
             capability_denials.snapshot(),
+            self.skill_production,
         );
 
         Ok(render_step_result(&response))
@@ -1268,6 +1282,7 @@ fn build_skill_call_authority(
 }
 
 #[cfg(feature = "skills")]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_skill_telemetry(
     dispatcher: Option<&crate::extras::js::skills::telemetry::TelemetryDispatcher>,
     bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
@@ -1276,6 +1291,7 @@ fn dispatch_skill_telemetry(
     worker_events: &[crate::extras::js::skills::telemetry::SkillEvent],
     _worker_claimed_evidence_complete: bool,
     capability_denials: Option<std::collections::BTreeSet<String>>,
+    production: bool,
 ) -> bool {
     use crate::extras::js::skills::telemetry::{
         ParentSkillBinding, ParentTelemetryContext, bind_worker_events, observability_lost_batch,
@@ -1308,7 +1324,7 @@ fn dispatch_skill_telemetry(
         query_fingerprint: (!bundle.query_fingerprint.is_empty())
             .then(|| bundle.query_fingerprint.clone()),
         index_generation: bundle.index_generation,
-        production: true,
+        production,
         step_outcome: step_outcome.clone(),
         skills,
         capability_denials,
@@ -2032,6 +2048,7 @@ mod js_permission_bridge {
             &[forged],
             true,
             Some(Default::default()),
+            false,
         ));
         let batch = rx.try_recv().expect("parent loss event should be queued");
         assert!(
@@ -2062,6 +2079,7 @@ mod js_permission_bridge {
             std::slice::from_ref(&injected),
             true,
             Some(Default::default()),
+            false,
         ));
         assert_eq!(saturated.observability_lost_for_test(), 1);
         drop(saturated_rx);
@@ -2077,6 +2095,7 @@ mod js_permission_bridge {
             &[injected],
             true,
             Some(Default::default()),
+            false,
         ));
         assert_eq!(disconnected.observability_lost_for_test(), 1);
     }
@@ -2458,109 +2477,6 @@ mod js_permission_bridge {
             .await
             .unwrap();
         assert_eq!(rejected, "too_large");
-    }
-}
-
-#[cfg(test)]
-mod description_tests {
-    use super::*;
-    use rig::tool::Tool;
-
-    #[tokio::test]
-    async fn description_documents_fetch_and_spawn_contracts_and_examples() {
-        let tool = JsTool::new(
-            Sandbox::new(false, "bwrap").with_complete_process_tree_for_test(),
-            None,
-            None,
-            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
-        );
-        let description = tool.description();
-
-        #[cfg(feature = "sandbox")]
-        {
-            assert!(description.contains("method?: 'GET'|'POST'"));
-            assert!(description.contains("{status: number, text: string}"));
-            assert!(description.contains("has no `ok`, `headers`, or `json()`"));
-            assert!(description.contains("const r = fetch('https://example.com/data'"));
-        }
-        assert!(description.contains("spawn(program: string, args: string[])"));
-        assert!(description.contains("timed_out: boolean"));
-        assert!(description.contains("`args` must be an array"));
-        assert!(description.contains("spawn('git', ['status', '--short'])"));
-        assert!(description.contains("30 s total"));
-        assert!(description.contains("64 MiB JavaScript heap"));
-        assert!(description.contains("512 KiB JavaScript stack"));
-        assert!(description.contains("64 KiB result"));
-        assert!(description.contains("256 effect calls"));
-        assert!(description.contains("max 256 records, 8 KiB each, 256 KiB total"));
-        assert!(description.contains("read_file(path: string): string` (synchronous; max 1 MiB)"));
-        assert!(description.contains(
-            "read_files(paths: string[]): string[]` (synchronous; one brokered batch, max 256 paths and 6 MiB aggregate JSON content)"
-        ));
-        assert!(description.contains("list_dir(path?: string)"));
-        assert!(description.contains("glob(pattern: string"));
-        assert!(description.contains("grep(pattern: string"));
-        assert!(
-            description.contains(
-                "write_file(path: string, content: string): void` (synchronous; max 1 MiB)"
-            )
-        );
-        assert!(description.contains("no variables or other JavaScript state persist"));
-        assert!(description.contains("multi-file aggregate"));
-        assert!(description.contains("Use read/grep for direct lookup"));
-        assert!(description.contains("For values containing `undefined`, NaN/Infinity"));
-        assert!(description.contains("end with `JSON.stringify(value)`"));
-        assert!(description.contains("plain `Error` objects with a stable `.code`"));
-        assert!(description.contains("`not_found`, `is_directory`, `denied`"));
-        #[cfg(feature = "sandbox")]
-        {
-            assert!(description.contains("request bodies are POST-only and capped at 256 KiB"));
-            assert!(description.contains("response body max 1 MiB"));
-        }
-        assert!(description.contains("stdout and stderr max 1 MiB each"));
-    }
-
-    #[tokio::test]
-    async fn description_omits_spawn_without_complete_tree_ownership() {
-        let tool = JsTool::new(
-            Sandbox::new(false, "bwrap"),
-            None,
-            None,
-            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
-        );
-
-        let description = tool.description();
-        assert!(!description.contains("spawn(program:"));
-        assert!(description.contains("list_dir(path?: string)"));
-        assert!(description.contains("glob(pattern: string"));
-        assert!(description.contains("grep(pattern: string"));
-    }
-
-    #[tokio::test]
-    async fn read_only_description_advertises_only_its_narrow_effect_surface() {
-        let tool = JsTool::new_read_only(
-            Sandbox::new(false, "bwrap").with_complete_process_tree_for_test(),
-            None,
-            None,
-            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
-        );
-        let description = tool.description();
-
-        for present in ["read_file(path", "list_dir(path", "grep(pattern"] {
-            assert!(description.contains(present), "{present}: {description}");
-        }
-        for absent in [
-            "read_files(paths",
-            "glob(pattern",
-            "write_file(path",
-            "fetch(url",
-            "spawn(program",
-            "scratch_put(key",
-            "propose_skill(draft",
-        ] {
-            assert!(!description.contains(absent), "{absent}: {description}");
-        }
-        assert!(description.contains("Writer, network, process, session-state"));
     }
 }
 

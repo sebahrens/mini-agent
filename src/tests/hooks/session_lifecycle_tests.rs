@@ -51,7 +51,13 @@ async fn session_start_runs_the_matching_hook_with_source() {
     let dispatcher = dispatcher_with("SessionStart", vec![handler(&cmd)]);
 
     dispatch_session_start_with(&dispatcher, &ctx(), "resume").await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("SessionStart hook did not publish its envelope");
 
     let contents = std::fs::read_to_string(&marker).unwrap();
     assert!(contents.contains("\"source\":\"resume\""));
@@ -69,7 +75,13 @@ async fn session_end_runs_the_matching_hook_with_reason() {
     let dispatcher = dispatcher_with("SessionEnd", vec![handler(&cmd)]);
 
     dispatch_session_end_with(&dispatcher, &ctx(), "clear").await;
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("SessionEnd hook did not publish its envelope");
 
     let contents = std::fs::read_to_string(&marker).unwrap();
     assert!(contents.contains("\"reason\":\"clear\""));
@@ -78,6 +90,8 @@ async fn session_end_runs_the_matching_hook_with_reason() {
 #[tokio::test]
 async fn no_matching_hook_does_not_panic_or_block() {
     let dispatcher = Arc::new(HookDispatcher::from_config(&HashMap::new()).unwrap());
+    assert!(!dispatcher.has_tool_hooks());
     dispatch_session_start_with(&dispatcher, &ctx(), "startup").await;
     dispatch_session_end_with(&dispatcher, &ctx(), "exit").await;
+    assert!(!dispatcher.has_tool_hooks());
 }

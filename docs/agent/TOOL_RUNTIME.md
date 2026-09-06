@@ -21,6 +21,14 @@ commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.
 
+Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
+they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher
+closes its temporary workspace-authority descriptor inside the namespace before the model's shell
+runs. General-sandbox availability is based on a bounded real launch probe, and model commands
+receive only the non-credential environment even when the operator explicitly disables OS
+containment. The dedicated sandbox cache is `<cache_dir>/sandbox-runtime`; the full application
+cache is not mounted.
+
 Captured stdout and stderr are returned in separately labelled sections. A
 non-zero exit is retained at the tail even under very small line caps; Unix
 signal deaths report the signal name and number instead of a synthetic `-1`

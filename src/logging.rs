@@ -98,10 +98,14 @@ pub fn resolve_log_path(cli: &Cli) -> Option<PathBuf> {
 }
 
 pub fn build_stderr_filter(cli: &Cli) -> EnvFilter {
-    if let Some(ref lvl) = cli.log_level
-        && let Ok(f) = EnvFilter::try_new(format!("{lvl},rig=off"))
-    {
-        return f;
+    if let Some(ref lvl) = cli.log_level {
+        if matches!(
+            lvl.to_ascii_lowercase().as_str(),
+            "off" | "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            return EnvFilter::new(format!("{lvl},rig=off"));
+        }
+        return EnvFilter::new("warn,rig=off");
     }
     if let Ok(f) = EnvFilter::try_from_default_env() {
         return f;

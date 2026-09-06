@@ -9,7 +9,7 @@
     "predecessor_id": null
   },
   "held_out_suites": [{
-    "selector": {"tags": ["seed", "toml"], "exports": ["parseToml"], "capability_tier": "pure"},
+    "selector": {"tags": ["seed", "toml"], "exports": [{"name": "parseToml", "signature": "(text: string) => object"}], "capability_tier": "pure"},
     "cases": [{"expression": "parseToml('title = \"demo\"\\n[build]\\njobs = 4').build.jobs === 4", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
   }]
 }

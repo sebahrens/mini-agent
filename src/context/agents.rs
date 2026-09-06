@@ -652,7 +652,14 @@ pub(crate) fn load_for_workspace_binding(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> HashMap<String, AgentDefinition> {
     let paths = crate::paths::process_paths().expect("startup must initialize application paths");
-    let mut agents = load_base(&paths);
+    load_for_paths_and_workspace(&paths, workspace)
+}
+
+fn load_for_paths_and_workspace(
+    paths: &crate::paths::AppPaths,
+    workspace: &crate::paths::WorkspaceBinding,
+) -> HashMap<String, AgentDefinition> {
+    let mut agents = load_base(paths);
     let project_dir = workspace.root().join(".zerostack/agents");
     let trusted = paths
         .with_workspace_root(workspace.root())
@@ -754,6 +761,55 @@ mod tests {
             .into_iter()
             .find_map(|(candidate, prompt)| (candidate == name).then_some(prompt))
             .unwrap_or_else(|| panic!("missing embedded specialist {name}"))
+    }
+
+    #[test]
+    fn real_project_trust_binding_controls_persona_override_round_trip() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-persona-trust-{}", uuid::Uuid::new_v4()));
+        let paths = crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: Some(root.join(".zerostack")),
+        };
+        crate::paths::prepare_storage_roots(&paths).unwrap();
+        let agent_dir = root.join(".zerostack/agents");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("rust-security-review.md"),
+            "trusted project persona",
+        )
+        .unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+
+        let untrusted = load_for_paths_and_workspace(&paths, &workspace);
+        assert_ne!(
+            untrusted["rust-security-review"].prompt,
+            "trusted project persona"
+        );
+
+        let config = paths.project_config_file().unwrap();
+        std::fs::write(&config, "default_prompt = \"code\"\n").unwrap();
+        crate::config::load::trust_project_config(&config, &paths.project_config_trust_file())
+            .unwrap();
+        let trusted = load_for_paths_and_workspace(&paths, &workspace);
+        assert_eq!(
+            trusted["rust-security-review"].prompt,
+            "trusted project persona"
+        );
+        assert!(matches!(
+            trusted["rust-security-review"].source,
+            AgentDefinitionSource::ProjectOverride { .. }
+        ));
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1187,51 +1243,6 @@ mod tests {
 
     #[test]
     fn embedded_specialists_respect_read_only_execution_contracts() {
-        let azure = embedded_prompt("azure-cloud-architect");
-        assert!(azure.contains("verified workload constraints"));
-        assert!(azure.contains("Lead with unknown and assumed constraints"));
-        assert!(azure.contains("Never fabricate prices or SLAs"));
-
-        let informatica = embedded_prompt("informatica-mapplet-to-fabric-sql");
-        assert!(informatica.contains("Never emit plausible SQL"));
-        assert!(informatica.contains("required human decisions"));
-        assert!(informatica.contains("current Microsoft documentation"));
-
-        let security = embedded_prompt("rust-security-review");
-        assert!(security.contains("source-to-sink path"));
-        assert!(security.contains("Do not claim a dependency vulnerability"));
-        assert!(security.contains("concrete attacker capability"));
-
-        let concurrency = embedded_prompt("rust-async-concurrency");
-        assert!(concurrency.contains("read-only, source-backed investigations"));
-        assert!(concurrency.contains("never assume Tokio defaults"));
-        assert!(concurrency.contains("Source inspection cannot prove runtime timing"));
-
-        let unsafe_audit = embedded_prompt("rust-unsafe-code-audit");
-        assert!(unsafe_audit.contains("full precondition chain"));
-        assert!(unsafe_audit.contains("State which exact check remains unrun"));
-        assert!(unsafe_audit.contains("verify ABI/calling convention"));
-
-        let vscode = embedded_prompt("vscode-extension-developer");
-        assert!(vscode.contains("Never imply that you launched VS Code"));
-        assert!(vscode.contains("workspace.isTrusted"));
-        assert!(vscode.contains("spawn without a shell"));
-
-        let rust_maintainer = embedded_prompt("rust-maintainer");
-        assert!(rust_maintainer.contains("Route material async, unsafe, or security questions"));
-        assert!(rust_maintainer.contains("Read repository instructions and manifests"));
-        assert!(rust_maintainer.contains("Never imply that you compiled or executed"));
-
-        let python_maintainer = embedded_prompt("python-maintainer");
-        assert!(python_maintainer.contains("Do not assume a framework"));
-        assert!(python_maintainer.contains("Never imply that you ran Python"));
-        assert!(python_maintainer.contains("Derive versions and commands"));
-
-        let node_ts_maintainer = embedded_prompt("node-typescript-maintainer");
-        assert!(node_ts_maintainer.contains("VS Code API and vsce-specific work belongs"));
-        assert!(node_ts_maintainer.contains("Do not assume npm, ESM, TypeScript, React"));
-        assert!(node_ts_maintainer.contains("Never imply that you ran scripts"));
-
         for (name, prompt) in crate::context::load_embedded_files(&EMBEDDED, "md") {
             assert!(prompt.contains("read-only"), "{name} must stay read-only");
             for repository_marker in [

@@ -316,7 +316,7 @@ fn interactive_confirmation_exposes_args_and_condition_and_persists_binding() {
         &trust_path,
         &|description| {
             assert!(description.starts_with(
-                "executable argv=[\"sh\",\"-c\",\"echo ARG; touch /tmp/pwned && printf '%s' \\\"$TOKEN\\\"\"]; shell condition=\"test -f \\\"$HOME/.allow\\\" && echo CONDITION; false || true\"; subprocess trust=\"trusted\"; explicit env keys=[\"TOKEN_FILE\"]; env binding sha256=\""
+                "executable argv=[\"sh\",\"-c\",\"echo ARG; touch /tmp/pwned && printf '%s' \\\"$TOKEN\\\"\"]; shell condition=\"test -f \\\"$HOME/.allow\\\" && echo CONDITION; false || true\"; event=\"PreToolUse\"; matcher=\"Bash\"; subprocess trust=\"trusted\"; explicit env keys=[\"TOKEN_FILE\"]; env binding sha256=\""
             ));
             assert!(description.ends_with('"'));
             assert!(!description.contains("top-secret-value"));

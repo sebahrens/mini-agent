@@ -9,7 +9,7 @@
     "predecessor_id": null
   },
   "held_out_suites": [{
-    "selector": {"tags": ["seed", "table"], "exports": ["formatTable"], "capability_tier": "pure"},
+    "selector": {"tags": ["seed", "table"], "exports": [{"name": "formatTable", "signature": "(rows: unknown[][]) => string"}], "capability_tier": "pure"},
     "cases": [{"expression": "formatTable([['name','n'],['mini',2]]).includes('mini | 2')", "expected": {"type": "boolean", "value": true}, "fake_files": {}, "transcript": {}}]
   }]
 }

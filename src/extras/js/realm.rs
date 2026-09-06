@@ -751,7 +751,7 @@ pub(crate) fn load_artifact_with_bound_exports_for_verification(
     artifact: &SkillArtifact,
     capabilities: InvocationCapabilityRuntime,
     bindings: HashMap<String, BoundExportInvocation>,
-    mutated_export: Option<&str>,
+    mutation: Option<(&str, super::protocol::VerificationMutation)>,
 ) -> Result<LoadedArtifact, RealmError> {
     load_artifact_internal(
         runtime,
@@ -759,7 +759,7 @@ pub(crate) fn load_artifact_with_bound_exports_for_verification(
         artifact,
         Some(Arc::new(capabilities)),
         Some(Arc::new(bindings)),
-        mutated_export,
+        mutation,
         None,
     )
 }
@@ -825,7 +825,7 @@ fn load_artifact_internal(
     artifact: &SkillArtifact,
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
-    mutated_export: Option<&str>,
+    mutation: Option<(&str, super::protocol::VerificationMutation)>,
     artifact_bytecode: Option<&[u8]>,
 ) -> Result<LoadedArtifact, RealmError> {
     artifact
@@ -900,6 +900,19 @@ fn load_artifact_internal(
         })
         .map_err(|_| RealmError::MissingExport)?;
 
+    // Mutate the private lexical/global binding when the source declaration is
+    // assignable. This makes calls routed through another exported function
+    // observe the mutant as well. `const` bindings reject assignment, so the
+    // selected public bridge below remains the deterministic fallback.
+    if let Some((export_name, mutation_kind)) = mutation {
+        let mutant = match mutation_kind {
+            super::protocol::VerificationMutation::Throw => "(() => { throw 0; })",
+            super::protocol::VerificationMutation::ReturnNull => "(() => null)",
+        };
+        let assignment = format!("{export_name} = {mutant}; void 0");
+        let _ = private_context.with(|ctx| ctx.eval::<(), _>(assignment.as_bytes()));
+    }
+
     if runtime.is_job_pending() {
         return Err(RealmError::PendingInitializationJobs);
     }
@@ -913,11 +926,19 @@ fn load_artifact_internal(
                 .exports
                 .iter()
                 .map(|export| {
-                    let original: Function = if mutated_export == Some(export.name.as_str()) {
-                        ctx.eval("(() => { throw 0; })")?
-                    } else {
-                        namespace.get(export.name.as_str())?
-                    };
+                    let original: Function =
+                        if mutation.is_some_and(|(name, _)| name == export.name.as_str()) {
+                            match mutation.expect("selected mutation exists").1 {
+                                super::protocol::VerificationMutation::Throw => {
+                                    ctx.eval("(() => { throw 0; })")?
+                                }
+                                super::protocol::VerificationMutation::ReturnNull => {
+                                    ctx.eval("(() => null)")?
+                                }
+                            }
+                        } else {
+                            namespace.get(export.name.as_str())?
+                        };
                     let bridge: Function = if let Some(capabilities) = capabilities.as_ref() {
                         let settlements = settlements
                             .as_ref()

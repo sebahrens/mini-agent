@@ -1,7 +1,7 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.4.0
+- **Specification version**: 1.5.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -17,6 +17,11 @@ explicit lineage-root activation. Trusted `enable_skill_proposals = true` config
 `propose_skill` and starts the bounded proposal/admission workers; it is off by default. Proposals
 stop at `awaiting_approval`, approval creates a non-retrievable canary, and activation remains a
 distinct local-owner action.
+
+The default CLI identifies both root-lifecycle approval actions as the same authenticated
+`local-owner` principal. Distinct approval records preserve two explicit operator actions, but
+they are not evidence of two independent human reviewers. Deployments that require separation of
+duties must add an external identity-aware approval control.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). The filename is retained for stable links, but Phase 4 does **not**
@@ -348,8 +353,9 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 
 1. **Operator surface** (mini-agent-p0h1, delivered). The shipped binary provides authenticated local-owner
    commands to import a skill draft (verified in the contained worker and inserted as awaiting
-   approval), approve or reject an awaiting revision into or out of canary, and list awaiting
-   revisions. `propose_skill` may be re-registered behind an explicit configuration flag so
+   approval), and approve or reject an awaiting revision by identity into or out of canary. The
+   stats command reports stored lifecycle statuses; there is no separate awaiting-only list
+   command. `propose_skill` may be re-registered behind an explicit configuration flag so
    proposals land in the same queue. Every human gate in this phase is preserved; no command
    activates code automatically.
 2. **Seed library and Agent-Skill bridge** (mini-agent-vvud, delivered). A shipped set of pure
@@ -359,6 +365,13 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    activation, containment, or learned-skill budgets.
 3. **Stats surface** (mini-agent-i78t, delivered). Per-skill selections, invocations, success rate, and
    last-use are readable by the operator.
+4. **Replacement integrity** (2026-09-06, delivered). Approval derives and persists a replacement's
+   `supersedes_id` and lineage root from the reviewed predecessor, so a real approved canary is
+   routable and remains rollback-capable. Semantic-duplicate evaluation excludes that exact
+   predecessor while still rejecting every unrelated duplicate. Capability comparison is a
+   structural subset test over each scoped grant, never tier-only equivalence. The proposal attempt
+   budget is consumed only after bounded payload and predecessor validation, and the admission
+   worker renews its lease before the worst-case contained verification window.
 
 ## Acceptance criteria
 

@@ -6,6 +6,7 @@ use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleError, LifecycleService, LifecycleStatus,
     ReplacementTransitionRequest,
 };
+use crate::extras::js::skills::policy::PromotionPolicy;
 use crate::extras::js::skills::{
     CapabilityManifest, SkillArtifact, SkillExport, store::SkillStore,
 };
@@ -41,7 +42,7 @@ fn fixture() -> (AppPaths, SkillStore, SkillArtifact, SkillArtifact) {
                 name: "run".into(),
                 signature: "() => string".into(),
             }],
-            vec!["run() !== ''".into()],
+            vec![format!("run() === {value:?}")],
             CapabilityManifest::pure(),
         )
         .unwrap()
@@ -91,65 +92,113 @@ fn request(predecessor: &SkillArtifact, candidate: &SkillArtifact) -> Replacemen
     }
 }
 
+fn insert_successful_invocations(store: &mut SkillStore, skill_id: &str, prefix: char) {
+    for index in 0..25 {
+        let invocation_id = format!("{prefix}{index:063x}");
+        let turn_id = format!("promotion-{prefix}-{index}");
+        for (event_kind, latency) in [("invoked", None), ("returned", Some(100i64))] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_events (
+                         invocation_id, skill_id, turn_id, event_kind, export_name,
+                         latency_us, index_generation, evidence_complete, production, created_at
+                     ) VALUES (?, ?, ?, ?, 'run', ?, 0, 1, 1, 0)",
+                    rusqlite::params![invocation_id, skill_id, turn_id, event_kind, latency],
+                )
+                .unwrap();
+        }
+    }
+}
+
 #[test]
 fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
     let (paths, mut store, predecessor, candidate) = fixture();
     {
         let mut service = LifecycleService::new(&mut store);
-        service.register_policy("v1", r#"{"min":25}"#, 0).unwrap();
+        service
+            .register_policy(
+                "v1",
+                &serde_json::to_string(&PromotionPolicy::conservative("v1", 0, 100)).unwrap(),
+                0,
+            )
+            .unwrap();
     }
-    for evidence_id in ["promotion-evidence", "rollback-evidence"] {
+    for (evidence_id, evidence_kind) in [
+        ("promotion-evidence", "qualified"),
+        ("rollback-evidence", "regression"),
+    ] {
         store
             .conn_mut()
             .execute(
                 "INSERT INTO skill_evidence (
                     evidence_id, skill_id, evidence_kind, payload_json,
                     policy_version, created_at
-                 ) VALUES (?, ?, 'qualified', '{}', 'v1', 0)",
-                rusqlite::params![evidence_id, candidate.id],
+                 ) VALUES (?, ?, ?, '{}', 'v1', 0)",
+                rusqlite::params![evidence_id, candidate.id, evidence_kind],
             )
             .unwrap();
     }
-    let mut service = LifecycleService::new(&mut store);
-    let promote_request = request(&predecessor, &candidate);
-    let promoted = service.promote_replacement(&promote_request, 1).unwrap();
-    assert_eq!(promoted.candidate_status, LifecycleStatus::Active);
-    assert_eq!(promoted.predecessor_status, LifecycleStatus::Superseded);
-    assert!(
-        service
-            .promote_replacement(&promote_request, 2)
-            .unwrap()
-            .replayed
-    );
-    let mut conflicting_replay = promote_request.clone();
-    conflicting_replay.reason = "different-decision".into();
-    assert!(matches!(
-        service.promote_replacement(&conflicting_replay, 2),
-        Err(LifecycleError::IdempotencyConflict)
-    ));
+    insert_successful_invocations(&mut store, &candidate.id, 'a');
+    insert_successful_invocations(&mut store, &predecessor.id, 'b');
+    {
+        let mut service = LifecycleService::new(&mut store);
+        let promote_request = request(&predecessor, &candidate);
+        let mut forged_request = promote_request.clone();
+        forged_request.idempotency_key = "forged-promotion".into();
+        forged_request.snapshot.evidence_ids = vec!["rollback-evidence".into()];
+        assert!(matches!(
+            service.promote_replacement(&forged_request, 1),
+            Err(LifecycleError::UnknownEvidence)
+        ));
+        let promoted = service.promote_replacement(&promote_request, 1).unwrap();
+        assert_eq!(promoted.candidate_status, LifecycleStatus::Active);
+        assert_eq!(promoted.predecessor_status, LifecycleStatus::Superseded);
+        assert!(
+            service
+                .promote_replacement(&promote_request, 2)
+                .unwrap()
+                .replayed
+        );
+        let mut conflicting_replay = promote_request.clone();
+        conflicting_replay.reason = "different-decision".into();
+        assert!(matches!(
+            service.promote_replacement(&conflicting_replay, 2),
+            Err(LifecycleError::IdempotencyConflict)
+        ));
 
-    let rollback = ReplacementTransitionRequest {
-        idempotency_key: "rollback-1".into(),
-        candidate_row_version: 2,
-        predecessor_row_version: 2,
-        reason: "regression".into(),
-        snapshot: EvidenceSnapshot::new(
-            candidate.id.clone(),
-            Some(predecessor.id.clone()),
-            "v1",
-            vec!["rollback-evidence".into()],
-            BTreeMap::from([("decision".into(), serde_json::json!("rollback"))]),
-            2,
-            Some(2),
-            1,
+        let rollback = ReplacementTransitionRequest {
+            idempotency_key: "rollback-1".into(),
+            candidate_row_version: 2,
+            predecessor_row_version: 2,
+            reason: "regression".into(),
+            snapshot: EvidenceSnapshot::new(
+                candidate.id.clone(),
+                Some(predecessor.id.clone()),
+                "v1",
+                vec!["rollback-evidence".into()],
+                BTreeMap::from([("decision".into(), serde_json::json!("rollback"))]),
+                2,
+                Some(2),
+                1,
+            )
+            .unwrap(),
+            ..promote_request
+        };
+        let rolled_back = service.rollback_replacement(&rollback, 3).unwrap();
+        assert_eq!(rolled_back.candidate_status, LifecycleStatus::Quarantined);
+        assert_eq!(rolled_back.predecessor_status, LifecycleStatus::Active);
+        assert_eq!(rolled_back.desired_generation, 2);
+    }
+    let predecessor_successor: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT superseded_by_id FROM skill_revisions WHERE id = ?1",
+            [&predecessor.id],
+            |row| row.get(0),
         )
-        .unwrap(),
-        ..promote_request
-    };
-    let rolled_back = service.rollback_replacement(&rollback, 3).unwrap();
-    assert_eq!(rolled_back.candidate_status, LifecycleStatus::Quarantined);
-    assert_eq!(rolled_back.predecessor_status, LifecycleStatus::Active);
-    assert_eq!(rolled_back.desired_generation, 2);
+        .unwrap();
+    assert_eq!(predecessor_successor, None);
     std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 

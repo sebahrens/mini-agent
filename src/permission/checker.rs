@@ -110,12 +110,12 @@ pub struct PermissionChecker {
     /// One-shot: the next `check`/`check_path` call for this tool is forced
     /// to `Ask`, consumed immediately after. Set by a hook `ask` verdict.
     #[cfg(feature = "hooks")]
-    pending_forced_ask: Option<String>,
+    pending_forced_ask: Option<(String, u64)>,
     /// One-shot: the next `check`/`check_path` call for this tool suppresses
     /// the prompt (`Allowed`), consumed immediately after. Set by a hook
     /// `allow` verdict. Never bypasses a deny rule (checked first).
     #[cfg(feature = "hooks")]
-    pending_one_shot_allow: Option<String>,
+    pending_one_shot_allow: Option<(String, u64)>,
 }
 
 impl PermissionChecker {
@@ -355,16 +355,45 @@ impl PermissionChecker {
     /// regardless of permission mode. Consumed after that one call. Set by a
     /// hook `ask` verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
+    pub fn force_ask_once_scoped(&mut self, tool: String, token: u64) {
+        self.pending_forced_ask = Some((canonical_permission_tool(&tool).to_string(), token));
+    }
+
+    #[cfg(all(feature = "hooks", test))]
     pub fn force_ask_once(&mut self, tool: String) {
-        self.pending_forced_ask = Some(canonical_permission_tool(&tool).to_string());
+        self.pending_forced_ask = Some((canonical_permission_tool(&tool).to_string(), u64::MAX));
     }
 
     /// Suppresses the interactive prompt for the next `check`/`check_path`
     /// call for `tool`. Consumed after that one call. Set by a hook `allow`
     /// verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
+    pub fn allow_once_scoped(&mut self, tool: String, token: u64) {
+        self.pending_one_shot_allow = Some((canonical_permission_tool(&tool).to_string(), token));
+    }
+
+    #[cfg(all(feature = "hooks", test))]
     pub fn allow_once(&mut self, tool: String) {
-        self.pending_one_shot_allow = Some(canonical_permission_tool(&tool).to_string());
+        self.pending_one_shot_allow =
+            Some((canonical_permission_tool(&tool).to_string(), u64::MAX));
+    }
+
+    #[cfg(feature = "hooks")]
+    pub fn clear_hook_one_shot(&mut self, token: u64) {
+        if self
+            .pending_forced_ask
+            .as_ref()
+            .is_some_and(|(_, pending)| *pending == token)
+        {
+            self.pending_forced_ask = None;
+        }
+        if self
+            .pending_one_shot_allow
+            .as_ref()
+            .is_some_and(|(_, pending)| *pending == token)
+        {
+            self.pending_one_shot_allow = None;
+        }
     }
 
     fn apply_rules(&self) -> bool {
@@ -430,7 +459,10 @@ impl PermissionChecker {
                 }
             }),
             SecurityMode::Standard => base.unwrap_or({
-                if matches!(tool, "shell" | "bash" | "js/fetch") {
+                if matches!(
+                    tool,
+                    "shell" | "bash" | "js/fetch" | "memory_write" | "memory_edit"
+                ) {
                     // Bash scripts and network destinations are opaque,
                     // security-sensitive permission keys. An unmatched call
                     // must never inherit a permissive default.
@@ -542,11 +574,26 @@ impl PermissionChecker {
     /// neither can ever bypass a deny.
     #[cfg(feature = "hooks")]
     fn take_pending_one_shot(&mut self, tool: &str) -> Option<CheckResult> {
-        if self.pending_forced_ask.as_deref() == Some(tool) {
+        let token = HOOK_PERMISSION_TOKEN
+            .try_with(|token| *token)
+            .unwrap_or(u64::MAX);
+        if self
+            .pending_forced_ask
+            .as_ref()
+            .is_some_and(|(pending_tool, pending_token)| {
+                pending_tool == tool && *pending_token == token
+            })
+        {
             self.pending_forced_ask = None;
             return Some(CheckResult::Ask);
         }
-        if self.pending_one_shot_allow.as_deref() == Some(tool) {
+        if self
+            .pending_one_shot_allow
+            .as_ref()
+            .is_some_and(|(pending_tool, pending_token)| {
+                pending_tool == tool && *pending_token == token
+            })
+        {
             self.pending_one_shot_allow = None;
             return Some(CheckResult::Allowed);
         }
@@ -1116,6 +1163,19 @@ impl PermissionChecker {
     fn count_doom_loop(&self) -> usize {
         self.consecutive_repeat_count
     }
+}
+
+#[cfg(feature = "hooks")]
+tokio::task_local! {
+    static HOOK_PERMISSION_TOKEN: u64;
+}
+
+#[cfg(feature = "hooks")]
+pub(crate) async fn scope_hook_permission<F: std::future::Future>(
+    token: u64,
+    future: F,
+) -> F::Output {
+    HOOK_PERMISSION_TOKEN.scope(token, future).await
 }
 
 fn is_path_tool_name(tool: &str) -> bool {
@@ -1839,6 +1899,19 @@ mod tests {
             ),
             CheckResult::Denied(_)
         ));
+    }
+
+    #[test]
+    fn global_memory_mutations_are_not_implicitly_allowed_in_standard_mode() {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Standard,
+            None,
+            Some(vec!["standard".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(checker.check("memory_write", "long_term"), CheckResult::Ask);
+        assert_eq!(checker.check("memory_edit", "long_term"), CheckResult::Ask);
     }
 
     #[test]

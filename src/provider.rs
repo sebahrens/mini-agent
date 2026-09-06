@@ -1815,7 +1815,6 @@ pub async fn build_agent_in_workspace(
     >,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
-    let completion_verification = runner::CompletionVerification::from_config(cfg, sandbox.clone());
     #[cfg(feature = "js")]
     let js_tool_eligible = cli.tool_is_eligible(cfg, "js");
     #[cfg(feature = "js")]
@@ -1833,6 +1832,24 @@ pub async fn build_agent_in_workspace(
         cfg.enable_skill_proposals.unwrap_or(false),
     )
     .await;
+    let completion_verification = runner::CompletionVerification::from_config(cfg, sandbox.clone());
+    #[cfg(feature = "skills")]
+    let completion_verification = match skills
+        .as_ref()
+        .and_then(|services| services.telemetry().map(|value| (services, value)))
+    {
+        Some((services, dispatcher)) => Some(runner::CompletionVerification::with_task_outcomes(
+            completion_verification,
+            cfg,
+            sandbox.clone(),
+            runner::TaskOutcomeRecorder::new(
+                dispatcher,
+                services.turn_context(),
+                crate::extras::js::skills::evidence_is_production_session(),
+            ),
+        )),
+        None => completion_verification,
+    };
 
     let inner = match model {
         AnyModel::OpenRouter(m, routing) => AnyAgentInner::OpenRouter(

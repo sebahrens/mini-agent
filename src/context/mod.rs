@@ -489,14 +489,14 @@ fn load_file(path: &PathBuf) -> Option<String> {
     }
 }
 
-/// Maximum total bytes of ancestor context files (AGENTS.md, CLAUDE.md,
+/// Maximum total bytes of repository context files (AGENTS.md, CLAUDE.md,
 /// ARCHITECTURE.md) to load into the system prompt. Prevents a planted or
 /// oversized file from blowing up the context window.
 const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
 
-/// Walks from CWD up to root once, collecting AGENTS.md, CLAUDE.md, and
-/// ARCHITECTURE.md files. This avoids the duplicate traversal that the
-/// older separate load_agents / load_architecture performed.
+/// Reads context only from the explicitly selected workspace root. Global
+/// application context is loaded separately; parent directories outside the
+/// workspace capability must never influence the prompt.
 fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<String>) {
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
@@ -555,7 +555,7 @@ fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<
                     ));
                 }
             }
-            current = dir.parent();
+            current = None;
         }
     }
 
@@ -570,6 +570,30 @@ fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<
         Some(arch_parts.join("\n\n"))
     };
     (agents, architecture)
+}
+
+#[cfg(test)]
+mod repository_context_tests {
+    use super::*;
+
+    #[test]
+    fn unbound_loader_does_not_read_context_above_selected_workspace() {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-context-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = parent.join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(parent.join("AGENTS.md"), "PARENT_CONTEXT_MARKER").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "WORKSPACE_CONTEXT_MARKER").unwrap();
+
+        let (agents, _) = walk_context_files(Some(&workspace));
+
+        let agents = agents.expect("workspace AGENTS.md should be loaded");
+        assert!(agents.contains("WORKSPACE_CONTEXT_MARKER"));
+        assert!(!agents.contains("PARENT_CONTEXT_MARKER"));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 }
 
 #[cfg(feature = "archmd")]

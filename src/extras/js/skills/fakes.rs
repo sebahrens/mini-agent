@@ -17,7 +17,7 @@ use crate::extras::js::skills::{CapabilityManifest, HostCapability};
 
 /// Version of the fake host implementation. Bumping this invalidates existing
 /// verification reports.
-pub const FAKES_VERSION: u32 = 2;
+pub const FAKES_VERSION: u32 = 3;
 
 /// Maximum total size of all virtual files in bytes.
 const FAKES_TOTAL_FILE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
@@ -119,6 +119,45 @@ pub struct FakeFetchRecord {
     pub url: String,
     pub method: String,
     pub result: Result<String, String>, // JSON response
+}
+
+/// Deterministic result returned by a verifier-owned spawn fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FakeSpawnResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+/// Exact spawn request and its hidden held-out response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FakeSpawnFixture {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub response: FakeSpawnResponse,
+}
+
+/// Deterministic result returned by a verifier-owned fetch fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FakeFetchResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Exact fetch request and its hidden held-out response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FakeFetchFixture {
+    pub url: String,
+    pub method: String,
+    pub response: FakeFetchResponse,
 }
 
 /// Transcript of all I/O operations during verification.
@@ -228,6 +267,8 @@ struct FakeState {
     files: HashMap<String, String>,
     /// Total bytes of all files.
     total_file_bytes: usize,
+    spawn_fixtures: HashMap<(String, Vec<String>), FakeSpawnResponse>,
+    fetch_fixtures: HashMap<(String, String), FakeFetchResponse>,
     /// Transcript of all operations.
     transcript: FakeTranscript,
 }
@@ -237,6 +278,8 @@ impl FakeState {
         Self {
             files: HashMap::new(),
             total_file_bytes: 0,
+            spawn_fixtures: HashMap::new(),
+            fetch_fixtures: HashMap::new(),
             transcript: FakeTranscript::default(),
         }
     }
@@ -319,6 +362,42 @@ impl FakeHostGlobals {
         self.state.lock().unwrap().write_file(path, content)
     }
 
+    pub(crate) fn seed_spawn(&self, fixture: &FakeSpawnFixture) -> Result<(), String> {
+        if !self.manifest.allows(HostCapability::Spawn) {
+            return Err("spawn not declared in capability manifest".to_string());
+        }
+        let key = (fixture.program.clone(), fixture.args.clone());
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .spawn_fixtures
+            .insert(key, fixture.response.clone())
+            .is_some()
+        {
+            return Err("duplicate spawn fixture".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn seed_fetch(&self, fixture: &FakeFetchFixture) -> Result<(), String> {
+        if !self.manifest.allows(HostCapability::Fetch) {
+            return Err("fetch not declared in capability manifest".to_string());
+        }
+        let key = (fixture.url.clone(), fixture.method.to_ascii_uppercase());
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .fetch_fixtures
+            .insert(key, fixture.response.clone())
+            .is_some()
+        {
+            return Err("duplicate fetch fixture".to_string());
+        }
+        Ok(())
+    }
+
     /// Read a virtual file. Fails if not declared in capability manifest.
     pub fn read_file(&self, path: &str) -> Result<String, String> {
         if !self.manifest.allows(HostCapability::ReadFile) {
@@ -370,8 +449,7 @@ impl FakeHostGlobals {
     }
 
     /// Simulate a spawn operation. Fails if not declared in capability manifest.
-    /// Always succeeds with exit code 0 for determinism.
-    pub fn spawn(&self, program: &str, args: &[String]) -> Result<String, String> {
+    pub fn spawn(&self, program: &str, args: &[String]) -> Result<FakeSpawnResponse, String> {
         if !self.manifest.allows(HostCapability::Spawn) {
             return Err("spawn not declared in capability manifest".to_string());
         }
@@ -387,19 +465,30 @@ impl FakeHostGlobals {
             return Err("spawn limit exceeded".to_string());
         }
 
-        // Simulated spawn result: always succeeds with empty output
-        let result_json = r#"{"stdout":"","stderr":"","code":0,"timed_out":false,"stdout_truncated":false,"stderr_truncated":false}"#.to_string();
-        let result = Ok(result_json.clone());
+        let response = state
+            .spawn_fixtures
+            .get(&(program.to_string(), args.to_vec()))
+            .cloned()
+            .unwrap_or_else(|| FakeSpawnResponse {
+                stdout: format!("simulated {program} completed\n"),
+                stderr: String::new(),
+                code: 0,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+        let result_json = serde_json::to_string(&response).map_err(|error| error.to_string())?;
+        let result = Ok(result_json);
         state.transcript.spawns.push(FakeSpawnRecord {
             program: program.to_string(),
             args: args.to_vec(),
             result: result.clone(),
         });
-        result
+        Ok(response)
     }
 
     /// Simulate a fetch operation. Fails if not declared in capability manifest.
-    pub fn fetch(&self, url: &str, _method: &str) -> Result<String, String> {
+    pub fn fetch(&self, url: &str, method: &str) -> Result<FakeFetchResponse, String> {
         if !self.manifest.allows(HostCapability::Fetch) {
             return Err("fetch not declared in capability manifest".to_string());
         }
@@ -407,7 +496,7 @@ impl FakeHostGlobals {
         self.transcript_budget.reserve(
             TRANSCRIPT_RECORD_FIXED_WIRE_BYTES
                 .saturating_add(string_wire_upper_bound(url))
-                .saturating_add(string_wire_upper_bound(_method)),
+                .saturating_add(string_wire_upper_bound(method)),
         )?;
 
         let mut state = self.state.lock().unwrap();
@@ -415,15 +504,28 @@ impl FakeHostGlobals {
             return Err("fetch limit exceeded".to_string());
         }
 
-        // Simulated fetch result: empty JSON object
-        let result_json = "{}".to_string();
-        let result = Ok(result_json.clone());
+        let normalized_method = method.to_ascii_uppercase();
+        let response = state
+            .fetch_fixtures
+            .get(&(url.to_string(), normalized_method.clone()))
+            .cloned()
+            .unwrap_or_else(|| FakeFetchResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "ok": true,
+                    "method": normalized_method,
+                    "url": url,
+                })
+                .to_string(),
+            });
+        let result_json = serde_json::to_string(&response).map_err(|error| error.to_string())?;
+        let result = Ok(result_json);
         state.transcript.fetches.push(FakeFetchRecord {
             url: url.to_string(),
-            method: _method.to_string(),
-            result: result.clone(),
+            method: method.to_string(),
+            result,
         });
-        result
+        Ok(response)
     }
 }
 

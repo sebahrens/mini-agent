@@ -84,10 +84,10 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/mode` | Show the current security mode. |
 | `/mode standard` | Allow path tools within CWD, ask for external paths. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
-| `/mode readonly` | Allow reads only; deny writes, edits, bash, and everything else. |
+| `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. |
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
-| `/mode guarded` | Allow reads; ask for writes, edits, bash, and everything else. Config rules apply. |
-| `/mode yolo` | Allow everything; ask for destructive bash commands. Config rules apply. |
+| `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
+| `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
 
 Prompts can set the security mode automatically via `%%mode=<mode>` on
 the first line. When a prompt with `%%mode=last_user_mode` is activated,
@@ -150,7 +150,7 @@ You are in read-only mode. Only read files and explore.
 | `/editsys` | Show the current edit system mode (similarity or hashedit). |
 | `/editsys similarity` | Use SEARCH/REPLACE with fuzzy matching for edits (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |
-| `/btw <message>` | Ask a quick side question in parallel, without touching the main conversation. It forks the current context (including the main agent's in-flight turn, if any), answers using read-only tools (read/grep/find_files/list_dir, no writes or bash), and prints the answer inline. Works even while the main agent is running. Nothing is written to history; its token cost is shown separately as `btw:$…`. Ctrl-C cancels an in-flight `/btw` without disturbing the main agent. |
+| `/btw <message>` | Ask a quick side question in parallel, without touching the main conversation. It forks the current context (including the main agent's in-flight turn, if any), answers using read-only tools (read/grep/find_files/list_dir, no writes or shell), and prints the answer inline. Works even while the main agent is running. Nothing is written to history; its token cost is shown separately as `btw:$…`. Ctrl-C cancels an in-flight `/btw` without disturbing the main agent. |
 | `/reasoning` | Toggle LLM reasoning on/off (requires model support). |
 | `/thinking` | Alias for `/reasoning`. |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
@@ -266,7 +266,7 @@ workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
 with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
 executable identity and argument contract are retained across agent rebuilds.
 If the executable is missing or unsupported, the model-visible compatibility
-tool named `bash` and its prompt guidance are omitted, and shell execution fails
+tool named `shell` and its prompt guidance are omitted, and shell execution fails
 closed. `--no-tools` performs no shell lookup.
 
 Shell commands use the configured general sandbox when it is enabled. Running
@@ -331,9 +331,12 @@ message, and after the response restores the previous prompt and
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
+| `Ctrl+R` | Toggle reasoning visibility. |
 | `@<query>` | Activate the file picker; Tab/Enter selects and Escape closes it. |
 | `Tab` | Insert two spaces when no picker is active. |
 | `Up / Down` | Move vertically in multiline input; at an edge, navigate command history. |
 | `PageUp / PageDown` | Scroll viewport. |
 | `Home / End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
+| Mouse drag | Select text and copy it on release. |
+| Mouse scroll | Scroll chat history. |

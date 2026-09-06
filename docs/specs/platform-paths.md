@@ -1,7 +1,7 @@
 # Cross-Platform Paths and Persistent Storage
 
 - **Document role**: normative cross-phase foundation
-- **Specification version**: 1.1.0
+- **Specification version**: 1.2.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
 - **Last reconciled**: 2026-09-06
@@ -138,12 +138,17 @@ new config file under the data root merely because no config file exists yet.
 |----------|----------------|--------|
 | `config.toml`/YAML/JSON, `SUFFIX.md`, global `AGENTS.md`, global hook `settings.json` | `config_dir` | User-authored configuration |
 | Project config, project prompts, project Agent Skills | `project_dir` | Repository-scoped, reviewable configuration |
-| Global prompts, themes, docs, imported portable Agent Skill trees | `data_dir` | Durable user content that may roam |
+| Global prompts and docs | `data_dir/prompts`, `data_dir/docs` | Durable user content that may roam |
+| Global memory and agent definitions | `data_dir/memory`, `data_dir/agents` | Durable user-authored context that may roam |
+| Installed themes and selected theme | `data_dir/themes`, `data_dir/theme.json` | Theme assets and the durable user selection may roam together |
+| Imported portable Agent Skill trees | `data_dir/skills` | Portable reviewed skill content |
 | Learned JS `skills.db`, embeddings, held-out suites, lifecycle/evidence DB | `local_data_dir/skills` | SQLite and mutable indexes are machine-local and unsafe to roam concurrently |
 | Sessions, transcripts, tool output, loop state, turn telemetry, crash state, logs | `state_dir` | Durable operational state, not configuration or skill evidence |
+| Welcome, hook/config trust, architecture, and migration markers | `state_dir/shown_welcome_msg`, `state_dir/hooks`, `state_dir/config`, `state_dir/archmd`, `state_dir/migrations/v1` | Machine-local operational and migration state |
 | Brokered JavaScript effect audit | `state_dir/audit/js-effects` | Private machine-local security evidence with one exclusive writer and hash-linked segments |
 | Embedding model downloads, query cache, rebuildable dense snapshots, import staging | `cache_dir` | Safe to delete and reconstruct |
 | MCP OAuth refresh/access tokens and future secret material | `credentials_dir` | Requires stronger access controls and must not roam by default |
+| Skill Gym worktrees, reports, and isolated AppPaths | Operator-selected `MINI_AGENT_GYM_ROOT` (the setup script defaults to `<repository>/.gym`) | Evaluation-only tree outside `AppPaths`; every episode overrides data/local-data/state/cache roots and sets `MINI_AGENT_GYM=1` so evidence cannot qualify as production |
 | System-managed hook settings | `/etc/zerostack` (Linux), `/Library/Application Support/zerostack` (macOS), `%ProgramData%\zerostack` (Windows) | Explicit read-only administrator-policy exception; no user override |
 
 An artifact has exactly one owner and one canonical root. A module may receive a fully resolved

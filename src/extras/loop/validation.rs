@@ -222,7 +222,7 @@ fn append_stream(rendered: &mut String, name: &str, safe: &str, was_present: boo
     rendered.push_str(safe);
 }
 
-fn sanitize_bytes(bytes: &[u8], max_bytes: usize) -> (String, bool) {
+pub(crate) fn sanitize_bytes(bytes: &[u8], max_bytes: usize) -> (String, bool) {
     let decoded = String::from_utf8_lossy(bytes);
     let mut result = String::with_capacity(decoded.len());
     let mut truncated = false;

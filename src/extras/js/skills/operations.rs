@@ -89,6 +89,10 @@ struct SkillUsageStats {
     direct_successes: u64,
     direct_failures: u64,
     last_used: Option<i64>,
+    tasks_with: u64,
+    passed_with: u64,
+    baseline_tasks: u64,
+    baseline_passes: u64,
     declared_effect_methods: u64,
     estimated_round_trips_saved: u64,
 }
@@ -100,6 +104,14 @@ impl SkillUsageStats {
             0.0
         } else {
             self.direct_successes as f64 * 100.0 / terminals as f64
+        }
+    }
+
+    fn pass_rate_without_percent(&self) -> f64 {
+        if self.baseline_tasks == 0 {
+            0.0
+        } else {
+            self.baseline_passes as f64 * 100.0 / self.baseline_tasks as f64
         }
     }
 }
@@ -118,6 +130,52 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                 COALESCE(stats.direct_failure_count, 0),
                 (SELECT MAX(event.created_at) FROM skill_events AS event
                   WHERE event.skill_id = revision.id AND event.event_kind = 'invoked'),
+                (SELECT COUNT(DISTINCT outcome.turn_id)
+                   FROM skill_task_outcome_links AS link
+                   JOIN skill_task_outcomes AS outcome
+                     ON outcome.evidence_id = link.evidence_id
+                  WHERE link.skill_id = revision.id
+                    AND outcome.source_kind != 'no_verify_command'),
+                (SELECT COUNT(DISTINCT CASE WHEN outcome.verify_passed = 1
+                                           THEN outcome.turn_id END)
+                   FROM skill_task_outcome_links AS link
+                   JOIN skill_task_outcomes AS outcome
+                     ON outcome.evidence_id = link.evidence_id
+                  WHERE link.skill_id = revision.id
+                    AND outcome.source_kind != 'no_verify_command'),
+                (SELECT COUNT(DISTINCT baseline.turn_id)
+                   FROM skill_task_outcomes AS baseline
+                  WHERE baseline.source_kind != 'no_verify_command'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM skill_task_outcome_links AS absent
+                         WHERE absent.evidence_id = baseline.evidence_id
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                          FROM skill_task_outcomes AS observed
+                          JOIN skill_task_outcome_links AS observed_link
+                            ON observed_link.evidence_id = observed.evidence_id
+                         WHERE observed_link.skill_id = revision.id
+                           AND observed.source_kind = baseline.source_kind
+                           AND observed.source_id IS baseline.source_id
+                    )),
+                (SELECT COUNT(DISTINCT CASE WHEN baseline.verify_passed = 1
+                                           THEN baseline.turn_id END)
+                   FROM skill_task_outcomes AS baseline
+                  WHERE baseline.source_kind != 'no_verify_command'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM skill_task_outcome_links AS absent
+                         WHERE absent.evidence_id = baseline.evidence_id
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                          FROM skill_task_outcomes AS observed
+                          JOIN skill_task_outcome_links AS observed_link
+                            ON observed_link.evidence_id = observed.evidence_id
+                         WHERE observed_link.skill_id = revision.id
+                           AND observed.source_kind = baseline.source_kind
+                           AND observed.source_id IS baseline.source_id
+                    )),
                 revision.capability_json
            FROM skill_revisions AS revision
            LEFT JOIN skill_stats AS stats ON stats.skill_id = revision.id
@@ -132,11 +190,27 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, Option<i64>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     rows.map(|row| {
-        let (skill_id, status, invocations, successes, failures, last_used, capability_json) = row?;
+        let (
+            skill_id,
+            status,
+            invocations,
+            successes,
+            failures,
+            last_used,
+            tasks_with,
+            passed_with,
+            baseline_tasks,
+            baseline_passes,
+            capability_json,
+        ) = row?;
         let declared_effect_methods = serde_json::from_str::<serde_json::Value>(&capability_json)
             .ok()
             .and_then(|value| value.pointer("/manifest/grants")?.as_array().map(Vec::len))
@@ -149,6 +223,10 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             direct_successes,
             direct_failures: u64::try_from(failures).unwrap_or(0),
             last_used,
+            tasks_with: u64::try_from(tasks_with).unwrap_or(0),
+            passed_with: u64::try_from(passed_with).unwrap_or(0),
+            baseline_tasks: u64::try_from(baseline_tasks).unwrap_or(0),
+            baseline_passes: u64::try_from(baseline_passes).unwrap_or(0),
             declared_effect_methods,
             estimated_round_trips_saved: estimate_round_trips_saved(
                 direct_successes,
@@ -163,17 +241,20 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
     let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let rows = load_skill_stats(&store).context("failed to read learned-skill usage")?;
     println!(
-        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\tdeclared_effect_methods\test_round_trips_saved"
+        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\ttasks_with\tpassed_with\tpass_rate_without\tdeclared_effect_methods\test_round_trips_saved"
     );
     for row in &rows {
         println!(
-            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{:.1}%\t{}\t{}",
             row.skill_id,
             row.status,
             row.invocations,
             row.success_percent(),
             row.last_used
                 .map_or_else(|| "never".into(), |value| value.to_string()),
+            row.tasks_with,
+            row.passed_with,
+            row.pass_rate_without_percent(),
             row.declared_effect_methods,
             row.estimated_round_trips_saved,
         );
@@ -183,7 +264,7 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
         .iter()
         .map(|row| row.estimated_round_trips_saved)
         .sum::<u64>();
-    println!("total\t-\t{invocations}\t-\t-\t-\t{saved}");
+    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t-\t{saved}");
     Ok(())
 }
 
@@ -402,6 +483,7 @@ fn import_package(
             current.status,
             ProposalStatus::AwaitingApproval
                 | ProposalStatus::Rejected
+                | ProposalStatus::Deferred
                 | ProposalStatus::Verified
                 | ProposalStatus::Approved
         ) {
@@ -476,10 +558,20 @@ fn review_proposal(
         .review_and_admit(proposal_id, &LocalOwnerReviewer { approve, now }, now)
         .context("learned-skill review failed")?;
     match outcome {
-        ReviewOutcome::Canary(result) => println!(
-            "Learned skill approved as canary: id={} generation={}",
-            result.skill_id, result.generation
-        ),
+        ReviewOutcome::Canary(result) => {
+            // Admission advances the durable desired generation. The operator
+            // command is not complete until that generation is published.
+            drop(evaluator);
+            let coordinator =
+                IndexCoordinator::open(paths, Arc::new(Embedder::from_config(embedding)?))?;
+            coordinator
+                .rebuild_and_publish()
+                .context("failed to publish approved learned-skill canary")?;
+            println!(
+                "Learned skill approved as canary: id={} generation={}",
+                result.skill_id, result.generation
+            );
+        }
         ReviewOutcome::Denied => println!("Learned skill rejected: id={proposal_id}"),
         ReviewOutcome::Cancelled | ReviewOutcome::TimedOut => {
             anyhow::bail!("local-owner learned-skill review did not complete")
@@ -544,7 +636,9 @@ fn activate_skill(
         skill_id,
         None,
         policy_version,
-        vec![report_id],
+        // Root activation is authorized by the report-bound second owner
+        // action above; it does not require a row in skill_evidence.
+        Vec::new(),
         BTreeMap::new(),
         row_version,
         None,
@@ -571,6 +665,7 @@ fn proposal_status(status: ProposalStatus) -> &'static str {
     match status {
         ProposalStatus::Pending => "pending",
         ProposalStatus::Evaluating => "evaluating",
+        ProposalStatus::Deferred => "deferred",
         ProposalStatus::Verified => "verified",
         ProposalStatus::Rejected => "rejected",
         ProposalStatus::AwaitingApproval => "awaiting_approval",
@@ -755,12 +850,42 @@ mod tests {
                 rusqlite::params!["a".repeat(64), artifact.id],
             )
             .unwrap();
+        for (evidence_id, turn_id, passed, linked) in [
+            ("with-pass", "with-1", 1, true),
+            ("with-fail", "with-2", 0, true),
+            ("without-pass", "without-1", 1, false),
+            ("without-fail", "without-2", 0, false),
+        ] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, created_at
+                     ) VALUES (?, ?, ?, 1, 'verify_command', 'same-command', 0, 42)",
+                    rusqlite::params![evidence_id, turn_id, passed],
+                )
+                .unwrap();
+            if linked {
+                store
+                    .conn_mut()
+                    .execute(
+                        "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+                         VALUES (?, ?)",
+                        rusqlite::params![evidence_id, artifact.id],
+                    )
+                    .unwrap();
+            }
+        }
 
         let rows = load_skill_stats(&store).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].invocations, 8);
         assert_eq!(rows[0].last_used, Some(42));
         assert_eq!(rows[0].success_percent(), 75.0);
+        assert_eq!(rows[0].tasks_with, 2);
+        assert_eq!(rows[0].passed_with, 1);
+        assert_eq!(rows[0].pass_rate_without_percent(), 50.0);
         assert_eq!(rows[0].estimated_round_trips_saved, 0);
 
         assert_eq!(estimate_round_trips_saved(6, 3), 12);
@@ -820,6 +945,91 @@ mod tests {
             assert_eq!(artifact.capability, CapabilityManifest::pure(), "{name}");
             artifact.verify_identity().unwrap();
         }
+    }
+
+    #[test]
+    fn operator_episode_preserves_generation_and_lifecycle_invariants_after_every_step() {
+        let (root, paths, _) = fixture();
+        let package_path = root.join("episode-seed.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&package_path, SEED_PACKAGES[0].1).unwrap();
+        let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let artifact = JsProposal::try_from(package.proposal)
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap();
+
+        let assert_state = |expected: &str| {
+            let store = SkillStore::open_at(&paths).unwrap();
+            assert_eq!(
+                store.metadata(&artifact.id).unwrap().unwrap().status,
+                expected
+            );
+            let generation = store.generation_state().unwrap();
+            assert_eq!(
+                generation.desired_generation, generation.applied_generation,
+                "published index must match durable desired generation after {expected}"
+            );
+            assert!(artifact.verify_identity().is_ok());
+        };
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Import(&package_path)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_state("verified");
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Approve(&artifact.id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_state("canary");
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Activate(&artifact.id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_state("active");
+
+        run(
+            None,
+            false,
+            Some(FeedbackOperation {
+                skill_id: &artifact.id,
+                invocation_id: None,
+                kind: "severe",
+                reason_code: "integrity",
+                idempotency_key: "gym-episode-severe",
+            }),
+            None,
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_state("quarantined");
+
+        run(Some(&artifact.id), false, None, None, &paths, None).unwrap();
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(store.metadata(&artifact.id).unwrap().is_none());
+        let generation = store.generation_state().unwrap();
+        assert_eq!(generation.desired_generation, generation.applied_generation);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
