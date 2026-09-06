@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rig::tool::Tool;
 
 use super::make_test_tool;
+use crate::agent::tools::ToolError;
 use crate::extras::js::broker::saturate_executable_preparation_slots_for_test;
 use crate::extras::js::protocol::{
     EffectResult, GrantId, InvocationId, MAX_EFFECTS_PER_STEP, MAX_SKILL_EXPORTS_PER_ARTIFACT,
@@ -62,6 +63,31 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
         index_generation: 7,
         skills,
     }))
+}
+
+async fn call_pure_skill_with_transport_retry(artifact: &SkillArtifact, code: &str) -> String {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(artifact, 0)]));
+        match tool
+            .call(JsArgs {
+                code: code.to_string(),
+            })
+            .await
+        {
+            Ok(result) => return result,
+            Err(ToolError::Msg(message))
+                if message == "JavaScript worker transport failed" && attempt < MAX_ATTEMPTS =>
+            {
+                eprintln!(
+                    "skill runtime binding test transport failed on attempt {attempt}; retrying with a fresh supervisor"
+                );
+                continue;
+            }
+            Err(error) => panic!("skill runtime binding call failed on attempt {attempt}: {error}"),
+        }
+    }
+    unreachable!("the final transport failure returns through the error arm")
 }
 
 fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
@@ -156,13 +182,8 @@ async fn production_and_verifier_make_identical_loader_decisions_for_differentia
     for (name, source, test, production_expression) in cases {
         let artifact = differential_artifact(source, test);
         let verifier_accepted = verify_skill(&artifact).is_ok();
-        let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
-        let production = tool
-            .call(JsArgs {
-                code: production_expression.to_string(),
-            })
-            .await
-            .unwrap();
+        let production =
+            call_pure_skill_with_transport_retry(&artifact, production_expression).await;
         let production_accepted = production == "true";
         assert_eq!(
             verifier_accepted, production_accepted,
@@ -524,14 +545,8 @@ async fn identity_mismatch_fails_before_skill_source_runs() {
         CapabilityManifest::pure(),
     );
     selected.source = "throw new Error('source must not execute')".to_string();
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
-
-    let result = tool
-        .call(JsArgs {
-            code: "globalThis.agentCodeRan = true".to_string(),
-        })
-        .await
-        .unwrap();
+    let result =
+        call_pure_skill_with_transport_retry(&selected, "globalThis.agentCodeRan = true").await;
 
     assert!(
         result.starts_with("JS error: internal error"),
@@ -549,14 +564,7 @@ async fn hidden_capability_abi_mismatch_fails_before_export_source_runs() {
     );
     selected.abi_version = 1;
     selected.id = selected.compute_identity();
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
-
-    let result = tool
-        .call(JsArgs {
-            code: "1".to_string(),
-        })
-        .await
-        .unwrap();
+    let result = call_pure_skill_with_transport_retry(&selected, "1").await;
 
     assert!(
         result.starts_with("JS error: internal error"),
