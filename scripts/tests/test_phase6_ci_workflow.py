@@ -420,6 +420,15 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("-- --exact --test-threads=1", isolated_step)
 
+    def test_windows_default_suite_serializes_process_global_fixtures(self) -> None:
+        body = job_body(self.workflow, "windows-default-tests")
+        header = body.split("    steps:\n", 1)[0]
+        self.assertIn("timeout-minutes: 60", header)
+        step = body.split("name: Test the Windows default feature suite", 1)[1].split(
+            "- name:", 1
+        )[0]
+        self.assertIn("cargo test --locked -- --test-threads=1", step)
+
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("kernel.apparmor_restrict_unprivileged_userns", linux)
