@@ -35,6 +35,10 @@ fn print_json_reserves_stdout_for_one_machine_readable_value() {
         .env("ZS_LOCAL_DATA_DIR", &root.0)
         .env("ZS_STATE_DIR", &root.0)
         .env("ZS_CACHE_DIR", &root.0)
+        // Startup resolves provider authentication before dispatching the local
+        // shell shortcut. Supply a non-secret test value so this process test is
+        // hermetic on CI runners without user credentials.
+        .env("OPENROUTER_API_KEY", "headless-json-test-key")
         .args([
             "--no-sandbox",
             "--no-session",
