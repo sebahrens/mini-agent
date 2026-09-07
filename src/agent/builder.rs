@@ -482,7 +482,16 @@ fn register_js_tool_with_status(
         backend, reason, ..
     } = containment_status
     {
-        tracing::warn!(backend = %backend, reason = %reason, "JavaScript tool unavailable");
+        // The reason is also recorded by `crate::provider::build_agent_in_workspace`
+        // into the session runtime report, which is what `/toggle` renders; the
+        // raw-mode TUI never shows `tracing` output, so this log alone is not an
+        // operator-visible signal. Interpolate the reason into the message too so
+        // log sinks that drop structured fields still carry it.
+        tracing::warn!(
+            backend = %backend,
+            reason = %reason,
+            "JavaScript tool unavailable ({backend}): {reason}"
+        );
         return;
     }
 

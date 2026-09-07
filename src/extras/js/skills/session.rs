@@ -20,6 +20,12 @@ use super::turn::{SkillRuntime, SkillTurnContext, shared_coordinator};
 use crate::config::EmbeddingConfig;
 use crate::paths::WorkspaceBinding;
 
+/// Bounded wait for the first learned-skill index publication. The first prompt
+/// of a session — the only prompt of a headless run — must see a hydrated index,
+/// so the initial rebuild is awaited here instead of only being scheduled. A
+/// session that exceeds this budget falls back to the background rebuild.
+const LEARNED_INDEX_HYDRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 struct WorkspaceSlot<T> {
     root: PathBuf,
     services: Arc<OnceCell<Option<Arc<T>>>>,
@@ -437,6 +443,42 @@ mod tests {
         assert_eq!(owner.initialization_attempts(), 0);
     }
 
+    #[tokio::test]
+    async fn session_open_publishes_a_hydrated_learned_index_before_the_first_turn() {
+        use crate::extras::js::skills::store::SkillStore;
+        use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+
+        let (root, paths) = app_paths();
+        let artifact = SkillArtifact::new(
+            "function hydratedStartupSkill(_cap, value) { return value.trim(); }".to_string(),
+            "Trim surrounding whitespace before the first turn.".to_string(),
+            vec!["text".to_string(), "trim".to_string()],
+            vec![SkillExport {
+                name: "hydratedStartupSkill".to_string(),
+                signature: "hydratedStartupSkill(value: string): string".to_string(),
+            }],
+            vec!["hydratedStartupSkill(' x ') === 'x'".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        SkillStore::open_at(&paths)
+            .and_then(|mut store| store.insert_verified(&artifact))
+            .unwrap();
+
+        let services = SkillSessionServices::open_with_paths(paths, None, false)
+            .await
+            .expect("session services");
+
+        assert_eq!(
+            services.learned_index_len_for_test(),
+            1,
+            "session startup must publish a hydrated index before any prepare_turn call"
+        );
+
+        drop(services);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn production_proposal_services_enqueue_into_the_durable_admission_queue() {
         use crate::extras::js::skills::proposal::{JsCapability, JsExport, JsProposal};
@@ -522,7 +564,14 @@ impl SkillSessionServices {
                 return None;
             }
         };
+        Self::open_with_paths(paths, embedding, enable_proposals).await
+    }
 
+    async fn open_with_paths(
+        paths: crate::paths::AppPaths,
+        embedding: Option<EmbeddingConfig>,
+        enable_proposals: bool,
+    ) -> Option<Arc<Self>> {
         let runtime_paths = paths.clone();
         let runtime_embedding = embedding.clone();
         let runtime = match crate::agent::runner::spawn_blocking_scoped(move || {
@@ -540,7 +589,15 @@ impl SkillSessionServices {
                 return None;
             }
         };
-        runtime.schedule_learned_rebuild();
+        // Hydrate once, synchronously and bounded, so the first prepared turn
+        // leases a published generation instead of the empty startup index. Every
+        // failure mode degrades to the previous stale-while-revalidate behaviour.
+        if !runtime
+            .hydrate_learned_index(LEARNED_INDEX_HYDRATION_BUDGET)
+            .await
+        {
+            runtime.schedule_learned_rebuild();
+        }
 
         let observation = match Self::start_observation_services(&paths, embedding.as_ref()) {
             Ok(services) => Some(services),
@@ -618,6 +675,11 @@ impl SkillSessionServices {
 
     pub(crate) fn turn_context(&self) -> Arc<SkillTurnContext> {
         self.runtime.turn_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn learned_index_len_for_test(&self) -> usize {
+        self.runtime.learned_index_len_for_test()
     }
 
     pub(crate) async fn prepare_prompt(&self, prompt: &str) -> String {

@@ -1832,6 +1832,16 @@ pub async fn build_agent_in_workspace(
         cfg.enable_skill_proposals.unwrap_or(false),
     )
     .await;
+    // The containment preflight decided here is the only place the specific
+    // refusal reason exists. Record it so the operator surface can name it;
+    // otherwise the JS tool and the whole learned-skill subsystem vanish with
+    // nothing on screen to say why.
+    #[cfg(feature = "js")]
+    record_js_runtime_report(js_runtime_report_from(
+        &js_worker_containment_status,
+        #[cfg(feature = "skills")]
+        skills.is_some(),
+    ));
     let completion_verification = runner::CompletionVerification::from_config(cfg, sandbox.clone());
     #[cfg(feature = "skills")]
     let completion_verification = match skills
@@ -2020,6 +2030,120 @@ async fn resolve_skill_services(
         return None;
     }
     owner.resolve(workspace, embedding, enable_proposals).await
+}
+
+/// Availability of one operator-visible runtime subsystem.
+///
+/// The JavaScript worker containment preflight already computes a specific
+/// reason for every refusal, but that reason used to die in a `tracing::warn!`
+/// that the raw-mode TUI never renders. Keeping it in a value lets the operator
+/// surface print it verbatim.
+// Which variants a given build constructs depends on the feature combination
+// (`NotCompiled` only without `js`/`skills`, `Available` only with them), so on
+// any single feature set one variant looks unused.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAvailability {
+    /// Requested, compiled in, and the containment preflight passed.
+    Available,
+    /// Compiled in but not live. `reason` is the verbatim preflight reason.
+    Unavailable { reason: String },
+    /// The owning Cargo feature is not compiled into this build.
+    NotCompiled,
+}
+
+/// Whether the brokered JavaScript runtime and the learned-skill subsystem are
+/// actually live for this session, and why not when they are not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsRuntimeReport {
+    pub javascript: RuntimeAvailability,
+    pub learned_skills: RuntimeAvailability,
+}
+
+impl JsRuntimeReport {
+    /// The report to show before any agent build has recorded one. A compiled-in
+    /// subsystem is reported as not-yet-probed rather than as available, so the
+    /// surface never claims more than has been verified.
+    fn unreported() -> Self {
+        #[cfg(feature = "js")]
+        let javascript = RuntimeAvailability::Unavailable {
+            reason: "startup containment probe has not run yet".to_string(),
+        };
+        #[cfg(not(feature = "js"))]
+        let javascript = RuntimeAvailability::NotCompiled;
+        #[cfg(feature = "skills")]
+        let learned_skills = RuntimeAvailability::Unavailable {
+            reason: "startup containment probe has not run yet".to_string(),
+        };
+        #[cfg(not(feature = "skills"))]
+        let learned_skills = RuntimeAvailability::NotCompiled;
+        Self {
+            javascript,
+            learned_skills,
+        }
+    }
+}
+
+static JS_RUNTIME_REPORT: std::sync::RwLock<Option<JsRuntimeReport>> = std::sync::RwLock::new(None);
+
+/// The last recorded JavaScript/learned-skill availability for this process.
+pub fn js_runtime_report() -> JsRuntimeReport {
+    match JS_RUNTIME_REPORT.read() {
+        Ok(guard) => match &*guard {
+            Some(report) => report.clone(),
+            None => JsRuntimeReport::unreported(),
+        },
+        Err(_) => JsRuntimeReport::unreported(),
+    }
+}
+
+/// Only the `js` build resolves containment, so only it has anything to record.
+#[cfg(feature = "js")]
+fn record_js_runtime_report(report: JsRuntimeReport) {
+    if let Ok(mut guard) = JS_RUNTIME_REPORT.write() {
+        *guard = Some(report);
+    }
+}
+
+/// Turns the containment preflight outcome into the operator-facing report.
+///
+/// Pure so the reason-propagation contract is unit-testable without launching a
+/// worker.
+#[cfg(feature = "js")]
+fn js_runtime_report_from(
+    containment: &crate::sandbox::worker::WorkerContainmentStatus,
+    #[cfg(feature = "skills")] skills_active: bool,
+) -> JsRuntimeReport {
+    let javascript = match containment {
+        crate::sandbox::worker::WorkerContainmentStatus::Available { .. } => {
+            RuntimeAvailability::Available
+        }
+        crate::sandbox::worker::WorkerContainmentStatus::Unavailable { reason, .. } => {
+            RuntimeAvailability::Unavailable {
+                reason: reason.clone(),
+            }
+        }
+    };
+    #[cfg(feature = "skills")]
+    let learned_skills = if skills_active {
+        RuntimeAvailability::Available
+    } else {
+        match &javascript {
+            RuntimeAvailability::Available => RuntimeAvailability::Unavailable {
+                reason: "learned-skill services did not initialize".to_string(),
+            },
+            RuntimeAvailability::Unavailable { reason } => RuntimeAvailability::Unavailable {
+                reason: format!("requires the contained JavaScript worker: {reason}"),
+            },
+            RuntimeAvailability::NotCompiled => RuntimeAvailability::NotCompiled,
+        }
+    };
+    #[cfg(not(feature = "skills"))]
+    let learned_skills = RuntimeAvailability::NotCompiled;
+    JsRuntimeReport {
+        javascript,
+        learned_skills,
+    }
 }
 
 #[cfg(feature = "js")]

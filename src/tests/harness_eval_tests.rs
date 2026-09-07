@@ -499,6 +499,40 @@ fn harness_eval_fixture_contract_is_complete() {
 }
 
 #[cfg(all(feature = "skills", feature = "sandbox"))]
+#[derive(Debug)]
+struct GymArmMeasurement {
+    arm: &'static str,
+    turn_id: String,
+    provider_turns: usize,
+    tool_calls: usize,
+    total_tokens: u64,
+}
+
+/// Library-axis gym eval over `tests/harness_eval/task.json`.
+///
+/// Every axis in the emitted `HARNESS_EVAL` record is measured from what the
+/// arm actually did; none of them is a fixture constant:
+///
+/// * `provider_turns` — completion requests the scripted provider really
+///   received (`MockCompletionModel::requests`).
+/// * `tool_calls` — assistant tool calls in the transcript `run_print`
+///   returned.
+/// * `total_tokens` — cumulative usage `run_print` reconciled for the run.
+/// * `js_round_trips` — durable `skill_events` rows of kind `invoked` carrying
+///   that arm's own `turn_id`, i.e. learned-skill exports the contained worker
+///   really called.
+///
+/// The delta gate therefore compares two independently measured arms: the
+/// no-library arm must record zero learned-skill invocations, the library arm
+/// exactly one, and the two arms must agree on the three cost axes. A library
+/// arm that silently fell back to hand-written JavaScript emits no `invoked`
+/// event and fails the gate.
+///
+/// Deliberately *not* covered here (tracked separately): the library is seeded
+/// straight into the store instead of through operator admission
+/// (mini-agent-4q06), and every task shares one `defaults` entry
+/// (mini-agent-vmfi).
+#[cfg(all(feature = "skills", feature = "sandbox"))]
 #[tokio::test]
 async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     use crate::agent::runner::TaskOutcomeRecorder;
@@ -511,10 +545,10 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
 
     let specification: GymTaskFile = serde_json::from_str(GYM_TASKS).unwrap();
     assert_eq!(specification.tasks.len(), 20);
-    assert!(specification.defaults.budgets.max_provider_turns > 0);
-    assert_eq!(specification.defaults.budgets.max_tool_calls, 1);
-    assert!(specification.defaults.budgets.max_total_tokens > 0);
-    assert_eq!(specification.defaults.library, "seeds");
+    // Budgets are not asserted as constants here: they are handed to the agent
+    // as the real turn/token caps below and then compared against the measured
+    // cost of each arm.
+    let budgets = &specification.defaults.budgets;
 
     let state = EvalDirectory::new();
     let paths = crate::paths::AppPaths {
@@ -538,9 +572,17 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
         CapabilityManifest::pure(),
     )
     .unwrap();
-    SkillStore::open_at(&paths)
-        .and_then(|mut store| store.insert_verified(&skill))
-        .unwrap();
+    // Dispatch on the fixture's library axis rather than asserting its value:
+    // an unrecognised axis must fail loudly instead of silently seeding a
+    // library the fixture never asked for.
+    match specification.defaults.library.as_str() {
+        "seeds" => {
+            SkillStore::open_at(&paths)
+                .and_then(|mut store| store.insert_verified(&skill))
+                .unwrap();
+        }
+        other => panic!("unsupported gym library axis {other:?}"),
+    }
     let runtime = SkillRuntime::open(&paths, None)
         .unwrap()
         .with_test_policies(
@@ -554,9 +596,10 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     runtime.settle_learned_rebuild_for_test().await;
     let dispatcher = Arc::new(TelemetryDispatcher::spawn(&paths).unwrap());
 
+    let mut runs: Vec<(String, Vec<GymArmMeasurement>)> = Vec::new();
     for task in &specification.tasks {
         assert!(!task.tags.is_empty(), "{} tags", task.name);
-        let mut metrics = Vec::new();
+        let mut measurements: Vec<GymArmMeasurement> = Vec::new();
         for arm in ["none", "library"] {
             let directory = EvalDirectory::new();
             for (relative, content) in &specification.defaults.initial_files {
@@ -582,6 +625,9 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
             } else {
                 Arc::new(SkillTurnContext::new(TurnSkillBundle::empty("gym-none")))
             };
+            // Captured before the run so the arm's telemetry can be counted by
+            // turn afterwards; the bundle is only replaced at a turn boundary.
+            let turn_id = context.snapshot().turn_id.clone();
             let workspace =
                 Arc::new(crate::paths::WorkspaceBinding::capture(directory.path()).unwrap());
             let tool = JsTool::new(
@@ -593,15 +639,59 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
             .with_skill_turn_context(context.clone())
             .with_shared_telemetry(dispatcher.clone());
             let scripts = &specification.defaults.scripted_provider_turns[arm];
-            assert_eq!(scripts.len(), 1);
-            Tool::call(
-                &tool,
-                crate::extras::js::tool::JsArgs {
-                    code: scripts[0].clone(),
-                },
+            assert_eq!(scripts.len(), 1, "{} {arm} scripted turns", task.name);
+
+            // Run the arm through the production agent loop (as
+            // `harness_regression_eval` does) so provider turns, tool calls and
+            // tokens are observed rather than assumed.
+            let model = MockCompletionModel::from_stream_turns(vec![
+                tool_turn(
+                    &format!("gym-{arm}"),
+                    "js",
+                    serde_json::json!({ "code": scripts[0] }),
+                ),
+                done_turn(),
+            ]);
+            let agent = AgentBuilder::new(model.clone())
+                .tools(vec![Box::new(tool) as Box<dyn ToolDyn>])
+                .default_max_turns(budgets.max_provider_turns)
+                .build();
+            let (response, usage, interactions) = run_print(
+                &agent,
+                &specification.defaults.prompt,
+                true,
+                &RetryConfig::default(),
+                Some(budgets.max_total_tokens),
+                Vec::<Message>::new(),
+                #[cfg(feature = "hooks")]
+                None,
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{} {arm} run failed: {error:#}", task.name));
+
+            assert_eq!(response, "done", "{} {arm} terminal response", task.name);
+            let provider_turns = model.requests().len();
+            let tool_calls = count_tool_calls(&interactions);
+            assert!(
+                provider_turns <= budgets.max_provider_turns,
+                "{} {arm} used {provider_turns} provider turns (max {})",
+                task.name,
+                budgets.max_provider_turns
+            );
+            assert!(
+                tool_calls <= budgets.max_tool_calls,
+                "{} {arm} used {tool_calls} tool calls (max {})",
+                task.name,
+                budgets.max_tool_calls
+            );
+            assert!(
+                usage.total_tokens <= budgets.max_total_tokens,
+                "{} {arm} used {} tokens (max {})",
+                task.name,
+                usage.total_tokens,
+                budgets.max_total_tokens
+            );
+
             let passed =
                 collect_files(directory.path()) == specification.defaults.oracle.expected_files;
             TaskOutcomeRecorder::new(dispatcher.clone(), context, false).record_oracle(
@@ -610,21 +700,22 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
                 1,
             );
             assert!(passed, "{} {arm} oracle", task.name);
-            metrics.push((1_usize, 1_usize, 0_u64, 1_usize));
-            println!(
-                "HARNESS_EVAL {}",
-                serde_json::json!({"name": task.name, "library": arm, "success": true,
-                    "provider_turns": 1, "tool_calls": 1, "total_tokens": 0,
-                    "js_round_trips": 1, "production": false})
-            );
+            measurements.push(GymArmMeasurement {
+                arm,
+                turn_id,
+                provider_turns,
+                tool_calls,
+                total_tokens: usage.total_tokens,
+            });
         }
-        assert_eq!(
-            metrics[0], metrics[1],
-            "{} library invocation regression",
-            task.name
-        );
+        runs.push((task.name.clone(), measurements));
     }
 
+    let expected_outcomes = i64::try_from(runs.len() * 2).unwrap();
+    let expected_links = i64::try_from(runs.len()).unwrap();
+    // One `gymNormalize` call per library arm, and none from the no-library
+    // arms, so the seeded skill must show exactly one `invoked` event per task.
+    let expected_invocations = expected_links;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let store = SkillStore::open_at(&paths).unwrap();
@@ -644,14 +735,83 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
                 |row| row.get(0),
             )
             .unwrap();
-        if outcomes == 40 && links == 20 {
+        let invocations: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_events
+                 WHERE event_kind = 'invoked' AND skill_id = ?",
+                [&skill.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if outcomes == expected_outcomes
+            && links == expected_links
+            && invocations == expected_invocations
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "task outcomes were not durably ordered"
+            "gym telemetry was not durably ordered: outcomes {outcomes}/{expected_outcomes}, \
+             links {links}/{expected_links}, invocations {invocations}/{expected_invocations}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let store = SkillStore::open_at(&paths).unwrap();
+    let round_trips = |turn_id: &str| -> usize {
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_events
+                 WHERE event_kind = 'invoked' AND skill_id = ? AND turn_id = ?",
+                [skill.id.as_str(), turn_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        usize::try_from(count).unwrap()
+    };
+
+    for (name, arms) in &runs {
+        assert_eq!(arms.len(), 2, "{name} arms");
+        let none = &arms[0];
+        let library = &arms[1];
+        assert_eq!(none.arm, "none", "{name} first arm");
+        assert_eq!(library.arm, "library", "{name} second arm");
+        let none_round_trips = round_trips(&none.turn_id);
+        let library_round_trips = round_trips(&library.turn_id);
+        assert_eq!(
+            none_round_trips, 0,
+            "{name} no-library arm invoked a learned skill"
+        );
+        assert_eq!(
+            library_round_trips, 1,
+            "{name} library arm must invoke the seeded skill exactly once"
+        );
+        assert_eq!(
+            (none.provider_turns, none.tool_calls, none.total_tokens),
+            (
+                library.provider_turns,
+                library.tool_calls,
+                library.total_tokens
+            ),
+            "{name} library invocation regression"
+        );
+        for (arm, js_round_trips) in [(none, none_round_trips), (library, library_round_trips)] {
+            println!(
+                "HARNESS_EVAL {}",
+                serde_json::json!({
+                    "name": name,
+                    "library": arm.arm,
+                    "success": true,
+                    "provider_turns": arm.provider_turns,
+                    "tool_calls": arm.tool_calls,
+                    "total_tokens": arm.total_tokens,
+                    "js_round_trips": js_round_trips,
+                    "production": false,
+                })
+            );
+        }
     }
 }
 

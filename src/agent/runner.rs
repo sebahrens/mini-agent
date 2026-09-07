@@ -1625,6 +1625,23 @@ pub fn convert_history_shared_with_tool_result_retention(
     history
 }
 
+/// Rewrites a persisted tool identity into one that is safe to replay.
+///
+/// The OpenAI Responses API treats a native `fc_...` `function_call` id as a
+/// reference to an item it already stored, and then requires the `reasoning`
+/// item that was emitted alongside it. Persisted sessions carry no reasoning
+/// items, so replaying a native id fails every continuation with "provided
+/// without its required 'reasoning' item". Rig omits non-`fc_` ids on
+/// serialization and pairs a call with its output by `call_id` alone, so a
+/// rewritten identity is accepted by both API styles as long as the call and
+/// its result agree on it.
+fn replay_tool_identity(id: &str) -> String {
+    match id.strip_prefix("fc_") {
+        Some(rest) => format!("call_{rest}"),
+        None => id.to_string(),
+    }
+}
+
 fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) -> Vec<Message> {
     let (summary, first_kept) = session.compacted_context();
     let replay_messages =
@@ -1715,8 +1732,10 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                             && !open_call_ids.contains(id.as_str()) =>
                     {
                         open_call_ids.insert(id.to_string());
-                        Some(AssistantContent::tool_call(
-                            id.to_string(),
+                        let replay_id = replay_tool_identity(id);
+                        Some(AssistantContent::tool_call_with_call_id(
+                            replay_id.clone(),
+                            replay_id,
                             name.to_string(),
                             arguments.clone(),
                         ))
@@ -1749,9 +1768,10 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                             && !completed_call_ids.contains(id.as_str()) =>
                     {
                         completed_call_ids.insert(id.to_string());
+                        let replay_id = replay_tool_identity(id);
                         Some(UserContent::ToolResult(ToolResult {
-                            id: id.to_string(),
-                            call_id: None,
+                            id: replay_id.clone(),
+                            call_id: Some(replay_id),
                             content: OneOrMany::one(ToolResultContent::text(output.to_string())),
                         }))
                     }

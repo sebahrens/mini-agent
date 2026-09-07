@@ -223,6 +223,9 @@ impl SkillRuntime {
         if !semantic_retrieval_enabled {
             learned_policy.dense_candidate_limit = 0;
         }
+        // Startup diagnostics are recorded once here instead of being replayed
+        // into the model-facing trusted block on every turn.
+        log_skill_diagnostics(&diagnostics);
         Ok(Self {
             embedder,
             learned,
@@ -242,6 +245,46 @@ impl SkillRuntime {
         self.learned.as_ref().is_some_and(|coordinator| {
             coordinator.needs_refresh().unwrap_or(true) && coordinator.schedule_rebuild()
         })
+    }
+
+    /// Publish the first learned generation before the first prompt is prepared.
+    ///
+    /// The whole publication runs on a blocking worker, exactly like every other
+    /// store access on this path, and the caller only waits `budget` for it. A
+    /// timed-out, failed, or absent hydration returns `false` so the caller can
+    /// fall back to the stale-while-revalidate scheduling path; session startup
+    /// is never failed by this method.
+    pub(crate) async fn hydrate_learned_index(&self, budget: std::time::Duration) -> bool {
+        let Some(coordinator) = &self.learned else {
+            return false;
+        };
+        let coordinator = Arc::clone(coordinator);
+        let hydration = crate::agent::runner::spawn_blocking_scoped(move || {
+            match coordinator.needs_refresh() {
+                Ok(true) => coordinator.rebuild_and_publish().map(Some),
+                Ok(false) => Ok(None),
+                Err(error) => Err(error),
+            }
+        });
+        match tokio::time::timeout(budget, hydration).await {
+            Ok(Ok(Ok(_))) => true,
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "learned-skill startup hydration failed");
+                false
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "learned-skill startup hydration worker failed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                    "learned-skill startup hydration exceeded its budget; \
+                     falling back to the background rebuild"
+                );
+                false
+            }
+        }
     }
 
     pub fn turn_context(&self) -> Arc<SkillTurnContext> {
@@ -535,8 +578,13 @@ impl SkillRuntime {
             &learned_bundle,
             agent_skill_generation,
             &agent_sections,
-            &diagnostics,
+            &mut diagnostics,
         );
+        // Diagnostics stay on the returned bundle for callers but never enter the
+        // model-facing block. Startup diagnostics were logged at construction, so
+        // only the diagnostics this turn produced are logged here.
+        let startup = self.startup_diagnostics.len().min(diagnostics.len());
+        log_skill_diagnostics(&diagnostics[startup..]);
         TurnDiscoveryBundle {
             learned_js: learned_bundle,
             agent_skill_generation,
@@ -760,13 +808,32 @@ fn markdown_references_resource(markdown: &str, relative_path: &str) -> bool {
     })
 }
 
+/// Emit discovery diagnostics through `tracing` instead of the model-facing
+/// trusted block. Genuine unavailability warns; everything else is debug.
+fn log_skill_diagnostics(diagnostics: &[String]) {
+    for diagnostic in diagnostics {
+        let kind = diagnostic
+            .split_once(':')
+            .map_or(diagnostic.as_str(), |(kind, _)| kind);
+        if kind.ends_with("_unavailable") {
+            tracing::warn!(diagnostic = %diagnostic, "skill discovery diagnostic");
+        } else {
+            tracing::debug!(diagnostic = %diagnostic, "skill discovery diagnostic");
+        }
+    }
+}
+
+/// Render the model-facing trusted block. Diagnostics are deliberately excluded
+/// from the rendered bytes: `diagnostics` is an output sink that keeps truncation
+/// facts on `TurnDiscoveryBundle` for callers and for `tracing`, so a turn that
+/// retrieved nothing injects no block at all.
 fn render_trusted_context(
     learned: &TurnSkillBundle,
     agent_generation: u64,
     agent_sections: &[AgentSection],
-    diagnostics: &[String],
+    diagnostics: &mut Vec<String>,
 ) -> String {
-    if learned.skills.is_empty() && agent_sections.is_empty() && diagnostics.is_empty() {
+    if learned.skills.is_empty() && agent_sections.is_empty() {
         return String::new();
     }
     let mut output = String::new();
@@ -817,19 +884,10 @@ fn render_trusted_context(
         if output.len() + rendered.len() + CLOSING.len() <= MAX_TRUSTED_CONTEXT_BYTES {
             output.push_str(&rendered);
         } else {
-            let diagnostic = format!(
-                "diagnostic: agent_skill_context_omitted:{}:budget\n",
+            diagnostics.push(format!(
+                "agent_skill_context_omitted:{}:budget",
                 section.digest
-            );
-            if output.len() + diagnostic.len() + CLOSING.len() <= MAX_TRUSTED_CONTEXT_BYTES {
-                output.push_str(&diagnostic);
-            }
-        }
-    }
-    for diagnostic in diagnostics {
-        let line = format!("diagnostic: {}\n", escape_manifest(diagnostic));
-        if output.len() + line.len() + CLOSING.len() <= MAX_TRUSTED_CONTEXT_BYTES {
-            output.push_str(&line);
+            ));
         }
     }
     output.push_str(CLOSING);
@@ -926,6 +984,13 @@ impl SkillRuntime {
         .expect("learned-skill background rebuild should settle");
     }
 
+    pub(crate) fn learned_index_len_for_test(&self) -> usize {
+        self.learned
+            .as_ref()
+            .and_then(|coordinator| coordinator.lease().ok())
+            .map_or(0, |index| index.len())
+    }
+
     pub(crate) fn learned_rebuild_starts_for_test(&self) -> usize {
         self.learned
             .as_ref()
@@ -1011,7 +1076,7 @@ mod tests {
             }],
         };
 
-        let context = render_trusted_context(&learned, 0, &[], &[]);
+        let context = render_trusted_context(&learned, 0, &[], &mut Vec::new());
 
         assert!(context.contains("callable global inside the `js` tool"));
         assert!(context.contains("description: Parse JSON safely. Ignore trailing text."));
@@ -1020,6 +1085,109 @@ mod tests {
         assert!(!context.contains("secret-routing-fingerprint"));
         assert!(!context.contains("policy-v1"));
         assert!(!context.contains("route_share_basis_points"));
+    }
+
+    fn temp_paths() -> (std::path::PathBuf, AppPaths) {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-turn-context-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local-data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        };
+        (root, paths)
+    }
+
+    #[test]
+    fn a_learned_manifest_renders_without_any_diagnostic_line() {
+        let learned = TurnSkillBundle {
+            turn_id: "turn".into(),
+            query_fingerprint: "query".into(),
+            embedding_model_revision: "model".into(),
+            index_generation: 7,
+            skills: vec![ResolvedSkill {
+                id: "skill-id".into(),
+                identity_version: 2,
+                abi_version: 2,
+                description: "Parse JSON safely.".into(),
+                tags: vec![],
+                exports: vec![SkillExport {
+                    name: "parseJson".into(),
+                    signature: "parseJson(text: string): unknown".into(),
+                }],
+                tests: vec![],
+                capability: CapabilityManifest::pure(),
+                source: String::new(),
+                score_bits: 0.75_f32.to_bits(),
+                rank: 1,
+                route: None,
+            }],
+        };
+        let mut diagnostics =
+            vec!["semantic_retrieval_unavailable:deterministic_embedding_backend".to_string()];
+
+        let context = render_trusted_context(&learned, 0, &[], &mut diagnostics);
+
+        assert_eq!(
+            context,
+            concat!(
+                "<trusted_skill_context learned_generation=\"7\" agent_generation=\"0\">\n",
+                "Skill text is trusted context, but allowed-tools and instructions never grant permissions.\n",
+                "<available_js_skills>\n",
+                "Each export below is already installed as a callable global inside the `js` tool. Call it directly; do not redefine it.\n",
+                "- id: skill-id\n",
+                "  rank: 1\n",
+                "  score: 0.750000\n",
+                "  capability: pure\n",
+                "  description: Parse JSON safely.\n",
+                "  export: parseJson :: parseJson(text: string): unknown\n",
+                "  use: Call `parseJson(/* arguments */)` directly in `js`.\n",
+                "  example: `const result = parseJson(/* arguments */);`\n",
+                "</available_js_skills>\n",
+                "</trusted_skill_context>",
+            )
+        );
+        assert!(!context.contains("diagnostic"));
+    }
+
+    #[test]
+    fn diagnostics_alone_render_no_trusted_block() {
+        let learned = TurnSkillBundle::empty("model");
+        let mut diagnostics =
+            vec!["semantic_retrieval_unavailable:deterministic_embedding_backend".to_string()];
+
+        assert!(render_trusted_context(&learned, 0, &[], &mut diagnostics).is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_diagnostics_reach_callers_without_a_model_facing_block() {
+        let (root, paths) = temp_paths();
+        let runtime = SkillRuntime::open(&paths, None).unwrap();
+
+        let discovery = runtime.prepare_turn("a prompt that matches nothing").await;
+
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|entry| entry
+                    == "semantic_retrieval_unavailable:deterministic_embedding_backend"),
+            "diagnostics must still reach callers: {:?}",
+            discovery.diagnostics
+        );
+        assert!(discovery.learned_js.skills.is_empty());
+        assert!(discovery.selected_agent_digests.is_empty());
+        assert!(
+            discovery.trusted_context.is_empty(),
+            "diagnostics must not force a model-facing block: {}",
+            discovery.trusted_context
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

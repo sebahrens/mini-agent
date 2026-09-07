@@ -265,3 +265,89 @@ fn old_tool_results_are_cleared_without_dropping_calls_or_mutating_the_session()
         "request-time pruning must not rewrite the durable transcript"
     );
 }
+
+/// The Responses API pairs a `function_call` with its output by `call_id`, and
+/// rejects the request outright when a replayed call carries none.
+#[test]
+fn structured_tool_history_carries_call_id_for_the_responses_api() {
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "edit it");
+    session.add_tool_call_with_id("call-1", "edit", &serde_json::json!({"path": "a.rs"}));
+    session.add_tool_result_with_id("call-1", "edit", "ok");
+
+    let history = convert_history(&session);
+    let Message::Assistant { content, .. } = &history[1] else {
+        panic!("tool call must replay as an assistant message")
+    };
+    let AssistantContent::ToolCall(call) = content.first() else {
+        panic!("tool call must remain structured")
+    };
+    let Message::User { content } = &history[2] else {
+        panic!("tool result must replay in a user message")
+    };
+    let UserContent::ToolResult(result) = content.first() else {
+        panic!("tool result must remain structured")
+    };
+
+    assert_eq!(call.call_id.as_deref(), Some("call-1"));
+    assert_eq!(result.call_id.as_deref(), Some("call-1"));
+    assert_eq!(call.call_id, result.call_id);
+}
+
+/// A native `fc_...` id makes the Responses API demand the reasoning item that
+/// was emitted with it. Persisted sessions store no reasoning items, so replay
+/// must not present the call as a stored provider item.
+#[test]
+fn native_function_call_ids_are_rewritten_so_replay_needs_no_reasoning_item() {
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "edit it");
+    session.add_tool_call_with_id("fc_abc123", "edit", &serde_json::json!({"path": "a.rs"}));
+    session.add_tool_result_with_id("fc_abc123", "edit", "ok");
+
+    let history = convert_history(&session);
+    let Message::Assistant { content, .. } = &history[1] else {
+        panic!("tool call must replay as an assistant message")
+    };
+    let AssistantContent::ToolCall(call) = content.first() else {
+        panic!("tool call must remain structured")
+    };
+    let Message::User { content } = &history[2] else {
+        panic!("tool result must replay in a user message")
+    };
+    let UserContent::ToolResult(result) = content.first() else {
+        panic!("tool result must remain structured")
+    };
+
+    assert!(
+        !call.id.starts_with("fc_"),
+        "a native function_call item id must not be replayed: {}",
+        call.id
+    );
+    assert_eq!(call.call_id.as_deref(), Some("call_abc123"));
+    assert_eq!(result.call_id, call.call_id);
+    assert_eq!(result.id, call.id);
+}
+
+/// End-to-end guard: rig's Responses request builder converts every history
+/// item through `TryFrom`, and returns `RequestError` before any HTTP call when
+/// a tool call or result is missing its `call_id`.
+#[test]
+fn replayed_tool_history_converts_into_responses_api_input_items() {
+    use rig::providers::openai::responses_api::InputItem;
+
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "edit it");
+    session.add_tool_call_with_id("fc_abc123", "edit", &serde_json::json!({"path": "a.rs"}));
+    session.add_tool_result_with_id("fc_abc123", "edit", "ok");
+    session.add_message(MessageRole::Assistant, "done");
+    session.add_message(MessageRole::User, "now the next thing");
+
+    for message in convert_history(&session) {
+        let converted = <Vec<InputItem>>::try_from(message.clone());
+        assert!(
+            converted.is_ok(),
+            "replayed history must build Responses input items: {:?}",
+            converted.err()
+        );
+    }
+}

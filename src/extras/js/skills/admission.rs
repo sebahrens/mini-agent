@@ -40,6 +40,12 @@ pub(crate) struct AdmissionEvaluator {
     worker_id: String,
     #[cfg(test)]
     verification_failure: Option<VerificationError>,
+    #[cfg(test)]
+    review_gate_failure: Option<VerificationError>,
+    /// Counts contained approval-gate re-runs so tests can pin the
+    /// "exactly one contained gate per `review_and_admit`" cost property.
+    #[cfg(test)]
+    review_gate_runs: std::cell::Cell<usize>,
 }
 
 impl AdmissionEvaluator {
@@ -58,6 +64,10 @@ impl AdmissionEvaluator {
             worker_id,
             #[cfg(test)]
             verification_failure: None,
+            #[cfg(test)]
+            review_gate_failure: None,
+            #[cfg(test)]
+            review_gate_runs: std::cell::Cell::new(0),
         })
     }
 
@@ -345,7 +355,10 @@ impl AdmissionEvaluator {
             .store
             .get(&proposal.skill_id)?
             .ok_or_else(|| AdmissionError::NotFound(proposal.skill_id.clone()))?;
-        self.revalidate_review_gates(&proposal, &report, &artifact)?;
+        // The contained held-out gate is expensive and is re-run exactly once,
+        // on the approval path only, after the reviewed record is confirmed
+        // unchanged. Running it here as well doubled the cost of every approval
+        // and made a denial impossible while the worker was unavailable.
         let artifact_version = self
             .store
             .revision_row_version(&artifact.id)?
@@ -397,6 +410,14 @@ impl AdmissionEvaluator {
                     || current_artifact_version != artifact_version
                 {
                     return Err(AdmissionError::StaleReview);
+                }
+                // Semantic equality above proves the reviewed record is intact;
+                // this single contained re-run additionally proves the gates
+                // still pass against the current store (for example after a
+                // held-out suite was disabled mid-review).
+                #[cfg(test)]
+                if let Some(error) = self.review_gate_failure.take() {
+                    return Err(review_gate_verification_error(&error));
                 }
                 self.revalidate_review_gates(
                     &current_proposal,
@@ -461,12 +482,21 @@ impl AdmissionEvaluator {
         Ok(())
     }
 
+    /// Re-run every admission gate against the current store.
+    ///
+    /// This runs exactly once per `review_and_admit` call, and only on the
+    /// approval path. Failures are classified by cause: a transient
+    /// verification outage is retryable and must not be reported to operators
+    /// as a changed review, and neither is an active duplicate or a missing
+    /// compatible embedding.
     fn revalidate_review_gates(
         &self,
         proposal: &super::store::ProposalRecord,
         report: &EvaluationReportRecord,
         artifact: &SkillArtifact,
     ) -> Result<(), AdmissionError> {
+        #[cfg(test)]
+        self.review_gate_runs.set(self.review_gate_runs.get() + 1);
         artifact
             .verify_identity()
             .map_err(|_| AdmissionError::StaleReview)?;
@@ -494,10 +524,10 @@ impl AdmissionEvaluator {
             return Err(AdmissionError::StaleReview);
         }
         if self.is_policy_duplicate(artifact, proposal.predecessor_id.as_deref())? {
-            return Err(AdmissionError::StaleReview);
+            return Err(AdmissionError::DuplicateOfActive);
         }
         let held_out = evaluate(&self.store, artifact, predecessor.as_ref())
-            .map_err(|_| AdmissionError::StaleReview)?;
+            .map_err(review_gate_held_out_error)?;
         if held_out.skill_id != artifact.id
             || held_out.predecessor_id != proposal.predecessor_id
             || held_out.suite_hashes != report.suite_hashes
@@ -510,13 +540,13 @@ impl AdmissionEvaluator {
             report.embedding_model_id.as_deref(),
             report.embedding_model_revision.as_deref(),
         ) else {
-            return Err(AdmissionError::StaleReview);
+            return Err(AdmissionError::EmbeddingUnavailable);
         };
         if !self
             .store
             .has_compatible_embedding(&artifact.id, model_id, model_revision)?
         {
-            return Err(AdmissionError::StaleReview);
+            return Err(AdmissionError::EmbeddingUnavailable);
         }
         Ok(())
     }
@@ -529,6 +559,19 @@ impl AdmissionEvaluator {
     #[cfg(test)]
     pub(crate) fn fail_next_verification_for_test(&mut self, error: VerificationError) {
         self.verification_failure = Some(error);
+    }
+
+    /// Fail the next approval-gate re-run with `error`, standing in for a
+    /// contained worker that is unavailable at approval time.
+    #[cfg(test)]
+    pub(crate) fn fail_next_review_gate_for_test(&mut self, error: VerificationError) {
+        self.review_gate_failure = Some(error);
+    }
+
+    /// Number of contained approval-gate re-runs performed so far.
+    #[cfg(test)]
+    pub(crate) fn review_gate_runs_for_test(&self) -> usize {
+        self.review_gate_runs.get()
     }
 
     #[cfg(test)]
@@ -681,6 +724,9 @@ fn admission_error_kind(error: &AdmissionError) -> &'static str {
         AdmissionError::NotFound(_) => "not_found",
         AdmissionError::NotAwaitingApproval => "not_awaiting_approval",
         AdmissionError::MissingReport => "missing_report",
+        AdmissionError::Infrastructure(_) => "infrastructure_unavailable",
+        AdmissionError::DuplicateOfActive => "duplicate_of_active",
+        AdmissionError::EmbeddingUnavailable => "embedding_unavailable",
         AdmissionError::StaleReview => "stale_review",
         AdmissionError::UnauthenticatedApproval => "unauthenticated_approval",
         AdmissionError::CanaryBecameRetrievable => "canary_became_retrievable",
@@ -885,14 +931,39 @@ fn classify_store(error: StoreError) -> EvaluationFailure {
     }
 }
 
+/// Classify an approval-gate verification failure.
+///
+/// Only a failure attributable to the reviewed record itself may be reported as
+/// a stale review; infrastructure outages are retryable and must say so.
+fn review_gate_verification_error(error: &VerificationError) -> AdmissionError {
+    if error.is_infrastructure() {
+        AdmissionError::Infrastructure(error.to_string())
+    } else {
+        AdmissionError::StaleReview
+    }
+}
+
+fn review_gate_held_out_error(error: HeldOutError) -> AdmissionError {
+    match error {
+        HeldOutError::Infrastructure(error)
+        | HeldOutError::Embedded(error)
+        | HeldOutError::Inherited(error) => review_gate_verification_error(&error),
+        HeldOutError::Store(error) => AdmissionError::Store(error),
+        _ => AdmissionError::StaleReview,
+    }
+}
+
 fn classify_verification(
     error: &VerificationError,
     fallback_code: &'static str,
     fallback_detail: &'static str,
 ) -> EvaluationFailure {
-    if let VerificationError::InfrastructureUnavailable(message) = error {
+    // Runtime creation, context creation, and the worker verification contract
+    // are build- and parent-owned. Attributing them to the candidate would
+    // permanently reject an identity that can never be re-proposed.
+    if error.is_infrastructure() {
         return EvaluationFailure::Infrastructure {
-            error: message.clone(),
+            error: error.to_string(),
         };
     }
     let resource_limited = match error {
@@ -900,9 +971,7 @@ fn classify_verification(
             outcome,
             TestResult::Timeout | TestResult::OutOfMemory | TestResult::JobLimitExceeded
         ),
-        VerificationError::RuntimeCreationFailed(message)
-        | VerificationError::ContextCreationFailed(message)
-        | VerificationError::SourceEvaluationFailed(message)
+        VerificationError::SourceEvaluationFailed(message)
         | VerificationError::MutationPassFailed {
             reason: message, ..
         } => {
@@ -1061,6 +1130,12 @@ pub(crate) enum AdmissionError {
     NotAwaitingApproval,
     #[error("evaluation report is missing")]
     MissingReport,
+    #[error("verification infrastructure was unavailable while re-running the approval gate: {0}")]
+    Infrastructure(String),
+    #[error("an active skill already has the same normalized contract")]
+    DuplicateOfActive,
+    #[error("no compatible embedding is available for the reviewed skill")]
+    EmbeddingUnavailable,
     #[error("reviewed proposal changed before approval")]
     StaleReview,
     #[error("approval is not backed by a fresh authenticated human session")]
@@ -1074,6 +1149,124 @@ pub(crate) enum AdmissionError {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+    use crate::extras::js::protocol::{
+        Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationResult,
+    };
+    use crate::extras::js::skills::verify::{test_result, validate_worker_result, worker_error};
+    use crate::extras::js::supervisor::WorkerError;
+
+    fn assert_never_permanently_rejects(error: &VerificationError, context: &str) {
+        let failure = classify_verification(
+            error,
+            "embedded_test_failed",
+            "embedded verification failed",
+        );
+        assert!(
+            matches!(failure, EvaluationFailure::Infrastructure { .. }),
+            "{context} must classify as retryable infrastructure; otherwise the proposal identity is permanently rejected"
+        );
+    }
+
+    #[test]
+    fn parent_side_verification_timeout_is_retryable_admission_infrastructure() {
+        // The 30s deadline is fixed before the job is queued and the wait
+        // includes queueing behind interactive JS, so a busy session must not
+        // be able to permanently reject an innocent proposal.
+        let error = worker_error(WorkerError::TimedOut);
+        assert!(
+            matches!(error, VerificationError::InfrastructureUnavailable(_)),
+            "parent-side deadline expiry is not attributable to the skill source"
+        );
+        assert_never_permanently_rejects(&error, "a parent-side verification deadline");
+    }
+
+    #[test]
+    fn native_cpu_exhaustion_is_retryable_admission_infrastructure() {
+        // RLIMIT_CPU is cumulative per worker process and worker processes are
+        // reused, so earlier interactive JS can exhaust it for this proposal.
+        let error = worker_error(WorkerError::NativeCpuLimit);
+        assert!(
+            matches!(error, VerificationError::InfrastructureUnavailable(_)),
+            "a cumulative per-process CPU cap is not attributable to the skill source"
+        );
+        assert_never_permanently_rejects(&error, "a native CPU limit kill");
+    }
+
+    #[test]
+    fn worker_internal_diagnostic_is_retryable_admission_infrastructure() {
+        // `DiagnosticClass::Internal` is emitted only for the worker's own
+        // host-side failures (Runtime::new, binding preparation, Context::full,
+        // missing trusted bootstrap bytecode).
+        let internal = Diagnostic {
+            class: DiagnosticClass::Internal,
+            stage: DiagnosticStage::Initialization,
+            script_role: ScriptRole::SkillSource,
+            exception_class: None,
+            line: None,
+            column: None,
+        };
+        let error = test_result(Some(&internal))
+            .expect_err("a worker internal failure is not a candidate test outcome");
+        assert!(matches!(
+            error,
+            VerificationError::InfrastructureUnavailable(_)
+        ));
+        assert_never_permanently_rejects(&error, "a worker internal diagnostic");
+
+        // A genuinely skill-attributable diagnostic still classifies as a
+        // deterministic outcome, so the fix does not blanket-excuse failures.
+        let thrown = Diagnostic {
+            class: DiagnosticClass::Exception,
+            stage: DiagnosticStage::Evaluation,
+            script_role: ScriptRole::EmbeddedTest,
+            exception_class: None,
+            line: None,
+            column: None,
+        };
+        assert!(matches!(
+            test_result(Some(&thrown)).expect("a thrown exception is a test outcome"),
+            TestResult::Threw(_)
+        ));
+        let deterministic_failure = classify_verification(
+            &VerificationError::TestFailed {
+                index: 0,
+                outcome: TestResult::ReturnedFalse,
+            },
+            "embedded_test_failed",
+            "embedded verification failed",
+        );
+        assert!(matches!(
+            deterministic_failure,
+            EvaluationFailure::Deterministic { .. }
+        ));
+    }
+
+    #[test]
+    fn worker_verification_contract_mismatch_is_retryable_admission_infrastructure() {
+        let case_count_mismatch = VerificationResult {
+            passed: false,
+            cases: Vec::new(),
+            loader_version: 1,
+        };
+        let error = validate_worker_result(&case_count_mismatch, 1)
+            .expect_err("a case-count mismatch breaks the worker contract");
+        assert!(matches!(error, VerificationError::RuntimeCreationFailed(_)));
+        assert_never_permanently_rejects(&error, "a worker verification case-count mismatch");
+
+        let loader_skew = VerificationResult {
+            passed: false,
+            cases: Vec::new(),
+            loader_version: u16::MAX,
+        };
+        let error = validate_worker_result(&loader_skew, 0)
+            .expect_err("loader-version skew breaks the worker contract");
+        assert_never_permanently_rejects(&error, "worker loader-version skew");
+
+        assert_never_permanently_rejects(
+            &VerificationError::ContextCreationFailed("allocation failed".to_string()),
+            "a worker context creation failure",
+        );
+    }
 
     #[test]
     fn verification_scheduler_queue_outage_is_retryable_admission_infrastructure() {

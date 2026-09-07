@@ -237,6 +237,23 @@ pub struct ReplacementTransitionOutcome {
     pub replayed: bool,
 }
 
+/// How a replacement promotion is authorized.
+///
+/// `EvidenceThreshold` revalidates the durable promotion policy against stored
+/// invocation and task-outcome evidence inside the transaction. `LocalOwner` is
+/// the explicit operator surface: it deliberately does not consult the
+/// evidence-threshold policy and instead consumes a single-use approval
+/// authority bound to a *second*, distinct local-owner action — exactly the
+/// property lineage-root activation enforces.
+#[derive(Debug, Clone, Copy)]
+enum PromotionAuthority<'a> {
+    EvidenceThreshold,
+    LocalOwner {
+        approval: &'a HumanApproval,
+        authorization: &'a super::store::ApprovalAuthorization,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct HumanApproval {
     approval_id: String,
@@ -379,6 +396,34 @@ impl<'a> CoordinatedLifecycle<'a> {
             .map_err(Into::into)
     }
 
+    /// Coordinated counterpart of
+    /// [`LifecycleService::promote_replacement_by_local_owner`]. It runs behind
+    /// the same new-turn gate and republishes the immutable index exactly as
+    /// root activation does.
+    pub(crate) fn promote_replacement_by_local_owner(
+        &self,
+        request: &ReplacementTransitionRequest,
+        approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
+        predecessor_from: LifecycleStatus,
+        created_at: i64,
+    ) -> Result<(ReplacementTransitionOutcome, PublicationReport), LifecyclePublicationError> {
+        let removed = HashSet::from([request.predecessor_id.clone()]);
+        self.coordinator
+            .coordinate_mutation(removed, |store| {
+                let outcome = LifecycleService::new(store).promote_replacement_by_local_owner(
+                    request,
+                    approval,
+                    authorization,
+                    predecessor_from,
+                    created_at,
+                )?;
+                let generation = outcome.desired_generation as u64;
+                Ok((outcome, generation))
+            })
+            .map_err(Into::into)
+    }
+
     pub(crate) fn rollback_replacement(
         &self,
         request: &ReplacementTransitionRequest,
@@ -449,6 +494,28 @@ impl<'a> LifecycleService<'a> {
     /// adapter. Keeping construction here preserves the opaque binding between
     /// approval, artifact, report, and transition.
     pub(crate) fn authorize_root_local_owner(
+        &mut self,
+        skill_id: &str,
+        approval: &HumanApproval,
+        issued_at: i64,
+    ) -> Result<super::store::ApprovalAuthorization, LifecycleError> {
+        self.authorize_local_owner(skill_id, approval, issued_at)
+    }
+
+    /// Persist the same short-lived, single-use local-owner authority for the
+    /// explicit operator replacement-promotion surface. The store still pins
+    /// the fixed local-owner principal and the canary -> active transition, and
+    /// the authority is consumed inside the promotion transaction.
+    pub(crate) fn authorize_replacement_local_owner(
+        &mut self,
+        skill_id: &str,
+        approval: &HumanApproval,
+        issued_at: i64,
+    ) -> Result<super::store::ApprovalAuthorization, LifecycleError> {
+        self.authorize_local_owner(skill_id, approval, issued_at)
+    }
+
+    fn authorize_local_owner(
         &mut self,
         skill_id: &str,
         approval: &HumanApproval,
@@ -547,6 +614,32 @@ impl<'a> LifecycleService<'a> {
                 return Err(LifecycleError::IdempotencyConflict);
             }
         }
+        Ok(())
+    }
+
+    /// Record the operator's own promotion evidence.
+    ///
+    /// The row is the durable trace of one explicit local-owner promotion
+    /// action. It is stored under the dedicated `operator_promotion` kind so it
+    /// can never be mistaken for — or substituted into — the `qualified`
+    /// evidence that the evidence-threshold promotion policy consumes.
+    pub(crate) fn record_operator_promotion_evidence(
+        &mut self,
+        evidence_id: &str,
+        skill_id: &str,
+        policy_version: &str,
+        payload_json: &str,
+        created_at: i64,
+    ) -> Result<(), LifecycleError> {
+        let parsed: serde_json::Value = serde_json::from_str(payload_json)?;
+        let canonical = serde_json::to_string(&parsed)?;
+        self.store.connection_mut().execute(
+            "INSERT OR IGNORE INTO skill_evidence (
+                evidence_id, skill_id, evidence_kind, payload_json,
+                policy_version, created_at
+             ) VALUES (?, ?, 'operator_promotion', ?, ?, ?)",
+            params![evidence_id, skill_id, canonical, policy_version, created_at],
+        )?;
         Ok(())
     }
 
@@ -878,6 +971,44 @@ impl<'a> LifecycleService<'a> {
             LifecycleStatus::Active,
             LifecycleStatus::Active,
             LifecycleStatus::Superseded,
+            PromotionAuthority::EvidenceThreshold,
+            created_at,
+        )
+    }
+
+    /// Promote an approved replacement canary by explicit local-owner action.
+    ///
+    /// `predecessor_from` is restricted to `Active` (the ordinary replacement)
+    /// or `Quarantined` (the emergency path, where the defective predecessor
+    /// was quarantined before a replacement existed). Every other predecessor
+    /// state is refused, and no other transition in this module is loosened.
+    pub(crate) fn promote_replacement_by_local_owner(
+        &mut self,
+        request: &ReplacementTransitionRequest,
+        approval: &HumanApproval,
+        authorization: &super::store::ApprovalAuthorization,
+        predecessor_from: LifecycleStatus,
+        created_at: i64,
+    ) -> Result<ReplacementTransitionOutcome, LifecycleError> {
+        if !matches!(
+            predecessor_from,
+            LifecycleStatus::Active | LifecycleStatus::Quarantined
+        ) {
+            return Err(LifecycleError::IllegalTransition {
+                from: predecessor_from,
+                to: LifecycleStatus::Superseded,
+            });
+        }
+        self.replace_pair(
+            request,
+            LifecycleStatus::Canary,
+            LifecycleStatus::Active,
+            predecessor_from,
+            LifecycleStatus::Superseded,
+            PromotionAuthority::LocalOwner {
+                approval,
+                authorization,
+            },
             created_at,
         )
     }
@@ -893,10 +1024,12 @@ impl<'a> LifecycleService<'a> {
             LifecycleStatus::Quarantined,
             LifecycleStatus::Superseded,
             LifecycleStatus::Active,
+            PromotionAuthority::EvidenceThreshold,
             created_at,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace_pair(
         &mut self,
         request: &ReplacementTransitionRequest,
@@ -904,6 +1037,7 @@ impl<'a> LifecycleService<'a> {
         candidate_to: LifecycleStatus,
         predecessor_from: LifecycleStatus,
         predecessor_to: LifecycleStatus,
+        authority: PromotionAuthority<'_>,
         created_at: i64,
     ) -> Result<ReplacementTransitionOutcome, LifecycleError> {
         if request.idempotency_key.is_empty()
@@ -1006,18 +1140,26 @@ impl<'a> LifecycleService<'a> {
         ensure_policy_exists(&tx, &request.snapshot.policy_version)?;
         let promoting = candidate_to == LifecycleStatus::Active
             && predecessor_to == LifecycleStatus::Superseded;
-        ensure_snapshot_evidence(
-            &tx,
-            &request.snapshot,
-            true,
-            promoting.then_some("qualified"),
-        )?;
+        // An explicit operator promotion carries its own dedicated evidence
+        // kind; it must never satisfy — or be satisfied by — the `qualified`
+        // evidence the evidence-threshold policy path requires.
+        let required_evidence_kind = promoting.then_some(match authority {
+            PromotionAuthority::EvidenceThreshold => "qualified",
+            PromotionAuthority::LocalOwner { .. } => "operator_promotion",
+        });
+        ensure_snapshot_evidence(&tx, &request.snapshot, true, required_evidence_kind)?;
         let candidate = read_revision(&tx, &request.candidate_id)?;
         let predecessor = read_revision(&tx, &request.predecessor_id)?;
-        if candidate.status != candidate_from || predecessor.status != predecessor_from {
+        if candidate.status != candidate_from {
             return Err(LifecycleError::IllegalTransition {
                 from: candidate.status,
                 to: candidate_to,
+            });
+        }
+        if predecessor.status != predecessor_from {
+            return Err(LifecycleError::IllegalTransition {
+                from: predecessor.status,
+                to: predecessor_to,
             });
         }
         if candidate.row_version != request.candidate_row_version {
@@ -1052,7 +1194,24 @@ impl<'a> LifecycleService<'a> {
             });
         }
         if promoting {
-            revalidate_promotion(&tx, request, &candidate, &predecessor, desired)?;
+            match authority {
+                PromotionAuthority::EvidenceThreshold => {
+                    revalidate_promotion(&tx, request, &candidate, &predecessor, desired)?;
+                }
+                PromotionAuthority::LocalOwner {
+                    approval,
+                    authorization,
+                } => {
+                    authorize_local_owner_promotion(
+                        &tx,
+                        request,
+                        approval,
+                        authorization,
+                        &candidate,
+                        created_at,
+                    )?;
+                }
+            }
         }
         let next_generation = desired + 1;
         let candidate_next = candidate.row_version + 1;
@@ -1242,6 +1401,77 @@ fn ensure_policy_exists(tx: &Transaction<'_>, version: &str) -> Result<(), Lifec
     } else {
         Err(LifecycleError::UnknownPolicyVersion(version.to_string()))
     }
+}
+
+/// Revalidate the explicit local-owner promotion inside the promotion
+/// transaction.
+///
+/// This is the replacement counterpart of `activate_root`'s gate: the approval
+/// must be bound to the exact candidate row and its evaluation report, a first
+/// and *distinct* local-owner approval must already exist for the canary, and
+/// the single-use authorization is consumed here so one operator action can
+/// promote at most once.
+fn authorize_local_owner_promotion(
+    tx: &Transaction<'_>,
+    request: &ReplacementTransitionRequest,
+    approval: &HumanApproval,
+    authorization: &super::store::ApprovalAuthorization,
+    candidate: &RevisionState,
+    created_at: i64,
+) -> Result<(), LifecycleError> {
+    validate_human_approval(approval)?;
+    if !authorization.binds_approval(&approval.approval_id, &approval.actor_id) {
+        return Err(StoreError::Unauthorized.into());
+    }
+    if approval.expected_row_version != request.candidate_row_version
+        || candidate.row_version != approval.expected_row_version
+    {
+        return Err(LifecycleError::InvalidHumanApproval);
+    }
+    let report: Option<String> = tx
+        .query_row(
+            "SELECT evaluation_report_id FROM skill_revisions WHERE id = ?",
+            [&request.candidate_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if report.as_deref() != Some(approval.evaluation_report_id.as_str()) {
+        return Err(LifecycleError::InvalidHumanApproval);
+    }
+    // Approval into canary recorded the first authenticated local-owner action.
+    // Promotion must be a second action with a different approval identity.
+    let first_approval: Option<String> = tx
+        .query_row(
+            "SELECT approval_id FROM skill_lifecycle_approvals
+             WHERE skill_id = ? AND approval_kind = 'phase4_canary'",
+            [&request.candidate_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if first_approval
+        .as_deref()
+        .is_none_or(|first| first == approval.approval_id)
+    {
+        return Err(LifecycleError::InvalidHumanApproval);
+    }
+    let artifact = read_artifact_for_policy(tx, &request.candidate_id)?;
+    consume_approval_authorization(
+        tx,
+        authorization,
+        &artifact,
+        &approval.evaluation_report_id,
+        ApprovalTransition::CanaryToActive,
+        created_at,
+    )?;
+    insert_approval(
+        tx,
+        &request.candidate_id,
+        "phase5_operator_promotion",
+        approval,
+        created_at,
+    )?;
+    Ok(())
 }
 
 fn revalidate_promotion(

@@ -613,6 +613,14 @@ mod tests {
         let result = verify_skill(&s);
         let interrupted = match &result {
             Err(VerificationError::SourceEvaluationFailed(_)) => true,
+            // The worker's own interrupt handler normally fires first, but if
+            // the parent-side deadline wins the race the failure is classified
+            // as infrastructure because it is not attributable to the source.
+            Err(VerificationError::InfrastructureUnavailable(message))
+                if message.contains("deadline expired") =>
+            {
+                true
+            }
             #[cfg(target_os = "linux")]
             Err(VerificationError::InfrastructureUnavailable(message)) => {
                 message == "worker unavailable"
@@ -623,12 +631,82 @@ mod tests {
     }
 
     #[test]
-    fn native_cpu_exhaustion_is_a_deterministic_source_failure() {
-        assert!(matches!(
-            worker_error(WorkerError::NativeCpuLimit),
-            VerificationError::SourceEvaluationFailed(message)
-                if message == "native CPU resource limit"
-        ));
+    fn native_cpu_exhaustion_is_retryable_verification_infrastructure() {
+        // `RLIMIT_CPU` is a cumulative per-process cap and worker processes are
+        // reused for many invocations, so earlier interactive JS or earlier
+        // seeds can exhaust it while an innocent proposal happens to be running.
+        let error = worker_error(WorkerError::NativeCpuLimit);
+        assert!(
+            matches!(error, VerificationError::InfrastructureUnavailable(_)),
+            "a cumulative per-process CPU kill is not attributable to the skill source: {error:?}"
+        );
+        assert!(error.is_infrastructure());
+    }
+
+    #[test]
+    fn parent_side_verification_timeout_is_retryable_verification_infrastructure() {
+        // The 30s deadline is fixed before the job is queued and the wait
+        // includes queueing behind interactive JS calls, so only a
+        // worker-reported interrupt is attributable to the skill source.
+        let error = worker_error(WorkerError::TimedOut);
+        assert!(
+            matches!(error, VerificationError::InfrastructureUnavailable(_)),
+            "a parent-side deadline is not attributable to the skill source: {error:?}"
+        );
+        assert!(error.is_infrastructure());
+    }
+
+    #[test]
+    fn worker_contract_mismatch_is_verification_infrastructure() {
+        let mismatch = crate::extras::js::skills::verify::validate_worker_result(
+            &crate::extras::js::protocol::VerificationResult {
+                passed: false,
+                cases: Vec::new(),
+                loader_version: 1,
+            },
+            1,
+        )
+        .expect_err("a case-count mismatch breaks the worker verification contract");
+        assert!(
+            mismatch.is_infrastructure(),
+            "build/loader skew is not attributable to the skill source: {mismatch:?}"
+        );
+    }
+
+    #[test]
+    fn worker_internal_diagnostic_is_verification_infrastructure() {
+        use crate::extras::js::protocol::{
+            Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole,
+        };
+
+        let internal = Diagnostic {
+            class: DiagnosticClass::Internal,
+            stage: DiagnosticStage::Initialization,
+            script_role: ScriptRole::SkillSource,
+            exception_class: None,
+            line: None,
+            column: None,
+        };
+        let error = crate::extras::js::skills::verify::test_result(Some(&internal))
+            .expect_err("the worker's own internal failure is not a candidate test outcome");
+        assert!(
+            error.is_infrastructure(),
+            "worker host-side failures must not be attributed to the skill: {error:?}"
+        );
+
+        let contract = Diagnostic {
+            class: DiagnosticClass::Contract,
+            stage: DiagnosticStage::Evaluation,
+            script_role: ScriptRole::EmbeddedTest,
+            exception_class: None,
+            line: None,
+            column: None,
+        };
+        assert_eq!(
+            crate::extras::js::skills::verify::test_result(Some(&contract))
+                .expect("a contract violation is a genuine candidate outcome"),
+            TestResult::ReturnedFalse
+        );
     }
 
     #[test]
@@ -897,5 +975,323 @@ mod fake_integrity_probes {
             verify_skill(&honest).is_ok(),
             "sealing the fakes must not break ordinary declared use"
         );
+    }
+}
+
+/// Attribution of verification failures to the candidate versus the
+/// infrastructure.
+///
+/// A proposal identity that is rejected can never be re-proposed
+/// (`SkillStore::enqueue_proposal` returns `Rejected` forever for it), so a
+/// failure that is not caused by the proposed source must always stay
+/// retryable.
+#[cfg(test)]
+mod failure_attribution {
+    use crate::extras::js::skills::admission::{
+        AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer,
+        ReviewDecision, ReviewOutcome, ReviewPacket,
+    };
+    use crate::extras::js::skills::embed::Embedder;
+    use crate::extras::js::skills::held_out::{
+        ExpectedJsValue, HeldOutCase, HeldOutSelector, HeldOutSuiteDraft, TranscriptExpectation,
+    };
+    use crate::extras::js::skills::store::{AdminIdentity, ProposalStatus, SkillStore};
+    use crate::extras::js::skills::verify::{VerificationError, worker_error};
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    use crate::extras::js::supervisor::WorkerError;
+    use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn paths() -> (PathBuf, AppPaths) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "verification_attribution_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let environment = PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                PathPlatform::Windows
+            } else {
+                PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.join("config")),
+            data_base: Some(root.join("data")),
+            local_data_base: Some(root.join("local")),
+            state_base: Some(root.join("state")),
+            cache_base: Some(root.join("cache")),
+            workspace_root: None,
+            overrides: Default::default(),
+        };
+        (root, AppPaths::resolve(&environment).expect("paths"))
+    }
+
+    fn candidate() -> SkillArtifact {
+        SkillArtifact::new(
+            "function normalize(_cap, v) { return String(v).trim(); }".to_string(),
+            "Normalize a value.".to_string(),
+            vec!["normalize".to_string()],
+            vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: unknown): string".to_string(),
+            }],
+            vec!["normalize(' x ') === 'x'".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .expect("artifact")
+    }
+
+    fn suite() -> HeldOutSuiteDraft {
+        HeldOutSuiteDraft {
+            selector: HeldOutSelector {
+                tags: vec!["normalize".to_string()],
+                exports: vec![SkillExport {
+                    name: "normalize".to_string(),
+                    signature: "normalize(value: unknown): string".to_string(),
+                }],
+                capability_tier: Some("pure".to_string()),
+            },
+            cases: vec![HeldOutCase {
+                expression: "normalize('\\tvalue\\n')".to_string(),
+                expected: ExpectedJsValue::String("value".to_string()),
+                fake_files: BTreeMap::new(),
+                fake_spawns: vec![],
+                fake_fetches: vec![],
+                transcript: TranscriptExpectation::default(),
+            }],
+        }
+    }
+
+    fn evaluator() -> (PathBuf, AdmissionEvaluator, SkillArtifact) {
+        let (root, paths) = paths();
+        let mut store = SkillStore::open_at(&paths).expect("store");
+        suite()
+            .import(
+                &mut store,
+                &AdminIdentity::authenticated("suite-admin").unwrap(),
+                5,
+            )
+            .expect("suite");
+        let artifact = candidate();
+        store
+            .enqueue_proposal(&artifact, None, 10)
+            .expect("proposal");
+        let evaluator = AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-1")
+            .expect("evaluator");
+        (root, evaluator, artifact)
+    }
+
+    struct Approver {
+        now: i64,
+    }
+
+    impl HumanReviewer for Approver {
+        fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
+            ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
+                format!("decision-{}", self.now),
+                "human-reviewer",
+                self.now,
+            ))
+        }
+    }
+
+    struct Denier;
+
+    impl HumanReviewer for Denier {
+        fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
+            ReviewDecision::Deny {
+                reason_code: "local_owner_rejected".to_string(),
+            }
+        }
+    }
+
+    /// The proposal must survive the failure, still queued and unrejected.
+    fn assert_identity_survives(evaluator: &AdmissionEvaluator, artifact: &SkillArtifact) {
+        let proposal = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .expect("proposal must remain queued");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Pending,
+            "an infrastructure failure must not permanently reject the identity"
+        );
+        assert_eq!(proposal.reason_code, None);
+        assert_eq!(proposal.attempt_count, 0);
+        assert_eq!(proposal.infrastructure_attempt_count, 1);
+        assert_eq!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("pending".to_string())
+        );
+    }
+
+    fn assert_not_rejected_by(error: VerificationError) {
+        let (root, mut evaluator, artifact) = evaluator();
+        evaluator.fail_next_verification_for_test(error);
+        let outcome = evaluator
+            .evaluate_next(20)
+            .expect_err("an infrastructure failure must be retryable");
+        assert!(
+            matches!(outcome, AdmissionError::Retryable(_)),
+            "unexpected admission outcome: {outcome:?}"
+        );
+        assert_identity_survives(&evaluator, &artifact);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_side_verification_deadline_does_not_reject_the_identity() {
+        assert_not_rejected_by(worker_error(WorkerError::TimedOut));
+    }
+
+    #[test]
+    fn native_cpu_exhaustion_does_not_reject_the_identity() {
+        assert_not_rejected_by(worker_error(WorkerError::NativeCpuLimit));
+    }
+
+    #[test]
+    fn worker_internal_failure_does_not_reject_the_identity() {
+        use crate::extras::js::protocol::{
+            Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole,
+        };
+
+        let error = crate::extras::js::skills::verify::test_result(Some(&Diagnostic {
+            class: DiagnosticClass::Internal,
+            stage: DiagnosticStage::Initialization,
+            script_role: ScriptRole::SkillSource,
+            exception_class: None,
+            line: None,
+            column: None,
+        }))
+        .expect_err("the worker's own internal failure is not a candidate outcome");
+        assert_not_rejected_by(error);
+    }
+
+    #[test]
+    fn worker_contract_mismatch_does_not_reject_the_identity() {
+        assert_not_rejected_by(
+            crate::extras::js::skills::verify::validate_worker_result(
+                &crate::extras::js::protocol::VerificationResult {
+                    passed: false,
+                    cases: Vec::new(),
+                    loader_version: 1,
+                },
+                1,
+            )
+            .expect_err("a case-count mismatch breaks the worker verification contract"),
+        );
+    }
+
+    #[test]
+    fn approval_gate_outage_is_reported_as_infrastructure_and_is_retryable() {
+        let (root, mut evaluator, artifact) = evaluator();
+        evaluator.evaluate_next(20).unwrap().unwrap();
+
+        evaluator.fail_next_review_gate_for_test(worker_error(WorkerError::ContainmentUnavailable));
+        let error = evaluator
+            .review_and_admit(&artifact.id, &Approver { now: 21 }, 21)
+            .expect_err("a contained worker outage must fail the approval");
+        assert!(
+            matches!(error, AdmissionError::Infrastructure(_)),
+            "a transient worker outage must not be reported as a changed review: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("verification infrastructure"),
+            "operator-facing message must name the cause: {message}"
+        );
+        assert!(
+            message.contains("unavailable"),
+            "operator-facing message must name the inner error: {message}"
+        );
+        assert_ne!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("canary".to_string())
+        );
+
+        // The same record approves once the infrastructure recovers, proving
+        // the failure was retryable rather than terminal.
+        let outcome = evaluator
+            .review_and_admit(&artifact.id, &Approver { now: 22 }, 22)
+            .expect("approval must succeed once the worker is back");
+        assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_runs_the_contained_held_out_gate_exactly_once() {
+        let (root, mut evaluator, artifact) = evaluator();
+        evaluator.evaluate_next(20).unwrap().unwrap();
+        assert_eq!(evaluator.review_gate_runs_for_test(), 0);
+
+        let outcome = evaluator
+            .review_and_admit(&artifact.id, &Approver { now: 21 }, 21)
+            .expect("approval");
+        assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+        assert_eq!(
+            evaluator.review_gate_runs_for_test(),
+            1,
+            "the contained held-out gate must run exactly once per approval"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn denial_does_not_require_a_passing_approval_gate() {
+        let (root, mut evaluator, artifact) = evaluator();
+        evaluator.evaluate_next(20).unwrap().unwrap();
+        // Break the gate: no held-out suite is selectable any more.
+        evaluator
+            .store()
+            .conn()
+            .execute("UPDATE held_out_suites SET enabled = 0", [])
+            .expect("disable suites");
+
+        assert_eq!(
+            evaluator
+                .review_and_admit(&artifact.id, &Denier, 21)
+                .expect("a rejection must not depend on the verification worker"),
+            ReviewOutcome::Denied
+        );
+        assert_eq!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("rejected".to_string())
+        );
+        assert_eq!(
+            evaluator.review_gate_runs_for_test(),
+            0,
+            "a denial must never run the contained gate"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_still_requires_a_passing_gate() {
+        let (root, mut evaluator, artifact) = evaluator();
+        evaluator.evaluate_next(20).unwrap().unwrap();
+        evaluator
+            .store()
+            .conn()
+            .execute("UPDATE held_out_suites SET enabled = 0", [])
+            .expect("disable suites");
+
+        let error = evaluator
+            .review_and_admit(&artifact.id, &Approver { now: 21 }, 21)
+            .expect_err("approval must not be granted when the gate no longer passes");
+        assert!(
+            matches!(error, AdmissionError::StaleReview),
+            "a changed held-out suite selection is a genuine semantic change: {error:?}"
+        );
+        assert_ne!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("canary".to_string())
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

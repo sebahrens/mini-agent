@@ -406,14 +406,19 @@ pub(crate) fn evaluate(
                 &case.fake_spawns,
                 &case.fake_fetches,
             )
-            .map_err(|error| match error {
-                VerificationError::InfrastructureUnavailable(_) => {
+            .map_err(|error| {
+                // Runtime/context creation and the worker verification contract
+                // are infrastructure, not the candidate's source: attributing
+                // them to the case would permanently reject an innocent
+                // identity.
+                if error.is_infrastructure() {
                     HeldOutError::Infrastructure(error)
+                } else {
+                    HeldOutError::CaseFailed {
+                        suite_id: suite.id.clone(),
+                        case_index,
+                    }
                 }
-                _ => HeldOutError::CaseFailed {
-                    suite_id: suite.id.clone(),
-                    case_index,
-                },
             })?;
             if !transcript_matches(&case.transcript, &transcript) {
                 return Err(HeldOutError::TranscriptMismatch {

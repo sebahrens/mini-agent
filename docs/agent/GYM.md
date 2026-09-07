@@ -19,9 +19,12 @@ scripts/gym/setup.sh
 ```
 
 The setup script checks the required Rust/Python tools, installs the debug binary with
-`cargo install --path . --debug`, exercises the platform worker-containment test, creates a private
-gym root, and imports, approves, and activates the seed library through the shipped local-owner
-commands. Override the default repository-local `.gym` root with `MINI_AGENT_GYM_ROOT`.
+`cargo install --path . --debug --locked --features skills`, exercises the platform
+worker-containment test, creates a private gym root, and imports, approves, and activates the seed
+library through the shipped local-owner commands. The `skills` feature is required and is not a
+default feature: the learned-skill operator commands the seed step calls do not exist in a default
+build, so `--binary` must always name a binary built with it. Override the default
+repository-local `.gym` root with `MINI_AGENT_GYM_ROOT`.
 
 The root contains separate `data`, `local`, `state`, and `cache` directories. Every gym process
 sets the corresponding `ZS_*_DIR` variables and `MINI_AGENT_GYM=1`; the operator's normal skill

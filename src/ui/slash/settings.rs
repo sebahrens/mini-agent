@@ -262,6 +262,15 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                 if *ctx.todo_tools_enabled { "on" } else { "off" }
             ),
         );
+        // Not toggleable: the JavaScript worker containment preflight and the
+        // learned-skill subsystem it gates are decided at startup. They are
+        // listed here because otherwise they fail completely silently — the tool
+        // is simply absent and `--learned-skill-stats` keeps answering, so the
+        // operator has no way to learn that skills are off or why.
+        write_ok(ctx.renderer, "runtime (read-only):");
+        for line in runtime_status_lines(&crate::provider::js_runtime_report()) {
+            write_result(ctx.renderer, line);
+        }
     } else {
         let new_state = match parts.get(2).copied() {
             Some("on") => true,
@@ -293,6 +302,31 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+/// Renders the read-only runtime availability lines shown by bare `/toggle`.
+///
+/// Kept pure and separate from the renderer so the verbatim containment refusal
+/// reason is unit-testable without a terminal.
+fn runtime_status_lines(report: &crate::provider::JsRuntimeReport) -> Vec<String> {
+    vec![
+        format!("  {:<8}{}", "js", availability_label(&report.javascript)),
+        format!(
+            "  {:<8}{}",
+            "skills",
+            availability_label(&report.learned_skills)
+        ),
+    ]
+}
+
+/// `on` / `off (<verbatim reason>)` / `not compiled`, matching the `on`/`off`
+/// vocabulary the rest of `/toggle` uses.
+fn availability_label(state: &crate::provider::RuntimeAvailability) -> String {
+    match state {
+        crate::provider::RuntimeAvailability::Available => "on".to_string(),
+        crate::provider::RuntimeAvailability::Unavailable { reason } => format!("off ({reason})"),
+        crate::provider::RuntimeAvailability::NotCompiled => "not compiled".to_string(),
+    }
 }
 
 async fn handle_editsys(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -511,4 +545,65 @@ fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         Err(e) => write_error(ctx.renderer, format!("logout failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_status_tests {
+    use super::runtime_status_lines;
+    use crate::provider::{JsRuntimeReport, RuntimeAvailability};
+
+    #[test]
+    fn unavailable_runtime_reports_the_containment_reason_verbatim() {
+        let reason = "macOS major version 15 is not a validated containment host";
+        let report = JsRuntimeReport {
+            javascript: RuntimeAvailability::Unavailable {
+                reason: reason.to_string(),
+            },
+            learned_skills: RuntimeAvailability::Unavailable {
+                reason: format!("requires the contained JavaScript worker: {reason}"),
+            },
+        };
+
+        let lines = runtime_status_lines(&report);
+
+        assert_eq!(lines.len(), 2);
+        let js = &lines[0];
+        assert!(js.starts_with("  js"), "{js}");
+        assert!(js.contains("off"), "{js}");
+        assert!(js.contains(reason), "{js}");
+
+        let skills = &lines[1];
+        assert!(skills.starts_with("  skills"), "{skills}");
+        assert!(skills.contains("off"), "{skills}");
+        assert!(skills.contains(reason), "{skills}");
+    }
+
+    #[test]
+    fn available_runtime_reports_on_without_a_reason() {
+        let report = JsRuntimeReport {
+            javascript: RuntimeAvailability::Available,
+            learned_skills: RuntimeAvailability::Available,
+        };
+
+        let lines = runtime_status_lines(&report);
+
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.trim_end().ends_with("on"), "{line}");
+            assert!(!line.contains('('), "{line}");
+        }
+    }
+
+    #[test]
+    fn not_compiled_runtime_is_distinct_from_a_contained_failure() {
+        let report = JsRuntimeReport {
+            javascript: RuntimeAvailability::Available,
+            learned_skills: RuntimeAvailability::NotCompiled,
+        };
+
+        let lines = runtime_status_lines(&report);
+
+        assert!(lines[1].contains("not compiled"), "{}", lines[1]);
+        assert!(!lines[1].contains("off"), "{}", lines[1]);
+    }
 }

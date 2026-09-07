@@ -41,7 +41,10 @@ mkdir -p "$gym_root" "$gym_root/tasks" "$gym_root/worktrees" "$gym_root/data" "$
 cd "$repo"
 
 step=debug_install
-cargo install --path . --debug
+# The learned-skill operator commands used by the seed_library step below are
+# gated behind the non-default `skills` feature, so a default install cannot run
+# them. --locked keeps this build's lockfile identical to the preflight below.
+cargo install --path . --debug --locked --features skills
 
 step=worker_containment_preflight
 case "$(uname -s)" in

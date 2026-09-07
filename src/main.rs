@@ -198,6 +198,12 @@ async fn run_inner() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "skills")]
+    if cli.list_learned_skill_proposals {
+        extras::js::skills::operations::print_proposal_queue(&app_paths)?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "skills")]
     if cli.purge_learned_skill.is_some()
         || cli.compact_learned_skill_events
         || cli.learned_skill_feedback.is_some()
@@ -206,6 +212,7 @@ async fn run_inner() -> anyhow::Result<()> {
         || cli.approve_learned_skill.is_some()
         || cli.reject_learned_skill.is_some()
         || cli.activate_learned_skill.is_some()
+        || cli.promote_learned_skill.is_some()
     {
         let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
             extras::js::skills::operations::FeedbackOperation {
@@ -247,6 +254,11 @@ async fn run_inner() -> anyhow::Result<()> {
                 cli.activate_learned_skill
                     .as_deref()
                     .map(extras::js::skills::operations::LibraryOperation::Activate)
+            })
+            .or_else(|| {
+                cli.promote_learned_skill
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::Promote)
             });
         extras::js::skills::operations::run(
             cli.purge_learned_skill.as_deref(),

@@ -315,10 +315,16 @@ fn probe_containment() -> WorkerContainmentStatus {
                 backend: BACKEND,
                 assurance: ASSURANCE,
             },
-            Err(_) => WorkerContainmentStatus::Unavailable {
+            // The child reports the failing stage as a MACOS_CONTAINMENT_* code,
+            // and folding it into the reason is what lets an operator tell a
+            // version-gate refusal from a genuine preflight failure. This is a
+            // message only: the availability decision above is unchanged.
+            Err(error) => WorkerContainmentStatus::Unavailable {
                 backend: BACKEND,
                 assurance: ASSURANCE,
-                reason: "the scoped one-time-image Seatbelt live preflight failed".into(),
+                reason: format!(
+                    "the scoped one-time-image Seatbelt live preflight failed: {error}"
+                ),
             },
         }
     }

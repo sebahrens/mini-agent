@@ -72,6 +72,7 @@ pub struct Cli {
     #[arg(
         long = "learned-skill-stats",
         conflicts_with_all = [
+            "list_learned_skill_proposals",
             "purge_learned_skill",
             "compact_learned_skill_events",
             "learned_skill_feedback",
@@ -79,11 +80,32 @@ pub struct Cli {
             "install_learned_skill_seeds",
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Print learned-skill usage and estimated round trips saved, then exit"
     )]
     pub learned_skill_stats: bool,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "list-learned-skill-proposals",
+        conflicts_with_all = [
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill"
+        ],
+        help = "List learned-skill proposals awaiting an operator decision, then exit \
+                (a verified proposal whose reason is held_out_suite_required is not \
+                approvable until a matching held-out baseline is imported)"
+    )]
+    pub list_learned_skill_proposals: bool,
 
     #[cfg(feature = "skills")]
     #[arg(
@@ -96,7 +118,8 @@ pub struct Cli {
             "install_learned_skill_seeds",
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Permanently purge one learned-skill revision and its dependent records"
     )]
@@ -111,7 +134,8 @@ pub struct Cli {
             "install_learned_skill_seeds",
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Compact learned-skill telemetry older than the retention window"
     )]
@@ -133,7 +157,8 @@ pub struct Cli {
             "install_learned_skill_seeds",
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Submit authenticated local-owner feedback for one learned skill"
     )]
@@ -180,7 +205,8 @@ pub struct Cli {
             "install_learned_skill_seeds",
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Import and contained-verify learned-skill JSON package(s) for approval"
     )]
@@ -192,7 +218,8 @@ pub struct Cli {
         conflicts_with_all = [
             "approve_learned_skill",
             "reject_learned_skill",
-            "activate_learned_skill"
+            "activate_learned_skill",
+            "promote_learned_skill"
         ],
         help = "Import and contained-verify the bundled pure learned-skill seed library"
     )]
@@ -202,7 +229,11 @@ pub struct Cli {
     #[arg(
         long = "approve-learned-skill",
         value_name = "SHA256",
-        conflicts_with_all = ["reject_learned_skill", "activate_learned_skill"],
+        conflicts_with_all = [
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill"
+        ],
         help = "Approve an evaluated learned skill into non-retrievable canary state"
     )]
     pub approve_learned_skill: Option<String>,
@@ -211,7 +242,7 @@ pub struct Cli {
     #[arg(
         long = "reject-learned-skill",
         value_name = "SHA256",
-        conflicts_with = "activate_learned_skill",
+        conflicts_with_all = ["activate_learned_skill", "promote_learned_skill"],
         help = "Reject an evaluated learned skill as the authenticated local owner"
     )]
     pub reject_learned_skill: Option<String>,
@@ -220,9 +251,20 @@ pub struct Cli {
     #[arg(
         long = "activate-learned-skill",
         value_name = "SHA256",
+        conflicts_with = "promote_learned_skill",
         help = "Activate an approved root learned skill after its held-out baseline"
     )]
     pub activate_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "promote-learned-skill",
+        value_name = "SHA256",
+        help = "Promote an approved learned-skill replacement canary over its active or \
+                quarantined predecessor as the authenticated local owner, superseding the \
+                predecessor and preserving lineage"
+    )]
+    pub promote_learned_skill: Option<String>,
 
     #[arg(
         long = "import-agent-skill",
@@ -1082,6 +1124,48 @@ mod tests {
                 "mini-agent",
                 "--learned-skill-stats",
                 "--install-learned-skill-seeds",
+            ])
+            .is_err()
+        );
+        let listed = Cli::try_parse_from(["mini-agent", "--list-learned-skill-proposals"]).unwrap();
+        assert!(listed.list_learned_skill_proposals);
+        let promoted =
+            Cli::try_parse_from(["mini-agent", "--promote-learned-skill", &"c".repeat(64)])
+                .unwrap();
+        assert_eq!(promoted.promote_learned_skill, Some("c".repeat(64)));
+        for conflicting in [
+            "--learned-skill-stats",
+            "--list-learned-skill-proposals",
+            "--compact-learned-skill-events",
+            "--install-learned-skill-seeds",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "mini-agent",
+                    "--promote-learned-skill",
+                    &"c".repeat(64),
+                    conflicting,
+                ])
+                .is_err(),
+                "{conflicting} must conflict with --promote-learned-skill"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--promote-learned-skill",
+                &"c".repeat(64),
+                "--activate-learned-skill",
+                &"c".repeat(64),
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--list-learned-skill-proposals",
+                "--approve-learned-skill",
+                &"c".repeat(64),
             ])
             .is_err()
         );

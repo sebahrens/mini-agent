@@ -21,7 +21,10 @@ use super::feedback::{
 };
 use super::held_out::HeldOutSuiteDraft;
 use super::lifecycle::LifecycleStatus;
-use super::lifecycle::{CoordinatedLifecycle, EvidenceSnapshot, HumanApproval, LifecycleService};
+use super::lifecycle::{
+    CoordinatedLifecycle, EvidenceSnapshot, HumanApproval, LifecycleService,
+    ReplacementTransitionRequest,
+};
 use super::privacy::Redactor;
 use super::proposal::JsProposal;
 use super::quarantine::{
@@ -47,6 +50,7 @@ pub(crate) enum LibraryOperation<'a> {
     Approve(&'a str),
     Reject(&'a str),
     Activate(&'a str),
+    Promote(&'a str),
 }
 
 #[derive(serde::Deserialize)]
@@ -268,6 +272,73 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One learned-skill proposal that is still awaiting an operator decision.
+#[derive(Debug, PartialEq, Eq)]
+struct ProposalQueueRow {
+    proposal_id: String,
+    skill_id: String,
+    status: String,
+    reason_code: Option<String>,
+    report_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl ProposalQueueRow {
+    fn to_line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.proposal_id,
+            self.skill_id,
+            self.status,
+            self.reason_code.as_deref().unwrap_or("-"),
+            self.report_id.as_deref().unwrap_or("-"),
+            self.created_at,
+            self.updated_at,
+        )
+    }
+}
+
+/// Read every proposal in a non-terminal status. Rejected proposals are
+/// terminal and are deliberately excluded: no operator action can advance them.
+fn load_proposal_queue(store: &SkillStore) -> anyhow::Result<Vec<ProposalQueueRow>> {
+    let mut statement = store.connection().prepare(
+        "SELECT proposal_id, skill_id, status, reason_code, report_id,
+                created_at, updated_at
+           FROM skill_proposals
+          WHERE status IN (
+              'pending', 'evaluating', 'verified', 'awaiting_approval',
+              'approved', 'deferred'
+          )
+          ORDER BY created_at, proposal_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ProposalQueueRow {
+            proposal_id: row.get(0)?,
+            skill_id: row.get(1)?,
+            status: row.get(2)?,
+            reason_code: row.get(3)?,
+            report_id: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+    rows.map(|row| row.map_err(anyhow::Error::from)).collect()
+}
+
+pub(crate) fn print_proposal_queue(paths: &AppPaths) -> anyhow::Result<()> {
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let rows = load_proposal_queue(&store).context("failed to read learned-skill proposals")?;
+    println!(
+        "proposal_id\tskill_id\tstatus\treason_code\treport_id\tcreated_at_unix\tupdated_at_unix"
+    );
+    for row in &rows {
+        println!("{}", row.to_line());
+    }
+    println!("total\t{}\t-\t-\t-\t-\t-", rows.len());
+    Ok(())
+}
+
 pub(crate) fn run(
     purge_id: Option<&str>,
     compact: bool,
@@ -342,6 +413,7 @@ fn run_library_operation(
         LibraryOperation::Approve(id) => review_proposal(id, true, paths, embedding),
         LibraryOperation::Reject(id) => review_proposal(id, false, paths, embedding),
         LibraryOperation::Activate(id) => activate_skill(id, paths, embedding),
+        LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
     }
 }
 
@@ -596,7 +668,10 @@ fn activate_skill(
         .get_proposal(skill_id)?
         .context("learned-skill proposal not found")?;
     if proposal.predecessor_id.is_some() {
-        anyhow::bail!("replacement activation requires the evidence-based promotion surface");
+        anyhow::bail!(
+            "learned skill {skill_id} is a replacement, not a lineage root; \
+             promote it with --promote-learned-skill instead of --activate-learned-skill"
+        );
     }
     match store
         .revision_status(skill_id)?
@@ -657,6 +732,163 @@ fn activate_skill(
     println!(
         "Learned skill activated: id={} generation={} removal_only={}",
         skill_id, outcome.desired_generation, publication.removal_only
+    );
+    Ok(())
+}
+
+/// Policy row that records *why* an operator promotion was permitted. It is
+/// deliberately not a `PromotionPolicy`: nothing in this path is decided by an
+/// evidence threshold.
+const OPERATOR_PROMOTION_POLICY_VERSION: &str = "local-owner-operator-promotion-v1";
+const OPERATOR_PROMOTION_POLICY_JSON: &str = r#"{"operator_promotion":true,"require_second_local_owner_action":true,"evidence_threshold_promotion":false}"#;
+const OPERATOR_PROMOTION_REASON: &str = "operator_local_owner_replacement_promotion";
+
+/// Promote an approved replacement canary over its predecessor.
+///
+/// This is the explicit local-owner counterpart of [`activate_skill`]: it runs
+/// through the same coordinated lifecycle façade, so the immutable index is
+/// rebuilt and published exactly as activation does. The predecessor may be
+/// `active` (an ordinary replacement) or `quarantined` (the emergency path for
+/// a defective active skill); lineage is preserved rather than re-rooted.
+fn promote_replacement_skill(
+    skill_id: &str,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+) -> anyhow::Result<()> {
+    let now = current_timestamp().context("failed to resolve promotion timestamp")?;
+    let embedder = Arc::new(Embedder::from_config(embedding)?);
+    let coordinator = IndexCoordinator::open(paths, embedder)?;
+    coordinator
+        .rebuild_and_publish()
+        .context("failed to reconcile the learned-skill index before promotion")?;
+    let mut store = SkillStore::open_at(paths)?;
+    let proposal = store
+        .get_proposal(skill_id)?
+        .context("learned-skill proposal not found")?;
+    let Some(predecessor_id) = proposal.predecessor_id.clone() else {
+        anyhow::bail!(
+            "learned skill {skill_id} is a lineage root with no predecessor; \
+             activate it with --activate-learned-skill instead"
+        );
+    };
+    let candidate = LifecycleService::new(&mut store).revision(skill_id)?;
+    match candidate.status {
+        LifecycleStatus::Active => {
+            println!("Learned skill replacement already promoted: id={skill_id} status=active");
+            return Ok(());
+        }
+        LifecycleStatus::Canary => {}
+        status => anyhow::bail!(
+            "learned-skill replacement promotion requires an approved canary; \
+             revision {skill_id} is {status}"
+        ),
+    }
+    if candidate.supersedes_id.as_deref() != Some(predecessor_id.as_str()) {
+        anyhow::bail!(
+            "learned-skill replacement promotion requires a canary bound to its predecessor; \
+             revision {skill_id} supersedes {} but its proposal names {predecessor_id}",
+            candidate.supersedes_id.as_deref().unwrap_or("nothing"),
+        );
+    }
+    let predecessor = LifecycleService::new(&mut store).revision(&predecessor_id)?;
+    if !matches!(
+        predecessor.status,
+        LifecycleStatus::Active | LifecycleStatus::Quarantined
+    ) {
+        anyhow::bail!(
+            "learned-skill replacement promotion requires an active or quarantined predecessor; \
+             predecessor {predecessor_id} is {}",
+            predecessor.status
+        );
+    }
+    let report_id = proposal
+        .report_id
+        .clone()
+        .context("learned-skill evaluation report is missing")?;
+    let generation = i64::try_from(store.generation_state()?.desired_generation)
+        .context("learned-skill generation is out of range")?;
+
+    // Binding the attempt to the observed row versions and generation keeps a
+    // retry of the *same* observation an exact replay, while any later attempt
+    // over moved rows gets its own key instead of colliding with this one.
+    let attempt = format!(
+        "{}-{}-{generation}",
+        candidate.row_version, predecessor.row_version
+    );
+    let evidence_id = format!("operator-promotion:{skill_id}:{attempt}");
+    let evidence_payload = serde_json::json!({
+        "actor": "local-owner",
+        "action": "explicit_operator_promotion",
+        "candidate_id": skill_id,
+        "predecessor_id": predecessor_id,
+        "predecessor_from": predecessor.status.as_token(),
+        "candidate_row_version": candidate.row_version,
+        "predecessor_row_version": predecessor.row_version,
+        "index_generation": generation,
+        "evaluation_report_id": report_id,
+        "evidence_threshold_promotion": false
+    })
+    .to_string();
+    LifecycleService::new(&mut store).register_policy(
+        OPERATOR_PROMOTION_POLICY_VERSION,
+        OPERATOR_PROMOTION_POLICY_JSON,
+        now,
+    )?;
+    LifecycleService::new(&mut store).record_operator_promotion_evidence(
+        &evidence_id,
+        skill_id,
+        OPERATOR_PROMOTION_POLICY_VERSION,
+        &evidence_payload,
+        now,
+    )?;
+    let approval = HumanApproval::local_owner(&report_id, candidate.row_version)?;
+    let authorization = LifecycleService::new(&mut store)
+        .authorize_replacement_local_owner(skill_id, &approval, now)?;
+    drop(store);
+
+    let policy_inputs = BTreeMap::from([(
+        "operator_promotion".to_string(),
+        serde_json::json!({
+            "actor": "local-owner",
+            "predecessor_from": predecessor.status.as_token(),
+            "evaluation_report_id": report_id
+        }),
+    )]);
+    let snapshot = EvidenceSnapshot::new(
+        skill_id,
+        Some(predecessor_id.clone()),
+        OPERATOR_PROMOTION_POLICY_VERSION,
+        vec![evidence_id],
+        policy_inputs,
+        candidate.row_version,
+        Some(predecessor.row_version),
+        generation,
+    )?;
+    let request = ReplacementTransitionRequest {
+        idempotency_key: format!("local-owner-promote:{skill_id}:{attempt}"),
+        candidate_id: skill_id.to_string(),
+        predecessor_id: predecessor_id.clone(),
+        candidate_row_version: candidate.row_version,
+        predecessor_row_version: predecessor.row_version,
+        reason: OPERATOR_PROMOTION_REASON.to_string(),
+        snapshot,
+    };
+    let (outcome, publication) = CoordinatedLifecycle::new(&coordinator)
+        .promote_replacement_by_local_owner(
+            &request,
+            &approval,
+            &authorization,
+            predecessor.status,
+            now,
+        )
+        .context("learned-skill replacement promotion failed")?;
+    println!(
+        "Learned skill replacement promoted: id={skill_id} status={} predecessor={predecessor_id} \
+         predecessor_status={} generation={} removal_only={}",
+        outcome.candidate_status,
+        outcome.predecessor_status,
+        outcome.desired_generation,
+        publication.removal_only
     );
     Ok(())
 }
@@ -1028,6 +1260,294 @@ mod tests {
         assert!(store.metadata(&artifact.id).unwrap().is_none());
         let generation = store.generation_state().unwrap();
         assert_eq!(generation.desired_generation, generation.applied_generation);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Build a replacement package for the first bundled seed.
+    ///
+    /// Only the source gains a distinguishing comment, so the candidate keeps
+    /// every inherited test, tag, export and capability of its predecessor and
+    /// therefore clears admission's inherited-regression and held-out gates.
+    fn replacement_package_json(marker: &str, predecessor_id: &str) -> (String, String) {
+        let mut value: serde_json::Value = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let source = value["proposal"]["source"].as_str().unwrap().to_string();
+        value["proposal"]["source"] = serde_json::Value::String(format!("{source}\n// {marker}\n"));
+        value["proposal"]["predecessor_id"] = serde_json::Value::String(predecessor_id.to_string());
+        let json = serde_json::to_string(&value).unwrap();
+        let package: LearnedSkillPackage = serde_json::from_str(&json).unwrap();
+        let skill_id = JsProposal::try_from(package.proposal)
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap()
+            .id;
+        (json, skill_id)
+    }
+
+    fn import_active_root(paths: &AppPaths) -> String {
+        let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let root_id = JsProposal::try_from(package.proposal.clone())
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap()
+            .id;
+        import_package(package, paths, None, "promotion-root").unwrap();
+        review_proposal(&root_id, true, paths, None).unwrap();
+        activate_skill(&root_id, paths, None).unwrap();
+        root_id
+    }
+
+    fn import_replacement(paths: &AppPaths, marker: &str, predecessor_id: &str) -> String {
+        let (json, skill_id) = replacement_package_json(marker, predecessor_id);
+        let package: LearnedSkillPackage = serde_json::from_str(&json).unwrap();
+        import_package(package, paths, None, marker).unwrap();
+        skill_id
+    }
+
+    fn approved_replacement(paths: &AppPaths, marker: &str, predecessor_id: &str) -> String {
+        let skill_id = import_replacement(paths, marker, predecessor_id);
+        review_proposal(&skill_id, true, paths, None).unwrap();
+        skill_id
+    }
+
+    fn revision_state(paths: &AppPaths, skill_id: &str) -> super::super::lifecycle::RevisionState {
+        let mut store = SkillStore::open_at(paths).unwrap();
+        LifecycleService::new(&mut store)
+            .revision(skill_id)
+            .unwrap()
+    }
+
+    #[test]
+    fn operator_promotion_supersedes_an_active_predecessor() {
+        let (root, paths, _) = fixture();
+        let predecessor_id = import_active_root(&paths);
+        let candidate_id = approved_replacement(&paths, "replacement-over-active", &predecessor_id);
+        assert_eq!(
+            revision_state(&paths, &candidate_id).status,
+            LifecycleStatus::Canary
+        );
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Promote(&candidate_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+
+        let candidate = revision_state(&paths, &candidate_id);
+        let predecessor = revision_state(&paths, &predecessor_id);
+        assert_eq!(candidate.status, LifecycleStatus::Active);
+        assert_eq!(predecessor.status, LifecycleStatus::Superseded);
+        // Lineage is preserved in both directions, unlike the purge workaround.
+        assert_eq!(candidate.supersedes_id.as_deref(), Some(&*predecessor_id));
+        assert_eq!(
+            predecessor.superseded_by_id.as_deref(),
+            Some(&*candidate_id)
+        );
+        assert_eq!(candidate.lineage_root_id, predecessor.lineage_root_id);
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(store.is_retrievable(&candidate_id).unwrap());
+        assert!(!store.is_retrievable(&predecessor_id).unwrap());
+        let generation = store.generation_state().unwrap();
+        assert_eq!(generation.desired_generation, generation.applied_generation);
+        // The recorded transition names the operator action, not an evidence
+        // threshold, and is bound to a second local-owner approval.
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM skill_transitions
+                      WHERE skill_id = ? AND to_status = 'active' AND reason = ?",
+                    rusqlite::params![candidate_id, OPERATOR_PROMOTION_REASON],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM skill_lifecycle_approvals
+                      WHERE skill_id = ? AND approval_kind = 'phase5_operator_promotion'",
+                    [&candidate_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM skill_evidence
+                      WHERE skill_id = ? AND evidence_kind = 'operator_promotion'",
+                    [&candidate_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operator_promotion_replaces_a_quarantined_predecessor() {
+        let (root, paths, _) = fixture();
+        let predecessor_id = import_active_root(&paths);
+        let candidate_id = approved_replacement(&paths, "emergency-replacement", &predecessor_id);
+
+        // The emergency sequence: the defective active skill is quarantined
+        // first, which used to make its replacement unpromotable forever.
+        run(
+            None,
+            false,
+            Some(FeedbackOperation {
+                skill_id: &predecessor_id,
+                invocation_id: None,
+                kind: "severe",
+                reason_code: "integrity",
+                idempotency_key: "operator-promotion-quarantine",
+            }),
+            None,
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            revision_state(&paths, &predecessor_id).status,
+            LifecycleStatus::Quarantined
+        );
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Promote(&candidate_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+
+        let candidate = revision_state(&paths, &candidate_id);
+        let predecessor = revision_state(&paths, &predecessor_id);
+        assert_eq!(candidate.status, LifecycleStatus::Active);
+        assert_eq!(predecessor.status, LifecycleStatus::Superseded);
+        assert_eq!(
+            predecessor.superseded_by_id.as_deref(),
+            Some(&*candidate_id)
+        );
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(store.is_retrievable(&candidate_id).unwrap());
+        let generation = store.generation_state().unwrap();
+        assert_eq!(generation.desired_generation, generation.applied_generation);
+        drop(store);
+
+        // A repeat promotion is a no-op rather than a second transition.
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Promote(&candidate_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            revision_state(&paths, &candidate_id).status,
+            LifecycleStatus::Active
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operator_promotion_refuses_roots_non_canaries_and_ineligible_predecessors() {
+        let (root, paths, _) = fixture();
+        let predecessor_id = import_active_root(&paths);
+
+        let rootless = promote_replacement_skill(&predecessor_id, &paths, None)
+            .unwrap_err()
+            .to_string();
+        assert!(rootless.contains("lineage root"), "{rootless}");
+        assert!(rootless.contains("--activate-learned-skill"), "{rootless}");
+
+        let unapproved_id = import_replacement(&paths, "unapproved-replacement", &predecessor_id);
+        let not_canary = promote_replacement_skill(&unapproved_id, &paths, None)
+            .unwrap_err()
+            .to_string();
+        assert!(not_canary.contains("approved canary"), "{not_canary}");
+        assert!(not_canary.contains("verified"), "{not_canary}");
+        assert_ne!(rootless, not_canary);
+
+        let candidate_id = approved_replacement(&paths, "ineligible-predecessor", &predecessor_id);
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'retired' WHERE id = ?",
+                [&predecessor_id],
+            )
+            .unwrap();
+        drop(store);
+        let ineligible = promote_replacement_skill(&candidate_id, &paths, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ineligible.contains("active or quarantined predecessor"),
+            "{ineligible}"
+        );
+        assert!(ineligible.contains("retired"), "{ineligible}");
+        assert_ne!(ineligible, not_canary);
+        assert_eq!(
+            revision_state(&paths, &candidate_id).status,
+            LifecycleStatus::Canary
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proposal_queue_lists_pending_operator_decisions_and_omits_terminal_ones() {
+        let (root, paths, _) = fixture();
+        let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let skill_id = JsProposal::try_from(package.proposal.clone())
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap()
+            .id;
+        import_package(package, &paths, None, "queue-listing").unwrap();
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        let rows = load_proposal_queue(&store).unwrap();
+        let listed = rows
+            .iter()
+            .find(|row| row.skill_id == skill_id)
+            .expect("a proposal awaiting approval must be listed");
+        assert_eq!(listed.status, "awaiting_approval");
+        assert_eq!(listed.reason_code, None);
+        assert!(listed.report_id.is_some());
+        let line = listed.to_line();
+        assert!(line.contains(&listed.proposal_id), "{line}");
+        assert!(line.contains(&skill_id), "{line}");
+        assert!(line.contains("awaiting_approval"), "{line}");
+        // An absent reason code renders as the documented placeholder.
+        assert!(line.contains("\t-\t"), "{line}");
+        assert!(line.ends_with(&format!("\t{}\t{}", listed.created_at, listed.updated_at)));
+        drop(store);
+
+        review_proposal(&skill_id, false, &paths, None).unwrap();
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(
+            load_proposal_queue(&store)
+                .unwrap()
+                .iter()
+                .all(|row| row.skill_id != skill_id),
+            "a rejected proposal is terminal and must not be listed"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

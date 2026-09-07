@@ -85,6 +85,25 @@ pub enum VerificationError {
     FakeFixtureInvalid(String),
 }
 
+impl VerificationError {
+    /// True when the failure is attributable to the verification infrastructure
+    /// rather than to the proposed skill's own immutable source.
+    ///
+    /// Only source-attributable failures may permanently reject a proposal
+    /// identity, because `SkillStore::enqueue_proposal` refuses that identity
+    /// forever once it is rejected. Runtime/context creation and the worker
+    /// verification contract are parent- and build-owned, so they are always
+    /// infrastructure.
+    pub(crate) fn is_infrastructure(&self) -> bool {
+        matches!(
+            self,
+            Self::InfrastructureUnavailable(_)
+                | Self::RuntimeCreationFailed(_)
+                | Self::ContextCreationFailed(_)
+        )
+    }
+}
+
 pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
     if skill.tests.is_empty() {
         return Err(VerificationError::NoTests);
@@ -131,8 +150,15 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
                 .as_ref()
                 .is_some_and(|diagnostic| diagnostic.script_role == ScriptRole::SkillSource)
     }) {
+        let diagnostic = source_failure
+            .diagnostic
+            .as_ref()
+            .expect("the predicate above matched a diagnostic");
+        if let Some(error) = worker_internal_failure(diagnostic) {
+            return Err(error);
+        }
         return Err(VerificationError::SourceEvaluationFailed(
-            closed_diagnostic(source_failure.diagnostic.as_ref().unwrap()),
+            closed_diagnostic(diagnostic),
         ));
     }
 
@@ -143,7 +169,7 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         let outcome = if case.passed {
             TestResult::Passed
         } else {
-            test_result(case.diagnostic.as_ref())
+            test_result(case.diagnostic.as_ref())?
         };
         if outcome != TestResult::Passed {
             return Err(VerificationError::TestFailed { index, outcome });
@@ -158,6 +184,9 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         .zip(result.cases[embedded_count..].chunks_exact(2))
     {
         if let Some(case) = cases.iter().find(|case| !case.passed) {
+            if let Some(error) = case.diagnostic.as_ref().and_then(worker_internal_failure) {
+                return Err(error);
+            }
             return Err(VerificationError::MutationPassFailed {
                 export: export.name.clone(),
                 reason: case
@@ -208,18 +237,19 @@ pub(crate) fn verify_inherited_cases(
         if case.passed {
             continue;
         }
-        if case
-            .diagnostic
-            .as_ref()
-            .is_some_and(|diagnostic| diagnostic.script_role == ScriptRole::SkillSource)
-        {
-            return Err(VerificationError::SourceEvaluationFailed(
-                closed_diagnostic(case.diagnostic.as_ref().unwrap()),
-            ));
+        if let Some(diagnostic) = case.diagnostic.as_ref() {
+            if let Some(error) = worker_internal_failure(diagnostic) {
+                return Err(error);
+            }
+            if diagnostic.script_role == ScriptRole::SkillSource {
+                return Err(VerificationError::SourceEvaluationFailed(
+                    closed_diagnostic(diagnostic),
+                ));
+            }
         }
         return Err(VerificationError::TestFailed {
             index,
-            outcome: test_result(case.diagnostic.as_ref()),
+            outcome: test_result(case.diagnostic.as_ref())?,
         });
     }
     Ok(())
@@ -249,18 +279,19 @@ pub(crate) fn verify_held_out_case(
     validate_worker_result(&result, 1)?;
     let case = &result.cases[0];
     if case.passed {
-        Ok(case.transcript.clone())
-    } else if case
-        .diagnostic
-        .as_ref()
-        .is_some_and(|diagnostic| diagnostic.script_role == ScriptRole::SkillSource)
-    {
-        Err(VerificationError::SourceEvaluationFailed(
-            closed_diagnostic(case.diagnostic.as_ref().unwrap()),
-        ))
-    } else {
-        Err(VerificationError::HeldOutExpectedMismatch)
+        return Ok(case.transcript.clone());
     }
+    if let Some(diagnostic) = case.diagnostic.as_ref() {
+        if let Some(error) = worker_internal_failure(diagnostic) {
+            return Err(error);
+        }
+        if diagnostic.script_role == ScriptRole::SkillSource {
+            return Err(VerificationError::SourceEvaluationFailed(
+                closed_diagnostic(diagnostic),
+            ));
+        }
+    }
+    Err(VerificationError::HeldOutExpectedMismatch)
 }
 
 fn verify_in_worker(request: VerifyArtifact) -> Result<VerificationResult, VerificationError> {
@@ -320,10 +351,19 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         | WorkerError::BlockingVerifyInAsyncRuntime => {
             VerificationError::InfrastructureUnavailable("worker unavailable".into())
         }
-        WorkerError::TimedOut => VerificationError::SourceEvaluationFailed("timeout".to_string()),
-        WorkerError::NativeCpuLimit => {
-            VerificationError::SourceEvaluationFailed("native CPU resource limit".to_string())
-        }
+        // The 30-second verification deadline is fixed before the job is queued and
+        // the wait includes queueing behind interactive JS calls, so a busy session
+        // can starve verification. Only a worker-reported interrupt
+        // (`DiagnosticClass::ResourceLimit`) is attributable to the skill source.
+        WorkerError::TimedOut => VerificationError::InfrastructureUnavailable(
+            "worker verification deadline expired before the worker reported a result".to_string(),
+        ),
+        // `RLIMIT_CPU` is a cumulative per-process cap and worker processes are
+        // reused across many invocations, so earlier interactive JS or earlier
+        // seeds can exhaust it for an innocent proposal.
+        WorkerError::NativeCpuLimit => VerificationError::InfrastructureUnavailable(
+            "worker process exhausted its cumulative native CPU budget".to_string(),
+        ),
         WorkerError::UnexpectedVerificationEffect => {
             VerificationError::SourceEvaluationFailed("external effect denied".to_string())
         }
@@ -333,7 +373,7 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
     }
 }
 
-fn validate_worker_result(
+pub(crate) fn validate_worker_result(
     result: &VerificationResult,
     expected_cases: usize,
 ) -> Result<(), VerificationError> {
@@ -346,11 +386,30 @@ fn validate_worker_result(
     Ok(())
 }
 
-fn test_result(diagnostic: Option<&Diagnostic>) -> TestResult {
+/// The worker emits `DiagnosticClass::Internal` only for its own host-side
+/// failures (`Runtime::new`, binding preparation, `Context::full`, and missing
+/// trusted bootstrap bytecode). Skill-attributable failures arrive as `Syntax`,
+/// `Exception`, `ResourceLimit`, or `Contract`, so an `Internal` diagnostic must
+/// never permanently reject the proposed identity.
+fn worker_internal_failure(diagnostic: &Diagnostic) -> Option<VerificationError> {
+    (diagnostic.class == DiagnosticClass::Internal).then(|| {
+        VerificationError::InfrastructureUnavailable(format!(
+            "worker reported an internal failure: {}",
+            closed_diagnostic(diagnostic)
+        ))
+    })
+}
+
+pub(crate) fn test_result(
+    diagnostic: Option<&Diagnostic>,
+) -> Result<TestResult, VerificationError> {
     let Some(diagnostic) = diagnostic else {
-        return TestResult::Threw("verification failed".to_string());
+        return Ok(TestResult::Threw("verification failed".to_string()));
     };
-    if diagnostic.stage == DiagnosticStage::JobDrain {
+    if let Some(error) = worker_internal_failure(diagnostic) {
+        return Err(error);
+    }
+    Ok(if diagnostic.stage == DiagnosticStage::JobDrain {
         TestResult::JobLimitExceeded
     } else if diagnostic.class == DiagnosticClass::ResourceLimit {
         TestResult::Timeout
@@ -358,7 +417,7 @@ fn test_result(diagnostic: Option<&Diagnostic>) -> TestResult {
         TestResult::ReturnedFalse
     } else {
         TestResult::Threw(closed_diagnostic(diagnostic))
-    }
+    })
 }
 
 fn closed_diagnostic(diagnostic: &Diagnostic) -> String {

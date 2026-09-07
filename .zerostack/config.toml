@@ -1,0 +1,3 @@
+# This explicit project setting anchors the trust decision that also enables
+# repository-owned prompts and persona notes under .zerostack/.
+task_enabled = true
