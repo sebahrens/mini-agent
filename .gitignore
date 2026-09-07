@@ -17,3 +17,10 @@ __pycache__/
 
 # Model cache downloaded by fastembed at runtime
 .fastembed_cache/
+
+# Local tool and runtime state that must never enter the crate archive.
+# `.claude/coderlm_state/coderlm_cli.py` is an absolute symlink into the
+# user's plugin cache, which made `cargo package` fail on CI.
+.claude/coderlm_state/
+.coderlm/
+.zerostack/
