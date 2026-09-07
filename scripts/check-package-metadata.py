@@ -160,6 +160,11 @@ LEGACY_COORDINATES = (
 )
 HISTORICAL_COORDINATE_ALLOWLIST = (
     "docs/specs/superseded/",
+    # The beads issue archive is a historical record, not a shipped artifact:
+    # the issue that renamed the repository necessarily quotes the coordinate
+    # it replaced. Nothing is built, downloaded, or published from here, so an
+    # old coordinate in the archive cannot point a user at the wrong release.
+    ".beads/",
 )
 UPSTREAM_PROVENANCE_FILES = frozenset({"README.md", "NOTICE"})
 SUPPORTED_PACKAGE_CHANNELS = ("cargo", "aur", "conda", "homebrew")

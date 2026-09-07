@@ -1242,6 +1242,22 @@ printf '%s' "${!#}" > "$out"
                 CHECK_PACKAGE_METADATA.validate_stale_coordinates(root, [relative]),
             )
 
+    def test_beads_issue_archive_may_quote_the_replaced_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relative = ".beads/issues.jsonl"
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "https://github.com/" + "gi-" + "dellav/zerostack",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [],
+                CHECK_PACKAGE_METADATA.validate_stale_coordinates(root, [relative]),
+            )
+
     def test_upstream_provenance_files_may_name_zerostack_repository(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
