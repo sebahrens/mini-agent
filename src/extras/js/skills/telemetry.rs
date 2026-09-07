@@ -891,11 +891,15 @@ fn behavioral_window_counts(
     window_end: i64,
 ) -> Result<(i64, i64), rusqlite::Error> {
     let window_start = window_end.saturating_sub(super::retention::DEFAULT_RAW_RETENTION_SECONDS);
+    // Timeouts, OOMs and capability denials are faults on their own. A thrown
+    // exception *or* an ordinary wrong result counts only when active
+    // authenticated negative or severe feedback targets that exact invocation
+    // (docs/specs/phase-5-evidence-learning.md section 8).
     store.connection().query_row(
         "SELECT COUNT(*), COALESCE(SUM(
              terminal.event_kind IN ('timed_out','oom','capability_denied')
              OR (
-                 terminal.event_kind = 'threw'
+                 terminal.event_kind IN ('threw', 'returned')
                  AND EXISTS (
                      SELECT 1 FROM skill_feedback AS feedback
                       WHERE feedback.skill_id = terminal.skill_id

@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
+use rusqlite::OptionalExtension;
 
 use super::admission::{
     AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision, ReviewOutcome,
@@ -28,10 +31,16 @@ use super::lifecycle::{
 use super::privacy::Redactor;
 use super::proposal::JsProposal;
 use super::quarantine::{
-    QuarantineEvidence, QuarantineExecutor, QuarantinePolicy, QuarantineReason,
+    FeedbackAttribution, QuarantineEvidence, QuarantineExecutionError, QuarantineExecutor,
+    QuarantinePolicy, QuarantineReason,
 };
-use super::retention::{CoordinatedRetention, DEFAULT_RAW_RETENTION_SECONDS, RetentionService};
-use super::store::{AdminIdentity, ProposalStatus, SkillStore, current_timestamp};
+use super::retention::{
+    CoordinatedRetention, DEFAULT_RAW_RETENTION_SECONDS, RetentionService, purge_preflight,
+};
+use super::store::{
+    AdminIdentity, MAX_EVALUATION_ATTEMPTS, ProposalRecord, ProposalStatus, SkillStore,
+    current_timestamp,
+};
 use crate::config::EmbeddingConfig;
 use crate::extras::js::protocol::SkillProposalDraft;
 use crate::paths::AppPaths;
@@ -51,6 +60,96 @@ pub(crate) enum LibraryOperation<'a> {
     Reject(&'a str),
     Activate(&'a str),
     Promote(&'a str),
+    Retire(&'a str),
+}
+
+/// Explicit privacy purge of one revision.
+///
+/// Purge deletes immutable bytes and re-roots dependants, so a non-terminal
+/// target or one with dependants requires `force`.
+pub(crate) struct PurgeOperation<'a> {
+    pub(crate) skill_id: &'a str,
+    pub(crate) force: bool,
+}
+
+static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// Select the operator output format for this process. Called once from the
+/// CLI; every operator command renders through [`OperatorReport`].
+pub(crate) fn set_json_output(enabled: bool) {
+    JSON_OUTPUT.store(enabled, Ordering::Relaxed);
+}
+
+fn json_output() -> bool {
+    JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+/// One structured operator result line.
+///
+/// Every learned-skill command reports the same shape — a command name, the
+/// store's canonical identifier, the live status, and whichever of
+/// `generation`/`idempotent` apply — so a script parses one format for all of
+/// them instead of a different sentence per command.
+struct OperatorReport {
+    command: &'static str,
+    fields: Vec<(&'static str, serde_json::Value)>,
+}
+
+impl OperatorReport {
+    fn new(command: &'static str) -> Self {
+        Self {
+            command,
+            fields: Vec::new(),
+        }
+    }
+
+    fn with(mut self, name: &'static str, value: impl Into<serde_json::Value>) -> Self {
+        self.fields.push((name, value.into()));
+        self
+    }
+
+    fn render(&self, json: bool) -> String {
+        if json {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "command".to_string(),
+                serde_json::Value::String(self.command.to_string()),
+            );
+            for (name, value) in &self.fields {
+                object.insert((*name).to_string(), value.clone());
+            }
+            return serde_json::Value::Object(object).to_string();
+        }
+        let mut line = format!("learned-skill {}:", self.command);
+        for (name, value) in &self.fields {
+            line.push(' ');
+            line.push_str(name);
+            line.push('=');
+            line.push_str(&render_text_value(value));
+        }
+        line
+    }
+
+    fn emit(self) {
+        println!("{}", self.render(json_output()));
+    }
+}
+
+/// Render one field for the human-readable line. Absent values print as the
+/// same `-` placeholder the tabular listings already use.
+fn render_text_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "-".to_string(),
+        serde_json::Value::String(text) if text.is_empty() => "-".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) if items.is_empty() => "-".to_string(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(render_text_value)
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -97,6 +196,8 @@ struct SkillUsageStats {
     passed_with: u64,
     baseline_tasks: u64,
     baseline_passes: u64,
+    user_positive: u64,
+    user_negative: u64,
     declared_effect_methods: u64,
     estimated_round_trips_saved: u64,
 }
@@ -180,6 +281,8 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                            AND observed.source_kind = baseline.source_kind
                            AND observed.source_id IS baseline.source_id
                     )),
+                COALESCE(stats.user_positive_count, 0),
+                COALESCE(stats.user_negative_count, 0),
                 revision.capability_json
            FROM skill_revisions AS revision
            LEFT JOIN skill_stats AS stats ON stats.skill_id = revision.id
@@ -198,7 +301,9 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)?,
             row.get::<_, i64>(9)?,
-            row.get::<_, String>(10)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, String>(12)?,
         ))
     })?;
     rows.map(|row| {
@@ -213,6 +318,8 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             passed_with,
             baseline_tasks,
             baseline_passes,
+            user_positive,
+            user_negative,
             capability_json,
         ) = row?;
         let declared_effect_methods = serde_json::from_str::<serde_json::Value>(&capability_json)
@@ -231,6 +338,8 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             passed_with: u64::try_from(passed_with).unwrap_or(0),
             baseline_tasks: u64::try_from(baseline_tasks).unwrap_or(0),
             baseline_passes: u64::try_from(baseline_passes).unwrap_or(0),
+            user_positive: u64::try_from(user_positive).unwrap_or(0),
+            user_negative: u64::try_from(user_negative).unwrap_or(0),
             declared_effect_methods,
             estimated_round_trips_saved: estimate_round_trips_saved(
                 direct_successes,
@@ -245,11 +354,11 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
     let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let rows = load_skill_stats(&store).context("failed to read learned-skill usage")?;
     println!(
-        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\ttasks_with\tpassed_with\tpass_rate_without\tdeclared_effect_methods\test_round_trips_saved"
+        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\ttasks_with\tpassed_with\tpass_rate_without\tuser_positive\tuser_negative\tdeclared_effect_methods\test_round_trips_saved"
     );
     for row in &rows {
         println!(
-            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{:.1}%\t{}\t{}",
+            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{}",
             row.skill_id,
             row.status,
             row.invocations,
@@ -259,6 +368,8 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
             row.tasks_with,
             row.passed_with,
             row.pass_rate_without_percent(),
+            row.user_positive,
+            row.user_negative,
             row.declared_effect_methods,
             row.estimated_round_trips_saved,
         );
@@ -268,7 +379,9 @@ pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
         .iter()
         .map(|row| row.estimated_round_trips_saved)
         .sum::<u64>();
-    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t-\t{saved}");
+    let positive = rows.iter().map(|row| row.user_positive).sum::<u64>();
+    let negative = rows.iter().map(|row| row.user_negative).sum::<u64>();
+    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t{positive}\t{negative}\t-\t{saved}");
     Ok(())
 }
 
@@ -326,6 +439,70 @@ fn load_proposal_queue(store: &SkillStore) -> anyhow::Result<Vec<ProposalQueueRo
     rows.map(|row| row.map_err(anyhow::Error::from)).collect()
 }
 
+/// Read one proposal by identifier in *any* status.
+///
+/// The queue listing deliberately omits terminal proposals, which left a
+/// rejected or deferred admission outcome — its `reason_code` and the
+/// `report_id` that carries the evidence — invisible to the operator.
+fn load_proposal(
+    store: &SkillStore,
+    proposal_id: &str,
+) -> anyhow::Result<Option<ProposalQueueRow>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT proposal_id, skill_id, status, reason_code, report_id,
+                    created_at, updated_at
+               FROM skill_proposals
+              WHERE proposal_id = ?1 OR skill_id = ?1",
+            [proposal_id],
+            |row| {
+                Ok(ProposalQueueRow {
+                    proposal_id: row.get(0)?,
+                    skill_id: row.get(1)?,
+                    status: row.get(2)?,
+                    reason_code: row.get(3)?,
+                    report_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Print the final admission outcome of one proposal.
+pub(crate) fn print_proposal(paths: &AppPaths, proposal_id: &str) -> anyhow::Result<()> {
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let row = load_proposal(&store, proposal_id)
+        .context("failed to read the learned-skill proposal")?
+        .with_context(|| format!("learned-skill proposal not found: {proposal_id}"))?;
+    let revision_status = store.revision_status(&row.skill_id)?;
+    // A rejected or deferred proposal is a decision the operator has to be
+    // able to see, so it is logged as well as printed.
+    if matches!(row.status.as_str(), "rejected" | "deferred") {
+        tracing::warn!(
+            proposal_id = %row.proposal_id,
+            skill_id = %row.skill_id,
+            status = %row.status,
+            reason_code = row.reason_code.as_deref().unwrap_or(""),
+            report_id = row.report_id.as_deref().unwrap_or(""),
+            "learned-skill proposal reached a non-approvable admission outcome"
+        );
+    }
+    OperatorReport::new("proposal")
+        .with("id", row.skill_id.clone())
+        .with("proposal_id", row.proposal_id.clone())
+        .with("status", row.status.clone())
+        .with("revision_status", revision_status)
+        .with("reason_code", row.reason_code.clone())
+        .with("report_id", row.report_id.clone())
+        .with("created_at", row.created_at)
+        .with("updated_at", row.updated_at)
+        .emit();
+    Ok(())
+}
+
 pub(crate) fn print_proposal_queue(paths: &AppPaths) -> anyhow::Result<()> {
     let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let rows = load_proposal_queue(&store).context("failed to read learned-skill proposals")?;
@@ -340,7 +517,7 @@ pub(crate) fn print_proposal_queue(paths: &AppPaths) -> anyhow::Result<()> {
 }
 
 pub(crate) fn run(
-    purge_id: Option<&str>,
+    purge: Option<PurgeOperation<'_>>,
     compact: bool,
     feedback: Option<FeedbackOperation<'_>>,
     library: Option<LibraryOperation<'_>>,
@@ -350,22 +527,8 @@ pub(crate) fn run(
     if let Some(operation) = library {
         return run_library_operation(operation, paths, embedding);
     }
-    if let Some(skill_id) = purge_id {
-        let embedder = Arc::new(
-            Embedder::from_config(embedding)
-                .context("failed to initialize learned-skill index metadata")?,
-        );
-        let coordinator = IndexCoordinator::open(paths, embedder)
-            .context("failed to open learned-skill index coordinator")?;
-        let now = current_timestamp().context("failed to resolve purge timestamp")?;
-        let (generation, publication) = CoordinatedRetention::new(&coordinator)
-            .privacy_purge(skill_id, "local_operator_request", now)
-            .context("learned-skill privacy purge failed")?;
-        println!(
-            "Learned skill purged: id={skill_id} generation={generation} removal_only={}",
-            publication.removal_only
-        );
-        return Ok(());
+    if let Some(operation) = purge {
+        return purge_skill(operation, paths, embedding);
     }
 
     if compact {
@@ -375,10 +538,10 @@ pub(crate) fn run(
         let report = RetentionService::new(&mut store)
             .compact_before(cutoff, 1, now)
             .context("learned-skill telemetry compaction failed")?;
-        println!(
-            "Learned-skill telemetry compacted: events={} through_event_id={}",
-            report.compacted_events, report.through_event_id
-        );
+        OperatorReport::new("compact")
+            .with("events", report.compacted_events as u64)
+            .with("through_event_id", report.through_event_id)
+            .emit();
         return Ok(());
     }
 
@@ -388,6 +551,89 @@ pub(crate) fn run(
     Ok(())
 }
 
+/// Purge one revision's immutable bytes after an explicit lifecycle and
+/// reference guard.
+///
+/// The guard is deliberately loud rather than silent: a non-terminal target or
+/// one with dependent revisions is refused unless the operator passed the force
+/// flag, and a forced purge names every revision it re-roots. Re-rooting is not
+/// cosmetic — a canary replacement whose predecessor is purged becomes a
+/// lineage root and would then pass `--activate-learned-skill` with no
+/// replacement evidence behind it.
+fn purge_skill(
+    operation: PurgeOperation<'_>,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+) -> anyhow::Result<()> {
+    let PurgeOperation { skill_id, force } = operation;
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let plan = purge_preflight(&store, skill_id)
+        .context("failed to inspect the learned-skill purge target")?;
+    drop(store);
+    let status = plan.status.clone();
+    let rerooted = plan
+        .rerooted_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if plan.requires_force() && !force {
+        if !plan.is_terminal() {
+            anyhow::bail!(
+                "learned skill {skill_id} is {} and is not in a terminal lifecycle status; \
+                 re-run with --purge-learned-skill-force to delete it{}",
+                status.as_deref().unwrap_or("absent"),
+                dependant_suffix(&rerooted)
+            );
+        }
+        anyhow::bail!(
+            "purging learned skill {skill_id} would re-root {} dependent revision(s) ({}); \
+             re-run with --purge-learned-skill-force to accept that",
+            rerooted.len(),
+            rerooted.join(",")
+        );
+    }
+    let embedder = Arc::new(
+        Embedder::from_config(embedding)
+            .context("failed to initialize learned-skill index metadata")?,
+    );
+    let coordinator = IndexCoordinator::open(paths, embedder)
+        .context("failed to open learned-skill index coordinator")?;
+    let now = current_timestamp().context("failed to resolve purge timestamp")?;
+    let (generation, publication) = CoordinatedRetention::new(&coordinator)
+        .privacy_purge(skill_id, "local_operator_request", now)
+        .context("learned-skill privacy purge failed")?;
+    OperatorReport::new("purge")
+        .with("id", skill_id)
+        .with("status", "purged")
+        .with("previous_status", status.clone())
+        .with("generation", generation)
+        .with("removal_only", publication.removal_only)
+        // A tombstoned target has no revision row left to purge, so a repeat
+        // purge is an acknowledged replay rather than a second deletion.
+        .with("idempotent", status.is_none())
+        .with(
+            "rerooted",
+            rerooted
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .emit();
+    Ok(())
+}
+
+fn dependant_suffix(rerooted: &[String]) -> String {
+    if rerooted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (this would also re-root {} dependent revision(s): {})",
+            rerooted.len(),
+            rerooted.join(",")
+        )
+    }
+}
+
 fn run_library_operation(
     operation: LibraryOperation<'_>,
     paths: &AppPaths,
@@ -395,26 +641,118 @@ fn run_library_operation(
 ) -> anyhow::Result<()> {
     match operation {
         LibraryOperation::Import(path) => import_path(path, paths, embedding),
-        LibraryOperation::InstallSeeds => {
-            let packages = SEED_PACKAGES
-                .into_iter()
-                .map(|(name, source)| {
-                    let package: LearnedSkillPackage = serde_json::from_str(source)
-                        .with_context(|| format!("bundled learned-skill seed {name} is invalid"))?;
-                    validate_package(&package, name)?;
-                    Ok((name, package))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            for (name, package) in packages {
-                import_package(package, paths, embedding, name)?;
-            }
-            Ok(())
-        }
+        LibraryOperation::InstallSeeds => install_seeds(paths, embedding),
         LibraryOperation::Approve(id) => review_proposal(id, true, paths, embedding),
         LibraryOperation::Reject(id) => review_proposal(id, false, paths, embedding),
         LibraryOperation::Activate(id) => activate_skill(id, paths, embedding),
         LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
+        LibraryOperation::Retire(id) => retire_skill(id, paths, embedding),
     }
+}
+
+/// Import every bundled seed, reporting each one independently.
+///
+/// Seeds are unrelated packages, so one failure must not hide the rest: a seed
+/// that was previously rejected, purged or bound to a moved predecessor is
+/// reported and skipped. The command is idempotent — re-running it over an
+/// already-imported library reports each seed's live state — and fails only
+/// when *no* seed reached an importable state.
+fn install_seeds(paths: &AppPaths, embedding: Option<&EmbeddingConfig>) -> anyhow::Result<()> {
+    let mut imported = 0usize;
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+    for (name, source) in SEED_PACKAGES {
+        let outcome = serde_json::from_str::<LearnedSkillPackage>(source)
+            .with_context(|| format!("bundled learned-skill seed {name} is invalid"))
+            .and_then(|package| {
+                validate_package(&package, name)?;
+                import_package(package, paths, embedding, name)
+            });
+        match outcome {
+            Ok(report) => {
+                imported += 1;
+                report
+                    .into_operator_report("install-seed")
+                    .with("seed", name)
+                    .emit();
+            }
+            Err(error) => {
+                failed += 1;
+                let detail = format!("{error:#}");
+                OperatorReport::new("install-seed")
+                    .with("seed", name)
+                    .with("status", "failed")
+                    .with("error", detail.clone())
+                    .emit();
+                first_error.get_or_insert(detail);
+            }
+        }
+    }
+    OperatorReport::new("install-seeds")
+        .with("imported", imported as u64)
+        .with("failed", failed as u64)
+        .emit();
+    if imported == 0 {
+        anyhow::bail!(
+            "no bundled learned-skill seed reached an importable state ({failed} failed); \
+             first failure: {}",
+            first_error.unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Retire an active learned skill by explicit operator action.
+///
+/// Unlike `--purge-learned-skill` this keeps the revision, its lineage and its
+/// audit: it is the administrative disable the lifecycle defines, published
+/// through the same coordinated gate as every other visibility change.
+fn retire_skill(
+    skill_id: &str,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+) -> anyhow::Result<()> {
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let status = store
+        .revision_status(skill_id)
+        .context("failed to read the learned-skill revision")?
+        .context("learned-skill revision not found")?;
+    let row_version = store
+        .revision_row_version(skill_id)
+        .context("failed to read the learned-skill row version")?
+        .context("learned-skill revision not found")?;
+    drop(store);
+    if status == "retired" {
+        OperatorReport::new("retire")
+            .with("id", skill_id)
+            .with("status", status)
+            .with("idempotent", true)
+            .emit();
+        return Ok(());
+    }
+    if status != "active" {
+        anyhow::bail!(
+            "learned-skill retirement requires an active revision; \
+             revision {skill_id} is {status}"
+        );
+    }
+    let embedder = Arc::new(Embedder::from_config(embedding)?);
+    let coordinator = IndexCoordinator::open(paths, embedder)
+        .context("failed to open learned-skill index coordinator")?;
+    let generation = coordinator
+        .retire_and_publish(skill_id, row_version)
+        .context("learned-skill retirement failed")?;
+    let store = SkillStore::open_at(paths)?;
+    let status = store
+        .revision_status(skill_id)?
+        .context("learned-skill revision disappeared after retirement")?;
+    OperatorReport::new("retire")
+        .with("id", skill_id)
+        .with("status", status)
+        .with("generation", generation)
+        .with("idempotent", false)
+        .emit();
+    Ok(())
 }
 
 fn import_path(
@@ -431,7 +769,10 @@ fn import_path(
         let label = path.display().to_string();
         let package = read_package(path)?;
         validate_package(&package, &label)?;
-        return import_package(package, paths, embedding, &label);
+        import_package(package, paths, embedding, &label)?
+            .into_operator_report("import")
+            .emit();
+        return Ok(());
     }
     if !metadata.is_dir() {
         anyhow::bail!("learned-skill import path must be a JSON file or directory");
@@ -468,7 +809,9 @@ fn import_path(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for (label, package) in packages {
-        import_package(package, paths, embedding, &label)?;
+        import_package(package, paths, embedding, &label)?
+            .into_operator_report("import")
+            .emit();
     }
     Ok(())
 }
@@ -503,12 +846,159 @@ fn read_package(path: &Path) -> anyhow::Result<LearnedSkillPackage> {
         .with_context(|| format!("learned-skill package {} is invalid", path.display()))
 }
 
+/// What one imported package reached, sourced from the store rather than from
+/// the caller's argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportReport {
+    skill_id: String,
+    proposal_id: String,
+    status: ProposalStatus,
+    reason_code: Option<String>,
+    report_id: Option<String>,
+    /// True when the proposal already existed in this exact form, so the
+    /// import changed nothing.
+    idempotent: bool,
+    /// Set when the proposal is durably queued for a later evaluation attempt.
+    next_attempt_at: Option<i64>,
+    /// Set when an unrelated proposal held the head of the due queue, so this
+    /// command deliberately declined to evaluate anything.
+    blocked_by: Option<String>,
+}
+
+impl ImportReport {
+    fn into_operator_report(self, command: &'static str) -> OperatorReport {
+        OperatorReport::new(command)
+            .with("id", self.skill_id)
+            .with("proposal_id", self.proposal_id)
+            .with("status", proposal_status(self.status))
+            .with("reason_code", self.reason_code)
+            .with("report_id", self.report_id)
+            .with("idempotent", self.idempotent)
+            .with("next_attempt_at", self.next_attempt_at)
+            .with("blocked_by", self.blocked_by)
+    }
+}
+
+/// Wall-clock budget for the bounded evaluation wait an operator import
+/// performs before reporting the proposal as queued for a later attempt.
+const IMPORT_EVALUATION_BUDGET: Duration = Duration::from_secs(120);
+/// Poll cadence while another worker owns the evaluation lease.
+const IMPORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Longest single sleep, so a long retry backoff still respects the budget.
+const IMPORT_MAX_SLEEP: Duration = Duration::from_secs(2);
+/// How long the import waits for an unrelated due proposal to clear before it
+/// reports its own proposal as queued instead of evaluating that proposal.
+const FOREIGN_HEAD_GRACE: Duration = Duration::from_secs(2);
+
+/// The proposal `AdmissionEvaluator::evaluate_next` would claim right now.
+///
+/// The operator import drives evaluation only while its *own* proposal is at
+/// the head of the due queue: `evaluate_next` claims the oldest due proposal of
+/// any identity, so calling it unconditionally would spend an unrelated,
+/// agent-originated proposal's retry budget inside an operator command.
+fn due_proposal_head(store: &SkillStore, now: i64) -> anyhow::Result<Option<String>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT proposal_id FROM skill_proposals
+              WHERE attempt_count < ?1
+                AND (
+                  (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?2))
+                  OR (status = 'evaluating' AND lease_expires_at <= ?2)
+                )
+              ORDER BY proposed_at, proposal_id
+              LIMIT 1",
+            rusqlite::params![MAX_EVALUATION_ATTEMPTS, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Refuse an import whose enqueue cannot succeed *before* held-out baselines
+/// are written.
+///
+/// `enqueue_proposal` and the held-out suite import each own their transaction,
+/// so a failing enqueue after a successful suite import would leave trusted
+/// baselines behind for a skill that was never queued. A single transaction
+/// spanning both would need a store-side API; until then this pre-flight
+/// removes every failure the enqueue can predict, and names the predecessor's
+/// observed state instead of one message for absent and ineligible alike.
+fn preflight_enqueue(
+    store: &SkillStore,
+    artifact: &super::SkillArtifact,
+    predecessor_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let tombstoned = store
+        .connection()
+        .query_row(
+            "SELECT 1 FROM skill_tombstones WHERE id = ?",
+            [&artifact.id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if tombstoned {
+        anyhow::bail!(
+            "learned skill {} was privacy-purged and cannot be re-proposed",
+            artifact.id
+        );
+    }
+    if let Some(predecessor_id) = predecessor_id {
+        let status: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT status FROM skill_revisions WHERE id = ?",
+                [predecessor_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match status.as_deref() {
+            Some("active" | "canary" | "quarantined") => {}
+            Some(observed) => anyhow::bail!(
+                "learned-skill predecessor {predecessor_id} is {observed}; a replacement \
+                 requires an active, canary, or quarantined immutable revision"
+            ),
+            None => anyhow::bail!(
+                "learned-skill predecessor {predecessor_id} is absent from the store; \
+                 import the predecessor before its replacement"
+            ),
+        }
+    }
+    if let Some(existing) = store.get(&artifact.id)?
+        && existing != *artifact
+    {
+        anyhow::bail!("identity collision for learned skill {}", artifact.id);
+    }
+    if let Some(record) = store.get_proposal(&artifact.id)?
+        && record.predecessor_id.as_deref() != predecessor_id
+    {
+        anyhow::bail!(
+            "learned skill {} is already proposed against predecessor {}; an existing \
+             proposal cannot be rebound to {}",
+            artifact.id,
+            record.predecessor_id.as_deref().unwrap_or("none"),
+            predecessor_id.unwrap_or("none")
+        );
+    }
+    Ok(())
+}
+
 fn import_package(
     package: LearnedSkillPackage,
     paths: &AppPaths,
     embedding: Option<&EmbeddingConfig>,
     label: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ImportReport> {
+    import_package_within(package, paths, embedding, label, IMPORT_EVALUATION_BUDGET)
+}
+
+fn import_package_within(
+    package: LearnedSkillPackage,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+    label: &str,
+    budget: Duration,
+) -> anyhow::Result<ImportReport> {
     validate_package(&package, label)?;
     let LearnedSkillPackage {
         proposal,
@@ -522,11 +1012,14 @@ fn import_package(
     let now = current_timestamp().context("failed to resolve import timestamp")?;
     let admin = AdminIdentity::authenticated("local-owner")?;
     let mut store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    preflight_enqueue(&store, &artifact, predecessor_id.as_deref())
+        .context("learned-skill proposal cannot be enqueued")?;
     for suite in held_out_suites {
         suite
             .import(&mut store, &admin, now)
             .context("failed to import learned-skill held-out baseline")?;
     }
+    let already_present = store.get_proposal(&artifact.id)?.is_some();
     let queued = store
         .enqueue_proposal(&artifact, predecessor_id.as_deref(), now)
         .context("failed to enqueue learned-skill proposal")?;
@@ -547,54 +1040,159 @@ fn import_package(
             .request_reevaluation(&queued.proposal_id, &admin, current_timestamp()?)
             .context("failed to requeue proposal after held-out baseline import")?;
     }
-    for _ in 0..MAX_DIRECTORY_PACKAGES {
-        let current = SkillStore::open_at(paths)?
+
+    // Bounded by wall clock rather than by an iteration count: a retryable
+    // failure reschedules the proposal with exponential backoff, and a fixed
+    // number of immediate iterations would spin past every one of them and
+    // then report a queued proposal as a failure.
+    let deadline = std::time::Instant::now() + budget;
+    let mut infrastructure_attempts = existing.infrastructure_attempt_count;
+    let mut blocked_since: Option<std::time::Instant> = None;
+    loop {
+        let store = SkillStore::open_at(paths)?;
+        let current = store
             .get_proposal(&queued.proposal_id)?
             .context("imported proposal disappeared")?;
-        if matches!(
-            current.status,
-            ProposalStatus::AwaitingApproval
-                | ProposalStatus::Rejected
-                | ProposalStatus::Deferred
-                | ProposalStatus::Verified
-                | ProposalStatus::Approved
-        ) {
-            if matches!(
-                current.status,
-                ProposalStatus::AwaitingApproval | ProposalStatus::Approved
-            ) {
-                println!(
-                    "Learned skill imported: id={} status={}",
-                    current.skill_id,
-                    proposal_status(current.status)
-                );
-                return Ok(());
+        let now = current_timestamp()?;
+        let head = due_proposal_head(&store, now)?;
+        drop(store);
+        match current.status {
+            ProposalStatus::AwaitingApproval | ProposalStatus::Approved => {
+                return Ok(import_report(&current, already_present));
             }
-            anyhow::bail!(
-                "learned-skill verification did not reach awaiting approval: id={} status={}{}",
-                current.skill_id,
-                proposal_status(current.status),
-                current
-                    .reason_code
-                    .as_deref()
-                    .map(|reason| format!(" reason={reason}"))
-                    .unwrap_or_default()
-            );
+            ProposalStatus::Rejected | ProposalStatus::Verified => {
+                anyhow::bail!(
+                    "learned-skill verification did not reach awaiting approval: id={} status={}{}",
+                    current.skill_id,
+                    proposal_status(current.status),
+                    current
+                        .reason_code
+                        .as_deref()
+                        .map(|reason| format!(" reason={reason}"))
+                        .unwrap_or_default()
+                );
+            }
+            ProposalStatus::Deferred => {
+                anyhow::bail!(
+                    "learned-skill verification infrastructure is unavailable on this host: \
+                     id={} status=deferred{}",
+                    current.skill_id,
+                    current
+                        .reason_code
+                        .as_deref()
+                        .map(|reason| format!(" reason={reason}"))
+                        .unwrap_or_default()
+                );
+            }
+            ProposalStatus::Pending | ProposalStatus::Evaluating => {}
         }
-        match evaluator.evaluate_next(current_timestamp()?) {
+        if std::time::Instant::now() >= deadline {
+            return Ok(scheduled_report(&current, already_present, now, None));
+        }
+        if current.next_attempt_at.is_some_and(|due| due > now) {
+            // The proposal is durably queued behind its own retry backoff.
+            // Sleeping to its next attempt is the whole point of the bound.
+            std::thread::sleep(sleep_until_due(current.next_attempt_at, now, deadline));
+            continue;
+        }
+        match head.as_deref() {
+            Some(head) if head == queued.proposal_id => {}
+            Some(other) => {
+                // Another proposal is due first. `evaluate_next` would claim
+                // it, so this operator command waits briefly and then reports
+                // its own proposal as queued rather than spending an unrelated
+                // proposal's retry budget.
+                if blocked_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    >= FOREIGN_HEAD_GRACE
+                {
+                    return Ok(scheduled_report(
+                        &current,
+                        already_present,
+                        now,
+                        Some(other.to_string()),
+                    ));
+                }
+                std::thread::sleep(
+                    IMPORT_POLL_INTERVAL
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                continue;
+            }
+            None => return Ok(scheduled_report(&current, already_present, now, None)),
+        }
+        blocked_since = None;
+        match evaluator.evaluate_next(now) {
             Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(error) => tracing::warn!(error = %error, "learned-skill evaluation will retry"),
+            // Nothing was claimable after all: report the queued proposal
+            // rather than spinning on an empty queue.
+            Ok(None) => return Ok(scheduled_report(&current, already_present, now, None)),
+            Err(error) => {
+                let observed = SkillStore::open_at(paths)?
+                    .get_proposal(&queued.proposal_id)?
+                    .context("imported proposal disappeared")?;
+                // An uncontained host fails the same way on every attempt, so
+                // report the containment reason immediately instead of looping
+                // until the budget expires.
+                if observed.infrastructure_attempt_count > infrastructure_attempts {
+                    anyhow::bail!(
+                        "learned-skill verification could not run in a contained worker: \
+                         id={} {error}",
+                        observed.skill_id
+                    );
+                }
+                infrastructure_attempts = observed.infrastructure_attempt_count;
+                tracing::warn!(error = %error, "learned-skill evaluation will retry");
+            }
         }
     }
-    let current = SkillStore::open_at(paths)?
-        .get_proposal(&queued.proposal_id)?
-        .context("imported proposal disappeared")?;
-    anyhow::bail!(
-        "learned-skill verification did not complete within the bounded import attempt: id={} status={}",
-        current.skill_id,
-        proposal_status(current.status)
-    )
+}
+
+/// Report a proposal that is durably queued for a later attempt. This is not
+/// a failure: a session admission worker picks it up, and re-running the import
+/// is idempotent.
+fn scheduled_report(
+    current: &ProposalRecord,
+    already_present: bool,
+    now: i64,
+    blocked_by: Option<String>,
+) -> ImportReport {
+    let mut report = import_report(current, already_present);
+    report.next_attempt_at = report.next_attempt_at.or(Some(now));
+    report.blocked_by = blocked_by;
+    report
+}
+
+fn import_report(current: &ProposalRecord, already_present: bool) -> ImportReport {
+    ImportReport {
+        skill_id: current.skill_id.clone(),
+        proposal_id: current.proposal_id.clone(),
+        status: current.status,
+        reason_code: current.reason_code.clone(),
+        report_id: current.report_id.clone(),
+        idempotent: already_present,
+        next_attempt_at: current.next_attempt_at,
+        blocked_by: None,
+    }
+}
+
+/// Sleep long enough for the proposal to become due, without overshooting the
+/// import's own deadline.
+fn sleep_until_due(
+    next_attempt_at: Option<i64>,
+    now: i64,
+    deadline: std::time::Instant,
+) -> Duration {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let wait = next_attempt_at
+        .map(
+            |due| Duration::from_secs(due.saturating_sub(now).clamp(0, i64::from(u32::MAX)) as u64),
+        )
+        .unwrap_or(IMPORT_POLL_INTERVAL)
+        .max(IMPORT_POLL_INTERVAL)
+        .min(IMPORT_MAX_SLEEP);
+    wait.min(remaining)
 }
 
 struct LocalOwnerReviewer {
@@ -636,20 +1234,58 @@ fn review_proposal(
             drop(evaluator);
             let coordinator =
                 IndexCoordinator::open(paths, Arc::new(Embedder::from_config(embedding)?))?;
-            coordinator
+            let generation = coordinator
                 .rebuild_and_publish()
                 .context("failed to publish approved learned-skill canary")?;
-            println!(
-                "Learned skill approved as canary: id={} generation={}",
-                result.skill_id, result.generation
-            );
+            // A replayed approval returns the *original* approval generation,
+            // and the revision may have moved on since. Report what the store
+            // holds now rather than restating the first decision.
+            let status = live_revision_status(paths, &result.skill_id)?;
+            approve_report(&result, generation, &status).emit();
         }
-        ReviewOutcome::Denied => println!("Learned skill rejected: id={proposal_id}"),
+        ReviewOutcome::Denied => {
+            let skill_id = SkillStore::open_at(paths)?
+                .get_proposal(proposal_id)?
+                .map(|record| record.skill_id)
+                .unwrap_or_else(|| proposal_id.to_string());
+            let status = live_revision_status(paths, &skill_id)?;
+            OperatorReport::new("reject")
+                .with("id", skill_id)
+                .with("status", status)
+                .with("idempotent", false)
+                .emit();
+        }
         ReviewOutcome::Cancelled | ReviewOutcome::TimedOut => {
             anyhow::bail!("local-owner learned-skill review did not complete")
         }
     }
     Ok(())
+}
+
+/// Render an approval outcome.
+///
+/// `result.generation` is the generation of the *original* approval, which a
+/// replayed approval returns unchanged, so the published generation and the
+/// revision's live status are reported alongside it rather than instead of it.
+fn approve_report(
+    result: &super::store::CanaryApprovalResult,
+    published_generation: u64,
+    status: &str,
+) -> OperatorReport {
+    OperatorReport::new("approve")
+        .with("id", result.skill_id.clone())
+        .with("status", status.to_string())
+        .with("generation", published_generation)
+        .with("approval_generation", result.generation)
+        .with("idempotent", result.idempotent)
+}
+
+/// The revision status the store holds right now, as the operator report's
+/// single source of truth.
+fn live_revision_status(paths: &AppPaths, skill_id: &str) -> anyhow::Result<String> {
+    Ok(SkillStore::open_at(paths)?
+        .revision_status(skill_id)?
+        .unwrap_or_else(|| "absent".to_string()))
 }
 
 fn activate_skill(
@@ -658,6 +1294,38 @@ fn activate_skill(
     embedding: Option<&EmbeddingConfig>,
 ) -> anyhow::Result<()> {
     let now = current_timestamp().context("failed to resolve activation timestamp")?;
+    // Validate the target *before* the index rebuild: a mistyped identifier
+    // must not pay for a full embedding rebuild before being rejected.
+    {
+        let store = SkillStore::open_at(paths)?;
+        let proposal = store
+            .get_proposal(skill_id)?
+            .context("learned-skill proposal not found")?;
+        if proposal.predecessor_id.is_some() {
+            anyhow::bail!(
+                "learned skill {skill_id} is a replacement, not a lineage root; \
+                 promote it with --promote-learned-skill instead of --activate-learned-skill"
+            );
+        }
+        match store
+            .revision_status(skill_id)?
+            .as_deref()
+            .context("learned-skill revision not found")?
+        {
+            "active" => {
+                OperatorReport::new("activate")
+                    .with("id", skill_id)
+                    .with("status", "active")
+                    .with("idempotent", true)
+                    .emit();
+                return Ok(());
+            }
+            "canary" => {}
+            status => anyhow::bail!(
+                "learned-skill activation requires an approved canary; current status is {status}"
+            ),
+        }
+    }
     let embedder = Arc::new(Embedder::from_config(embedding)?);
     let coordinator = IndexCoordinator::open(paths, embedder)?;
     coordinator
@@ -667,26 +1335,6 @@ fn activate_skill(
     let proposal = store
         .get_proposal(skill_id)?
         .context("learned-skill proposal not found")?;
-    if proposal.predecessor_id.is_some() {
-        anyhow::bail!(
-            "learned skill {skill_id} is a replacement, not a lineage root; \
-             promote it with --promote-learned-skill instead of --activate-learned-skill"
-        );
-    }
-    match store
-        .revision_status(skill_id)?
-        .as_deref()
-        .context("learned-skill revision not found")?
-    {
-        "active" => {
-            println!("Learned skill already active: id={skill_id}");
-            return Ok(());
-        }
-        "canary" => {}
-        status => anyhow::bail!(
-            "learned-skill activation requires an approved canary; current status is {status}"
-        ),
-    }
     let report_id = proposal
         .report_id
         .context("learned-skill evaluation report is missing")?;
@@ -729,10 +1377,13 @@ fn activate_skill(
             now,
         )
         .context("learned-skill activation failed")?;
-    println!(
-        "Learned skill activated: id={} generation={} removal_only={}",
-        skill_id, outcome.desired_generation, publication.removal_only
-    );
+    OperatorReport::new("activate")
+        .with("id", skill_id)
+        .with("status", outcome.status.as_token())
+        .with("generation", outcome.desired_generation)
+        .with("removal_only", publication.removal_only)
+        .with("idempotent", false)
+        .emit();
     Ok(())
 }
 
@@ -774,7 +1425,12 @@ fn promote_replacement_skill(
     let candidate = LifecycleService::new(&mut store).revision(skill_id)?;
     match candidate.status {
         LifecycleStatus::Active => {
-            println!("Learned skill replacement already promoted: id={skill_id} status=active");
+            OperatorReport::new("promote")
+                .with("id", skill_id)
+                .with("status", "active")
+                .with("predecessor", predecessor_id)
+                .with("idempotent", true)
+                .emit();
             return Ok(());
         }
         LifecycleStatus::Canary => {}
@@ -882,14 +1538,15 @@ fn promote_replacement_skill(
             now,
         )
         .context("learned-skill replacement promotion failed")?;
-    println!(
-        "Learned skill replacement promoted: id={skill_id} status={} predecessor={predecessor_id} \
-         predecessor_status={} generation={} removal_only={}",
-        outcome.candidate_status,
-        outcome.predecessor_status,
-        outcome.desired_generation,
-        publication.removal_only
-    );
+    OperatorReport::new("promote")
+        .with("id", skill_id)
+        .with("status", outcome.candidate_status.as_token())
+        .with("predecessor", predecessor_id)
+        .with("predecessor_status", outcome.predecessor_status.as_token())
+        .with("generation", outcome.desired_generation)
+        .with("removal_only", publication.removal_only)
+        .with("idempotent", false)
+        .emit();
     Ok(())
 }
 
@@ -935,59 +1592,108 @@ fn submit_feedback(
         .submit(&actor, &command, now)
         .context("learned-skill feedback submission failed")?;
 
-    if kind == FeedbackKind::Severe {
-        let metadata = store
-            .metadata(operation.skill_id)
-            .context("failed to inspect feedback target")?
-            .context("feedback target disappeared")?;
-        let status = LifecycleStatus::from_token(&metadata.status)
-            .context("feedback target has an invalid lifecycle status")?;
-        if status == LifecycleStatus::Canary || status == LifecycleStatus::Active {
-            drop(store);
-            let embedder = Arc::new(Embedder::from_config(embedding)?);
-            let coordinator = IndexCoordinator::open(paths, embedder)?;
-            coordinator
-                .rebuild_and_publish()
-                .context("failed to reconcile the learned-skill index before quarantine")?;
-            let store = SkillStore::open_at(paths)?;
-            let generation = store.generation_state()?;
-            let metadata = store
-                .metadata(operation.skill_id)?
-                .context("feedback target disappeared before quarantine")?;
-            let reason = if status == LifecycleStatus::Canary {
-                QuarantineReason::AuthenticatedCanarySafetyFeedback
-            } else {
-                QuarantineReason::AuthenticatedActiveIntegrityFeedback
-            };
-            let evidence = QuarantineEvidence {
-                skill_id: operation.skill_id.to_string(),
-                reason,
-                qualified_invocations: 0,
-                direct_failures: 0,
-                evidence_complete: true,
-                authenticated_feedback: true,
-                feedback_marked_severe: true,
-                row_version_current: true,
-                generation_current: generation.desired_generation == generation.applied_generation,
-            };
-            let row_version = i64::try_from(metadata.row_version)
-                .context("feedback target row version is out of range")?;
-            let desired_generation = i64::try_from(generation.desired_generation)
-                .context("feedback target generation is out of range")?;
-            QuarantineExecutor::new(&coordinator)
-                .apply(
-                    &QuarantinePolicy::conservative("phase5-quarantine-v1"),
-                    &evidence,
-                    status,
-                    row_version,
-                    desired_generation,
-                    now,
-                )
-                .context("severe feedback was stored but quarantine failed")?;
+    // Severe feedback is containment only where the target is retrievable or
+    // about to be. Reporting the same "recorded" line for every status hid
+    // whether anything was actually quarantined.
+    let (quarantine, quarantine_detail) = if kind == FeedbackKind::Severe {
+        let attribution = FeedbackAttribution::new(feedback_id.as_str(), operation.reason_code);
+        contain_severe_feedback(store, &operation, &attribution, paths, embedding, now)?
+    } else {
+        drop(store);
+        ("not_applicable", None)
+    };
+    // Read the status back after the action, so an applied quarantine shows up
+    // in the same line that records the feedback.
+    let status = live_revision_status(paths, operation.skill_id)?;
+    OperatorReport::new("feedback")
+        .with("id", operation.skill_id)
+        .with("feedback_id", feedback_id)
+        .with("kind", operation.kind)
+        .with("status", status)
+        .with("quarantine", quarantine)
+        .with("quarantine_reason", quarantine_detail)
+        .emit();
+    Ok(())
+}
+
+/// Quarantine the target of severe feedback when its lifecycle status allows
+/// it, reporting `applied`, `held` (with the policy's hold reason) or
+/// `skipped` (with the ineligible status) rather than staying silent.
+fn contain_severe_feedback(
+    store: SkillStore,
+    operation: &FeedbackOperation<'_>,
+    attribution: &FeedbackAttribution,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+    now: i64,
+) -> anyhow::Result<(&'static str, Option<String>)> {
+    let metadata = store
+        .metadata(operation.skill_id)
+        .context("failed to inspect feedback target")?
+        .context("feedback target disappeared")?;
+    let status = LifecycleStatus::from_token(&metadata.status)
+        .context("feedback target has an invalid lifecycle status")?;
+    if status != LifecycleStatus::Canary && status != LifecycleStatus::Active {
+        return Ok((
+            "skipped",
+            Some(format!("ineligible_status:{}", status.as_token())),
+        ));
+    }
+    drop(store);
+    let embedder = Arc::new(Embedder::from_config(embedding)?);
+    let coordinator = IndexCoordinator::open(paths, embedder)?;
+    coordinator
+        .rebuild_and_publish()
+        .context("failed to reconcile the learned-skill index before quarantine")?;
+    let store = SkillStore::open_at(paths)?;
+    let generation = store.generation_state()?;
+    let metadata = store
+        .metadata(operation.skill_id)?
+        .context("feedback target disappeared before quarantine")?;
+    let reason = if status == LifecycleStatus::Canary {
+        QuarantineReason::AuthenticatedCanarySafetyFeedback
+    } else {
+        QuarantineReason::AuthenticatedActiveIntegrityFeedback
+    };
+    let evidence = QuarantineEvidence {
+        skill_id: operation.skill_id.to_string(),
+        reason,
+        qualified_invocations: 0,
+        direct_failures: 0,
+        evidence_complete: true,
+        authenticated_feedback: true,
+        feedback_marked_severe: true,
+        row_version_current: true,
+        generation_current: generation.desired_generation == generation.applied_generation,
+    };
+    let row_version = i64::try_from(metadata.row_version)
+        .context("feedback target row version is out of range")?;
+    let desired_generation = i64::try_from(generation.desired_generation)
+        .context("feedback target generation is out of range")?;
+    drop(store);
+    // The attribution carries the submitted reason code and the stored feedback
+    // row into the evidence snapshot and the transition reason, so an operator
+    // `permission_violation` is not flattened into the lifecycle-derived
+    // quarantine reason.
+    match QuarantineExecutor::new(&coordinator).apply_with_attribution(
+        &QuarantinePolicy::conservative("phase5-quarantine-v1"),
+        &evidence,
+        Some(attribution),
+        status,
+        row_version,
+        desired_generation,
+        now,
+    ) {
+        Ok(_) => Ok(("applied", None)),
+        // A policy hold is a decision, not an infrastructure fault: the
+        // feedback stays recorded and the operator is told why nothing was
+        // contained.
+        Err(QuarantineExecutionError::Held(held)) => Ok(("held", Some(held.to_string()))),
+        Err(error) => {
+            Err(anyhow::Error::new(error)
+                .context("severe feedback was stored but quarantine failed"))
         }
     }
-    println!("Learned-skill feedback recorded: id={feedback_id}");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1042,7 +1748,18 @@ mod tests {
         store.insert_verified(&artifact).unwrap();
         drop(store);
 
-        run(Some(&artifact.id), false, None, None, &paths, None).unwrap();
+        run(
+            Some(PurgeOperation {
+                skill_id: &artifact.id,
+                force: true,
+            }),
+            false,
+            None,
+            None,
+            &paths,
+            None,
+        )
+        .unwrap();
 
         let store = SkillStore::open_at(&paths).unwrap();
         assert!(store.get(&artifact.id).unwrap().is_none());
@@ -1255,7 +1972,18 @@ mod tests {
         .unwrap();
         assert_state("quarantined");
 
-        run(Some(&artifact.id), false, None, None, &paths, None).unwrap();
+        run(
+            Some(PurgeOperation {
+                skill_id: &artifact.id,
+                force: true,
+            }),
+            false,
+            None,
+            None,
+            &paths,
+            None,
+        )
+        .unwrap();
         let store = SkillStore::open_at(&paths).unwrap();
         assert!(store.metadata(&artifact.id).unwrap().is_none());
         let generation = store.generation_state().unwrap();
@@ -1548,6 +2276,14 @@ mod tests {
                 .all(|row| row.skill_id != skill_id),
             "a rejected proposal is terminal and must not be listed"
         );
+        // The terminal outcome is still reachable by identifier, which is the
+        // only way an operator can see why admission ended where it did.
+        let rejected = load_proposal(&store, &skill_id)
+            .unwrap()
+            .expect("a rejected proposal must remain queryable by id");
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(rejected.skill_id, skill_id);
+        assert!(load_proposal(&store, &"e".repeat(64)).unwrap().is_none());
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1596,6 +2332,477 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_blocked_import_reports_a_queued_proposal_without_draining_the_other_one() {
+        let (root, paths, _) = fixture();
+        let neighbour = SkillArtifact::new(
+            "function run() { return 3; }".into(),
+            "Agent-originated queue neighbour".into(),
+            vec![],
+            vec![SkillExport {
+                name: "run".into(),
+                signature: "() => number".into(),
+            }],
+            vec!["run() === 3".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        // Enqueued far in the past, so it owns the head of the due queue.
+        store.enqueue_proposal(&neighbour, None, 1).unwrap();
+        drop(store);
+
+        let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let report = import_package_within(
+            package,
+            &paths,
+            None,
+            "blocked-import",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        // A proposal that is merely queued is not an import failure.
+        assert_eq!(report.status, ProposalStatus::Pending);
+        assert_eq!(report.blocked_by.as_deref(), Some(neighbour.id.as_str()));
+        let store = SkillStore::open_at(&paths).unwrap();
+        let untouched = store.get_proposal(&neighbour.id).unwrap().unwrap();
+        assert_eq!(untouched.status, ProposalStatus::Pending);
+        assert_eq!(
+            untouched.attempt_count, 0,
+            "an operator import must not spend an unrelated proposal's retry budget"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_seeds_reports_every_seed_and_continues_past_a_failing_one() {
+        let (root, paths, _) = fixture();
+        // A purged identity can never be re-proposed, so this seed fails for
+        // good while the rest of the library is still installable.
+        let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let purged = JsProposal::try_from(package.proposal)
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&purged).unwrap();
+        RetentionService::new(&mut store)
+            .privacy_purge(&purged.id, "test_request", 10)
+            .unwrap();
+        drop(store);
+
+        install_seeds(&paths, None).unwrap();
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(
+            store.get_proposal(&purged.id).unwrap().is_none(),
+            "a purged seed stays purged"
+        );
+        let admitted: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_proposals WHERE status = 'awaiting_approval'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            admitted,
+            (SEED_PACKAGES.len() - 1) as i64,
+            "one failing seed must not abort the remaining seeds"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operator_reports_render_one_shape_in_text_and_json() {
+        let report = OperatorReport::new("approve")
+            .with("id", "abc")
+            .with("status", "canary")
+            .with("generation", 4u64)
+            .with("idempotent", true)
+            .with("reason_code", None::<String>);
+        assert_eq!(
+            report.render(false),
+            "learned-skill approve: id=abc status=canary generation=4 idempotent=true reason_code=-"
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.render(true)).unwrap();
+        assert_eq!(json["command"], "approve");
+        assert_eq!(json["id"], "abc");
+        assert_eq!(json["generation"], 4);
+        assert_eq!(json["idempotent"], true);
+        assert!(json["reason_code"].is_null());
+    }
+
+    #[test]
+    fn an_idempotent_approval_reports_the_live_status_and_published_generation() {
+        let replay = super::super::store::CanaryApprovalResult {
+            skill_id: "a".repeat(64),
+            generation: 2,
+            idempotent: true,
+        };
+        // The revision moved on after the first approval: the report must say
+        // so instead of restating "approved as canary" at generation 2.
+        let line = approve_report(&replay, 9, "active").render(false);
+        assert!(line.contains("idempotent=true"), "{line}");
+        assert!(line.contains("status=active"), "{line}");
+        assert!(line.contains("generation=9"), "{line}");
+        assert!(line.contains("approval_generation=2"), "{line}");
+
+        let first = super::super::store::CanaryApprovalResult {
+            skill_id: "a".repeat(64),
+            generation: 9,
+            idempotent: false,
+        };
+        assert!(
+            approve_report(&first, 9, "canary")
+                .render(false)
+                .contains("idempotent=false")
+        );
+    }
+
+    #[test]
+    fn purge_refuses_a_non_terminal_revision_without_the_force_flag() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        drop(store);
+
+        let refused = run(
+            Some(PurgeOperation {
+                skill_id: &artifact.id,
+                force: false,
+            }),
+            false,
+            None,
+            None,
+            &paths,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("terminal lifecycle status"), "{refused}");
+        assert!(refused.contains("--purge-learned-skill-force"), "{refused}");
+        assert!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .get(&artifact.id)
+                .unwrap()
+                .is_some(),
+            "a refused purge must not delete anything"
+        );
+
+        run(
+            Some(PurgeOperation {
+                skill_id: &artifact.id,
+                force: true,
+            }),
+            false,
+            None,
+            None,
+            &paths,
+            None,
+        )
+        .unwrap();
+        assert!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .get(&artifact.id)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_names_the_dependants_a_terminal_target_would_reroot() {
+        let (root, paths, artifact) = fixture();
+        let replacement = SkillArtifact::new(
+            "function run() { return 1; } // replacement".into(),
+            "Operator surface replacement".into(),
+            vec![],
+            vec![SkillExport {
+                name: "run".into(),
+                signature: "() => number".into(),
+            }],
+            vec!["run() === 1".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        store.insert_verified(&replacement).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'superseded' WHERE id = ?",
+                [&artifact.id],
+            )
+            .unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions
+                 SET status = 'canary', supersedes_id = ? WHERE id = ?",
+                rusqlite::params![artifact.id, replacement.id],
+            )
+            .unwrap();
+        drop(store);
+
+        // The target itself is terminal, so only the dependant forces the
+        // operator's hand.
+        let refused = run(
+            Some(PurgeOperation {
+                skill_id: &artifact.id,
+                force: false,
+            }),
+            false,
+            None,
+            None,
+            &paths,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("re-root"), "{refused}");
+        assert!(refused.contains(&replacement.id), "{refused}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn severe_feedback_reports_whether_containment_actually_happened() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'verified' WHERE id = ?",
+                [&artifact.id],
+            )
+            .unwrap();
+        drop(store);
+        let operation = FeedbackOperation {
+            skill_id: &artifact.id,
+            invocation_id: None,
+            kind: "severe",
+            reason_code: "integrity",
+            idempotency_key: "severe-ineligible",
+        };
+
+        let attribution = FeedbackAttribution::new("feedback-1", "integrity");
+        let store = SkillStore::open_at(&paths).unwrap();
+        let (outcome, detail) =
+            contain_severe_feedback(store, &operation, &attribution, &paths, None, 100).unwrap();
+        assert_eq!(outcome, "skipped");
+        assert_eq!(detail.as_deref(), Some("ineligible_status:verified"));
+        assert_eq!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .metadata(&artifact.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "verified",
+            "an ineligible target must not be quarantined"
+        );
+
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'active' WHERE id = ?",
+                [&artifact.id],
+            )
+            .unwrap();
+        drop(store);
+        let store = SkillStore::open_at(&paths).unwrap();
+        let (outcome, detail) =
+            contain_severe_feedback(store, &operation, &attribution, &paths, None, 101).unwrap();
+        assert_eq!(outcome, "applied");
+        assert_eq!(detail, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retirement_disables_an_active_skill_and_keeps_its_lineage() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        drop(store);
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Retire(&artifact.id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert_eq!(
+            store.revision_status(&artifact.id).unwrap().as_deref(),
+            Some("retired")
+        );
+        assert!(!store.is_retrievable(&artifact.id).unwrap());
+        // Unlike purge, the revision and its bytes survive.
+        assert!(store.get(&artifact.id).unwrap().is_some());
+        drop(store);
+
+        // A repeated retirement is an acknowledged no-op, not an error.
+        retire_skill(&artifact.id, &paths, None).unwrap();
+        assert_eq!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .revision_status(&artifact.id)
+                .unwrap()
+                .as_deref(),
+            Some("retired")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_validates_the_target_before_paying_for_an_index_rebuild() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        let before = store.generation_state().unwrap();
+        drop(store);
+
+        let error = activate_skill(&"a".repeat(64), &paths, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("proposal not found"), "{error}");
+
+        let after = SkillStore::open_at(&paths)
+            .unwrap()
+            .generation_state()
+            .unwrap();
+        assert_eq!(
+            (after.desired_generation, after.applied_generation),
+            (before.desired_generation, before.applied_generation),
+            "a mistyped identifier must be rejected before the embedding rebuild"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_import_wait_polls_its_own_proposal_and_never_claims_another() {
+        let (root, paths, artifact) = fixture();
+        let other = SkillArtifact::new(
+            "function run() { return 2; }".into(),
+            "Operator surface queue neighbour".into(),
+            vec![],
+            vec![SkillExport {
+                name: "run".into(),
+                signature: "() => number".into(),
+            }],
+            vec!["run() === 2".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.enqueue_proposal(&other, None, 10).unwrap();
+        store.enqueue_proposal(&artifact, None, 20).unwrap();
+
+        // `evaluate_next` claims the oldest due proposal, so the neighbour is
+        // the head and an import of the later proposal must not drive it.
+        assert_eq!(
+            due_proposal_head(&store, 30).unwrap().as_deref(),
+            Some(other.id.as_str())
+        );
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_proposals SET next_attempt_at = 900 WHERE skill_id = ?",
+                [&other.id],
+            )
+            .unwrap();
+        assert_eq!(
+            due_proposal_head(&store, 30).unwrap().as_deref(),
+            Some(artifact.id.as_str())
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_import_wait_sleeps_to_the_backoff_without_overrunning_its_budget() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        // No scheduled retry: poll at the short cadence rather than busy-loop.
+        assert_eq!(sleep_until_due(None, 100, deadline), IMPORT_POLL_INTERVAL);
+        // A one-second backoff is waited out rather than spun through.
+        assert_eq!(
+            sleep_until_due(Some(101), 100, deadline),
+            Duration::from_secs(1)
+        );
+        // A long backoff is capped so the budget stays enforceable.
+        assert_eq!(
+            sleep_until_due(Some(100_000), 100, deadline),
+            IMPORT_MAX_SLEEP
+        );
+        // An expired budget never sleeps.
+        let expired = std::time::Instant::now() - Duration::from_secs(1);
+        assert_eq!(sleep_until_due(Some(100_000), 100, expired), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_replacement_import_names_the_predecessors_observed_state() {
+        let (root, paths, artifact) = fixture();
+        let (json, _) = replacement_package_json("absent-predecessor", &"b".repeat(64));
+        let package: LearnedSkillPackage = serde_json::from_str(&json).unwrap();
+        // The pre-flight refuses before any held-out baseline is written.
+        let absent = import_package(package, &paths, None, "absent-predecessor")
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("cannot be enqueued"), "{absent}");
+        assert_eq!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .connection()
+                .query_row("SELECT COUNT(*) FROM held_out_suites", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a refused enqueue must not leave orphan trusted baselines behind"
+        );
+
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'retired' WHERE id = ?",
+                [&artifact.id],
+            )
+            .unwrap();
+        drop(store);
+        let (json, _) = replacement_package_json("retired-predecessor", &artifact.id);
+        let package: LearnedSkillPackage = serde_json::from_str(&json).unwrap();
+        let candidate = JsProposal::try_from(package.proposal)
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap();
+        let store = SkillStore::open_at(&paths).unwrap();
+        let ineligible = preflight_enqueue(&store, &candidate, Some(&artifact.id))
+            .unwrap_err()
+            .to_string();
+        assert!(ineligible.contains("is retired"), "{ineligible}");
+        let missing = preflight_enqueue(&store, &candidate, Some(&"c".repeat(64)))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("absent from the store"), "{missing}");
+        assert_ne!(ineligible, missing);
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 

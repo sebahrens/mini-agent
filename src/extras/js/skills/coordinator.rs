@@ -94,22 +94,45 @@ impl IndexCoordinator {
     /// Only identity-valid active revisions are returned. Verified or canary
     /// revisions remain unavailable until the existing human approval and
     /// explicit activation path publishes them.
+    ///
+    /// A tampered, legacy, or otherwise unreadable row must cost only its own
+    /// declaration: every id is resolved independently and reports its own
+    /// diagnostic, so one bad revision can no longer drop the whole batch.
     pub(crate) fn resolve_active_ids(
         &self,
         ids: &[String],
-    ) -> Result<Vec<Option<super::SkillArtifact>>, CoordinatorError> {
+    ) -> Result<Vec<Result<Option<super::SkillArtifact>, String>>, CoordinatorError> {
         let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
-        ids.iter()
-            .map(|id| {
-                let Some(metadata) = store.metadata(id)? else {
-                    return Ok(None);
-                };
-                if metadata.status != "active" {
-                    return Ok(None);
-                }
-                store.get(id).map_err(CoordinatorError::from)
+        Ok(ids
+            .iter()
+            .map(|id| match store.metadata(id) {
+                Ok(None) => Ok(None),
+                Ok(Some(metadata)) if metadata.status != "active" => Ok(None),
+                Ok(Some(_)) => store.get(id).map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
             })
-            .collect()
+            .collect())
+    }
+
+    /// Narrow a leased selection to the revisions durable state still allows a
+    /// turn to bind. A purge from another process deletes the row and a retire
+    /// or quarantine moves it out of `active`/`canary`, so an in-flight turn
+    /// that leased the previous generation must drop it before publishing its
+    /// bundle. Callers must run this on a blocking worker.
+    pub(crate) fn retain_bindable_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<HashSet<String>, CoordinatorError> {
+        let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+        let mut bindable = HashSet::with_capacity(ids.len());
+        for id in ids {
+            if let Some(metadata) = store.metadata(id)?
+                && matches!(metadata.status.as_str(), "active" | "canary")
+            {
+                bindable.insert(id.clone());
+            }
+        }
+        Ok(bindable)
     }
 
     pub fn open(paths: &AppPaths, embedder: Arc<Embedder>) -> Result<Self, CoordinatorError> {
@@ -390,19 +413,22 @@ impl IndexCoordinator {
             .store
             .lock()
             .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
-        let mut published = self
-            .published
-            .write()
-            .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
         let (result, generation) =
             mutation(&mut store).map_err(CoordinatedMutationError::Mutation)?;
 
         // Publish committed removals immediately. Additions remain invisible
-        // while the complete generation is built off the new-turn gate.
+        // while the complete generation is built off the new-turn gate. The
+        // publication write lock is taken only now: holding it across the
+        // mutation would block every reader's `lease()` for as long as the
+        // SQLite write waits on another process.
+        let mut published = self
+            .published
+            .write()
+            .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
         *published = Arc::new(published.without_ids(generation, &removed_ids));
+        drop(published);
         let removal_acknowledgement =
             store.mark_generation_applied_with_mode(generation, "removal_only", None);
-        drop(published);
         if let Err(error) = removal_acknowledgement {
             return Err(CoordinatedMutationError::Publication(error.into()));
         }
@@ -470,13 +496,16 @@ impl IndexCoordinator {
             .store
             .lock()
             .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
+        let (result, generation) =
+            mutation(&mut store).map_err(CoordinatedMutationError::Mutation)?;
+        // Readers keep leasing the previous generation until the mutation has
+        // actually committed; the write lock is never held across SQLite I/O.
         let mut published = self
             .published
             .write()
             .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
-        let (result, generation) =
-            mutation(&mut store).map_err(CoordinatedMutationError::Mutation)?;
         *published = Arc::new(published.without_ids(generation, &removed_ids));
+        drop(published);
         store
             .mark_generation_applied_with_mode(generation, "removal_only", None)
             .map_err(CoordinatorError::from)
@@ -508,6 +537,20 @@ impl IndexCoordinator {
             .lock()
             .map_err(|_| CoordinatorError::Poisoned)?;
         let model = self.embedder.model_metadata().clone();
+        // A mutation that already published a full generation leaves a stale
+        // `needs_refresh()` behind it, so this rebuild is frequently a no-op by
+        // the time it wins the build lock. Re-read durable state here instead of
+        // requesting a brand-new generation and re-embedding every skill.
+        {
+            let store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
+            let state = store.generation_state()?;
+            if self.hydrated.load(Ordering::Acquire)
+                && state.desired_generation == state.applied_generation
+                && state.publication_mode == "full"
+            {
+                return Ok(state.applied_generation);
+            }
+        }
         let (generation, acknowledge_generation, initial, backfill, database_path) = {
             let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
             let state = store.generation_state()?;
@@ -857,4 +900,244 @@ fn skill_document(artifact: &super::SkillArtifact) -> String {
                 .collect(),
         )
         .render()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extras::js::skills::store::SkillStore;
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    use crate::paths::AppPaths;
+    use std::sync::mpsc;
+
+    fn temp_paths() -> (std::path::PathBuf, AppPaths) {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-coordinator-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local-data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        };
+        (root, paths)
+    }
+
+    fn open_coordinator(paths: &AppPaths) -> Arc<IndexCoordinator> {
+        Arc::new(
+            IndexCoordinator::open(
+                paths,
+                Arc::new(Embedder::from_config(None).expect("deterministic embedder")),
+            )
+            .expect("index coordinator"),
+        )
+    }
+
+    fn artifact(name: &str, description: &str) -> SkillArtifact {
+        SkillArtifact::new(
+            format!("function {name}(_cap, value) {{ return value; }}"),
+            description.to_string(),
+            vec!["coordinator".to_string()],
+            vec![SkillExport {
+                name: name.to_string(),
+                signature: format!("{name}(value: string): string"),
+            }],
+            vec![format!("{name}('x') === 'x'")],
+            CapabilityManifest::pure(),
+        )
+        .expect("test artifact")
+    }
+
+    #[test]
+    fn a_current_full_generation_is_not_rebuilt_and_re_embedded_again() {
+        let (root, paths) = temp_paths();
+        let coordinator = open_coordinator(&paths);
+
+        let first = coordinator
+            .rebuild_and_publish()
+            .expect("first publication");
+        let after_first = SkillStore::open_at(&paths)
+            .and_then(|store| store.generation_state())
+            .expect("durable state");
+        let second = coordinator
+            .rebuild_and_publish()
+            .expect("redundant publication");
+        let after_second = SkillStore::open_at(&paths)
+            .and_then(|store| store.generation_state())
+            .expect("durable state");
+
+        assert_eq!(
+            second, first,
+            "a redundant rebuild must reuse the published generation"
+        );
+        assert_eq!(
+            after_second.desired_generation, after_first.desired_generation,
+            "a redundant rebuild must not request a brand-new generation"
+        );
+        assert_eq!(
+            after_second.applied_generation,
+            after_first.applied_generation
+        );
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_in_flight_mutation_does_not_block_a_turn_lease() {
+        let (root, paths) = temp_paths();
+        let coordinator = open_coordinator(&paths);
+        coordinator
+            .rebuild_and_publish()
+            .expect("initial publication");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mutating = {
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                coordinator
+                    .coordinate_mutation(HashSet::new(), move |store: &mut SkillStore| {
+                        entered_tx
+                            .send(())
+                            .expect("announce the in-flight mutation");
+                        release_rx.recv().expect("hold the mutation open");
+                        let state = store.generation_state()?;
+                        let generation = store.request_generation(
+                            &state.model_id,
+                            &state.model_revision,
+                            state.dimensions,
+                            state.normalized,
+                        )?;
+                        Ok::<((), u64), StoreError>(((), generation))
+                    })
+                    .map(|(_, report)| report.generation)
+            })
+        };
+        entered_rx.recv().expect("the mutation must start");
+
+        let (leased_tx, leased_rx) = mpsc::channel();
+        let reader = Arc::clone(&coordinator);
+        std::thread::spawn(move || {
+            let _ = leased_tx.send(reader.lease().is_ok());
+        });
+        let leased = leased_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release the mutation");
+        let generation = mutating
+            .join()
+            .expect("mutation thread")
+            .expect("mutation should publish");
+
+        assert_eq!(
+            leased,
+            Ok(true),
+            "a turn lease must not wait for an in-flight lifecycle mutation"
+        );
+        assert!(generation > 0);
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_unreadable_declared_row_does_not_drop_the_rest_of_the_batch() {
+        let (root, paths) = temp_paths();
+        let good = artifact("goodDeclaredSkill", "Keep a readable declared skill.");
+        let tampered = artifact("tamperedDeclaredSkill", "Tamper with this row on disk.");
+        let mut store = SkillStore::open_at(&paths).expect("store");
+        store.insert_verified(&good).expect("insert readable row");
+        store
+            .insert_verified(&tampered)
+            .expect("insert row to tamper with");
+        store
+            .connection_mut()
+            .execute_batch("DROP TRIGGER IF EXISTS skill_revisions_identity_immutable;")
+            .expect("drop the immutability guard for the tamper fixture");
+        store
+            .connection_mut()
+            .execute(
+                "UPDATE skill_revisions SET source = source || ' ' WHERE id = ?",
+                [&tampered.id],
+            )
+            .expect("tamper with the stored source");
+        drop(store);
+
+        let coordinator = open_coordinator(&paths);
+        let resolved = coordinator
+            .resolve_active_ids(&[tampered.id.clone(), good.id.clone()])
+            .expect("a tampered row must not fail the whole batch");
+
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved[0].is_err(),
+            "the tampered row must report its own diagnostic"
+        );
+        assert_eq!(
+            resolved[1]
+                .as_ref()
+                .expect("readable row must still resolve")
+                .as_ref()
+                .map(|artifact| artifact.id.as_str()),
+            Some(good.id.as_str())
+        );
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_active_and_canary_revisions_remain_bindable() {
+        let (root, paths) = temp_paths();
+        let active = artifact("activeBindableSkill", "Stay bindable while active.");
+        let canary = artifact("canaryBindableSkill", "Stay bindable while a canary.");
+        let retired = artifact("retiredBindableSkill", "Leave the set once retired.");
+        let mut store = SkillStore::open_at(&paths).expect("store");
+        store.insert_verified(&active).expect("insert active");
+        store.insert_verified(&canary).expect("insert canary");
+        store.insert_verified(&retired).expect("insert retired");
+        store
+            .connection_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'canary' WHERE id = ?",
+                [&canary.id],
+            )
+            .expect("mark the canary revision");
+        let version = store
+            .metadata(&retired.id)
+            .expect("metadata")
+            .expect("retired row")
+            .row_version;
+        store.retire(&retired.id, version).expect("retire");
+        drop(store);
+
+        let coordinator = open_coordinator(&paths);
+        let bindable = coordinator
+            .retain_bindable_ids(&[
+                active.id.clone(),
+                canary.id.clone(),
+                retired.id.clone(),
+                "purged-revision-id".to_string(),
+            ])
+            .expect("bindable set");
+
+        assert!(bindable.contains(&active.id));
+        assert!(
+            bindable.contains(&canary.id),
+            "canary routing must survive the bindable filter"
+        );
+        assert!(
+            !bindable.contains(&retired.id),
+            "a retired revision must not stay bindable"
+        );
+        assert!(
+            !bindable.contains("purged-revision-id"),
+            "a purged revision must not stay bindable"
+        );
+        assert_eq!(bindable.len(), 2);
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -1646,21 +1646,68 @@ pub fn convert_history_shared_with_tool_result_retention(
     history
 }
 
-/// Rewrites a persisted tool identity into one that is safe to replay.
+/// Rewrites a persisted tool identity into one that is safe to replay on its
+/// own.
 ///
 /// The OpenAI Responses API treats a native `fc_...` `function_call` id as a
 /// reference to an item it already stored, and then requires the `reasoning`
-/// item that was emitted alongside it. Persisted sessions carry no reasoning
-/// items, so replaying a native id fails every continuation with "provided
-/// without its required 'reasoning' item". Rig omits non-`fc_` ids on
-/// serialization and pairs a call with its output by `call_id` alone, so a
-/// rewritten identity is accepted by both API styles as long as the call and
-/// its result agree on it.
+/// item that was emitted alongside it. A session that persisted no reasoning
+/// item for the call — every session written before
+/// [`Session::tool_call_provenance`] existed, and every provider that never
+/// sends one — therefore cannot replay the native id: it fails the
+/// continuation with "provided without its required 'reasoning' item". Rig
+/// omits non-`fc_` ids on serialization and pairs a call with its output by
+/// `call_id` alone, so a rewritten identity is accepted by both API styles as
+/// long as the call and its result agree on it.
 fn replay_tool_identity(id: &str) -> String {
     match id.strip_prefix("fc_") {
         Some(rest) => format!("call_{rest}"),
         None => id.to_string(),
     }
+}
+
+/// The provider item id and `call_id` a replayed call and its result share.
+#[derive(Clone)]
+struct ReplayToolIdentity {
+    item_id: String,
+    call_id: String,
+}
+
+/// Decide how one persisted tool call is presented to the provider on replay.
+///
+/// The provider's own item ids are replayed verbatim only when the session also
+/// persisted the reasoning item that was emitted with the call, because that is
+/// exactly the pairing the Responses API validates. Everything else — an older
+/// session file with no provenance, a provider that supplies no `call_id`, a
+/// reasoning item stored without its `rs_...` id — keeps the rewritten identity
+/// that needs no stored provider item, which is what every session did before
+/// reasoning could be persisted at all.
+fn replay_call_identity(
+    provenance: Option<&crate::session::PersistedCallProvenance>,
+    persisted_id: &str,
+) -> (ReplayToolIdentity, Vec<AssistantContent>) {
+    if let Some((item_id, call_id, reasoning)) =
+        provenance.and_then(|provenance| provenance.replayable_reasoning())
+    {
+        return (
+            ReplayToolIdentity {
+                item_id: item_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+            reasoning
+                .into_iter()
+                .map(|item| AssistantContent::Reasoning(item.to_rig()))
+                .collect(),
+        );
+    }
+    let rewritten = replay_tool_identity(persisted_id);
+    (
+        ReplayToolIdentity {
+            item_id: rewritten.clone(),
+            call_id: rewritten,
+        },
+        Vec::new(),
+    )
 }
 
 fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) -> Vec<Message> {
@@ -1729,6 +1776,9 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
         .collect();
     let mut open_call_ids = HashSet::new();
     let mut completed_call_ids = HashSet::new();
+    // The identity a call was replayed under, so its result can be paired with
+    // it whether the call kept the provider's own ids or a rewritten identity.
+    let mut replay_identities: HashMap<String, ReplayToolIdentity> = HashMap::new();
 
     for msg in &replay_messages[first_kept..] {
         match msg.role {
@@ -1753,28 +1803,35 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                             && !open_call_ids.contains(id.as_str()) =>
                     {
                         open_call_ids.insert(id.to_string());
-                        let replay_id = replay_tool_identity(id);
-                        Some(AssistantContent::tool_call_with_call_id(
-                            replay_id.clone(),
-                            replay_id,
+                        let (identity, mut items) = replay_call_identity(
+                            session.provenance_for_tool_call(id.as_str()),
+                            id.as_str(),
+                        );
+                        // Reasoning first: the Responses API requires the
+                        // `reasoning` item to precede the `function_call` it
+                        // was emitted with, in the same assistant turn.
+                        items.push(AssistantContent::tool_call_with_call_id(
+                            identity.item_id.clone(),
+                            identity.call_id.clone(),
                             name.to_string(),
                             arguments.clone(),
-                        ))
+                        ));
+                        replay_identities.insert(id.to_string(), identity);
+                        Some(items)
                     }
                     _ => None,
                 };
-                if let Some(call) = structured {
+                if let Some(items) = structured {
                     if matches!(
                         replay_kind,
                         ReplayKind::Assistant | ReplayKind::StructuredCall
                     ) && let Some(Message::Assistant { content, .. }) = messages.last_mut()
                     {
-                        content.push(call);
-                    } else {
-                        messages.push(Message::Assistant {
-                            id: None,
-                            content: OneOrMany::one(call),
-                        });
+                        for item in items {
+                            content.push(item);
+                        }
+                    } else if let Ok(content) = OneOrMany::many(items) {
+                        messages.push(Message::Assistant { id: None, content });
                     }
                     replay_kind = ReplayKind::StructuredCall;
                 } else {
@@ -1789,10 +1846,20 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                             && !completed_call_ids.contains(id.as_str()) =>
                     {
                         completed_call_ids.insert(id.to_string());
-                        let replay_id = replay_tool_identity(id);
+                        let identity =
+                            replay_identities
+                                .get(id.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    let rewritten = replay_tool_identity(id.as_str());
+                                    ReplayToolIdentity {
+                                        item_id: rewritten.clone(),
+                                        call_id: rewritten,
+                                    }
+                                });
                         Some(UserContent::ToolResult(ToolResult {
-                            id: replay_id.clone(),
-                            call_id: Some(replay_id),
+                            id: identity.item_id,
+                            call_id: Some(identity.call_id),
                             content: OneOrMany::one(ToolResultContent::text(output.to_string())),
                         }))
                     }

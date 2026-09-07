@@ -14,15 +14,15 @@ use super::admission_store::AdmissionStore;
 use super::embed::{Embedder, SkillDocument};
 use super::held_out::{HeldOutError, HeldOutEvaluationReport, evaluate};
 use super::store::{
-    AdminIdentity, CanaryApprovalResult, EvaluationReportRecord, MAX_EVALUATION_ATTEMPTS,
-    ProposalLease, ProposalStatus, SkillStore, StoreError,
+    AdminIdentity, CanaryApprovalResult, EVALUATION_ATTEMPTS_EXHAUSTED, EvaluationReportRecord,
+    MAX_EVALUATION_ATTEMPTS, ProposalLease, ProposalStatus, SkillStore, StoreError,
 };
 #[cfg(test)]
 use super::store::{
     ApprovalAuthorization, ApprovalAuthorizationRequest, ApprovalTransition,
     approval_manifest_digest,
 };
-use super::verify::{TestResult, VerificationError};
+use super::verify::VerificationError;
 use super::{CapabilityManifest, CapabilityScope, SkillArtifact, SkillExport};
 
 const LEASE_SECONDS: i64 = 30;
@@ -75,6 +75,19 @@ impl AdmissionEvaluator {
         &mut self,
         now: i64,
     ) -> Result<Option<EvaluationReportRecord>, AdmissionError> {
+        // A row whose lease expired on its final attempt can no longer be
+        // claimed (`claim_due_proposal` requires `attempt_count <
+        // MAX_EVALUATION_ATTEMPTS`), so without this sweep it would stay
+        // `evaluating` forever with no report and no reason code, invisible to
+        // an authenticated reevaluation request. Park it as deferred instead:
+        // the immutable identity is never rejected and stays recoverable.
+        for proposal_id in self.store.sweep_exhausted_proposals(now)? {
+            tracing::warn!(
+                proposal_id = %proposal_id,
+                reason_code = EVALUATION_ATTEMPTS_EXHAUSTED,
+                "skill proposal exhausted its evaluation attempt budget and was deferred"
+            );
+        }
         let Some(mut lease) = self
             .store
             .claim_due_proposal(&self.worker_id, now, LEASE_SECONDS)?
@@ -114,30 +127,6 @@ impl AdmissionEvaluator {
                 )?;
                 Ok(Some(report))
             }
-            Err(EvaluationFailure::Retryable { code, error }) => {
-                if lease.attempt >= MAX_EVALUATION_ATTEMPTS {
-                    let report = rejection_report(&lease, code, "retry budget exhausted", now);
-                    self.store.reject_proposal(
-                        &lease.proposal_id,
-                        &self.worker_id,
-                        lease.row_version,
-                        &report,
-                        code,
-                        now,
-                    )?;
-                    return Ok(Some(report));
-                }
-                let exponent = lease.attempt.saturating_sub(1).min(8);
-                let delay = (1i64 << exponent).min(MAX_RETRY_BACKOFF_SECONDS);
-                self.store.retry_proposal(
-                    &lease.proposal_id,
-                    &self.worker_id,
-                    lease.row_version,
-                    now.saturating_add(delay),
-                    now,
-                )?;
-                Err(AdmissionError::Retryable(error))
-            }
             Err(EvaluationFailure::Infrastructure { error }) => {
                 if lease.infrastructure_attempts.saturating_add(1) >= MAX_EVALUATION_ATTEMPTS {
                     self.store.defer_infrastructure_proposal(
@@ -147,6 +136,12 @@ impl AdmissionEvaluator {
                         "evaluation_infrastructure_deferred",
                         now,
                     )?;
+                    tracing::warn!(
+                        proposal_id = %lease.proposal_id,
+                        skill_id = %lease.skill_id,
+                        reason_code = "evaluation_infrastructure_deferred",
+                        "skill proposal deferred after repeated verification infrastructure failures"
+                    );
                     return Err(AdmissionError::Retryable(error));
                 }
                 let exponent = lease.infrastructure_attempts.min(8);
@@ -966,25 +961,12 @@ fn classify_verification(
             error: error.to_string(),
         };
     }
-    let resource_limited = match error {
-        VerificationError::TestFailed { outcome, .. } => matches!(
-            outcome,
-            TestResult::Timeout | TestResult::OutOfMemory | TestResult::JobLimitExceeded
-        ),
-        VerificationError::SourceEvaluationFailed(message)
-        | VerificationError::MutationPassFailed {
-            reason: message, ..
-        } => {
-            let normalized = message.to_ascii_lowercase();
-            normalized.contains("timeout")
-                || normalized.contains("interrupted")
-                || normalized.contains("outofmemory")
-                || normalized.contains("out of memory")
-                || normalized.contains("joblimit")
-        }
-        _ => false,
-    };
-    if resource_limited {
+    // Classification is decided on the typed worker diagnostic carried by the
+    // error. The rendered diagnostic is `Class/Stage/Role`
+    // (`ResourceLimit/Evaluation/SkillSource`), which shares no substring with
+    // the outcome names the previous text match looked for, so every genuine
+    // source-side resource limit was reported as an embedded-test failure.
+    if error.is_resource_limit() {
         deterministic(
             "verification_resource_limit",
             "verification resource limit exceeded",
@@ -1000,10 +982,6 @@ enum EvaluationFailure {
         detail: &'static str,
     },
     SuiteRequired,
-    Retryable {
-        code: &'static str,
-        error: String,
-    },
     Infrastructure {
         error: String,
     },
@@ -1152,7 +1130,9 @@ mod scheduler_tests {
     use crate::extras::js::protocol::{
         Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationResult,
     };
-    use crate::extras::js::skills::verify::{test_result, validate_worker_result, worker_error};
+    use crate::extras::js::skills::verify::{
+        SourceFailure, TestResult, test_result, validate_worker_result, worker_error,
+    };
     use crate::extras::js::supervisor::WorkerError;
 
     fn assert_never_permanently_rejects(error: &VerificationError, context: &str) {
@@ -1266,6 +1246,72 @@ mod scheduler_tests {
             &VerificationError::ContextCreationFailed("allocation failed".to_string()),
             "a worker context creation failure",
         );
+    }
+
+    #[test]
+    fn source_resource_limits_classify_on_the_typed_diagnostic() {
+        fn source_failure(class: DiagnosticClass, stage: DiagnosticStage) -> VerificationError {
+            VerificationError::SourceEvaluationFailed(SourceFailure::from_diagnostic(&Diagnostic {
+                class,
+                stage,
+                script_role: ScriptRole::SkillSource,
+                exception_class: None,
+                line: None,
+                column: None,
+            }))
+        }
+
+        // The worker renders these as `ResourceLimit/Evaluation/SkillSource`
+        // and `Contract/JobDrain/SkillSource`; neither contains any of the
+        // substrings the previous text match looked for.
+        for error in [
+            source_failure(DiagnosticClass::ResourceLimit, DiagnosticStage::Evaluation),
+            source_failure(DiagnosticClass::Contract, DiagnosticStage::JobDrain),
+            VerificationError::MutationPassFailed {
+                export: "run".to_string(),
+                reason: "ResourceLimit/Evaluation/SkillSource".to_string(),
+                diagnostic: Some(Diagnostic {
+                    class: DiagnosticClass::ResourceLimit,
+                    stage: DiagnosticStage::Evaluation,
+                    script_role: ScriptRole::SkillSource,
+                    exception_class: None,
+                    line: None,
+                    column: None,
+                }),
+            },
+            VerificationError::TestFailed {
+                index: 0,
+                outcome: TestResult::JobLimitExceeded,
+            },
+        ] {
+            assert!(
+                matches!(
+                    classify_verification(
+                        &error,
+                        "embedded_test_failed",
+                        "embedded verification failed",
+                    ),
+                    EvaluationFailure::Deterministic {
+                        code: "verification_resource_limit",
+                        ..
+                    }
+                ),
+                "a candidate resource limit must be reported as such: {error}"
+            );
+        }
+
+        // A thrown exception in the source is still an ordinary failure.
+        assert!(matches!(
+            classify_verification(
+                &source_failure(DiagnosticClass::Exception, DiagnosticStage::Evaluation),
+                "embedded_test_failed",
+                "embedded verification failed",
+            ),
+            EvaluationFailure::Deterministic {
+                code: "embedded_test_failed",
+                ..
+            }
+        ));
     }
 
     #[test]

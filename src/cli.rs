@@ -109,6 +109,28 @@ pub struct Cli {
 
     #[cfg(feature = "skills")]
     #[arg(
+        long = "learned-skill-proposal",
+        value_name = "SHA256",
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill"
+        ],
+        help = "Print one learned-skill proposal's admission outcome, including the \
+                reason_code and report_id of a rejected or deferred decision, then exit"
+    )]
+    pub learned_skill_proposal: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
         long = "purge-learned-skill",
         value_name = "SHA256",
         conflicts_with_all = [
@@ -124,6 +146,15 @@ pub struct Cli {
         help = "Permanently purge one learned-skill revision and its dependent records"
     )]
     pub purge_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "purge-learned-skill-force",
+        requires = "purge_learned_skill",
+        help = "Permit --purge-learned-skill to delete a revision that is not in a terminal \
+                lifecycle status, or whose dependent revisions would be re-rooted"
+    )]
+    pub purge_learned_skill_force: bool,
 
     #[cfg(feature = "skills")]
     #[arg(
@@ -265,6 +296,38 @@ pub struct Cli {
                 predecessor and preserving lineage"
     )]
     pub promote_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "retire-learned-skill",
+        value_name = "SHA256",
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "learned_skill_proposal",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill"
+        ],
+        help = "Retire an active learned skill as the authenticated local owner: an \
+                administrative disable that preserves the revision and its lineage, \
+                unlike --purge-learned-skill"
+    )]
+    pub retire_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-json",
+        visible_alias = "json",
+        help = "Emit learned-skill operator command results as one JSON object per line"
+    )]
+    pub learned_skill_json: bool,
 
     #[arg(
         long = "import-agent-skill",
@@ -1168,6 +1231,82 @@ mod tests {
                 &"c".repeat(64),
             ])
             .is_err()
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn learned_skill_purge_force_retire_proposal_and_json_flags_parse() {
+        // Purge is destructive, so its override is only meaningful alongside it.
+        assert!(Cli::try_parse_from(["mini-agent", "--purge-learned-skill-force"]).is_err());
+        let forced = Cli::try_parse_from([
+            "mini-agent",
+            "--purge-learned-skill",
+            &"a".repeat(64),
+            "--purge-learned-skill-force",
+        ])
+        .unwrap();
+        assert!(forced.purge_learned_skill_force);
+        assert!(
+            !Cli::try_parse_from(["mini-agent", "--purge-learned-skill", &"a".repeat(64)])
+                .unwrap()
+                .purge_learned_skill_force
+        );
+
+        let retired =
+            Cli::try_parse_from(["mini-agent", "--retire-learned-skill", &"b".repeat(64)]).unwrap();
+        assert_eq!(retired.retire_learned_skill, Some("b".repeat(64)));
+        for conflicting in [
+            "--purge-learned-skill",
+            "--activate-learned-skill",
+            "--promote-learned-skill",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "mini-agent",
+                    "--retire-learned-skill",
+                    &"b".repeat(64),
+                    conflicting,
+                    &"b".repeat(64),
+                ])
+                .is_err(),
+                "{conflicting} must conflict with --retire-learned-skill"
+            );
+        }
+
+        let queried =
+            Cli::try_parse_from(["mini-agent", "--learned-skill-proposal", &"c".repeat(64)])
+                .unwrap();
+        assert_eq!(queried.learned_skill_proposal, Some("c".repeat(64)));
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--learned-skill-proposal",
+                &"c".repeat(64),
+                "--list-learned-skill-proposals",
+            ])
+            .is_err()
+        );
+
+        // `--json` is a modifier, not a mode: it composes with any command.
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--install-learned-skill-seeds",
+                "--learned-skill-json",
+            ])
+            .unwrap()
+            .learned_skill_json
+        );
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--list-learned-skill-proposals", "--json"])
+                .unwrap()
+                .learned_skill_json
+        );
+        assert!(
+            !Cli::try_parse_from(["mini-agent"])
+                .unwrap()
+                .learned_skill_json
         );
     }
 }

@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_call_refreezes_the_bound_turn_context() {
+    async fn search_call_refreezes_the_bundle_without_starting_a_new_turn() {
         let root = std::env::temp_dir().join(format!(
             "mini-agent-skills-search-refreeze-{}-{}",
             std::process::id(),
@@ -189,7 +189,11 @@ mod tests {
             .unwrap();
         let after = services.turn_context().snapshot();
 
-        assert_ne!(before.turn_id, after.turn_id);
+        assert_eq!(
+            before.turn_id, after.turn_id,
+            "a mid-turn search must not re-draw the turn's canary route or \
+             orphan earlier invocations from its outcome evidence"
+        );
         assert_ne!(before.query_fingerprint, after.query_fingerprint);
         assert!(result.contains("agent_skills"));
         assert!(result.contains("learned_js"));

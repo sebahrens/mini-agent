@@ -70,7 +70,7 @@ pub enum VerificationError {
     #[error("verification infrastructure is temporarily unavailable: {0}")]
     InfrastructureUnavailable(String),
     #[error("skill source failed to evaluate: {0}")]
-    SourceEvaluationFailed(String),
+    SourceEvaluationFailed(SourceFailure),
     #[error("declared export '{export}' not found in source")]
     ExportNotFound { export: String },
     #[error("declared export '{export}' exists but is not a function")]
@@ -78,11 +78,69 @@ pub enum VerificationError {
     #[error("test at index {index} failed: {outcome:?}")]
     TestFailed { index: usize, outcome: TestResult },
     #[error("mutation pass failed for export '{export}': {reason}")]
-    MutationPassFailed { export: String, reason: String },
+    MutationPassFailed {
+        export: String,
+        reason: String,
+        diagnostic: Option<Diagnostic>,
+    },
     #[error("held-out expected value mismatch")]
     HeldOutExpectedMismatch,
     #[error("invalid held-out fake fixture: {0}")]
     FakeFixtureInvalid(String),
+}
+
+/// A source-attributable verification failure together with the closed worker
+/// diagnostic that produced it.
+///
+/// The diagnostic is carried as typed data so callers classify on
+/// `DiagnosticClass`/`DiagnosticStage` instead of on rendered text. The
+/// rendered form stays closed: class/stage/role only, never source or message
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFailure {
+    detail: String,
+    diagnostic: Option<Diagnostic>,
+}
+
+impl SourceFailure {
+    pub(crate) fn from_diagnostic(diagnostic: &Diagnostic) -> Self {
+        Self {
+            detail: closed_diagnostic(diagnostic),
+            diagnostic: Some(diagnostic.clone()),
+        }
+    }
+
+    /// A failure the parent attributes to the source without a worker
+    /// diagnostic, such as a denied external effect during verification.
+    pub(crate) fn without_diagnostic(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn is_resource_limit(&self) -> bool {
+        self.diagnostic
+            .as_ref()
+            .is_some_and(diagnostic_is_resource_limit)
+    }
+}
+
+impl std::fmt::Display for SourceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+/// A worker diagnostic that reports an interrupted or over-budget candidate.
+///
+/// `DiagnosticStage::JobDrain` is the promise-job bound and
+/// `DiagnosticClass::ResourceLimit` is the interrupt/memory bound; both are
+/// attributable to the candidate source, unlike the parent-side deadline and
+/// the cumulative native CPU cap, which never reach here as diagnostics.
+fn diagnostic_is_resource_limit(diagnostic: &Diagnostic) -> bool {
+    diagnostic.class == DiagnosticClass::ResourceLimit
+        || diagnostic.stage == DiagnosticStage::JobDrain
 }
 
 impl VerificationError {
@@ -101,6 +159,26 @@ impl VerificationError {
                 | Self::RuntimeCreationFailed(_)
                 | Self::ContextCreationFailed(_)
         )
+    }
+
+    /// True when the candidate itself exhausted a verification resource bound
+    /// (interrupt, memory, or the promise-job budget).
+    ///
+    /// This is decided on the typed worker diagnostic, never on rendered text:
+    /// the closed rendering is `Class/Stage/Role`, which shares no substring
+    /// with the outcome names it used to be matched against.
+    pub(crate) fn is_resource_limit(&self) -> bool {
+        match self {
+            Self::TestFailed { outcome, .. } => matches!(
+                outcome,
+                TestResult::Timeout | TestResult::OutOfMemory | TestResult::JobLimitExceeded
+            ),
+            Self::SourceEvaluationFailed(failure) => failure.is_resource_limit(),
+            Self::MutationPassFailed { diagnostic, .. } => diagnostic
+                .as_ref()
+                .is_some_and(diagnostic_is_resource_limit),
+            _ => false,
+        }
     }
 }
 
@@ -158,7 +236,7 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
             return Err(error);
         }
         return Err(VerificationError::SourceEvaluationFailed(
-            closed_diagnostic(diagnostic),
+            SourceFailure::from_diagnostic(diagnostic),
         ));
     }
 
@@ -194,6 +272,7 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
                     .as_ref()
                     .map(closed_diagnostic)
                     .unwrap_or_else(|| "mutation was not detected".to_string()),
+                diagnostic: case.diagnostic.clone(),
             });
         }
         mutation_outcomes.push(MutationOutcome::Detected);
@@ -243,7 +322,7 @@ pub(crate) fn verify_inherited_cases(
             }
             if diagnostic.script_role == ScriptRole::SkillSource {
                 return Err(VerificationError::SourceEvaluationFailed(
-                    closed_diagnostic(diagnostic),
+                    SourceFailure::from_diagnostic(diagnostic),
                 ));
             }
         }
@@ -287,7 +366,7 @@ pub(crate) fn verify_held_out_case(
         }
         if diagnostic.script_role == ScriptRole::SkillSource {
             return Err(VerificationError::SourceEvaluationFailed(
-                closed_diagnostic(diagnostic),
+                SourceFailure::from_diagnostic(diagnostic),
             ));
         }
     }
@@ -364,9 +443,9 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         WorkerError::NativeCpuLimit => VerificationError::InfrastructureUnavailable(
             "worker process exhausted its cumulative native CPU budget".to_string(),
         ),
-        WorkerError::UnexpectedVerificationEffect => {
-            VerificationError::SourceEvaluationFailed("external effect denied".to_string())
-        }
+        WorkerError::UnexpectedVerificationEffect => VerificationError::SourceEvaluationFailed(
+            SourceFailure::without_diagnostic("external effect denied"),
+        ),
         WorkerError::VerificationQueueFull | WorkerError::VerificationQueueClosed => {
             unreachable!("verification queue failures return above")
         }

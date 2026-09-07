@@ -168,3 +168,73 @@ async fn resumed_session_history_survives_stop_hook_continuation() {
          tool interactions"
     );
 }
+
+/// mini-agent-wzv1: a resumed session that persisted the provider's reasoning
+/// item must hand the model that item, ahead of the native `function_call` it
+/// belongs to, in the same assistant message.
+#[tokio::test]
+async fn resumed_session_reasoning_reaches_model_before_its_tool_call() {
+    use crate::session::{PersistedCallProvenance, PersistedReasoning, PersistedReasoningBlock};
+
+    let mut session = Session::new("openai", "gpt-5", 400_000, "");
+    session.add_message(MessageRole::User, "what's the plan");
+    session.add_tool_call_with_id(
+        "call_plan1",
+        "read",
+        &serde_json::json!({"path": "docs/plan.md"}),
+    );
+    session.add_tool_result_with_id("call_plan1", "read", "ship section 3");
+    session.record_tool_call_provenance(
+        "call_plan1",
+        PersistedCallProvenance {
+            provider_item_id: Some("fc_plan1".into()),
+            provider_call_id: Some("call_plan1".into()),
+            reasoning: vec![PersistedReasoning {
+                id: Some("rs_plan1".into()),
+                blocks: vec![PersistedReasoningBlock::Encrypted {
+                    data: "gAAAAABm-opaque".into(),
+                }],
+            }],
+        },
+    );
+    let expected_history = convert_history(&session);
+
+    let model = text_chunks(["got it"]);
+    let agent = AgentBuilder::new(model.clone()).build();
+
+    #[cfg(feature = "hooks")]
+    let _dispatcher_guard = crate::tests::fake_model::dispatcher_guard::acquire();
+
+    let (_response, _usage, _) = run_print(
+        &agent,
+        "continue",
+        false,
+        &RetryConfig::default(),
+        None,
+        expected_history.clone(),
+        #[cfg(feature = "hooks")]
+        None,
+    )
+    .await
+    .expect("run_print should succeed against the fake model");
+
+    let observed_history = history_at(&model, 0);
+    assert_eq!(observed_history, expected_history);
+    let Message::Assistant { content, .. } = &observed_history[1] else {
+        panic!("the resumed tool call must reach the provider in an assistant message")
+    };
+    let items: Vec<&AssistantContent> = content.iter().collect();
+    let [
+        AssistantContent::Reasoning(reasoning),
+        AssistantContent::ToolCall(call),
+    ] = items.as_slice()
+    else {
+        panic!("the reasoning item must precede its tool call: {items:?}")
+    };
+    assert_eq!(reasoning.id.as_deref(), Some("rs_plan1"));
+    assert_eq!(
+        call.id, "fc_plan1",
+        "the native item id replays alongside its reasoning item"
+    );
+    assert_eq!(call.call_id.as_deref(), Some("call_plan1"));
+}

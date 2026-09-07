@@ -1,3 +1,4 @@
+use crate::extras::js::protocol::{Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole};
 use crate::extras::js::skills::admission::{
     AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision,
     ReviewOutcome, ReviewPacket,
@@ -12,7 +13,7 @@ use crate::extras::js::skills::lifecycle::{
 use crate::extras::js::skills::store::{
     AdminIdentity, EnqueueStatus, MAX_EVALUATION_ATTEMPTS, ProposalStatus, SkillStore,
 };
-use crate::extras::js::skills::verify::worker_error;
+use crate::extras::js::skills::verify::{SourceFailure, VerificationError, worker_error};
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, SkillArtifact, SkillExport,
 };
@@ -193,6 +194,137 @@ fn verification_scheduler_cancellation_parks_after_bounded_infrastructure_retrie
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
     assert_eq!(proposal.infrastructure_attempt_count, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn skill_source_diagnostic(class: DiagnosticClass, stage: DiagnosticStage) -> Diagnostic {
+    Diagnostic {
+        class,
+        stage,
+        script_role: ScriptRole::SkillSource,
+        exception_class: None,
+        line: None,
+        column: None,
+    }
+}
+
+#[test]
+fn source_resource_limits_are_reported_as_verification_resource_limit() {
+    // The worker renders a source-side resource limit as `Class/Stage/Role`,
+    // which shares no substring with the outcome names the classifier used to
+    // match, so each of these was misreported as an embedded-test failure.
+    for (class, stage, expected_reason) in [
+        (
+            DiagnosticClass::ResourceLimit,
+            DiagnosticStage::Evaluation,
+            "verification_resource_limit",
+        ),
+        (
+            DiagnosticClass::Contract,
+            DiagnosticStage::JobDrain,
+            "verification_resource_limit",
+        ),
+        (
+            DiagnosticClass::Exception,
+            DiagnosticStage::Evaluation,
+            "embedded_test_failed",
+        ),
+    ] {
+        let (root, _paths, mut evaluator, artifact) = evaluator(true);
+        evaluator.fail_next_verification_for_test(VerificationError::SourceEvaluationFailed(
+            SourceFailure::from_diagnostic(&skill_source_diagnostic(class, stage)),
+        ));
+        let report = evaluator
+            .evaluate_next(20)
+            .expect("a source failure is a deterministic outcome")
+            .expect("a report is produced");
+        assert_eq!(report.outcome, "rejected");
+        assert_eq!(report.reason_code.as_deref(), Some(expected_reason));
+        let proposal = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Rejected);
+        assert_eq!(proposal.reason_code.as_deref(), Some(expected_reason));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn exhausted_evaluation_attempts_are_deferred_with_a_reason_code_and_stay_recoverable() {
+    let (root, _paths, mut evaluator, artifact) = evaluator(true);
+
+    // Every claim increments `attempt_count`, including reclaims of a crashed
+    // worker's expired lease. After the last one the row can never be claimed
+    // again.
+    let mut now = 100;
+    for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
+        let lease = evaluator
+            .store_mut()
+            .claim_due_proposal("crashed-worker", now, 1)
+            .expect("claim")
+            .expect("the proposal is still claimable");
+        assert_eq!(lease.attempt, attempt);
+        now += 2;
+    }
+    let stranded = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stranded.status, ProposalStatus::Evaluating);
+    assert_eq!(stranded.attempt_count, MAX_EVALUATION_ATTEMPTS);
+    assert!(
+        evaluator
+            .store_mut()
+            .claim_due_proposal("worker-1", now, 30)
+            .unwrap()
+            .is_none(),
+        "an exhausted row is invisible to the claim filter"
+    );
+
+    assert!(
+        evaluator.evaluate_next(now).unwrap().is_none(),
+        "there is nothing left to evaluate, only to sweep"
+    );
+    let swept = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .expect("the proposal is still queued, never rejected");
+    assert_eq!(swept.status, ProposalStatus::Deferred);
+    assert_eq!(
+        swept.reason_code.as_deref(),
+        Some("evaluation_attempts_exhausted")
+    );
+    assert_eq!(swept.lease_owner, None);
+    assert_eq!(swept.lease_expires_at, None);
+    assert_eq!(swept.report_id, None);
+    assert_eq!(
+        evaluator.store().revision_status(&artifact.id).unwrap(),
+        Some("pending".to_string())
+    );
+
+    // The parked row is recoverable: an authenticated reevaluation request
+    // clears the spent budget and the proposal evaluates normally.
+    let admin = AdminIdentity::authenticated("recovery-admin").unwrap();
+    evaluator
+        .request_reevaluation(&artifact.id, &admin, now + 1)
+        .expect("an exhausted deferral is reevaluable");
+    let requeued = evaluator
+        .store()
+        .get_proposal(&artifact.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(requeued.status, ProposalStatus::Pending);
+    assert_eq!(requeued.attempt_count, 0);
+    assert_eq!(requeued.reason_code, None);
+    let report = evaluator
+        .evaluate_next(now + 2)
+        .unwrap()
+        .expect("the recovered proposal evaluates");
+    assert_eq!(report.outcome, "passed");
     let _ = std::fs::remove_dir_all(root);
 }
 

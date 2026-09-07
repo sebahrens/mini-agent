@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use super::coordinator::IndexCoordinator;
 use super::embed::Embedder;
 use super::index::{RetrievalPolicy, SkillIndex, manifest_size};
-use super::router::{FrozenRoute, RouteRequest, route};
+use super::router::{FrozenRoute, RouteKind, RouteRequest, route};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
 use crate::extras::skills::catalog::AgentSkillCatalog;
 use crate::extras::skills::index::{AgentSkillIndex, AgentSkillSearchPolicy};
@@ -17,6 +17,11 @@ use crate::extras::skills::loader::{load_resource, load_skill_markdown};
 use crate::paths::AppPaths;
 
 const MAX_QUERY_BYTES: usize = 8 * 1024;
+/// Routing policy identity frozen onto every route. Recorded on the canary
+/// audit record so a route can be replayed against the policy that produced it.
+const ROUTE_POLICY_VERSION: &str = "phase5-v1";
+/// The ten-percent Phase 5 canary ceiling, in basis points.
+const CANARY_SHARE_BASIS_POINTS: u16 = 1_000;
 const MAX_TRUSTED_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_RESOURCE_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_AGENT_RESOURCE_INVENTORY_BYTES: usize = 8 * 1024;
@@ -172,6 +177,8 @@ pub struct SkillRuntime {
     learned_policy: RetrievalPolicy,
     agent_policy: AgentSkillSearchPolicy,
     pure_learned_only: bool,
+    #[cfg(test)]
+    background_rebuild_disabled: std::sync::atomic::AtomicBool,
 }
 
 impl SkillRuntime {
@@ -235,7 +242,24 @@ impl SkillRuntime {
             learned_policy,
             agent_policy: AgentSkillSearchPolicy::default(),
             pure_learned_only: false,
+            #[cfg(test)]
+            background_rebuild_disabled: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether this runtime may schedule the stale-while-revalidate rebuild.
+    /// Always true in production; a test can freeze the published generation to
+    /// observe the stale-lease path deterministically.
+    #[cfg(test)]
+    fn background_rebuild_enabled(&self) -> bool {
+        !self
+            .background_rebuild_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn background_rebuild_enabled(&self) -> bool {
+        true
     }
 
     /// Start a stale-while-revalidate publication without delaying runtime
@@ -305,10 +329,37 @@ impl SkillRuntime {
             learned_policy: self.learned_policy.clone(),
             agent_policy: self.agent_policy.clone(),
             pure_learned_only: true,
+            #[cfg(test)]
+            background_rebuild_disabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
+    /// Freeze discovery for a new user turn.
     pub async fn prepare_turn(&self, prompt: &str) -> TurnDiscoveryBundle {
+        self.discover(prompt, uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Re-freeze the bound bundle for a mid-turn `skills_search` without
+    /// starting a new user turn.
+    ///
+    /// The turn id is both the deterministic canary routing draw and the
+    /// attribution key for task-outcome evidence. Minting a fresh one on every
+    /// search would let a model re-roll the route until it landed on (or
+    /// avoided) the canary, and would orphan every invocation already made in
+    /// this user turn from the turn's outcome evidence. Only the query
+    /// fingerprint and the selected bundle change here.
+    pub(crate) async fn refreeze_turn(&self, query: &str) -> TurnDiscoveryBundle {
+        let current = self.turn_context.snapshot().turn_id.clone();
+        let turn_id = if current.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            current
+        };
+        self.discover(query, turn_id).await
+    }
+
+    async fn discover(&self, prompt: &str, turn_id: String) -> TurnDiscoveryBundle {
         let query = normalize_query(prompt);
         let fingerprint = fingerprint(&query);
         let mut diagnostics = self.startup_diagnostics.clone();
@@ -337,11 +388,13 @@ impl SkillRuntime {
                 None
             }
         };
+        let mut refresh_pending = false;
         if let Some(coordinator) = &self.learned {
             let coordinator = Arc::clone(coordinator);
+            let may_schedule = self.background_rebuild_enabled();
             match crate::agent::runner::spawn_blocking_scoped(move || {
                 let needs_refresh = coordinator.needs_refresh();
-                if matches!(needs_refresh, Ok(true)) {
+                if matches!(needs_refresh, Ok(true)) && may_schedule {
                     coordinator.schedule_rebuild();
                 }
                 (needs_refresh, coordinator.rebuild_backoff_diagnostic())
@@ -349,6 +402,7 @@ impl SkillRuntime {
             .await
             {
                 Ok((Ok(true), backoff)) => {
+                    refresh_pending = true;
                     diagnostics.push("learned_js_refresh_pending".to_string());
                     if let Some(error) = backoff {
                         diagnostics.push(format!("learned_js_refresh_backoff:{error}"));
@@ -369,111 +423,192 @@ impl SkillRuntime {
         }
 
         let mut learned_bundle = TurnSkillBundle {
-            turn_id: uuid::Uuid::new_v4().to_string(),
+            turn_id,
             query_fingerprint: fingerprint,
             embedding_model_revision: self.embedder.model_metadata().model_revision.clone(),
             index_generation: 0,
             skills: Vec::new(),
         };
         if let (Some(vector), Some(coordinator)) = (&query_embedding, &self.learned) {
-            match coordinator.lease().and_then(|index| {
-                learned_bundle.index_generation = index.generation();
-                if index.model() != self.embedder.model_metadata() {
-                    return Err(super::coordinator::CoordinatorError::Index(
-                        super::index::SkillIndexError::DimensionMismatch {
-                            expected: index.model().dimensions,
-                            actual: vector.len(),
-                        },
-                    ));
-                }
-                Ok(index)
-            }) {
-                Ok(index) => {
-                    let generation = index.generation();
-                    let query = query.clone();
-                    let vector = vector.clone();
-                    let policy = self.learned_policy.clone();
-                    let pure_only = self.pure_learned_only;
-                    match crate::agent::runner::spawn_blocking_scoped(move || {
-                        if pure_only {
-                            index
-                                .search_pure_with_metrics(&query, &vector, &policy)
-                                .map(|output| output.skills)
-                        } else {
-                            index.search(&query, &vector, &policy)
-                        }
-                    })
-                    .await
-                    {
-                        Ok(Ok(skills)) => {
-                            let active_ids = skills
-                                .iter()
-                                .map(|skill| skill.artifact.id.clone())
-                                .collect::<Vec<_>>();
-                            let routing_context = if self.pure_learned_only {
-                                None
-                            } else {
-                                let coordinator = Arc::clone(coordinator);
-                                crate::agent::runner::spawn_blocking_scoped(move || {
-                                    coordinator.routing_context(&active_ids, generation)
-                                })
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .flatten()
-                            };
-                            learned_bundle.skills = skills
-                                .into_iter()
-                                .map(|skill| {
-                                    let candidate = routing_context.as_ref().and_then(|context| {
-                                        context.candidates.get(&skill.artifact.id).cloned()
-                                    });
-                                    let route = routing_context.as_ref().and_then(|context| {
-                                        route(
-                                            &context.key,
-                                            &RouteRequest {
-                                                active_id: skill.artifact.id.clone(),
-                                                active_lineage_root_id: candidate
-                                                    .as_ref()
-                                                    .map(|(_, metadata)| {
-                                                        metadata.lineage_root_id.clone()
-                                                    })
-                                                    .unwrap_or_else(|| skill.artifact.id.clone()),
-                                                turn_id: learned_bundle.turn_id.clone(),
-                                                policy_version: "phase5-v1".to_string(),
-                                                canary_share_basis_points: 1_000,
-                                                retrieval_score: f64::from(skill.score),
-                                                retrieval_rank: skill.rank as u32,
-                                                index_generation: skill.generation,
-                                                candidate: candidate
-                                                    .as_ref()
-                                                    .map(|(_, metadata)| metadata.clone()),
-                                            },
-                                        )
-                                        .ok()
-                                    });
-                                    let artifact = match (&route, candidate) {
-                                        (Some(route), Some((candidate, _)))
-                                            if route.chosen_id == candidate.id =>
-                                        {
-                                            candidate
-                                        }
-                                        _ => skill.artifact.as_ref().clone(),
-                                    };
-                                    resolved_skill(&artifact, skill.score, skill.rank, route)
-                                })
-                                .collect();
-                        }
-                        Ok(Err(error)) => {
-                            diagnostics.push(format!("learned_js_search_unavailable:{error}"))
-                        }
-                        Err(error) => diagnostics
-                            .push(format!("learned_js_search_worker_unavailable:{error}")),
+            // `lease()` takes a std `RwLock` read guard that a concurrent
+            // publication can hold while it waits on another process's SQLite
+            // write lock, so it belongs on the same blocking hop as every other
+            // store access on this path instead of on the async executor.
+            let leased = {
+                let coordinator = Arc::clone(coordinator);
+                crate::agent::runner::spawn_blocking_scoped(move || coordinator.lease()).await
+            };
+            let leased = match leased {
+                Ok(Ok(index)) => {
+                    learned_bundle.index_generation = index.generation();
+                    let expected = index.model().dimensions;
+                    if index.model() == self.embedder.model_metadata() {
+                        Some(index)
+                    } else {
+                        diagnostics.push(format!(
+                            "learned_js_search_unavailable:{}",
+                            super::index::SkillIndexError::DimensionMismatch {
+                                expected,
+                                actual: vector.len(),
+                            }
+                        ));
+                        None
                     }
                 }
-                Err(error) => diagnostics.push(format!("learned_js_search_unavailable:{error}")),
+                Ok(Err(error)) => {
+                    diagnostics.push(format!("learned_js_search_unavailable:{error}"));
+                    None
+                }
+                Err(error) => {
+                    diagnostics.push(format!("learned_js_search_worker_unavailable:{error}"));
+                    None
+                }
+            };
+            if let Some(index) = leased {
+                let generation = index.generation();
+                let query = query.clone();
+                let vector = vector.clone();
+                let policy = self.learned_policy.clone();
+                let pure_only = self.pure_learned_only;
+                match crate::agent::runner::spawn_blocking_scoped(move || {
+                    if pure_only {
+                        index
+                            .search_pure_with_metrics(&query, &vector, &policy)
+                            .map(|output| output.skills)
+                    } else {
+                        index.search(&query, &vector, &policy)
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(skills)) => {
+                        let active_ids = skills
+                            .iter()
+                            .map(|skill| skill.artifact.id.clone())
+                            .collect::<Vec<_>>();
+                        let routing_context = if self.pure_learned_only {
+                            None
+                        } else {
+                            let coordinator = Arc::clone(coordinator);
+                            crate::agent::runner::spawn_blocking_scoped(move || {
+                                coordinator.routing_context(&active_ids, generation)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten()
+                        };
+                        let turn_id = learned_bundle.turn_id.clone();
+                        learned_bundle.skills = skills
+                            .into_iter()
+                            .map(|skill| {
+                                let candidate = routing_context.as_ref().and_then(|context| {
+                                    context.candidates.get(&skill.artifact.id).cloned()
+                                });
+                                let route = routing_context.as_ref().and_then(|context| {
+                                    route(
+                                        &context.key,
+                                        &RouteRequest {
+                                            active_id: skill.artifact.id.clone(),
+                                            active_lineage_root_id: candidate
+                                                .as_ref()
+                                                .map(|(_, metadata)| {
+                                                    metadata.lineage_root_id.clone()
+                                                })
+                                                .unwrap_or_else(|| skill.artifact.id.clone()),
+                                            turn_id: turn_id.clone(),
+                                            policy_version: ROUTE_POLICY_VERSION.to_string(),
+                                            canary_share_basis_points: CANARY_SHARE_BASIS_POINTS,
+                                            retrieval_score: f64::from(skill.score),
+                                            retrieval_rank: skill.rank as u32,
+                                            index_generation: skill.generation,
+                                            candidate: candidate
+                                                .as_ref()
+                                                .map(|(_, metadata)| metadata.clone()),
+                                        },
+                                    )
+                                    .ok()
+                                });
+                                // Canary exposure must be auditable outside the
+                                // model-facing block. The durable `skill_events`
+                                // row cannot carry route identity yet, so the
+                                // frozen route is recorded here instead.
+                                if let Some(record) = route
+                                    .as_ref()
+                                    .and_then(|route| canary_route_audit(&turn_id, route))
+                                {
+                                    tracing::info!(
+                                        route = %record,
+                                        "learned-skill canary route frozen"
+                                    );
+                                }
+                                let artifact = match (&route, candidate) {
+                                    (Some(route), Some((candidate, _)))
+                                        if route.chosen_id == candidate.id =>
+                                    {
+                                        candidate
+                                    }
+                                    _ => skill.artifact.as_ref().clone(),
+                                };
+                                resolved_skill(&artifact, skill.score, skill.rank, route)
+                            })
+                            .collect();
+                    }
+                    Ok(Err(error)) => {
+                        diagnostics.push(format!("learned_js_search_unavailable:{error}"))
+                    }
+                    Err(error) => {
+                        diagnostics.push(format!("learned_js_search_worker_unavailable:{error}"))
+                    }
+                }
             }
         }
+
+        // A `--purge-learned-skill` or retirement committed by another process
+        // only bumps the durable generation; this turn still holds the previous
+        // lease, and the bundle carries executable source. Narrow the frozen
+        // selection against durable state before publishing it so a withdrawn
+        // revision can never be bound for the rest of this turn.
+        if refresh_pending
+            && !learned_bundle.skills.is_empty()
+            && let Some(coordinator) = &self.learned
+        {
+            let requested = learned_bundle
+                .skills
+                .iter()
+                .map(|skill| skill.id.clone())
+                .collect::<Vec<_>>();
+            let coordinator = Arc::clone(coordinator);
+            let bindable = match crate::agent::runner::spawn_blocking_scoped(move || {
+                coordinator.retain_bindable_ids(&requested)
+            })
+            .await
+            {
+                Ok(Ok(bindable)) => Some(bindable),
+                Ok(Err(error)) => {
+                    diagnostics.push(format!("learned_js_binding_state_unavailable:{error}"));
+                    None
+                }
+                Err(error) => {
+                    diagnostics.push(format!("learned_js_binding_worker_unavailable:{error}"));
+                    None
+                }
+            };
+            // Fail closed: a selection that cannot be revalidated is dropped
+            // rather than bound from a superseded lease.
+            let bindable = bindable.unwrap_or_default();
+            learned_bundle.skills.retain(|skill| {
+                let bound = bindable.contains(&skill.id);
+                if !bound {
+                    diagnostics.push(format!(
+                        "learned_js_selection_omitted:{}:not_bindable",
+                        skill.id
+                    ));
+                }
+                bound
+            });
+        }
+
         let mut agent_skill_generation = 0;
         let mut selected_agent_digests = Vec::new();
         let mut selected_agent_skills = Vec::new();
@@ -663,7 +798,7 @@ impl SkillRuntime {
         let mut resolved_by_id = unresolved
             .into_iter()
             .zip(resolved)
-            .collect::<HashMap<_, _>>();
+            .collect::<HashMap<String, Result<Option<SkillArtifact>, String>>>();
         let mut semantic = learned.skills.drain(..).collect::<Vec<_>>();
         let mut candidates = Vec::new();
         for (digest, id) in declarations {
@@ -675,19 +810,28 @@ impl SkillRuntime {
                     == id
             }) {
                 candidates.push(semantic.remove(index));
-            } else if let Some(Some(artifact)) = resolved_by_id.remove(&id) {
-                if self.pure_learned_only && artifact.capability.tier != super::CapabilityTier::Pure
-                {
-                    diagnostics.push(format!(
-                        "agent_skill_learned_js_unavailable:{digest}:{id}:not_pure"
-                    ));
-                } else {
-                    candidates.push(resolved_skill(&artifact, 1.0, 0, None));
+                continue;
+            }
+            // A tampered or legacy row costs only its own declaration: every
+            // other declared id in this turn still binds.
+            match resolved_by_id.remove(&id) {
+                Some(Ok(Some(artifact))) => {
+                    if self.pure_learned_only
+                        && artifact.capability.tier != super::CapabilityTier::Pure
+                    {
+                        diagnostics.push(format!(
+                            "agent_skill_learned_js_unavailable:{digest}:{id}:not_pure"
+                        ));
+                    } else {
+                        candidates.push(resolved_skill(&artifact, 1.0, 0, None));
+                    }
                 }
-            } else {
-                diagnostics.push(format!(
+                Some(Err(error)) => diagnostics.push(format!(
+                    "agent_skill_learned_js_unavailable:{digest}:{id}:store_error:{error}"
+                )),
+                Some(Ok(None)) | None => diagnostics.push(format!(
                     "agent_skill_learned_js_unavailable:{digest}:{id}:not_active"
-                ));
+                )),
             }
         }
         candidates.extend(semantic);
@@ -773,6 +917,36 @@ fn resolved_skill(
         score_bits: score.to_bits(),
         rank,
         route,
+    }
+}
+
+/// Render one canary-exposure audit record for a frozen route.
+///
+/// Any turn that had an eligible replacement candidate produces a record, so
+/// both taken and untaken canary draws are auditable. The record deliberately
+/// never enters the model-facing trusted block.
+fn canary_route_audit(turn_id: &str, route: &FrozenRoute) -> Option<String> {
+    let candidate_id = route.candidate_id.as_deref()?;
+    Some(format!(
+        "turn_id={turn_id} route_kind={kind} route_fingerprint={fingerprint} \
+         policy_version={policy} canary_share_basis_points={share} \
+         active_id={active} candidate_id={candidate_id} chosen_id={chosen} \
+         index_generation={generation} fallback_before_effects={fallback}",
+        kind = route_kind_token(route.route_kind),
+        fingerprint = route.route_fingerprint,
+        policy = route.policy_version,
+        share = route.canary_share_basis_points,
+        active = route.active_id,
+        chosen = route.chosen_id,
+        generation = route.index_generation,
+        fallback = route.fallback_before_effects,
+    ))
+}
+
+fn route_kind_token(kind: RouteKind) -> &'static str {
+    match kind {
+        RouteKind::Active => "active",
+        RouteKind::Canary => "canary",
     }
 }
 
@@ -984,6 +1158,13 @@ impl SkillRuntime {
         .expect("learned-skill background rebuild should settle");
     }
 
+    /// Freeze the published generation so a test can observe the stale-lease
+    /// path deterministically instead of racing the background rebuild.
+    pub(crate) fn disable_background_rebuild_for_test(&self) {
+        self.background_rebuild_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn learned_index_len_for_test(&self) -> usize {
         self.learned
             .as_ref()
@@ -1185,6 +1366,156 @@ mod tests {
             discovery.trusted_context.is_empty(),
             "diagnostics must not force a model-facing block: {}",
             discovery.trusted_context
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_canary_route_is_recorded_as_an_audit_line() {
+        let taken = FrozenRoute {
+            chosen_id: "candidate-id".into(),
+            active_id: "active-id".into(),
+            candidate_id: Some("candidate-id".into()),
+            route_kind: RouteKind::Canary,
+            route_fingerprint: "fingerprint-abc".into(),
+            policy_version: "policy-v1".into(),
+            canary_share_basis_points: 500,
+            retrieval_score: 0.5,
+            retrieval_rank: 2,
+            index_generation: 9,
+            fallback_before_effects: true,
+        };
+
+        let record = canary_route_audit("turn-7", &taken)
+            .expect("an eligible candidate must produce an audit record");
+        assert!(record.contains("turn_id=turn-7"), "{record}");
+        assert!(record.contains("route_kind=canary"), "{record}");
+        assert!(
+            record.contains("route_fingerprint=fingerprint-abc"),
+            "{record}"
+        );
+        assert!(record.contains("policy_version=policy-v1"), "{record}");
+        assert!(record.contains("canary_share_basis_points=500"), "{record}");
+        assert!(record.contains("candidate_id=candidate-id"), "{record}");
+        assert!(record.contains("chosen_id=candidate-id"), "{record}");
+        assert!(record.contains("index_generation=9"), "{record}");
+
+        let mut untaken = taken.clone();
+        untaken.route_kind = RouteKind::Active;
+        untaken.chosen_id = "active-id".into();
+        let record = canary_route_audit("turn-7", &untaken)
+            .expect("an untaken draw is still canary-exposure evidence");
+        assert!(record.contains("route_kind=active"), "{record}");
+        assert!(record.contains("chosen_id=active-id"), "{record}");
+
+        let mut without_candidate = taken;
+        without_candidate.candidate_id = None;
+        assert!(canary_route_audit("turn-7", &without_candidate).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_mid_turn_refreeze_keeps_the_user_turn_id_stable() {
+        let (root, paths) = temp_paths();
+        let runtime = SkillRuntime::open(&paths, None).unwrap();
+
+        let first = runtime.prepare_turn("the first user prompt").await;
+        let refrozen = runtime.refreeze_turn("a mid-turn discovery query").await;
+        let second = runtime.prepare_turn("the second user prompt").await;
+
+        assert_eq!(
+            first.learned_js.turn_id, refrozen.learned_js.turn_id,
+            "a mid-turn search must not re-draw the turn's canary route"
+        );
+        assert_ne!(
+            first.learned_js.query_fingerprint, refrozen.learned_js.query_fingerprint,
+            "the re-frozen bundle must still describe the search query"
+        );
+        assert_ne!(
+            first.learned_js.turn_id, second.learned_js.turn_id,
+            "a new user turn must start a new attribution scope"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_pending_withdrawal_drops_the_leased_skill_before_the_bundle_is_published() {
+        use crate::extras::js::skills::store::SkillStore;
+
+        let (root, paths) = temp_paths();
+        let artifact = SkillArtifact::new(
+            "function purgeableTurnSkill(_cap, value) { return value.trim(); }".to_string(),
+            "Normalize purgeable whitespace tokens.".to_string(),
+            vec!["purgeable".to_string(), "whitespace".to_string()],
+            vec![SkillExport {
+                name: "purgeableTurnSkill".to_string(),
+                signature: "purgeableTurnSkill(value: string): string".to_string(),
+            }],
+            vec!["purgeableTurnSkill(' x ') === 'x'".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        SkillStore::open_at(&paths)
+            .and_then(|mut store| store.insert_verified(&artifact))
+            .unwrap();
+
+        let runtime = SkillRuntime::open(&paths, None).unwrap();
+        runtime.settle_learned_rebuild_for_test().await;
+        let query = "normalize purgeable whitespace tokens";
+        let bound = runtime.prepare_turn(query).await;
+        assert!(
+            bound
+                .learned_js
+                .skills
+                .iter()
+                .any(|skill| skill.id == artifact.id),
+            "the fixture must be retrievable before it is withdrawn: {:?}",
+            bound.diagnostics
+        );
+
+        // Another process withdraws the revision and bumps the desired
+        // generation; this session still holds the previous publication.
+        runtime.disable_background_rebuild_for_test();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        crate::extras::js::skills::retention::RetentionService::new(&mut store)
+            .privacy_purge(&artifact.id, "user_request", 10)
+            .unwrap();
+        let state = store.generation_state().unwrap();
+        store
+            .request_generation(
+                &state.model_id,
+                &state.model_revision,
+                state.dimensions,
+                state.normalized,
+            )
+            .unwrap();
+        drop(store);
+
+        let after = runtime.prepare_turn(query).await;
+
+        assert!(
+            after.learned_js.skills.is_empty(),
+            "a withdrawn revision must not be bound from a stale lease: {:?}",
+            after.diagnostics
+        );
+        // Retrieval itself already fails closed here: with the bindable filter
+        // disabled the selection is still empty for both a retirement and a
+        // privacy purge, so the filter below it is defence in depth and cannot
+        // be observed through this path. Asserting its diagnostic would pin
+        // behaviour that never runs, so this only pins the property that
+        // matters, and the filter keeps its own unit test on the coordinator.
+        assert!(
+            after
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == "learned_js_refresh_pending"),
+            "the stale lease must be reported as pending refresh: {:?}",
+            after.diagnostics
+        );
+        assert!(
+            !after.trusted_context.contains("purgeableTurnSkill"),
+            "the withdrawn export must not reach the model-facing block"
         );
 
         let _ = std::fs::remove_dir_all(root);

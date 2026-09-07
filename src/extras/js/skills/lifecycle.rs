@@ -309,8 +309,13 @@ pub enum LifecycleError {
     Json(#[from] serde_json::Error),
     #[error("unknown lifecycle status in storage: {0}")]
     UnknownStatus(String),
-    #[error("illegal lifecycle transition: {from} -> {to}")]
+    #[error("illegal lifecycle transition for the {role} {skill_id}: {from} -> {to}")]
     IllegalTransition {
+        /// Which side of the transition was wrong: `revision`, `candidate` or
+        /// `predecessor`. Collapsing the two sides of a replacement into one
+        /// message left an operator unable to tell them apart.
+        role: &'static str,
+        skill_id: String,
         from: LifecycleStatus,
         to: LifecycleStatus,
     },
@@ -344,6 +349,18 @@ pub enum LifecycleError {
     RejectedIsTerminal,
     #[error("authenticated human approval is missing, stale, or invalid")]
     InvalidHumanApproval,
+    #[error(
+        "authenticated human approval does not match {field} for {skill_id}: \
+         expected {expected}, observed {observed}"
+    )]
+    ApprovalMismatch {
+        skill_id: String,
+        /// The precondition that failed: `status`, `row_version`,
+        /// `evaluation_report_id` or `first_approval`.
+        field: &'static str,
+        expected: String,
+        observed: String,
+    },
     #[error("lineage-root activation was attempted on a replacement")]
     NotLineageRoot,
     #[error("privileged activation/supersession requires its dedicated atomic service")]
@@ -673,6 +690,8 @@ impl<'a> LifecycleService<'a> {
         }
         if current.status != request.from_status {
             return Err(LifecycleError::IllegalTransition {
+                role: "revision",
+                skill_id: current.id.clone(),
                 from: current.status,
                 to: request.to_status,
             });
@@ -787,12 +806,37 @@ impl<'a> LifecycleService<'a> {
             )
             .optional()?
             .flatten();
-        if revision.status != LifecycleStatus::Canary
-            || revision.supersedes_id.is_some()
-            || revision.row_version != approval.expected_row_version
-            || report.as_deref() != Some(approval.evaluation_report_id.as_str())
-        {
-            return Err(LifecycleError::InvalidHumanApproval);
+        if revision.status != LifecycleStatus::Canary {
+            return Err(approval_mismatch(
+                skill_id,
+                "status",
+                LifecycleStatus::Canary.as_token(),
+                revision.status.as_token(),
+            ));
+        }
+        if revision.supersedes_id.is_some() {
+            return Err(approval_mismatch(
+                skill_id,
+                "supersedes_id",
+                "none",
+                revision.supersedes_id.as_deref().unwrap_or("none"),
+            ));
+        }
+        if revision.row_version != approval.expected_row_version {
+            return Err(approval_mismatch(
+                skill_id,
+                "row_version",
+                approval.expected_row_version,
+                revision.row_version,
+            ));
+        }
+        if report.as_deref() != Some(approval.evaluation_report_id.as_str()) {
+            return Err(approval_mismatch(
+                skill_id,
+                "evaluation_report_id",
+                &approval.evaluation_report_id,
+                report.as_deref().unwrap_or("none"),
+            ));
         }
         insert_approval(&tx, skill_id, "phase4_canary", approval, created_at)?;
         tx.commit()?;
@@ -861,10 +905,21 @@ impl<'a> LifecycleService<'a> {
         if revision.supersedes_id.is_some() || revision.lineage_root_id != revision.id {
             return Err(LifecycleError::NotLineageRoot);
         }
-        if revision.status != LifecycleStatus::Canary
-            || revision.row_version != approval.expected_row_version
-        {
-            return Err(LifecycleError::InvalidHumanApproval);
+        if revision.status != LifecycleStatus::Canary {
+            return Err(approval_mismatch(
+                skill_id,
+                "status",
+                LifecycleStatus::Canary.as_token(),
+                revision.status.as_token(),
+            ));
+        }
+        if revision.row_version != approval.expected_row_version {
+            return Err(approval_mismatch(
+                skill_id,
+                "row_version",
+                approval.expected_row_version,
+                revision.row_version,
+            ));
         }
         let report: Option<String> = tx
             .query_row(
@@ -875,7 +930,12 @@ impl<'a> LifecycleService<'a> {
             .optional()?
             .flatten();
         if report.as_deref() != Some(approval.evaluation_report_id.as_str()) {
-            return Err(LifecycleError::InvalidHumanApproval);
+            return Err(approval_mismatch(
+                skill_id,
+                "evaluation_report_id",
+                &approval.evaluation_report_id,
+                report.as_deref().unwrap_or("none"),
+            ));
         }
         let first_approval: Option<String> = tx
             .query_row(
@@ -885,11 +945,18 @@ impl<'a> LifecycleService<'a> {
                 |row| row.get(0),
             )
             .optional()?;
+        // Activation is the *second* authenticated action, so a missing first
+        // approval and a replayed one are different failures.
         if first_approval
             .as_deref()
             .is_none_or(|first| first == approval.approval_id)
         {
-            return Err(LifecycleError::InvalidHumanApproval);
+            return Err(approval_mismatch(
+                skill_id,
+                "first_approval",
+                "a distinct earlier phase4_canary approval",
+                first_approval.as_deref().unwrap_or("none"),
+            ));
         }
         consume_approval_authorization(
             &tx,
@@ -995,6 +1062,8 @@ impl<'a> LifecycleService<'a> {
             LifecycleStatus::Active | LifecycleStatus::Quarantined
         ) {
             return Err(LifecycleError::IllegalTransition {
+                role: "predecessor",
+                skill_id: request.predecessor_id.clone(),
                 from: predecessor_from,
                 to: LifecycleStatus::Superseded,
             });
@@ -1152,12 +1221,16 @@ impl<'a> LifecycleService<'a> {
         let predecessor = read_revision(&tx, &request.predecessor_id)?;
         if candidate.status != candidate_from {
             return Err(LifecycleError::IllegalTransition {
+                role: "candidate",
+                skill_id: candidate.id.clone(),
                 from: candidate.status,
                 to: candidate_to,
             });
         }
         if predecessor.status != predecessor_from {
             return Err(LifecycleError::IllegalTransition {
+                role: "predecessor",
+                skill_id: predecessor.id.clone(),
                 from: predecessor.status,
                 to: predecessor_to,
             });
@@ -1303,6 +1376,22 @@ impl<'a> LifecycleService<'a> {
     }
 }
 
+/// Name the exact precondition an authenticated approval failed, and the value
+/// observed instead. Six checks used to collapse into one payload-less error.
+fn approval_mismatch(
+    skill_id: &str,
+    field: &'static str,
+    expected: impl std::fmt::Display,
+    observed: impl std::fmt::Display,
+) -> LifecycleError {
+    LifecycleError::ApprovalMismatch {
+        skill_id: skill_id.to_string(),
+        field,
+        expected: expected.to_string(),
+        observed: observed.to_string(),
+    }
+}
+
 fn validate_human_approval(approval: &HumanApproval) -> Result<(), LifecycleError> {
     if approval.approval_id.is_empty()
         || approval.actor_id.is_empty()
@@ -1354,16 +1443,20 @@ fn insert_approval(
                 },
             )
             .optional()?;
-        if existing.as_ref()
-            != Some(&(
-                skill_id.to_string(),
-                kind.to_string(),
-                approval.actor_id.clone(),
-                approval.expected_row_version,
-                approval.evaluation_report_id.clone(),
-            ))
-        {
-            return Err(LifecycleError::InvalidHumanApproval);
+        let expected = (
+            skill_id.to_string(),
+            kind.to_string(),
+            approval.actor_id.clone(),
+            approval.expected_row_version,
+            approval.evaluation_report_id.clone(),
+        );
+        if existing.as_ref() != Some(&expected) {
+            return Err(approval_mismatch(
+                skill_id,
+                "approval_id_binding",
+                format!("{expected:?}"),
+                existing.map_or_else(|| "none".to_string(), |row| format!("{row:?}")),
+            ));
         }
     }
     Ok(())
@@ -1372,6 +1465,8 @@ fn insert_approval(
 fn validate_request(request: &TransitionRequest) -> Result<(), LifecycleError> {
     if !request.from_status.may_transition_to(request.to_status) {
         return Err(LifecycleError::IllegalTransition {
+            role: "revision",
+            skill_id: request.skill_id.clone(),
             from: request.from_status,
             to: request.to_status,
         });
@@ -1423,10 +1518,21 @@ fn authorize_local_owner_promotion(
     if !authorization.binds_approval(&approval.approval_id, &approval.actor_id) {
         return Err(StoreError::Unauthorized.into());
     }
-    if approval.expected_row_version != request.candidate_row_version
-        || candidate.row_version != approval.expected_row_version
-    {
-        return Err(LifecycleError::InvalidHumanApproval);
+    if approval.expected_row_version != request.candidate_row_version {
+        return Err(approval_mismatch(
+            &request.candidate_id,
+            "requested_row_version",
+            request.candidate_row_version,
+            approval.expected_row_version,
+        ));
+    }
+    if candidate.row_version != approval.expected_row_version {
+        return Err(approval_mismatch(
+            &request.candidate_id,
+            "row_version",
+            approval.expected_row_version,
+            candidate.row_version,
+        ));
     }
     let report: Option<String> = tx
         .query_row(
@@ -1437,7 +1543,12 @@ fn authorize_local_owner_promotion(
         .optional()?
         .flatten();
     if report.as_deref() != Some(approval.evaluation_report_id.as_str()) {
-        return Err(LifecycleError::InvalidHumanApproval);
+        return Err(approval_mismatch(
+            &request.candidate_id,
+            "evaluation_report_id",
+            &approval.evaluation_report_id,
+            report.as_deref().unwrap_or("none"),
+        ));
     }
     // Approval into canary recorded the first authenticated local-owner action.
     // Promotion must be a second action with a different approval identity.
@@ -1453,7 +1564,12 @@ fn authorize_local_owner_promotion(
         .as_deref()
         .is_none_or(|first| first == approval.approval_id)
     {
-        return Err(LifecycleError::InvalidHumanApproval);
+        return Err(approval_mismatch(
+            &request.candidate_id,
+            "first_approval",
+            "a distinct earlier phase4_canary approval",
+            first_approval.as_deref().unwrap_or("none"),
+        ));
     }
     let artifact = read_artifact_for_policy(tx, &request.candidate_id)?;
     consume_approval_authorization(
@@ -1873,4 +1989,93 @@ fn validate_lineage(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_failures_name_the_field_and_the_observed_value() {
+        let stale_row = approval_mismatch("skill-1", "row_version", 4, 7);
+        let wrong_report =
+            approval_mismatch("skill-1", "evaluation_report_id", "report-a", "report-b");
+        let missing_first = approval_mismatch(
+            "skill-1",
+            "first_approval",
+            "a distinct earlier approval",
+            "none",
+        );
+
+        // Six preconditions used to produce one payload-less message.
+        assert_ne!(stale_row.to_string(), wrong_report.to_string());
+        assert_ne!(wrong_report.to_string(), missing_first.to_string());
+        assert!(stale_row.to_string().contains("row_version"), "{stale_row}");
+        assert!(stale_row.to_string().contains("expected 4"), "{stale_row}");
+        assert!(stale_row.to_string().contains("observed 7"), "{stale_row}");
+        assert!(
+            wrong_report.to_string().contains("observed report-b"),
+            "{wrong_report}"
+        );
+        assert!(matches!(
+            stale_row,
+            LifecycleError::ApprovalMismatch {
+                field: "row_version",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_illegal_transition_names_which_side_of_the_pair_was_wrong() {
+        let candidate = LifecycleError::IllegalTransition {
+            role: "candidate",
+            skill_id: "skill-candidate".to_string(),
+            from: LifecycleStatus::Verified,
+            to: LifecycleStatus::Active,
+        };
+        let predecessor = LifecycleError::IllegalTransition {
+            role: "predecessor",
+            skill_id: "skill-predecessor".to_string(),
+            from: LifecycleStatus::Retired,
+            to: LifecycleStatus::Superseded,
+        };
+        assert!(
+            candidate.to_string().contains("candidate skill-candidate"),
+            "{candidate}"
+        );
+        assert!(
+            predecessor
+                .to_string()
+                .contains("predecessor skill-predecessor"),
+            "{predecessor}"
+        );
+        assert_ne!(candidate.to_string(), predecessor.to_string());
+    }
+
+    #[test]
+    fn a_structurally_impossible_transition_names_the_revision_it_refused() {
+        let request = TransitionRequest {
+            idempotency_key: "key".to_string(),
+            skill_id: "skill-2".to_string(),
+            from_status: LifecycleStatus::Retired,
+            to_status: LifecycleStatus::Active,
+            expected_row_version: 1,
+            reason: "test".to_string(),
+            snapshot: EvidenceSnapshot::new(
+                "skill-2",
+                None,
+                "v1",
+                Vec::new(),
+                BTreeMap::new(),
+                1,
+                None,
+                0,
+            )
+            .unwrap(),
+        };
+        let error = validate_request(&request).unwrap_err().to_string();
+        assert!(error.contains("revision skill-2"), "{error}");
+        assert!(error.contains("retired -> active"), "{error}");
+    }
 }

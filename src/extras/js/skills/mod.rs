@@ -46,6 +46,11 @@ pub mod quarantine;
 pub mod repair;
 pub mod retention;
 pub mod router;
+// The evidence-decision lease machinery has no production caller: nothing
+// enqueues a `skill_decision_jobs` row, so the module is kept out of the
+// production build until the automatic/scheduled quarantine path actually
+// enqueues its held decisions.
+#[cfg(test)]
 pub mod scheduler;
 pub mod search_tool;
 pub mod session;
@@ -53,6 +58,10 @@ pub mod store;
 pub mod telemetry;
 pub mod turn;
 pub mod verify;
+// Phase 4 visibility snapshots are exercised only by the auto-admission
+// end-to-end test; no production path reads them, and the production
+// per-turn boundary is `turn::TurnSkillBundle`.
+#[cfg(test)]
 pub mod visibility;
 
 /// Gym subprocesses are explicitly marked by the local training driver.

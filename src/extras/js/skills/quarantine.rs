@@ -45,6 +45,27 @@ pub struct QuarantineEvidence {
     pub generation_current: bool,
 }
 
+/// The feedback row a quarantine decision was derived from.
+///
+/// [`QuarantineReason`] is chosen from the target's lifecycle status, so it
+/// cannot say *what* was reported. Carrying the submitted reason code and the
+/// feedback id makes the evidence snapshot traceable back to the exact
+/// `skill_feedback` row, and puts the reported code in the transition reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackAttribution {
+    pub feedback_id: String,
+    pub reason_code: String,
+}
+
+impl FeedbackAttribution {
+    pub fn new(feedback_id: impl Into<String>, reason_code: impl Into<String>) -> Self {
+        Self {
+            feedback_id: feedback_id.into(),
+            reason_code: reason_code.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuarantinePolicy {
     pub version: String,
@@ -69,6 +90,20 @@ pub enum QuarantineDecision {
 }
 
 pub fn evaluate(policy: &QuarantinePolicy, evidence: &QuarantineEvidence) -> QuarantineDecision {
+    evaluate_with_attribution(policy, evidence, None)
+}
+
+/// Evaluate the same policy, recording which feedback row drove the decision.
+///
+/// The attribution is serialized into the canonical snapshot, so the persisted
+/// `skill_evidence` payload names the feedback id and the submitted reason code.
+/// It is omitted entirely when absent, so snapshots taken by non-feedback paths
+/// keep their existing bytes and evidence ids.
+pub fn evaluate_with_attribution(
+    policy: &QuarantinePolicy,
+    evidence: &QuarantineEvidence,
+    attribution: Option<&FeedbackAttribution>,
+) -> QuarantineDecision {
     if policy.version.is_empty()
         || policy.min_behavioral_invocations == 0
         || policy.min_behavioral_failures == 0
@@ -100,12 +135,15 @@ pub fn evaluate(policy: &QuarantinePolicy, evidence: &QuarantineEvidence) -> Qua
         schema_version: u32,
         policy: &'a QuarantinePolicy,
         evidence: &'a QuarantineEvidence,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        feedback: Option<&'a FeedbackAttribution>,
         decision: &'static str,
     }
     match serde_json::to_string(&Snapshot {
         schema_version: 1,
         policy,
         evidence,
+        feedback: attribution,
         decision: "quarantine",
     }) {
         Ok(canonical_snapshot) => QuarantineDecision::Quarantine { canonical_snapshot },
@@ -154,7 +192,34 @@ impl<'a> QuarantineExecutor<'a> {
         expected_generation: i64,
         created_at: i64,
     ) -> Result<(TransitionOutcome, PublicationReport), QuarantineExecutionError> {
-        let canonical_snapshot = match evaluate(policy, evidence) {
+        self.apply_with_attribution(
+            policy,
+            evidence,
+            None,
+            from_status,
+            expected_row_version,
+            expected_generation,
+            created_at,
+        )
+    }
+
+    /// Apply a quarantine that a specific feedback row caused.
+    ///
+    /// The attribution reaches both the canonical evidence snapshot and the
+    /// recorded transition reason, so `permission_violation` is no longer
+    /// flattened into `authenticatedactiveintegrityfeedback`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_attribution(
+        &self,
+        policy: &QuarantinePolicy,
+        evidence: &QuarantineEvidence,
+        attribution: Option<&FeedbackAttribution>,
+        from_status: LifecycleStatus,
+        expected_row_version: i64,
+        expected_generation: i64,
+        created_at: i64,
+    ) -> Result<(TransitionOutcome, PublicationReport), QuarantineExecutionError> {
+        let canonical_snapshot = match evaluate_with_attribution(policy, evidence, attribution) {
             QuarantineDecision::Quarantine { canonical_snapshot } => canonical_snapshot,
             QuarantineDecision::Hold(reason) => return Err(QuarantineExecutionError::Held(reason)),
         };
@@ -180,13 +245,18 @@ impl<'a> QuarantineExecutor<'a> {
             None,
             expected_generation,
         )?;
+        let mut reason = format!("{:?}", evidence.reason).to_ascii_lowercase();
+        if let Some(attribution) = attribution {
+            reason.push(':');
+            reason.push_str(&attribution.reason_code);
+        }
         let request = TransitionRequest {
             idempotency_key: format!("quarantine:{evidence_id}"),
             skill_id: evidence.skill_id.clone(),
             from_status,
             to_status: LifecycleStatus::Quarantined,
             expected_row_version,
-            reason: format!("{:?}", evidence.reason).to_ascii_lowercase(),
+            reason,
             snapshot,
         };
         self.coordinator
@@ -198,7 +268,12 @@ impl<'a> QuarantineExecutor<'a> {
                         &serde_json::to_string(policy)?,
                         created_at,
                     )?;
-                    store.connection_mut().execute(
+                    // `transition` opens its own `BEGIN IMMEDIATE`, so the
+                    // evidence row below is already committed by the time the
+                    // transition is evaluated. Remember whether this call is
+                    // the one that created it, so a rejected transition does
+                    // not leave evidence for a decision that never happened.
+                    let inserted_evidence = store.connection_mut().execute(
                         "INSERT OR IGNORE INTO skill_evidence (
                             evidence_id, skill_id, evidence_kind, payload_json,
                             policy_version, created_at
@@ -210,12 +285,38 @@ impl<'a> QuarantineExecutor<'a> {
                             policy.version,
                             created_at,
                         ],
-                    )?;
-                    let outcome = LifecycleService::new(store).transition(&request, created_at)?;
-                    let generation = outcome.desired_generation as u64;
-                    Ok((outcome, generation))
+                    )? == 1;
+                    match LifecycleService::new(store).transition(&request, created_at) {
+                        Ok(outcome) => {
+                            let generation = outcome.desired_generation as u64;
+                            Ok((outcome, generation))
+                        }
+                        Err(error) => {
+                            if inserted_evidence {
+                                discard_unused_evidence(store, &evidence_id);
+                            }
+                            Err(QuarantineExecutionError::from(error))
+                        }
+                    }
                 },
             )
             .map_err(Into::into)
+    }
+}
+
+/// Compensate the pre-transition evidence insert when the transition is
+/// rejected. Full atomicity needs a `transition` entry point that accepts a
+/// caller-owned transaction; until then this keeps `skill_evidence` from
+/// implying a decision that was never applied.
+fn discard_unused_evidence(store: &mut super::store::SkillStore, evidence_id: &str) {
+    match store.connection_mut().execute(
+        "DELETE FROM skill_evidence WHERE evidence_id = ? AND evidence_kind = 'quarantine'",
+        rusqlite::params![evidence_id],
+    ) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            "failed to discard quarantine evidence after a rejected transition"
+        ),
     }
 }

@@ -7,6 +7,23 @@ use super::privacy::Redactor;
 use super::store::SkillStore;
 
 pub const MAX_FEEDBACK_REASON_BYTES: usize = 512;
+/// Maximum bytes accepted for `reason_code`, which is copied verbatim into the
+/// append-only audit table.
+pub const MAX_FEEDBACK_REASON_CODE_BYTES: usize = 64;
+/// Maximum bytes accepted for `idempotency_key`, which is stored in a UNIQUE
+/// TEXT column.
+pub const MAX_FEEDBACK_IDEMPOTENCY_KEY_BYTES: usize = 128;
+/// The closed set of reason codes that may accompany [`FeedbackKind::Severe`].
+/// Anything else is an ordinary quality report and must be submitted as
+/// negative feedback.
+pub const SEVERE_FEEDBACK_REASON_CODES: [&str; 3] =
+    ["integrity", "permission_violation", "unsafe_effect"];
+/// Whole days of raw telemetry retained before compaction removes the
+/// `invoked` rows that attributed feedback is matched against.
+pub const RAW_TELEMETRY_RETENTION_DAYS: i64 =
+    super::retention::DEFAULT_RAW_RETENTION_SECONDS / (24 * 60 * 60);
+/// Longest offending-value fragment echoed back in a format error.
+const MALFORMED_ID_PREVIEW_CHARS: usize = 72;
 
 type ExistingFeedback = (
     String,
@@ -94,10 +111,44 @@ pub enum FeedbackError {
     Sqlite(#[from] rusqlite::Error),
     #[error("actor is unauthenticated or outside the target scope")]
     Unauthorized,
-    #[error("feedback target does not exist or does not match the revision")]
-    UnknownTarget,
-    #[error("feedback fields exceed bounds or are invalid")]
-    InvalidFeedback,
+    #[error("no learned-skill revision `{skill_id}` exists")]
+    UnknownSkill { skill_id: String },
+    #[error(
+        "invocation `{invocation_id}` has no recorded `invoked` event in raw \
+         skill telemetry; raw events are retained for {retention_days} days and \
+         are compacted into daily aggregates afterwards, so an older invocation \
+         id can no longer be attributed"
+    )]
+    UnknownInvocation {
+        invocation_id: String,
+        retention_days: i64,
+    },
+    #[error(
+        "invocation `{invocation_id}` was recorded for a different learned skill \
+         than `{skill_id}`"
+    )]
+    InvocationSkillMismatch {
+        invocation_id: String,
+        skill_id: String,
+    },
+    #[error("feedback record `{feedback_id}` does not exist")]
+    UnknownFeedback { feedback_id: String },
+    #[error("feedback field `{field}` is invalid: {rule}")]
+    InvalidFeedback {
+        field: &'static str,
+        rule: &'static str,
+    },
+    #[error(
+        "feedback field `{field}` must be 64 lowercase hexadecimal characters as \
+         copied from telemetry, not `{value}`"
+    )]
+    MalformedId { field: &'static str, value: String },
+    #[error(
+        "severe feedback requires reason_code to be one of `integrity`, \
+         `permission_violation` or `unsafe_effect`; `{reason_code}` is not one of \
+         them, so submit it as negative feedback instead"
+    )]
+    UnsupportedSevereReasonCode { reason_code: String },
     #[error("idempotency key was reused for different feedback")]
     IdempotencyConflict,
     #[error("feedback state transition is stale or illegal")]
@@ -121,9 +172,7 @@ impl<'a> FeedbackService<'a> {
         created_at: i64,
     ) -> Result<String, FeedbackError> {
         validate_command(actor, command)?;
-        if created_at < 0 {
-            return Err(FeedbackError::InvalidFeedback);
-        }
+        validate_timestamp(created_at)?;
         let reason_text = command
             .reason_text
             .as_deref()
@@ -141,7 +190,9 @@ impl<'a> FeedbackService<'a> {
             .optional()?
             .is_some();
         if !revision_exists {
-            return Err(FeedbackError::UnknownTarget);
+            return Err(FeedbackError::UnknownSkill {
+                skill_id: command.skill_id.clone(),
+            });
         }
         if let Some(invocation_id) = &command.invocation_id {
             let target: Option<String> = tx
@@ -152,8 +203,24 @@ impl<'a> FeedbackService<'a> {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if target.as_deref() != Some(command.skill_id.as_str()) {
-                return Err(FeedbackError::UnknownTarget);
+            match target {
+                // The raw `invoked` row is gone. That is indistinguishable from
+                // a typo here, but retention compacts every event older than
+                // the raw window, so say so instead of claiming the invocation
+                // never existed.
+                None => {
+                    return Err(FeedbackError::UnknownInvocation {
+                        invocation_id: invocation_id.clone(),
+                        retention_days: RAW_TELEMETRY_RETENTION_DAYS,
+                    });
+                }
+                Some(observed) if observed != command.skill_id => {
+                    return Err(FeedbackError::InvocationSkillMismatch {
+                        invocation_id: invocation_id.clone(),
+                        skill_id: command.skill_id.clone(),
+                    });
+                }
+                Some(_) => {}
             }
         }
         let feedback_id = feedback_id(command);
@@ -225,6 +292,27 @@ impl<'a> FeedbackService<'a> {
              ) VALUES (?, NULL, 'active', ?, ?, 1, ?)",
             params![feedback_id, actor.actor_id, command.reason_code, created_at],
         )?;
+        // Authenticated user feedback is a first-class signal, so record it in
+        // the same counters the telemetry path maintains. The counts are
+        // cumulative reports received; resolving or retracting a report leaves
+        // them alone so the columns can never underflow their CHECK.
+        let positive = i64::from(command.kind == FeedbackKind::Positive);
+        let negative = i64::from(matches!(
+            command.kind,
+            FeedbackKind::Negative | FeedbackKind::Severe
+        ));
+        tx.execute(
+            "INSERT INTO skill_stats (
+                skill_id, user_positive_count, user_negative_count, updated_at
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(skill_id) DO UPDATE SET
+                user_positive_count =
+                    user_positive_count + excluded.user_positive_count,
+                user_negative_count =
+                    user_negative_count + excluded.user_negative_count,
+                updated_at = MAX(updated_at, excluded.updated_at)",
+            params![command.skill_id, positive, negative, created_at],
+        )?;
         tx.commit()?;
         Ok(feedback_id)
     }
@@ -238,9 +326,14 @@ impl<'a> FeedbackService<'a> {
         reason_code: &str,
         created_at: i64,
     ) -> Result<(), FeedbackError> {
-        if feedback_id.is_empty() || reason_code.is_empty() || created_at < 0 {
-            return Err(FeedbackError::InvalidFeedback);
+        if feedback_id.is_empty() {
+            return Err(FeedbackError::InvalidFeedback {
+                field: "feedback_id",
+                rule: "must not be empty",
+            });
         }
+        validate_reason_code(reason_code)?;
+        validate_timestamp(created_at)?;
         let tx = self
             .store
             .connection_mut()
@@ -253,7 +346,9 @@ impl<'a> FeedbackService<'a> {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .ok_or(FeedbackError::UnknownTarget)?;
+            .ok_or_else(|| FeedbackError::UnknownFeedback {
+                feedback_id: feedback_id.to_string(),
+            })?;
         if !actor.may_target(&skill_id) {
             return Err(FeedbackError::Unauthorized);
         }
@@ -295,26 +390,118 @@ fn validate_command(
     if !actor.may_target(&command.skill_id) {
         return Err(FeedbackError::Unauthorized);
     }
-    if command.idempotency_key.is_empty()
-        || command.skill_id.is_empty()
-        || command.reason_code.is_empty()
-        || command.reason_code.len() > 64
-        || command
-            .reason_text
-            .as_ref()
-            .is_some_and(|text| text.len() > MAX_FEEDBACK_REASON_BYTES)
+    validate_idempotency_key(&command.idempotency_key)?;
+    validate_hex_id("skill_id", &command.skill_id)?;
+    if let Some(invocation_id) = &command.invocation_id {
+        validate_hex_id("invocation_id", invocation_id)?;
+    }
+    validate_reason_code(&command.reason_code)?;
+    if command
+        .reason_text
+        .as_ref()
+        .is_some_and(|text| text.len() > MAX_FEEDBACK_REASON_BYTES)
     {
-        return Err(FeedbackError::InvalidFeedback);
+        return Err(FeedbackError::InvalidFeedback {
+            field: "reason_text",
+            rule: "must not exceed 512 bytes",
+        });
     }
     if command.kind == FeedbackKind::Severe
-        && !matches!(
-            command.reason_code.as_str(),
-            "integrity" | "permission_violation" | "unsafe_effect"
-        )
+        && !SEVERE_FEEDBACK_REASON_CODES.contains(&command.reason_code.as_str())
     {
-        return Err(FeedbackError::InvalidFeedback);
+        return Err(FeedbackError::UnsupportedSevereReasonCode {
+            reason_code: command.reason_code.clone(),
+        });
     }
     Ok(())
+}
+
+fn validate_timestamp(created_at: i64) -> Result<(), FeedbackError> {
+    if created_at < 0 {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "created_at",
+            rule: "must not be negative",
+        });
+    }
+    Ok(())
+}
+
+/// The key is stored in a UNIQUE TEXT column and echoed in conflict reports, so
+/// it is bounded and restricted to characters that survive logging verbatim.
+fn validate_idempotency_key(key: &str) -> Result<(), FeedbackError> {
+    if key.is_empty() {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "idempotency_key",
+            rule: "must not be empty",
+        });
+    }
+    if key.len() > MAX_FEEDBACK_IDEMPOTENCY_KEY_BYTES {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "idempotency_key",
+            rule: "must not exceed 128 bytes",
+        });
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "idempotency_key",
+            rule: "must contain only ASCII letters, digits, '.', '_', ':' or '-'",
+        });
+    }
+    Ok(())
+}
+
+/// `reason_code` is copied unredacted into `skill_feedback_audit`, so it stays a
+/// closed-shape token rather than free text.
+fn validate_reason_code(reason_code: &str) -> Result<(), FeedbackError> {
+    if reason_code.is_empty() {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "reason_code",
+            rule: "must not be empty",
+        });
+    }
+    if reason_code.len() > MAX_FEEDBACK_REASON_CODE_BYTES {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "reason_code",
+            rule: "must not exceed 64 bytes",
+        });
+    }
+    if !reason_code
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return Err(FeedbackError::InvalidFeedback {
+            field: "reason_code",
+            rule: "must contain only lowercase ASCII letters and '_'",
+        });
+    }
+    Ok(())
+}
+
+/// Skill and invocation ids are 64 lowercase hex characters everywhere else in
+/// the telemetry and retention paths. Reject the wrong shape here so a typo or
+/// an uppercase copy is not reported as a missing target.
+fn validate_hex_id(field: &'static str, value: &str) -> Result<(), FeedbackError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(FeedbackError::MalformedId {
+        field,
+        value: preview(value),
+    })
+}
+
+fn preview(value: &str) -> String {
+    match value.char_indices().nth(MALFORMED_ID_PREVIEW_CHARS) {
+        Some((end, _)) => format!("{}…", &value[..end]),
+        None => value.to_string(),
+    }
 }
 
 fn feedback_id(command: &FeedbackCommand) -> String {

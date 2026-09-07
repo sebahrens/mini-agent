@@ -928,7 +928,11 @@ impl Tool for JsTool {
         let mut proposal_guidance = "";
         #[cfg(feature = "skills")]
         if self.proposal_service.is_some() {
-            globals.push("`propose_skill(draft): void` (synchronous)".to_string());
+            globals.push(
+                "`propose_skill(draft): string` (synchronous; returns the JSON string \
+                 `{id, proposal_id, status, report_id}`)."
+                    .to_string(),
+            );
             proposal_guidance = " After a pattern proves repeated and generalizable, curate it with \
                 propose_skill({source, description, exports: [{name, signature}], tests, \
                 capability: {tier, grants}, tags?, predecessor_id?}). Every test must be a \
@@ -936,7 +940,14 @@ impl Tool for JsTool {
                 side_effecting. Grants use {kind: 'read_file'|'write_file', workspace_prefixes}, \
                 {kind: 'fetch', origins, methods}, or {kind: 'spawn', programs}; use [] when no \
                 effects are needed. A proposal is an immutable candidate for verification and \
-                human-gated admission; it is not executed or activated by proposing it.";
+                human-gated admission; it is not executed or activated by proposing it. The \
+                returned `id` is the canonical immutable revision id of that candidate and never \
+                changes; `proposal_id` is the same id. The returned status `pending` is only an \
+                acknowledgement that the candidate was durably queued: evaluation runs off this \
+                call, and the proposal later settles as awaiting_approval, rejected, verified \
+                (gates passed but a held-out suite is still required), or deferred. A settled \
+                outcome is reported at the end of a later js call; proposing the same draft again \
+                does not speed it up.";
         }
         #[cfg(not(feature = "skills"))]
         let proposal_guidance = "";
@@ -1191,8 +1202,69 @@ impl Tool for JsTool {
             self.skill_production,
         );
 
-        Ok(render_step_result(&response))
+        let output = render_step_result(&response);
+        #[cfg(feature = "skills")]
+        let output = match self.proposal_service.as_ref() {
+            Some(service) => with_settled_proposal_outcomes(output, service),
+            None => output,
+        };
+        Ok(output)
     }
+}
+
+/// Append the settled admission outcome of every proposal this session
+/// enqueued and has not reported yet.
+///
+/// `propose_skill` answers with a queue acknowledgement (`pending`), so this
+/// follow-up note is how the model learns that its candidate reached
+/// `awaiting_approval`, was rejected, or was deferred. Outcomes are closed
+/// values: a canonical revision id, a status token, and an internal reason
+/// code; a proposal that is still queued stays tracked for a later call.
+#[cfg(feature = "skills")]
+pub(crate) fn with_settled_proposal_outcomes(
+    mut output: String,
+    service: &ProposalEffectService,
+) -> String {
+    let outcomes = service.settled_outcomes();
+    if outcomes.is_empty() {
+        return output;
+    }
+    // `propose_skill` answers with a JSON object, and appending prose to it
+    // would leave the tool result unparseable for the very caller that asked
+    // for the proposal. Carry the notice as a field when the result is an
+    // object, and fall back to prose for every other JavaScript value.
+    if let Ok(serde_json::Value::Object(mut object)) =
+        serde_json::from_str::<serde_json::Value>(&output)
+    {
+        let settled = outcomes
+            .iter()
+            .map(|outcome| {
+                serde_json::json!({
+                    "proposal_id": outcome.proposal_id,
+                    "status": outcome.status.as_str(),
+                    "reason_code": outcome.reason_code,
+                })
+            })
+            .collect::<Vec<_>>();
+        object.insert(
+            "settled_proposals".to_string(),
+            serde_json::Value::Array(settled),
+        );
+        return serde_json::Value::Object(object).to_string();
+    }
+    for outcome in outcomes {
+        output.push_str("\n\nSkill proposal ");
+        output.push_str(&outcome.proposal_id);
+        output.push_str(" settled as ");
+        output.push_str(outcome.status.as_str());
+        if let Some(reason_code) = outcome.reason_code.as_deref() {
+            output.push_str(" (reason: ");
+            output.push_str(reason_code);
+            output.push(')');
+        }
+        output.push('.');
+    }
+    output
 }
 
 #[cfg(feature = "skills")]

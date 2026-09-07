@@ -2840,10 +2840,16 @@ pub(crate) fn make_propose_skill(
 ) -> impl for<'js> Fn(Object<'js>) -> rquickjs::Result<String> {
     let service = ProposalEffectService::new(proposal_host);
     move |object: Object<'_>| {
-        service.reserve_attempt().map_err(proposal_host_error)?;
+        // Shape and canonical validation run before the session attempt budget
+        // is touched: a malformed draft is the model's mistake to fix, not a
+        // spent proposal attempt.
         let proposal = JsProposal::from_object(&object).map_err(proposal_host_error)?;
+        let prepared = service
+            .authorize_reserved(proposal)
+            .map_err(proposal_host_error)?;
+        service.reserve_attempt().map_err(proposal_host_error)?;
         let result = service
-            .execute_reserved(proposal)
+            .execute_prepared(prepared)
             .map_err(proposal_host_error)?;
         serde_json::to_string(&serde_json::json!({
             "id": result.skill_id,
@@ -4061,16 +4067,20 @@ impl ParentEffectService for ParentHostEffectService {
                     .proposal
                     .as_ref()
                     .ok_or(HostEffectError::BackendFailure)?;
-                proposal
-                    .reserve_attempt()
-                    .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
-                self.validated = Some(PreparedParentEffect::Proposal(
+                // Validate first, then reserve. Reserving ahead of wire and
+                // canonical validation let one oversized or malformed draft
+                // burn one of the session's proposal attempts, which the
+                // direct service path never did.
+                let prepared =
                     proposal
                         .authorize_reserved(JsProposal::try_from(draft.clone()).map_err(
                             |error| HostEffectError::from(proposal_service_error(error)),
                         )?)
-                        .map_err(|error| HostEffectError::from(proposal_service_error(error)))?,
-                ));
+                        .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
+                proposal
+                    .reserve_attempt()
+                    .map_err(|error| HostEffectError::from(proposal_service_error(error)))?;
+                self.validated = Some(PreparedParentEffect::Proposal(prepared));
                 Ok(())
             }
             #[cfg(not(feature = "skills"))]

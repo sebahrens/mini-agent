@@ -1,7 +1,7 @@
 pub mod chat_history;
 pub mod storage;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -171,6 +171,239 @@ pub enum PersistedToolMessage {
     },
 }
 
+/// One reasoning block exactly as the provider emitted it.
+///
+/// Kept as an ordered list of typed blocks rather than a flattened summary so
+/// a replayed item is byte-identical to what the model produced: the Responses
+/// API validates a `reasoning` item against the `function_call` it was emitted
+/// with, and Anthropic validates a thinking block against its signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistedReasoningBlock {
+    Text {
+        text: CompactString,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<CompactString>,
+    },
+    Summary {
+        text: CompactString,
+    },
+    Encrypted {
+        data: CompactString,
+    },
+    Redacted {
+        data: CompactString,
+    },
+}
+
+/// A complete provider reasoning item persisted alongside the tool call it was
+/// emitted for. `id` is the provider's own item id (`rs_...` on the Responses
+/// API); without it the item cannot be replayed as a stored provider item and
+/// the paired native `function_call` id must not be replayed either.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedReasoning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<CompactString>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<PersistedReasoningBlock>,
+}
+
+impl PersistedReasoning {
+    /// True when the item carries neither an identity nor any content, and so
+    /// is not worth persisting.
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none() && self.blocks.is_empty()
+    }
+
+    /// True when the item can be replayed as a stored provider reasoning item.
+    fn is_replayable(&self) -> bool {
+        self.id.is_some() && !self.blocks.is_empty()
+    }
+
+    pub fn from_rig(reasoning: &rig::message::Reasoning) -> Self {
+        let blocks = reasoning
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rig::message::ReasoningContent::Text { text, signature } => {
+                    Some(PersistedReasoningBlock::Text {
+                        text: CompactString::new(text),
+                        signature: signature.as_deref().map(CompactString::new),
+                    })
+                }
+                rig::message::ReasoningContent::Summary(text) => {
+                    Some(PersistedReasoningBlock::Summary {
+                        text: CompactString::new(text),
+                    })
+                }
+                rig::message::ReasoningContent::Encrypted(data) => {
+                    Some(PersistedReasoningBlock::Encrypted {
+                        data: CompactString::new(data),
+                    })
+                }
+                rig::message::ReasoningContent::Redacted { data } => {
+                    Some(PersistedReasoningBlock::Redacted {
+                        data: CompactString::new(data),
+                    })
+                }
+                // `ReasoningContent` is `#[non_exhaustive]`. An unknown block is
+                // dropped rather than guessed at; a call left with no replayable
+                // reasoning falls back to the rewritten identity, which is safe.
+                _ => None,
+            })
+            .collect();
+        Self {
+            id: reasoning.id.as_deref().map(CompactString::new),
+            blocks,
+        }
+    }
+
+    pub fn to_rig(&self) -> rig::message::Reasoning {
+        // `rig::message::Reasoning` is `#[non_exhaustive]` and has no
+        // constructor that takes arbitrary blocks, so start from an empty item
+        // and fill its public fields.
+        let mut reasoning = rig::message::Reasoning::multi(Vec::new())
+            .optional_id(self.id.as_ref().map(ToString::to_string));
+        reasoning.content = self
+            .blocks
+            .iter()
+            .map(|block| match block {
+                PersistedReasoningBlock::Text { text, signature } => {
+                    rig::message::ReasoningContent::Text {
+                        text: text.to_string(),
+                        signature: signature.as_ref().map(ToString::to_string),
+                    }
+                }
+                PersistedReasoningBlock::Summary { text } => {
+                    rig::message::ReasoningContent::Summary(text.to_string())
+                }
+                PersistedReasoningBlock::Encrypted { data } => {
+                    rig::message::ReasoningContent::Encrypted(data.to_string())
+                }
+                PersistedReasoningBlock::Redacted { data } => {
+                    rig::message::ReasoningContent::Redacted {
+                        data: data.to_string(),
+                    }
+                }
+            })
+            .collect();
+        reasoning
+    }
+}
+
+/// The provider's own identity for one persisted tool call, plus the reasoning
+/// items it emitted immediately before that call.
+///
+/// This lives in [`Session::tool_call_provenance`], keyed by the call record's
+/// `tool_call_id`, rather than inside [`PersistedToolMessage::Call`]: the tool
+/// record shape predates it, so a session file written before this existed
+/// simply has no map and every one of its records keeps replaying through the
+/// rewritten identity, exactly as it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCallProvenance {
+    /// The provider's own `function_call` item id (`fc_...` on the Responses
+    /// API). Replaying it asserts the item is already stored provider-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_item_id: Option<CompactString>,
+    /// The provider `call_id` that pairs a call with its output. This is the
+    /// durable pairing key both run modes persist as `tool_call_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<CompactString>,
+    /// Reasoning items emitted before the call, in provider order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<PersistedReasoning>,
+}
+
+impl PersistedCallProvenance {
+    /// True when this call can be replayed with the provider's own item ids:
+    /// both identities are known and at least one reasoning item can be
+    /// replayed with them. The Responses API rejects a native `function_call`
+    /// id whose `reasoning` item is missing, so anything less must fall back to
+    /// the rewritten identity.
+    pub(crate) fn replayable_reasoning(&self) -> Option<(&str, &str, Vec<&PersistedReasoning>)> {
+        let item_id = self.provider_item_id.as_deref()?;
+        let call_id = self.provider_call_id.as_deref()?;
+        let reasoning: Vec<&PersistedReasoning> = self
+            .reasoning
+            .iter()
+            .filter(|item| item.is_replayable())
+            .collect();
+        if reasoning.is_empty() {
+            return None;
+        }
+        Some((item_id, call_id, reasoning))
+    }
+}
+
+/// One tool call as the provider itself described it, read back out of the
+/// runner's canonical turn transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderToolCall {
+    pub(crate) name: String,
+    pub(crate) provenance: PersistedCallProvenance,
+}
+
+/// Read every tool call out of a completed turn's canonical provider
+/// transcript, attaching the reasoning items that preceded each one.
+///
+/// Reasoning accumulates across assistant text (a provider may narrate between
+/// thinking and calling) but is dropped at a tool-result boundary, which is
+/// where the provider's own item ordering restarts.
+pub(crate) fn provider_tool_calls(
+    interactions: &[rig::completion::Message],
+) -> Vec<ProviderToolCall> {
+    use rig::message::AssistantContent;
+
+    let mut calls = Vec::new();
+    let mut pending: Vec<PersistedReasoning> = Vec::new();
+    for interaction in interactions {
+        match interaction {
+            rig::completion::Message::Assistant { content, .. } => {
+                for item in content.iter() {
+                    match item {
+                        AssistantContent::Reasoning(reasoning) => {
+                            let persisted = PersistedReasoning::from_rig(reasoning);
+                            if !persisted.is_empty() {
+                                pending.push(persisted);
+                            }
+                        }
+                        AssistantContent::ToolCall(call) => calls.push(ProviderToolCall {
+                            name: call.function.name.clone(),
+                            provenance: PersistedCallProvenance {
+                                provider_item_id: Some(CompactString::new(call.id.as_str())),
+                                provider_call_id: call.call_id.as_deref().map(CompactString::new),
+                                reasoning: std::mem::take(&mut pending),
+                            },
+                        }),
+                        AssistantContent::Text(_) | AssistantContent::Image(_) => {}
+                    }
+                }
+            }
+            rig::completion::Message::User { .. } => pending.clear(),
+            rig::completion::Message::System { .. } => {}
+        }
+    }
+    calls
+}
+
+/// The identifier both run modes persist for a provider tool call.
+///
+/// The Responses API pairs a `function_call` with its output by `call_id`, so
+/// that is the durable key whenever the provider supplies one. A provider that
+/// supplies none (Anthropic) leaves the record on the identity it already has:
+/// the provider's single item id headless, the live lifecycle id interactively.
+/// Interactive and headless runs must agree here or `--continue` replays
+/// differently depending on which mode wrote the session.
+pub(crate) fn persisted_call_identifier<'a>(
+    call_id: Option<&'a str>,
+    fallback: &'a str,
+) -> &'a str {
+    match call_id {
+        Some(call_id) if !call_id.is_empty() => call_id,
+        _ => fallback,
+    }
+}
+
 /// A single-step restore point captured before a conversation rewind, so the
 /// destructive truncation can be undone with `/redo`. New records hold only
 /// the removed tail; `tail_only = false` preserves compatibility with older
@@ -246,6 +479,12 @@ pub struct Session {
     pub id: CompactString,
     pub name: CompactString,
     pub messages: Vec<SessionMessage>,
+    /// Provider-native identity and reasoning for persisted tool calls, keyed
+    /// by the call record's `tool_call_id`. A session file written before this
+    /// field existed omits it entirely and deserializes to an empty map, so
+    /// every one of its calls replays exactly as it did before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_call_provenance: BTreeMap<CompactString, PersistedCallProvenance>,
     pub compactions: Vec<Compaction>,
     pub created_at: CompactString,
     pub updated_at: CompactString,
@@ -440,6 +679,7 @@ impl Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
             messages: Vec::new(),
+            tool_call_provenance: BTreeMap::new(),
             compactions: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
@@ -606,6 +846,147 @@ impl Session {
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
         self.add_message_with_tool_data(role, content, None, None);
+    }
+
+    /// Record the provider's own identity and reasoning items for the tool call
+    /// already persisted under `tool_call_id`.
+    pub(crate) fn record_tool_call_provenance(
+        &mut self,
+        tool_call_id: &str,
+        provenance: PersistedCallProvenance,
+    ) {
+        if tool_call_id.is_empty() || provenance == PersistedCallProvenance::default() {
+            return;
+        }
+        self.tool_call_provenance
+            .insert(CompactString::new(tool_call_id), provenance);
+        self.mark_history_changed();
+    }
+
+    pub(crate) fn provenance_for_tool_call(
+        &self,
+        tool_call_id: &str,
+    ) -> Option<&PersistedCallProvenance> {
+        self.tool_call_provenance.get(tool_call_id)
+    }
+
+    /// Adopt the provider's own tool identity and reasoning items for the tool
+    /// records the interactive path already persisted live.
+    ///
+    /// `AgentEvent::ToolCall` carries rig's internal lifecycle id and no
+    /// reasoning at all, so without this the interactive transcript would
+    /// persist a different identifier than headless `-p` (making `--continue`
+    /// mode-dependent) and could never replay a native `function_call` item.
+    ///
+    /// `interactions` is the runner's canonical transcript for the turn that
+    /// just ended. Pairing is positional over the turn's trailing tool-call
+    /// records — the same provider order both sides observe — and is guarded
+    /// three ways: the run of records must be exactly as long as the provider's
+    /// call list, the tool names must agree pairwise, and no record in the run
+    /// may already carry provenance (which would mean it belongs to an earlier
+    /// committed turn). Anything that fails to line up abandons the whole
+    /// adoption and leaves the live records exactly as they were.
+    ///
+    /// Returns the number of records that adopted a provider identity.
+    pub(crate) fn adopt_provider_tool_identity(
+        &mut self,
+        interactions: &[rig::completion::Message],
+    ) -> usize {
+        let calls = provider_tool_calls(interactions);
+        if calls.is_empty() {
+            return 0;
+        }
+        let Some(indices) = self.trailing_unrecorded_tool_call_indices(calls.len()) else {
+            return 0;
+        };
+        for (index, call) in indices.iter().zip(calls.iter()) {
+            let Some(PersistedToolMessage::Call { name, .. }) = &self.messages[*index].tool else {
+                return 0;
+            };
+            if name.as_str() != call.name {
+                return 0;
+            }
+        }
+
+        let mut adopted = 0;
+        for (index, call) in indices.iter().zip(calls) {
+            let Some(previous) = self.messages[*index].tool_call_id.clone() else {
+                continue;
+            };
+            // Only a provider that supplies its own pairing key renames the
+            // record; otherwise the live lifecycle id stays the identity the
+            // call and its result share, and keys the provenance too.
+            let identifier = CompactString::new(persisted_call_identifier(
+                call.provenance.provider_call_id.as_deref(),
+                previous.as_str(),
+            ));
+            if identifier != previous {
+                self.rename_tool_record_identity(*index, &previous, &identifier);
+            }
+            self.record_tool_call_provenance(&identifier, call.provenance);
+            adopted += 1;
+        }
+        adopted
+    }
+
+    /// Indices of the last `count` tool-call records of the current turn, or
+    /// `None` when that run cannot be identified unambiguously.
+    fn trailing_unrecorded_tool_call_indices(&self, count: usize) -> Option<Vec<usize>> {
+        let mut indices = Vec::with_capacity(count);
+        for (index, message) in self.messages.iter().enumerate().rev() {
+            if message.role == MessageRole::User {
+                break;
+            }
+            if !matches!(message.tool, Some(PersistedToolMessage::Call { .. })) {
+                continue;
+            }
+            let id = message
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.is_empty())?;
+            if self.tool_call_provenance.contains_key(id) {
+                break;
+            }
+            indices.push(index);
+            if indices.len() == count {
+                break;
+            }
+        }
+        if indices.len() != count {
+            return None;
+        }
+        indices.reverse();
+        Some(indices)
+    }
+
+    /// Rewrite the identity a call record and its result record share.
+    fn rename_tool_record_identity(&mut self, call_index: usize, previous: &str, next: &str) {
+        self.messages[call_index].tool_call_id = Some(CompactString::new(next));
+        for message in &mut self.messages[call_index + 1..] {
+            if message.role == MessageRole::ToolResult
+                && message.tool_call_id.as_deref() == Some(previous)
+            {
+                message.tool_call_id = Some(CompactString::new(next));
+                break;
+            }
+        }
+        self.mark_history_changed();
+    }
+
+    /// Drop provenance for calls that are no longer in the transcript. Called
+    /// where messages are removed for good; a rewind keeps its entries so
+    /// `/redo` restores complete records.
+    fn prune_tool_call_provenance(&mut self) {
+        if self.tool_call_provenance.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = self
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        self.tool_call_provenance
+            .retain(|id, _| live.contains(id.as_str()));
     }
 
     fn add_message_with_tool_data(
@@ -1208,6 +1589,7 @@ impl Session {
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
         self.messages.insert(0, summary_msg);
+        self.prune_tool_call_provenance();
 
         // Recompute total from remaining messages so the count is always
         // consistent — no underflow risk when token_savings is stale.

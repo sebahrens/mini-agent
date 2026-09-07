@@ -6,8 +6,9 @@ use crate::session::storage::{
     load_session_exact, load_suffix, save_session, save_tool_output, suffix_path, tool_output_dir,
 };
 use crate::session::{
-    PermissionAllowEntry, PersistedToolMessage, Session, TOOL_RESULT_HEAD_CHARS,
-    TOOL_RESULT_SAVE_THRESHOLD, TOOL_RESULT_TAIL_CHARS,
+    PermissionAllowEntry, PersistedCallProvenance, PersistedReasoning, PersistedReasoningBlock,
+    PersistedToolMessage, Session, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_SAVE_THRESHOLD,
+    TOOL_RESULT_TAIL_CHARS,
 };
 use crate::ui::state::{AgentRunState, PendingMainTurn};
 use crate::ui::utils::suggest_pattern;
@@ -1010,5 +1011,137 @@ fn session_storage_permissions_unsupported_platform_fails_closed() {
     let env = setup_test_env();
     let session = Session::new("openai", "gpt-4", 128000, "");
     assert!(save_session(&session).is_err());
+    drop(env);
+}
+
+/// mini-agent-wzv1: an assistant turn's reasoning item and both provider tool
+/// identities must survive the durable session round trip, or a resumed turn
+/// can never replay the native `function_call` the Responses API validates
+/// against its `reasoning` item.
+#[test]
+fn saved_session_round_trips_reasoning_and_both_provider_tool_ids() {
+    let env = setup_test_env();
+    let mut session = Session::new("openai", "gpt-5", 400_000, "");
+    session.add_message(MessageRole::User, "edit it");
+    session.add_tool_call_with_id("call_abc123", "edit", &serde_json::json!({"path": "a.rs"}));
+    session.add_tool_result_with_id("call_abc123", "edit", "ok");
+    let provenance = PersistedCallProvenance {
+        provider_item_id: Some("fc_abc123".into()),
+        provider_call_id: Some("call_abc123".into()),
+        reasoning: vec![PersistedReasoning {
+            id: Some("rs_abc123".into()),
+            blocks: vec![
+                PersistedReasoningBlock::Summary {
+                    text: "checking the file first".into(),
+                },
+                PersistedReasoningBlock::Text {
+                    text: "the edit is safe".into(),
+                    signature: Some("sig-1".into()),
+                },
+                PersistedReasoningBlock::Encrypted {
+                    data: "gAAAAABm-opaque".into(),
+                },
+            ],
+        }],
+    };
+    session.record_tool_call_provenance("call_abc123", provenance.clone());
+    save_session(&session).unwrap();
+
+    let loaded = load_session_exact(&session.id)
+        .unwrap()
+        .expect("saved session must load");
+    assert_eq!(
+        loaded.tool_call_provenance.get("call_abc123"),
+        Some(&provenance),
+        "the reasoning item and both provider ids must survive save/load"
+    );
+    assert_eq!(
+        loaded.messages[1].tool_call_id.as_deref(),
+        Some("call_abc123"),
+        "the persisted record is keyed by the provider call_id"
+    );
+
+    // The reloaded session replays the native ids together with the reasoning.
+    let history = crate::agent::runner::convert_history(&loaded);
+    let rig::completion::Message::Assistant { content, .. } = &history[1] else {
+        panic!("tool call must replay as an assistant message")
+    };
+    let items: Vec<&rig::message::AssistantContent> = content.iter().collect();
+    let [
+        rig::message::AssistantContent::Reasoning(reasoning),
+        rig::message::AssistantContent::ToolCall(call),
+    ] = items.as_slice()
+    else {
+        panic!("expected the reasoning item then the call: {items:?}")
+    };
+    assert_eq!(reasoning.id.as_deref(), Some("rs_abc123"));
+    assert_eq!(call.id, "fc_abc123");
+    assert_eq!(call.call_id.as_deref(), Some("call_abc123"));
+    drop(env);
+}
+
+/// A session file written before the provenance map existed has no such key at
+/// all. It must still load, and every one of its calls must keep replaying
+/// through the rewritten identity that needs no stored provider item.
+#[test]
+fn old_format_session_without_provenance_still_loads_and_replays_rewritten() {
+    let env = setup_test_env();
+    let mut session = Session::new("openai", "gpt-5", 400_000, "");
+    session.add_message(MessageRole::User, "edit it");
+    session.add_tool_call_with_id("fc_abc123", "edit", &serde_json::json!({"path": "a.rs"}));
+    session.add_tool_result_with_id("fc_abc123", "edit", "ok");
+    session.record_tool_call_provenance(
+        "fc_abc123",
+        PersistedCallProvenance {
+            provider_item_id: Some("fc_abc123".into()),
+            provider_call_id: Some("call_abc123".into()),
+            reasoning: vec![PersistedReasoning {
+                id: Some("rs_abc123".into()),
+                blocks: vec![PersistedReasoningBlock::Summary {
+                    text: "thinking".into(),
+                }],
+            }],
+        },
+    );
+    save_session(&session).unwrap();
+
+    // Strip every field the old format did not have, leaving a byte-exact
+    // pre-mini-agent-wzv1 session file on disk.
+    let path = crate::session::storage::session_path(&session.id).unwrap();
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        raw.as_object_mut()
+            .unwrap()
+            .remove("tool_call_provenance")
+            .is_some(),
+        "the new field must be the only thing an old file is missing"
+    );
+    atomic_write(&path, &serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let loaded = load_session_exact(&session.id)
+        .unwrap()
+        .expect("an old-format session must still load");
+    assert!(loaded.tool_call_provenance.is_empty());
+    assert_eq!(loaded.messages.len(), 3);
+
+    let history = crate::agent::runner::convert_history(&loaded);
+    let rig::completion::Message::Assistant { content, .. } = &history[1] else {
+        panic!("tool call must replay as an assistant message")
+    };
+    let rig::message::AssistantContent::ToolCall(call) = content.first() else {
+        panic!("tool call must remain structured")
+    };
+    assert_eq!(
+        call.id, "call_abc123",
+        "a native item id must still be rewritten when no reasoning is stored"
+    );
+    assert_eq!(call.call_id.as_deref(), Some("call_abc123"));
+    assert!(
+        !content
+            .iter()
+            .any(|item| matches!(item, rig::message::AssistantContent::Reasoning(_))),
+        "an old session must replay exactly as it did, with no reasoning item"
+    );
     drop(env);
 }

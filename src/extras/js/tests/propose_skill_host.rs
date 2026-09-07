@@ -6,7 +6,8 @@ use crate::extras::js::host::AllowConfig;
 use crate::extras::js::host::{FileEffectService, ParentHostEffectService, SpawnEffectService};
 use crate::extras::js::protocol::{
     AdvisoryAttribution, EffectOperation, EffectRequest, EffectResult, GrantId, InvocationId,
-    SkillProposalCapability, SkillProposalDraft, SkillProposalExport, SkillProposalScope,
+    ProposalStatus, SkillProposalCapability, SkillProposalDraft, SkillProposalExport,
+    SkillProposalScope,
 };
 use crate::extras::js::realm::{
     call_export_with_capability, load_artifact, load_artifact_with_capabilities,
@@ -14,7 +15,7 @@ use crate::extras::js::realm::{
 use crate::extras::js::skills::capability::{InvocationAuthorization, InvocationCapabilityRuntime};
 use crate::extras::js::skills::proposal::{
     AttemptBudget, JsCapability, JsCapabilityScope, JsExport, JsProposal, ProposalEffectService,
-    ProposalError, ProposalHost, ProposalQueue,
+    ProposalError, ProposalHost, ProposalQueue, SettledProposal,
 };
 use crate::extras::js::skills::store::{EnqueueResult, EnqueueStatus, SkillStore};
 use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -503,7 +504,7 @@ async fn proposal_denial_and_cancellation_enqueue_nothing_and_audit_denials() {
 }
 
 #[tokio::test]
-async fn parent_proposal_attempt_budget_precedes_canonical_validation() {
+async fn malformed_parent_proposals_do_not_consume_the_session_budget() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker = ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).unwrap();
@@ -544,27 +545,38 @@ async fn parent_proposal_attempt_budget_precedes_canonical_validation() {
             .await
             .is_err()
     );
-    assert!(
-        broker
-            .dispatch(
-                EffectRequest {
-                    effect_ordinal: 1,
-                    grant_id,
-                    advisory: AdvisoryAttribution::default(),
-                    operation: EffectOperation::ProposeSkill {
-                        draft: wire_proposal("-must-not-enqueue"),
-                    },
+    // The single session attempt must survive the malformed draft: the broker
+    // path validates before reserving, exactly like the direct service path.
+    broker
+        .dispatch(
+            EffectRequest {
+                effect_ordinal: 1,
+                grant_id,
+                advisory: AdvisoryAttribution::default(),
+                operation: EffectOperation::ProposeSkill {
+                    draft: wire_proposal("-well-formed"),
                 },
-                PermCancellation::new(),
-            )
-            .await
-            .is_err()
+            },
+            PermCancellation::new(),
+        )
+        .await
+        .expect("a well-formed draft still owns the session attempt");
+
+    let records = audit.lock().unwrap();
+    assert_eq!(records.records().len(), 3);
+    assert_eq!(records.records()[0].state, AuditState::Completed);
+    assert_eq!(records.records()[0].decision, "denied");
+    assert_eq!(records.records()[1].state, AuditState::Intent);
+    assert_eq!(records.records()[1].decision, "authorized");
+    assert_eq!(
+        records.records()[2].result_code.as_deref(),
+        Some("succeeded")
     );
-    assert_denial_records(&audit, 2);
+    drop(records);
     drop(broker);
     drop(worker);
     let store = SkillStore::open_at(&paths).unwrap();
-    assert_eq!(store.count_proposals().unwrap(), 0);
+    assert_eq!(store.count_proposals().unwrap(), 1);
     drop(store);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -720,6 +732,20 @@ async fn proposal_host_wiring_enqueues_only_in_normal_skills_context() {
     let description = tool.description();
     assert!(description.contains("propose_skill({source, description, exports"));
     assert!(
+        !description.contains("propose_skill(draft): void"),
+        "propose_skill returns a JSON string, not void"
+    );
+    assert!(description.contains("`propose_skill(draft): string`"));
+    assert!(description.contains("{id, proposal_id, status, report_id}"));
+    assert!(description.contains("canonical immutable revision id"));
+    assert!(description.contains("acknowledgement that the candidate was durably queued"));
+    for settled in ["awaiting_approval", "rejected", "deferred"] {
+        assert!(
+            description.contains(settled),
+            "the lifecycle sentence must name {settled}"
+        );
+    }
+    assert!(
         description
             .contains("Every test must be a JavaScript expression that returns exactly true")
     );
@@ -815,7 +841,7 @@ async fn proposal_host_wiring_enforces_session_budget() {
 }
 
 #[tokio::test]
-async fn proposal_host_validation_budget_precedes_canonical_validation() {
+async fn proposal_host_validation_failures_do_not_consume_the_session_budget() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("store");
     let worker =
@@ -844,6 +870,20 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
             "unexpected: {output}"
         );
     }
+    // None of the rejected drafts may have spent an attempt, so the whole
+    // session budget is still available to well-formed proposals.
+    for _ in 0..3 {
+        let output = tool
+            .call(JsArgs {
+                code: format!("propose_skill({})", js_payload()),
+            })
+            .await
+            .expect("allowed attempt");
+        assert!(
+            output.contains("\"status\":\"pending\""),
+            "unexpected: {output}"
+        );
+    }
     let exhausted = tool
         .call(JsArgs {
             code: format!("propose_skill({})", js_payload()),
@@ -857,6 +897,88 @@ async fn proposal_host_validation_budget_precedes_canonical_validation() {
     );
     drop(tool);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn settled_proposal_outcomes_are_observed_once_and_queued_ones_stay_tracked() {
+    let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
+    let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
+    let responder = std::thread::spawn(move || {
+        receiver.respond_next(
+            Duration::ZERO,
+            Ok(EnqueueResult {
+                proposal_id: "settling-proposal".to_string(),
+                skill_id: "settling-skill".to_string(),
+                status: EnqueueStatus::Pending,
+                report_id: None,
+            }),
+        );
+        // First observation: still queued. Second: settled.
+        receiver.respond_next_observation(Ok(None));
+        receiver.respond_next_observation(Ok(Some(SettledProposal {
+            proposal_id: "settling-proposal".to_string(),
+            skill_id: "settling-skill".to_string(),
+            status: ProposalStatus::Rejected,
+            reason_code: Some("duplicate_skill".to_string()),
+            report_id: Some("report-1".to_string()),
+        })));
+    });
+
+    service.execute(proposal("")).expect("enqueue");
+    assert!(
+        service.settled_outcomes().is_empty(),
+        "a queued proposal has no settled outcome yet"
+    );
+    let settled = service.settled_outcomes();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].proposal_id, "settling-proposal");
+    assert_eq!(settled[0].status, ProposalStatus::Rejected);
+    assert_eq!(settled[0].reason_code.as_deref(), Some("duplicate_skill"));
+    assert!(
+        service.settled_outcomes().is_empty(),
+        "a settled outcome is reported exactly once"
+    );
+    responder.join().unwrap();
+}
+
+#[test]
+fn settled_proposal_outcomes_are_appended_to_the_tool_result() {
+    let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
+    let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
+    let responder = std::thread::spawn(move || {
+        receiver.respond_next(
+            Duration::ZERO,
+            Ok(EnqueueResult {
+                proposal_id: "reported-proposal".to_string(),
+                skill_id: "reported-skill".to_string(),
+                status: EnqueueStatus::Pending,
+                report_id: None,
+            }),
+        );
+        receiver.respond_next_observation(Ok(Some(SettledProposal {
+            proposal_id: "reported-proposal".to_string(),
+            skill_id: "reported-skill".to_string(),
+            status: ProposalStatus::Deferred,
+            reason_code: Some("evaluation_infrastructure_deferred".to_string()),
+            report_id: None,
+        })));
+    });
+
+    service.execute(proposal("")).expect("enqueue");
+    let rendered = crate::extras::js::tool::with_settled_proposal_outcomes(
+        "step result".to_string(),
+        &service,
+    );
+    assert!(rendered.starts_with("step result"));
+    assert!(rendered.contains("reported-proposal"));
+    assert!(rendered.contains("settled as deferred"));
+    assert!(rendered.contains("evaluation_infrastructure_deferred"));
+    assert_eq!(
+        crate::extras::js::tool::with_settled_proposal_outcomes("next step".to_string(), &service),
+        "next step",
+        "a reported outcome is not repeated on the next call"
+    );
+    responder.join().unwrap();
 }
 
 #[test]

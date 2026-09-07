@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::extras::js::skills::feedback::{
     ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackError, FeedbackKind, FeedbackService,
-    FeedbackState,
+    FeedbackState, RAW_TELEMETRY_RETENTION_DAYS, SEVERE_FEEDBACK_REASON_CODES,
 };
 use crate::extras::js::skills::privacy::Redactor;
+use crate::extras::js::skills::retention::RetentionService;
 use crate::extras::js::skills::telemetry::{
     EventBatch, SkillEvent, SkillEventKind, TelemetryIngestor, stable_invocation_id,
 };
@@ -142,33 +143,492 @@ fn model_and_unknown_targets_have_no_effect() {
     assert!(matches!(result, Err(FeedbackError::Unauthorized)));
 }
 
+/// The exact-secret list is only the last line of defence: operators paste
+/// credentials that nobody configured. Assert on unconfigured credential
+/// shapes, and keep a negative control that must survive redaction so the
+/// patterns cannot pass by deleting everything.
 #[test]
-fn skill_feedback_privacy_redacts_configured_secret_values() {
-    let secret = "FEEDBACK-SECRET-CANARY";
-    let redacted =
-        Redactor::new(vec![secret.into()], 512).redact(&format!("incorrect token={secret}"));
-    assert!(!redacted.contains(secret));
-    assert!(redacted.contains("[REDACTED]"));
+fn feedback_redaction_removes_unconfigured_credential_shapes() {
+    let redactor = Redactor::new(vec![], 4096);
+    let control = "the tokenizer emitted 12 tokens and the run returned 200";
+    for (leak, secret) in [
+        (
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+            "abcdefghijklmnopqrstuvwxyz012345",
+        ),
+        (
+            "called with Bearer abcdefghijklmnopqrstuvwxyz012345 attached",
+            "abcdefghijklmnopqrstuvwxyz012345",
+        ),
+        (
+            "used sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 for the call",
+            "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        ),
+        (
+            "aws key AKIAIOSFODNN7EXAMPLE was embedded",
+            "AKIAIOSFODNN7EXAMPLE",
+        ),
+        (
+            "ghp_0123456789abcdefghijABCDEFGHIJ leaked",
+            "ghp_0123456789abcdefghijABCDEFGHIJ",
+        ),
+        (
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKQ\n-----END RSA PRIVATE KEY-----",
+            "MIIBOgIBAAJBAKQ",
+        ),
+    ] {
+        let redacted = redactor.redact(&format!("{control} :: {leak}"));
+        assert!(!redacted.contains(secret), "leaked {secret} in {redacted}");
+        assert!(redacted.contains("[REDACTED"), "{redacted}");
+        // Negative control: ordinary prose that merely mentions tokens must
+        // survive untouched.
+        assert!(
+            redacted.contains("the tokenizer emitted 12 tokens"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("returned 200"), "{redacted}");
+    }
 }
 
 #[test]
-fn severe_feedback_requires_an_enumerated_safety_reason() {
+fn stored_feedback_text_never_retains_an_unconfigured_credential() {
+    let (_root, mut store, skill, invocation) = fixture();
+    let actor = owner(&skill.id);
+    let mut command = negative_command(&skill.id, &invocation, "text-leak");
+    command.reason_text =
+        Some("wrong output; repro used Authorization: Bearer abcdefghijklmnop012345".into());
+    let id = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &command, 2)
+        .unwrap();
+    let stored: String = store
+        .conn()
+        .query_row(
+            "SELECT COALESCE(reason_text, '') FROM skill_feedback WHERE feedback_id = ?",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored.contains("abcdefghijklmnop012345"), "{stored}");
+    assert!(stored.contains("wrong output"), "{stored}");
+}
+
+#[test]
+fn severe_feedback_names_the_rejected_code_and_lists_the_accepted_ones() {
     let (_root, mut store, skill, invocation) = fixture();
     let actor = AuthenticatedActor {
         actor_id: "reviewer".into(),
         kind: ActorKind::Reviewer,
         allowed_skill_ids: Some(BTreeSet::from([skill.id.clone()])),
     };
-    let command = FeedbackCommand {
-        idempotency_key: "severe-invalid".into(),
-        skill_id: skill.id,
-        invocation_id: Some(invocation),
-        kind: FeedbackKind::Severe,
-        reason_code: "incorrect_result".into(),
-        reason_text: None,
+    let mut command = negative_command(&skill.id, &invocation, "severe-invalid");
+    command.kind = FeedbackKind::Severe;
+    command.reason_code = "incorrect_output".into();
+    let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &command, 2)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(error, FeedbackError::UnsupportedSevereReasonCode { .. }),
+        "{message}"
+    );
+    assert!(message.contains("incorrect_output"), "{message}");
+    for accepted in SEVERE_FEEDBACK_REASON_CODES {
+        assert!(
+            message.contains(accepted),
+            "{accepted} missing from {message}"
+        );
+    }
+    // The same code is an ordinary negative report, and must be accepted.
+    let ordinary = negative_command(&skill.id, &invocation, "severe-invalid-as-negative");
+    FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &ordinary, 2)
+        .unwrap();
+}
+
+#[test]
+fn out_of_bounds_feedback_fields_are_named_with_the_rule_they_broke() {
+    let (_root, mut store, skill, invocation) = fixture();
+    let actor = owner(&skill.id);
+    let base = negative_command(&skill.id, &invocation, "bounds");
+    let mut empty_key = base.clone();
+    empty_key.idempotency_key = String::new();
+    let mut spaced_key = base.clone();
+    spaced_key.idempotency_key = "key with spaces".into();
+    let mut long_key = base.clone();
+    long_key.idempotency_key = "k".repeat(129);
+    let mut mixed_case_code = base.clone();
+    mixed_case_code.reason_code = "Incorrect-Output".into();
+    let mut long_code = base.clone();
+    long_code.reason_code = "r".repeat(65);
+    let mut long_text = base.clone();
+    long_text.reason_text = Some("x".repeat(513));
+    for (field, command) in [
+        ("idempotency_key", empty_key),
+        ("idempotency_key", spaced_key),
+        ("idempotency_key", long_key),
+        ("reason_code", mixed_case_code),
+        ("reason_code", long_code),
+        ("reason_text", long_text),
+    ] {
+        let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+            .submit(&actor, &command, 2)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(field), "{field}: {message}");
+        assert!(
+            matches!(error, FeedbackError::InvalidFeedback { field: named, .. } if named == field),
+            "{field}: {message}"
+        );
+    }
+    // A key that uses the whole accepted charset and near-maximum length is
+    // still accepted, so the bounds are not simply rejecting everything.
+    let mut accepted = base.clone();
+    accepted.idempotency_key = format!("ops.run:2026-09-07-{}", "a".repeat(100));
+    assert_eq!(accepted.idempotency_key.len(), 119);
+    FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &accepted, 2)
+        .unwrap();
+}
+
+#[test]
+fn misshapen_skill_and_invocation_ids_are_format_errors_not_missing_targets() {
+    let (_root, mut store, skill, invocation) = fixture();
+    let actor = AuthenticatedActor {
+        actor_id: "owner".into(),
+        kind: ActorKind::Owner,
+        allowed_skill_ids: None,
     };
-    assert!(matches!(
-        FeedbackService::new(&mut store, Redactor::new(vec![], 512)).submit(&actor, &command, 2),
-        Err(FeedbackError::InvalidFeedback)
-    ));
+    let base = negative_command(&skill.id, &invocation, "shape");
+    let mut uppercase_invocation = base.clone();
+    uppercase_invocation.invocation_id = Some(invocation.to_uppercase());
+    let mut typo_invocation = base.clone();
+    typo_invocation.invocation_id = Some("not-a-hex-invocation".into());
+    let mut short_skill = base.clone();
+    short_skill.skill_id = "abc123".into();
+    for (field, command) in [
+        ("invocation_id", uppercase_invocation),
+        ("invocation_id", typo_invocation),
+        ("skill_id", short_skill),
+    ] {
+        let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+            .submit(&actor, &command, 2)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, FeedbackError::MalformedId { field: named, .. } if named == field),
+            "{field}: {message}"
+        );
+        assert!(message.contains(field), "{field}: {message}");
+        assert!(message.contains("64 lowercase hexadecimal"), "{message}");
+    }
+}
+
+#[test]
+fn feedback_for_a_compacted_invocation_reports_the_retention_window() {
+    let (_root, mut store, skill, invocation) = fixture();
+    // The fixture's `invoked` event is at t=1; compaction rolls it into the
+    // daily aggregate and deletes the raw row, exactly as the automatic
+    // post-ingest compaction does after the raw retention window.
+    let report = RetentionService::new(&mut store)
+        .compact_before(2, 1, 3)
+        .unwrap();
+    assert_eq!(report.compacted_events, 1);
+
+    let actor = owner(&skill.id);
+    let command = negative_command(&skill.id, &invocation, "after-compaction");
+    let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &command, 4)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(
+            error,
+            FeedbackError::UnknownInvocation { retention_days, .. }
+                if retention_days == RAW_TELEMETRY_RETENTION_DAYS
+        ),
+        "{message}"
+    );
+    assert!(message.contains("compacted"), "{message}");
+    assert!(message.contains("30 days"), "{message}");
+    assert!(!message.contains("different learned skill"), "{message}");
+}
+
+#[test]
+fn feedback_aimed_at_another_skills_invocation_is_distinguished_from_compaction() {
+    let (_root, mut store, skill, _invocation) = fixture();
+    let other = SkillArtifact::new(
+        "function run() { return 2; }".into(),
+        "Other feedback fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "run".into(),
+            signature: "() => number".into(),
+        }],
+        // Embedded tests must evaluate to a boolean; a truthy number is
+        // rejected by the verifier.
+        vec!["run() === 2".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    store.insert_verified(&other).unwrap();
+    let other_invocation = stable_invocation_id("turn-2", "tool-2", &other.id, "run", 0);
+    TelemetryIngestor::new(&mut store)
+        .ingest(
+            &EventBatch::new(vec![SkillEvent {
+                invocation_id: Some(other_invocation.clone()),
+                skill_id: other.id.clone(),
+                turn_id: "turn-2".into(),
+                tool_call_id: Some("tool-2".into()),
+                kind: SkillEventKind::Invoked,
+                export_name: Some("run".into()),
+                outcome: None,
+                latency_us: None,
+                retrieval_score: None,
+                retrieval_rank: None,
+                query_fingerprint: None,
+                index_generation: 0,
+                evidence_complete: true,
+                production: true,
+                argument_shape: None,
+                created_at: 1,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+
+    let actor = owner(&skill.id);
+    let command = negative_command(&skill.id, &other_invocation, "cross-target");
+    let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &command, 2)
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        matches!(error, FeedbackError::InvocationSkillMismatch { .. }),
+        "{message}"
+    );
+    assert!(message.contains("different learned skill"), "{message}");
+    assert!(!message.contains("compacted"), "{message}");
+}
+
+#[test]
+fn a_reused_idempotency_key_with_a_different_payload_writes_nothing() {
+    let (_root, mut store, skill, invocation) = fixture();
+    let actor = owner(&skill.id);
+    let first = negative_command(&skill.id, &invocation, "duplicate-key");
+    FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &first, 2)
+        .unwrap();
+    let mut second = first.clone();
+    second.reason_code = "slow_response".into();
+    let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&actor, &second, 3)
+        .unwrap_err();
+    assert!(
+        matches!(error, FeedbackError::IdempotencyConflict),
+        "{error}"
+    );
+    let (rows, stored): (i64, String) = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*), MAX(reason_code) FROM skill_feedback
+             WHERE idempotency_key = 'duplicate-key'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, stored.as_str()), (1, "incorrect_output"));
+}
+
+#[test]
+fn user_feedback_is_counted_in_the_stats_the_store_keeps() {
+    let (_root, mut store, skill, invocation) = fixture();
+    let actor = owner(&skill.id);
+    let negative = negative_command(&skill.id, &invocation, "counted-negative");
+    let mut severe = negative_command(&skill.id, &invocation, "counted-severe");
+    severe.kind = FeedbackKind::Severe;
+    severe.reason_code = "integrity".into();
+    let mut positive = negative_command(&skill.id, &invocation, "counted-positive");
+    positive.kind = FeedbackKind::Positive;
+    for command in [&negative, &severe, &positive] {
+        FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+            .submit(&actor, command, 5)
+            .unwrap();
+    }
+    let counts: (i64, i64) = store
+        .conn()
+        .query_row(
+            "SELECT user_negative_count, user_positive_count FROM skill_stats
+             WHERE skill_id = ?",
+            [&skill.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (2, 1));
+}
+
+fn owner(skill_id: &str) -> AuthenticatedActor {
+    AuthenticatedActor {
+        actor_id: "owner".into(),
+        kind: ActorKind::Owner,
+        allowed_skill_ids: Some(BTreeSet::from([skill_id.to_string()])),
+    }
+}
+
+fn negative_command(skill_id: &str, invocation_id: &str, key: &str) -> FeedbackCommand {
+    FeedbackCommand {
+        idempotency_key: key.to_string(),
+        skill_id: skill_id.to_string(),
+        invocation_id: Some(invocation_id.to_string()),
+        kind: FeedbackKind::Negative,
+        reason_code: "incorrect_output".into(),
+        reason_text: None,
+    }
+}
+
+#[test]
+fn quarantine_evidence_names_the_feedback_row_it_came_from() {
+    use crate::extras::js::skills::quarantine::{
+        FeedbackAttribution, QuarantineDecision, QuarantineEvidence, QuarantinePolicy,
+        QuarantineReason, evaluate, evaluate_with_attribution,
+    };
+
+    let policy = QuarantinePolicy::conservative("phase5-quarantine-v1");
+    let evidence = QuarantineEvidence {
+        skill_id: "skill".into(),
+        reason: QuarantineReason::AuthenticatedActiveIntegrityFeedback,
+        qualified_invocations: 0,
+        direct_failures: 0,
+        evidence_complete: true,
+        authenticated_feedback: true,
+        feedback_marked_severe: true,
+        row_version_current: true,
+        generation_current: true,
+    };
+    let attribution = FeedbackAttribution::new("feedback-abc", "permission_violation");
+    let QuarantineDecision::Quarantine { canonical_snapshot } =
+        evaluate_with_attribution(&policy, &evidence, Some(&attribution))
+    else {
+        panic!("attributed feedback quarantine was held");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&canonical_snapshot).unwrap();
+    // The reason enum is derived from lifecycle status and cannot say what was
+    // reported, so the snapshot has to carry the submitted code and the row id.
+    assert_eq!(
+        parsed["evidence"]["reason"],
+        "authenticated_active_integrity_feedback"
+    );
+    assert_eq!(parsed["feedback"]["feedback_id"], "feedback-abc");
+    assert_eq!(parsed["feedback"]["reason_code"], "permission_violation");
+
+    // Non-feedback quarantines keep their existing snapshot bytes, so their
+    // evidence ids do not move.
+    let QuarantineDecision::Quarantine {
+        canonical_snapshot: unattributed,
+    } = evaluate(&policy, &evidence)
+    else {
+        panic!("quarantine was held");
+    };
+    assert!(!unattributed.contains("feedback_id"), "{unattributed}");
+    assert_ne!(unattributed, canonical_snapshot);
+}
+
+#[test]
+fn a_rejected_quarantine_transition_leaves_no_evidence_behind() {
+    use std::sync::Arc;
+
+    use crate::extras::js::skills::coordinator::IndexCoordinator;
+    use crate::extras::js::skills::embed::Embedder;
+    use crate::extras::js::skills::lifecycle::LifecycleStatus;
+    use crate::extras::js::skills::quarantine::{
+        FeedbackAttribution, QuarantineEvidence, QuarantineExecutionError, QuarantineExecutor,
+        QuarantinePolicy, QuarantineReason,
+    };
+
+    let root = std::env::temp_dir().join(format!("quarantine-rollback-{}", uuid::Uuid::new_v4()));
+    let paths = AppPaths::resolve(&PathEnvironment {
+        platform: if cfg!(target_os = "macos") {
+            PathPlatform::MacOs
+        } else if cfg!(target_os = "windows") {
+            PathPlatform::Windows
+        } else {
+            PathPlatform::Linux
+        },
+        home_dir: None,
+        config_base: Some(root.clone()),
+        data_base: Some(root.clone()),
+        local_data_base: Some(root.clone()),
+        state_base: Some(root.clone()),
+        cache_base: Some(root.clone()),
+        workspace_root: None,
+        overrides: Default::default(),
+    })
+    .unwrap();
+    let skill = SkillArtifact::new(
+        "function run() { return 3; }".into(),
+        "Quarantine rollback fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "run".into(),
+            signature: "() => number".into(),
+        }],
+        vec!["run() === 3".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    store.insert_verified(&skill).unwrap();
+    drop(store);
+    let coordinator = IndexCoordinator::open(&paths, Arc::new(Embedder::new().unwrap())).unwrap();
+    let generation = coordinator.rebuild_and_publish().unwrap();
+
+    let evidence = QuarantineEvidence {
+        skill_id: skill.id.clone(),
+        reason: QuarantineReason::AuthenticatedActiveIntegrityFeedback,
+        qualified_invocations: 0,
+        direct_failures: 0,
+        evidence_complete: true,
+        authenticated_feedback: true,
+        feedback_marked_severe: true,
+        row_version_current: true,
+        generation_current: true,
+    };
+    let attribution = FeedbackAttribution::new("feedback-stale", "integrity");
+    // The expected row version is stale, so the lifecycle transition rejects
+    // the decision after the evidence row has already been committed by its
+    // own autocommit statement.
+    let error = QuarantineExecutor::new(&coordinator)
+        .apply_with_attribution(
+            &QuarantinePolicy::conservative("phase5-quarantine-rollback"),
+            &evidence,
+            Some(&attribution),
+            LifecycleStatus::Active,
+            999,
+            generation as i64,
+            10,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, QuarantineExecutionError::Lifecycle(_)),
+        "{error}"
+    );
+    let store = SkillStore::open_at(&paths).unwrap();
+    let evidence_rows: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM skill_evidence WHERE evidence_kind = 'quarantine'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_rows, 0);
+    let status: String = store
+        .conn()
+        .query_row(
+            "SELECT status FROM skill_revisions WHERE id = ?",
+            [&skill.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(status, "quarantined");
+    let _ = std::fs::remove_dir_all(root);
 }

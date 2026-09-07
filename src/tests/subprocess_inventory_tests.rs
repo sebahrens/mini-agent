@@ -1422,6 +1422,26 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Learned-skill operator commands: `status` here is a lifecycle status
+    // rendered into a log field or an error message, never a process exit.
+    (
+        "src/extras/js/skills/operations.rs",
+        "status = %row.status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/operations.rs",
+        "status.as_deref().unwrap_or(\"absent\"),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/skills/operations.rs",
+        "Some(format!(\"ineligible_status:{}\", status.as_token())),",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/docs.rs",
         "Ok(status) => anyhow::bail!(\"less exited with {}\", status),",
@@ -2627,6 +2647,23 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             "2ae1572a8e3e684cff68f2fdcdb44d0c5ee3808f1bb261e9b1818446ee024674",
             1,
         )],
+    ),
+    (
+        "src/extras/js/skills/operations.rs",
+        &[
+            (
+                "2727f66b793de5da9bf06afce532b6430db688e1627dd9de99a26d28241d6ca1",
+                1,
+            ),
+            (
+                "5e1cad9558bb44aff59cfceb758fa075425286c89e08b41cb0514efaca10eb05",
+                1,
+            ),
+            (
+                "7e2e1921ca489c8880183f827afffd928a982893eabe1ec6ead9228af5d99d36",
+                1,
+            ),
+        ],
     ),
     (
         "src/extras/js/skills/store.rs",

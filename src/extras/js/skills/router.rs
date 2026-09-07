@@ -128,6 +128,13 @@ pub fn route(secret_key: &[u8], request: &RouteRequest) -> Result<FrozenRoute, R
 }
 
 impl FrozenRoute {
+    /// Whether a failed canary could still be replaced by its active
+    /// predecessor without replaying a completed side effect.
+    ///
+    /// NOT WIRED: no production caller re-invokes the predecessor. The
+    /// invocation boundary that would have to retry lives in the JS tool, so
+    /// this predicate currently only states the precondition; the Phase 5
+    /// rule-5 automatic-fallback claim is not implemented.
     pub fn may_fallback(&self, effects_started: bool) -> bool {
         self.route_kind == RouteKind::Canary && self.fallback_before_effects && !effects_started
     }

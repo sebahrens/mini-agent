@@ -696,7 +696,10 @@ impl SkillSessionServices {
             .search_gate
             .try_lock()
             .map_err(|_| "another skills_search call is already running; wait for it to finish")?;
-        let discovery = self.runtime.prepare_turn(query).await;
+        // A mid-turn search re-freezes the bundle inside the SAME user turn:
+        // starting a new turn here would re-draw the canary route and orphan
+        // the invocations already made in this turn from its outcome evidence.
+        let discovery = self.runtime.refreeze_turn(query).await;
         self.replace_trusted_context(discovery.trusted_context.clone());
         Ok(discovery)
     }

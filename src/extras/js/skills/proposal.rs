@@ -7,10 +7,10 @@
 use rquickjs::{Array, Object, String as JsString};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use super::store::{EnqueueResult, SkillStore, StoreError, current_timestamp};
+use super::store::{EnqueueResult, ProposalRecord, SkillStore, StoreError, current_timestamp};
 use super::{
     CapabilityManifest, CapabilityScope, CapabilityTier, HttpMethod, IdentityError, SkillArtifact,
     SkillExport,
@@ -729,10 +729,35 @@ impl AttemptBudget {
     }
 }
 
-struct ProposalCommand {
-    artifact: SkillArtifact,
-    predecessor_id: Option<String>,
-    reply: mpsc::Sender<Result<EnqueueResult, ProposalError>>,
+/// The settled admission outcome of one proposal, as observed after the queue
+/// acknowledgement the model already received.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SettledProposal {
+    pub(crate) proposal_id: String,
+    pub(crate) skill_id: String,
+    pub(crate) status: ProposalStatus,
+    pub(crate) reason_code: Option<String>,
+    pub(crate) report_id: Option<String>,
+}
+
+/// The most proposal ids one session tracks for settled-outcome reporting.
+/// A session can spend at most `DEFAULT_SESSION_ATTEMPTS` attempts, so this
+/// bound is never reached in practice; it exists so a caller-supplied budget
+/// cannot grow the list without limit.
+const MAX_OBSERVED_PROPOSALS: usize = 8;
+
+enum ProposalCommand {
+    Enqueue {
+        artifact: SkillArtifact,
+        predecessor_id: Option<String>,
+        reply: mpsc::Sender<Result<EnqueueResult, ProposalError>>,
+    },
+    /// Read back the durable status of a proposal this session enqueued.
+    /// Runs on the store worker thread; the JS thread never touches SQLite.
+    Observe {
+        proposal_id: String,
+        reply: mpsc::Sender<Result<Option<SettledProposal>, ProposalError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -745,11 +770,51 @@ pub(crate) struct ProposalSender {
 pub(crate) struct ProposalHost {
     pub sender: ProposalSender,
     pub budget: AttemptBudget,
+    /// Proposal ids this session enqueued whose settled outcome has not been
+    /// reported back yet. Shared with every clone so the session, not the
+    /// individual service handle, owns the observation list.
+    observed: Arc<Mutex<Vec<String>>>,
 }
 
 impl ProposalHost {
     pub(crate) fn new(sender: ProposalSender, budget: AttemptBudget) -> Self {
-        Self { sender, budget }
+        Self {
+            sender,
+            budget,
+            observed: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn observe_enqueued(&self, proposal_id: &str) {
+        let mut observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observed.len() >= MAX_OBSERVED_PROPOSALS
+            || observed.iter().any(|tracked| tracked == proposal_id)
+        {
+            return;
+        }
+        observed.push(proposal_id.to_string());
+    }
+
+    fn take_observed(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn restore_observed(&self, proposal_id: String) {
+        let mut observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observed.len() < MAX_OBSERVED_PROPOSALS {
+            observed.push(proposal_id);
+        }
     }
 }
 
@@ -840,14 +905,6 @@ impl ProposalEffectService {
         self.host.budget.consume()
     }
 
-    pub(crate) fn execute_reserved(
-        &self,
-        proposal: JsProposal,
-    ) -> Result<ProposalEffectResult, ProposalError> {
-        let prepared = self.authorize_reserved(proposal)?;
-        self.execute_prepared(prepared)
-    }
-
     pub(crate) fn authorize_reserved(
         &self,
         proposal: JsProposal,
@@ -860,6 +917,25 @@ impl ProposalEffectService {
         })
     }
 
+    /// Settled outcomes for proposals this session enqueued.
+    ///
+    /// `propose_skill` answers with a queue acknowledgement (`pending`), so
+    /// without this the model could never learn whether its candidate reached
+    /// `awaiting_approval`, was rejected, or was deferred. A proposal that is
+    /// still queued stays tracked and is reported on a later call.
+    pub(crate) fn settled_outcomes(&self) -> Vec<SettledProposal> {
+        let mut settled = Vec::new();
+        for proposal_id in self.host.take_observed() {
+            match self.host.sender.observe(proposal_id.clone()) {
+                Ok(Some(outcome)) => settled.push(outcome),
+                // Still queued, or the store could not answer right now: keep
+                // tracking it and report on a later call.
+                Ok(None) | Err(_) => self.host.restore_observed(proposal_id),
+            }
+        }
+        settled
+    }
+
     pub(crate) fn execute_prepared(
         &self,
         prepared: PreparedProposalEffect,
@@ -868,6 +944,7 @@ impl ProposalEffectService {
             .host
             .sender
             .enqueue(prepared.artifact, prepared.predecessor_id)?;
+        self.host.observe_enqueued(&result.proposal_id);
         let status = match result.status {
             super::store::EnqueueStatus::Pending => ProposalStatus::Pending,
             super::store::EnqueueStatus::Deferred => ProposalStatus::Deferred,
@@ -908,22 +985,40 @@ impl ProposalSender {
         predecessor_id: Option<String>,
     ) -> Result<EnqueueResult, ProposalError> {
         let (reply, response) = mpsc::channel();
-        self.sender
-            .try_send(ProposalCommand {
-                artifact,
-                predecessor_id,
-                reply,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => ProposalError::QueueFull,
-                mpsc::TrySendError::Disconnected(_) => ProposalError::QueueClosed,
-            })?;
+        self.dispatch(ProposalCommand::Enqueue {
+            artifact,
+            predecessor_id,
+            reply,
+        })?;
+        self.await_reply(&response)?
+    }
+
+    pub(crate) fn observe(
+        &self,
+        proposal_id: String,
+    ) -> Result<Option<SettledProposal>, ProposalError> {
+        let (reply, response) = mpsc::channel();
+        self.dispatch(ProposalCommand::Observe { proposal_id, reply })?;
+        self.await_reply(&response)?
+    }
+
+    fn dispatch(&self, command: ProposalCommand) -> Result<(), ProposalError> {
+        self.sender.try_send(command).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => ProposalError::QueueFull,
+            mpsc::TrySendError::Disconnected(_) => ProposalError::QueueClosed,
+        })
+    }
+
+    fn await_reply<T>(
+        &self,
+        response: &mpsc::Receiver<Result<T, ProposalError>>,
+    ) -> Result<Result<T, ProposalError>, ProposalError> {
         response
             .recv_timeout(self.response_timeout)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => ProposalError::QueueTimeout,
                 mpsc::RecvTimeoutError::Disconnected => ProposalError::QueueClosed,
-            })?
+            })
     }
 }
 
@@ -936,9 +1031,28 @@ impl ProposalReceiver {
     pub(crate) fn is_empty(&self) -> bool {
         match self.receiver.try_recv() {
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => true,
-            Ok(command) => {
-                let _ = command.reply.send(Err(ProposalError::QueueClosed));
+            Ok(ProposalCommand::Enqueue { reply, .. }) => {
+                let _ = reply.send(Err(ProposalError::QueueClosed));
                 false
+            }
+            Ok(ProposalCommand::Observe { reply, .. }) => {
+                let _ = reply.send(Err(ProposalError::QueueClosed));
+                false
+            }
+        }
+    }
+
+    /// Answer the next command as a settled-outcome observation.
+    pub(crate) fn respond_next_observation(
+        &self,
+        result: Result<Option<SettledProposal>, ProposalError>,
+    ) {
+        match self.receiver.recv().expect("proposal command") {
+            ProposalCommand::Observe { reply, .. } => {
+                let _ = reply.send(result);
+            }
+            ProposalCommand::Enqueue { reply, .. } => {
+                let _ = reply.send(Err(ProposalError::QueueClosed));
             }
         }
     }
@@ -948,9 +1062,15 @@ impl ProposalReceiver {
         delay: Duration,
         result: Result<EnqueueResult, ProposalError>,
     ) {
-        let command = self.receiver.recv().expect("proposal command");
-        std::thread::sleep(delay);
-        let _ = command.reply.send(result);
+        match self.receiver.recv().expect("proposal command") {
+            ProposalCommand::Enqueue { reply, .. } => {
+                std::thread::sleep(delay);
+                let _ = reply.send(result);
+            }
+            ProposalCommand::Observe { reply, .. } => {
+                let _ = reply.send(Ok(None));
+            }
+        }
     }
 }
 
@@ -1009,19 +1129,26 @@ impl ProposalQueue {
             .spawn(move || {
                 while !worker_shutdown.load(Ordering::Acquire) {
                     match receiver.receiver.recv_timeout(Duration::from_millis(50)) {
-                        Ok(command) => {
+                        Ok(ProposalCommand::Enqueue {
+                            artifact,
+                            predecessor_id,
+                            reply,
+                        }) => {
                             let result = current_timestamp()
                                 .map_err(|_| ProposalError::StoreUnavailable)
                                 .and_then(|now| {
                                     store
-                                        .enqueue_proposal(
-                                            &command.artifact,
-                                            command.predecessor_id.as_deref(),
-                                            now,
-                                        )
+                                        .enqueue_proposal(&artifact, predecessor_id.as_deref(), now)
                                         .map_err(map_store_error)
                                 });
-                            let _ = command.reply.send(result);
+                            let _ = reply.send(result);
+                        }
+                        Ok(ProposalCommand::Observe { proposal_id, reply }) => {
+                            let result = store
+                                .get_proposal(&proposal_id)
+                                .map_err(|_| ProposalError::StoreUnavailable)
+                                .map(|record| record.and_then(settled_proposal));
+                            let _ = reply.send(result);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1037,16 +1164,46 @@ impl ProposalQueue {
     }
 }
 
+/// Project a durable proposal row onto its settled admission outcome.
+///
+/// A queued row (`pending`/`evaluating`) has no outcome yet and returns `None`
+/// so the caller keeps waiting.
+fn settled_proposal(record: ProposalRecord) -> Option<SettledProposal> {
+    let status = match record.status {
+        super::store::ProposalStatus::Pending | super::store::ProposalStatus::Evaluating => {
+            return None;
+        }
+        super::store::ProposalStatus::Deferred => ProposalStatus::Deferred,
+        super::store::ProposalStatus::Verified => ProposalStatus::Verified,
+        super::store::ProposalStatus::Rejected => ProposalStatus::Rejected,
+        super::store::ProposalStatus::AwaitingApproval => ProposalStatus::AwaitingApproval,
+        super::store::ProposalStatus::Approved => ProposalStatus::Approved,
+    };
+    Some(SettledProposal {
+        proposal_id: record.proposal_id,
+        skill_id: record.skill_id,
+        status,
+        reason_code: record.reason_code,
+        report_id: record.report_id,
+    })
+}
+
+/// Map a durable-store failure onto the closed proposal error surface.
+///
+/// Classification is by error variant only. Matching on SQLite constraint text
+/// silently reclassified every message the store rephrased, so the store now
+/// raises `PredecessorIneligible` and `Collision` for the caller-attributable
+/// cases. `Constraint` is kept alongside them because the idempotence
+/// rebinding check is the only constraint `enqueue_proposal` can raise and is
+/// likewise a caller-supplied predecessor problem.
 fn map_store_error(error: StoreError) -> ProposalError {
     match error {
-        StoreError::Constraint(message)
-            if message.contains("predecessor") || message.contains("identity collision") =>
-        {
-            ProposalError::InvalidField {
-                field: "predecessor_id",
-                reason: "does not identify an eligible immutable predecessor",
-            }
-        }
+        StoreError::PredecessorIneligible(_)
+        | StoreError::Collision(_)
+        | StoreError::Constraint(_) => ProposalError::InvalidField {
+            field: "predecessor_id",
+            reason: "does not identify an eligible immutable predecessor",
+        },
         _ => ProposalError::StoreUnavailable,
     }
 }

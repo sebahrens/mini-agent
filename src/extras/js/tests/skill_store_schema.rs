@@ -928,6 +928,64 @@ fn test_schema_v7_allows_sibling_canaries_but_only_one_active_successor()
 }
 
 #[test]
+fn test_duplicate_policy_covers_canary_and_awaiting_approval_lineages()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let mut store = SkillStore::open_at(&paths)?;
+
+    // Same description and exports, different immutable bytes: the contract
+    // the duplicate policy compares is identical.
+    let canary = pure_number_skill(1, "Return the configured value.")?;
+    let awaiting = pure_number_skill(2, "Return the configured value.")?;
+    let candidate = pure_number_skill(3, "Return the configured value.")?;
+    let unrelated = pure_number_skill(4, "Return something else entirely.")?;
+    for skill in [&canary, &awaiting] {
+        store.insert_verified(skill)?;
+    }
+    store.conn_mut().execute(
+        "UPDATE skill_revisions SET status = 'canary' WHERE id = ?",
+        [&canary.id],
+    )?;
+    store.conn_mut().execute(
+        "UPDATE skill_revisions SET status = 'verified' WHERE id = ?",
+        [&awaiting.id],
+    )?;
+    store.conn_mut().execute(
+        // `awaiting_approval` requires a bound report id by table CHECK.
+        "INSERT INTO skill_proposals (
+            proposal_id, skill_id, predecessor_id, proposed_at, status,
+            attempt_count, report_id, row_version, created_at, updated_at
+         ) VALUES (?1, ?1, NULL, 1, 'awaiting_approval', 1, 'evaluation-report', 1, 1, 1)",
+        [&awaiting.id],
+    )?;
+
+    // Neither lineage is active, yet both already hold the contract: a third
+    // identical proposal must not pass the gate only to fail approval later.
+    assert!(store.has_policy_duplicate(&candidate, None)?);
+    assert!(!store.has_policy_duplicate(&unrelated, None)?);
+
+    // A pending revision with no approved standing is not a duplicate source.
+    store.conn_mut().execute(
+        "UPDATE skill_revisions SET status = 'pending' WHERE id = ?",
+        [&canary.id],
+    )?;
+    store.conn_mut().execute(
+        "DELETE FROM skill_proposals WHERE proposal_id = ?",
+        [&awaiting.id],
+    )?;
+    store.conn_mut().execute(
+        "UPDATE skill_revisions SET status = 'pending' WHERE id = ?",
+        [&awaiting.id],
+    )?;
+    assert!(!store.has_policy_duplicate(&candidate, None)?);
+
+    drop(store);
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
 fn test_purge_deletes_invalid_legacy_id_without_raw_tombstone()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = temp_app_paths();

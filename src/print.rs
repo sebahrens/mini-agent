@@ -4,6 +4,7 @@ use std::io::{self, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use compact_str::CompactString;
 use rig::completion::{Message, Usage};
 use rig::message::{AssistantContent, ToolResultContent, UserContent};
 use serde::Serialize;
@@ -12,7 +13,9 @@ use crate::cli;
 use crate::config;
 use crate::sandbox::Sandbox;
 use crate::session;
-use crate::session::{MessageRole, Session};
+use crate::session::{
+    MessageRole, PersistedCallProvenance, PersistedReasoning, Session, persisted_call_identifier,
+};
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 
@@ -255,10 +258,18 @@ pub(crate) fn render_headless_json(
 ///
 /// `interactions` is the runner's canonical provider transcript for the turn
 /// (`run_print`'s third return value), accumulated across every stream of the
-/// turn. Tool results are attributed to their tool by provider id so the
-/// record carries the real tool name; assistant text inside `interactions` is
-/// not persisted separately because `response` already carries the turn's
-/// complete text.
+/// turn. Tool results are attributed to their tool by the same identifier the
+/// call was recorded under so the record carries the real tool name; assistant
+/// text inside `interactions` is not persisted separately because `response`
+/// already carries the turn's complete text.
+///
+/// Records are keyed by [`persisted_call_identifier`] — the provider `call_id`
+/// when there is one — because the interactive path adopts that same key when
+/// it commits a turn (`event_handler::commit_turn_response`), so `--continue`
+/// replays a session identically whichever mode wrote it (mini-agent-wzv1).
+/// The provider's own item id and the reasoning items emitted before each call
+/// are recorded beside the record, which is what lets the replay present a
+/// native `function_call` together with its required `reasoning` item.
 pub(crate) fn persist_headless_turn(
     session: &mut Session,
     prompt: &str,
@@ -266,28 +277,58 @@ pub(crate) fn persist_headless_turn(
     interactions: &[Message],
 ) {
     session.add_message(MessageRole::User, prompt);
-    let mut tool_names: HashMap<&str, &str> = HashMap::new();
+    let mut tool_names: HashMap<String, &str> = HashMap::new();
+    let mut pending_reasoning: Vec<PersistedReasoning> = Vec::new();
     for interaction in interactions {
         match interaction {
             Message::Assistant { content, .. } => {
                 for item in content.iter() {
-                    if let AssistantContent::ToolCall(call) = item {
-                        tool_names.insert(call.id.as_str(), call.function.name.as_str());
-                        session.add_tool_call_with_id(
-                            &call.id,
-                            &call.function.name,
-                            &call.function.arguments,
-                        );
+                    match item {
+                        AssistantContent::Reasoning(reasoning) => {
+                            let persisted = PersistedReasoning::from_rig(reasoning);
+                            if !persisted.is_empty() {
+                                pending_reasoning.push(persisted);
+                            }
+                        }
+                        AssistantContent::ToolCall(call) => {
+                            let identifier = persisted_call_identifier(
+                                call.call_id.as_deref(),
+                                call.id.as_str(),
+                            )
+                            .to_string();
+                            tool_names.insert(identifier.clone(), call.function.name.as_str());
+                            session.add_tool_call_with_id(
+                                &identifier,
+                                &call.function.name,
+                                &call.function.arguments,
+                            );
+                            session.record_tool_call_provenance(
+                                &identifier,
+                                PersistedCallProvenance {
+                                    provider_item_id: Some(CompactString::new(call.id.as_str())),
+                                    provider_call_id: call
+                                        .call_id
+                                        .as_deref()
+                                        .map(CompactString::new),
+                                    reasoning: std::mem::take(&mut pending_reasoning),
+                                },
+                            );
+                        }
+                        AssistantContent::Text(_) | AssistantContent::Image(_) => {}
                     }
                 }
             }
             Message::User { content } => {
+                pending_reasoning.clear();
                 for item in content.iter() {
                     let UserContent::ToolResult(result) = item else {
                         continue;
                     };
+                    let identifier =
+                        persisted_call_identifier(result.call_id.as_deref(), result.id.as_str())
+                            .to_string();
                     let name = tool_names
-                        .get(result.id.as_str())
+                        .get(identifier.as_str())
                         .copied()
                         .unwrap_or("unknown");
                     let output = result
@@ -299,7 +340,7 @@ pub(crate) fn persist_headless_turn(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    session.add_tool_result_with_id(&result.id, name, &output);
+                    session.add_tool_result_with_id(&identifier, name, &output);
                 }
             }
             Message::System { .. } => {}

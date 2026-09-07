@@ -12,6 +12,106 @@ use super::store::{SkillStore, StoreError};
 pub const DEFAULT_RAW_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DAY_SECONDS: i64 = 24 * 60 * 60;
 
+/// Lifecycle statuses a purge may remove without an explicit operator
+/// override: no transition leads out of them, so nothing is cut short.
+pub const TERMINAL_PURGE_STATUSES: [&str; 3] = ["rejected", "retired", "superseded"];
+
+/// Read-only facts the operator purge surface needs *before* immutable bytes
+/// are deleted.
+///
+/// [`RetentionService::privacy_purge`] is deliberately unconditional — it is
+/// the privacy escape hatch — so the lifecycle and reference guard lives here,
+/// where the operator command can refuse or report before calling it. The read
+/// is not part of the purge transaction; a concurrent writer could still move
+/// the target, which is why the guard is an operator confirmation gate and not
+/// a safety invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PurgePlan {
+    /// Current lifecycle status, or `None` when the target is already a
+    /// tombstone and the purge is an idempotent replay.
+    pub status: Option<String>,
+    /// `(id, status)` of every revision naming the target as its predecessor.
+    /// The purge clears their `supersedes_id` and makes each its own lineage
+    /// root, so a canary replacement silently becomes an activatable root.
+    pub rerooted_replacements: Vec<(String, String)>,
+    /// Further revisions sharing the target's lineage root, which the purge
+    /// also re-roots.
+    pub rerooted_lineage: Vec<String>,
+}
+
+impl PurgePlan {
+    /// True when nothing can transition out of the target's status.
+    pub fn is_terminal(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_none_or(|status| TERMINAL_PURGE_STATUSES.contains(&status))
+    }
+
+    /// True when the purge would cut a live lifecycle short or silently
+    /// re-root a dependant, and therefore needs an explicit operator override.
+    pub fn requires_force(&self) -> bool {
+        !self.is_terminal()
+            || !self.rerooted_replacements.is_empty()
+            || !self.rerooted_lineage.is_empty()
+    }
+
+    /// Every revision this purge would re-root, in stable order.
+    pub fn rerooted_ids(&self) -> Vec<&str> {
+        self.rerooted_replacements
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .chain(self.rerooted_lineage.iter().map(String::as_str))
+            .collect()
+    }
+}
+
+/// Collect the lifecycle status and dependent revisions of a purge target.
+pub fn purge_preflight(store: &SkillStore, skill_id: &str) -> Result<PurgePlan, RetentionError> {
+    let connection = store.connection();
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM skill_revisions WHERE id = ?",
+            [skill_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if status.is_none() {
+        let tombstoned = connection
+            .query_row(
+                "SELECT 1 FROM skill_tombstones WHERE id = ?",
+                [skill_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !tombstoned {
+            return Err(RetentionError::NotFound);
+        }
+        return Ok(PurgePlan::default());
+    }
+    let mut statement = connection
+        .prepare("SELECT id, status FROM skill_revisions WHERE supersedes_id = ? ORDER BY id")?;
+    let rerooted_replacements = statement
+        .query_map([skill_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut statement = connection.prepare(
+        "SELECT id FROM skill_revisions
+          WHERE lineage_root_id = ?1 AND id <> ?1
+            AND (supersedes_id IS NULL OR supersedes_id <> ?1)
+          ORDER BY id",
+    )?;
+    let rerooted_lineage = statement
+        .query_map([skill_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PurgePlan {
+        status,
+        rerooted_replacements,
+        rerooted_lineage,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionReport {
     pub compacted_events: usize,
@@ -220,6 +320,12 @@ impl<'a> RetentionService<'a> {
         })
     }
 
+    /// Delete the target's immutable bytes and dependent audit.
+    ///
+    /// This is the unconditional privacy escape hatch: it removes an `active`
+    /// revision as readily as a `rejected` one and re-roots every dependant.
+    /// Operator surfaces must call [`purge_preflight`] first and refuse or
+    /// report what this will do.
     pub fn privacy_purge(
         &mut self,
         skill_id: &str,
@@ -321,5 +427,142 @@ impl<'a> RetentionService<'a> {
         )?;
         tx.commit()?;
         Ok(next_generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
+
+    fn fixture() -> (std::path::PathBuf, SkillStore) {
+        let root = std::env::temp_dir().join(format!(
+            "skill-retention-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::resolve(&PathEnvironment {
+            platform: if cfg!(target_os = "macos") {
+                PathPlatform::MacOs
+            } else if cfg!(target_os = "windows") {
+                PathPlatform::Windows
+            } else {
+                PathPlatform::Linux
+            },
+            home_dir: None,
+            config_base: Some(root.join("config")),
+            data_base: Some(root.join("data")),
+            local_data_base: Some(root.join("local")),
+            state_base: Some(root.join("state")),
+            cache_base: Some(root.join("cache")),
+            workspace_root: None,
+            overrides: Default::default(),
+        })
+        .unwrap();
+        let store = SkillStore::open_at(&paths).unwrap();
+        (root, store)
+    }
+
+    fn artifact(source: &str, description: &str) -> SkillArtifact {
+        SkillArtifact::new(
+            source.into(),
+            description.into(),
+            vec![],
+            vec![SkillExport {
+                name: "run".into(),
+                signature: "() => number".into(),
+            }],
+            vec!["run() === 1".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn purge_preflight_names_the_status_and_every_revision_the_purge_would_reroot() {
+        let (root, mut store) = fixture();
+        let predecessor = artifact(
+            "function run() { return 1; }",
+            "Purge preflight predecessor",
+        );
+        let replacement = artifact(
+            "function run() { return 1; } // replacement",
+            "Purge preflight replacement",
+        );
+        store.insert_verified(&predecessor).unwrap();
+        store.insert_verified(&replacement).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions
+                 SET status = 'canary', supersedes_id = ?, lineage_root_id = ?
+                 WHERE id = ?",
+                rusqlite::params![predecessor.id, predecessor.id, replacement.id],
+            )
+            .unwrap();
+
+        let plan = purge_preflight(&store, &predecessor.id).unwrap();
+        assert_eq!(plan.status.as_deref(), Some("active"));
+        assert!(!plan.is_terminal());
+        assert!(plan.requires_force());
+        assert_eq!(
+            plan.rerooted_replacements,
+            vec![(replacement.id.clone(), "canary".to_string())]
+        );
+        assert!(plan.rerooted_lineage.is_empty());
+        assert_eq!(plan.rerooted_ids(), vec![replacement.id.as_str()]);
+
+        // The unguarded purge is exactly what the plan warned about: the
+        // canary replacement is re-rooted rather than removed with it.
+        RetentionService::new(&mut store)
+            .privacy_purge(&predecessor.id, "test_request", 10)
+            .unwrap();
+        let (supersedes, lineage_root): (Option<String>, String) = store
+            .conn()
+            .query_row(
+                "SELECT supersedes_id, lineage_root_id FROM skill_revisions WHERE id = ?",
+                [&replacement.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(supersedes, None);
+        assert_eq!(lineage_root, replacement.id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_preflight_clears_force_for_terminal_revisions_and_replayed_tombstones() {
+        let (root, mut store) = fixture();
+        let skill = artifact("function run() { return 1; }", "Purge preflight terminal");
+        store.insert_verified(&skill).unwrap();
+
+        let live = purge_preflight(&store, &skill.id).unwrap();
+        assert_eq!(live.status.as_deref(), Some("active"));
+        assert!(live.requires_force());
+
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_revisions SET status = 'rejected' WHERE id = ?",
+                [&skill.id],
+            )
+            .unwrap();
+        let terminal = purge_preflight(&store, &skill.id).unwrap();
+        assert!(terminal.is_terminal());
+        assert!(!terminal.requires_force());
+
+        RetentionService::new(&mut store)
+            .privacy_purge(&skill.id, "test_request", 10)
+            .unwrap();
+        let replayed = purge_preflight(&store, &skill.id).unwrap();
+        assert_eq!(replayed.status, None);
+        assert!(!replayed.requires_force());
+
+        assert!(matches!(
+            purge_preflight(&store, &"f".repeat(64)),
+            Err(RetentionError::NotFound)
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

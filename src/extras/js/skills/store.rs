@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
 pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
@@ -55,6 +55,17 @@ pub struct GenerationState {
 }
 
 pub(crate) const MAX_EVALUATION_ATTEMPTS: u32 = 8;
+
+/// Reason code recorded when a proposal exhausted `MAX_EVALUATION_ATTEMPTS`
+/// claims (typically repeated crash reclaims of an expired lease) without ever
+/// producing a report. The row is parked as `deferred`, never rejected, so the
+/// immutable identity stays recoverable through an authenticated reevaluation
+/// request or a byte-identical resubmission.
+pub(crate) const EVALUATION_ATTEMPTS_EXHAUSTED: &str = "evaluation_attempts_exhausted";
+
+/// Reason code recorded when repeated verification infrastructure failures park
+/// a proposal.
+pub(crate) const EVALUATION_INFRASTRUCTURE_DEFERRED: &str = "evaluation_infrastructure_deferred";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -316,6 +327,9 @@ pub enum StoreError {
 
     #[error("constraint violation: {0}")]
     Constraint(String),
+
+    #[error("proposal predecessor is not eligible: {0}")]
+    PredecessorIneligible(String),
 
     #[error("database locked or busy")]
     Busy,
@@ -604,6 +618,13 @@ impl SkillStore {
     }
 
     /// Check the duplicate-admission policy without loading executable source.
+    ///
+    /// The comparison covers every revision that already holds, or is one human
+    /// approval away from holding, the contract: `active`, `canary`, and the
+    /// `verified` revision of a proposal that is `awaiting_approval`. Comparing
+    /// against `active` alone let two identical proposals both pass the gate
+    /// while neither was active yet, and the loser then failed approval with an
+    /// unrelated stale-review error instead of `duplicate_skill`.
     pub(crate) fn has_policy_duplicate(
         &self,
         artifact: &SkillArtifact,
@@ -623,9 +644,27 @@ impl SkillStore {
             .transpose()?
             .flatten();
         let mut statement = self.db.prepare(
-            "SELECT id, description, exports_json, COALESCE(lineage_root_id, id)
-             FROM skill_revisions
-             WHERE status = 'active' AND identity_version = 2 AND id <> ?",
+            // A replacement only gains `lineage_root_id` when it is promoted, so
+            // a sibling that is still `verified` or in canary carries its
+            // lineage on its proposal instead. Resolving through the proposal
+            // keeps two replacements of one predecessor out of each other's
+            // duplicate gate.
+            "SELECT r.id, r.description, r.exports_json,
+                    COALESCE(
+                        r.lineage_root_id,
+                        (SELECT COALESCE(pr.lineage_root_id, pr.id)
+                           FROM skill_proposals p
+                           JOIN skill_revisions pr ON pr.id = p.predecessor_id
+                          WHERE p.skill_id = r.id AND p.predecessor_id IS NOT NULL
+                          LIMIT 1),
+                        r.id)
+             FROM skill_revisions r
+             WHERE r.identity_version = 2 AND r.id <> ?
+               AND (r.status IN ('active', 'canary')
+                    OR (r.status = 'verified'
+                        AND EXISTS(SELECT 1 FROM skill_proposals p
+                                   WHERE p.skill_id = r.id
+                                     AND p.status = 'awaiting_approval')))",
         )?;
         let rows = statement.query_map([&artifact.id], |row| {
             Ok((
@@ -1223,7 +1262,7 @@ impl SkillStore {
                 predecessor_status.as_deref(),
                 Some("active" | "canary" | "quarantined")
             ) {
-                return Err(StoreError::Constraint(
+                return Err(StoreError::PredecessorIneligible(
                     "predecessor must be an active, canary, or quarantined immutable revision"
                         .to_string(),
                 ));
@@ -1243,10 +1282,7 @@ impl SkillStore {
             let existing = existing?;
             existing.verify_identity()?;
             if existing != *artifact {
-                return Err(StoreError::Constraint(format!(
-                    "identity collision for {}",
-                    artifact.id
-                )));
+                return Err(StoreError::Collision(artifact.id.clone()));
             }
             let record = tx
                 .query_row(
@@ -1260,6 +1296,12 @@ impl SkillStore {
                 .optional()?
                 .ok_or_else(|| StoreError::AlreadyExists(artifact.id.clone()))?;
             if record.predecessor_id.as_deref() != predecessor_id {
+                // NOTE: this stays `Constraint` only because
+                // `src/extras/js/tests/skill_admission_schema.rs`
+                // (`skill_admission_schema_idempotence_cannot_rebind_predecessor`)
+                // matches that variant and message. It is the sole constraint
+                // `enqueue_proposal` can raise, and `map_store_error` maps the
+                // variant itself, not its text.
                 return Err(StoreError::Constraint(
                     "an existing proposal cannot be rebound to a different predecessor".to_string(),
                 ));
@@ -1459,32 +1501,60 @@ impl SkillStore {
             .map_err(|_| StoreError::CorruptRow("negative proposal row version".to_string()))
     }
 
-    pub(crate) fn retry_proposal(
+    /// Park every proposal that can no longer be claimed because its evaluation
+    /// attempt budget is spent, and return the parked proposal ids.
+    ///
+    /// `claim_due_proposal` requires `attempt_count < MAX_EVALUATION_ATTEMPTS`
+    /// and `attempt_count` is incremented by every claim, including reclaims of
+    /// a crashed worker's expired lease. Without this sweep the final reclaim
+    /// leaves the row `evaluating` with an expired lease, no report and no
+    /// reason code: no worker can pick it up and
+    /// `request_blocked_reevaluation` cannot see it. Parking it as `deferred`
+    /// with an explicit reason code keeps the immutable identity unrejected and
+    /// recoverable, either by an authenticated reevaluation request or by a
+    /// byte-identical resubmission.
+    pub(crate) fn sweep_exhausted_proposals(
         &mut self,
-        proposal_id: &str,
-        worker: &str,
-        row_version: u64,
-        next_attempt_at: i64,
         now: i64,
-    ) -> Result<(), StoreError> {
-        let changed = self.db.execute(
-            "UPDATE skill_proposals
-             SET status = 'pending', next_attempt_at = ?1, lease_owner = NULL,
-                 lease_expires_at = NULL, row_version = row_version + 1, updated_at = ?2
-             WHERE proposal_id = ?3 AND status = 'evaluating'
-               AND lease_owner = ?4 AND row_version = ?5",
-            params![
-                next_attempt_at,
-                now,
-                proposal_id,
-                worker,
-                sql_version(row_version)?
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::LeaseLost(proposal_id.to_string()));
+    ) -> Result<Vec<String>, StoreError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stranded = {
+            let mut statement = tx.prepare(
+                "SELECT proposal_id FROM skill_proposals
+                 WHERE attempt_count >= ?1
+                   AND ((status = 'evaluating' AND lease_expires_at <= ?2)
+                        OR status = 'pending')
+                 ORDER BY proposal_id",
+            )?;
+            let rows = statement.query_map(params![MAX_EVALUATION_ATTEMPTS, now], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<String>, rusqlite::Error>>()?
+        };
+        for proposal_id in &stranded {
+            let changed = tx.execute(
+                "UPDATE skill_proposals
+                 SET status = 'deferred', next_attempt_at = NULL, lease_owner = NULL,
+                     lease_expires_at = NULL, reason_code = ?1,
+                     row_version = row_version + 1, updated_at = ?2
+                 WHERE proposal_id = ?3 AND attempt_count >= ?4
+                   AND ((status = 'evaluating' AND lease_expires_at <= ?2)
+                        OR status = 'pending')",
+                params![
+                    EVALUATION_ATTEMPTS_EXHAUSTED,
+                    now,
+                    proposal_id,
+                    MAX_EVALUATION_ATTEMPTS
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Stale(proposal_id.clone()));
+            }
         }
-        Ok(())
+        tx.commit()?;
+        Ok(stranded)
     }
 
     /// Requeue work that never reached artifact evaluation without consuming its retry budget.
@@ -2329,23 +2399,41 @@ impl SkillStore {
                 "SELECT skill_id, status FROM skill_proposals
                  WHERE proposal_id = ?1 AND row_version = ?2
                    AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
-                        OR (status = 'deferred'
-                            AND reason_code = 'evaluation_infrastructure_deferred'))",
-                params![proposal_id, sql_version(expected_row_version)?],
+                        OR (status = 'deferred' AND reason_code IN (?3, ?4)))",
+                params![
+                    proposal_id,
+                    sql_version(expected_row_version)?,
+                    EVALUATION_INFRASTRUCTURE_DEFERRED,
+                    EVALUATION_ATTEMPTS_EXHAUSTED
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
+        // A row parked by `sweep_exhausted_proposals` has a spent claim budget,
+        // so it must be cleared or the reopened row is unclaimable all over
+        // again. Every other reopen keeps its count: `attempt` numbers the
+        // evaluation reports, and rewinding it would collide with the report
+        // the earlier attempt already wrote.
         let proposal_changed = tx.execute(
             "UPDATE skill_proposals
-             SET status = 'pending', infrastructure_attempt_count = 0,
+             SET status = 'pending',
+                 attempt_count = CASE
+                     WHEN reason_code = ?6 THEN 0 ELSE attempt_count END,
+                 infrastructure_attempt_count = 0,
                  next_attempt_at = ?1, report_id = NULL,
                  reason_code = NULL, row_version = row_version + 1, updated_at = ?1
              WHERE proposal_id = ?2 AND row_version = ?3
                AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
-                    OR (status = 'deferred'
-                        AND reason_code = 'evaluation_infrastructure_deferred'))",
-            params![now, proposal_id, sql_version(expected_row_version)?],
+                    OR (status = 'deferred' AND reason_code IN (?4, ?5)))",
+            params![
+                now,
+                proposal_id,
+                sql_version(expected_row_version)?,
+                EVALUATION_INFRASTRUCTURE_DEFERRED,
+                EVALUATION_ATTEMPTS_EXHAUSTED,
+                EVALUATION_ATTEMPTS_EXHAUSTED
+            ],
         )?;
         let revision_changed = if status == "verified" {
             tx.execute(
@@ -3677,6 +3765,95 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         }
     }
 
+    // Migration 11 -> 12: a proposal whose evaluation attempt budget is spent
+    // is parked as deferred under its own reason code, so the deferred
+    // reason-code CHECK must admit `evaluation_attempts_exhausted` too.
+    if current_version < 12 {
+        db.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        let migration = db.execute_batch(
+            "CREATE TABLE skill_proposals_v12 (
+                 proposal_id      TEXT PRIMARY KEY,
+                 skill_id         TEXT NOT NULL UNIQUE,
+                 predecessor_id   TEXT,
+                 proposed_at      INTEGER NOT NULL,
+                 status           TEXT NOT NULL DEFAULT 'pending',
+                 attempt_count    INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_at  INTEGER,
+                 lease_owner      TEXT,
+                 lease_expires_at INTEGER,
+                 report_id        TEXT,
+                 reason_code      TEXT,
+                 row_version      INTEGER NOT NULL DEFAULT 1,
+                 created_at       INTEGER NOT NULL,
+                 updated_at       INTEGER NOT NULL,
+                 infrastructure_attempt_count INTEGER NOT NULL DEFAULT 0,
+                 FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                 FOREIGN KEY (predecessor_id) REFERENCES skill_revisions(id) ON DELETE RESTRICT,
+                 CHECK (status IN (
+                     'pending','evaluating','deferred','verified','rejected',
+                     'awaiting_approval','approved'
+                 )),
+                 CHECK (attempt_count >= 0 AND attempt_count <= 8),
+                 CHECK (infrastructure_attempt_count >= 0
+                        AND infrastructure_attempt_count <= 8),
+                 CHECK (row_version > 0),
+                 CHECK (
+                     (status = 'evaluating' AND lease_owner IS NOT NULL
+                                              AND lease_expires_at IS NOT NULL)
+                     OR
+                     (status <> 'evaluating' AND lease_owner IS NULL
+                                               AND lease_expires_at IS NULL)
+                 ),
+                 CHECK (
+                     (status IN ('rejected','awaiting_approval','approved')
+                      AND report_id IS NOT NULL)
+                     OR
+                     (status NOT IN ('rejected','awaiting_approval','approved'))
+                 ),
+                 CHECK ((status = 'rejected' AND reason_code IS NOT NULL)
+                        OR status <> 'rejected'),
+                 CHECK ((status = 'deferred'
+                         AND reason_code IN ('evaluation_infrastructure_deferred',
+                                             'evaluation_attempts_exhausted'))
+                        OR status <> 'deferred')
+             );
+             INSERT INTO skill_proposals_v12 (
+                 proposal_id, skill_id, predecessor_id, proposed_at, status,
+                 attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                 report_id, reason_code, row_version, created_at, updated_at,
+                 infrastructure_attempt_count
+             )
+             SELECT proposal_id, skill_id, predecessor_id, proposed_at, status,
+                    attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                    report_id, reason_code, row_version, created_at, updated_at,
+                    infrastructure_attempt_count
+               FROM skill_proposals;
+             DROP TABLE skill_proposals;
+             ALTER TABLE skill_proposals_v12 RENAME TO skill_proposals;
+             CREATE INDEX skill_proposals_due_idx
+                 ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
+             CREATE INDEX skill_proposals_skill_idx ON skill_proposals(skill_id);
+             PRAGMA user_version = 12;",
+        );
+        match migration {
+            Ok(()) => db.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?,
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+                return Err(StoreError::Sqlite(error));
+            }
+        }
+        let foreign_key_error: Option<String> = db
+            .prepare("PRAGMA foreign_key_check")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .next()
+            .transpose()?;
+        if let Some(table) = foreign_key_error {
+            return Err(StoreError::Constraint(format!(
+                "schema migration left a foreign-key violation in {table}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -3804,7 +3981,7 @@ fn validate_full_id(id: Option<&str>) -> Result<(), StoreError> {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     {
-        return Err(StoreError::Constraint(
+        return Err(StoreError::PredecessorIneligible(
             "predecessor ID must be 64 lowercase hexadecimal characters".to_string(),
         ));
     }

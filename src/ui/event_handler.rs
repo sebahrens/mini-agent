@@ -358,13 +358,23 @@ fn save_session_if_settled(
 /// persisted every tool interaction twice, the second copy attributed to
 /// "unknown" (mini-agent-h41j). Only the headless `-p` path, which has no live
 /// events, persists from the batch (`print::persist_headless_turn`).
+///
+/// The batch is still the only place the provider's own tool identity and its
+/// reasoning items are visible — `AgentEvent::ToolCall` carries rig's internal
+/// lifecycle id and no reasoning at all — so the live records adopt both from
+/// it here (mini-agent-wzv1). That is what makes an interactive session persist
+/// the same `call_id` headless `-p` does, and what lets a resumed turn replay
+/// a native `function_call` item with the `reasoning` item the Responses API
+/// demands alongside it.
 pub(crate) fn commit_turn_response(
     session: &mut Session,
     response: &str,
     interactions: &[Message],
 ) {
+    let adopted = session.adopt_provider_tool_identity(interactions);
     tracing::debug!(
         canonical_interactions = interactions.len(),
+        adopted_provider_identities = adopted,
         "committing turn response; tool records were persisted live"
     );
     session.add_message(MessageRole::Assistant, response);

@@ -637,18 +637,52 @@ fn multiple_terminal_outcomes_fail_before_writing() {
 fn skill_event_privacy_shape_has_no_value_bearing_fields() {
     let (_root, _store, artifact) = store();
     let invocation = stable_invocation_id("turn-1", "tool-1", &artifact.id, "run", 0);
-    let secret = "SECRET-CANARY-DO-NOT-PERSIST";
     let safe = event(
         &artifact.id,
         &invocation,
         SkillEventKind::Returned,
         Some("fulfilled"),
     );
-    let serialized = serde_json::to_string(&safe).unwrap();
-    assert!(!serialized.contains(secret));
-    assert!(!serialized.contains("prompt"));
-    assert!(!serialized.contains("source"));
-    assert!(!serialized.contains("arguments"));
+    // The persisted shape is closed: adding any value-bearing field to
+    // `SkillEvent` fails here rather than silently widening what is stored.
+    let serialized = serde_json::to_value(&safe).unwrap();
+    let mut keys = serialized
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "argument_shape",
+            "created_at",
+            "evidence_complete",
+            "export_name",
+            "index_generation",
+            "invocation_id",
+            "kind",
+            "latency_us",
+            "outcome",
+            "production",
+            "query_fingerprint",
+            "retrieval_rank",
+            "retrieval_score",
+            "skill_id",
+            "tool_call_id",
+            "turn_id",
+        ]
+    );
+
+    // `outcome` is the only free-ish token on the event, and it is restricted
+    // to a closed code, so a credential pasted there never reaches the store.
+    let mut credential_outcome = safe.clone();
+    credential_outcome.outcome = Some("Bearer abcdefghijklmnop012345".into());
+    assert!(matches!(
+        EventBatch::new(vec![credential_outcome]),
+        Err(TelemetryError::InvalidEvent)
+    ));
 
     let mut unsafe_shape = safe;
     unsafe_shape.argument_shape = Some(r#"{"argc":1,"value":"SECRET-CANARY"}"#.into());
@@ -843,4 +877,68 @@ async fn global_host_escape_is_still_bound_by_the_skill_manifest() {
         response.skill_events
     );
     owner.shutdown();
+}
+
+#[test]
+fn behavioral_quarantine_counts_targeted_feedback_on_a_returned_invocation() {
+    use crate::extras::js::skills::feedback::{
+        ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackKind, FeedbackService,
+    };
+    use crate::extras::js::skills::privacy::Redactor;
+
+    let (_root, mut store, artifact) = store();
+    let window_end = 4_000_000;
+    let actor = AuthenticatedActor {
+        actor_id: "owner".into(),
+        kind: ActorKind::Owner,
+        allowed_skill_ids: Some([artifact.id.clone()].into_iter().collect()),
+    };
+    // Every invocation returned a value; six of them were reported as wrong.
+    // The spec puts ordinary wrong-result feedback into the behavioral window,
+    // so those six are directly attributed faults.
+    for ordinal in 0..20 {
+        let invocation = format!("{ordinal:064x}");
+        for kind in [SkillEventKind::Invoked, SkillEventKind::Returned] {
+            let mut observation = event(
+                &artifact.id,
+                &invocation,
+                kind,
+                kind.is_terminal().then_some("fulfilled"),
+            );
+            observation.created_at = window_end - 1;
+            TelemetryIngestor::new(&mut store)
+                .ingest(&EventBatch::new(vec![observation]).unwrap())
+                .unwrap();
+        }
+        if ordinal < 6 {
+            FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+                .submit(
+                    &actor,
+                    &FeedbackCommand {
+                        idempotency_key: format!("returned-feedback-{ordinal}"),
+                        skill_id: artifact.id.clone(),
+                        invocation_id: Some(invocation),
+                        kind: FeedbackKind::Negative,
+                        reason_code: "incorrect_output".into(),
+                        reason_text: None,
+                    },
+                    window_end,
+                )
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        behavioral_window_counts_for_test(&store, &artifact.id, window_end).unwrap(),
+        (20, 6)
+    );
+    let negative: i64 = store
+        .conn()
+        .query_row(
+            "SELECT user_negative_count FROM skill_stats WHERE skill_id = ?",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(negative, 6);
 }
