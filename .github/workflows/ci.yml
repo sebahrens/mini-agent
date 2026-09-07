@@ -121,6 +121,38 @@ jobs:
             --features js,skills,sandbox,subagents \
             task_json_library_axis_uses_real_store_and_records_oracles -- --nocapture
 
+      # scripts/gym/setup.sh installs a `skills`-featured debug binary and then
+      # drives its learned-skill operator flags; no other job installs such a
+      # binary, so a Gym host build that silently loses `skills` is invisible to
+      # CI (scripts/tests/test_gym.py cannot see a feature set). This is a
+      # --help-only smoke: no episodes, no worktrees and no provider traffic. It
+      # asserts the binary contract the Gym depends on rather than any script
+      # internal, so it stays valid while scripts/gym/* is rewritten.
+      - name: Smoke the Gym entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked --path . --debug --features skills \
+            --root "$RUNNER_TEMP/gym"
+          binary="$RUNNER_TEMP/gym/bin/mini-agent"
+          test -x "$binary"
+          help=$("$binary" --help 2>&1)
+          for flag in \
+            --install-learned-skill-seeds \
+            --approve-learned-skill \
+            --activate-learned-skill
+          do
+            if ! printf '%s\n' "$help" | grep -q -- "$flag"; then
+              printf 'installed binary does not advertise %s: the gym install lost the skills feature\n' \
+                "$flag" >&2
+              exit 1
+            fi
+          done
+          bash -n scripts/gym/setup.sh
+          bash -n scripts/gym/train.sh
+          python3 scripts/gym/train.py --help > /dev/null
+          bash scripts/gym/train.sh --help > /dev/null
+
   package-compliance-smoke:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:

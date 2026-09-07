@@ -31,19 +31,28 @@ const PERSONA_FIXTURE: &str = include_str!("../../tests/harness_eval/personas/fi
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 const GYM_TASKS: &str = include_str!("../../tests/harness_eval/task.json");
 
+/// `defaults` supplies the fallback for every field a task omits. Nothing here
+/// is a per-task value: a task that declares its own `prompt`, `initial_files`,
+/// `oracle`, `budgets`, `scripted_provider_turns` or `expected_export`
+/// overrides the default outright (see [`GymTask::resolve`]).
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GymDefaults {
     prompt: String,
     initial_files: BTreeMap<PathBuf, String>,
     oracle: GymOracle,
     budgets: GymBudgets,
     scripted_provider_turns: BTreeMap<String, Vec<String>>,
+    /// Name of the learned-skill export the library arm is expected to call.
+    /// Shared with the Python runner's schema (`scripts/gym/mine_tasks.py`).
+    expected_export: String,
     library: String,
 }
 
 #[cfg(all(feature = "skills", feature = "sandbox"))]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 struct GymOracle {
     expected_files: BTreeMap<PathBuf, String>,
     id: String,
@@ -51,6 +60,7 @@ struct GymOracle {
 
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GymBudgets {
     max_provider_turns: usize,
     max_tool_calls: usize,
@@ -59,6 +69,7 @@ struct GymBudgets {
 
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GymTaskFile {
     defaults: GymDefaults,
     tasks: Vec<GymTask>,
@@ -66,9 +77,57 @@ struct GymTaskFile {
 
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GymTask {
     name: String,
     tags: Vec<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    initial_files: Option<BTreeMap<PathBuf, String>>,
+    #[serde(default)]
+    oracle: Option<GymOracle>,
+    #[serde(default)]
+    budgets: Option<GymBudgets>,
+    #[serde(default)]
+    scripted_provider_turns: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default)]
+    expected_export: Option<String>,
+}
+
+/// One task's effective fixture: its own overrides where present, `defaults`
+/// everywhere else.
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+struct GymResolvedTask<'a> {
+    prompt: &'a str,
+    initial_files: &'a BTreeMap<PathBuf, String>,
+    oracle: &'a GymOracle,
+    budgets: &'a GymBudgets,
+    scripted_provider_turns: &'a BTreeMap<String, Vec<String>>,
+    expected_export: &'a str,
+}
+
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+impl GymTask {
+    fn resolve<'a>(&'a self, defaults: &'a GymDefaults) -> GymResolvedTask<'a> {
+        GymResolvedTask {
+            prompt: self.prompt.as_deref().unwrap_or(&defaults.prompt),
+            initial_files: self
+                .initial_files
+                .as_ref()
+                .unwrap_or(&defaults.initial_files),
+            oracle: self.oracle.as_ref().unwrap_or(&defaults.oracle),
+            budgets: self.budgets.as_ref().unwrap_or(&defaults.budgets),
+            scripted_provider_turns: self
+                .scripted_provider_turns
+                .as_ref()
+                .unwrap_or(&defaults.scripted_provider_turns),
+            expected_export: self
+                .expected_export
+                .as_deref()
+                .unwrap_or(&defaults.expected_export),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,11 +557,197 @@ fn harness_eval_fixture_contract_is_complete() {
     }
 }
 
+/// Fixture-shape contract for `tests/harness_eval/task.json`.
+///
+/// The gym is only an eval if its tasks differ. This test measures the
+/// *resolved* fixtures (per-task override, else `defaults`) and fails if the
+/// file collapses back into one task wearing twenty names: it requires twenty
+/// distinct prompts, input trees, oracles and scripted turn pairs, at least
+/// four different learned-skill exports across the suite, and a baseline arm
+/// that never names a learned-skill export. It also keeps the fallback path
+/// covered by requiring at least one task that inherits `defaults` wholesale.
+#[cfg(all(feature = "skills", feature = "sandbox"))]
+#[test]
+fn gym_task_fixtures_are_distinct_and_library_free_in_the_baseline_arm() {
+    let specification: GymTaskFile = serde_json::from_str(GYM_TASKS).expect("valid gym task file");
+    assert_eq!(specification.tasks.len(), 20);
+    let names = specification
+        .tasks
+        .iter()
+        .map(|task| task.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names.len(),
+        specification.tasks.len(),
+        "task names are unique"
+    );
+
+    let resolved = specification
+        .tasks
+        .iter()
+        .map(|task| (task, task.resolve(&specification.defaults)))
+        .collect::<Vec<_>>();
+    let exports = resolved
+        .iter()
+        .map(|(_, fixture)| fixture.expected_export)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        exports.len() >= 4,
+        "the suite must exercise at least four learned-skill exports, saw {exports:?}"
+    );
+    for (task, fixture) in &resolved {
+        assert!(!task.tags.is_empty(), "{} tags", task.name);
+        assert!(!fixture.prompt.trim().is_empty(), "{} prompt", task.name);
+        assert!(
+            fixture.budgets.max_provider_turns > 0,
+            "{} turns",
+            task.name
+        );
+        assert!(
+            fixture.budgets.max_tool_calls > 0,
+            "{} tool calls",
+            task.name
+        );
+        assert!(fixture.budgets.max_total_tokens > 0, "{} tokens", task.name);
+        assert!(
+            !fixture.initial_files.is_empty(),
+            "{} initial tree",
+            task.name
+        );
+        for path in fixture
+            .initial_files
+            .keys()
+            .chain(fixture.oracle.expected_files.keys())
+        {
+            assert!(!path.is_absolute(), "{} absolute path", task.name);
+            assert!(
+                path.components()
+                    .all(|part| matches!(part, Component::Normal(_))),
+                "{} unsafe path: {}",
+                task.name,
+                path.display()
+            );
+        }
+        for (path, content) in fixture.initial_files {
+            assert_eq!(
+                fixture.oracle.expected_files.get(path),
+                Some(content),
+                "{} must declare the final state of {}",
+                task.name,
+                path.display()
+            );
+        }
+        assert!(
+            fixture
+                .oracle
+                .expected_files
+                .contains_key(Path::new("output.txt")),
+            "{} oracle must require an output.txt",
+            task.name
+        );
+        let arms = &fixture.scripted_provider_turns;
+        for arm in ["none", "library"] {
+            let script = arms
+                .get(arm)
+                .unwrap_or_else(|| panic!("{} is missing the {arm} arm", task.name));
+            assert_eq!(script.len(), 1, "{} {arm} scripted turns", task.name);
+        }
+        assert_ne!(
+            arms["none"][0], arms["library"][0],
+            "{} runs the same script in both arms",
+            task.name
+        );
+        assert!(
+            arms["library"][0].contains(fixture.expected_export),
+            "{} declares export {} but its library turn never calls it",
+            task.name,
+            fixture.expected_export
+        );
+        // The baseline arm exists to measure the cost of *not* having the
+        // library, so it must hand-write the transformation itself. (That the
+        // declared names really are the admitted library's exports is checked
+        // against the seeded store in
+        // `task_json_library_axis_uses_real_store_and_records_oracles`.)
+        for export in &exports {
+            assert!(
+                !arms["none"][0].contains(export),
+                "{} baseline arm calls learned-skill export {export}",
+                task.name
+            );
+        }
+    }
+
+    let count = resolved.len();
+    let distinct = |mut values: Vec<String>| {
+        values.sort();
+        values.dedup();
+        values.len()
+    };
+    assert_eq!(
+        distinct(
+            resolved
+                .iter()
+                .map(|(_, fixture)| fixture.prompt.to_string())
+                .collect()
+        ),
+        count,
+        "every task needs its own prompt"
+    );
+    assert_eq!(
+        distinct(
+            resolved
+                .iter()
+                .map(|(_, fixture)| format!("{:?}", fixture.initial_files))
+                .collect()
+        ),
+        count,
+        "every task needs its own input tree"
+    );
+    assert_eq!(
+        distinct(
+            resolved
+                .iter()
+                .map(|(_, fixture)| format!("{:?}", fixture.oracle))
+                .collect()
+        ),
+        count,
+        "every task needs its own oracle"
+    );
+    assert_eq!(
+        distinct(
+            resolved
+                .iter()
+                .map(|(_, fixture)| format!("{:?}", fixture.scripted_provider_turns))
+                .collect()
+        ),
+        count,
+        "every task needs its own scripted turns"
+    );
+    assert!(
+        specification
+            .tasks
+            .iter()
+            .any(|task| task.prompt.is_none() && task.oracle.is_none()),
+        "at least one task must inherit defaults so the fallback path stays covered"
+    );
+    assert!(
+        specification
+            .tasks
+            .iter()
+            .any(|task| task.budgets.is_some()),
+        "at least one task must override the default budgets"
+    );
+}
+
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[derive(Debug)]
 struct GymArmMeasurement {
     arm: &'static str,
     turn_id: String,
+    /// Identifier of the admitted seed whose export this task's library turn
+    /// names. `None` for the no-library arm, which is given an empty bundle on
+    /// purpose.
+    skill_id: Option<String>,
     provider_turns: usize,
     tool_calls: usize,
     total_tokens: u64,
@@ -524,31 +769,32 @@ struct GymArmMeasurement {
 ///
 /// The delta gate therefore compares two independently measured arms: the
 /// no-library arm must record zero learned-skill invocations, the library arm
-/// exactly one, and the two arms must agree on the three cost axes. A library
-/// arm that silently fell back to hand-written JavaScript emits no `invoked`
-/// event and fails the gate.
+/// exactly one — and specifically one of the seed that exports the name the
+/// task's fixture declares — and the two arms must agree on the three cost
+/// axes. A library arm that silently fell back to hand-written JavaScript emits
+/// no `invoked` event and fails the gate.
 ///
-/// Deliberately *not* covered here (tracked separately): the library is seeded
-/// straight into the store instead of through operator admission
-/// (mini-agent-4q06), and every task shares one `defaults` entry
-/// (mini-agent-vmfi).
+/// The library itself is the one operators get: `library: "seeds"` dispatches
+/// to `operations::run(.., LibraryOperation::InstallSeeds, ..)`, which admits
+/// the bundled `assets/learned-skills` packages through canonicalization and
+/// the contained held-out verifier, followed by `Approve` and `Activate` —
+/// the same operator episode `src/extras/js/skills/operations.rs` tests. Nothing
+/// is hand-inserted into the store. Admission runs a contained worker per seed,
+/// so seeding happens once for the whole arm rather than once per task; the
+/// per-task work stays the two agent runs.
 #[cfg(all(feature = "skills", feature = "sandbox"))]
 #[tokio::test]
 async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     use crate::agent::runner::TaskOutcomeRecorder;
     use crate::extras::js::skills::index::RetrievalPolicy;
+    use crate::extras::js::skills::operations::{LibraryOperation, run as run_library_operation};
     use crate::extras::js::skills::store::SkillStore;
     use crate::extras::js::skills::telemetry::TelemetryDispatcher;
     use crate::extras::js::skills::turn::{SkillRuntime, SkillTurnContext, TurnSkillBundle};
-    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
     use crate::extras::skills::index::AgentSkillSearchPolicy;
 
     let specification: GymTaskFile = serde_json::from_str(GYM_TASKS).unwrap();
     assert_eq!(specification.tasks.len(), 20);
-    // Budgets are not asserted as constants here: they are handed to the agent
-    // as the real turn/token caps below and then compared against the measured
-    // cost of each arm.
-    let budgets = &specification.defaults.budgets;
 
     let state = EvalDirectory::new();
     let paths = crate::paths::AppPaths {
@@ -560,33 +806,83 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
         credentials_dir: state.path().join("credentials"),
         project_dir: None,
     };
-    let skill = SkillArtifact::new(
-        "function gymNormalize(_cap, text) { return text.trim(); }".into(),
-        "Normalize gym text by trimming surrounding whitespace.".into(),
-        vec!["normalize".into(), "gym".into(), "text".into()],
-        vec![SkillExport {
-            name: "gymNormalize".into(),
-            signature: "(text: string) => string".into(),
-        }],
-        vec!["gymNormalize(' x ') === 'x'".into()],
-        CapabilityManifest::pure(),
-    )
-    .unwrap();
     // Dispatch on the fixture's library axis rather than asserting its value:
     // an unrecognised axis must fail loudly instead of silently seeding a
     // library the fixture never asked for.
-    match specification.defaults.library.as_str() {
+    let seeded_ids: Vec<String> = match specification.defaults.library.as_str() {
         "seeds" => {
-            SkillStore::open_at(&paths)
-                .and_then(|mut store| store.insert_verified(&skill))
-                .unwrap();
+            run_library_operation(
+                None,
+                false,
+                None,
+                Some(LibraryOperation::InstallSeeds),
+                &paths,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("install-seeds failed: {error:#}"));
+            // `install-seeds` only returns `Ok` for a package whose proposal
+            // reached the reviewable end of admission, so this reads back the
+            // ids admission actually produced instead of naming them here.
+            let verified = {
+                let store = SkillStore::open_at(&paths).unwrap();
+                let mut statement = store
+                    .conn()
+                    .prepare(
+                        "SELECT DISTINCT skill_id FROM skill_proposals
+                          WHERE status IN ('awaiting_approval', 'approved')
+                          ORDER BY skill_id",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<String>, _>>()
+                    .unwrap()
+            };
+            assert!(
+                !verified.is_empty(),
+                "install-seeds admitted no learned skill through the held-out verifier"
+            );
+            for id in &verified {
+                run_library_operation(
+                    None,
+                    false,
+                    None,
+                    Some(LibraryOperation::Approve(id.as_str())),
+                    &paths,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("approving seed {id} failed: {error:#}"));
+                run_library_operation(
+                    None,
+                    false,
+                    None,
+                    Some(LibraryOperation::Activate(id.as_str())),
+                    &paths,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("activating seed {id} failed: {error:#}"));
+            }
+            let store = SkillStore::open_at(&paths).unwrap();
+            for id in &verified {
+                assert_eq!(
+                    store.metadata(id).unwrap().unwrap().status,
+                    "active",
+                    "seed {id} never reached the active lifecycle state"
+                );
+            }
+            verified
         }
         other => panic!("unsupported gym library axis {other:?}"),
-    }
+    };
     let runtime = SkillRuntime::open(&paths, None)
         .unwrap()
         .with_test_policies(
             RetrievalPolicy {
+                // Every admitted seed must fit in one bundle so a task can name
+                // the export it needs; the floors keep the deterministic test
+                // embedder from dropping candidates before fusion.
+                max_skills: seeded_ids.len().max(RetrievalPolicy::default().max_skills),
                 dense_score_floor: -1.0,
                 lexical_score_floor: -1.0,
                 ..RetrievalPolicy::default()
@@ -596,33 +892,101 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     runtime.settle_learned_rebuild_for_test().await;
     let dispatcher = Arc::new(TelemetryDispatcher::spawn(&paths).unwrap());
 
+    // One probe turn maps the exports the admitted library actually publishes
+    // to the artifacts that own them. Nothing is run against this bundle; it is
+    // the ground truth the fixtures' scripted turns are matched against, so a
+    // task cannot claim a skill the library never admitted.
+    let library_exports: BTreeMap<String, String> = {
+        let discovery = runtime.prepare_turn("learned skill library probe").await;
+        discovery
+            .learned_js
+            .skills
+            .iter()
+            .flat_map(|skill| {
+                skill
+                    .exports
+                    .iter()
+                    .map(move |export| (export.name.clone(), skill.id.clone()))
+            })
+            .collect()
+    };
+    let reachable = library_exports.values().collect::<BTreeSet<_>>();
+    assert_eq!(
+        reachable.len(),
+        seeded_ids.len(),
+        "retrieval reached {} of the {} admitted seeds",
+        reachable.len(),
+        seeded_ids.len()
+    );
+
     let mut runs: Vec<(String, Vec<GymArmMeasurement>)> = Vec::new();
     for task in &specification.tasks {
         assert!(!task.tags.is_empty(), "{} tags", task.name);
+        // Per-task overrides where the fixture declares them, `defaults`
+        // otherwise; every axis below is read through this view.
+        let fixture = task.resolve(&specification.defaults);
+        // Budgets are not asserted as constants here: they are handed to the
+        // agent as the real turn/token caps below and then compared against the
+        // measured cost of each arm.
+        let budgets = fixture.budgets;
         let mut measurements: Vec<GymArmMeasurement> = Vec::new();
         for arm in ["none", "library"] {
             let directory = EvalDirectory::new();
-            for (relative, content) in &specification.defaults.initial_files {
+            for (relative, content) in fixture.initial_files {
                 let target = directory.path().join(relative);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).unwrap();
                 }
                 std::fs::write(target, content.as_bytes()).unwrap();
             }
+            let scripts = &fixture.scripted_provider_turns[arm];
+            assert_eq!(scripts.len(), 1, "{} {arm} scripted turns", task.name);
+            // Which learned-skill export this turn reaches is read off the
+            // scripted turn itself rather than declared beside it, so the
+            // fixture cannot claim an invocation its JavaScript never makes.
+            let named = library_exports
+                .iter()
+                .filter(|(export, _)| scripts[0].contains(export.as_str()))
+                .collect::<Vec<_>>();
+            let mut skill_id = None;
             let context = if arm == "library" {
-                let query = format!("{} {}", specification.defaults.prompt, task.tags.join(" "));
+                assert_eq!(
+                    named.len(),
+                    1,
+                    "{} library turn must call exactly one admitted export, it names {:?}",
+                    task.name,
+                    named.iter().map(|(export, _)| export).collect::<Vec<_>>()
+                );
+                let (export, expected_id) = named[0];
+                assert_eq!(
+                    export.as_str(),
+                    fixture.expected_export,
+                    "{} declares export {} but its library turn calls {export}",
+                    task.name,
+                    fixture.expected_export
+                );
+                let query = format!("{} {}", fixture.prompt, task.tags.join(" "));
                 let discovery = runtime.prepare_turn(&query).await;
                 assert!(
                     discovery
                         .learned_js
                         .skills
                         .iter()
-                        .any(|item| item.id == skill.id),
-                    "{} must retrieve the seeded library",
+                        .any(|item| &item.id == expected_id),
+                    "{} retrieved no admitted seed exporting {export}",
                     task.name
                 );
+                skill_id = Some(expected_id.clone());
                 runtime.turn_context()
             } else {
+                // The baseline arm must pay for the work itself: naming any
+                // admitted export here would make the delta meaningless.
+                assert!(
+                    named.is_empty(),
+                    "{} baseline turn calls admitted export(s) {:?}",
+                    task.name,
+                    named.iter().map(|(export, _)| export).collect::<Vec<_>>()
+                );
                 Arc::new(SkillTurnContext::new(TurnSkillBundle::empty("gym-none")))
             };
             // Captured before the run so the arm's telemetry can be counted by
@@ -638,9 +1002,6 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
             )
             .with_skill_turn_context(context.clone())
             .with_shared_telemetry(dispatcher.clone());
-            let scripts = &specification.defaults.scripted_provider_turns[arm];
-            assert_eq!(scripts.len(), 1, "{} {arm} scripted turns", task.name);
-
             // Run the arm through the production agent loop (as
             // `harness_regression_eval` does) so provider turns, tool calls and
             // tokens are observed rather than assumed.
@@ -658,7 +1019,7 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
                 .build();
             let (response, usage, interactions) = run_print(
                 &agent,
-                &specification.defaults.prompt,
+                fixture.prompt,
                 true,
                 &RetryConfig::default(),
                 Some(budgets.max_total_tokens),
@@ -692,17 +1053,22 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
                 budgets.max_total_tokens
             );
 
-            let passed =
-                collect_files(directory.path()) == specification.defaults.oracle.expected_files;
+            let produced = collect_files(directory.path());
+            let passed = produced == fixture.oracle.expected_files;
             TaskOutcomeRecorder::new(dispatcher.clone(), context, false).record_oracle(
-                &specification.defaults.oracle.id,
+                &fixture.oracle.id,
                 passed,
                 1,
             );
-            assert!(passed, "{} {arm} oracle", task.name);
+            assert!(
+                passed,
+                "{} {arm} oracle: produced {produced:?}, expected {:?}",
+                task.name, fixture.oracle.expected_files
+            );
             measurements.push(GymArmMeasurement {
                 arm,
                 turn_id,
+                skill_id,
                 provider_turns,
                 tool_calls,
                 total_tokens: usage.total_tokens,
@@ -712,11 +1078,12 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
     }
 
     let expected_outcomes = i64::try_from(runs.len() * 2).unwrap();
+    // One learned-skill call per library arm and none from the no-library arms,
+    // so exactly one outcome per task carries a skill attribution. A link only
+    // exists if the `invoked` event was already durable when the oracle outcome
+    // was ingested, so this also pins the telemetry ordering.
     let expected_links = i64::try_from(runs.len()).unwrap();
-    // One `gymNormalize` call per library arm, and none from the no-library
-    // arms, so the seeded skill must show exactly one `invoked` event per task.
-    let expected_invocations = expected_links;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let store = SkillStore::open_at(&paths).unwrap();
         let outcomes: i64 = store
@@ -729,48 +1096,63 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
             .unwrap();
         let links: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM skill_task_outcome_links WHERE skill_id = ?",
-                [&skill.id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM skill_task_outcome_links", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        let invocations: i64 = store
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM skill_events
-                 WHERE event_kind = 'invoked' AND skill_id = ?",
-                [&skill.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if outcomes == expected_outcomes
-            && links == expected_links
-            && invocations == expected_invocations
-        {
+        if outcomes == expected_outcomes && links == expected_links {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "gym telemetry was not durably ordered: outcomes {outcomes}/{expected_outcomes}, \
-             links {links}/{expected_links}, invocations {invocations}/{expected_invocations}"
+             links {links}/{expected_links}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     let store = SkillStore::open_at(&paths).unwrap();
-    let round_trips = |turn_id: &str| -> usize {
+    // Every `invoked` event recorded in this arm's turn, whichever seed it
+    // names: a library arm that reached a *different* seed than the fixture
+    // declares fails the per-skill count below while still counting here.
+    fn round_trips(store: &SkillStore, turn_id: &str) -> usize {
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_events
+                 WHERE event_kind = 'invoked' AND turn_id = ?",
+                [turn_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        usize::try_from(count).unwrap()
+    }
+    fn round_trips_for(store: &SkillStore, skill_id: &str, turn_id: &str) -> usize {
         let count: i64 = store
             .conn()
             .query_row(
                 "SELECT COUNT(*) FROM skill_events
                  WHERE event_kind = 'invoked' AND skill_id = ? AND turn_id = ?",
-                [skill.id.as_str(), turn_id],
+                [skill_id, turn_id],
                 |row| row.get(0),
             )
             .unwrap();
         usize::try_from(count).unwrap()
-    };
+    }
+    fn attributed(store: &SkillStore, skill_id: &str, turn_id: &str) -> usize {
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_task_outcome_links AS link
+                 JOIN skill_task_outcomes AS outcome
+                   ON outcome.evidence_id = link.evidence_id
+                 WHERE outcome.turn_id = ? AND link.skill_id = ?",
+                [turn_id, skill_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        usize::try_from(count).unwrap()
+    }
 
     for (name, arms) in &runs {
         assert_eq!(arms.len(), 2, "{name} arms");
@@ -778,15 +1160,33 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
         let library = &arms[1];
         assert_eq!(none.arm, "none", "{name} first arm");
         assert_eq!(library.arm, "library", "{name} second arm");
-        let none_round_trips = round_trips(&none.turn_id);
-        let library_round_trips = round_trips(&library.turn_id);
+        assert!(
+            none.skill_id.is_none(),
+            "{name} no-library arm was given a skill bundle"
+        );
+        let library_skill = library
+            .skill_id
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name} library arm resolved no seed"));
+        let none_round_trips = round_trips(&store, &none.turn_id);
+        let library_round_trips = round_trips(&store, &library.turn_id);
         assert_eq!(
             none_round_trips, 0,
             "{name} no-library arm invoked a learned skill"
         );
         assert_eq!(
             library_round_trips, 1,
-            "{name} library arm must invoke the seeded skill exactly once"
+            "{name} library arm must invoke exactly one learned skill"
+        );
+        assert_eq!(
+            round_trips_for(&store, library_skill, &library.turn_id),
+            1,
+            "{name} library arm must invoke the seed it retrieved ({library_skill})"
+        );
+        assert_eq!(
+            attributed(&store, library_skill, &library.turn_id),
+            1,
+            "{name} oracle outcome must be attributed to {library_skill}"
         );
         assert_eq!(
             (none.provider_turns, none.tool_calls, none.total_tokens),
@@ -803,6 +1203,7 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
                 serde_json::json!({
                     "name": name,
                     "library": arm.arm,
+                    "skill_id": &arm.skill_id,
                     "success": true,
                     "provider_turns": arm.provider_turns,
                     "tool_calls": arm.tool_calls,
@@ -813,6 +1214,197 @@ async fn task_json_library_axis_uses_real_store_and_records_oracles() {
             );
         }
     }
+
+    // The suite must spread across the seeded library rather than hammering one
+    // artifact: a fixture set that collapses back onto a single export fails
+    // here even if every per-task assertion above still passes.
+    let distinct_attributed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(DISTINCT skill_id) FROM skill_task_outcome_links",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        distinct_attributed >= 4,
+        "gym outcomes were attributed to only {distinct_attributed} seeded skills"
+    );
+}
+
+/// Drives `TaskOutcome` emission through the real completion-verification gate.
+///
+/// Two runs go through `run_print_with_verification` with a
+/// `TaskOutcomeRecorder` attached, each with its own turn context so the rows
+/// can be counted by `turn_id`:
+///
+/// * a run whose `Config` carries a verify command, whose scripted model calls
+///   the mutating `write` tool (so the gate arms), must leave exactly one
+///   `skill_task_outcomes` row of kind `verify_command` whose `source_id` is
+///   the SHA-256 of the *configured* command and whose `verify_passed` bit is
+///   set;
+/// * an otherwise identical run with no verify command configured must leave
+///   exactly one row of kind `no_verify_command` with a null `source_id`.
+///
+/// Unix-only for the same reason as the runner's own verification tests: the
+/// verify command is POSIX shell text.
+#[cfg(all(unix, feature = "skills", feature = "sandbox"))]
+#[tokio::test]
+async fn completion_verification_gate_records_both_task_outcome_source_kinds() {
+    use crate::agent::runner::{
+        CompletionVerification, TaskOutcomeRecorder, run_print_with_verification,
+    };
+    use crate::extras::js::skills::store::SkillStore;
+    use crate::extras::js::skills::telemetry::TelemetryDispatcher;
+    use crate::extras::js::skills::turn::{SkillTurnContext, TurnSkillBundle};
+    use sha2::Digest;
+
+    // No leading or trailing whitespace: `from_config` trims before hashing, so
+    // the hash below has to be taken over the same bytes the gate hashes.
+    const VERIFY_COMMAND: &str = "printf 'gate ran'";
+
+    let state = EvalDirectory::new();
+    let paths = crate::paths::AppPaths {
+        config_dir: state.path().join("config"),
+        data_dir: state.path().join("data"),
+        local_data_dir: state.path().join("local"),
+        state_dir: state.path().join("state"),
+        cache_dir: state.path().join("cache"),
+        credentials_dir: state.path().join("credentials"),
+        project_dir: None,
+    };
+    let dispatcher = Arc::new(TelemetryDispatcher::spawn(&paths).unwrap());
+    let sandbox = Sandbox::new(false, "gym-verify");
+
+    let mut turn_ids = Vec::new();
+    for configured_command in [Some(VERIFY_COMMAND), None] {
+        let directory = EvalDirectory::new();
+        let context = Arc::new(SkillTurnContext::new(TurnSkillBundle::empty("verify-gate")));
+        turn_ids.push(context.snapshot().turn_id.clone());
+        let cfg = crate::config::Config {
+            verify_command: configured_command.map(|command| command.into()),
+            verify_timeout_secs: Some(30),
+            verify_max_attempts: Some(1),
+            ..Default::default()
+        };
+        let verification = CompletionVerification::with_task_outcomes(
+            CompletionVerification::from_config(&cfg, sandbox.clone()),
+            &cfg,
+            sandbox.clone(),
+            TaskOutcomeRecorder::new(dispatcher.clone(), context, false),
+        );
+        // `write` is a mutating tool, so both runs arm the gate; the only
+        // difference between them is whether a command is configured.
+        let model = MockCompletionModel::from_stream_turns(vec![
+            tool_turn(
+                "gate-write",
+                "write",
+                serde_json::json!({ "path": "verified.txt", "content": "ok\n" }),
+            ),
+            done_turn(),
+        ]);
+        let write = Box::new(
+            WriteTool::new(None, None, None).with_workspace(directory.path().to_path_buf()),
+        ) as Box<dyn ToolDyn>;
+        let agent = AgentBuilder::new(model)
+            .tools(vec![write])
+            .default_max_turns(2)
+            .build();
+        let (response, _, interactions) = run_print_with_verification(
+            &agent,
+            "write the file and finish",
+            true,
+            false,
+            &RetryConfig::default(),
+            None,
+            Vec::<Message>::new(),
+            Some(verification),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("verification-gate run failed: {error:#}"));
+        assert_eq!(response, "done", "verification-gate terminal response");
+        assert_eq!(
+            count_tool_calls(&interactions),
+            1,
+            "the gate must be armed by a real mutating tool call"
+        );
+        assert!(
+            directory.path().join("verified.txt").is_file(),
+            "the scripted write must have reached the workspace"
+        );
+    }
+    assert_eq!(turn_ids.len(), 2, "one turn per verification-gate run");
+    let verify_turn = turn_ids[0].clone();
+    let no_verify_turn = turn_ids[1].clone();
+    assert_ne!(
+        verify_turn, no_verify_turn,
+        "each run needs its own turn so the rows can be told apart"
+    );
+
+    let expected_source_id =
+        crate::hex::encode_lower(sha2::Sha256::digest(VERIFY_COMMAND.as_bytes()));
+    fn rows_for(store: &SkillStore, turn_id: &str) -> Vec<(String, Option<String>, i64)> {
+        let mut statement = store
+            .conn()
+            .prepare(
+                "SELECT source_kind, source_id, verify_passed
+                   FROM skill_task_outcomes
+                  WHERE turn_id = ?
+                  ORDER BY source_kind",
+            )
+            .unwrap();
+        statement
+            .query_map([turn_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (verify_rows, no_verify_rows) = loop {
+        let store = SkillStore::open_at(&paths).unwrap();
+        let verify_rows = rows_for(&store, &verify_turn);
+        let no_verify_rows = rows_for(&store, &no_verify_turn);
+        if verify_rows.len() == 1 && no_verify_rows.len() == 1 {
+            break (verify_rows, no_verify_rows);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "verification-gate outcomes were never durable: verify {verify_rows:?}, \
+             no-verify {no_verify_rows:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(
+        verify_rows[0].0, "verify_command",
+        "the armed gate must record a verify_command outcome"
+    );
+    assert_eq!(
+        verify_rows[0].1.as_deref(),
+        Some(expected_source_id.as_str()),
+        "verify_command source_id must be the SHA-256 of the configured command"
+    );
+    assert_eq!(
+        verify_rows[0].2, 1,
+        "the verify command succeeded, so the outcome must record a pass"
+    );
+    assert_eq!(
+        no_verify_rows[0].0, "no_verify_command",
+        "a run with no verify command must record a no_verify_command outcome"
+    );
+    assert_eq!(
+        no_verify_rows[0].1, None,
+        "no_verify_command carries no source_id"
+    );
 }
 
 #[tokio::test]

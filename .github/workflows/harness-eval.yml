@@ -40,6 +40,30 @@ jobs:
             sed 's/^PERSONA_EVAL //' > "$RUNNER_TEMP/persona-eval.jsonl"
           test "$(wc -l < "$RUNNER_TEMP/persona-eval.jsonl")" -eq 9
 
+      # The library-axis eval is cfg-gated on `skills` + `sandbox`, and its
+      # module on `js` + `subagents`. `skills` is not a default feature, so the
+      # default-feature step above cannot compile the test at all; it needs its
+      # own explicitly featured build. It is not `#[ignore]`d, so it runs by
+      # name without `--ignored`. Its records go to a separate log, leaving the
+      # two counts above measuring only the deterministic fixture suites.
+      - name: Run the gated learned-skill library axis
+        shell: bash
+        run: |
+          set -o pipefail
+          : > "$RUNNER_TEMP/library-axis-eval.log"
+          cargo test --locked --no-default-features \
+            --features js,skills,sandbox,subagents \
+            tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles \
+            -- --exact --nocapture --test-threads=1 2>&1 |
+            tee -a "$RUNNER_TEMP/library-axis-eval.log"
+          grep '^HARNESS_EVAL ' "$RUNNER_TEMP/library-axis-eval.log" |
+            sed 's/^HARNESS_EVAL //' > "$RUNNER_TEMP/library-axis-eval.jsonl"
+          # The record count tracks the task document, which grows; assert the
+          # shape instead, so a silently skipped or single-armed run still fails.
+          test "$(wc -l < "$RUNNER_TEMP/library-axis-eval.jsonl")" -gt 0
+          grep -q '"library":"none"' "$RUNNER_TEMP/library-axis-eval.jsonl"
+          grep -q '"library":"library"' "$RUNNER_TEMP/library-axis-eval.jsonl"
+
       - name: Archive harness metrics
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -47,4 +71,5 @@ jobs:
           path: |
             ${{ runner.temp }}/harness-eval.jsonl
             ${{ runner.temp }}/persona-eval.jsonl
+            ${{ runner.temp }}/library-axis-eval.jsonl
           if-no-files-found: error

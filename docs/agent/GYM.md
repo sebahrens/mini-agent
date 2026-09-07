@@ -1,6 +1,6 @@
 ---
 title: "Skill Gym"
-description: "Prepare isolated learned-skill state, mine task candidates, run paired library episodes, and interpret non-production reports."
+description: "Prepare an isolated gym host, mine task candidates, run paired library episodes, and interpret non-production reports."
 ---
 
 # Skill Gym
@@ -10,75 +10,200 @@ same task in a `none` arm and a `library` arm, runs a mechanical oracle, and wri
 `GYM_OUTCOME` JSON record per episode. It is not a release gate and it never turns evaluation data
 into production evidence.
 
+## Prerequisites
+
+- Linux or macOS. `scripts/gym/setup.sh` exits 2 on any other host, and the runner shells out to
+  `/bin/sh` and `git worktree`.
+- `cargo` and `rustc` matching `rust-toolchain.toml` (setup compares the exact version), `git` 2.40
+  or newer, `python3`, and `jq`.
+- `bd` (beads) only for `scripts/gym/mine_tasks.py`; the miner falls back to an exported
+  `.beads/issues.jsonl` or an explicit `--beads-json` file when `bd` is missing or fails.
+- A workspace outside `/private/tmp`. Setup refuses that prefix because it is the Seatbelt test
+  boundary.
+
 ## Prepare a host
 
-From the repository root:
-
 ```bash
-scripts/gym/setup.sh
+scripts/gym/setup.sh [repository]
 ```
 
-The setup script checks the required Rust/Python tools, installs the debug binary with
-`cargo install --path . --debug --locked --features skills`, exercises the platform
-worker-containment test, creates a private gym root, and imports, approves, and activates the seed
-library through the shipped local-owner commands. The `skills` feature is required and is not a
-default feature: the learned-skill operator commands the seed step calls do not exist in a default
-build, so `--binary` must always name a binary built with it. Override the default
-repository-local `.gym` root with `MINI_AGENT_GYM_ROOT`.
+The optional first argument is the repository to build and evaluate; it defaults to the current
+directory. The gym root defaults to `<repository>/.gym` and is overridden with
+`MINI_AGENT_GYM_ROOT`. Episode worktrees and per-episode AppPaths trees are created under that
+root, so ignore it in Git or point `MINI_AGENT_GYM_ROOT` outside the repository.
 
-The root contains separate `data`, `local`, `state`, and `cache` directories. Every gym process
-sets the corresponding `ZS_*_DIR` variables and `MINI_AGENT_GYM=1`; the operator's normal skill
-database, sessions, memory, and effect audit are not selected. Treat the directory as sensitive
-test state anyway: an explicitly configured external command or an unsandboxed model can still use
-the authority of the account running it.
+Setup checks the prerequisites, creates `<gym root>/worktrees` and `<gym root>/runs`, then runs:
+
+```bash
+cargo install --path . --debug --locked --features skills --root "$gym_root"
+```
+
+`cargo install --root DIR` installs into `DIR/bin`, so the gym binary is `<gym root>/bin/mini-agent`
+and the operator's production `~/.cargo/bin/mini-agent` is left alone. Pass that absolute path to
+`--binary`; a `PATH` lookup can resolve a different build. The `skills` feature is not a default
+feature and the learned-skill operator commands the library arm calls do not exist without it, so
+setup asserts the installed binary advertises `--install-learned-skill-seeds`. The platform
+worker-containment test then runs under the **same** feature set as the install
+(`cargo test --locked --features skills`), so the preflight exercises the build the episodes use.
+
+Setup does not import or activate a library. Each `library` episode installs and activates its own
+library into its own throwaway AppPaths tree, so no shared seeded state can leak between arms.
 
 There is no runtime `gym.toml` configuration parser. Script options and the task JSON are the
-configuration surface; normal mini-agent settings, including `verify_command`, keep their ordinary
-documented defaults.
+configuration surface.
 
-## Task files
+## Task schema
 
-`scripts/gym/mine_tasks.py` reads an explicit JSON map from bead ID to oracle command, finds fix
-commits naming those beads, and optionally verifies that each oracle fails at the parent and passes
-at the fix. It emits a JSON array whose entries contain:
+Both `scripts/gym/train.py` and the deterministic Rust harness fixture
+(`tests/harness_eval/task.json`) use one `{defaults, tasks}` object in which a task entry shallowly
+overrides any `defaults` field:
 
-- `name`, `prompt`, `base_commit`, and classification `tags`;
-- bounded `initial_files` and expected post-fix files;
-- `oracle.command` and a stable `oracle.id`;
-- `budgets` for provider turns, tool calls, and tokens;
-- optional scripted provider turns, the selected `library`, and the fix commit used only for
-  provenance.
+```json
+{
+  "schema_version": 1,
+  "defaults": { "prompt": "...", "initial_files": {},
+                "oracle": {"expected_files": {}, "id": "..."},
+                "budgets": {"max_provider_turns": 12, "max_tool_calls": 24, "max_total_tokens": 16000},
+                "scripted_provider_turns": {"none": [], "library": []},
+                "expected_export": "parseJson",
+                "library": "seeds" },
+  "tasks": [ {"name": "...", "tags": ["..."], "base_commit": "...", "deleted_files": [],
+              "oracle": {"command": "...", "id": "..."}, "...": "any default field"} ]
+}
+```
 
-The deterministic CI fixture at `tests/harness_eval/task.json` uses a compact object with
-`defaults` plus a `tasks` array. A task overrides any default field. Its oracle uses
-`expected_files`; `scripted_provider_turns` supplies separate `none` and `library` scripts. The
-Rust harness materializes a fresh workspace and real `SkillStore` for every arm, checks exact files
-and budgets, and records evaluator-oracle outcomes with `production=false`.
+`scripts/gym/mine_tasks.py` writes exactly that `defaults` field set. The Rust harness deserializes
+its fixture with `deny_unknown_fields`, so the checked-in fixture carries only the fields that
+struct declares (no `schema_version`, no `oracle.command`, no `base_commit`); the Python runner
+reads that file unchanged and additionally accepts the gym-only superset — `schema_version`,
+`base_commit`, `deleted_files`, `timeout_secs`, `oracle.command`, `library`, and `fix_commit`.
+`schema_version` is optional, defaults to `1`, and must be `1`. A bare JSON array is the
+pre-convergence format and is rejected with a pointer at `mine_tasks.py`.
+
+What the Python runner enforces at load time, before any episode runs:
+
+| Field | Enforcement |
+| --- | --- |
+| `name` | required, non-empty, unique across the file |
+| `prompt` | required, non-empty |
+| `base_commit` | defaults to `HEAD`; a commit Git cannot materialize is a failed row, not an empty directory |
+| `initial_files`, `deleted_files` | relative paths only; `..` and absolute paths are rejected |
+| `oracle` | needs `command` or a non-empty `expected_files`; `id` defaults to a hash of the oracle |
+| `budgets.max_provider_turns` | **required**, integer >= 1; passed to the binary as `--max-agent-turns` |
+| `budgets.max_tool_calls`, `budgets.max_total_tokens` | optional, integer >= 1, **not enforced** (see below) |
+| `timeout_secs` | optional per-task override of `--task-timeout` |
+
+`scripted_provider_turns` and `expected_export` are consumed by the Rust harness only; the Python
+runner ignores them. `tags`, `fix_commit`, and a mined `oracle.expected_files` sitting alongside a
+`command` are provenance.
+
+### Budgets that are recorded but not enforced
+
+The binary caps agent turns (`--max-agent-turns`) and per-response tokens, but has no tool-call cap
+and no per-task total-token or dollar cap. `max_tool_calls` and `max_total_tokens` are therefore
+validated, echoed in each row's `budgets_unenforced` list, and enforced by nothing. Cap cost outside
+the gym (for example with a provider account limit) before a live-model run.
+
+## Mine tasks from closed beads
+
+```bash
+python3 scripts/gym/mine_tasks.py --oracle-map map.json --output tasks.json [--main-ref main] \
+  [--beads-json export.jsonl] [--limit 20] [--no-validate]
+```
+
+Each `map.json` value is either an oracle command string or an object with `command` plus optional
+`fix_commit`, `base_commit`, `id`, and `library`. Without an explicit `fix_commit` the miner takes
+the **oldest** commit reachable from `--main-ref` whose message mentions the bead id, so a
+follow-up mention or an abandoned branch cannot be selected. Every bead that cannot be turned into
+a task is reported on stderr with the reason (no matching commit, unresolvable base, oracle already
+green at base, oracle not green at the fix, or no bounded text delta).
+
+Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim and binary
+blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes,
+renames are recorded as a delete plus an add (`--no-renames`), deletions become `deleted_files`, and
+any path with a dot-prefixed component (`.github/workflows/...` included) is skipped. Validation
+runs each oracle with `/bin/sh -c` under the same curated environment and gym-owned AppPaths as
+training, never a login shell and never the operator's environment.
 
 ## Run paired episodes
 
 ```bash
 scripts/gym/train.sh \
-  --tasks path/to/tasks.json \
-  --output path/to/outcomes.jsonl \
-  --binary mini-agent
+  --tasks tasks.json \
+  --output outcomes.jsonl \
+  --binary "$PWD/.gym/bin/mini-agent" \
+  --agent-arg=--yolo
 ```
 
-For each array entry, the runner creates a fresh detached worktree at `base_commit` (or an empty
-isolated directory if Git cannot materialize it), overlays `initial_files`, and runs both arms. The
-library arm installs either the shipped seeds or the bundle named by `library`, then approves and
-root-activates every newly awaiting revision. Each arm has its own AppPaths tree, so it cannot
-observe the other arm's library or session state.
+`train.sh` only fixes `--repo` to the repository root; every other option belongs to `train.py`:
+`--gym-root` (default `$MINI_AGENT_GYM_ROOT` or `<repo>/.gym`), `--agent-arg` (repeatable),
+`--forward-env` (repeatable), `--provider`, `--model`, `--task-timeout`, `--allow-empty-workspace`,
+and `--keep-run-dirs`.
 
-The runner invokes `mini-agent -p`, then executes the task's oracle with a 300-second bound. A row
-passes only when both processes exit successfully. The JSONL fields are `task`, `arm`, `success`,
-`oracle_id`, `elapsed_ms`, `production`, `agent_exit`, and `oracle_exit`; `production` is always
-false. Standard output repeats each row with a `GYM_OUTCOME ` prefix for streaming collection.
+For each task and each arm the runner:
 
-Compare success counts and elapsed time only across matching task/oracle IDs and always report the
-sample size. These records do not currently include reliable provider-token or dollar-cost fields,
-so enforce cost outside the script (for example with a provider account limit) before a live-model
-run. The deterministic task-json test is the supported no-provider regression path.
+1. creates a detached worktree at `base_commit` under `<gym root>/worktrees/`, removes
+   `deleted_files`, and overlays `initial_files`. A worktree that cannot be created is a failed row
+   with `failure_reason=workspace_unavailable`; `--allow-empty-workspace` restores the old silent
+   empty-directory behaviour;
+2. builds a fresh AppPaths tree under `<gym root>/runs/` and a curated environment (below);
+3. for the `library` arm, installs the library from a neutral directory, approves and activates only
+   the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
+   one revision ends up `active`. The runner reads `skills.db` directly with read-only SQLite
+   because the operator CLI has no JSON output yet; the active ids land in `active_skill_ids`;
+4. runs the oracle **before** the agent and records `oracle_pre_exit`. An oracle that already passes
+   makes the task invalid: the row fails with `task_invalid_oracle_passes_before_agent` and the
+   agent is never launched;
+5. runs `mini-agent --max-agent-turns <budget> [agent args] -p <prompt>` bounded by
+   `--task-timeout` (default 900s);
+6. runs the oracle again: `oracle.command` through `/bin/sh -c` with a 300-second bound, or, when no
+   command is given, an exact comparison of `oracle.expected_files` against the workspace;
+7. removes the worktree, runs `git worktree prune`, and deletes the run tree — in a `finally`, so a
+   timeout or install failure cannot leak either.
+
+Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
+finished.
+
+### Isolation
+
+Episodes never read the operator's configuration. `ZS_CONFIG_DIR` and `ZS_CREDENTIALS_DIR` point at
+gym-owned directories seeded with a minimal `config.toml` holding only `--provider`/`--model` when
+given, alongside gym-owned `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`,
+`TMPDIR`, and `MINI_AGENT_GYM=1`. The environment is an allowlist, not a copy: `PATH`, `HOME`,
+`USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TZ`, `SSL_CERT_DIR`, `SSL_CERT_FILE`, the
+known provider key variables (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY`,
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `VLLM_API_KEY`), and anything added with `--forward-env`.
+Library installs run from a neutral gym-owned directory so a project-local `config.toml` in a
+checked-out workspace cannot influence the import. Treat the gym root as sensitive test state
+anyway: an explicitly configured external command or an unsandboxed model still runs with the
+authority of the account.
+
+### Permission mode
+
+`-p` runs headless. In the default `standard` mode the `shell`, `js`, `fetch`, and `memory_write`
+tools resolve to *ask*, and a non-interactive run turns *ask* into "Permission denied
+(non-interactive mode)" — so an agent cannot run `cargo test` or `grep` unless you say otherwise.
+Pass `--agent-arg=--yolo` (or any other flag the binary accepts) to change that. Every row records
+the `agent_args` used and a `permission_mode` of `yolo` or `standard`.
+
+### Output rows and exit codes
+
+Each JSONL row and each `GYM_OUTCOME` line carries: `task`, `arm`, `success`, `production` (always
+false), `schema_version`, `oracle_id`, `elapsed_ms`, `timeout_secs`, `agent_exit` (124 on timeout),
+`oracle_exit`, `oracle_pre_exit`, `failure_reason`, `failure_detail`, `agent_stderr_tail`,
+`permission_mode`, `agent_args`, `provider`, `model`, `active_skill_ids`, `budgets_enforced`, and
+`budgets_unenforced`. `failure_reason` is one of `workspace_unavailable`,
+`library_install_failed`, `task_invalid_oracle_passes_before_agent`, `agent_timeout`,
+`agent_exit_nonzero`, or `oracle_failed`.
+
+The run ends with a `GYM_SUMMARY` line and one `gym arm <arm>: N passed, M failed of T` line per
+arm. **Exit 0 means the run completed**, whatever the rows say — the `none` arm is expected to fail
+the tasks the library helps with. Non-zero is reserved for runner errors: exit 2 covers an
+unreadable or invalid task file, an invalid budget, and output-path failures.
+
+Compare success counts and elapsed time only across matching task/oracle ids and always report the
+sample size. These records do not include provider-token or dollar-cost fields. The deterministic
+task-json test is the supported no-provider regression path.
 
 The optional successful-step distiller, resumable live-model experiment manager, built-in dollar
 cost cutoff, aggregate Wilson report, and evidence-derived retrieval labels are deferred. No gym

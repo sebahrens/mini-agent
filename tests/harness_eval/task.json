@@ -1,35 +1,590 @@
 {
   "defaults": {
-    "prompt": "Normalize this gym text with the available library and write output.txt.",
-    "initial_files": {"input.txt": "  value  \n"},
-    "oracle": {"expected_files": {"input.txt": "  value  \n", "output.txt": "value\n"}, "id": "expected-files-v1"},
-    "budgets": {"max_provider_turns": 2, "max_tool_calls": 1, "max_total_tokens": 300},
-    "scripted_provider_turns": {
-      "none": ["write_file('output.txt', read_file('input.txt').trim() + '\\n'); 'ok'"],
-      "library": ["write_file('output.txt', gymNormalize(read_file('input.txt')) + '\\n'); 'ok'"]
+    "prompt": "Read the JSON document and write its value field to output.txt.",
+    "initial_files": {
+      "input.json": "{\"value\": \"ok\"}\n"
     },
+    "oracle": {
+      "expected_files": {
+        "input.json": "{\"value\": \"ok\"}\n",
+        "output.txt": "ok\n"
+      },
+      "id": "expected-files-v1"
+    },
+    "budgets": {
+      "max_provider_turns": 2,
+      "max_tool_calls": 1,
+      "max_total_tokens": 300
+    },
+    "scripted_provider_turns": {
+      "none": [
+        "write_file('output.txt', JSON.parse(read_file('input.json')).value + '\\n'); 'ok'"
+      ],
+      "library": [
+        "write_file('output.txt', parseJson(read_file('input.json')).value + '\\n'); 'ok'"
+      ]
+    },
+    "expected_export": "parseJson",
     "library": "seeds"
   },
   "tasks": [
-    {"name": "crlf_normalization", "tags": ["history", "line-endings"]},
-    {"name": "dependency_bump_lock_line", "tags": ["history", "lockfile"]},
-    {"name": "test_output_summary", "tags": ["history", "tests"]},
-    {"name": "permission_path_normalization", "tags": ["history", "permissions"]},
-    {"name": "tool_output_boundary", "tags": ["history", "security"]},
-    {"name": "worker_timeout_cleanup", "tags": ["history", "containment"]},
-    {"name": "hook_payload_normalization", "tags": ["history", "hooks"]},
-    {"name": "session_filename_portability", "tags": ["history", "sessions"]},
-    {"name": "grep_result_truncation", "tags": ["history", "tools"]},
-    {"name": "subagent_result_order", "tags": ["history", "subagents"]},
-    {"name": "cargo_add_feature", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_remove_feature", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_default_features", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_target_dependency", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_lock_checksum", "tags": ["cargo", "lockfile"]},
-    {"name": "cargo_lock_dependency", "tags": ["cargo", "lockfile"]},
-    {"name": "cargo_package_metadata", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_workspace_member", "tags": ["cargo", "workspace"]},
-    {"name": "cargo_profile_setting", "tags": ["cargo", "manifest"]},
-    {"name": "cargo_platform_section", "tags": ["cargo", "manifest"]}
+    {
+      "name": "json_scalar_field",
+      "tags": [
+        "json",
+        "parse",
+        "scalar"
+      ],
+      "prompt": "Read the measurement JSON and write the answer field to output.txt.",
+      "initial_files": {
+        "input.json": "{\"answer\": 42, \"unit\": \"ms\"}\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "input.json": "{\"answer\": 42, \"unit\": \"ms\"}\n",
+          "output.txt": "42\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "write_file('output.txt', JSON.parse(read_file('input.json')).answer + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', parseJson(read_file('input.json')).answer + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseJson"
+    },
+    {
+      "name": "json_array_length",
+      "tags": [
+        "json",
+        "parse",
+        "array"
+      ],
+      "prompt": "Count the entries in the JSON array and write the count to output.txt.",
+      "initial_files": {
+        "items.json": "[3, 5, 8, 13]\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "items.json": "[3, 5, 8, 13]\n",
+          "output.txt": "4\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "write_file('output.txt', JSON.parse(read_file('items.json')).length + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', parseJson(read_file('items.json')).length + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseJson"
+    },
+    {
+      "name": "json_sorted_keys",
+      "tags": [
+        "json",
+        "parse",
+        "keys"
+      ],
+      "prompt": "Write the JSON object's keys to output.txt in sorted order, comma separated.",
+      "initial_files": {
+        "config.json": "{\"zeta\": 1, \"alpha\": 2, \"mid\": 3}\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "config.json": "{\"zeta\": 1, \"alpha\": 2, \"mid\": 3}\n",
+          "output.txt": "alpha,mid,zeta\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "write_file('output.txt', Object.keys(JSON.parse(read_file('config.json'))).sort().join(',') + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', Object.keys(parseJson(read_file('config.json'))).sort().join(',') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseJson"
+    },
+    {
+      "name": "json_nested_flag",
+      "tags": [
+        "json",
+        "parse",
+        "nested"
+      ],
+      "prompt": "Read the nested tool object and write name=enabled to output.txt.",
+      "initial_files": {
+        "tool.json": "{\"tool\": {\"enabled\": false, \"name\": \"js\"}}\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "tool.json": "{\"tool\": {\"enabled\": false, \"name\": \"js\"}}\n",
+          "output.txt": "js=false\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const t = JSON.parse(read_file('tool.json')).tool; write_file('output.txt', t.name + '=' + t.enabled + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const t = parseJson(read_file('tool.json')).tool; write_file('output.txt', t.name + '=' + t.enabled + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseJson"
+    },
+    {
+      "name": "cargo_package_metadata",
+      "tags": [
+        "cargo",
+        "manifest",
+        "toml"
+      ],
+      "prompt": "Read the package table from the manifest and write 'name version' to output.txt.",
+      "initial_files": {
+        "Cargo.toml": "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "Cargo.toml": "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n",
+          "output.txt": "demo 0.2.0\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const m = read_file('Cargo.toml'); write_file('output.txt', m.match(/name = \"([^\"]*)\"/)[1] + ' ' + m.match(/version = \"([^\"]*)\"/)[1] + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const p = parseToml(read_file('Cargo.toml')).package; write_file('output.txt', p.name + ' ' + p.version + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseToml"
+    },
+    {
+      "name": "cargo_profile_setting",
+      "tags": [
+        "cargo",
+        "manifest",
+        "toml",
+        "profile"
+      ],
+      "prompt": "Read the release profile and write 'opt-level lto' to output.txt.",
+      "initial_files": {
+        "Cargo.toml": "[profile.release]\nopt-level = 3\nlto = true\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "Cargo.toml": "[profile.release]\nopt-level = 3\nlto = true\n",
+          "output.txt": "3 true\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "budgets": {
+        "max_provider_turns": 3,
+        "max_tool_calls": 2,
+        "max_total_tokens": 400
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const m = read_file('Cargo.toml'); write_file('output.txt', m.match(/opt-level = (\\S+)/)[1] + ' ' + m.match(/lto = (\\S+)/)[1] + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const p = parseToml(read_file('Cargo.toml'))['profile.release']; write_file('output.txt', p['opt-level'] + ' ' + p.lto + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseToml"
+    },
+    {
+      "name": "cargo_default_features",
+      "tags": [
+        "cargo",
+        "manifest",
+        "toml",
+        "features"
+      ],
+      "prompt": "Write every feature that is enabled in the manifest to output.txt, comma separated.",
+      "initial_files": {
+        "Cargo.toml": "[features]\ndefault_on = true\nextra = false\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "Cargo.toml": "[features]\ndefault_on = true\nextra = false\n",
+          "output.txt": "default_on\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const on = []; read_file('Cargo.toml').split('\\n').forEach((line) => { const at = line.indexOf(' = true'); if (at > 0) on.push(line.slice(0, at)); }); write_file('output.txt', on.join(',') + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const f = parseToml(read_file('Cargo.toml')).features; write_file('output.txt', Object.keys(f).filter((k) => f[k]).join(',') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseToml"
+    },
+    {
+      "name": "lockfile_checksum_lookup",
+      "tags": [
+        "cargo",
+        "lockfile",
+        "toml"
+      ],
+      "prompt": "Read the locked package entry and write 'name@version checksum' to output.txt.",
+      "initial_files": {
+        "lock.toml": "name = \"serde\"\nversion = \"1.0.0\"\nchecksum = \"abc123\"\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "lock.toml": "name = \"serde\"\nversion = \"1.0.0\"\nchecksum = \"abc123\"\n",
+          "output.txt": "serde@1.0.0 abc123\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const m = read_file('lock.toml'); write_file('output.txt', m.match(/name = \"([^\"]*)\"/)[1] + '@' + m.match(/version = \"([^\"]*)\"/)[1] + ' ' + m.match(/checksum = \"([^\"]*)\"/)[1] + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const l = parseToml(read_file('lock.toml')); write_file('output.txt', l.name + '@' + l.version + ' ' + l.checksum + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseToml"
+    },
+    {
+      "name": "workspace_member_listing",
+      "tags": [
+        "cargo",
+        "workspace",
+        "toml"
+      ],
+      "prompt": "Read the workspace table and write 'member resolver' to output.txt.",
+      "initial_files": {
+        "Cargo.toml": "[workspace]\nmember = \"spike\"\nresolver = 2\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "Cargo.toml": "[workspace]\nmember = \"spike\"\nresolver = 2\n",
+          "output.txt": "spike 2\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const m = read_file('Cargo.toml'); write_file('output.txt', m.match(/member = \"([^\"]*)\"/)[1] + ' ' + m.match(/resolver = (\\S+)/)[1] + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const w = parseToml(read_file('Cargo.toml')).workspace; write_file('output.txt', w.member + ' ' + w.resolver + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseToml"
+    },
+    {
+      "name": "csv_row_count",
+      "tags": [
+        "csv",
+        "parse",
+        "rows"
+      ],
+      "prompt": "Count the rows in the CSV file and write the count to output.txt.",
+      "initial_files": {
+        "rows.csv": "name,size\nalpha,3\nbeta,5\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "rows.csv": "name,size\nalpha,3\nbeta,5\n",
+          "output.txt": "3\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "write_file('output.txt', read_file('rows.csv').split('\\n').filter((line) => line.length > 0).length + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', parseCsv(read_file('rows.csv')).length + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseCsv"
+    },
+    {
+      "name": "csv_quoted_field",
+      "tags": [
+        "csv",
+        "parse",
+        "quoting"
+      ],
+      "prompt": "Split the quoted CSV line into fields and write them pipe separated to output.txt.",
+      "initial_files": {
+        "quoted.csv": "\"a,b\",c\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "quoted.csv": "\"a,b\",c\n",
+          "output.txt": "a,b|c\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const line = read_file('quoted.csv').split('\\n')[0]; const out = []; let field = '', quoted = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (c === '\"') quoted = !quoted; else if (c === ',' && !quoted) { out.push(field); field = ''; } else field += c; } out.push(field); write_file('output.txt', out.join('|') + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', parseCsv(read_file('quoted.csv'))[0].join('|') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseCsv"
+    },
+    {
+      "name": "csv_column_extract",
+      "tags": [
+        "csv",
+        "parse",
+        "column"
+      ],
+      "prompt": "Write the first column of every CSV data row to output.txt, one per line.",
+      "initial_files": {
+        "table.csv": "name,size\nalpha,3\nbeta,5\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "table.csv": "name,size\nalpha,3\nbeta,5\n",
+          "output.txt": "alpha\nbeta\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const rows = read_file('table.csv').split('\\n').slice(1).filter((line) => line.length > 0); write_file('output.txt', rows.map((line) => line.split(',')[0]).join('\\n') + '\\n'); 'ok'"
+        ],
+        "library": [
+          "const rows = parseCsv(read_file('table.csv')).slice(1); write_file('output.txt', rows.map((row) => row[0]).join('\\n') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "parseCsv"
+    },
+    {
+      "name": "release_note_rewrite_diff",
+      "tags": [
+        "diff",
+        "format",
+        "notes"
+      ],
+      "prompt": "Write a unified diff of the two note revisions to output.txt.",
+      "initial_files": {
+        "before.txt": "alpha\n",
+        "after.txt": "beta\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "before.txt": "alpha\n",
+          "after.txt": "beta\n",
+          "output.txt": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n-alpha\n-\n+beta\n+\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const before = read_file('before.txt'), after = read_file('after.txt'); const oldLines = before.split('\\n'), newLines = after.split('\\n'); const body = oldLines.map((line) => '-' + line).concat(newLines.map((line) => '+' + line)); const diff = before === after ? '' : '--- a/notes.txt\\n+++ b/notes.txt\\n@@ -1,' + oldLines.length + ' +1,' + newLines.length + ' @@\\n' + body.join('\\n'); write_file('output.txt', diff + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', unifiedDiff(read_file('before.txt'), read_file('after.txt'), 'notes.txt') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "unifiedDiff"
+    },
+    {
+      "name": "identical_files_empty_diff",
+      "tags": [
+        "diff",
+        "format",
+        "identical"
+      ],
+      "prompt": "Diff the two identical files and write the (empty) diff to output.txt.",
+      "initial_files": {
+        "left.txt": "same\n",
+        "right.txt": "same\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "left.txt": "same\n",
+          "right.txt": "same\n",
+          "output.txt": "\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const before = read_file('left.txt'), after = read_file('right.txt'); const oldLines = before.split('\\n'), newLines = after.split('\\n'); const body = oldLines.map((line) => '-' + line).concat(newLines.map((line) => '+' + line)); const diff = before === after ? '' : '--- a/left.txt\\n+++ b/left.txt\\n@@ -1,' + oldLines.length + ' +1,' + newLines.length + ' @@\\n' + body.join('\\n'); write_file('output.txt', diff + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', unifiedDiff(read_file('left.txt'), read_file('right.txt'), 'left.txt') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "unifiedDiff"
+    },
+    {
+      "name": "permission_path_diff",
+      "tags": [
+        "diff",
+        "format",
+        "permissions"
+      ],
+      "prompt": "Write a unified diff of the two permission paths to output.txt.",
+      "initial_files": {
+        "old.txt": "path = /tmp/a\n",
+        "new.txt": "path = /tmp/b\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "old.txt": "path = /tmp/a\n",
+          "new.txt": "path = /tmp/b\n",
+          "output.txt": "--- a/config.txt\n+++ b/config.txt\n@@ -1,2 +1,2 @@\n-path = /tmp/a\n-\n+path = /tmp/b\n+\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const before = read_file('old.txt'), after = read_file('new.txt'); const oldLines = before.split('\\n'), newLines = after.split('\\n'); const body = oldLines.map((line) => '-' + line).concat(newLines.map((line) => '+' + line)); const diff = before === after ? '' : '--- a/config.txt\\n+++ b/config.txt\\n@@ -1,' + oldLines.length + ' +1,' + newLines.length + ' @@\\n' + body.join('\\n'); write_file('output.txt', diff + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', unifiedDiff(read_file('old.txt'), read_file('new.txt'), 'config.txt') + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "unifiedDiff"
+    },
+    {
+      "name": "suite_summary_table",
+      "tags": [
+        "table",
+        "format",
+        "tests"
+      ],
+      "prompt": "Format the suite result rows as an aligned table in output.txt.",
+      "initial_files": {
+        "suite.json": "[[\"suite\", \"result\"], [\"js\", \"pass\"], [\"sandbox\", \"pass\"]]\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "suite.json": "[[\"suite\", \"result\"], [\"js\", \"pass\"], [\"sandbox\", \"pass\"]]\n",
+          "output.txt": "suite   | result\njs      | pass\nsandbox | pass\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const rows = JSON.parse(read_file('suite.json')); const cell = (row, i) => String(row[i] == null ? '' : row[i]); const width = rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.length)); const cols = Array.from({length: width}, (_, i) => Math.max(...rows.map((row) => cell(row, i).length))); const text = rows.map((row) => cols.map((n, i) => cell(row, i).padEnd(n)).join(' | ').replace(/\\s+$/, '')).join('\\n'); write_file('output.txt', text + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', formatTable(JSON.parse(read_file('suite.json'))) + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "formatTable"
+    },
+    {
+      "name": "empty_table_is_blank",
+      "tags": [
+        "table",
+        "format",
+        "empty"
+      ],
+      "prompt": "Format the empty row set as a table and write the result to output.txt.",
+      "initial_files": {
+        "empty.json": "[]\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "empty.json": "[]\n",
+          "output.txt": "\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const rows = JSON.parse(read_file('empty.json')); const cell = (row, i) => String(row[i] == null ? '' : row[i]); const width = rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.length)); const cols = Array.from({length: width}, (_, i) => Math.max(...rows.map((row) => cell(row, i).length))); const text = rows.map((row) => cols.map((n, i) => cell(row, i).padEnd(n)).join(' | ').replace(/\\s+$/, '')).join('\\n'); write_file('output.txt', text + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', formatTable(JSON.parse(read_file('empty.json'))) + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "formatTable"
+    },
+    {
+      "name": "ragged_rows_padded",
+      "tags": [
+        "table",
+        "format",
+        "ragged"
+      ],
+      "prompt": "Format the ragged rows as an aligned table in output.txt.",
+      "initial_files": {
+        "ragged.json": "[[\"a\", \"bb\"], [\"ccc\"]]\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "ragged.json": "[[\"a\", \"bb\"], [\"ccc\"]]\n",
+          "output.txt": "a   | bb\nccc |\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const rows = JSON.parse(read_file('ragged.json')); const cell = (row, i) => String(row[i] == null ? '' : row[i]); const width = rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.length)); const cols = Array.from({length: width}, (_, i) => Math.max(...rows.map((row) => cell(row, i).length))); const text = rows.map((row) => cols.map((n, i) => cell(row, i).padEnd(n)).join(' | ').replace(/\\s+$/, '')).join('\\n'); write_file('output.txt', text + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', formatTable(JSON.parse(read_file('ragged.json'))) + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "formatTable"
+    },
+    {
+      "name": "grep_hit_table",
+      "tags": [
+        "table",
+        "format",
+        "tools"
+      ],
+      "prompt": "Format the grep hit rows as an aligned table in output.txt.",
+      "initial_files": {
+        "hits.json": "[[\"src/lib.rs\", \"12\"], [\"src/main.rs\", \"3\"]]\n"
+      },
+      "oracle": {
+        "expected_files": {
+          "hits.json": "[[\"src/lib.rs\", \"12\"], [\"src/main.rs\", \"3\"]]\n",
+          "output.txt": "src/lib.rs  | 12\nsrc/main.rs | 3\n"
+        },
+        "id": "expected-files-v1"
+      },
+      "budgets": {
+        "max_provider_turns": 3,
+        "max_tool_calls": 2,
+        "max_total_tokens": 400
+      },
+      "scripted_provider_turns": {
+        "none": [
+          "const rows = JSON.parse(read_file('hits.json')); const cell = (row, i) => String(row[i] == null ? '' : row[i]); const width = rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.length)); const cols = Array.from({length: width}, (_, i) => Math.max(...rows.map((row) => cell(row, i).length))); const text = rows.map((row) => cols.map((n, i) => cell(row, i).padEnd(n)).join(' | ').replace(/\\s+$/, '')).join('\\n'); write_file('output.txt', text + '\\n'); 'ok'"
+        ],
+        "library": [
+          "write_file('output.txt', formatTable(JSON.parse(read_file('hits.json'))) + '\\n'); 'ok'"
+        ]
+      },
+      "expected_export": "formatTable"
+    },
+    {
+      "name": "default_json_value_passthrough",
+      "tags": [
+        "json",
+        "defaults",
+        "inheritance"
+      ]
+    }
   ]
 }

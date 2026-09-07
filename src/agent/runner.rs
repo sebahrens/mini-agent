@@ -9,7 +9,9 @@ use rig::completion::Usage;
 #[cfg(feature = "multimodal")]
 use rig::completion::message::{AudioMediaType, DocumentMediaType, ImageMediaType};
 use rig::completion::{CompletionModel, Message};
-use rig::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
+use rig::message::{
+    AssistantContent, Reasoning, ToolCall, ToolResult, ToolResultContent, UserContent,
+};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1386,6 +1388,25 @@ fn append_streamed_text(interactions: &mut Vec<Message>, text: &str) {
     interactions.push(Message::assistant(text.to_string()));
 }
 
+/// Record a completed reasoning item in the same assistant message that will
+/// carry the tool call that follows it.
+///
+/// The Responses API refuses a `function_call` whose associated `reasoning`
+/// item is missing, so any continuation that replays this transcript (a
+/// mid-stream retry, a verification re-prompt, a Stop-hook continuation) has to
+/// carry the reasoning across with the call. Providers stream the reasoning
+/// before the call, so arrival order is already the order rig serializes.
+fn append_reasoning(interactions: &mut Vec<Message>, reasoning: &Reasoning) {
+    if let Some(Message::Assistant { content, .. }) = interactions.last_mut() {
+        content.push(AssistantContent::Reasoning(reasoning.clone()));
+    } else {
+        interactions.push(Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::Reasoning(reasoning.clone())),
+        });
+    }
+}
+
 fn append_tool_call(interactions: &mut Vec<Message>, tool_call: &ToolCall) {
     if let Some(Message::Assistant { content, .. }) = interactions.last_mut() {
         content.push(AssistantContent::ToolCall(tool_call.clone()));
@@ -2255,6 +2276,11 @@ where
                 match item {
                     Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
                         if let Some(reasoning) = streamed_reasoning_text(&content) {
+                            // A complete reasoning item also has to enter the
+                            // replayed transcript; a delta is display only.
+                            if let StreamedAssistantContent::Reasoning(item) = &content {
+                                append_reasoning(&mut interactions, item);
+                            }
                             let _ = event_tx.send(AgentEvent::Reasoning(reasoning)).await;
                             continue;
                         }
@@ -3003,7 +3029,15 @@ where
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::Reasoning(r),
                 )) => {
+                    append_reasoning(&mut interactions, &r);
                     eprint!("{}", r.display_text());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+                )) => {
+                    // Display only: the complete item above is what gets replayed.
+                    eprint!("{reasoning}");
                     let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
@@ -6386,6 +6420,59 @@ mod tests {
             done_interactions.as_deref(),
             Some(expected_interactions.as_slice()),
             "the committed turn delta must be the exact model-visible continuation transcript"
+        );
+    }
+
+    /// A reasoning model whose stream is interrupted must replay its reasoning
+    /// item, not just its text. The Responses API rejects a continuation that
+    /// presents a `function_call` without the reasoning item it was emitted
+    /// with, so dropping reasoning from the replayed transcript kills the turn.
+    #[tokio::test]
+    async fn an_interrupted_turn_replays_the_reasoning_item_it_streamed() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::reasoning("weighing the options"),
+                MockStreamEvent::text("prefix "),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("suffix"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(2)
+            .build();
+
+        super::run_print_with_stream_policy(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            RunnerStreamPolicy::drop_next_terminal_responses(1),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("headless EOF recovery succeeds");
+
+        assert_eq!(model.requests().len(), 2);
+        let replayed = model.requests()[1]
+            .chat_history
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let carried_reasoning = replayed.iter().any(|message| match message {
+            Message::Assistant { content, .. } => content
+                .iter()
+                .any(|item| matches!(item, AssistantContent::Reasoning(_))),
+            _ => false,
+        });
+        assert!(
+            carried_reasoning,
+            "the continuation must replay the streamed reasoning item: {replayed:?}"
         );
     }
 

@@ -24,3 +24,7 @@ __pycache__/
 .claude/coderlm_state/
 .coderlm/
 .zerostack/
+
+# Default Skill Gym root: episode worktrees and per-arm AppPaths trees.
+# Override with MINI_AGENT_GYM_ROOT to place it outside the repository.
+.gym/
