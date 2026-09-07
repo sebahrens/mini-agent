@@ -75,6 +75,72 @@ fn pure_suite(expected: &str) -> HeldOutSuiteDraft {
     }
 }
 
+fn pure_suite_with_cases(first_case: usize, count: usize) -> HeldOutSuiteDraft {
+    HeldOutSuiteDraft {
+        selector: HeldOutSelector {
+            tags: vec!["normalize".to_string()],
+            exports: vec![SkillExport {
+                name: "normalize".to_string(),
+                signature: "normalize(value: unknown): string".to_string(),
+            }],
+            capability_tier: Some("pure".to_string()),
+        },
+        cases: (first_case..first_case + count)
+            .map(|index| HeldOutCase {
+                expression: format!("normalize(' case{index} ')"),
+                expected: ExpectedJsValue::String(format!("case{index}")),
+                fake_files: BTreeMap::new(),
+                fake_spawns: vec![],
+                fake_fetches: vec![],
+                transcript: TranscriptExpectation::default(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn skill_held_out_evaluator_refuses_a_corpus_above_the_matched_case_cap() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).expect("store");
+    let admin = AdminIdentity::authenticated("reviewer").expect("admin");
+    let artifact = pure_artifact();
+
+    // Two matched suites of 40 cases each: 80 cases against a 64-case cap.
+    let first_id = pure_suite_with_cases(0, 40)
+        .import(&mut store, &admin, 10)
+        .expect("import the first suite");
+    let second_id = pure_suite_with_cases(40, 40)
+        .import(&mut store, &admin, 11)
+        .expect("import the second suite");
+    assert_ne!(
+        first_id, second_id,
+        "the fixture must import two distinct suites"
+    );
+
+    let selected = select_suites(&store, &artifact).expect("selection");
+    assert_eq!(selected.len(), 2);
+    let matched_cases = selected
+        .iter()
+        .map(|suite| suite.cases.len())
+        .sum::<usize>();
+    assert_eq!(matched_cases, 80);
+
+    match evaluate(&store, &artifact, None) {
+        Err(HeldOutError::InvalidSuite(detail)) => {
+            assert!(
+                detail.contains("64-case evaluation cap"),
+                "unexpected refusal detail: {detail}"
+            );
+        }
+        other => panic!(
+            "a corpus above the case cap must be refused instead of binding \
+             suite hashes for cases that never ran, got {other:?}"
+        ),
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn skill_held_out_evaluator_import_selection_and_report_are_reproducible() {
     let (root, paths) = paths();

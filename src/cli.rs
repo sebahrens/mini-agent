@@ -329,6 +329,10 @@ pub struct Cli {
     )]
     pub learned_skill_json: bool,
 
+    // Agent Skills are only ever read by the catalog, index and loader, which
+    // exist only in a `skills` build. Without this gate the default release
+    // binary accepted the flag and installed a tree nothing would ever read.
+    #[cfg(feature = "skills")]
     #[arg(
         long = "import-agent-skill",
         value_name = "PATH",

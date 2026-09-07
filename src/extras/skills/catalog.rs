@@ -13,7 +13,10 @@ use crate::paths::{AppPaths, portable};
 use super::index::{AgentSkillIndex, AgentSkillRecord};
 use super::manifest::parse_skill_markdown;
 
-const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
+// A tree whose SKILL.md is larger than one turn's instruction budget can never
+// be surfaced, so it is omitted from the generation rather than ranked first
+// and then dropped. Import refuses to install one above this bound.
+const MAX_SKILL_MD_BYTES: u64 = super::MAX_SKILL_INSTRUCTION_BYTES;
 const MAX_RESOURCES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,11 @@ pub enum CatalogError {
     ResourceLimit,
     #[error("active Agent Skill digest does not exist: {0}")]
     MissingActiveDigest(String),
+    #[error(
+        "installed Agent Skill {0} has {1} digests and no ACTIVE pointer; \
+         re-import it to record which one is active"
+    )]
+    AmbiguousActiveDigest(String, usize),
 }
 
 /// Rebuildable catalog owner. Search readers receive only immutable `AgentSkillIndex` values.
@@ -50,12 +58,17 @@ pub struct AgentSkillCatalog {
     signature: Option<CatalogSignature>,
 }
 
+// A signature is only ever compared as a whole. The derived `PartialEq` reads
+// every field, but rustc does not count a derived impl as a read, so the allow
+// is scoped to these two types instead of the whole `extras::skills` module.
 #[derive(Clone, Eq, PartialEq)]
+#[allow(dead_code)]
 struct CatalogSignature {
     entries: Vec<CatalogSignatureEntry>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
+#[allow(dead_code)]
 struct CatalogSignatureEntry {
     path: PathBuf,
     bytes: u64,
@@ -258,7 +271,21 @@ fn select_active_digest(name_root: &Path) -> Result<Option<String>, CatalogError
         .filter(|digest| validate_digest(digest).is_ok())
         .collect::<Vec<_>>();
     digests.sort();
-    Ok(digests.pop())
+    // Never guess. Sorting the digests and taking the last one made the winner
+    // an artefact of SHA-256 ordering, so re-importing an updated skill could
+    // silently leave the older version active. Import writes the pointer; a
+    // package with several digests and no pointer is omitted instead.
+    match digests.len() {
+        0 => Ok(None),
+        1 => Ok(digests.pop()),
+        count => Err(CatalogError::AmbiguousActiveDigest(
+            name_root
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            count,
+        )),
+    }
 }
 
 fn validate_digest(digest: &str) -> Result<(), CatalogError> {

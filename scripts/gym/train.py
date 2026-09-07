@@ -79,6 +79,11 @@ def tail_text(data: bytes | None, limit: int = STDERR_TAIL_BYTES) -> str:
     return data[-limit:].decode("utf-8", errors="replace") if data else ""
 
 
+def elapsed_ms_since(started: float) -> int:
+    """Whole milliseconds since a `time.monotonic()` mark."""
+    return round((time.monotonic() - started) * 1000)
+
+
 def run(argv: list[str], cwd: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=timeout)
 
@@ -341,7 +346,13 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
         "production": False,
         "schema_version": SCHEMA_VERSION,
         "oracle_id": oracle["id"],
+        # Three separate clocks. `elapsed_ms` is the agent's own wall clock,
+        # because that is the number operators compare across arms; folding the
+        # oracle (and, in the library arm, the seed import) into it would make
+        # the library arm look slower for work the agent never did.
         "elapsed_ms": 0,
+        "oracle_ms": 0,
+        "total_ms": 0,
         "agent_exit": None,
         "oracle_exit": None,
         "oracle_pre_exit": None,
@@ -362,25 +373,33 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
     shutil.rmtree(root, ignore_errors=True)
     remove_workspace(repo, workspace)
     started = time.monotonic()
+    oracle_ms = 0
     try:
         prepare_workspace(repo, task, workspace, args.allow_empty_workspace)
         env = episode_env(root, args.provider, args.model, args.forward_env)
         if arm == "library":
             record["active_skill_ids"] = install_library(args.binary, str(task["library"]), env)
+        oracle_started = time.monotonic()
         pre_exit, pre_detail = run_oracle(oracle, workspace, env)
+        oracle_ms += elapsed_ms_since(oracle_started)
         record["oracle_pre_exit"] = pre_exit
         if pre_exit == 0:
             raise EpisodeFailure("task_invalid_oracle_passes_before_agent", pre_detail)
         argv = [args.binary, "--max-agent-turns", str(budgets["max_provider_turns"]), *args.agent_arg, "-p", str(task["prompt"])]
+        agent_started = time.monotonic()
         try:
             agent = run(argv, workspace, env, int(task["timeout_secs"]))
         except subprocess.TimeoutExpired as expired:
+            record["elapsed_ms"] = elapsed_ms_since(agent_started)
             record["agent_exit"] = TIMEOUT_EXIT
             record["agent_stderr_tail"] = tail_text(expired.stderr)
             raise EpisodeFailure("agent_timeout", f"agent exceeded {task['timeout_secs']}s") from None
+        record["elapsed_ms"] = elapsed_ms_since(agent_started)
         record["agent_exit"] = agent.returncode
         record["agent_stderr_tail"] = tail_text(agent.stderr)
+        oracle_started = time.monotonic()
         post_exit, post_detail = run_oracle(oracle, workspace, env)
+        oracle_ms += elapsed_ms_since(oracle_started)
         record["oracle_exit"] = post_exit
         if agent.returncode:
             record["failure_reason"] = "agent_exit_nonzero"
@@ -397,7 +416,11 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
         remove_workspace(repo, workspace)
         if not args.keep_run_dirs:
             shutil.rmtree(root, ignore_errors=True)
-        record["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+        record["oracle_ms"] = oracle_ms
+        # Everything the episode cost, so the library arm's seed-import and
+        # workspace setup overhead stays visible instead of hiding inside the
+        # agent's number.
+        record["total_ms"] = elapsed_ms_since(started)
     return record
 
 

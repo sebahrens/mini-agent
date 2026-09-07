@@ -123,6 +123,10 @@ fn add_configuration_hint(error: anyhow::Error) -> anyhow::Error {
 
 /// Mark an explicit operator-command failure so [`add_configuration_hint`]
 /// leaves it alone.
+///
+/// Every operator command that can fail this way is behind `skills`, so the
+/// non-`skills` binary keeps the helper only for its own tests.
+#[cfg_attr(not(feature = "skills"), allow(dead_code))]
 fn operator_command_failure(error: anyhow::Error) -> anyhow::Error {
     error.context(OperatorCommandFailure)
 }
@@ -187,13 +191,22 @@ async fn run_inner() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Gated with the flag in `cli.rs`: the catalog, index and loader that read an
+    // installed tree only exist in a `skills` build, so importing anywhere else
+    // would validate and install a tree nothing ever reads.
+    #[cfg(feature = "skills")]
     if let Some(source) = cli.import_agent_skill.as_deref() {
         let imported = extras::skills::import_agent_skill(source, &app_paths)
             .map_err(|error| operator_command_failure(error.into()))?;
         println!(
-            "Agent Skill imported: {} digest={} path={} reimported={}",
+            "Agent Skill imported: {} digest={} identity_version={} entries={} files={} \
+             bytes={} path={} reimported={}",
             imported.manifest.name,
             imported.identity.digest,
+            imported.identity.version,
+            imported.identity.entries,
+            imported.identity.files,
+            imported.identity.expanded_bytes,
             imported.install_path.display(),
             imported.reimported
         );

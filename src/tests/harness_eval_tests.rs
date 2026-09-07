@@ -489,7 +489,9 @@ fn scripted_case(
 #[test]
 fn harness_eval_fixture_contract_is_complete() {
     let fixtures = parse_fixtures();
-    assert_eq!(fixtures.len(), 5);
+    // No length check against `FIXTURES` here: `parse_fixtures` maps that
+    // array, so its length can only restate the constant. The name set below
+    // is read out of the fixture files themselves and does pin the suite.
     let names = fixtures
         .iter()
         .map(|fixture| fixture.name.as_str())
@@ -1515,7 +1517,26 @@ async fn harness_regression_eval() {
         all_metrics.push(metrics);
     }
 
-    assert_eq!(all_metrics.len(), FIXTURES.len());
+    // Measured, not counted: comparing `all_metrics.len()` with `FIXTURES.len()`
+    // would only restate this loop's own input. Every fixture must instead have
+    // driven a real provider turn, a real tool call and real token usage, so a
+    // harness that silently stopped exercising the agent fails here.
+    let names = all_metrics
+        .iter()
+        .map(|metrics| metrics.name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names.len(),
+        all_metrics.len(),
+        "each fixture must report exactly one metrics row"
+    );
+    for metrics in &all_metrics {
+        assert!(
+            metrics.provider_turns > 0 && metrics.tool_calls > 0 && metrics.total_tokens > 0,
+            "{} recorded no measured work: {metrics:?}",
+            metrics.name
+        );
+    }
 }
 
 #[tokio::test]
@@ -1523,7 +1544,13 @@ async fn harness_regression_eval() {
 async fn persona_regression_eval() {
     let fixture: PersonaFixture =
         serde_json::from_str(PERSONA_FIXTURE).expect("valid persona harness fixture");
-    assert_eq!(fixture.cases.len(), 9, "one case per shipped persona");
+    // A fixture-file shape guard, not a claim about the persona set: each case
+    // is separately proven to name a persona that really resolves, below.
+    assert_eq!(
+        fixture.cases.len(),
+        9,
+        "the persona fixture must keep all nine cases"
+    );
     let names = fixture
         .cases
         .iter()

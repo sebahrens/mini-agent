@@ -4,14 +4,47 @@ set -euo pipefail
 step=initialization
 trap 'printf "gym setup failed during %s\n" "$step" >&2' ERR
 
+step=workspace_location
+# Resolve before deciding: `$(pwd)`, `$1` and MINI_AGENT_GYM_ROOT can all reach
+# the temp root through a symlink (macOS `/tmp` -> `/private/tmp`), and the
+# unresolved spelling walks straight past a literal prefix test. Resolves the
+# deepest existing ancestor so a gym root that does not exist yet still gets a
+# real path.
+resolve_path() {
+  target=$1
+  if [ -d "$target" ]; then
+    (cd "$target" && pwd -P)
+    return
+  fi
+  parent=$(dirname "$target")
+  if [ -d "$parent" ]; then
+    parent=$(cd "$parent" && pwd -P)
+    printf '%s/%s\n' "${parent%/}" "$(basename "$target")"
+  else
+    printf '%s\n' "$target"
+  fi
+}
+
 repo=${1:-$(pwd)}
-gym_root=${MINI_AGENT_GYM_ROOT:-"$repo/.gym"}
-case "$repo" in
-  /private/tmp|/private/tmp/*)
-    printf 'gym setup refuses workspaces under /private/tmp (Seatbelt test boundary)\n' >&2
-    exit 2
-    ;;
-esac
+if [ ! -d "$repo" ]; then
+  printf 'gym setup: %s is not a directory\n' "$repo" >&2
+  exit 2
+fi
+repo=$(resolve_path "$repo")
+gym_root=$(resolve_path "${MINI_AGENT_GYM_ROOT:-"$repo/.gym"}")
+# Both trees must stay out of the system temp root. macOS Seatbelt write-allows
+# /private/tmp wholesale, and Linux bwrap replaces /tmp with a fresh tmpfs, so a
+# workspace or a per-arm data/state/cache tree living there is either outside
+# the boundary under test or invisible to the sandboxed child.
+for candidate in "$repo" "$gym_root"; do
+  case "$candidate" in
+    /tmp|/tmp/*|/private/tmp|/private/tmp/*)
+      printf 'gym setup refuses workspaces under the system temp root (sandbox boundary): %s\n' \
+        "$candidate" >&2
+      exit 2
+      ;;
+  esac
+done
 
 step=prerequisites
 command -v cargo >/dev/null

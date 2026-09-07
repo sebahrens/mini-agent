@@ -18,7 +18,7 @@ use crate::agent::prompt;
 use crate::agent::runner::{self, AgentRunner};
 use crate::auth::{AuthResolver, ProviderKind};
 use crate::cli::Cli;
-use crate::config::{ApiStyle, Config, CustomProviderConfig};
+use crate::config::{ApiStyle, Config, CustomProviderConfig, ReasoningConfig};
 use crate::context::ContextFiles;
 #[cfg(any(feature = "hooks", feature = "subagents"))]
 use crate::event::AgentEvent;
@@ -245,11 +245,25 @@ pub(crate) fn merge_extra_body(
     }
 }
 
-/// Adds an opaque, stable per-session routing key for OpenAI Responses prompt caching. Explicit
-/// user configuration retains precedence over the generated default.
+/// The one `include` value this agent requests on the Responses path, and the
+/// only one rig's closed `Include` enum needs for reasoning replay.
+pub(crate) const REASONING_ENCRYPTED_CONTENT: &str = "reasoning.encrypted_content";
+
+/// Builds the Responses-API defaults this agent always wants: an opaque,
+/// stable per-session prompt-cache routing key, the typed `reasoning` object,
+/// and the `include` entry that makes a persisted reasoning item replayable.
+///
+/// Requesting `reasoning.encrypted_content` is what turns a stored reasoning
+/// item into something replayable *without* server-side state: rig adds that
+/// `include` only when a `reasoning` object is already present, so a session
+/// configured with no reasoning object would otherwise persist items carrying
+/// nothing but an id — ids that resolve only if the upstream itself stored the
+/// response. Explicit user `extra_body` configuration keeps precedence over
+/// every generated default.
 pub(crate) fn openai_responses_extra_body(
     extra: Option<serde_json::Value>,
     session_id: &str,
+    reasoning: Option<&ReasoningConfig>,
 ) -> Option<serde_json::Value> {
     use std::fmt::Write as _;
 
@@ -257,8 +271,63 @@ pub(crate) fn openai_responses_extra_body(
     for byte in Sha256::digest(session_id.as_bytes()) {
         write!(&mut prompt_cache_key, "{byte:02x}").expect("writing to a String cannot fail");
     }
+    let mut base = serde_json::Map::new();
+    base.insert(
+        "prompt_cache_key".to_string(),
+        serde_json::Value::String(prompt_cache_key),
+    );
+
+    let mut reasoning_object = serde_json::Map::new();
+    if let Some(config) = reasoning {
+        if let Some(effort) = config.effort {
+            reasoning_object.insert(
+                "effort".to_string(),
+                serde_json::Value::String(effort.as_wire_str().to_string()),
+            );
+        }
+        if let Some(summary) = config.summary {
+            reasoning_object.insert(
+                "summary".to_string(),
+                serde_json::Value::String(summary.as_wire_str().to_string()),
+            );
+        }
+        if let Some(store) = config.store {
+            base.insert("store".to_string(), serde_json::Value::Bool(store));
+        }
+    }
+    if !reasoning_object.is_empty() {
+        base.insert(
+            "reasoning".to_string(),
+            serde_json::Value::Object(reasoning_object),
+        );
+    }
+    if ReasoningConfig::wants_encrypted_content(reasoning) {
+        base.insert(
+            "include".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(
+                REASONING_ENCRYPTED_CONTENT.to_string(),
+            )]),
+        );
+    }
+
+    merge_extra_body(Some(serde_json::Value::Object(base)), extra)
+}
+
+/// Maps the typed reasoning config onto the Chat Completions request body.
+///
+/// Completions has no `reasoning` object and no summary or encrypted-content
+/// concept; only the top-level `reasoning_effort` key exists, so everything
+/// else in [`ReasoningConfig`] is deliberately dropped here rather than sent
+/// under a key the endpoint would ignore.
+pub(crate) fn openai_completions_extra_body(
+    extra: Option<serde_json::Value>,
+    reasoning: Option<&ReasoningConfig>,
+) -> Option<serde_json::Value> {
+    let Some(effort) = reasoning.and_then(|config| config.effort) else {
+        return extra;
+    };
     merge_extra_body(
-        Some(serde_json::json!({"prompt_cache_key": prompt_cache_key})),
+        Some(serde_json::json!({"reasoning_effort": effort.as_wire_str()})),
         extra,
     )
 }
@@ -1749,7 +1818,11 @@ async fn build_openai_agent(
                 tool_result_spills.clone(),
                 reasoning_enabled,
                 temperature,
-                openai_responses_extra_body(extra_body, tool_output_session_id),
+                openai_responses_extra_body(
+                    extra_body,
+                    tool_output_session_id,
+                    cfg.reasoning.as_ref(),
+                ),
                 #[cfg(feature = "js")]
                 js_worker_containment_status.clone(),
                 #[cfg(feature = "js")]
@@ -1777,7 +1850,7 @@ async fn build_openai_agent(
                 tool_result_spills,
                 reasoning_enabled,
                 temperature,
-                extra_body,
+                openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
                 #[cfg(feature = "js")]
                 js_worker_containment_status,
                 #[cfg(feature = "js")]
@@ -2291,7 +2364,11 @@ pub fn build_btw_agent(
                 tool_result_spills.clone(),
                 reasoning_enabled,
                 temperature,
-                openai_responses_extra_body(extra_body, tool_output_session_id),
+                openai_responses_extra_body(
+                    extra_body,
+                    tool_output_session_id,
+                    cfg.reasoning.as_ref(),
+                ),
             )),
             OpenAiModel::Completions(m) => {
                 OpenAiAgent::Completions(builder::build_btw_agent_inner(
@@ -2306,7 +2383,7 @@ pub fn build_btw_agent(
                     tool_result_spills.clone(),
                     reasoning_enabled,
                     temperature,
-                    extra_body,
+                    openai_completions_extra_body(extra_body, cfg.reasoning.as_ref()),
                 ))
             }
         }),

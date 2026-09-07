@@ -192,7 +192,18 @@ def beads_from_file(path: Path) -> list[dict[str, object]]:
 
 
 def load_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]]:
-    """Enumerate beads from `bd`, falling back to an exported JSONL file."""
+    """Enumerate beads in a stable order.
+
+    `bd list` documents no ordering and the JSONL export follows write order,
+    so `--limit` would otherwise select a different subset from run to run and
+    a mined task file would not be reproducible. Sorting by id here is the only
+    ordering guarantee `mine()` relies on.
+    """
+    return sorted(collect_beads(repo, beads_json), key=lambda bead: str(bead.get("id", "")))
+
+
+def collect_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]]:
+    """Read beads from `bd`, falling back to an exported JSONL file."""
     fallback = beads_json or (repo / ".beads" / "issues.jsonl")
     if beads_json is not None:
         return beads_from_file(beads_json)
@@ -221,6 +232,28 @@ def load_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]]:
     if not isinstance(parsed, list):
         raise SystemExit("gym mine: bd list did not return an array of beads")
     return [bead for bead in parsed if isinstance(bead, dict)]
+
+
+def mined_prompt(bead: dict[str, object]) -> str:
+    """Compose an agent prompt from everything the bead actually says.
+
+    The title alone under-specifies a mined task: the description carries the
+    reproduction and the intended fix, and `acceptance_criteria` carries the
+    definition of done. Sections the bead does not have are omitted rather than
+    emitted empty.
+    """
+    def text(key: str) -> str:
+        value = bead.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    parts = [text("title") or str(bead.get("id", ""))]
+    description = text("description")
+    if description:
+        parts.append(f"Description:\n{description}")
+    acceptance = text("acceptance_criteria")
+    if acceptance:
+        parts.append(f"Acceptance criteria:\n{acceptance}")
+    return "\n\n".join(parts)
 
 
 def normalized_entry(bead_id: str, value: object) -> dict[str, object]:
@@ -295,7 +328,7 @@ def mine(
         tasks.append(
             {
                 "name": bead_id,
-                "prompt": str(bead.get("title") or bead.get("description") or bead_id),
+                "prompt": mined_prompt(bead),
                 "tags": sorted(set(bead.get("labels") or []) | {"mined", "fail-to-pass"}),
                 "base_commit": parent,
                 "initial_files": initial,

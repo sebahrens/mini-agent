@@ -842,3 +842,245 @@ mod default_permission_mode {
         );
     }
 }
+
+mod responses_extra_body_validation {
+    use crate::config::load::validate_responses_extra_body;
+
+    #[test]
+    fn unknown_completions_style_keys_are_reported_not_dropped_in_silence() {
+        // qr2y: rig's AdditionalParameters has no deny_unknown_fields, so
+        // `reasoning_effort` on the Responses path never reaches the provider.
+        let mut extra = serde_json::json!({
+            "reasoning_effort": "high",
+            "max_completion_tokens": 100,
+            "store": false,
+        });
+        let warnings = validate_responses_extra_body("extra_body", &mut extra).unwrap();
+        let joined = warnings.join("\n");
+        assert!(joined.contains("reasoning_effort"), "{joined}");
+        assert!(joined.contains("max_completion_tokens"), "{joined}");
+        // Keys the Responses body does honor are never flagged.
+        assert!(!joined.contains("store"), "{joined}");
+        // Warning only: the honored keys survive untouched.
+        assert_eq!(extra["store"], false);
+    }
+
+    #[test]
+    fn known_responses_keys_produce_no_warnings() {
+        let mut extra = serde_json::json!({
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "service_tier": "flex",
+            "metadata": {"run": "1"},
+        });
+        assert!(
+            validate_responses_extra_body("extra_body", &mut extra)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn previous_response_id_is_stripped_with_a_warning() {
+        let mut extra = serde_json::json!({
+            "previous_response_id": "resp_123",
+            "store": true,
+        });
+        let warnings = validate_responses_extra_body("extra_body", &mut extra).unwrap();
+        assert!(extra.get("previous_response_id").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("previous_response_id")),
+            "{warnings:?}"
+        );
+        assert_eq!(extra["store"], true);
+    }
+
+    #[test]
+    fn unsupported_include_value_is_rejected_and_names_the_accepted_ones() {
+        let mut extra = serde_json::json!({"include": ["reasoning.encrypted_contents"]});
+        let error = validate_responses_extra_body("extra_body", &mut extra)
+            .expect_err("an include value outside rig's closed enum must be rejected");
+        assert!(error.contains("reasoning.encrypted_contents"), "{error}");
+        for accepted in [
+            "reasoning.encrypted_content",
+            "file_search_call.results",
+            "message.input_image.image_url",
+            "computer_call.output.image_url",
+            "code_interpreter_call.outputs",
+        ] {
+            assert!(error.contains(accepted), "{error} lacks {accepted}");
+        }
+    }
+
+    #[test]
+    fn include_must_be_an_array_of_strings() {
+        let mut extra = serde_json::json!({"include": "reasoning.encrypted_content"});
+        let error = validate_responses_extra_body("extra_body", &mut extra)
+            .expect_err("a scalar include must be rejected");
+        assert!(error.contains("array"), "{error}");
+
+        let mut numeric = serde_json::json!({"include": [7]});
+        assert!(validate_responses_extra_body("extra_body", &mut numeric).is_err());
+    }
+
+    #[test]
+    fn non_table_extra_body_is_rejected_with_its_shape() {
+        let mut extra = serde_json::json!(["reasoning"]);
+        let error = validate_responses_extra_body("quick_models.gpt.extra_body", &mut extra)
+            .expect_err("an array extra_body must be rejected");
+        assert!(error.contains("quick_models.gpt.extra_body"), "{error}");
+        assert!(error.contains("an array"), "{error}");
+    }
+}
+
+mod extra_body_api_style_scoping {
+    use crate::config::Config;
+    use crate::config::load::validate_extra_body;
+    use crate::config::types::{ApiStyle, QuickModelConfig};
+    use compact_str::CompactString;
+    use std::collections::HashMap;
+
+    fn gateway(api_style: Option<ApiStyle>) -> super::CustomProviderConfig {
+        super::CustomProviderConfig {
+            api_style,
+            ..super::custom_provider("openai")
+        }
+    }
+
+    fn quick_model(provider: &str, extra_body: serde_json::Value) -> QuickModelConfig {
+        QuickModelConfig {
+            provider: CompactString::new(provider),
+            model: CompactString::new("gpt-5"),
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            reserve_tokens: None,
+            temperature: None,
+            extra_body: Some(extra_body),
+            context_window: None,
+        }
+    }
+
+    #[test]
+    fn direct_openai_extra_body_is_validated() {
+        let mut cfg = Config {
+            provider: Some(CompactString::new("openai")),
+            extra_body: Some(serde_json::json!({
+                "reasoning_effort": "high",
+                "previous_response_id": "resp_1",
+            })),
+            ..Config::default()
+        };
+        let warnings = validate_extra_body(&mut cfg).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let extra = cfg.extra_body.as_ref().unwrap();
+        assert!(extra.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn completions_gateway_extra_body_is_left_alone() {
+        // A base_url-bearing OpenAI-compatible gateway defaults to Chat
+        // Completions, where `reasoning_effort` is the correct key and no
+        // Responses schema applies.
+        let mut providers = HashMap::new();
+        providers.insert("gw".to_string(), gateway(None));
+        let mut cfg = Config {
+            provider: Some(CompactString::new("gw")),
+            custom_providers: Some(providers),
+            extra_body: Some(serde_json::json!({
+                "reasoning_effort": "high",
+                "previous_response_id": "resp_1",
+            })),
+            ..Config::default()
+        };
+        assert!(validate_extra_body(&mut cfg).unwrap().is_empty());
+        assert_eq!(
+            cfg.extra_body.as_ref().unwrap()["previous_response_id"],
+            "resp_1"
+        );
+    }
+
+    #[test]
+    fn gateway_pinned_to_responses_is_validated() {
+        let mut providers = HashMap::new();
+        providers.insert("gw".to_string(), gateway(Some(ApiStyle::Responses)));
+        let mut cfg = Config {
+            provider: Some(CompactString::new("gw")),
+            custom_providers: Some(providers),
+            extra_body: Some(serde_json::json!({"include": ["nope"]})),
+            ..Config::default()
+        };
+        assert!(validate_extra_body(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn quick_model_extra_body_is_validated_against_its_own_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("gw".to_string(), gateway(None));
+        let mut quick_models = HashMap::new();
+        quick_models.insert(
+            "direct".to_string(),
+            quick_model("openai", serde_json::json!({"max_completion_tokens": 10})),
+        );
+        quick_models.insert(
+            "gatewayed".to_string(),
+            quick_model("gw", serde_json::json!({"max_completion_tokens": 10})),
+        );
+        let mut cfg = Config {
+            provider: Some(CompactString::new("anthropic")),
+            custom_providers: Some(providers),
+            quick_models: Some(quick_models),
+            ..Config::default()
+        };
+        let warnings = validate_extra_body(&mut cfg).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("quick_models.direct.extra_body"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn non_openai_provider_is_not_validated() {
+        let mut cfg = Config {
+            provider: Some(CompactString::new("openrouter")),
+            extra_body: Some(serde_json::json!({"previous_response_id": "resp_1"})),
+            ..Config::default()
+        };
+        assert!(validate_extra_body(&mut cfg).unwrap().is_empty());
+        assert_eq!(
+            cfg.extra_body.as_ref().unwrap()["previous_response_id"],
+            "resp_1"
+        );
+    }
+}
+
+#[test]
+fn reasoning_tokens_are_exclusive_only_for_gemini() {
+    // mini-agent-6mpw: OpenAI folds reasoning into `output_tokens`; Gemini
+    // reports `thoughtsTokenCount` alongside `candidatesTokenCount`.
+    let cfg = Config::default();
+    assert!(cfg.reasoning_tokens_are_exclusive_of_output("gemini"));
+    assert!(cfg.reasoning_tokens_are_exclusive_of_output("google"));
+    for provider in ["openai", "anthropic", "openrouter", "ollama", "custom"] {
+        assert!(
+            !cfg.reasoning_tokens_are_exclusive_of_output(provider),
+            "{provider} folds reasoning into output tokens"
+        );
+    }
+}
+
+#[test]
+fn reasoning_tokens_exclusivity_resolves_custom_provider_type() {
+    let mut providers = HashMap::new();
+    providers.insert("gw".to_string(), custom_provider("gemini"));
+    providers.insert("compat".to_string(), custom_provider("openai"));
+    let cfg = Config {
+        custom_providers: Some(providers),
+        ..Config::default()
+    };
+    assert!(cfg.reasoning_tokens_are_exclusive_of_output("gw"));
+    assert!(!cfg.reasoning_tokens_are_exclusive_of_output("compat"));
+}

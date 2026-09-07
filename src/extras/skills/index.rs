@@ -21,6 +21,11 @@ pub struct AgentSkillRecord {
     pub skill_md_sha256: String,
     pub resources: Vec<ResourceMetadata>,
     /// Non-authoritative display metadata only.
+    ///
+    /// Deliberately retained and deliberately unread: the import contract is
+    /// that `allowed-tools` never reaches a permission decision, and
+    /// `agent_skill_catalog.rs` asserts it survives as inert metadata.
+    #[allow(dead_code)]
     pub allowed_tools: Option<String>,
     /// Exact learned-JS identities declared by the immutable Agent Skill tree.
     pub learned_js: Vec<String>,
@@ -53,7 +58,9 @@ impl Default for AgentSkillSearchPolicy {
             max_skills: 3,
             score_floor: 0.20,
             metadata_byte_budget: 8 * 1024,
-            instruction_byte_budget: 48 * 1024,
+            // Shared with the import-time refusal so a skill can never be
+            // installed above the budget that would drop it from every turn.
+            instruction_byte_budget: super::MAX_SKILL_INSTRUCTION_BYTES as usize,
         }
     }
 }

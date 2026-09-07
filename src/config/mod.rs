@@ -59,6 +59,16 @@ pub struct Config {
     /// doubt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Value>,
+    /// First-class reasoning controls for the OpenAI family: `effort` and
+    /// `summary` map to the Responses API's `reasoning` object (and `effort`
+    /// alone to Chat Completions' `reasoning_effort`), `encrypted_content`
+    /// governs the `include: ["reasoning.encrypted_content"]` request that
+    /// makes persisted reasoning items replayable, and `store` selects
+    /// server-side retention. See [`ReasoningConfig`] for the
+    /// `store`/`previous_response_id` caveats on gateways that do not persist
+    /// response state. A raw `extra_body` key still wins on collision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub retry: RetryConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,6 +366,27 @@ impl Config {
         matches!(
             crate::auth::ProviderKind::from_name(kind_name),
             Some(crate::auth::ProviderKind::Anthropic)
+        )
+    }
+
+    /// Whether `provider` reports reasoning/thinking tokens *in addition to*
+    /// its output-token count rather than as a subset of it.
+    ///
+    /// Gemini is the exception: `thoughtsTokenCount` is reported alongside
+    /// `candidatesTokenCount`, so reasoning has to be added to reconstruct
+    /// what the turn actually cost. OpenAI (Responses and Chat Completions),
+    /// Anthropic and the OpenAI-compatible gateways all fold reasoning into
+    /// `output_tokens` — adding it there charges the same tokens twice.
+    pub fn reasoning_tokens_are_exclusive_of_output(&self, provider: &str) -> bool {
+        let kind_name = self
+            .custom_providers
+            .as_ref()
+            .and_then(|m| m.get(provider))
+            .map(|c| c.provider_type.as_str())
+            .unwrap_or(provider);
+        matches!(
+            crate::auth::ProviderKind::from_name(kind_name),
+            Some(crate::auth::ProviderKind::Gemini)
         )
     }
 

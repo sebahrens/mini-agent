@@ -389,15 +389,28 @@ pub(crate) fn evaluate(
     if suites.is_empty() {
         return Err(HeldOutError::SuiteRequired);
     }
+    // Every hash pushed into `suite_hashes` is bound into the report identity
+    // and the approval packet as an assertion that the whole suite ran. Running
+    // only a prefix of the last suite while still binding its full hash would
+    // claim coverage that never executed, so a corpus that cannot be evaluated
+    // in full is refused outright instead of silently sampled.
+    let matched_cases = suites
+        .iter()
+        .map(|suite| suite.cases.len())
+        .try_fold(0usize, |total, count| total.checked_add(count))
+        .unwrap_or(usize::MAX);
+    if matched_cases > MAX_MATCHED_CASES {
+        return Err(HeldOutError::InvalidSuite(format!(
+            "matched held-out cases exceed the {MAX_MATCHED_CASES}-case evaluation cap: \
+             {matched_cases} cases across {} suites",
+            suites.len()
+        )));
+    }
     let mut case_reports = Vec::new();
     let mut suite_hashes = Vec::with_capacity(suites.len());
-    let mut remaining_cases = MAX_MATCHED_CASES;
     for suite in suites {
-        if remaining_cases == 0 {
-            break;
-        }
         suite_hashes.push(suite.content_hash.clone());
-        for (case_index, case) in suite.cases.iter().take(remaining_cases).enumerate() {
+        for (case_index, case) in suite.cases.iter().enumerate() {
             let transcript = verify_held_out_case(
                 artifact,
                 &case.expression,
@@ -431,7 +444,6 @@ pub(crate) fn evaluate(
                 case_index,
                 passed: true,
             });
-            remaining_cases -= 1;
         }
     }
 

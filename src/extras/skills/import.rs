@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 use crate::paths::AppPaths;
 use crate::{fs as secure_fs, paths::portable};
 
+use super::catalog::{AgentSkillCatalog, CatalogError};
 use super::manifest::{AgentSkillManifest, ManifestError, parse_skill_markdown};
 
-#[cfg(feature = "skills")]
 use crate::extras::js::skills::store::SkillStore;
 
 const TREE_IDENTITY_VERSION: &[u8] = b"mini-agent-agent-skill-tree-v1";
@@ -62,6 +62,13 @@ pub enum ImportError {
     VerificationFailed,
     #[error("installed Agent Skill digest path already contains different content")]
     DigestConflict,
+    #[error(
+        "SKILL.md is {bytes} bytes; an Agent Skill may install at most {budget} bytes of \
+         instructions, because a larger SKILL.md is never selected for a turn"
+    )]
+    InstructionBudgetExceeded { bytes: u64, budget: u64 },
+    #[error("installed Agent Skill tree could not be made active: {0}")]
+    Activation(String),
     #[error(
         "learned-js identity {id} is unavailable through the verified lifecycle gate: {reason}"
     )]
@@ -229,6 +236,7 @@ pub fn import_agent_skill(
     };
 
     let (tree, manifest) = normalize_skill_tree(tree, expected_directory.as_deref())?;
+    validate_instruction_budget(&tree)?;
     validate_learned_js_references(&manifest, app_paths)?;
     let identity = identity(&tree);
 
@@ -250,6 +258,7 @@ pub fn import_agent_skill(
     if fs::symlink_metadata(&install_path).is_ok() {
         validate_existing(&install_path, &manifest.name, &identity.digest)?;
         staging_cleanup.remove_now()?;
+        activate_installed(app_paths, &manifest.name, &identity.digest)?;
         return Ok(ImportedSkill {
             manifest,
             identity,
@@ -270,6 +279,7 @@ pub fn import_agent_skill(
             validate_existing(&install_path, &manifest.name, &identity.digest)?;
             publication_cleanup.remove_now()?;
             staging_cleanup.remove_now()?;
+            activate_installed(app_paths, &manifest.name, &identity.digest)?;
             return Ok(ImportedSkill {
                 manifest,
                 identity,
@@ -281,6 +291,7 @@ pub fn import_agent_skill(
     }
 
     staging_cleanup.remove_now()?;
+    activate_installed(app_paths, &manifest.name, &identity.digest)?;
     Ok(ImportedSkill {
         manifest,
         identity,
@@ -289,7 +300,38 @@ pub fn import_agent_skill(
     })
 }
 
-#[cfg(feature = "skills")]
+/// Point the catalog at the tree this import just installed.
+///
+/// The pointer is the only record of which installed version is current. An
+/// import that skipped it left the catalog to guess, and the guess was the
+/// lexicographic maximum of the digest directories, so re-importing an updated
+/// skill could silently leave the old one active.
+fn activate_installed(app_paths: &AppPaths, name: &str, digest: &str) -> Result<(), ImportError> {
+    AgentSkillCatalog::new(app_paths)
+        .activate(name, digest)
+        .map_err(|error| match error {
+            CatalogError::Io(error) => ImportError::Io(error),
+            other => ImportError::Activation(other.to_string()),
+        })
+}
+
+/// Refuse a `SKILL.md` larger than one turn's whole instruction budget.
+///
+/// Such a file installs, embeds and ranks first, and is then dropped by
+/// `AgentSkillIndex::apply_budgets` on every turn. Refusing here states the
+/// budget once, to the operator running the import, instead of logging a
+/// per-turn diagnostic nobody is watching.
+fn validate_instruction_budget(tree: &SourceTree) -> Result<(), ImportError> {
+    let bytes = tree.file("SKILL.md").map_or(0, <[u8]>::len) as u64;
+    if bytes > super::MAX_SKILL_INSTRUCTION_BYTES {
+        return Err(ImportError::InstructionBudgetExceeded {
+            bytes,
+            budget: super::MAX_SKILL_INSTRUCTION_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn validate_learned_js_references(
     manifest: &AgentSkillManifest,
     app_paths: &AppPaths,
@@ -329,20 +371,6 @@ fn validate_learned_js_references(
                 reason: format!("lifecycle state is {lifecycle_state:?}"),
             });
         }
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "skills"))]
-fn validate_learned_js_references(
-    manifest: &AgentSkillManifest,
-    _app_paths: &AppPaths,
-) -> Result<(), ImportError> {
-    if let Some(id) = manifest.learned_js.first() {
-        return Err(ImportError::LearnedJsUnavailable {
-            id: id.clone(),
-            reason: "this binary was built without learned-skill support".to_string(),
-        });
     }
     Ok(())
 }
@@ -1286,5 +1314,98 @@ mod tests {
             import_agent_skill(&directory, &temp.paths()),
             Err(ImportError::UnsafeEntry(_))
         ));
+    }
+
+    #[test]
+    fn agent_skill_import_activates_the_digest_it_installed() {
+        let temp = TempRoot::new();
+        let marker = temp.0.join("executed");
+        let directory = write_directory_skill(&temp.0, "pointed-skill", &marker);
+        let pointer = temp
+            .paths()
+            .data_dir
+            .join("agent-skills")
+            .join("pointed-skill")
+            .join("ACTIVE");
+
+        let first = import_agent_skill(&directory, &temp.paths()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&pointer).unwrap().trim(),
+            first.identity.digest,
+            "import must record which installed digest is active"
+        );
+
+        fs::write(
+            directory.join("SKILL.md"),
+            b"---\nname: pointed-skill\ndescription: A second version of the same skill.\n---\n\n# V2\n",
+        )
+        .unwrap();
+        let second = import_agent_skill(&directory, &temp.paths()).unwrap();
+        assert_ne!(first.identity.digest, second.identity.digest);
+        assert_eq!(
+            fs::read_to_string(&pointer).unwrap().trim(),
+            second.identity.digest,
+            "re-importing an updated skill must not leave the old version active"
+        );
+
+        // The re-import path is the same: it points at what it validated.
+        let again = import_agent_skill(&directory, &temp.paths()).unwrap();
+        assert!(again.reimported);
+        assert_eq!(
+            fs::read_to_string(&pointer).unwrap().trim(),
+            second.identity.digest
+        );
+    }
+
+    #[test]
+    fn agent_skill_import_refuses_instructions_over_the_turn_budget() {
+        let temp = TempRoot::new();
+        let directory = temp.0.join("verbose-skill");
+        fs::create_dir_all(&directory).unwrap();
+        let header = "---\nname: verbose-skill\ndescription: Says far too much.\n---\n\n";
+        let padding = usize::try_from(super::super::MAX_SKILL_INSTRUCTION_BYTES).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("{header}{}\n", "instruction ".repeat(padding / 12)),
+        )
+        .unwrap();
+
+        let error = import_agent_skill(&directory, &temp.paths()).unwrap_err();
+        assert!(
+            matches!(error, ImportError::InstructionBudgetExceeded { budget, .. }
+                if budget == super::super::MAX_SKILL_INSTRUCTION_BYTES),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&super::super::MAX_SKILL_INSTRUCTION_BYTES.to_string()),
+            "the refusal must state the budget: {error}"
+        );
+        assert!(
+            !temp
+                .paths()
+                .data_dir
+                .join("agent-skills")
+                .join("verbose-skill")
+                .exists(),
+            "a refused skill must not be installed"
+        );
+    }
+
+    #[test]
+    fn agent_skill_import_accepts_instructions_at_the_turn_budget() {
+        let temp = TempRoot::new();
+        let directory = temp.0.join("exact-skill");
+        fs::create_dir_all(&directory).unwrap();
+        let header = "---\nname: exact-skill\ndescription: Says exactly enough.\n---\n\n";
+        let budget = usize::try_from(super::super::MAX_SKILL_INSTRUCTION_BYTES).unwrap();
+        let mut markdown = header.to_string();
+        markdown.push_str(&"x".repeat(budget - header.len()));
+        assert_eq!(markdown.len(), budget);
+        fs::write(directory.join("SKILL.md"), &markdown).unwrap();
+
+        let imported = import_agent_skill(&directory, &temp.paths()).unwrap();
+        assert_eq!(imported.manifest.name, "exact-skill");
     }
 }

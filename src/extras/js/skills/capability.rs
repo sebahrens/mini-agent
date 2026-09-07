@@ -48,6 +48,35 @@ pub enum CapabilityError {
     InvalidArguments,
     #[error("effect dispatcher denied the request")]
     DispatchDenied,
+    /// A brokered effect returned a typed closed error code.
+    ///
+    /// The code is preserved so the learned-skill ABI can raise the same
+    /// code-bearing exception model-authored globals already receive. Without
+    /// it a missing file, an oversized read, a timeout and a real denial all
+    /// reach skill code as one opaque exception.
+    #[error("effect failed: {0:?}")]
+    EffectFailed(EffectErrorCode),
+}
+
+/// Stable JS-visible token for one closed effect error code.
+///
+/// Mirrors the mapping the worker's model-authored `effect_error` helper uses,
+/// so a learned skill and a model-authored global observe the same `code`
+/// string for the same failure.
+pub(crate) fn effect_error_code_token(code: EffectErrorCode) -> &'static str {
+    match code {
+        EffectErrorCode::Denied => "denied",
+        EffectErrorCode::CapabilityDenied => "capability_denied",
+        EffectErrorCode::InvalidTarget => "invalid_target",
+        EffectErrorCode::NotFound => "not_found",
+        EffectErrorCode::IsDirectory => "is_directory",
+        EffectErrorCode::Cancelled => "cancelled",
+        EffectErrorCode::TimedOut => "timed_out",
+        EffectErrorCode::TooLarge => "too_large",
+        EffectErrorCode::BackendFailure => "backend_failure",
+        EffectErrorCode::AuditFailure => "audit_failure",
+        EffectErrorCode::OutcomeUnknown => "outcome_unknown",
+    }
 }
 
 /// Parent-issued authority for exactly one ABI-v2 export invocation.
@@ -560,22 +589,10 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
         | EffectResult::ProposalAccepted { .. } => {
             return Err(CapabilityError::DispatchDenied);
         }
-        EffectResult::Error(error) => {
-            let _closed_code = match error.code {
-                EffectErrorCode::Denied
-                | EffectErrorCode::CapabilityDenied
-                | EffectErrorCode::InvalidTarget
-                | EffectErrorCode::NotFound
-                | EffectErrorCode::IsDirectory
-                | EffectErrorCode::Cancelled
-                | EffectErrorCode::TimedOut
-                | EffectErrorCode::TooLarge
-                | EffectErrorCode::BackendFailure
-                | EffectErrorCode::AuditFailure
-                | EffectErrorCode::OutcomeUnknown => error.code,
-            };
-            return Err(CapabilityError::DispatchDenied);
-        }
+        // The closed code is carried to the ABI boundary instead of being
+        // collapsed into one opaque denial, so a skill can distinguish a
+        // missing file from a revoked capability.
+        EffectResult::Error(error) => return Err(CapabilityError::EffectFailed(error.code)),
     };
     serde_json::to_string(&value).map_err(|_| CapabilityError::DispatchDenied)
 }
@@ -744,4 +761,74 @@ impl Drop for CapabilityGuard {
 
 pub fn tier_may_automate(tier: CapabilityTier) -> bool {
     matches!(tier, CapabilityTier::Pure | CapabilityTier::ReadOnly)
+}
+
+#[cfg(test)]
+mod effect_error_code_tests {
+    use super::*;
+    use crate::extras::js::protocol::EffectError;
+
+    #[test]
+    fn a_failed_effect_carries_its_closed_code_to_the_abi_boundary() {
+        for code in [
+            EffectErrorCode::Denied,
+            EffectErrorCode::CapabilityDenied,
+            EffectErrorCode::InvalidTarget,
+            EffectErrorCode::NotFound,
+            EffectErrorCode::IsDirectory,
+            EffectErrorCode::Cancelled,
+            EffectErrorCode::TimedOut,
+            EffectErrorCode::TooLarge,
+            EffectErrorCode::BackendFailure,
+            EffectErrorCode::AuditFailure,
+            EffectErrorCode::OutcomeUnknown,
+        ] {
+            let error = encode_effect_result(EffectResult::Error(EffectError { code }))
+                .expect_err("a failed effect must not encode as a value");
+            match error {
+                CapabilityError::EffectFailed(observed) => assert_eq!(observed, code),
+                other => panic!("effect code {code:?} was discarded as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_closed_effect_code_has_a_distinct_stable_token() {
+        let codes = [
+            EffectErrorCode::Denied,
+            EffectErrorCode::CapabilityDenied,
+            EffectErrorCode::InvalidTarget,
+            EffectErrorCode::NotFound,
+            EffectErrorCode::IsDirectory,
+            EffectErrorCode::Cancelled,
+            EffectErrorCode::TimedOut,
+            EffectErrorCode::TooLarge,
+            EffectErrorCode::BackendFailure,
+            EffectErrorCode::AuditFailure,
+            EffectErrorCode::OutcomeUnknown,
+        ];
+        let tokens = codes
+            .iter()
+            .map(|code| effect_error_code_token(*code))
+            .collect::<HashSet<_>>();
+        assert_eq!(tokens.len(), codes.len(), "effect codes must not collide");
+        // The tokens must match the ones model-authored effect globals throw.
+        assert_eq!(
+            effect_error_code_token(EffectErrorCode::NotFound),
+            "not_found"
+        );
+        assert_eq!(
+            effect_error_code_token(EffectErrorCode::TooLarge),
+            "too_large"
+        );
+        assert_eq!(
+            effect_error_code_token(EffectErrorCode::TimedOut),
+            "timed_out"
+        );
+        assert_eq!(
+            effect_error_code_token(EffectErrorCode::BackendFailure),
+            "backend_failure"
+        );
+        assert_eq!(effect_error_code_token(EffectErrorCode::Denied), "denied");
+    }
 }

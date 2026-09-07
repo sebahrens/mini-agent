@@ -1040,3 +1040,244 @@ fn test_purge_deletes_invalid_legacy_id_without_raw_tombstone()
     std::fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }
+
+/// The full durable schema and lexical index state, for equality across opens.
+fn schema_fingerprint(store: &SkillStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut fingerprint = store
+        .conn()
+        .prepare(
+            "SELECT type, name, COALESCE(sql, '')
+               FROM sqlite_master
+              WHERE name NOT LIKE 'sqlite_%'
+                AND name NOT LIKE '__fts5_test_%'
+              ORDER BY type, name",
+        )?
+        .query_map([], |row| {
+            Ok(format!(
+                "{}|{}|{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    fingerprint.sort();
+    Ok(fingerprint)
+}
+
+fn fts_identifiers(store: &SkillStore) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(store
+        .conn()
+        .prepare("SELECT identifier FROM skill_search ORDER BY identifier")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+#[test]
+fn test_reopening_a_migrated_database_replays_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let skill = minimal_skill()?;
+
+    let (expected_schema, expected_fts, expected_row_version) = {
+        let mut store = SkillStore::open_at(&paths)?;
+        store.insert_verified(&skill)?;
+        store.conn_mut().execute(
+            "UPDATE skill_revisions SET status = 'active' WHERE id = ?",
+            [&skill.id],
+        )?;
+        let fts = fts_identifiers(&store)?;
+        assert_eq!(
+            fts,
+            vec![skill.id.clone()],
+            "the identity-v2 FTS trigger must index the activated revision"
+        );
+        let row_version: i64 = store.conn().query_row(
+            "SELECT row_version FROM skill_revisions WHERE id = ?",
+            [&skill.id],
+            |row| row.get(0),
+        )?;
+        (schema_fingerprint(&store)?, fts, row_version)
+    };
+
+    // Re-running the migrations on an already-migrated database must not
+    // rewrite the FTS triggers, repopulate the index, or rebuild any table.
+    for round in 0..3 {
+        let store = SkillStore::open_at(&paths)?;
+        assert_eq!(
+            store
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            crate::extras::js::skills::store::CURRENT_SCHEMA_VERSION,
+            "round {round} changed the schema version"
+        );
+        assert_eq!(
+            schema_fingerprint(&store)?,
+            expected_schema,
+            "round {round} rewrote the durable schema"
+        );
+        assert_eq!(
+            fts_identifiers(&store)?,
+            expected_fts,
+            "round {round} rebuilt the lexical index"
+        );
+        assert_eq!(
+            store.conn().query_row(
+                "SELECT row_version FROM skill_revisions WHERE id = ?",
+                [&skill.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            expected_row_version,
+            "round {round} rewrote a live revision row"
+        );
+    }
+
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_concurrent_openers_do_not_replay_applied_migrations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let db_dir = paths.local_data_dir.join("skills");
+    std::fs::create_dir_all(&db_dir)?;
+    let db_path = db_dir.join("skills.db");
+
+    // Hold the write lock on an empty database so every opener reads
+    // `user_version = 0` before any of them can begin migrating. Each opener
+    // that loses the race must then observe the winner's committed version
+    // from inside its own write transaction and skip the applied steps.
+    let blocker = Connection::open(&db_path)?;
+    blocker.busy_timeout(std::time::Duration::from_secs(30))?;
+    let journal_mode: String =
+        blocker.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    assert!(journal_mode.eq_ignore_ascii_case("wal"));
+    blocker.execute_batch("BEGIN IMMEDIATE;")?;
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let openers = (0..4)
+        .map(|_| {
+            let base = temp_dir.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || -> Result<u32, String> {
+                let paths = resolve_test_paths(&base).map_err(|error| error.to_string())?;
+                barrier.wait();
+                let store = SkillStore::open_at(&paths).map_err(|error| error.to_string())?;
+                store
+                    .conn()
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    blocker.execute_batch("COMMIT;")?;
+    drop(blocker);
+
+    for opener in openers {
+        let version = opener.join().expect("migration opener thread panicked")?;
+        assert_eq!(
+            version,
+            crate::extras::js::skills::store::CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    let store = SkillStore::open_at(&paths)?;
+    let triggers = store
+        .conn()
+        .prepare(
+            "SELECT name, sql FROM sqlite_master
+              WHERE type = 'trigger' AND name LIKE 'skill_search%'
+              ORDER BY name",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        triggers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["skill_search_ad", "skill_search_ai", "skill_search_au"]
+    );
+    for (name, sql) in &triggers {
+        if name == "skill_search_ad" {
+            continue;
+        }
+        assert!(
+            sql.contains("identity_version = 2"),
+            "{name} was rewritten to its pre-v5 definition by a replayed migration: {sql}"
+        );
+    }
+    let proposals: String = store.conn().query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'skill_proposals'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        proposals.contains("evaluation_attempts_exhausted"),
+        "skill_proposals was rebuilt at an older schema version: {proposals}"
+    );
+
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_migration_step_skips_a_version_another_migrator_already_applied()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::extras::js::skills::store::{CURRENT_SCHEMA_VERSION, migration_step_for_test};
+
+    let temp_dir = temp_app_paths();
+    let paths = resolve_test_paths(&temp_dir)?;
+    let store = SkillStore::open_at(&paths)?;
+
+    // Re-running an already-applied step — what a process that read a stale
+    // `user_version` before waiting on another migrator's lock would do — must
+    // not execute the step body.
+    let replayed = std::cell::Cell::new(false);
+    migration_step_for_test(store.conn(), CURRENT_SCHEMA_VERSION, || {
+        replayed.set(true);
+        Ok(())
+    })?;
+    assert!(
+        !replayed.get(),
+        "a step whose version is already committed must not run again"
+    );
+    for earlier in 1..CURRENT_SCHEMA_VERSION {
+        migration_step_for_test(store.conn(), earlier, || {
+            replayed.set(true);
+            Ok(())
+        })?;
+    }
+    assert!(!replayed.get(), "no earlier step may be replayed either");
+    assert_eq!(
+        store
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+        CURRENT_SCHEMA_VERSION
+    );
+
+    // A step that has not been applied still runs and advances the version.
+    let applied = std::cell::Cell::new(false);
+    let next = CURRENT_SCHEMA_VERSION + 1;
+    migration_step_for_test(store.conn(), next, || {
+        applied.set(true);
+        store.conn().pragma_update(None, "user_version", next)?;
+        Ok(())
+    })?;
+    assert!(applied.get(), "an unapplied step must run");
+    assert_eq!(
+        store
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+        next
+    );
+
+    std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}

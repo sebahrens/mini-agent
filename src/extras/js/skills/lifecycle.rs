@@ -660,127 +660,23 @@ impl<'a> LifecycleService<'a> {
         Ok(())
     }
 
+    /// Apply one lifecycle transition in its own `BEGIN IMMEDIATE`.
+    ///
+    /// Callers that must write policy or evidence rows atomically with the
+    /// decision own the transaction themselves and use
+    /// [`register_policy_in_tx`] plus [`transition_in_tx`] instead.
     pub(crate) fn transition(
         &mut self,
         request: &TransitionRequest,
         created_at: i64,
     ) -> Result<TransitionOutcome, LifecycleError> {
-        validate_request(request)?;
-        if request.to_status == LifecycleStatus::Active
-            || (request.from_status == LifecycleStatus::Active
-                && request.to_status == LifecycleStatus::Superseded)
-        {
-            return Err(LifecycleError::PrivilegedTransition);
-        }
         let tx = self
             .store
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        if let Some(replayed) = read_idempotent_transition(&tx, request)? {
-            tx.commit()?;
-            return Ok(replayed);
-        }
-
-        ensure_policy_exists(&tx, &request.snapshot.policy_version)?;
-        ensure_snapshot_evidence(&tx, &request.snapshot, false, None)?;
-        let current = read_revision(&tx, &request.skill_id)?;
-        if current.status == LifecycleStatus::Rejected {
-            return Err(LifecycleError::RejectedIsTerminal);
-        }
-        if current.status != request.from_status {
-            return Err(LifecycleError::IllegalTransition {
-                role: "revision",
-                skill_id: current.id.clone(),
-                from: current.status,
-                to: request.to_status,
-            });
-        }
-        if current.row_version != request.expected_row_version {
-            return Err(LifecycleError::StaleRowVersion {
-                skill_id: current.id,
-                expected: request.expected_row_version,
-                actual: current.row_version,
-            });
-        }
-
-        let (desired_generation, _): (i64, i64) = tx.query_row(
-            "SELECT desired_generation, applied_generation
-             FROM skill_generations WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if desired_generation != request.snapshot.index_generation {
-            return Err(LifecycleError::StaleGeneration {
-                expected: request.snapshot.index_generation,
-                actual: desired_generation,
-            });
-        }
-
-        validate_lineage(&tx, &current, request.to_status)?;
-        let next_generation = desired_generation + 1;
-        let next_row_version = current.row_version + 1;
-        let changed = tx.execute(
-            "UPDATE skill_revisions
-             SET status = ?, row_version = ?, updated_at = ?
-             WHERE id = ? AND status = ? AND row_version = ?",
-            params![
-                request.to_status.as_token(),
-                next_row_version,
-                created_at,
-                request.skill_id,
-                request.from_status.as_token(),
-                request.expected_row_version
-            ],
-        )?;
-        if changed != 1 {
-            return Err(LifecycleError::StaleRowVersion {
-                skill_id: request.skill_id.clone(),
-                expected: request.expected_row_version,
-                actual: current.row_version,
-            });
-        }
-
-        tx.execute(
-            "UPDATE skill_generations
-             SET desired_generation = ?, updated_at = ?
-             WHERE singleton = 1 AND desired_generation = ?",
-            params![next_generation, created_at, desired_generation],
-        )?;
-
-        let evidence_snapshot = request.snapshot.canonical_json()?;
-        tx.execute(
-            "INSERT INTO skill_transitions (
-                idempotency_key, skill_id, predecessor_id, from_status,
-                to_status, reason, evidence_snapshot, policy_version,
-                row_version_from, row_version_to, desired_generation, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                request.idempotency_key,
-                request.skill_id,
-                request.snapshot.predecessor_id,
-                request.from_status.as_token(),
-                request.to_status.as_token(),
-                request.reason,
-                evidence_snapshot,
-                request.snapshot.policy_version,
-                current.row_version,
-                next_row_version,
-                next_generation,
-                created_at,
-            ],
-        )?;
-        let transition_id = tx.last_insert_rowid();
+        let outcome = transition_in_tx(&tx, request, created_at)?;
         tx.commit()?;
-
-        Ok(TransitionOutcome {
-            transition_id,
-            skill_id: request.skill_id.clone(),
-            status: request.to_status,
-            row_version: next_row_version,
-            desired_generation: next_generation,
-            replayed: false,
-        })
+        Ok(outcome)
     }
 
     /// Record Phase 4's first authenticated approval after the unchanged
@@ -1457,6 +1353,162 @@ fn insert_approval(
                 format!("{expected:?}"),
                 existing.map_or_else(|| "none".to_string(), |row| format!("{row:?}")),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply one lifecycle transition inside a caller-owned transaction.
+///
+/// Callers that must write policy or evidence rows atomically with the
+/// decision open the `BEGIN IMMEDIATE` themselves and pass it here, so a crash
+/// between those writes and the decision can never leave evidence for a
+/// transition that was never applied. Every idempotency, policy, evidence,
+/// row-version, generation, and lineage guard is unchanged; only the commit
+/// belongs to the caller.
+pub(crate) fn transition_in_tx(
+    tx: &Transaction<'_>,
+    request: &TransitionRequest,
+    created_at: i64,
+) -> Result<TransitionOutcome, LifecycleError> {
+    validate_request(request)?;
+    if request.to_status == LifecycleStatus::Active
+        || (request.from_status == LifecycleStatus::Active
+            && request.to_status == LifecycleStatus::Superseded)
+    {
+        return Err(LifecycleError::PrivilegedTransition);
+    }
+
+    if let Some(replayed) = read_idempotent_transition(tx, request)? {
+        return Ok(replayed);
+    }
+
+    ensure_policy_exists(tx, &request.snapshot.policy_version)?;
+    ensure_snapshot_evidence(tx, &request.snapshot, false, None)?;
+    let current = read_revision(tx, &request.skill_id)?;
+    if current.status == LifecycleStatus::Rejected {
+        return Err(LifecycleError::RejectedIsTerminal);
+    }
+    if current.status != request.from_status {
+        return Err(LifecycleError::IllegalTransition {
+            role: "revision",
+            skill_id: current.id.clone(),
+            from: current.status,
+            to: request.to_status,
+        });
+    }
+    if current.row_version != request.expected_row_version {
+        return Err(LifecycleError::StaleRowVersion {
+            skill_id: current.id,
+            expected: request.expected_row_version,
+            actual: current.row_version,
+        });
+    }
+
+    let (desired_generation, _): (i64, i64) = tx.query_row(
+        "SELECT desired_generation, applied_generation
+             FROM skill_generations WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if desired_generation != request.snapshot.index_generation {
+        return Err(LifecycleError::StaleGeneration {
+            expected: request.snapshot.index_generation,
+            actual: desired_generation,
+        });
+    }
+
+    validate_lineage(tx, &current, request.to_status)?;
+    let next_generation = desired_generation + 1;
+    let next_row_version = current.row_version + 1;
+    let changed = tx.execute(
+        "UPDATE skill_revisions
+             SET status = ?, row_version = ?, updated_at = ?
+             WHERE id = ? AND status = ? AND row_version = ?",
+        params![
+            request.to_status.as_token(),
+            next_row_version,
+            created_at,
+            request.skill_id,
+            request.from_status.as_token(),
+            request.expected_row_version
+        ],
+    )?;
+    if changed != 1 {
+        return Err(LifecycleError::StaleRowVersion {
+            skill_id: request.skill_id.clone(),
+            expected: request.expected_row_version,
+            actual: current.row_version,
+        });
+    }
+
+    tx.execute(
+        "UPDATE skill_generations
+             SET desired_generation = ?, updated_at = ?
+             WHERE singleton = 1 AND desired_generation = ?",
+        params![next_generation, created_at, desired_generation],
+    )?;
+
+    let evidence_snapshot = request.snapshot.canonical_json()?;
+    tx.execute(
+        "INSERT INTO skill_transitions (
+                idempotency_key, skill_id, predecessor_id, from_status,
+                to_status, reason, evidence_snapshot, policy_version,
+                row_version_from, row_version_to, desired_generation, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            request.idempotency_key,
+            request.skill_id,
+            request.snapshot.predecessor_id,
+            request.from_status.as_token(),
+            request.to_status.as_token(),
+            request.reason,
+            evidence_snapshot,
+            request.snapshot.policy_version,
+            current.row_version,
+            next_row_version,
+            next_generation,
+            created_at,
+        ],
+    )?;
+    let transition_id = tx.last_insert_rowid();
+
+    Ok(TransitionOutcome {
+        transition_id,
+        skill_id: request.skill_id.clone(),
+        status: request.to_status,
+        row_version: next_row_version,
+        desired_generation: next_generation,
+        replayed: false,
+    })
+}
+
+/// Register a policy version inside a caller-owned transaction.
+///
+/// The same idempotency contract as [`LifecycleService::register_policy`]: a
+/// byte-identical re-registration is a no-op, a conflicting one is refused.
+pub(crate) fn register_policy_in_tx(
+    tx: &Transaction<'_>,
+    policy_version: &str,
+    canonical_policy_json: &str,
+    created_at: i64,
+) -> Result<(), LifecycleError> {
+    let parsed: serde_json::Value = serde_json::from_str(canonical_policy_json)?;
+    let canonical = serde_json::to_string(&parsed)?;
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO skill_policy_versions
+            (policy_version, policy_json, created_at)
+         VALUES (?, ?, ?)",
+        params![policy_version, canonical, created_at],
+    )?;
+    if changed == 0 {
+        let existing: String = tx.query_row(
+            "SELECT policy_json FROM skill_policy_versions WHERE policy_version = ?",
+            [policy_version],
+            |row| row.get(0),
+        )?;
+        if existing != canonical {
+            return Err(LifecycleError::IdempotencyConflict);
         }
     }
     Ok(())

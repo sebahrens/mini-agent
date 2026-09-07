@@ -196,29 +196,66 @@ struct SkillUsageStats {
     passed_with: u64,
     baseline_tasks: u64,
     baseline_passes: u64,
+    /// Tasks observed for this skill outside production (`MINI_AGENT_GYM`).
+    ///
+    /// Reported separately so gym traffic is visible without inflating the
+    /// operator-facing utility columns, which count production rows only.
+    gym_tasks: u64,
     user_positive: u64,
     user_negative: u64,
     declared_effect_methods: u64,
     estimated_round_trips_saved: u64,
 }
 
+/// Column header for [`SkillUsageStats::to_line`].
+///
+/// `tasks_with`, `passed_with` and `pass_rate_without` are derived from task
+/// outcomes recorded against a `verify_command`: an operator who runs without
+/// one records `no_verify_command` rows, which carry no pass/fail signal and
+/// are excluded, so those three columns stay empty for that operator.
+const SKILL_STATS_HEADER: &str = "id\tstatus\tinvocations\tsuccess\tlast_used_unix\t\
+     tasks_with\tpassed_with\tpass_rate_without\tgym_tasks\tuser_positive\tuser_negative\t\
+     declared_effect_methods\test_round_trips_saved";
+
 impl SkillUsageStats {
-    fn success_percent(&self) -> f64 {
+    /// `None` when the ratio has no denominator, so "no observations" and "0%"
+    /// stay distinguishable.
+    fn success_percent(&self) -> Option<f64> {
         let terminals = self.direct_successes.saturating_add(self.direct_failures);
-        if terminals == 0 {
-            0.0
-        } else {
-            self.direct_successes as f64 * 100.0 / terminals as f64
-        }
+        (terminals != 0).then(|| self.direct_successes as f64 * 100.0 / terminals as f64)
     }
 
-    fn pass_rate_without_percent(&self) -> f64 {
-        if self.baseline_tasks == 0 {
-            0.0
-        } else {
-            self.baseline_passes as f64 * 100.0 / self.baseline_tasks as f64
-        }
+    /// `None` when no comparable task ran without the skill. An empty baseline
+    /// is not a 0% baseline.
+    fn pass_rate_without_percent(&self) -> Option<f64> {
+        (self.baseline_tasks != 0)
+            .then(|| self.baseline_passes as f64 * 100.0 / self.baseline_tasks as f64)
     }
+
+    fn to_line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.skill_id,
+            self.status,
+            self.invocations,
+            render_percent(self.success_percent()),
+            self.last_used
+                .map_or_else(|| "never".to_string(), |value| value.to_string()),
+            self.tasks_with,
+            self.passed_with,
+            render_percent(self.pass_rate_without_percent()),
+            self.gym_tasks,
+            self.user_positive,
+            self.user_negative,
+            self.declared_effect_methods,
+            self.estimated_round_trips_saved,
+        )
+    }
+}
+
+/// Render a percentage, or `n/a` where the denominator was zero.
+fn render_percent(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}%"))
 }
 
 fn estimate_round_trips_saved(direct_successes: u64, declared_effect_methods: u64) -> u64 {
@@ -240,6 +277,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                    JOIN skill_task_outcomes AS outcome
                      ON outcome.evidence_id = link.evidence_id
                   WHERE link.skill_id = revision.id
+                    AND outcome.production = 1
                     AND outcome.source_kind != 'no_verify_command'),
                 (SELECT COUNT(DISTINCT CASE WHEN outcome.verify_passed = 1
                                            THEN outcome.turn_id END)
@@ -247,10 +285,12 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                    JOIN skill_task_outcomes AS outcome
                      ON outcome.evidence_id = link.evidence_id
                   WHERE link.skill_id = revision.id
+                    AND outcome.production = 1
                     AND outcome.source_kind != 'no_verify_command'),
                 (SELECT COUNT(DISTINCT baseline.turn_id)
                    FROM skill_task_outcomes AS baseline
-                  WHERE baseline.source_kind != 'no_verify_command'
+                  WHERE baseline.production = 1
+                    AND baseline.source_kind != 'no_verify_command'
                     AND NOT EXISTS (
                         SELECT 1 FROM skill_task_outcome_links AS absent
                          WHERE absent.evidence_id = baseline.evidence_id
@@ -261,13 +301,15 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                           JOIN skill_task_outcome_links AS observed_link
                             ON observed_link.evidence_id = observed.evidence_id
                          WHERE observed_link.skill_id = revision.id
+                           AND observed.production = 1
                            AND observed.source_kind = baseline.source_kind
                            AND observed.source_id IS baseline.source_id
                     )),
                 (SELECT COUNT(DISTINCT CASE WHEN baseline.verify_passed = 1
                                            THEN baseline.turn_id END)
                    FROM skill_task_outcomes AS baseline
-                  WHERE baseline.source_kind != 'no_verify_command'
+                  WHERE baseline.production = 1
+                    AND baseline.source_kind != 'no_verify_command'
                     AND NOT EXISTS (
                         SELECT 1 FROM skill_task_outcome_links AS absent
                          WHERE absent.evidence_id = baseline.evidence_id
@@ -278,9 +320,17 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                           JOIN skill_task_outcome_links AS observed_link
                             ON observed_link.evidence_id = observed.evidence_id
                          WHERE observed_link.skill_id = revision.id
+                           AND observed.production = 1
                            AND observed.source_kind = baseline.source_kind
                            AND observed.source_id IS baseline.source_id
                     )),
+                (SELECT COUNT(DISTINCT outcome.turn_id)
+                   FROM skill_task_outcome_links AS link
+                   JOIN skill_task_outcomes AS outcome
+                     ON outcome.evidence_id = link.evidence_id
+                  WHERE link.skill_id = revision.id
+                    AND outcome.production = 0
+                    AND outcome.source_kind != 'no_verify_command'),
                 COALESCE(stats.user_positive_count, 0),
                 COALESCE(stats.user_negative_count, 0),
                 revision.capability_json
@@ -303,7 +353,8 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             row.get::<_, i64>(9)?,
             row.get::<_, i64>(10)?,
             row.get::<_, i64>(11)?,
-            row.get::<_, String>(12)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, String>(13)?,
         ))
     })?;
     rows.map(|row| {
@@ -318,6 +369,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             passed_with,
             baseline_tasks,
             baseline_passes,
+            gym_tasks,
             user_positive,
             user_negative,
             capability_json,
@@ -338,6 +390,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
             passed_with: u64::try_from(passed_with).unwrap_or(0),
             baseline_tasks: u64::try_from(baseline_tasks).unwrap_or(0),
             baseline_passes: u64::try_from(baseline_passes).unwrap_or(0),
+            gym_tasks: u64::try_from(gym_tasks).unwrap_or(0),
             user_positive: u64::try_from(user_positive).unwrap_or(0),
             user_negative: u64::try_from(user_negative).unwrap_or(0),
             declared_effect_methods,
@@ -353,35 +406,19 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
 pub(crate) fn print_skill_stats(paths: &AppPaths) -> anyhow::Result<()> {
     let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let rows = load_skill_stats(&store).context("failed to read learned-skill usage")?;
-    println!(
-        "id\tstatus\tinvocations\tsuccess\tlast_used_unix\ttasks_with\tpassed_with\tpass_rate_without\tuser_positive\tuser_negative\tdeclared_effect_methods\test_round_trips_saved"
-    );
+    println!("{SKILL_STATS_HEADER}");
     for row in &rows {
-        println!(
-            "{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{:.1}%\t{}\t{}\t{}\t{}",
-            row.skill_id,
-            row.status,
-            row.invocations,
-            row.success_percent(),
-            row.last_used
-                .map_or_else(|| "never".into(), |value| value.to_string()),
-            row.tasks_with,
-            row.passed_with,
-            row.pass_rate_without_percent(),
-            row.user_positive,
-            row.user_negative,
-            row.declared_effect_methods,
-            row.estimated_round_trips_saved,
-        );
+        println!("{}", row.to_line());
     }
     let invocations = rows.iter().map(|row| row.invocations).sum::<u64>();
     let saved = rows
         .iter()
         .map(|row| row.estimated_round_trips_saved)
         .sum::<u64>();
+    let gym = rows.iter().map(|row| row.gym_tasks).sum::<u64>();
     let positive = rows.iter().map(|row| row.user_positive).sum::<u64>();
     let negative = rows.iter().map(|row| row.user_negative).sum::<u64>();
-    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t{positive}\t{negative}\t-\t{saved}");
+    println!("total\t-\t{invocations}\t-\t-\t-\t-\t-\t{gym}\t{positive}\t{negative}\t-\t{saved}");
     Ok(())
 }
 
@@ -1698,6 +1735,9 @@ fn contain_severe_feedback(
 
 #[cfg(test)]
 mod tests {
+    use super::super::telemetry::{
+        EventBatch, SkillEvent, SkillEventKind, TelemetryIngestor, stable_invocation_id,
+    };
     use super::*;
     use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
     use crate::paths::{PathEnvironment, PathPlatform};
@@ -1799,11 +1839,17 @@ mod tests {
                 rusqlite::params!["a".repeat(64), artifact.id],
             )
             .unwrap();
-        for (evidence_id, turn_id, passed, linked) in [
-            ("with-pass", "with-1", 1, true),
-            ("with-fail", "with-2", 0, true),
-            ("without-pass", "without-1", 1, false),
-            ("without-fail", "without-2", 0, false),
+        // Gym rows share the verify command with the production rows, so a
+        // missing `production` predicate would fold them into the utility
+        // columns instead of the gym column.
+        for (evidence_id, turn_id, passed, linked, production) in [
+            ("with-pass", "with-1", 1, true, 1),
+            ("with-fail", "with-2", 0, true, 1),
+            ("without-pass", "without-1", 1, false, 1),
+            ("without-fail", "without-2", 0, false, 1),
+            ("gym-with-pass", "gym-1", 1, true, 0),
+            ("gym-with-fail", "gym-2", 0, true, 0),
+            ("gym-without-pass", "gym-3", 1, false, 0),
         ] {
             store
                 .conn_mut()
@@ -1811,8 +1857,8 @@ mod tests {
                     "INSERT INTO skill_task_outcomes (
                          evidence_id, turn_id, verify_passed, attempt, source_kind,
                          source_id, production, created_at
-                     ) VALUES (?, ?, ?, 1, 'verify_command', 'same-command', 0, 42)",
-                    rusqlite::params![evidence_id, turn_id, passed],
+                     ) VALUES (?, ?, ?, 1, 'verify_command', 'same-command', ?, 42)",
+                    rusqlite::params![evidence_id, turn_id, passed, production],
                 )
                 .unwrap();
             if linked {
@@ -1831,13 +1877,52 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].invocations, 8);
         assert_eq!(rows[0].last_used, Some(42));
-        assert_eq!(rows[0].success_percent(), 75.0);
-        assert_eq!(rows[0].tasks_with, 2);
+        assert_eq!(rows[0].success_percent(), Some(75.0));
+        assert_eq!(rows[0].tasks_with, 2, "gym tasks must not count as utility");
         assert_eq!(rows[0].passed_with, 1);
-        assert_eq!(rows[0].pass_rate_without_percent(), 50.0);
+        assert_eq!(rows[0].baseline_tasks, 2);
+        assert_eq!(rows[0].pass_rate_without_percent(), Some(50.0));
+        assert_eq!(rows[0].gym_tasks, 2, "gym tasks are reported separately");
         assert_eq!(rows[0].estimated_round_trips_saved, 0);
+        let line = rows[0].to_line();
+        assert!(
+            line.contains("\t75.0%\t42\t2\t1\t50.0%\t2\t0\t0\t"),
+            "{line}"
+        );
 
         assert_eq!(estimate_round_trips_saved(6, 3), 12);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_stats_distinguish_an_absent_baseline_from_a_failing_one() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+        drop(store);
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        let rows = load_skill_stats(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].baseline_tasks, 0);
+        assert_eq!(
+            rows[0].pass_rate_without_percent(),
+            None,
+            "no baseline task must not read as a 0% baseline"
+        );
+        assert_eq!(rows[0].success_percent(), None);
+        let line = rows[0].to_line();
+        assert_eq!(
+            line.split('\t').filter(|field| *field == "n/a").count(),
+            2,
+            "{line}"
+        );
+        assert_eq!(
+            line.split('\t').count(),
+            SKILL_STATS_HEADER.split('\t').count(),
+            "every column needs a header"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1896,30 +1981,45 @@ mod tests {
         }
     }
 
+    /// Drive the whole operator funnel once and assert every invariant the
+    /// lifecycle promises, at the step that establishes it.
+    ///
+    /// import -> approve -> activate -> telemetry -> refused duplicate ->
+    /// replacement -> canary routing -> containment -> promotion ->
+    /// withdrawal -> purge.
     #[test]
-    fn operator_episode_preserves_generation_and_lifecycle_invariants_after_every_step() {
+    fn operator_episode_drives_the_whole_funnel_and_holds_its_invariants() {
         let (root, paths, _) = fixture();
-        let package_path = root.join("episode-seed.json");
         std::fs::create_dir_all(&root).unwrap();
+        let package_path = root.join("episode-seed.json");
         std::fs::write(&package_path, SEED_PACKAGES[0].1).unwrap();
         let package: LearnedSkillPackage = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
         let artifact = JsProposal::try_from(package.proposal)
             .unwrap()
             .validate_and_canonicalize()
             .unwrap();
+        let root_id = artifact.id.clone();
+        let export_name = artifact.exports[0].name.clone();
 
+        // Every step re-reads the durable store and re-verifies the bytes it
+        // hands back. Verifying the in-memory artifact the test already holds
+        // would assert nothing about what any step persisted.
         let assert_state = |expected: &str| {
             let store = SkillStore::open_at(&paths).unwrap();
-            assert_eq!(
-                store.metadata(&artifact.id).unwrap().unwrap().status,
-                expected
-            );
+            assert_eq!(store.metadata(&root_id).unwrap().unwrap().status, expected);
             let generation = store.generation_state().unwrap();
             assert_eq!(
                 generation.desired_generation, generation.applied_generation,
                 "published index must match durable desired generation after {expected}"
             );
-            assert!(artifact.verify_identity().is_ok());
+            let stored = store
+                .get(&root_id)
+                .unwrap()
+                .expect("the immutable revision must survive every lifecycle step");
+            stored
+                .verify_identity()
+                .expect("stored bytes must still hash to the stored identity");
+            assert_eq!(stored.source, artifact.source);
         };
 
         run(
@@ -1937,7 +2037,7 @@ mod tests {
             None,
             false,
             None,
-            Some(LibraryOperation::Approve(&artifact.id)),
+            Some(LibraryOperation::Approve(&root_id)),
             &paths,
             None,
         )
@@ -1948,22 +2048,140 @@ mod tests {
             None,
             false,
             None,
-            Some(LibraryOperation::Activate(&artifact.id)),
+            Some(LibraryOperation::Activate(&root_id)),
             &paths,
             None,
         )
         .unwrap();
         assert_state("active");
 
+        // Telemetry ingestion: one production invocation must reach the
+        // operator-visible usage surface, and an invocation with no terminal
+        // event must not be reported as a 0% success rate.
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        let index_generation = store.generation_state().unwrap().applied_generation;
+        TelemetryIngestor::new(&mut store)
+            .ingest(
+                &EventBatch::new(vec![SkillEvent {
+                    invocation_id: Some(stable_invocation_id(
+                        "episode-turn",
+                        "episode-tool",
+                        &root_id,
+                        &export_name,
+                        0,
+                    )),
+                    skill_id: root_id.clone(),
+                    turn_id: "episode-turn".to_string(),
+                    tool_call_id: Some("episode-tool".to_string()),
+                    kind: SkillEventKind::Invoked,
+                    export_name: Some(export_name.clone()),
+                    outcome: None,
+                    latency_us: Some(1_500),
+                    retrieval_score: Some(0.9),
+                    retrieval_rank: Some(1),
+                    query_fingerprint: None,
+                    index_generation,
+                    evidence_complete: true,
+                    production: true,
+                    argument_shape: None,
+                    created_at: 4_242,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let ingested = load_skill_stats(&store)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.skill_id == root_id)
+            .expect("the active revision must appear in the usage report");
+        assert_eq!(ingested.invocations, 1);
+        assert_eq!(ingested.last_used, Some(4_242));
+        assert_eq!(ingested.gym_tasks, 0);
+        assert_eq!(
+            ingested.success_percent(),
+            None,
+            "an invocation with no terminal event has no success rate yet"
+        );
+        drop(store);
+
+        // A same-contract sibling in another lineage is refused by admission,
+        // and the refusal is terminal: it must not keep spending the attempt
+        // budget afterwards.
+        let (duplicate_json, duplicate_id) = duplicate_package_json("episode-duplicate");
+        let duplicate_path = root.join("episode-duplicate.json");
+        std::fs::write(&duplicate_path, duplicate_json).unwrap();
+        let refusal = run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Import(&duplicate_path)),
+            &paths,
+            None,
+        )
+        .unwrap_err();
+        let refusal = format!("{refusal:#}");
+        assert!(refusal.contains("duplicate_skill"), "{refusal}");
+        let store = SkillStore::open_at(&paths).unwrap();
+        let refused = store.get_proposal(&duplicate_id).unwrap().unwrap();
+        assert_eq!(refused.status, ProposalStatus::Rejected);
+        assert!(
+            (1..=MAX_EVALUATION_ATTEMPTS).contains(&refused.attempt_count),
+            "attempt budget exceeded: {}",
+            refused.attempt_count
+        );
+        assert_eq!(
+            due_proposal_head(&store, current_timestamp().unwrap()).unwrap(),
+            None,
+            "a terminally refused proposal must stop consuming the attempt budget"
+        );
+        drop(store);
+
+        // An approved replacement is a routable canary over its active
+        // predecessor, on the exact applied generation.
+        let replacement_id = approved_replacement(&paths, "episode-replacement", &root_id);
+        assert_eq!(
+            revision_state(&paths, &replacement_id).status,
+            LifecycleStatus::Canary
+        );
+        let root_lineage = revision_state(&paths, &root_id).lineage_root_id;
+        assert_eq!(
+            root_lineage, root_id,
+            "an activated lineage root is its own lineage root"
+        );
+        let coordinator =
+            IndexCoordinator::open(&paths, Arc::new(Embedder::from_config(None).unwrap())).unwrap();
+        coordinator.rebuild_and_publish().unwrap();
+        let generation = SkillStore::open_at(&paths)
+            .unwrap()
+            .generation_state()
+            .unwrap()
+            .applied_generation;
+        let routing = coordinator
+            .routing_context(std::slice::from_ref(&root_id), generation)
+            .unwrap()
+            .expect("routing must resolve against the applied generation");
+        let (routed_artifact, canary) = routing
+            .candidates
+            .get(&root_id)
+            .expect("an approved canary must be routable over its active predecessor");
+        assert_eq!(canary.candidate_id, replacement_id);
+        assert_eq!(canary.status, LifecycleStatus::Canary);
+        assert_eq!(canary.lineage_root_id, root_lineage);
+        assert!(canary.identity_valid);
+        assert_eq!(routed_artifact.id, replacement_id);
+        drop(coordinator);
+
+        // Severe feedback contains the active predecessor without stranding
+        // its replacement.
         run(
             None,
             false,
             Some(FeedbackOperation {
-                skill_id: &artifact.id,
+                skill_id: &root_id,
                 invocation_id: None,
                 kind: "severe",
                 reason_code: "integrity",
-                idempotency_key: "gym-episode-severe",
+                idempotency_key: "episode-severe",
             }),
             None,
             &paths,
@@ -1972,9 +2190,73 @@ mod tests {
         .unwrap();
         assert_state("quarantined");
 
+        // Promotion keeps lineage in both directions.
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Promote(&replacement_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        let promoted = revision_state(&paths, &replacement_id);
+        let superseded = revision_state(&paths, &root_id);
+        assert_eq!(promoted.status, LifecycleStatus::Active);
+        assert_eq!(superseded.status, LifecycleStatus::Superseded);
+        assert_eq!(promoted.supersedes_id.as_deref(), Some(&*root_id));
+        assert_eq!(promoted.lineage_root_id, superseded.lineage_root_id);
+        assert_eq!(
+            superseded.superseded_by_id.as_deref(),
+            Some(&*replacement_id)
+        );
+
+        // Withdrawal clears retrieval and routing, and nothing else.
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Retire(&replacement_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        let withdrawn = revision_state(&paths, &replacement_id);
+        assert_eq!(withdrawn.status, LifecycleStatus::Retired);
+        assert_eq!(
+            withdrawn.supersedes_id.as_deref(),
+            Some(&*root_id),
+            "withdrawal must not erase lineage"
+        );
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert!(
+            !store.is_retrievable(&replacement_id).unwrap(),
+            "a withdrawn skill must leave the retrieval set"
+        );
+        assert!(
+            store.get(&replacement_id).unwrap().is_some(),
+            "withdrawal keeps the immutable bytes; only purge removes them"
+        );
+        let generation = store.generation_state().unwrap();
+        assert_eq!(generation.desired_generation, generation.applied_generation);
+        drop(store);
+        let coordinator =
+            IndexCoordinator::open(&paths, Arc::new(Embedder::from_config(None).unwrap())).unwrap();
+        let generation = coordinator.rebuild_and_publish().unwrap();
+        assert!(
+            coordinator
+                .routing_context(std::slice::from_ref(&replacement_id), generation)
+                .unwrap()
+                .expect("routing must resolve against the applied generation")
+                .candidates
+                .is_empty(),
+            "nothing may route into a withdrawn lineage"
+        );
+        drop(coordinator);
+
         run(
             Some(PurgeOperation {
-                skill_id: &artifact.id,
+                skill_id: &replacement_id,
                 force: true,
             }),
             false,
@@ -1985,11 +2267,31 @@ mod tests {
         )
         .unwrap();
         let store = SkillStore::open_at(&paths).unwrap();
-        assert!(store.metadata(&artifact.id).unwrap().is_none());
+        assert!(store.metadata(&replacement_id).unwrap().is_none());
+        assert!(store.get(&replacement_id).unwrap().is_none());
         let generation = store.generation_state().unwrap();
         assert_eq!(generation.desired_generation, generation.applied_generation);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Build a same-contract sibling of the first bundled seed.
+    ///
+    /// Only the source differs, so the sibling keeps the seed's description and
+    /// exports — the normalized contract admission refuses as `duplicate_skill`
+    /// — while claiming no predecessor and therefore no shared lineage.
+    fn duplicate_package_json(marker: &str) -> (String, String) {
+        let mut value: serde_json::Value = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        let source = value["proposal"]["source"].as_str().unwrap().to_string();
+        value["proposal"]["source"] = serde_json::Value::String(format!("{source}\n// {marker}\n"));
+        let json = serde_json::to_string(&value).unwrap();
+        let package: LearnedSkillPackage = serde_json::from_str(&json).unwrap();
+        let skill_id = JsProposal::try_from(package.proposal)
+            .unwrap()
+            .validate_and_canonicalize()
+            .unwrap()
+            .id;
+        (json, skill_id)
     }
 
     /// Build a replacement package for the first bundled seed.

@@ -427,9 +427,16 @@ impl IndexCoordinator {
             .map_err(|_| CoordinatedMutationError::Publication(CoordinatorError::Poisoned))?;
         *published = Arc::new(published.without_ids(generation, &removed_ids));
         drop(published);
-        let removal_acknowledgement =
-            store.mark_generation_applied_with_mode(generation, "removal_only", None);
-        if let Err(error) = removal_acknowledgement {
+        if let Err(error) =
+            store.mark_generation_applied_with_mode(generation, "removal_only", None)
+        {
+            // A concurrent `coordinate_removal` may have advanced the desired
+            // generation past this one without taking `generation_build`. This
+            // caller's lifecycle transition has already committed, so report
+            // the newer removal-only generation instead of a publication error.
+            if let Some(report) = superseding_removal_report(&store, generation, None) {
+                return Ok((result, report));
+            }
             return Err(CoordinatedMutationError::Publication(error.into()));
         }
         drop(store);
@@ -439,10 +446,18 @@ impl IndexCoordinator {
                 let mut store = self.store.lock().map_err(|_| {
                     CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
                 })?;
-                store
-                    .mark_generation_applied_with_mode(generation, "full", None)
-                    .map_err(CoordinatorError::from)
-                    .map_err(CoordinatedMutationError::Publication)?;
+                if let Err(error) =
+                    store.mark_generation_applied_with_mode(generation, "full", None)
+                {
+                    // The freshly built snapshot is stale: a concurrent removal
+                    // published a newer generation while it was being built.
+                    if let Some(report) = superseding_removal_report(&store, generation, None) {
+                        return Ok((result, report));
+                    }
+                    return Err(CoordinatedMutationError::Publication(
+                        CoordinatorError::from(error),
+                    ));
+                }
                 let mut published = self.published.write().map_err(|_| {
                     CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
                 })?;
@@ -464,14 +479,24 @@ impl IndexCoordinator {
                 let mut store = self.store.lock().map_err(|_| {
                     CoordinatedMutationError::Publication(CoordinatorError::Poisoned)
                 })?;
-                store
-                    .mark_generation_applied_with_mode(
-                        generation,
-                        "removal_only",
-                        Some(&diagnostic),
-                    )
-                    .map_err(CoordinatorError::from)
-                    .map_err(CoordinatedMutationError::Publication)?;
+                if let Err(mark_error) = store.mark_generation_applied_with_mode(
+                    generation,
+                    "removal_only",
+                    Some(&diagnostic),
+                ) {
+                    // `build_generation` failed `ensure_generation_current`
+                    // because a concurrent removal moved the generation, which
+                    // also makes this acknowledgement fail. The mutation itself
+                    // committed, so surface the newer removal-only generation.
+                    if let Some(report) =
+                        superseding_removal_report(&store, generation, Some(diagnostic.clone()))
+                    {
+                        return Ok((result, report));
+                    }
+                    return Err(CoordinatedMutationError::Publication(
+                        CoordinatorError::from(mark_error),
+                    ));
+                }
                 Ok((
                     result,
                     PublicationReport {
@@ -822,6 +847,32 @@ impl IndexCoordinator {
     }
 }
 
+/// Recover the publication report when acknowledging `generation` was refused.
+///
+/// `mark_generation_applied_with_mode` only matches the exact desired
+/// generation. `coordinate_removal` advances that generation without taking
+/// `generation_build`, so a mutation that is building a generation can find its
+/// own acknowledgement refused after its lifecycle transition already
+/// committed. In that case the honest answer is the newer removal-only
+/// generation, not a `Publication(Constraint)` error that hides a committed
+/// transition. Returns `None` when the generation was not superseded, so a
+/// genuine constraint failure still reaches the caller.
+fn superseding_removal_report(
+    store: &SkillStore,
+    generation: u64,
+    diagnostic: Option<String>,
+) -> Option<PublicationReport> {
+    let state = store.generation_state().ok()?;
+    if state.desired_generation <= generation {
+        return None;
+    }
+    Some(PublicationReport {
+        generation: state.desired_generation,
+        removal_only: true,
+        diagnostic,
+    })
+}
+
 fn ensure_generation_current(store: &SkillStore, generation: u64) -> Result<(), StoreError> {
     let state = store.generation_state()?;
     if state.desired_generation == generation {
@@ -982,6 +1033,91 @@ mod tests {
         );
 
         drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_generation_superseded_by_a_concurrent_removal_reports_removal_only() {
+        let (root, paths) = temp_paths();
+        let coordinator = open_coordinator(&paths);
+        coordinator
+            .rebuild_and_publish()
+            .expect("initial publication");
+
+        let concurrent_paths = paths.clone();
+        let ((requested, superseding), report) = coordinator
+            .coordinate_mutation(HashSet::new(), move |store: &mut SkillStore| {
+                let state = store.generation_state()?;
+                let requested = store.request_generation(
+                    &state.model_id,
+                    &state.model_revision,
+                    state.dimensions,
+                    state.normalized,
+                )?;
+                // A `coordinate_removal` elsewhere advances the desired
+                // generation without taking `generation_build`.
+                let mut concurrent = SkillStore::open_at(&concurrent_paths)?;
+                let superseding = concurrent.request_generation(
+                    &state.model_id,
+                    &state.model_revision,
+                    state.dimensions,
+                    state.normalized,
+                )?;
+                Ok::<((u64, u64), u64), StoreError>(((requested, superseding), requested))
+            })
+            .expect("a committed transition must not surface as a publication failure");
+
+        assert!(
+            superseding > requested,
+            "the fixture must actually supersede the mutation's generation"
+        );
+        assert!(
+            report.removal_only,
+            "a superseded build must be reported as removal-only"
+        );
+        assert_eq!(
+            report.generation, superseding,
+            "the report must carry the newer durable generation"
+        );
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_current_generation_still_surfaces_a_genuine_acknowledgement_failure() {
+        let (root, paths) = temp_paths();
+        let mut store = SkillStore::open_at(&paths).expect("store");
+        let state = store.generation_state().expect("durable state");
+        let generation = store
+            .request_generation(
+                &state.model_id,
+                &state.model_revision,
+                state.dimensions,
+                state.normalized,
+            )
+            .expect("request a generation");
+
+        assert!(
+            superseding_removal_report(&store, generation, None).is_none(),
+            "a generation that is still current must not be reported as superseded"
+        );
+
+        let newer = store
+            .request_generation(
+                &state.model_id,
+                &state.model_revision,
+                state.dimensions,
+                state.normalized,
+            )
+            .expect("request a newer generation");
+        let report = superseding_removal_report(&store, generation, Some("boom".to_string()))
+            .expect("a superseded generation must produce a removal-only report");
+        assert_eq!(report.generation, newer);
+        assert!(report.removal_only);
+        assert_eq!(report.diagnostic.as_deref(), Some("boom"));
+
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 

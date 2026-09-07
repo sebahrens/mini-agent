@@ -12,6 +12,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAIN = ROOT / "scripts/gym/train.py"
+SETUP = ROOT / "scripts/gym/setup.sh"
+TEMP_ROOTS = ("/tmp", "/private/tmp")
+
+
+def scratch_outside_tmp() -> tempfile.TemporaryDirectory:
+    """A scratch tree the gym host guard accepts.
+
+    `setup.sh` refuses any workspace whose *resolved* path is under the system
+    temp root, and on Linux `tempfile`'s default parent is exactly that root, so
+    a full setup run has to be staged elsewhere. The checkout is the one
+    directory guaranteed to exist and be writable here.
+    """
+    return tempfile.TemporaryDirectory(prefix=".gym-setup-", dir=ROOT)
 
 
 def load(name: str, path: Path):
@@ -79,6 +92,7 @@ case "${{1:-}}" in
     ;;
 esac
 printf '%s\\n' "$*" >> "$log"
+printf '%s\\t%s\\t%s\\n' "$PWD" "$TMPDIR" "$ZS_LOCAL_DATA_DIR" >> "$log.env"
 case "$mode" in
   failure)
     echo "agent failed" >&2
@@ -199,6 +213,82 @@ class GymTrainerTests(unittest.TestCase):
             self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
             self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
             self.assertEqual(sorted((gym_root / "runs").iterdir()), [])
+
+    def test_workspace_and_apppaths_stay_under_the_gym_root(self) -> None:
+        # The episode workspace and every per-arm tree must live under the gym
+        # root, not in the system temp dir: macOS Seatbelt write-allows
+        # /private/tmp wholesale and Linux bwrap replaces /tmp with a tmpfs, so
+        # a temp-dir arm is either outside the boundary under test or invisible
+        # to the sandboxed child.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            binary, log = make_stub(root, "success")
+            completed, rows, gym_root = run_training(
+                root, repo, binary, task_document([{"name": "fix", "tags": []}]), "--keep-run-dirs"
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            observed = [
+                line.split("\t")
+                for line in Path(f"{log}.env").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(observed), len(rows))
+            # Compared resolved: the shell reports the physical cwd, which on
+            # macOS differs from the symlinked temp path by /private.
+            worktrees = (gym_root / "worktrees").resolve()
+            runs = (gym_root / "runs").resolve()
+            for cwd, tmpdir, local in observed:
+                self.assertEqual(Path(cwd).resolve().parent, worktrees, cwd)
+                for owned in (tmpdir, local):
+                    self.assertEqual(Path(owned).resolve().parent.parent, runs, owned)
+            # --keep-run-dirs leaves the AppPaths trees behind; they are the
+            # gym's, so they are inside the gym root.
+            self.assertTrue(sorted((gym_root / "runs").iterdir()))
+
+    def test_elapsed_ms_times_the_agent_without_the_oracle(self) -> None:
+        # A one-second oracle runs twice per episode (before and after the
+        # agent). Folding that into elapsed_ms would make the number operators
+        # compare across arms mostly oracle time.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            binary, _ = make_stub(root, "success")
+            document = task_document([{"name": "fix", "tags": []}])
+            document["defaults"]["oracle"] = {
+                "command": "sleep 1; test -f fixed.txt",
+                "id": "slow-oracle",
+            }
+            completed, rows, _ = run_training(root, repo, binary, document)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            for row in rows:
+                self.assertTrue(row["success"], row)
+                self.assertGreaterEqual(row["oracle_ms"], 1900, row)
+                self.assertLess(row["elapsed_ms"], 900, row)
+                self.assertGreaterEqual(
+                    row["total_ms"], row["elapsed_ms"] + row["oracle_ms"], row
+                )
+
+    def test_agent_timeout_records_the_agent_clock_without_the_oracle(self) -> None:
+        # The pre-agent oracle also takes a second here, so an elapsed_ms that
+        # still spanned the whole episode would be about twice the timeout.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            binary, _ = make_stub(root, "timeout")
+            document = task_document([{"name": "slow", "tags": []}])
+            document["defaults"]["oracle"] = {
+                "command": "sleep 1; test -f fixed.txt",
+                "id": "slow-oracle",
+            }
+            completed, rows, _ = run_training(
+                root, repo, binary, document, "--task-timeout", "1"
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            for row in rows:
+                self.assertEqual(row["failure_reason"], "agent_timeout")
+                self.assertGreaterEqual(row["elapsed_ms"], 900, row)
+                self.assertLess(row["elapsed_ms"], 1900, row)
+                self.assertGreaterEqual(row["oracle_ms"], 900, row)
 
     def test_agent_failure_is_a_failed_row_and_the_run_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -451,6 +541,69 @@ class GymMinerTests(unittest.TestCase):
             self.assertEqual(loaded[0]["id"], "mini-agent-test")
             self.assertIn("dolt_mode", MINE.beads_hint(repo))
 
+    def test_beads_are_returned_in_a_stable_id_order(self) -> None:
+        # bd list documents no ordering, so --limit would otherwise select a
+        # different subset from run to run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            beads = root / "beads.jsonl"
+            unordered = ["mini-agent-zzz", "mini-agent-aaa", "mini-agent-mmm"]
+            beads.write_text(
+                "".join(
+                    json.dumps({"id": name, "title": name, "status": "closed"}) + "\n"
+                    for name in unordered
+                ),
+                encoding="utf-8",
+            )
+            loaded = MINE.load_beads(repo, beads)
+            self.assertEqual([bead["id"] for bead in loaded], sorted(unordered))
+
+    def test_mined_prompt_carries_the_description_and_acceptance_criteria(self) -> None:
+        prompt = MINE.mined_prompt(
+            {
+                "id": "mini-agent-test",
+                "title": "make value.txt say fixed",
+                "description": "value.txt still reads broken after the import.",
+                "acceptance_criteria": "grep -qx fixed value.txt passes.",
+            }
+        )
+        self.assertIn("make value.txt say fixed", prompt)
+        self.assertIn("value.txt still reads broken after the import.", prompt)
+        self.assertIn("grep -qx fixed value.txt passes.", prompt)
+        # A bead with nothing but a title contributes no empty sections.
+        bare = MINE.mined_prompt({"id": "mini-agent-test", "title": "just a title"})
+        self.assertEqual(bare, "just a title")
+        self.assertEqual(MINE.mined_prompt({"id": "mini-agent-test"}), "mini-agent-test")
+
+    def test_mined_tasks_use_the_composed_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            (repo / "value.txt").write_text("fixed\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "fix mini-agent-test")
+            beads = root / "beads.jsonl"
+            beads.write_text(
+                json.dumps(
+                    {
+                        "id": "mini-agent-test",
+                        "title": "make value.txt say fixed",
+                        "description": "The import left value.txt reading broken.",
+                        "acceptance_criteria": "grep -qx fixed value.txt passes.",
+                        "status": "closed",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tasks, skipped = MINE.mine(
+                repo, {"mini-agent-test": "grep -qx fixed value.txt"}, True, 10, "main", beads
+            )
+            self.assertEqual(skipped, [])
+            prompt = str(tasks[0]["prompt"])
+            self.assertIn("The import left value.txt reading broken.", prompt)
+            self.assertIn("grep -qx fixed value.txt passes.", prompt)
+
     def test_miner_emits_a_loadable_document_for_a_real_fix_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -475,15 +628,115 @@ class GymMinerTests(unittest.TestCase):
             self.assertEqual(loaded[0]["oracle"]["expected_files"]["value.txt"], "fixed\n")
 
 
+CARGO_STUB = """#!/bin/sh
+set -u
+printf '%s\\n' "$*" >> "$CARGO_LOG"
+if [ "${1:-}" = install ]; then
+  mkdir -p "$MINI_AGENT_GYM_ROOT/bin"
+  cat > "$MINI_AGENT_GYM_ROOT/bin/mini-agent" <<'INNER'
+#!/bin/sh
+echo "usage: mini-agent [--install-learned-skill-seeds] [--import-learned-skill <path>]"
+INNER
+  chmod 755 "$MINI_AGENT_GYM_ROOT/bin/mini-agent"
+fi
+exit 0
+"""
+
+RUSTC_STUB = """#!/bin/sh
+echo "rustc 1.90.0 (0000000000 2026-01-01)"
+"""
+
+NOOP_STUB = """#!/bin/sh
+exit 0
+"""
+
+
+def make_setup_host(root: Path) -> tuple[Path, Path, dict[str, str]]:
+    """A fake toolchain plus a repo `setup.sh` will accept.
+
+    Only `cargo`, `rustc` and `jq` are stubbed; `git` and `python3` stay real
+    because setup.sh checks their actual versions.
+    """
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    (repo / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.90.0"\n', encoding="utf-8")
+    binaries = root / "bin"
+    binaries.mkdir()
+    for name, body in (("cargo", CARGO_STUB), ("rustc", RUSTC_STUB), ("jq", NOOP_STUB)):
+        stub = binaries / name
+        stub.write_text(body, encoding="utf-8")
+        stub.chmod(0o755)
+    gym_root = root / "gym"
+    env = {
+        **os.environ,
+        "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+        "CARGO_LOG": str(root / "cargo.log"),
+        "MINI_AGENT_GYM_ROOT": str(gym_root),
+    }
+    return repo, gym_root, env
+
+
 class GymEntrypointTests(unittest.TestCase):
-    def test_shell_entrypoints_are_syntax_valid_and_installed_out_of_the_way(self) -> None:
-        for script in (ROOT / "scripts/gym/setup.sh", ROOT / "scripts/gym/train.sh"):
+    def test_shell_entrypoints_are_syntax_valid(self) -> None:
+        for script in (SETUP, ROOT / "scripts/gym/train.sh"):
             subprocess.run(["bash", "-n", str(script)], check=True)
-        setup = (ROOT / "scripts/gym/setup.sh").read_text(encoding="utf-8")
-        self.assertIn('cargo install --path . --debug --locked --features skills --root "$gym_root"', setup)
-        # The containment preflight must exercise the same feature set as the install.
-        self.assertNotIn("--no-default-features", setup)
-        self.assertIn("cargo test --locked --features skills", setup)
+
+    def test_setup_installs_and_preflights_with_the_same_feature_set(self) -> None:
+        # Behavioural: the argv `setup.sh` really hands cargo, not a substring
+        # of its own source text.
+        with scratch_outside_tmp() as directory:
+            root = Path(directory)
+            repo, gym_root, env = make_setup_host(root)
+            completed = subprocess.run(
+                ["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            invocations = (root / "cargo.log").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                invocations[0],
+                f"install --path . --debug --locked --features skills --root {gym_root}",
+            )
+            self.assertTrue(
+                invocations[1].startswith("test --locked --features skills "), invocations[1]
+            )
+            self.assertIn("_js_worker_containment", invocations[1])
+            self.assertIn("--ignored", invocations[1])
+            for invocation in invocations:
+                self.assertNotIn("--no-default-features", invocation)
+            self.assertTrue((gym_root / "bin/mini-agent").is_file())
+            self.assertTrue((gym_root / "worktrees").is_dir())
+            self.assertTrue((gym_root / "runs").is_dir())
+            self.assertIn("gym host ready", completed.stdout)
+
+    def test_setup_refuses_a_repo_that_only_resolves_into_the_temp_root(self) -> None:
+        # macOS hands out `/tmp/...`, which resolves to `/private/tmp`; Linux
+        # keeps `/tmp`. Either way the unresolved spelling must not get through.
+        temp_root = next((path for path in TEMP_ROOTS if Path(path).is_dir()), None)
+        if temp_root is None:
+            self.skipTest("no system temp root to test against")
+        repo = Path(tempfile.mkdtemp(prefix="gym-guard-", dir=temp_root))
+        try:
+            completed = subprocess.run(
+                ["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=os.environ
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("system temp root", completed.stderr)
+        finally:
+            repo.rmdir()
+
+    def test_setup_refuses_a_gym_root_in_the_temp_root(self) -> None:
+        with scratch_outside_tmp() as directory:
+            root = Path(directory)
+            repo, _, env = make_setup_host(root)
+            refused = Path(f"/tmp/mini-agent-gym-guard-{os.getpid()}")
+            env["MINI_AGENT_GYM_ROOT"] = str(refused)
+            completed = subprocess.run(
+                ["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("system temp root", completed.stderr)
+            self.assertFalse(Path(env["CARGO_LOG"]).exists(), "the guard must run before cargo")
+            self.assertFalse(refused.exists(), "the refused gym root must not be created")
 
 
 if __name__ == "__main__":

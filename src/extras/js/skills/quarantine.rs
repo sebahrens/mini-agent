@@ -7,8 +7,8 @@ use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
 use super::lifecycle::{
-    EvidenceSnapshot, LifecycleError, LifecycleService, LifecycleStatus, TransitionOutcome,
-    TransitionRequest,
+    EvidenceSnapshot, LifecycleError, LifecycleStatus, TransitionOutcome, TransitionRequest,
+    register_policy_in_tx, transition_in_tx,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,17 +263,18 @@ impl<'a> QuarantineExecutor<'a> {
             .coordinate_removal(
                 std::collections::HashSet::from([evidence.skill_id.clone()]),
                 |store| {
-                    LifecycleService::new(store).register_policy(
-                        &policy.version,
-                        &serde_json::to_string(policy)?,
-                        created_at,
-                    )?;
-                    // `transition` opens its own `BEGIN IMMEDIATE`, so the
-                    // evidence row below is already committed by the time the
-                    // transition is evaluated. Remember whether this call is
-                    // the one that created it, so a rejected transition does
-                    // not leave evidence for a decision that never happened.
-                    let inserted_evidence = store.connection_mut().execute(
+                    // The policy row, the evidence row, and the decision are
+                    // one transaction. Writing evidence as an autocommit
+                    // statement before the transition opened its own
+                    // `BEGIN IMMEDIATE` left `skill_evidence` implying a
+                    // decision that a crash or a stale row version never
+                    // applied.
+                    let policy_json = serde_json::to_string(policy)?;
+                    let tx = store
+                        .connection_mut()
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    register_policy_in_tx(&tx, &policy.version, &policy_json, created_at)?;
+                    tx.execute(
                         "INSERT OR IGNORE INTO skill_evidence (
                             evidence_id, skill_id, evidence_kind, payload_json,
                             policy_version, created_at
@@ -285,38 +286,175 @@ impl<'a> QuarantineExecutor<'a> {
                             policy.version,
                             created_at,
                         ],
-                    )? == 1;
-                    match LifecycleService::new(store).transition(&request, created_at) {
-                        Ok(outcome) => {
-                            let generation = outcome.desired_generation as u64;
-                            Ok((outcome, generation))
-                        }
-                        Err(error) => {
-                            if inserted_evidence {
-                                discard_unused_evidence(store, &evidence_id);
-                            }
-                            Err(QuarantineExecutionError::from(error))
-                        }
-                    }
+                    )?;
+                    let outcome = transition_in_tx(&tx, &request, created_at)?;
+                    tx.commit()?;
+                    let generation = outcome.desired_generation as u64;
+                    Ok::<(TransitionOutcome, u64), QuarantineExecutionError>((outcome, generation))
                 },
             )
             .map_err(Into::into)
     }
 }
 
-/// Compensate the pre-transition evidence insert when the transition is
-/// rejected. Full atomicity needs a `transition` entry point that accepts a
-/// caller-owned transaction; until then this keeps `skill_evidence` from
-/// implying a decision that was never applied.
-fn discard_unused_evidence(store: &mut super::store::SkillStore, evidence_id: &str) {
-    match store.connection_mut().execute(
-        "DELETE FROM skill_evidence WHERE evidence_id = ? AND evidence_kind = 'quarantine'",
-        rusqlite::params![evidence_id],
-    ) {
-        Ok(_) => {}
-        Err(error) => tracing::warn!(
-            error = %error,
-            "failed to discard quarantine evidence after a rejected transition"
-        ),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extras::js::skills::embed::Embedder;
+    use crate::extras::js::skills::store::SkillStore;
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    use crate::paths::AppPaths;
+    use std::sync::Arc;
+
+    fn temp_paths() -> (std::path::PathBuf, AppPaths) {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-quarantine-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local-data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        };
+        (root, paths)
+    }
+
+    fn quarantine_artifact() -> SkillArtifact {
+        SkillArtifact::new(
+            "function quarantineTarget(_cap, value) { return value; }".to_string(),
+            "A revision that the quarantine executor acts on.".to_string(),
+            vec!["quarantine".to_string()],
+            vec![SkillExport {
+                name: "quarantineTarget".to_string(),
+                signature: "quarantineTarget(value: string): string".to_string(),
+            }],
+            vec!["quarantineTarget('x') === 'x'".to_string()],
+            CapabilityManifest::pure(),
+        )
+        .expect("test artifact")
+    }
+
+    fn immediate_evidence(skill_id: &str) -> QuarantineEvidence {
+        QuarantineEvidence {
+            skill_id: skill_id.to_string(),
+            reason: QuarantineReason::IdentityMismatch,
+            qualified_invocations: 0,
+            direct_failures: 0,
+            evidence_complete: true,
+            authenticated_feedback: false,
+            feedback_marked_severe: false,
+            row_version_current: true,
+            generation_current: true,
+        }
+    }
+
+    /// `(policy rows, evidence rows)` durably visible to a fresh connection.
+    fn durable_rows(paths: &AppPaths, policy_version: &str, evidence_id: &str) -> (i64, i64) {
+        let store = SkillStore::open_at(paths).expect("store");
+        let policies = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_policy_versions WHERE policy_version = ?",
+                [policy_version],
+                |row| row.get(0),
+            )
+            .expect("count policy rows");
+        let evidence = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_evidence
+                  WHERE evidence_id = ? AND evidence_kind = 'quarantine'",
+                [evidence_id],
+                |row| row.get(0),
+            )
+            .expect("count evidence rows");
+        (policies, evidence)
+    }
+
+    #[test]
+    fn a_rejected_quarantine_commits_neither_its_policy_nor_its_evidence() {
+        let (root, paths) = temp_paths();
+        let artifact = quarantine_artifact();
+        {
+            let mut store = SkillStore::open_at(&paths).expect("store");
+            store.insert_verified(&artifact).expect("insert revision");
+            store
+                .connection_mut()
+                .execute(
+                    "UPDATE skill_revisions SET status = 'canary' WHERE id = ?",
+                    [&artifact.id],
+                )
+                .expect("mark the revision as a canary");
+        }
+
+        let coordinator = IndexCoordinator::open(
+            &paths,
+            Arc::new(Embedder::from_config(None).expect("deterministic embedder")),
+        )
+        .expect("index coordinator");
+        let executor = QuarantineExecutor::new(&coordinator);
+        let policy = QuarantinePolicy::conservative("quarantine-atomicity-v1");
+        let evidence = immediate_evidence(&artifact.id);
+        let canonical_snapshot = match evaluate(&policy, &evidence) {
+            QuarantineDecision::Quarantine { canonical_snapshot } => canonical_snapshot,
+            QuarantineDecision::Hold(reason) => {
+                panic!("the fixture must quarantine, it held for {reason}")
+            }
+        };
+        let evidence_id = crate::hex::encode_lower(Sha256::digest(canonical_snapshot.as_bytes()));
+
+        let (generation, row_version) = {
+            let store = SkillStore::open_at(&paths).expect("store");
+            let state = store.generation_state().expect("generation state");
+            let metadata = store
+                .metadata(&artifact.id)
+                .expect("metadata")
+                .expect("revision row");
+            (state.desired_generation as i64, metadata.row_version as i64)
+        };
+
+        // A stale row version rejects the transition after the policy and the
+        // evidence row have already been written inside the same transaction.
+        let rejected = executor.apply(
+            &policy,
+            &evidence,
+            LifecycleStatus::Canary,
+            row_version + 1,
+            generation,
+            100,
+        );
+        assert!(
+            rejected.is_err(),
+            "a stale row version must reject the quarantine"
+        );
+        assert_eq!(
+            durable_rows(&paths, &policy.version, &evidence_id),
+            (0, 0),
+            "a rejected quarantine must leave neither a policy row nor evidence for a \
+             decision that was never applied"
+        );
+
+        // The same decision on the current row version commits all three writes.
+        let (outcome, _report) = executor
+            .apply(
+                &policy,
+                &evidence,
+                LifecycleStatus::Canary,
+                row_version,
+                generation,
+                101,
+            )
+            .expect("an applicable quarantine must commit");
+        assert_eq!(outcome.status, LifecycleStatus::Quarantined);
+        assert_eq!(
+            durable_rows(&paths, &policy.version, &evidence_id),
+            (1, 1),
+            "an applied quarantine must persist its policy and its evidence"
+        );
+
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

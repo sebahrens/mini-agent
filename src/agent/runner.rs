@@ -501,14 +501,32 @@ impl CompletionVerification {
         );
     }
 
+    /// Record why the completion gate produced no verification result.
+    ///
+    /// `no_verify_command` must mean exactly what it says: no verify command
+    /// is configured, so this turn could never have been gated. A *configured*
+    /// command that simply had nothing to check — the turn never touched the
+    /// workspace — is a different fact, and storing it as `no_verify_command`
+    /// with `verify_passed = false` misattributes the reason in every audit
+    /// built from task-outcome evidence.
+    ///
+    /// `TaskOutcomeSource` lives in `src/extras/js/skills/policy.rs` and has no
+    /// variant for the untouched-workspace case, so that case deliberately
+    /// records nothing here rather than recording something false. Reusing
+    /// `Oracle` would be worse than silence: promotion counts every source
+    /// except `NoVerifyCommand` as evidence, so a read-only turn would be
+    /// admitted as a failing gate result.
     #[cfg(feature = "skills")]
-    fn record_no_verify_command(&self) {
-        if let Some(recorder) = &self.task_outcomes {
-            recorder.record(
-                false,
-                1,
-                crate::extras::js::skills::policy::TaskOutcomeSource::NoVerifyCommand,
+    fn record_verification_skipped(&self, workspace_may_have_changed: bool) {
+        let Some(source) = skipped_verification_source(self.has_command()) else {
+            tracing::debug!(
+                workspace_may_have_changed,
+                "completion verification skipped under a configured command; no task outcome recorded"
             );
+            return;
+        };
+        if let Some(recorder) = &self.task_outcomes {
+            recorder.record(false, 1, source);
         }
     }
 
@@ -523,6 +541,26 @@ impl CompletionVerification {
         .wait()
         .await
     }
+}
+
+/// Which task-outcome source describes a turn that finished without running
+/// the completion gate, or `None` when no source honestly describes it.
+///
+/// `no_verify_command` claims the gate could never have run because nothing
+/// was configured. A configured command whose gate was skipped — the turn was
+/// read-only, so there was nothing to verify — is a different fact, and
+/// recording it as `no_verify_command` with `verify_passed = false`
+/// misattributes the reason to every audit built from this evidence.
+/// `TaskOutcomeSource` (in `src/extras/js/skills/policy.rs`) has no variant
+/// for the skipped-gate case, so it records nothing rather than something
+/// false; reusing `Oracle` would be worse than silence, because promotion
+/// counts every source except `NoVerifyCommand` as evidence and a read-only
+/// turn would then be admitted as a failing gate result.
+#[cfg(feature = "skills")]
+fn skipped_verification_source(
+    has_command: bool,
+) -> Option<crate::extras::js::skills::policy::TaskOutcomeSource> {
+    (!has_command).then_some(crate::extras::js::skills::policy::TaskOutcomeSource::NoVerifyCommand)
 }
 
 fn tool_may_mutate_workspace(name: &str) -> bool {
@@ -1750,16 +1788,20 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
     let mut replay_kind = ReplayKind::Other;
     let mut call_counts: HashMap<&str, usize> = HashMap::new();
     let mut result_counts: HashMap<&str, usize> = HashMap::new();
-    for msg in &replay_messages[first_kept..] {
+    let mut call_positions: HashMap<&str, usize> = HashMap::new();
+    let mut result_positions: HashMap<&str, usize> = HashMap::new();
+    for (position, msg) in replay_messages[first_kept..].iter().enumerate() {
         let Some(id) = msg.tool_call_id.as_deref().filter(|id| !id.is_empty()) else {
             continue;
         };
         match (&msg.role, &msg.tool) {
             (MessageRole::ToolCall, Some(PersistedToolMessage::Call { .. })) => {
                 *call_counts.entry(id).or_default() += 1;
+                call_positions.entry(id).or_insert(position);
             }
             (MessageRole::ToolResult, Some(PersistedToolMessage::Result { .. })) => {
                 *result_counts.entry(id).or_default() += 1;
+                result_positions.entry(id).or_insert(position);
             }
             _ => {}
         }
@@ -1768,10 +1810,21 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
     // duplicate identities. Only reconstruct complete one-to-one pairs; prose
     // fallback preserves every other record without producing invalid provider
     // protocol messages.
+    //
+    // The pair must also be *ordered*: a result record that precedes its call
+    // takes the prose branch (nothing is open yet), which would leave the
+    // later call emitted as a structured `function_call` with no output after
+    // it anywhere in the history — exactly the dangling call the Responses API
+    // rejects. Such a transcript replays entirely as prose instead.
     let valid_tool_ids: HashSet<&str> = call_counts
         .iter()
         .filter_map(|(id, calls)| {
-            (*calls == 1 && result_counts.get(id).copied() == Some(1)).then_some(*id)
+            let paired = *calls == 1 && result_counts.get(id).copied() == Some(1);
+            let ordered = matches!(
+                (call_positions.get(id), result_positions.get(id)),
+                (Some(call), Some(result)) if call < result
+            );
+            (paired && ordered).then_some(*id)
         })
         .collect();
     let mut open_call_ids = HashSet::new();
@@ -1779,8 +1832,24 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
     // The identity a call was replayed under, so its result can be paired with
     // it whether the call kept the provider's own ids or a rewritten identity.
     let mut replay_identities: HashMap<String, ReplayToolIdentity> = HashMap::new();
+    // A subagent tool-call record is a note about work a *nested* agent did
+    // while the parent's own tool call was still in flight. It carries no
+    // identity and no result, so it can never become a structured
+    // `function_call` — but emitting its prose where it was recorded would
+    // wedge an assistant text message between a structured call and its
+    // result, which Anthropic rejects outright and which costs the Responses
+    // path its call/result adjacency. The notes are therefore held until the
+    // open pair closes and replayed immediately after it.
+    let mut deferred_subagent_notes: Vec<String> = Vec::new();
 
     for msg in &replay_messages[first_kept..] {
+        let structured_call_open = open_call_ids.len() > completed_call_ids.len();
+        if !structured_call_open && !deferred_subagent_notes.is_empty() {
+            for note in deferred_subagent_notes.drain(..) {
+                messages.push(Message::assistant(note));
+            }
+            replay_kind = ReplayKind::Other;
+        }
         match msg.role {
             MessageRole::User => {
                 messages.push(Message::user(msg.content.to_string()));
@@ -1882,13 +1951,18 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                 }
             }
             MessageRole::SubagentToolCall => {
-                messages.push(Message::assistant(format!(
-                    "[SubagentToolCall]: {}",
-                    msg.content
-                )));
-                replay_kind = ReplayKind::Other;
+                let note = format!("[SubagentToolCall]: {}", msg.content);
+                if structured_call_open {
+                    deferred_subagent_notes.push(note);
+                } else {
+                    messages.push(Message::assistant(note));
+                    replay_kind = ReplayKind::Other;
+                }
             }
         }
+    }
+    for note in deferred_subagent_notes {
+        messages.push(Message::assistant(note));
     }
 
     messages
@@ -2638,7 +2712,8 @@ where
                             if !verification_ran
                                 && let Some(verification) = completion_verification.as_ref()
                             {
-                                verification.record_no_verify_command();
+                                verification
+                                    .record_verification_skipped(workspace_may_have_changed);
                             }
                             let _ = event_tx
                                 .send(AgentEvent::Done {
@@ -3278,7 +3353,7 @@ where
                         && !verification_ran
                         && let Some(verification) = completion_verification.as_ref()
                     {
-                        verification.record_no_verify_command();
+                        verification.record_verification_skipped(workspace_may_have_changed);
                     }
                     break;
                 }
@@ -7990,5 +8065,146 @@ mod tests {
             error.to_string(),
             "Agent returned empty response too many times, aborting."
         );
+    }
+}
+
+/// Replay-shape regressions for `convert_history_uncached` (mini-agent-mcja)
+/// and the completion-gate attribution fix (mini-agent-v98t).
+#[cfg(test)]
+mod replay_and_gate_attribution_tests {
+    use rig::completion::Message;
+    use rig::message::AssistantContent;
+
+    use crate::agent::runner::convert_history;
+    use crate::session::{MessageRole, Session};
+
+    fn session() -> Session {
+        Session::new("anthropic", "claude-test", 200_000, "")
+    }
+
+    fn is_tool_call(message: &Message) -> bool {
+        let Message::Assistant { content, .. } = message else {
+            return false;
+        };
+        content
+            .iter()
+            .any(|item| matches!(item, AssistantContent::ToolCall(_)))
+    }
+
+    fn assistant_text(message: &Message) -> Option<String> {
+        let Message::Assistant { content, .. } = message else {
+            return None;
+        };
+        match content.first() {
+            AssistantContent::Text(text) => Some(text.text),
+            _ => None,
+        }
+    }
+
+    /// mcja: a subagent record written while the parent's own tool call was in
+    /// flight used to be emitted where it was recorded, wedging an assistant
+    /// text message between a structured call and its result. The pair must
+    /// stay adjacent and the note must survive after it.
+    #[test]
+    fn subagent_notes_never_split_a_structured_call_from_its_result() {
+        let mut session = session();
+        session.add_message(MessageRole::User, "spawn a subagent");
+        session.add_tool_call_with_id("call-1", "task", &serde_json::json!({"prompts": ["find"]}));
+        session.add_message(MessageRole::SubagentToolCall, "read src/main.rs");
+        session.add_message(MessageRole::SubagentToolCall, "grep needle");
+        session.add_tool_result_with_id("call-1", "task", "subagent report");
+
+        let history = convert_history(&session);
+        let call_index = history
+            .iter()
+            .position(is_tool_call)
+            .expect("the task call must replay structurally");
+        assert!(
+            matches!(&history[call_index + 1], Message::User { .. }),
+            "the tool result must immediately follow its call: {history:?}"
+        );
+        let notes: Vec<String> = history[call_index + 2..]
+            .iter()
+            .filter_map(assistant_text)
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                "[SubagentToolCall]: read src/main.rs".to_string(),
+                "[SubagentToolCall]: grep needle".to_string(),
+            ],
+            "deferred subagent notes must be replayed, in order, after the pair"
+        );
+    }
+
+    /// A subagent record outside any open pair keeps its original position.
+    #[test]
+    fn subagent_notes_outside_a_pair_stay_where_they_were_recorded() {
+        let mut session = session();
+        session.add_message(MessageRole::SubagentToolCall, "read a.rs");
+        session.add_message(MessageRole::User, "and then?");
+
+        assert_eq!(
+            convert_history(&session),
+            vec![
+                Message::assistant("[SubagentToolCall]: read a.rs"),
+                Message::user("and then?"),
+            ]
+        );
+    }
+
+    /// mcja: a result recorded before its call used to leave the later call
+    /// replayed as a structured `function_call` with no output anywhere after
+    /// it — precisely the dangling call the Responses API rejects.
+    #[test]
+    fn a_result_recorded_before_its_call_never_produces_a_dangling_function_call() {
+        let mut session = session();
+        session.add_tool_result_with_id("inverted", "read", "output");
+        session.add_tool_call_with_id("inverted", "read", &serde_json::json!({"path": "a.rs"}));
+
+        let history = convert_history(&session);
+        assert!(
+            !history.iter().any(is_tool_call),
+            "an out-of-order pair must replay entirely as prose: {history:?}"
+        );
+        assert_eq!(history.len(), 2);
+    }
+
+    /// The ordinary in-order pair still replays structurally.
+    #[test]
+    fn an_ordered_pair_still_replays_structurally() {
+        let mut session = session();
+        session.add_tool_call_with_id("ordered", "read", &serde_json::json!({"path": "a.rs"}));
+        session.add_tool_result_with_id("ordered", "read", "output");
+
+        let history = convert_history(&session);
+        assert!(history.iter().any(is_tool_call), "{history:?}");
+        assert!(matches!(history.last(), Some(Message::User { .. })));
+    }
+
+    /// v98t: `no_verify_command` may only describe a turn with no configured
+    /// command. A configured command whose gate was skipped records nothing.
+    #[cfg(feature = "skills")]
+    #[test]
+    fn a_configured_verify_command_is_never_recorded_as_no_verify_command() {
+        use crate::agent::runner::{CompletionVerification, skipped_verification_source};
+        use crate::extras::js::skills::policy::TaskOutcomeSource;
+
+        let cfg = crate::config::Config {
+            verify_command: Some(compact_str::CompactString::new("true")),
+            ..crate::config::Config::default()
+        };
+        let verification =
+            CompletionVerification::from_config(&cfg, crate::sandbox::Sandbox::new(false, "bwrap"))
+                .expect("a configured verify command builds the gate");
+        assert!(verification.has_command());
+        assert!(
+            skipped_verification_source(verification.has_command()).is_none(),
+            "a read-only turn under a configured command must not be attributed to a missing one"
+        );
+        assert!(matches!(
+            skipped_verification_source(false),
+            Some(TaskOutcomeSource::NoVerifyCommand)
+        ));
     }
 }

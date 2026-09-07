@@ -657,6 +657,8 @@ editing in a known location, grepping for a literal you will act on immediately.
         )?;
         let specialization = specialization.map(|resolved| resolved.prompt);
         let anthropic_native = config.is_anthropic_native(&runtime.provider_name);
+        let reasoning_exclusive =
+            config.reasoning_tokens_are_exclusive_of_output(&runtime.provider_name);
 
         let subagent_event_tx = clone_subagent_event_tx();
         if let Some(event_tx) = &subagent_event_tx {
@@ -720,7 +722,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                     cancellation_retry_usage.total(),
                 );
                 let output = Err("subagent cancelled before completion".to_string());
-                usage_cost_units(&usage, anthropic_native, &cancellation_prompt, &output)
+                usage_cost_units(
+                    &usage,
+                    anthropic_native,
+                    reasoning_exclusive,
+                    &cancellation_prompt,
+                    &output,
+                )
             });
             let future = Box::pin(async move {
                 let display_prompt = prompt_text.clone();
@@ -789,8 +797,13 @@ editing in a known location, grepping for a literal you will act on immediately.
                 let output = run
                     .response
                     .map(|response| enforce_bounded_report_contract(&response));
-                let cost_units =
-                    usage_cost_units(&run.usage, anthropic_native, &display_prompt, &output);
+                let cost_units = usage_cost_units(
+                    &run.usage,
+                    anthropic_native,
+                    reasoning_exclusive,
+                    &display_prompt,
+                    &output,
+                );
                 ChildExecution { output, cost_units }
             });
             ScheduledChild {
@@ -842,7 +855,7 @@ fn indexed_child_future(index: usize, prompt: String, child: ChildFuture) -> Ind
             Err(_) => {
                 let output = Err("subagent panicked".to_string());
                 ChildExecution {
-                    cost_units: usage_cost_units(&Usage::new(), false, &prompt, &output),
+                    cost_units: usage_cost_units(&Usage::new(), false, false, &prompt, &output),
                     output,
                 }
             }
@@ -1304,9 +1317,19 @@ fn enforce_bounded_report_contract(response: &str) -> String {
     )
 }
 
+/// Tokens charged against the subagent budget for one completion.
+///
+/// `reasoning_exclusive` says whether the provider reports reasoning tokens
+/// *in addition to* `output_tokens`. OpenAI's `output_tokens` already contains
+/// `output_tokens_details.reasoning_tokens`, so adding them there charged
+/// reasoning twice and could exhaust the budget at roughly half the real
+/// spend; Gemini reports `thoughtsTokenCount` separately, so there the addend
+/// is the only way to see the cost at all. The main session's accounting makes
+/// the same distinction.
 fn usage_cost_units(
     usage: &Usage,
     anthropic_native: bool,
+    reasoning_exclusive: bool,
     prompt: &str,
     response: &Result<String, String>,
 ) -> u64 {
@@ -1318,7 +1341,11 @@ fn usage_cost_units(
     )
     .saturating_add(usage.output_tokens)
     .saturating_add(usage.tool_use_prompt_tokens)
-    .saturating_add(usage.reasoning_tokens);
+    .saturating_add(if reasoning_exclusive {
+        usage.reasoning_tokens
+    } else {
+        0
+    });
     if itemized > 0 {
         return itemized;
     }
@@ -2162,11 +2189,11 @@ mod tests {
             ..Usage::new()
         };
         assert_eq!(
-            usage_cost_units(&usage, false, "prompt", &Ok("response".into())),
+            usage_cost_units(&usage, false, false, "prompt", &Ok("response".into())),
             13
         );
         assert_eq!(
-            usage_cost_units(&usage, true, "prompt", &Ok("response".into())),
+            usage_cost_units(&usage, true, false, "prompt", &Ok("response".into())),
             16
         );
         let cache_only = Usage {
@@ -2175,7 +2202,7 @@ mod tests {
             ..Usage::new()
         };
         assert_eq!(
-            usage_cost_units(&cache_only, true, "", &Ok(String::new())),
+            usage_cost_units(&cache_only, true, false, "", &Ok(String::new())),
             10
         );
         let unreported_total = Usage {
@@ -2186,12 +2213,47 @@ mod tests {
             ..Usage::new()
         };
         assert_eq!(
-            usage_cost_units(&unreported_total, true, "", &Ok(String::new())),
+            usage_cost_units(&unreported_total, true, false, "", &Ok(String::new())),
             11
         );
         assert_eq!(
-            usage_cost_units(&Usage::new(), false, "1234", &Ok("5678".into())),
+            usage_cost_units(&Usage::new(), false, false, "1234", &Ok("5678".into())),
             2
+        );
+    }
+
+    /// mini-agent-6mpw: OpenAI reports `output_tokens_details.reasoning_tokens`
+    /// as a *subset* of `output_tokens`, so adding it charged the same tokens
+    /// twice and exhausted the subagent budget at roughly half the real spend.
+    #[test]
+    fn reasoning_tokens_are_not_charged_twice_for_inclusive_providers() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            reasoning_tokens: 40,
+            ..Usage::new()
+        };
+        assert_eq!(
+            usage_cost_units(&usage, false, false, "prompt", &Ok("response".into())),
+            150
+        );
+    }
+
+    /// Gemini reports `thoughtsTokenCount` alongside `candidatesTokenCount`,
+    /// so there the addend is the only way the reasoning cost is seen at all.
+    #[test]
+    fn reasoning_tokens_are_charged_for_exclusive_providers() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 190,
+            reasoning_tokens: 40,
+            ..Usage::new()
+        };
+        assert_eq!(
+            usage_cost_units(&usage, false, true, "prompt", &Ok("response".into())),
+            190
         );
     }
 
@@ -2236,7 +2298,7 @@ mod tests {
         assert_eq!(merged.usage.tool_use_prompt_tokens, u64::MAX);
         assert_eq!(merged.usage.reasoning_tokens, u64::MAX);
         assert_eq!(
-            usage_cost_units(&merged.usage, true, "prompt", &merged.response),
+            usage_cost_units(&merged.usage, true, true, "prompt", &merged.response),
             u64::MAX,
             "aggregate task budgeting must fail closed at the saturated maximum"
         );

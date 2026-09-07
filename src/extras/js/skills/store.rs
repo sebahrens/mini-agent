@@ -2631,6 +2631,81 @@ fn table_has_column(db: &Connection, table: &str, column: &str) -> Result<bool, 
     Ok(columns.iter().any(|existing| existing == column))
 }
 
+/// Run one schema migration step inside a single `BEGIN IMMEDIATE` transaction.
+///
+/// `PRAGMA user_version` is re-read *inside* the write transaction. A process
+/// that read a stale version before waiting on another migrator's write lock
+/// therefore observes the version that migrator committed and skips the step
+/// instead of replaying it on an already-migrated database (replaying step 3
+/// would reinstate the pre-v5 FTS triggers, and replaying 6/11/12 would
+/// rewrite live rows). `body` must advance `user_version` to `target`.
+///
+/// `disable_foreign_keys` toggles `PRAGMA foreign_keys` around the
+/// transaction, because SQLite ignores that pragma inside one.
+fn migration_step<F>(
+    db: &Connection,
+    target: u32,
+    disable_foreign_keys: bool,
+    body: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    if disable_foreign_keys {
+        db.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    let outcome = (|| -> Result<(), StoreError> {
+        db.execute_batch("BEGIN IMMEDIATE;")?;
+        let attempt = (|| -> Result<(), StoreError> {
+            let observed: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if observed >= target {
+                // A concurrent migrator committed this step while this
+                // process waited for the write lock.
+                return Ok(());
+            }
+            body()?;
+            let written: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if written != target {
+                return Err(StoreError::Constraint(format!(
+                    "schema migration {target} left user_version at {written}"
+                )));
+            }
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => {
+                db.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = db.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    })();
+    if disable_foreign_keys {
+        let _ = db.execute_batch("PRAGMA foreign_keys = ON;");
+    }
+    outcome
+}
+
+/// Test hook for the per-step guard that makes `migrate` safe to re-enter.
+///
+/// Exposed so the concurrency invariant — a step whose target version is
+/// already committed must not run again — can be asserted without racing two
+/// processes.
+#[cfg(test)]
+pub(crate) fn migration_step_for_test<F>(
+    db: &Connection,
+    target: u32,
+    body: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    migration_step(db, target, false, body)
+}
+
 /// Run idempotent schema migrations.
 fn migrate(db: &Connection) -> Result<(), StoreError> {
     // Get current schema version. PRAGMA user_version returns 0 for uninitialized DB.
@@ -2646,10 +2721,10 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     }
 
     // Migration 0 -> 1: Initial schema.
-    if current_version == 0 {
-        db.execute_batch(
-            "
-            BEGIN;
+    if current_version < 1 {
+        migration_step(db, 1, false, || {
+            db.execute_batch(
+                "
 
             CREATE TABLE IF NOT EXISTS skill_revisions (
                 id               TEXT PRIMARY KEY,
@@ -2707,19 +2782,19 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             END;
 
             PRAGMA user_version = 1;
-
-            COMMIT;
             ",
-        )?;
+            )?;
+            Ok(())
+        })?;
     }
 
     // Migration 1 -> 2: privacy tombstones, monotonic index generations, and
     // active-only lexical visibility. Rebuilding FTS is safe because it is a
     // derived index; canonical artifact bytes remain in skill_revisions.
     if current_version < 2 {
-        db.execute_batch(
-            "
-            BEGIN;
+        migration_step(db, 2, false, || {
+            db.execute_batch(
+                "
 
             CREATE TABLE IF NOT EXISTS skill_tombstones (
                 id        TEXT PRIMARY KEY,
@@ -2772,16 +2847,16 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             FROM skill_revisions WHERE status = 'active';
 
             PRAGMA user_version = 2;
-            COMMIT;
             ",
-        )?;
+            )?;
+            Ok(())
+        })?;
     }
 
     // Migration 2 -> 3: reconcile the independently developed Phase 3 and
     // Phase 4 v2 layouts, then add durable proposal/admission state.
     if current_version < 3 {
-        db.execute_batch("BEGIN IMMEDIATE;")?;
-        let migration = (|| -> Result<(), StoreError> {
+        migration_step(db, 3, false, || {
             ensure_column(
                 db,
                 "skill_generations",
@@ -2985,15 +3060,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                 ",
             )?;
             Ok(())
-        })();
-
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK;");
-                return Err(error);
-            }
-        }
+        })?;
     }
 
     // Migration 3 -> 4: directly attributed evidence, lifecycle automation,
@@ -3001,8 +3068,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     // generation table introduced by Phase 3 instead of creating a competing
     // publication authority.
     if current_version < 4 {
-        db.execute_batch("BEGIN IMMEDIATE;")?;
-        let migration = (|| -> Result<(), StoreError> {
+        migration_step(db, 4, false, || {
             ensure_column(db, "skill_revisions", "lineage_root_id", "TEXT")?;
             ensure_column(db, "skill_revisions", "evaluation_report_id", "TEXT")?;
             ensure_column(
@@ -3290,15 +3356,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                 ",
             )?;
             Ok(())
-        })();
-
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK;");
-                return Err(error);
-            }
-        }
+        })?;
     }
 
     // Migration 4 -> 5: identity-v2 manifests bind ABI v2 and structured scopes.
@@ -3306,8 +3364,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     // operationally quarantined with a stable reason. FTS is rebuilt behind an
     // identity-v2 predicate. No legacy flat host list is interpreted.
     if current_version < 5 {
-        db.execute_batch("BEGIN IMMEDIATE;")?;
-        let migration = (|| -> Result<(), StoreError> {
+        migration_step(db, 5, false, || {
             ensure_column(db, "skill_revisions", "quarantine_reason", "TEXT")?;
             db.execute(
                 "UPDATE skill_revisions
@@ -3349,21 +3406,13 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  PRAGMA user_version = 5;",
             )?;
             Ok(())
-        })();
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK;");
-                return Err(error);
-            }
-        }
+        })?;
     }
 
     // Migration 5 -> 6: persist exact one-time parent approval authority separately from
     // lifecycle evidence. A token is consumed only inside the transition transaction.
     if current_version < 6 {
-        db.execute_batch("BEGIN IMMEDIATE;")?;
-        let migration = (|| -> Result<(), StoreError> {
+        migration_step(db, 6, false, || {
             db.execute_batch(
                 "CREATE TEMP TABLE phase6_invalid_approval_skills (
                      id TEXT PRIMARY KEY
@@ -3531,53 +3580,48 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
             )?;
             db.pragma_update(None, "user_version", 6)?;
             Ok(())
-        })();
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK;");
-                return Err(error);
-            }
-        }
+        })?;
     }
 
     // Migration 6 -> 7: add index for efficient identity_version filtering in snapshot queries.
     // The snapshot queries filter by status='active' AND identity_version=2, but the schema only
     // indexed (status, id). Adding (status, identity_version, id) eliminates post-index filtering.
     if current_version < 7 {
-        db.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+        migration_step(db, 7, false, || {
+            db.execute_batch(
+                "
             CREATE INDEX IF NOT EXISTS skill_revisions_status_identity_version_idx
                 ON skill_revisions(status, identity_version, id);
             PRAGMA user_version = 7;
-            COMMIT;
             ",
-        )?;
+            )?;
+            Ok(())
+        })?;
     }
 
     // Migration 7 -> 8: sibling canaries may coexist while collecting evidence.
     // Only the eventual active successor must remain unique for a predecessor.
     if current_version < 8 {
-        db.execute_batch(
-            "
-            BEGIN IMMEDIATE;
+        migration_step(db, 8, false, || {
+            db.execute_batch(
+                "
             DROP INDEX IF EXISTS skill_revisions_one_live_successor;
             CREATE UNIQUE INDEX IF NOT EXISTS skill_revisions_one_active_successor
                 ON skill_revisions(supersedes_id)
                 WHERE supersedes_id IS NOT NULL AND status = 'active';
             PRAGMA user_version = 8;
-            COMMIT;
             ",
-        )?;
+            )?;
+            Ok(())
+        })?;
     }
 
     // Migration 8 -> 9: verification/oracle outcomes attributed to skills
     // that were durably invoked in the same turn.
     if current_version < 9 {
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS skill_task_outcomes (
+        migration_step(db, 9, false, || {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS skill_task_outcomes (
                  evidence_id   TEXT PRIMARY KEY,
                  turn_id       TEXT NOT NULL,
                  skill_id      TEXT NOT NULL,
@@ -3592,25 +3636,26 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  UNIQUE (turn_id, skill_id, attempt, source_kind, source_id),
                  FOREIGN KEY (skill_id) REFERENCES skill_revisions(id) ON DELETE CASCADE
              );
-             PRAGMA user_version = 9;
-             COMMIT;",
-        )?;
-        if table_has_column(db, "skill_task_outcomes", "skill_id")? {
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS skill_task_outcomes_skill_time_idx
-                 ON skill_task_outcomes(skill_id, created_at, turn_id)",
-                [],
+             PRAGMA user_version = 9;",
             )?;
-        }
+            if table_has_column(db, "skill_task_outcomes", "skill_id")? {
+                db.execute(
+                    "CREATE INDEX IF NOT EXISTS skill_task_outcomes_skill_time_idx
+                 ON skill_task_outcomes(skill_id, created_at, turn_id)",
+                    [],
+                )?;
+            }
+            Ok(())
+        })?;
     }
 
     // Migration 9 -> 10: store each task outcome once, including no-library
     // baselines, and keep skill attribution in a separate join table.
     if current_version < 10 {
-        if table_has_column(db, "skill_task_outcomes", "skill_id")? {
-            db.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE skill_task_outcomes RENAME TO skill_task_outcomes_v9;
+        migration_step(db, 10, false, || {
+            if table_has_column(db, "skill_task_outcomes", "skill_id")? {
+                db.execute_batch(
+                    "ALTER TABLE skill_task_outcomes RENAME TO skill_task_outcomes_v9;
                  CREATE TABLE skill_task_outcomes (
                      evidence_id   TEXT PRIMARY KEY,
                      turn_id       TEXT NOT NULL,
@@ -3642,13 +3687,11 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  FROM skill_task_outcomes_v9;
                  INSERT OR IGNORE INTO skill_task_outcome_links (evidence_id, skill_id)
                  SELECT evidence_id, skill_id FROM skill_task_outcomes_v9;
-                 DROP TABLE skill_task_outcomes_v9;
-                 COMMIT;",
-            )?;
-        }
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS skill_task_outcomes (
+                 DROP TABLE skill_task_outcomes_v9;",
+                )?;
+            }
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS skill_task_outcomes (
                  evidence_id   TEXT PRIMARY KEY,
                  turn_id       TEXT NOT NULL,
                  verify_passed INTEGER NOT NULL CHECK (verify_passed IN (0, 1)),
@@ -3674,17 +3717,18 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  ON skill_task_outcomes(source_kind, source_id, production, created_at);
              CREATE INDEX IF NOT EXISTS skill_task_outcome_links_skill_idx
                  ON skill_task_outcome_links(skill_id, evidence_id);
-             PRAGMA user_version = 10;
-             COMMIT;",
-        )?;
+             PRAGMA user_version = 10;",
+            )?;
+            Ok(())
+        })?;
     }
 
     // Migration 10 -> 11: infrastructure failures are parked separately from
     // deterministic rejection and have their own bounded retry counter.
     if current_version < 11 {
-        db.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
-        let migration = db.execute_batch(
-            "CREATE TABLE skill_proposals_v11 (
+        migration_step(db, 11, true, || {
+            db.execute_batch(
+                "CREATE TABLE skill_proposals_v11 (
                  proposal_id      TEXT PRIMARY KEY,
                  skill_id         TEXT NOT NULL UNIQUE,
                  predecessor_id   TEXT,
@@ -3745,14 +3789,9 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
              CREATE INDEX skill_proposals_skill_idx ON skill_proposals(skill_id);
              PRAGMA user_version = 11;",
-        );
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
-                return Err(StoreError::Sqlite(error));
-            }
-        }
+            )?;
+            Ok(())
+        })?;
         let foreign_key_error: Option<String> = db
             .prepare("PRAGMA foreign_key_check")?
             .query_map([], |row| row.get::<_, String>(0))?
@@ -3769,9 +3808,9 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
     // is parked as deferred under its own reason code, so the deferred
     // reason-code CHECK must admit `evaluation_attempts_exhausted` too.
     if current_version < 12 {
-        db.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
-        let migration = db.execute_batch(
-            "CREATE TABLE skill_proposals_v12 (
+        migration_step(db, 12, true, || {
+            db.execute_batch(
+                "CREATE TABLE skill_proposals_v12 (
                  proposal_id      TEXT PRIMARY KEY,
                  skill_id         TEXT NOT NULL UNIQUE,
                  predecessor_id   TEXT,
@@ -3834,14 +3873,9 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
              CREATE INDEX skill_proposals_skill_idx ON skill_proposals(skill_id);
              PRAGMA user_version = 12;",
-        );
-        match migration {
-            Ok(()) => db.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?,
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
-                return Err(StoreError::Sqlite(error));
-            }
-        }
+            )?;
+            Ok(())
+        })?;
         let foreign_key_error: Option<String> = db
             .prepare("PRAGMA foreign_key_check")?
             .query_map([], |row| row.get::<_, String>(0))?

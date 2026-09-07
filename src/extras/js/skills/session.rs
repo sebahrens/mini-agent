@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
 use super::admission::{AdmissionEvaluator, AdmissionWorker};
@@ -26,9 +27,62 @@ use crate::paths::WorkspaceBinding;
 /// session that exceeds this budget falls back to the background rebuild.
 const LEARNED_INDEX_HYDRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Attempt budget for one workspace's learned-skill initialization.
+///
+/// A failure used to be cached forever, so a transient one — `SQLITE_BUSY`
+/// after the store's busy timeout while another process migrates, or a worker
+/// that could not start — permanently disabled learned skills for the whole
+/// session. Failures are now retried under a growing delay until this budget
+/// is spent.
+const SERVICE_INIT_MAX_ATTEMPTS: u32 = 4;
+const SERVICE_INIT_RETRY_BASE: Duration = Duration::from_secs(5);
+const SERVICE_INIT_RETRY_MAX: Duration = Duration::from_secs(120);
+
+fn service_init_retry_delay(attempts: u32) -> Duration {
+    let multiplier = 1u32.checked_shl(attempts.min(5)).unwrap_or(u32::MAX).max(1);
+    SERVICE_INIT_RETRY_BASE
+        .saturating_mul(multiplier)
+        .min(SERVICE_INIT_RETRY_MAX)
+}
+
+/// Why learned skills are currently unavailable for one workspace.
+///
+/// Initialization failures used to exist only as a `tracing::warn!`, so a
+/// silently disabled session looked identical to one with no learned skills.
+/// `/status` and the trusted-context diagnostics render this instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillServiceFailure {
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) attempts: u32,
+    pub(crate) exhausted: bool,
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for SkillServiceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let root = self.workspace_root.display();
+        if self.exhausted {
+            write!(
+                formatter,
+                "learned skills are disabled for {root} after {} failed initialization attempts: {}",
+                self.attempts, self.reason
+            )
+        } else {
+            write!(
+                formatter,
+                "learned skills are unavailable for {root} (attempt {} of {SERVICE_INIT_MAX_ATTEMPTS}, retrying): {}",
+                self.attempts, self.reason
+            )
+        }
+    }
+}
+
 struct WorkspaceSlot<T> {
     root: PathBuf,
     services: Arc<OnceCell<Option<Arc<T>>>>,
+    attempts: u32,
+    retry_not_before: Option<Instant>,
+    last_failure: Option<String>,
 }
 
 struct WorkspaceServiceCache<T> {
@@ -45,23 +99,106 @@ impl<T> WorkspaceServiceCache<T> {
     async fn resolve<F, Fut>(&self, root: PathBuf, initialize: F) -> Option<Arc<T>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Option<Arc<T>>>,
+        Fut: std::future::Future<Output = Result<Arc<T>, String>>,
     {
         let cell = {
             let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-            match slot.as_ref() {
-                Some(slot) if slot.root == root => Arc::clone(&slot.services),
-                _ => {
-                    let services = Arc::new(OnceCell::new());
-                    *slot = Some(WorkspaceSlot {
-                        root,
-                        services: Arc::clone(&services),
-                    });
-                    services
-                }
+            if !matches!(slot.as_ref(), Some(existing) if existing.root == root) {
+                *slot = Some(WorkspaceSlot {
+                    root: root.clone(),
+                    services: Arc::new(OnceCell::new()),
+                    attempts: 0,
+                    retry_not_before: None,
+                    last_failure: None,
+                });
             }
+            let existing = slot.as_mut().expect("the slot was just populated");
+            if matches!(existing.services.get(), Some(None)) {
+                // The cached attempt failed. Retry only once the backoff has
+                // elapsed and the attempt budget still has room, so a later
+                // turn can recover from a transient failure without letting
+                // every rebuild churn on a permanent one.
+                if existing.attempts >= SERVICE_INIT_MAX_ATTEMPTS {
+                    return None;
+                }
+                if existing
+                    .retry_not_before
+                    .is_some_and(|deadline| Instant::now() < deadline)
+                {
+                    return None;
+                }
+                // Throttle concurrent callers while this retry is in flight.
+                existing.retry_not_before =
+                    Some(Instant::now() + service_init_retry_delay(existing.attempts));
+                existing.services = Arc::new(OnceCell::new());
+            }
+            Arc::clone(&existing.services)
         };
-        cell.get_or_init(initialize).await.clone()
+
+        let reported = Arc::new(Mutex::new(None::<String>));
+        let sink = Arc::clone(&reported);
+        let services = cell
+            .get_or_init(move || async move {
+                match initialize().await {
+                    Ok(services) => Some(services),
+                    Err(reason) => {
+                        *sink.lock().unwrap_or_else(|error| error.into_inner()) = Some(reason);
+                        None
+                    }
+                }
+            })
+            .await
+            .clone();
+
+        // Only the caller that actually ran the failed attempt charges the
+        // budget; callers that joined an in-flight attempt do not.
+        let reason = reported
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(reason) = reason {
+            let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = slot.as_mut()
+                && existing.root == root
+            {
+                existing.attempts = existing.attempts.saturating_add(1);
+                existing.retry_not_before =
+                    Some(Instant::now() + service_init_retry_delay(existing.attempts));
+                tracing::warn!(
+                    workspace = %existing.root.display(),
+                    attempt = existing.attempts,
+                    max_attempts = SERVICE_INIT_MAX_ATTEMPTS,
+                    error = %reason,
+                    "learned-skill services failed to initialize"
+                );
+                existing.last_failure = Some(reason);
+            }
+        }
+        services
+    }
+
+    /// The current disablement for the tracked workspace, if any.
+    fn failure(&self) -> Option<SkillServiceFailure> {
+        let slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        let existing = slot.as_ref()?;
+        if matches!(existing.services.get(), Some(Some(_))) {
+            return None;
+        }
+        Some(SkillServiceFailure {
+            workspace_root: existing.root.clone(),
+            attempts: existing.attempts,
+            exhausted: existing.attempts >= SERVICE_INIT_MAX_ATTEMPTS,
+            reason: existing.last_failure.clone()?,
+        })
+    }
+
+    /// Drop the retry backoff so the next `resolve` re-attempts immediately.
+    #[cfg(test)]
+    fn expire_retry_backoff_for_test(&self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = slot.as_mut() {
+            existing.retry_not_before = None;
+        }
     }
 }
 
@@ -69,7 +206,9 @@ impl<T> WorkspaceServiceCache<T> {
 ///
 /// Rebinding to another canonical workspace replaces the slot. Existing agents retain the old
 /// service `Arc` until they finish, while subsequent rebuilds initialize services for the new
-/// authority. Failed initialization is cached as `None` so rebuilds do not churn on startup.
+/// authority. A failed initialization is cached so rebuilds do not churn on startup, but only
+/// until its backoff elapses: a transient failure must not disable learned skills for the rest
+/// of the session, and the disabled state is readable through `disabled_diagnostic`.
 pub(crate) struct SkillServiceOwner {
     cache: WorkspaceServiceCache<SkillSessionServices>,
     #[cfg(test)]
@@ -102,6 +241,12 @@ impl SkillServiceOwner {
             .await
     }
 
+    /// Why learned skills are currently unavailable, for `/status` and the
+    /// trusted-context diagnostics. `None` while they are healthy.
+    pub(crate) fn disabled_diagnostic(&self) -> Option<SkillServiceFailure> {
+        self.cache.failure()
+    }
+
     #[cfg(test)]
     pub(crate) fn initialization_attempts(&self) -> usize {
         self.initialization_attempts
@@ -113,7 +258,7 @@ impl SkillServiceOwner {
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use super::{SkillSessionServices, WorkspaceServiceCache};
+    use super::{SERVICE_INIT_MAX_ATTEMPTS, SkillSessionServices, WorkspaceServiceCache};
     use crate::extras::js::skills::turn::{SkillTurnContext, TurnSkillBundle};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -155,7 +300,7 @@ mod tests {
                 for count in first_starts.iter() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
-                Some(Arc::new("services"))
+                Ok(Arc::new("services"))
             })
             .await
             .expect("first service initialization");
@@ -165,7 +310,7 @@ mod tests {
                 for count in second_starts.iter() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
-                Some(Arc::new("unexpected replacement"))
+                Ok(Arc::new("unexpected replacement"))
             })
             .await
             .expect("cached services");
@@ -191,24 +336,100 @@ mod tests {
                 cache
                     .resolve("workspace-a".into(), || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        None
+                        Err("store is busy".to_string())
                     })
                     .await
                     .is_none()
             );
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a failure inside its backoff window must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_initialization_failure_recovers_on_a_later_turn() {
+        let cache = WorkspaceServiceCache::<u8>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let failing = Arc::clone(&calls);
+        assert!(
+            cache
+                .resolve("workspace-a".into(), || async move {
+                    failing.fetch_add(1, Ordering::SeqCst);
+                    Err("database is locked".to_string())
+                })
+                .await
+                .is_none()
+        );
+        let failure = cache
+            .failure()
+            .expect("a failed initialization must be observable");
+        assert_eq!(failure.attempts, 1);
+        assert!(!failure.exhausted);
+        assert_eq!(failure.reason, "database is locked");
+        assert!(
+            failure.to_string().contains("database is locked"),
+            "the diagnostic must name the underlying failure"
+        );
+
+        // A later turn, once the backoff has elapsed, must be able to recover.
+        cache.expire_retry_backoff_for_test();
+        let recovering = Arc::clone(&calls);
+        let services = cache
+            .resolve("workspace-a".into(), || async move {
+                recovering.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(7_u8))
+            })
+            .await
+            .expect("a transient failure must not disable skills for the session");
+        assert_eq!(*services, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cache.failure().is_none(),
+            "a recovered workspace must no longer report a disablement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_initialization_failure_stops_at_the_attempt_budget() {
+        let cache = WorkspaceServiceCache::<u8>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..(SERVICE_INIT_MAX_ATTEMPTS + 3) {
+            cache.expire_retry_backoff_for_test();
+            let calls = Arc::clone(&calls);
+            assert!(
+                cache
+                    .resolve("workspace-a".into(), || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err("permanently broken".to_string())
+                    })
+                    .await
+                    .is_none()
+            );
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            SERVICE_INIT_MAX_ATTEMPTS as usize,
+            "retries must stop once the attempt budget is spent"
+        );
+        let failure = cache.failure().expect("the disablement must stay visible");
+        assert!(failure.exhausted);
+        assert_eq!(failure.attempts, SERVICE_INIT_MAX_ATTEMPTS);
     }
 
     #[tokio::test]
     async fn workspace_rebind_gets_a_fresh_service_bundle() {
         let cache = WorkspaceServiceCache::new();
         let first = cache
-            .resolve("workspace-a".into(), || async { Some(Arc::new(1_u8)) })
+            .resolve("workspace-a".into(), || async { Ok(Arc::new(1_u8)) })
             .await
             .unwrap();
         let second = cache
-            .resolve("workspace-b".into(), || async { Some(Arc::new(2_u8)) })
+            .resolve("workspace-b".into(), || async { Ok(Arc::new(2_u8)) })
             .await
             .unwrap();
 
@@ -223,7 +444,7 @@ mod tests {
         let second = WorkspaceServiceCache::new();
         let first_service = first
             .resolve("workspace-a".into(), || async {
-                Some(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
+                Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
                     "first",
                 ))))
             })
@@ -231,7 +452,7 @@ mod tests {
             .unwrap();
         let second_service = second
             .resolve("workspace-a".into(), || async {
-                Some(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
+                Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
                     "second",
                 ))))
             })
@@ -423,7 +644,7 @@ mod tests {
         let probe = Arc::clone(&drops);
         let service = cache
             .resolve("workspace-a".into(), || async move {
-                Some(Arc::new([
+                Ok(Arc::new([
                     DropProbe(Arc::clone(&probe)),
                     DropProbe(Arc::clone(&probe)),
                     DropProbe(probe),
@@ -554,14 +775,13 @@ impl SkillSessionServices {
         workspace_root: PathBuf,
         embedding: Option<EmbeddingConfig>,
         enable_proposals: bool,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Arc<Self>, String> {
         let paths = match crate::paths::process_paths()
             .and_then(|paths| paths.with_workspace_root(&workspace_root))
         {
             Ok(paths) => paths,
             Err(error) => {
-                tracing::warn!("skill discovery paths unavailable: {error}");
-                return None;
+                return Err(format!("skill discovery paths unavailable: {error}"));
             }
         };
         Self::open_with_paths(paths, embedding, enable_proposals).await
@@ -571,7 +791,7 @@ impl SkillSessionServices {
         paths: crate::paths::AppPaths,
         embedding: Option<EmbeddingConfig>,
         enable_proposals: bool,
-    ) -> Option<Arc<Self>> {
+    ) -> Result<Arc<Self>, String> {
         let runtime_paths = paths.clone();
         let runtime_embedding = embedding.clone();
         let runtime = match crate::agent::runner::spawn_blocking_scoped(move || {
@@ -581,12 +801,12 @@ impl SkillSessionServices {
         {
             Ok(Ok(runtime)) => Arc::new(runtime),
             Ok(Err(error)) => {
-                tracing::warn!("skill discovery disabled: {error}");
-                return None;
+                // The store may simply be busy behind another process's
+                // migration; the caller retries this under its own backoff.
+                return Err(format!("skill discovery unavailable: {error}"));
             }
             Err(error) => {
-                tracing::warn!("skill discovery startup worker failed: {error}");
-                return None;
+                return Err(format!("skill discovery startup worker failed: {error}"));
             }
         };
         // Hydrate once, synchronously and bounded, so the first prepared turn
@@ -619,7 +839,7 @@ impl SkillSessionServices {
             None
         };
 
-        Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             runtime,
             observation,
             proposals,

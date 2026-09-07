@@ -53,6 +53,165 @@ const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "temperature",
 ];
 
+/// Top-level `extra_body` keys the OpenAI Responses request body actually
+/// honors.
+///
+/// rig deserializes `extra_body` into its `AdditionalParameters`, which has no
+/// `deny_unknown_fields`, so anything outside this set is dropped without a
+/// word — a Chat-Completions habit like `reasoning_effort` or
+/// `max_completion_tokens` simply never reaches the provider. `stream` is
+/// listed because rig consumes and removes it before deserializing.
+const RESPONSES_EXTRA_BODY_KEYS: &[&str] = &[
+    "background",
+    "include",
+    "metadata",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "reasoning",
+    "service_tier",
+    "store",
+    "stream",
+    "text",
+    "top_p",
+    "truncation",
+    "user",
+];
+
+/// The complete set of `include` values rig's closed `Include` enum can
+/// deserialize. Anything else turns *every* completion request into a
+/// `RequestError`, so it is rejected at load with the accepted list named.
+const RESPONSES_INCLUDE_VALUES: &[&str] = &[
+    "code_interpreter_call.outputs",
+    "computer_call.output.image_url",
+    "file_search_call.results",
+    "message.input_image.image_url",
+    "reasoning.encrypted_content",
+];
+
+/// Whether `provider` resolves to the OpenAI family *and* to the Responses
+/// API, which is the only combination where `extra_body` is interpreted by
+/// rig's closed `AdditionalParameters` schema.
+fn provider_uses_responses_api(cfg: &Config, provider: &str) -> bool {
+    let customs = cfg.custom_providers.clone().unwrap_or_default();
+    let Ok(resolved) = crate::provider::resolve_provider_config(provider, &customs) else {
+        return false;
+    };
+    if resolved.kind != crate::auth::ProviderKind::OpenAI {
+        return false;
+    }
+    crate::provider::resolve_api_style(resolved.base_url.as_deref(), customs.get(provider))
+        == crate::config::ApiStyle::Responses
+}
+
+/// Validates one `extra_body` value against the Responses request schema.
+///
+/// Warnings are returned for keys rig would silently drop and for a stripped
+/// `previous_response_id` (this agent always sends the full input for a turn,
+/// so a globally pinned id would resend the whole conversation *and* ask the
+/// provider to prepend a stored one). An `include` value outside rig's closed
+/// enum is a hard error: left in place it would fail every request with an
+/// opaque `RequestError`.
+pub(crate) fn validate_responses_extra_body(
+    label: &str,
+    extra: &mut serde_json::Value,
+) -> Result<Vec<String>, String> {
+    if !extra.is_object() {
+        let shape = match extra {
+            serde_json::Value::Array(_) => "an array",
+            serde_json::Value::Null => "an empty value",
+            _ => "a scalar",
+        };
+        return Err(format!(
+            "{label} must be a table of Responses request-body keys, not {shape}"
+        ));
+    }
+    let object = extra
+        .as_object_mut()
+        .expect("extra_body shape checked immediately above");
+
+    if let Some(include) = object.get("include") {
+        let serde_json::Value::Array(values) = include else {
+            return Err(format!(
+                "{label}.include must be an array of strings; accepted values are {}",
+                RESPONSES_INCLUDE_VALUES.join(", ")
+            ));
+        };
+        for value in values {
+            let accepted = value
+                .as_str()
+                .is_some_and(|value| RESPONSES_INCLUDE_VALUES.contains(&value));
+            if !accepted {
+                return Err(format!(
+                    "{label}.include contains an unsupported value {value}; \
+                     the OpenAI Responses API client accepts only {}",
+                    RESPONSES_INCLUDE_VALUES.join(", ")
+                ));
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if object.remove("previous_response_id").is_some() {
+        warnings.push(format!(
+            "{label}.previous_response_id was ignored: this agent replays the full input \
+             every turn, so pinning a stored response id would duplicate the conversation"
+        ));
+    }
+    let unknown: Vec<String> = object
+        .keys()
+        .filter(|key| !RESPONSES_EXTRA_BODY_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        warnings.push(format!(
+            "{label} has key(s) the OpenAI Responses API request ignores: {}. \
+             Chat-Completions keys such as reasoning_effort are not read on this path; \
+             use the [reasoning] config section instead",
+            unknown.join(", ")
+        ));
+    }
+    Ok(warnings)
+}
+
+/// Validates every configured `extra_body` whose provider resolves to the
+/// OpenAI Responses API, stripping `previous_response_id` and warning about
+/// keys that would be dropped in silence.
+pub(crate) fn validate_extra_body(cfg: &mut Config) -> Result<Vec<String>, String> {
+    let global_is_responses = cfg
+        .provider
+        .clone()
+        .is_some_and(|provider| provider_uses_responses_api(cfg, &provider));
+    let responses_quick_models: Vec<String> = cfg
+        .quick_models
+        .iter()
+        .flatten()
+        .filter(|(_, model)| provider_uses_responses_api(cfg, &model.provider))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let mut warnings = Vec::new();
+    if global_is_responses && let Some(extra) = cfg.extra_body.as_mut() {
+        warnings.extend(validate_responses_extra_body("extra_body", extra)?);
+    }
+    if let Some(quick_models) = cfg.quick_models.as_mut() {
+        for name in responses_quick_models {
+            let Some(model) = quick_models.get_mut(&name) else {
+                continue;
+            };
+            let Some(extra) = model.extra_body.as_mut() else {
+                continue;
+            };
+            warnings.extend(validate_responses_extra_body(
+                &format!("quick_models.{name}.extra_body"),
+                extra,
+            )?);
+        }
+    }
+    Ok(warnings)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProjectConfigTrustStore {
     schema: u32,
@@ -569,6 +728,21 @@ fn load_from_path(
 
     #[cfg(feature = "mcp")]
     inject_mcp_defaults(&mut cfg);
+
+    match validate_extra_body(&mut cfg) {
+        Ok(warnings) => {
+            for warning in warnings {
+                tracing::warn!("config: {warning}");
+                eprintln!("warning: {warning}");
+            }
+        }
+        Err(error) => fatal_config_load(format!(
+            "error: {} configures an unusable OpenAI Responses request body: {}\n\
+             Fix the value or remove it.",
+            path.display(),
+            error,
+        )),
+    }
 
     (cfg, is_first_startup)
 }

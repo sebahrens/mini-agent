@@ -9,7 +9,8 @@ use rquickjs::context::EvalOptions;
 use rquickjs::function::{Args, IntoArgs, Rest};
 use rquickjs::object::Property;
 use rquickjs::{
-    Context, Ctx, FromJs, Function, Module, Object, Persistent, Runtime, Value, WriteOptions, qjs,
+    Context, Ctx, Exception, FromJs, Function, Module, Object, Persistent, Runtime, Value,
+    WriteOptions, qjs,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -19,7 +20,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use thiserror::Error;
 
-use super::skills::capability::{InvocationCapabilityRuntime, PreparedInvocationHandle};
+use super::skills::capability::{
+    CapabilityError, InvocationCapabilityRuntime, PreparedInvocationHandle, effect_error_code_token,
+};
 use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
@@ -946,12 +949,12 @@ fn load_artifact_internal(
                         let dispatch_capabilities = capabilities.clone();
                         let dispatch = Function::new(
                             ctx.clone(),
-                            move |token: u64, method: String, arguments: String| {
+                            move |ctx: Ctx<'_>, token: u64, method: String, arguments: String| {
                                 let operation = HostCapability::from_token(&method)
                                     .ok_or(rquickjs::Error::Unknown)?;
                                 dispatch_capabilities
                                     .dispatch(token, operation, &arguments)
-                                    .map_err(|_| rquickjs::Error::Unknown)
+                                    .map_err(|error| skill_effect_exception(&ctx, &method, &error))
                             },
                         )?;
                         let finish_capabilities = capabilities.clone();
@@ -1309,10 +1312,91 @@ fn publish_model_wrappers(
         .map_err(|_| RealmError::WrapperInstallation)
 }
 
+/// Raise the code-bearing exception the learned-skill ABI reports failures with.
+///
+/// Model-authored effect globals already throw an `Error` carrying a closed
+/// `code` property. Collapsing every brokered failure into
+/// `rquickjs::Error::Unknown` made `not_found`, `too_large`, `timed_out`,
+/// `backend_failure` and a real denial indistinguishable inside skill code, so
+/// a skill could not, for example, fall back when a file is missing. The same
+/// tokens and the same `code` property are used here.
+pub(super) fn skill_effect_exception(
+    ctx: &Ctx<'_>,
+    method: &str,
+    error: &CapabilityError,
+) -> rquickjs::Error {
+    let code = match error {
+        CapabilityError::EffectFailed(code) => effect_error_code_token(*code),
+        CapabilityError::InvalidArguments => "invalid_target",
+        CapabilityError::DispatchDenied => "denied",
+        CapabilityError::Denied(_)
+        | CapabilityError::Revoked
+        | CapabilityError::InvalidInvocation
+        | CapabilityError::InvalidAttribution
+        | CapabilityError::InvalidManifest(_) => "capability_denied",
+    };
+    let Ok(exception) = Exception::from_message(ctx.clone(), &format!("{method}: {code}")) else {
+        return rquickjs::Error::Unknown;
+    };
+    if exception.as_object().prop("code", code).is_err() {
+        return rquickjs::Error::Unknown;
+    }
+    exception.throw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extras::js::protocol::EffectErrorCode;
     use crate::extras::js::skills::{CapabilityManifest, SkillExport};
+
+    #[test]
+    fn a_brokered_effect_failure_reaches_skill_code_with_its_closed_code() {
+        let runtime = Runtime::new().expect("runtime");
+        let context = Context::full(&runtime).expect("context");
+        context.with(|ctx| {
+            for (error, expected) in [
+                (
+                    CapabilityError::EffectFailed(EffectErrorCode::NotFound),
+                    "not_found",
+                ),
+                (
+                    CapabilityError::EffectFailed(EffectErrorCode::TooLarge),
+                    "too_large",
+                ),
+                (
+                    CapabilityError::EffectFailed(EffectErrorCode::TimedOut),
+                    "timed_out",
+                ),
+                (
+                    CapabilityError::EffectFailed(EffectErrorCode::BackendFailure),
+                    "backend_failure",
+                ),
+                (
+                    CapabilityError::EffectFailed(EffectErrorCode::Denied),
+                    "denied",
+                ),
+                (CapabilityError::DispatchDenied, "denied"),
+                (CapabilityError::Revoked, "capability_denied"),
+            ] {
+                let raised = skill_effect_exception(&ctx, "read_file", &error);
+                assert!(matches!(raised, rquickjs::Error::Exception));
+                let thrown = ctx.catch();
+                let exception = thrown
+                    .as_exception()
+                    .expect("the ABI must raise an Error object");
+                let code: String = exception
+                    .as_object()
+                    .get("code")
+                    .expect("the exception must carry a closed code");
+                assert_eq!(code, expected, "wrong code for {error}");
+                assert_eq!(
+                    exception.message().expect("exception message"),
+                    format!("read_file: {expected}")
+                );
+            }
+        });
+    }
 
     #[test]
     fn trusted_realm_bootstrap_bytecode_loads_repeatedly_without_shared_state() {

@@ -321,3 +321,117 @@ impl Default for AdvisorConfig {
         }
     }
 }
+
+/// How much internal reasoning a reasoning-capable model should spend.
+///
+/// Maps to the OpenAI Responses API's `reasoning.effort` and to Chat
+/// Completions' top-level `reasoning_effort`. Values match the provider wire
+/// spellings exactly, so an unknown value is rejected at config parse time
+/// rather than turning every request into a provider error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    /// The provider wire value for this effort level.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+        }
+    }
+}
+
+/// How verbose the provider-rendered reasoning summary should be.
+///
+/// Maps to the OpenAI Responses API's `reasoning.summary`. There is no Chat
+/// Completions equivalent, so this key is ignored on the Completions path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
+impl ReasoningSummary {
+    /// The provider wire value for this summary level.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            ReasoningSummary::Auto => "auto",
+            ReasoningSummary::Concise => "concise",
+            ReasoningSummary::Detailed => "detailed",
+        }
+    }
+}
+
+/// First-class reasoning controls for the OpenAI family.
+///
+/// These are typed rather than hand-written `extra_body` JSON because the
+/// Responses request body is validated by rig against a closed schema: a
+/// misspelled key there is silently dropped and an out-of-range `include`
+/// value fails every request.
+///
+/// # Replay across gateways
+///
+/// A persisted reasoning item can only be replayed on a later turn if its
+/// content travelled back to us in the first place. The Responses API returns
+/// that content only when the request asked for it via
+/// `include: ["reasoning.encrypted_content"]`, which is why
+/// [`ReasoningConfig::encrypted_content`] defaults to on. Without it a
+/// persisted item carries nothing but an id, and the id resolves only against
+/// server-side state the upstream stored.
+///
+/// # `store` and `previous_response_id` caveats
+///
+/// * `store` defaults to **true** at OpenAI, meaning responses are retained
+///   server side and reasoning ids resolve on the next turn. A gateway that
+///   does not persist state, or that rewrites ids, breaks that continuation —
+///   set `store = false` there and rely on encrypted reasoning content
+///   instead. `store = false` is also the right setting for zero-retention
+///   deployments.
+/// * `previous_response_id` is deliberately **not** exposed here. This agent
+///   always sends the full input for a turn, so a globally pinned
+///   `previous_response_id` would resend the whole conversation *and* ask the
+///   provider to prepend a stored one. It is stripped from `extra_body` at
+///   config load for the same reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReasoningConfig {
+    /// `reasoning.effort` on Responses, `reasoning_effort` on Completions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    /// `reasoning.summary` on Responses. Ignored on Completions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
+    /// Whether the Responses request asks for `reasoning.encrypted_content`.
+    /// Defaults to **on**: it is what makes a persisted reasoning item
+    /// replayable on a gateway that does not retain server-side state. Set to
+    /// `false` only for an endpoint that rejects the `include` value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<bool>,
+    /// Responses `store`. `None` leaves the provider default (true at OpenAI)
+    /// untouched. See the type-level caveats before changing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+}
+
+impl ReasoningConfig {
+    /// Whether a request should ask for encrypted reasoning content. On by
+    /// default, including when no `[reasoning]` table is configured at all.
+    pub fn wants_encrypted_content(this: Option<&Self>) -> bool {
+        this.and_then(|config| config.encrypted_content)
+            .unwrap_or(true)
+    }
+}

@@ -1683,6 +1683,36 @@ fn select_interactive_auto_trigger(cli: &Cli, fallback: Option<String>) -> Optio
     interactive_initial_message(cli).or(fallback)
 }
 
+/// Startup-banner lines for a JavaScript runtime or learned-skill subsystem the
+/// worker-containment preflight refused, carrying that preflight's reason
+/// verbatim.
+///
+/// The gate can remove the `js` tool and the entire learned-skill subsystem
+/// with no other visible sign — the tool is simply absent — so the banner is
+/// the only surface an operator who never runs `/toggle` or `--print-config`
+/// sees. Only [`provider::RuntimeAvailability::Unavailable`] produces a line:
+/// a live subsystem and a build that never compiled the owning Cargo feature
+/// both add nothing, so the banner stays silent when there is nothing to say.
+///
+/// Kept pure and out of the renderer so the reason-propagation contract is
+/// unit-testable without a terminal.
+pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec<String> {
+    use provider::RuntimeAvailability::Unavailable;
+    match (&report.javascript, &report.learned_skills) {
+        // The learned-skill refusal is derived from the JavaScript one
+        // (`requires the contained JavaScript worker: <reason>`), so one line
+        // names both subsystems and repeats the single underlying reason.
+        (Unavailable { reason }, Unavailable { .. }) => vec![format!(
+            "[!] JavaScript runtime and learned skills unavailable: {reason}"
+        )],
+        (Unavailable { reason }, _) => {
+            vec![format!("[!] JavaScript runtime unavailable: {reason}")]
+        }
+        (_, Unavailable { reason }) => vec![format!("[!] learned skills unavailable: {reason}")],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "multithread")]
@@ -1690,12 +1720,77 @@ mod tests {
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
         apply_resume_provider_decision, compact_headless_session_with, headless_compaction_plan,
-        interactive_initial_message, needs_openrouter_context_refresh, require_recent_session,
-        resolve_resume_provider_decision, run_startup_probes_concurrently,
+        interactive_initial_message, js_runtime_banner_lines, needs_openrouter_context_refresh,
+        require_recent_session, resolve_resume_provider_decision, run_startup_probes_concurrently,
         select_interactive_auto_trigger, unavailable_sandbox_must_fail,
         validate_startup_permission_policy,
     };
     use crate::cli::Cli;
+
+    /// A refused containment preflight must reach the startup banner with its
+    /// reason intact, and a healthy (or not-compiled) runtime must add nothing.
+    #[test]
+    fn js_runtime_banner_names_the_verbatim_containment_reason() {
+        use crate::provider::{JsRuntimeReport, RuntimeAvailability};
+        const REASON: &str =
+            "MACOS_CONTAINMENT_UNSUPPORTED_VERSION: macOS 15 is not a validated major";
+
+        for report in [
+            JsRuntimeReport {
+                javascript: RuntimeAvailability::Available,
+                learned_skills: RuntimeAvailability::Available,
+            },
+            JsRuntimeReport {
+                javascript: RuntimeAvailability::NotCompiled,
+                learned_skills: RuntimeAvailability::NotCompiled,
+            },
+        ] {
+            assert!(
+                js_runtime_banner_lines(&report).is_empty(),
+                "the banner must stay silent for {report:?}"
+            );
+        }
+
+        let both = js_runtime_banner_lines(&JsRuntimeReport {
+            javascript: RuntimeAvailability::Unavailable {
+                reason: REASON.to_string(),
+            },
+            learned_skills: RuntimeAvailability::Unavailable {
+                reason: format!("requires the contained JavaScript worker: {REASON}"),
+            },
+        });
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert!(
+            both[0].contains("JavaScript runtime and learned skills unavailable"),
+            "the banner must name both subsystems: {both:?}"
+        );
+        assert!(
+            both[0].contains(REASON),
+            "the banner must repeat the preflight reason verbatim: {both:?}"
+        );
+
+        assert_eq!(
+            js_runtime_banner_lines(&JsRuntimeReport {
+                javascript: RuntimeAvailability::Unavailable {
+                    reason: REASON.to_string(),
+                },
+                learned_skills: RuntimeAvailability::NotCompiled,
+            }),
+            vec![format!("[!] JavaScript runtime unavailable: {REASON}")]
+        );
+        assert_eq!(
+            js_runtime_banner_lines(&JsRuntimeReport {
+                javascript: RuntimeAvailability::Available,
+                learned_skills: RuntimeAvailability::Unavailable {
+                    reason: "learned-skill services did not initialize".to_string(),
+                },
+            }),
+            vec![
+                "[!] learned skills unavailable: learned-skill services did not initialize"
+                    .to_string()
+            ]
+        );
+    }
 
     #[test]
     fn continue_requires_a_readable_existing_session() {

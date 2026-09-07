@@ -1,11 +1,14 @@
 use crate::auth::ProviderKind;
-use crate::config::{ApiStyle, CustomProviderConfig};
+use crate::config::{
+    ApiStyle, CustomProviderConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
+};
 use crate::provider::ModelEntry;
 use crate::provider::{
     AnyClient, AnyModel, bound_summary, compaction_request_limits, compress_messages_with,
     create_client, expand_env, is_agent_model, is_localhost, merge_extra_body,
-    openai_responses_extra_body, openrouter_anthropic_routing, resolve_api_style,
-    resolve_provider_config, serialize_conversation, summarize_conversation_bounded,
+    openai_completions_extra_body, openai_responses_extra_body, openrouter_anthropic_routing,
+    resolve_api_style, resolve_provider_config, serialize_conversation,
+    summarize_conversation_bounded,
 };
 use crate::session::{MessageRole, SessionMessage};
 use compact_str::CompactString;
@@ -776,9 +779,9 @@ fn merge_extra_body_handles_absent_sides() {
 
 #[test]
 fn openai_responses_cache_key_is_stable_per_session_and_user_overridable() {
-    let first = openai_responses_extra_body(None, "session-a").unwrap();
-    let repeated = openai_responses_extra_body(None, "session-a").unwrap();
-    let other = openai_responses_extra_body(None, "session-b").unwrap();
+    let first = openai_responses_extra_body(None, "session-a", None).unwrap();
+    let repeated = openai_responses_extra_body(None, "session-a", None).unwrap();
+    let other = openai_responses_extra_body(None, "session-b", None).unwrap();
 
     assert_eq!(first, repeated);
     assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
@@ -787,6 +790,7 @@ fn openai_responses_cache_key_is_stable_per_session_and_user_overridable() {
     let overridden = openai_responses_extra_body(
         Some(serde_json::json!({"prompt_cache_key": "configured", "store": false})),
         "session-a",
+        None,
     )
     .unwrap();
     assert_eq!(overridden["prompt_cache_key"], "configured");
@@ -953,4 +957,95 @@ async fn openrouter_anthropic_request_sends_automatic_tail_cache_control() {
     assert_eq!(body["cache_control"]["type"], "ephemeral");
     assert_eq!(body["provider"]["order"], serde_json::json!(["Anthropic"]));
     assert_eq!(body["provider"]["allow_fallbacks"], true);
+}
+
+/// b1au: without a first-class reasoning config nothing ever asked the
+/// Responses API for encrypted reasoning content, so a persisted reasoning
+/// item carried only an id and replay depended on the upstream having stored
+/// the response. The `include` entry must be present by default.
+#[test]
+fn openai_responses_requests_encrypted_reasoning_content_by_default() {
+    let body = openai_responses_extra_body(None, "session-a", None).unwrap();
+    assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    assert_eq!(body["include"].as_array().unwrap().len(), 1);
+    // No reasoning object is invented when nothing is configured.
+    assert!(body.get("reasoning").is_none());
+    assert!(body.get("store").is_none());
+}
+
+#[test]
+fn openai_responses_maps_reasoning_config_to_typed_request_keys() {
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::High),
+        summary: Some(ReasoningSummary::Detailed),
+        encrypted_content: None,
+        store: Some(false),
+    };
+    let body = openai_responses_extra_body(None, "session-a", Some(&reasoning)).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "detailed");
+    assert_eq!(body["store"], false);
+    assert_eq!(body["include"][0], "reasoning.encrypted_content");
+}
+
+#[test]
+fn openai_responses_encrypted_content_can_be_disabled() {
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::Low),
+        summary: None,
+        encrypted_content: Some(false),
+        store: None,
+    };
+    let body = openai_responses_extra_body(None, "session-a", Some(&reasoning)).unwrap();
+    assert!(body.get("include").is_none());
+    assert_eq!(body["reasoning"]["effort"], "low");
+    assert!(body["reasoning"].get("summary").is_none());
+}
+
+#[test]
+fn openai_responses_user_extra_body_overrides_generated_reasoning_defaults() {
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::Medium),
+        summary: None,
+        encrypted_content: None,
+        store: None,
+    };
+    let body = openai_responses_extra_body(
+        Some(serde_json::json!({"reasoning": {"effort": "minimal"}, "include": []})),
+        "session-a",
+        Some(&reasoning),
+    )
+    .unwrap();
+    assert_eq!(body["reasoning"]["effort"], "minimal");
+    assert!(body["include"].as_array().unwrap().is_empty());
+}
+
+/// b1au: Chat Completions has no `reasoning` object; effort travels as the
+/// top-level `reasoning_effort` key and nothing else from the typed config is
+/// sent.
+#[test]
+fn openai_completions_maps_only_reasoning_effort() {
+    let reasoning = ReasoningConfig {
+        effort: Some(ReasoningEffort::Xhigh),
+        summary: Some(ReasoningSummary::Concise),
+        encrypted_content: Some(true),
+        store: Some(false),
+    };
+    let body = openai_completions_extra_body(None, Some(&reasoning)).unwrap();
+    assert_eq!(body["reasoning_effort"], "xhigh");
+    assert!(body.get("reasoning").is_none());
+    assert!(body.get("include").is_none());
+    assert!(body.get("store").is_none());
+}
+
+#[test]
+fn openai_completions_preserves_extra_body_without_reasoning_config() {
+    let user = serde_json::json!({"logit_bias": {"1": -100}});
+    assert_eq!(
+        openai_completions_extra_body(Some(user.clone()), None),
+        Some(user)
+    );
+    assert_eq!(openai_completions_extra_body(None, None), None);
+    let empty = ReasoningConfig::default();
+    assert_eq!(openai_completions_extra_body(None, Some(&empty)), None);
 }

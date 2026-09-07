@@ -106,6 +106,7 @@ pub fn render_session(
             BlockStyle::Welcome,
             "──────────────────────────────────────────────────",
         );
+        push_runtime_availability(feed, &crate::provider::js_runtime_report());
         feed.push_line(
             BlockStyle::Welcome,
             "Ready to code; type a request or '/' for commands",
@@ -115,6 +116,22 @@ pub fn render_session(
         feed.push_line(BlockStyle::Plain, "");
     }
     Ok(())
+}
+
+/// Announce a JavaScript runtime / learned-skill subsystem the worker
+/// containment preflight refused, so the startup banner carries the signal an
+/// operator would otherwise only get from `/toggle` or `--print-config`.
+///
+/// Pushes nothing when both subsystems are live or were never compiled in;
+/// [`crate::startup::js_runtime_banner_lines`] owns that decision and the
+/// verbatim reason text.
+fn push_runtime_availability(
+    feed: &mut crate::ui::feed::Feed,
+    report: &crate::provider::JsRuntimeReport,
+) {
+    for line in crate::startup::js_runtime_banner_lines(report) {
+        feed.push_line(BlockStyle::Error, line);
+    }
 }
 
 fn render_tool_result_to_feed(
@@ -264,4 +281,55 @@ pub fn sanitize_output(text: &str) -> CompactString {
         }
     }
     CompactString::from(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_runtime_availability;
+    use crate::provider::{JsRuntimeReport, RuntimeAvailability};
+    use crate::ui::feed::Feed;
+
+    /// The startup banner must carry the containment refusal, and must not
+    /// grow a line when the runtime is live.
+    #[test]
+    fn startup_banner_shows_the_refused_runtime_and_stays_silent_otherwise() {
+        const REASON: &str = "MACOS_CONTAINMENT_UNSUPPORTED_VERSION: macOS 15";
+
+        let mut quiet = Feed::new();
+        push_runtime_availability(
+            &mut quiet,
+            &JsRuntimeReport {
+                javascript: RuntimeAvailability::Available,
+                learned_skills: RuntimeAvailability::Available,
+            },
+        );
+        assert_eq!(
+            quiet.block_count(),
+            0,
+            "a live runtime must add no banner line"
+        );
+
+        let mut warned = Feed::new();
+        push_runtime_availability(
+            &mut warned,
+            &JsRuntimeReport {
+                javascript: RuntimeAvailability::Unavailable {
+                    reason: REASON.to_string(),
+                },
+                learned_skills: RuntimeAvailability::Unavailable {
+                    reason: format!("requires the contained JavaScript worker: {REASON}"),
+                },
+            },
+        );
+        assert_eq!(warned.block_count(), 1);
+        let line = warned.block_text(0).expect("banner line");
+        assert!(
+            line.contains("JavaScript runtime and learned skills unavailable"),
+            "{line}"
+        );
+        assert!(
+            line.contains(REASON),
+            "the reason must reach the banner: {line}"
+        );
+    }
 }
