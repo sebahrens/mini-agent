@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MEMORY_LIMIT: usize = 64 * 1024 * 1024; // 64 MiB
 pub const STACK_LIMIT: usize = 512 * 1024; // 512 KiB JS stack
+#[cfg(test)]
 pub const THREAD_STACK: usize = 8 * 1024 * 1024; // 8 MiB OS thread stack
 pub const READ_FILE_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const READ_FILES_MAX_PATHS: usize = 256;
@@ -116,6 +117,7 @@ fn quote_spawn_policy_word(word: &str) -> String {
 
 static NEXT_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
 pub struct JsRequest {
     pub code: String,
     #[cfg(feature = "skills")]
@@ -126,6 +128,7 @@ pub struct JsRequest {
     pub reply: tokio::sync::oneshot::Sender<JsResponse>,
 }
 
+#[cfg(test)]
 impl fmt::Debug for JsRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsRequest")
@@ -157,6 +160,7 @@ impl fmt::Debug for JsRequest {
     }
 }
 
+#[cfg(test)]
 pub struct JsResponse {
     pub outcome: JsOutcome,
     #[cfg(feature = "skills")]
@@ -165,6 +169,7 @@ pub struct JsResponse {
     pub evidence_complete: bool,
 }
 
+#[cfg(test)]
 impl fmt::Debug for JsResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("JsResponse");
@@ -177,7 +182,7 @@ impl fmt::Debug for JsResponse {
     }
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(test, feature = "skills"))]
 #[derive(Debug, Clone)]
 pub struct InstrumentedSkill {
     pub artifact: crate::extras::js::skills::SkillArtifact,
@@ -186,7 +191,7 @@ pub struct InstrumentedSkill {
     pub query_fingerprint: Option<String>,
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(test, feature = "skills"))]
 #[derive(Debug, Clone)]
 pub struct SkillExecutionBundle {
     pub turn_id: String,
@@ -196,7 +201,7 @@ pub struct SkillExecutionBundle {
     pub skills: Vec<InstrumentedSkill>,
 }
 
-#[cfg(feature = "skills")]
+#[cfg(all(test, feature = "skills"))]
 impl SkillExecutionBundle {
     pub fn from_turn_bundle(
         bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
@@ -232,6 +237,7 @@ impl SkillExecutionBundle {
     }
 }
 
+#[cfg(test)]
 #[derive(PartialEq, Eq)]
 pub enum JsOutcome {
     Value(String),
@@ -242,6 +248,7 @@ pub enum JsOutcome {
     OomKilled,
 }
 
+#[cfg(test)]
 impl fmt::Debug for JsOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

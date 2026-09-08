@@ -1072,6 +1072,7 @@ impl FetchExecutor {
         self.execute_controlled(raw_url, request, Arc::new(FetchCallControl::new()))
     }
 
+    #[cfg(test)]
     fn execute_controlled(
         &self,
         raw_url: &str,
@@ -1087,6 +1088,7 @@ impl FetchExecutor {
         self.execute_prepared(prepared)
     }
 
+    #[cfg(test)]
     fn prepare(
         &self,
         raw_url: &str,
@@ -1339,6 +1341,7 @@ pub(crate) struct FetchRequest {
 
 #[cfg(feature = "sandbox")]
 impl FetchRequest {
+    #[cfg(test)]
     pub(crate) fn get() -> Self {
         Self {
             method: reqwest::Method::GET,
@@ -2143,6 +2146,7 @@ async fn resolve_write_target(
     })
 }
 
+#[cfg(test)]
 async fn write_approved_file(
     target: ResolvedWriteTarget,
     content: String,
@@ -2226,6 +2230,7 @@ impl FileEffectService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn read(
         &self,
         path: &str,
@@ -2236,6 +2241,7 @@ impl FileEffectService {
         self.execute_read(prepared, bridge).await
     }
 
+    #[cfg(test)]
     async fn authorize_read(
         &self,
         path: &str,
@@ -2308,6 +2314,7 @@ impl FileEffectService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn write(
         &self,
         path: &str,
@@ -2322,6 +2329,7 @@ impl FileEffectService {
         self.execute_write(prepared, content, bridge).await
     }
 
+    #[cfg(test)]
     async fn authorize_write(
         &self,
         path: &str,
@@ -2599,6 +2607,7 @@ impl FetchEffectService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         url: String,
@@ -2612,6 +2621,7 @@ impl FetchEffectService {
         self.execute_prepared(prepared, cancellation).await
     }
 
+    #[cfg(test)]
     async fn authorize(
         &self,
         url: String,
@@ -2885,6 +2895,7 @@ pub(crate) fn register_proposal_global(
 pub(crate) const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
+#[cfg(test)]
 const CONSOLE_MAX_BYTES_PER_STEP: usize = 256 * 1024;
 
 /// Parent-side structured process service. Permission identity and execution
@@ -3211,6 +3222,7 @@ impl SpawnEffectService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         program: &str,
@@ -3234,6 +3246,7 @@ impl SpawnEffectService {
         self.execute_prepared(prepared, bridge).await
     }
 
+    #[cfg(test)]
     async fn authorize(
         &self,
         program: &str,

@@ -132,6 +132,7 @@ impl PermissionBridge {
         bridge
     }
 
+    #[cfg(test)]
     pub(crate) fn is_shutdown(&self) -> bool {
         self.shutdown.is_cancelled()
     }
@@ -148,11 +149,7 @@ impl PermissionBridge {
         self.check_sync(PermissionCheckKind::Input, tool, key)
     }
 
-    #[allow(dead_code)] // Retained for compatibility with synchronous host tests.
-    pub(crate) fn check_path(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
-        self.check_sync(PermissionCheckKind::Path, tool, key)
-    }
-
+    #[cfg(test)]
     pub(crate) fn check_bound_path(
         &self,
         tool: &str,

@@ -113,6 +113,7 @@ impl BuildIdentity {
         .expect("exact build identity is a valid wire identity")
     }
 
+    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -1217,6 +1218,7 @@ impl ParentProtocol {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &ParentState {
         &self.state
     }
@@ -1446,6 +1448,7 @@ impl WorkerProtocol {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &WorkerState {
         &self.state
     }

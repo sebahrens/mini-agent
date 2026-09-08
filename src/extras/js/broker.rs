@@ -60,6 +60,7 @@ pub(crate) enum HostCapability {
 }
 
 impl HostCapability {
+    #[cfg(test)]
     pub(crate) fn all() -> BTreeSet<Self> {
         BTreeSet::from([
             Self::ReadFile,
@@ -883,10 +884,12 @@ pub(crate) enum NormalizedTarget {
 }
 
 impl AuthorizedEffect {
+    #[cfg(test)]
     pub(crate) fn invocation_id(&self) -> &InvocationId {
         &self.invocation_id
     }
 
+    #[cfg(test)]
     pub(crate) fn grant_id(&self) -> &GrantId {
         &self.grant_id
     }
@@ -895,6 +898,7 @@ impl AuthorizedEffect {
         &self.principal
     }
 
+    #[cfg(test)]
     pub(crate) fn capability(&self) -> HostCapability {
         self.capability
     }

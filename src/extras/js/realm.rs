@@ -500,16 +500,20 @@ pub(crate) enum RealmError {
 /// Metadata proving which immutable artifact was installed into the model context.
 #[derive(Debug)]
 pub(crate) struct LoadedArtifact {
+    #[cfg(test)]
     artifact_id: String,
+    #[cfg(test)]
     exports: Vec<String>,
     dispatcher_resources: Vec<Arc<Mutex<Option<DispatcherResources>>>>,
 }
 
 impl LoadedArtifact {
+    #[cfg(test)]
     pub(crate) fn artifact_id(&self) -> &str {
         &self.artifact_id
     }
 
+    #[cfg(test)]
     pub(crate) fn exports(&self) -> &[String] {
         &self.exports
     }
@@ -543,6 +547,7 @@ impl CompiledArtifactBytecode {
         self.bytes.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -1031,7 +1036,9 @@ fn load_artifact_internal(
     }
     publish_model_wrappers(model_context, wrappers)?;
     Ok(LoadedArtifact {
+        #[cfg(test)]
         artifact_id: artifact.id.clone(),
+        #[cfg(test)]
         exports: artifact
             .exports
             .iter()

@@ -679,6 +679,7 @@ impl EffectAudit {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub(crate) fn records(&self) -> &[EffectAuditRecord] {
         &self.records
     }

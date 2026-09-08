@@ -1069,6 +1069,7 @@ impl WorkerCapabilityLifecycle {
         Self { capabilities }
     }
 
+    #[cfg(test)]
     pub(crate) fn cancel(&self, invocation_id: &super::protocol::InvocationId) {
         self.capabilities.cancel(invocation_id);
     }

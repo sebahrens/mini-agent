@@ -138,9 +138,9 @@ pub(crate) fn private_skill_source(skill: &SkillArtifact) -> &str {
     &skill.source
 }
 
-/// Compatibility wrapper for the Phase 3 in-process engine. The Phase 6 realm loader uses
-/// [`private_skill_source`]; A15/A21 remove the remaining compatibility callers when production
-/// registration and verification move onto the worker loader.
+/// Compatibility wrapper for the test-only Phase 3 in-process engine. Production registration
+/// and verification use the Phase 6 realm loader and [`private_skill_source`].
+#[cfg(test)]
 pub(crate) fn legacy_private_skill_source(skill: &SkillArtifact) -> String {
     let published = skill
         .exports
