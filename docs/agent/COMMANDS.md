@@ -305,6 +305,51 @@ The `.[prompt] [msg]` syntax is a one-shot: it sets the prompt, submits the
 message, and after the response restores the previous prompt and
 `last_user_mode`.
 
+## Learned-skill and Agent Skill CLI flags
+
+These are shell flags, not slash commands. Every one of them requires a build with the `skills`
+feature; without it the flag does not exist and `clap` rejects it as an unexpected argument. Each
+learned-skill flag runs before provider initialization and exits without starting a session, and
+most of them conflict with one another so only one lifecycle action runs per invocation. The full
+reference — package format, held-out suites, feedback semantics, stats columns — is in
+[SKILLS.md](SKILLS.md).
+
+| Flag | Description |
+| ---- | ----------- |
+| `--import-learned-skill <DIR_OR_JSON>` | Import and contained-verify learned-skill JSON package(s) for approval. A directory imports 1–32 sorted `.json` files. |
+| `--install-learned-skill-seeds` | Import and contained-verify the five bundled pure seed packages. Reports each seed independently and is idempotent. |
+| `--list-learned-skill-proposals` | List proposals still awaiting an operator decision, as TSV, then exit. A `verified` proposal whose reason is `held_out_suite_required` is listed but is not approvable. |
+| `--learned-skill-proposal <SHA256>` | Print one proposal's admission outcome, including the `reason_code` and `report_id` of a rejected or deferred decision, then exit. Unlike the listing, this also finds terminal proposals. |
+| `--learned-skill-stats` | Print the per-revision usage table (TSV) and exit. See [Reading `--learned-skill-stats`](SKILLS.md#reading---learned-skill-stats) before drawing conclusions from the `success` column. |
+| `--approve-learned-skill <SHA256>` | Approve an evaluated proposal into the non-retrievable canary state. Requires `awaiting_approval`. |
+| `--reject-learned-skill <SHA256>` | Reject an evaluated proposal as the authenticated local owner. |
+| `--activate-learned-skill <SHA256>` | Activate an approved **lineage-root** skill after its held-out baseline. Deliberately refuses a replacement. |
+| `--promote-learned-skill <SHA256>` | Promote an approved replacement canary over its active or quarantined predecessor, superseding it and preserving lineage. |
+| `--retire-learned-skill <SHA256>` | Administratively disable an `active` revision, preserving the revision and its lineage. |
+| `--compact-learned-skill-events` | Aggregate raw telemetry older than the 30-day retention window into daily rows, then delete it. |
+| `--purge-learned-skill <SHA256>` | Coordinated, tombstoned privacy purge of one revision and its dependent records. |
+| `--purge-learned-skill-force` | Permit that purge to delete a revision that is not in a terminal lifecycle status, or whose dependent revisions would be re-rooted. Only valid with `--purge-learned-skill`. |
+| `--learned-skill-feedback <SHA256>` | Submit authenticated local-owner feedback for one learned skill. Requires the three flags below. |
+| `--learned-skill-feedback-kind <KIND>` | `positive`, `negative` or `severe`; the flag itself rejects any other value. |
+| `--learned-skill-feedback-reason <CODE>` | Reason code: 1–64 bytes of lowercase ASCII letters and `_`. For `severe`, only `integrity`, `permission_violation` or `unsafe_effect` are accepted. |
+| `--learned-skill-feedback-key <KEY>` | Caller-chosen idempotency key: 1–128 bytes of ASCII letters, digits, `.`, `_`, `:` or `-`. Re-using it with a different payload is an error. |
+| `--learned-skill-feedback-invocation <SHA256>` | Optional. Attribute the report to one exact invocation. Must be 64 lowercase hex characters naming a retained `invoked` event for that skill, within the 30-day raw-telemetry window. |
+| `--learned-skill-json` (alias `--json`) | Emit learned-skill operator command results as one JSON object per line. The two tabular listings stay TSV. |
+| `--import-agent-skill <PATH>` | Validate and install one local Agent Skills directory or ZIP archive, and point that skill's `ACTIVE` marker at the new digest. See [CONFIG.md](CONFIG.md#importing-portable-agent-skills). |
+
+The four `--learned-skill-feedback-*` flags currently carry no `help` text of their own, so
+`--help` shows them with a value name and no description. Until that is fixed, this table is the
+reference for what each accepts.
+
+Apart from the two TSV listings, every learned-skill command reports one line in a single shared
+shape — `learned-skill <command>: name=value …`, with `-` for an absent value — so one parser
+handles all of them. For example:
+
+```text
+learned-skill import: id=<sha256> proposal_id=<sha256> status=awaiting_approval reason_code=- report_id=<sha256> idempotent=false next_attempt_at=- blocked_by=-
+learned-skill feedback: id=<sha256> feedback_id=<sha256> kind=severe status=quarantined quarantine=applied quarantine_reason=-
+```
+
 ## General
 
 | Command | Description |

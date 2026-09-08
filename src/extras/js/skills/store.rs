@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
 pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
@@ -3873,6 +3873,55 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                  ON skill_proposals(status, next_attempt_at, lease_expires_at, proposed_at);
              CREATE INDEX skill_proposals_skill_idx ON skill_proposals(skill_id);
              PRAGMA user_version = 12;",
+            )?;
+            Ok(())
+        })?;
+        let foreign_key_error: Option<String> = db
+            .prepare("PRAGMA foreign_key_check")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .next()
+            .transpose()?;
+        if let Some(table) = foreign_key_error {
+            return Err(StoreError::Constraint(format!(
+                "schema migration left a foreign-key violation in {table}"
+            )));
+        }
+    }
+
+    // A turn that ran under a configured verify command without touching the
+    // workspace is neither a gate result nor an absent command, so it records
+    // its own source. SQLite cannot widen a CHECK in place, so the table is
+    // copied the way migrations 10 and 12 copy theirs.
+    if current_version < 13 {
+        migration_step(db, 13, true, || {
+            db.execute_batch(
+                "CREATE TABLE skill_task_outcomes_v13 (
+                 evidence_id   TEXT PRIMARY KEY,
+                 turn_id       TEXT NOT NULL,
+                 verify_passed INTEGER NOT NULL CHECK (verify_passed IN (0, 1)),
+                 attempt       INTEGER NOT NULL CHECK (attempt > 0),
+                 source_kind   TEXT NOT NULL CHECK (
+                     source_kind IN (
+                         'verify_command', 'oracle', 'no_verify_command', 'gate_skipped'
+                     )
+                 ),
+                 source_id     TEXT,
+                 production    INTEGER NOT NULL CHECK (production IN (0, 1)),
+                 created_at    INTEGER NOT NULL,
+                 UNIQUE (turn_id, attempt, source_kind, source_id)
+             );
+             INSERT INTO skill_task_outcomes_v13 (
+                 evidence_id, turn_id, verify_passed, attempt, source_kind,
+                 source_id, production, created_at
+             )
+             SELECT evidence_id, turn_id, verify_passed, attempt, source_kind,
+                    source_id, production, created_at
+               FROM skill_task_outcomes;
+             DROP TABLE skill_task_outcomes;
+             ALTER TABLE skill_task_outcomes_v13 RENAME TO skill_task_outcomes;
+             CREATE INDEX IF NOT EXISTS skill_task_outcomes_source_idx
+                 ON skill_task_outcomes(source_kind, source_id, production, created_at);
+             PRAGMA user_version = 13;",
             )?;
             Ok(())
         })?;

@@ -211,8 +211,9 @@ struct SkillUsageStats {
 ///
 /// `tasks_with`, `passed_with` and `pass_rate_without` are derived from task
 /// outcomes recorded against a `verify_command`: an operator who runs without
-/// one records `no_verify_command` rows, which carry no pass/fail signal and
-/// are excluded, so those three columns stay empty for that operator.
+/// one records `no_verify_command` rows, and a turn that never touched the
+/// workspace records `gate_skipped`. Neither carries a pass/fail signal, so
+/// both are excluded and those three columns stay empty for that operator.
 const SKILL_STATS_HEADER: &str = "id\tstatus\tinvocations\tsuccess\tlast_used_unix\t\
      tasks_with\tpassed_with\tpass_rate_without\tgym_tasks\tuser_positive\tuser_negative\t\
      declared_effect_methods\test_round_trips_saved";
@@ -278,7 +279,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                      ON outcome.evidence_id = link.evidence_id
                   WHERE link.skill_id = revision.id
                     AND outcome.production = 1
-                    AND outcome.source_kind != 'no_verify_command'),
+                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
                 (SELECT COUNT(DISTINCT CASE WHEN outcome.verify_passed = 1
                                            THEN outcome.turn_id END)
                    FROM skill_task_outcome_links AS link
@@ -286,11 +287,11 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                      ON outcome.evidence_id = link.evidence_id
                   WHERE link.skill_id = revision.id
                     AND outcome.production = 1
-                    AND outcome.source_kind != 'no_verify_command'),
+                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
                 (SELECT COUNT(DISTINCT baseline.turn_id)
                    FROM skill_task_outcomes AS baseline
                   WHERE baseline.production = 1
-                    AND baseline.source_kind != 'no_verify_command'
+                    AND baseline.source_kind NOT IN ('no_verify_command', 'gate_skipped')
                     AND NOT EXISTS (
                         SELECT 1 FROM skill_task_outcome_links AS absent
                          WHERE absent.evidence_id = baseline.evidence_id
@@ -309,7 +310,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                                            THEN baseline.turn_id END)
                    FROM skill_task_outcomes AS baseline
                   WHERE baseline.production = 1
-                    AND baseline.source_kind != 'no_verify_command'
+                    AND baseline.source_kind NOT IN ('no_verify_command', 'gate_skipped')
                     AND NOT EXISTS (
                         SELECT 1 FROM skill_task_outcome_links AS absent
                          WHERE absent.evidence_id = baseline.evidence_id
@@ -330,7 +331,7 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                      ON outcome.evidence_id = link.evidence_id
                   WHERE link.skill_id = revision.id
                     AND outcome.production = 0
-                    AND outcome.source_kind != 'no_verify_command'),
+                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
                 COALESCE(stats.user_positive_count, 0),
                 COALESCE(stats.user_negative_count, 0),
                 revision.capability_json

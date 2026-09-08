@@ -32,7 +32,7 @@ or process authority.
 | JavaScript actions | The model can filter, parse, loop, branch, and combine tool results inside one bounded QuickJS program. There is no Node.js sidecar, package manager, `require()`, `import()`, or direct OS API. A fresh JavaScript runtime is created for every request. |
 | Permissions and effects | Rust owns every JavaScript external effect. Brokered file, fetch, process, and skill operations are typed, scope-narrowed, permission-checked, bounded, and audited by the parent process. Approval of one operation does not grant unrelated authority. |
 | Sandboxing | Linux, macOS, and Windows use different native containment backends behind the same JavaScript contract. Startup includes live platform checks; if mini-agent cannot prove the required boundary, the affected capability fails closed instead of silently running uncontained. |
-| Learned skills | The optional `skills` build can turn useful JavaScript into immutable, content-addressed local skills. Proposals do not activate themselves: verification, explicit human approval, evidence, promotion, quarantine, repair, and rollback are separate lifecycle stages. |
+| Learned skills | The optional `skills` build can turn useful JavaScript into immutable, content-addressed local skills. Proposals do not activate themselves: verification, explicit human approval, activation, and promotion are separate lifecycle stages, and quarantine is automatic on directly attributed faults. |
 | Default versus optional | Release binaries include JavaScript execution, sandboxing, MCP, ACP, subagents, worktrees, loops, memory, and the other default features. Learned-skill storage is not included in release archives; install from source with `--features skills` to enable it. |
 | Data and operation | Configuration, sessions, memory, and learned skills are local. The contained JavaScript worker has no direct network access; providers, MCP services, hooks, and shell or fetch operations follow their separately visible configuration, permission, and containment policies. |
 
@@ -79,7 +79,7 @@ each.
 | Structured local Git | The agent can inspect history and safely stage, unstage, or commit through seven fixed permission-checked operations without raw shell arguments, remotes, or network access. |
 | Fresh runtimes | Every step and every complete verification request receives a new bounded QuickJS runtime. No JavaScript heap survives between requests. |
 | Curated skill library | The agent can propose useful JavaScript snippets, verify them, retrieve them by meaning, and improve the library from attributable evidence. |
-| Evidence-based lifecycle | Skills can progress through proposal, verification, human-gated canary, promotion, quarantine, repair, supersession, and rollback. |
+| Evidence-based lifecycle | Skills progress through proposal, verification, human-gated canary, operator promotion or retirement, and automatic quarantine. Repair and rollback are implemented and tested as library contracts but are not reachable from the shipped binary. |
 
 ## Code as tool
 
@@ -189,13 +189,18 @@ The lifecycle is deliberately curatorial:
 ```text
 repeated task
     → propose immutable JS skill
-    → verify in fresh no-effect runtimes + held-out Rust cases
+    → verify in fresh no-effect runtimes + held-out cases
     → human-approved, non-retrievable canary
-    → evidence-based promotion
-    → semantic retrieval for a relevant future prompt
+    → explicit operator activation or promotion
+    → retrieval for a relevant future prompt
     → attributed success or failure evidence
-    → retain / quarantine / repair / supersede / roll back
+    → retain / quarantine / retire / supersede
 ```
+
+Promotion of a replacement over its predecessor is an explicit local-owner command, not something
+evidence performs on its own: nothing in the shipped binary promotes a canary because a threshold
+was crossed. Quarantine is the one automatic transition, and it only ever removes a revision from
+retrieval.
 
 This follows the useful part of the
 [Voyager skill-library idea](https://voyager.minedojo.org/): code represents temporally extended,
@@ -216,15 +221,27 @@ This is **bounded self-improvement**, not uncontrolled self-modification:
 - write, process, and network authority keep their human gates;
 - production evidence must be directly attributable to the exact skill revision;
 - failures can quarantine a revision without deleting its audit history; and
-- repair creates a new immutable revision, so rollback never means guessing what changed.
+- every change of authority is a new immutable revision, so recovery never means guessing what
+  changed.
 
-Skills-enabled builds ship the complete local-owner lifecycle surface. Operators can import and
-contained-verify packages, install the bundled seed library, inspect status and usage, approve or
-reject candidates, explicitly activate an approved lineage root, submit attributable feedback,
-compact retained events, and irreversibly purge a revision. Setting
-`enable_skill_proposals = true` in trusted configuration also exposes `propose_skill` and starts the
-bounded proposal/admission workers. Every approval and activation gate above remains separate;
-importing or proposing code never activates it automatically.
+Skills-enabled builds ship the local-owner lifecycle surface. Operators can import and
+contained-verify packages, install the bundled seed library, inspect status and usage, list
+proposals and read one proposal's admission outcome, approve or reject candidates, explicitly
+activate an approved lineage root, promote an approved replacement over its active or quarantined
+predecessor, retire an active revision without deleting it, submit attributable feedback, compact
+retained events, and irreversibly purge a revision. Setting `enable_skill_proposals = true` in
+trusted configuration also exposes `propose_skill` and starts the bounded proposal/admission
+workers. Every approval, activation, and promotion gate above remains separate; importing or
+proposing code never activates it automatically.
+
+Two lifecycle capabilities described in the specifications are library contracts only and have no
+command: **rollback** to a previous revision, and **repair**, which is compiled solely into the
+verification suite. The recovery path for a defective active revision is therefore forward, not
+backward: contain it (severe safety feedback quarantines it immediately; `--retire-learned-skill`
+disables it administratively), get a corrected replacement approved, then promote the replacement
+over the quarantined predecessor. See
+[the Phase 5 spec](docs/specs/phase-5-evidence-learning.md) for the exact sequence and its
+preconditions.
 
 The local CLI's separate approval and root-activation actions use one `local-owner` identity; they
 are two deliberate gates, not a claim that two independent people reviewed the skill.

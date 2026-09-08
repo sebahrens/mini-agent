@@ -110,10 +110,26 @@ mini-agent --import-agent-skill ./my-skill
 mini-agent --import-agent-skill ./my-skill.zip
 ```
 
+`--import-agent-skill` requires a build with the `skills` feature. The catalog,
+index and loader that read an installed tree exist only in that build, so the
+flag is compiled out otherwise and is rejected as an unexpected argument rather
+than installing a tree nothing would ever read.
+
 Imports are validated without executing bundled scripts. Trees are installed
-by whole-tree digest below `<data-dir>/agent-skills/<name>/<digest>/`.
+by whole-tree digest below `<data-dir>/agent-skills/<name>/<digest>/`, and the
+import then writes that digest into `<data-dir>/agent-skills/<name>/ACTIVE`, so
+the newly imported version is the one selected from that point on. Re-importing
+a tree that is already installed skips the copy but still repoints `ACTIVE`.
+Already-running TUI and ACP sessions notice both the new tree and the moved
+pointer through the per-turn catalog signature.
+
+`SKILL.md` is capped at 48 KiB at import — one whole turn's instruction budget.
+A larger file is refused by the import command instead of installing, ranking
+first and then being silently dropped by the per-turn budget on every request.
+Bundled resources are not counted against that cap; only `SKILL.md` itself is.
+
 `allowed-tools` is retained as non-authoritative metadata and grants no tool
-permission. With the `skills` feature, frontmatter may include up to 32 unique
+permission. Frontmatter may include up to 32 unique
 full identities in `learned-js`. Every reference must already be an
 identity-v2 revision in `verified`, `canary`, or `active` state or the import
 fails before installation. Selecting the Agent Skill attaches only identities
@@ -842,9 +858,29 @@ can talk to either of rig's two OpenAI transports:
   when a custom `base_url` is set, because most OpenAI-compatible gateways
   (vLLM, LiteLLM, self-hosted) implement only this endpoint.
 
-Set `api_style` to override the auto-detected default — for example, to force
-`completions` against a gateway, or `responses` against an endpoint that
-actually implements `/responses`.
+`api_style` is a **custom-provider field only**. It is read from a
+`custom_providers` entry whose name matches the selected provider, and a custom
+provider entry requires a `base_url`; there is no top-level `api_style` key and
+no way to set one on the built-in `openai` provider as such. Because a
+`base_url` is present by construction, the auto-detected default for every
+custom provider is `completions` — so a Responses-only endpoint (Azure's `v1`
+surface, a LiteLLM `/responses` route) needs `api_style` set explicitly or it
+will be addressed as Chat Completions.
+
+The way to force a transport is therefore to define the endpoint as a custom
+provider and select it by that name. A custom provider may reuse the name
+`openai`, which shadows the built-in for the whole resolution path:
+
+```toml
+[custom_providers.azure-responses]
+provider_type = "openai"
+base_url = "https://example.openai.azure.com/openai/v1"
+api_key_env = "AZURE_OPENAI_API_KEY"
+api_style = "responses"
+```
+
+Selecting the built-in `openai` provider with no custom entry uses no
+`base_url` at all, and therefore always resolves to `responses`.
 
 Responses requests include an opaque SHA-256 `prompt_cache_key` derived from the
 stable session ID, keeping consecutive turns on the same provider cache route.
@@ -890,6 +926,59 @@ of any task still cancelling until it completes. A refresh that finishes in
 time updates only fields that are still missing.
 `custom_providers.openrouter.timeout_secs` continues to govern the request
 while it is live.
+
+## Reasoning controls (`[reasoning]`)
+
+`[reasoning]` holds first-class controls for the OpenAI family. They are typed
+rather than hand-written `extra_body` JSON because the Responses request body is
+validated against a closed schema: a misspelled key there is dropped in silence,
+and an out-of-range `include` value fails every request.
+
+```toml
+[reasoning]
+effort = "medium"            # none | minimal | low | medium | high | xhigh
+summary = "auto"             # auto | concise | detailed
+encrypted_content = true     # default: true
+store = true                 # omit to leave the provider default alone
+```
+
+The table rejects unknown keys, and each value must be one of the spellings
+above — an unknown one is rejected at config parse time instead of turning every
+request into a provider error.
+
+| Key | Responses API | Chat Completions |
+| --- | ------------- | ---------------- |
+| `effort` | `reasoning.effort` | top-level `reasoning_effort` |
+| `summary` | `reasoning.summary` | ignored — Completions has no equivalent |
+| `encrypted_content` | adds `include: ["reasoning.encrypted_content"]` | ignored |
+| `store` | top-level `store` | ignored |
+
+Only the keys you set are sent: with no `effort` and no `summary` no `reasoning`
+object is built at all, and with no `store` the provider's own default is left
+untouched.
+
+**Encrypted reasoning content is requested by default**, including when no
+`[reasoning]` table is configured. A persisted reasoning item can only be
+replayed on a later turn if its content came back in the first place, and the
+Responses API returns that content only when the request asked for it. Without
+it a persisted item carries nothing but an id, and that id resolves only against
+server-side state the upstream happened to keep. Set
+`encrypted_content = false` only for an endpoint that rejects the `include`
+value.
+
+`store` defaults to `true` at OpenAI, meaning responses are retained server side
+and reasoning ids resolve on the next turn. A gateway that does not persist
+state, or that rewrites ids, breaks that continuation — set `store = false`
+there and rely on encrypted reasoning content instead. `store = false` is also
+the right setting for a zero-retention deployment.
+
+`previous_response_id` is deliberately not exposed. This agent always sends the
+full input for a turn, so a globally pinned id would resend the whole
+conversation *and* ask the provider to prepend a stored one. It is stripped from
+`extra_body` at config load for the same reason (see below).
+
+Responses requests also carry the generated `prompt_cache_key` described above.
+An explicit value in `extra_body` still wins over any generated default.
 
 ## Provider-specific request body parameters
 
@@ -949,6 +1038,31 @@ understands may be ignored or rejected by another. Unlike `temperature`, a
 global `extra_body` does not follow model switches, so prefer setting it per
 `quick_models` entry — bundled with the matching `provider`/`model` — when the
 parameter is tied to a specific provider.
+
+### `extra_body` validation on the Responses path
+
+When a provider resolves to the OpenAI family **and** to the Responses API, its
+`extra_body` is interpreted against a closed request schema, so it is checked at
+config load. The check runs on the global `extra_body` and on each
+`quick_models` entry whose provider resolves the same way; every other provider
+and the Chat Completions path are left untouched.
+
+- **Unknown keys warn.** The Responses request body honors `background`,
+  `include`, `metadata`, `parallel_tool_calls`, `previous_response_id`,
+  `prompt_cache_key`, `prompt_cache_retention`, `reasoning`, `service_tier`,
+  `store`, `stream`, `text`, `top_p`, `truncation` and `user`. Anything else is
+  dropped without a word by the client, so load-time emits a warning naming the
+  keys instead. Chat-Completions habits such as `reasoning_effort` or
+  `max_completion_tokens` are exactly the case this catches: use `[reasoning]`
+  instead.
+- **`previous_response_id` is stripped**, with a warning, for the reason given
+  in the `[reasoning]` section above.
+- **An unsupported `include` value is a hard error.** `include` must be an array
+  of strings drawn from `code_interpreter_call.outputs`,
+  `computer_call.output.image_url`, `file_search_call.results`,
+  `message.input_image.image_url` and `reasoning.encrypted_content`. Anything
+  else would fail *every* completion request with an opaque client error, so
+  startup refuses it and names the accepted list.
 
 ## Status bar
 

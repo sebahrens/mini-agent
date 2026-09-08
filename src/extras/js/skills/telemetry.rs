@@ -772,22 +772,44 @@ impl TelemetryDispatcher {
     }
 }
 
+/// Durable column encoding for a task-outcome source.
+///
+/// `gate_skipped` is its own token, distinct from `no_verify_command`: a turn
+/// that ran under a *configured* verify command and simply never touched the
+/// workspace is a different audit fact from one that could never have been
+/// gated at all. Neither carries a pass/fail signal, and
+/// `policy::evaluate_promotion_with_task_outcomes` excludes both.
+/// `lifecycle.rs` holds the inverse mapping; the two must stay in step.
+fn task_outcome_source_columns(
+    source: &super::policy::TaskOutcomeSource,
+) -> (&'static str, Option<&str>) {
+    use super::policy::TaskOutcomeSource;
+    match source {
+        TaskOutcomeSource::VerifyCommand(id) => ("verify_command", Some(id.as_str())),
+        TaskOutcomeSource::Oracle(id) => ("oracle", Some(id.as_str())),
+        TaskOutcomeSource::NoVerifyCommand => ("no_verify_command", None),
+        TaskOutcomeSource::GateSkipped => ("gate_skipped", None),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn task_outcome_source_columns_for_test(
+    source: &super::policy::TaskOutcomeSource,
+) -> (&'static str, Option<&str>) {
+    task_outcome_source_columns(source)
+}
+
 fn ingest_task_outcome(
     store: &mut SkillStore,
     outcome: &super::policy::TaskOutcomeEvidence,
 ) -> Result<(), TelemetryError> {
-    use super::policy::TaskOutcomeSource;
     outcome
         .validate()
         .map_err(|_| TelemetryError::InvalidEvent)?;
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (source_kind, source_id) = match &outcome.source {
-        TaskOutcomeSource::VerifyCommand(id) => ("verify_command", Some(id.as_str())),
-        TaskOutcomeSource::Oracle(id) => ("oracle", Some(id.as_str())),
-        TaskOutcomeSource::NoVerifyCommand => ("no_verify_command", None),
-    };
+    let (source_kind, source_id) = task_outcome_source_columns(&outcome.source);
     let mut attributed_skills = Vec::new();
     for skill_id in &outcome.skill_ids {
         let invoked: bool = tx.query_row(
@@ -1277,4 +1299,39 @@ fn update_stats(tx: &Transaction<'_>, event: &SkillEvent) -> Result<(), Telemetr
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod task_outcome_source_encoding_tests {
+    use super::super::policy::TaskOutcomeSource;
+    use super::task_outcome_source_columns;
+
+    /// v98t: a skipped gate under a configured verify command is its own
+    /// durable fact. Encoding it as `no_verify_command` would misattribute the
+    /// reason in every audit built from task-outcome evidence.
+    #[test]
+    fn a_skipped_gate_encodes_to_its_own_token() {
+        assert_eq!(
+            task_outcome_source_columns(&TaskOutcomeSource::GateSkipped),
+            ("gate_skipped", None)
+        );
+        assert_eq!(
+            task_outcome_source_columns(&TaskOutcomeSource::NoVerifyCommand),
+            ("no_verify_command", None)
+        );
+        assert_ne!(
+            task_outcome_source_columns(&TaskOutcomeSource::GateSkipped).0,
+            task_outcome_source_columns(&TaskOutcomeSource::NoVerifyCommand).0
+        );
+        // Neither skip reason may be laundered into a source that promotion
+        // counts as evidence.
+        assert_ne!(
+            task_outcome_source_columns(&TaskOutcomeSource::GateSkipped).0,
+            task_outcome_source_columns(&TaskOutcomeSource::Oracle("o".into())).0
+        );
+        assert_ne!(
+            task_outcome_source_columns(&TaskOutcomeSource::GateSkipped).0,
+            task_outcome_source_columns(&TaskOutcomeSource::VerifyCommand("v".into())).0
+        );
+    }
 }

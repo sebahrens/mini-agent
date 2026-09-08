@@ -149,8 +149,9 @@ For each task and each arm the runner:
 2. builds a fresh AppPaths tree under `<gym root>/runs/` and a curated environment (below);
 3. for the `library` arm, installs the library from a neutral directory, approves and activates only
    the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
-   one revision ends up `active`. The runner reads `skills.db` directly with read-only SQLite
-   because the operator CLI has no JSON output yet; the active ids land in `active_skill_ids`;
+   one revision ends up `active`. The runner reads `skills.db` directly with read-only SQLite to
+   pick the roots and read back the active set; the active ids land in `active_skill_ids`. (The
+   binary now has `--learned-skill-json`, but the runner does not use it.)
 4. runs the oracle **before** the agent and records `oracle_pre_exit`. An oracle that already passes
    makes the task invalid: the row fails with `task_invalid_oracle_passes_before_agent` and the
    agent is never launched;
@@ -189,12 +190,25 @@ the `agent_args` used and a `permission_mode` of `yolo` or `standard`.
 ### Output rows and exit codes
 
 Each JSONL row and each `GYM_OUTCOME` line carries: `task`, `arm`, `success`, `production` (always
-false), `schema_version`, `oracle_id`, `elapsed_ms`, `timeout_secs`, `agent_exit` (124 on timeout),
-`oracle_exit`, `oracle_pre_exit`, `failure_reason`, `failure_detail`, `agent_stderr_tail`,
-`permission_mode`, `agent_args`, `provider`, `model`, `active_skill_ids`, `budgets_enforced`, and
-`budgets_unenforced`. `failure_reason` is one of `workspace_unavailable`,
+false), `schema_version`, `oracle_id`, `elapsed_ms`, `oracle_ms`, `total_ms`, `timeout_secs`,
+`agent_exit` (124 on timeout), `oracle_exit`, `oracle_pre_exit`, `failure_reason`, `failure_detail`,
+`agent_stderr_tail`, `permission_mode`, `agent_args`, `provider`, `model`, `active_skill_ids`,
+`budgets_enforced`, and `budgets_unenforced`. `failure_reason` is one of `workspace_unavailable`,
 `library_install_failed`, `task_invalid_oracle_passes_before_agent`, `agent_timeout`,
 `agent_exit_nonzero`, or `oracle_failed`.
+
+The three clocks are separate on purpose:
+
+- `elapsed_ms` times **the agent alone** — from launching `mini-agent` to its exit, or to the
+  timeout. That is the number to compare across arms; folding in the oracle, and in the library arm
+  the seed import, would make the library arm look slower for work the agent never did.
+- `oracle_ms` is the summed wall clock of the pre- and post-agent oracle runs.
+- `total_ms` is the whole episode including workspace setup and, for the library arm, the library
+  install — so that overhead stays visible instead of hiding inside the agent's number.
+
+All three are present on every row, including failed ones: `elapsed_ms` stays `0` when the episode
+failed before the agent launched, and `oracle_ms`/`total_ms` are written in a `finally` so they are
+recorded whatever went wrong.
 
 The run ends with a `GYM_SUMMARY` line and one `gym arm <arm>: N passed, M failed of T` line per
 arm. **Exit 0 means the run completed**, whatever the rows say — the `none` arm is expected to fail

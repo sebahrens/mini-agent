@@ -326,6 +326,12 @@ impl<'a> RetentionService<'a> {
     /// revision as readily as a `rejected` one and re-roots every dependant.
     /// Operator surfaces must call [`purge_preflight`] first and refuse or
     /// report what this will do.
+    ///
+    /// Telemetry goes with the revision: events, rolled-up stats, daily
+    /// aggregates, feedback, task-outcome attributions, and the task outcomes
+    /// this skill was the only claimant of. Nothing keyed to the purged id
+    /// survives the transaction — telemetry outliving the artifact is exactly
+    /// what a privacy purge exists to prevent.
     pub fn privacy_purge(
         &mut self,
         skill_id: &str,
@@ -411,6 +417,48 @@ impl<'a> RetentionService<'a> {
              WHERE predecessor_id = ?",
             [skill_id],
         )?;
+        // A task outcome is stored once and attributed through
+        // `skill_task_outcome_links`. Its own row is NOT skill-scoped, so
+        // nothing removes it when the revision goes: it would survive the
+        // purge as an unlinked row, and an unlinked outcome is exactly how the
+        // store spells "this turn ran with no library" — the purged skill's
+        // turns would be silently recycled as no-library baseline evidence for
+        // every other skill's comparison, with their turn IDs intact. Delete
+        // the outcomes this skill was the only claimant of, before the links
+        // that identify them go. Outcomes shared with a surviving skill stay:
+        // they remain that skill's evidence, and only the purged attribution
+        // is removed.
+        tx.execute(
+            "DELETE FROM skill_task_outcomes
+             WHERE evidence_id IN (
+                 SELECT owned.evidence_id FROM skill_task_outcome_links AS owned
+                  WHERE owned.skill_id = ?1
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM skill_task_outcome_links AS other
+                  WHERE other.evidence_id = skill_task_outcomes.evidence_id
+                    AND other.skill_id <> ?1
+             )",
+            [skill_id],
+        )?;
+        // Telemetry for the purged id. Every one of these tables declares
+        // `ON DELETE CASCADE` on `skill_revisions(id)`, so the deletion below
+        // already removes them whenever `PRAGMA foreign_keys` is on. They are
+        // deleted explicitly anyway: this is the privacy escape hatch, and its
+        // guarantee must not rest on a per-connection pragma being set. The
+        // deletes are idempotent and cost nothing once the rows are gone.
+        for table in [
+            "skill_task_outcome_links",
+            "skill_events",
+            "skill_stats",
+            "skill_feedback",
+            "skill_daily_stats",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE skill_id = ?"),
+                [skill_id],
+            )?;
+        }
         tx.execute("DELETE FROM skill_revisions WHERE id = ?", [skill_id])?;
         tx.execute(
             "INSERT INTO skill_tombstones (
@@ -563,6 +611,185 @@ mod tests {
             purge_preflight(&store, &"f".repeat(64)),
             Err(RetentionError::NotFound)
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Seed one row in every telemetry table keyed to `skill_id`, plus the
+    /// task outcomes used to tell "owned by this skill" from "shared" and
+    /// "no-library baseline" apart.
+    fn seed_telemetry(store: &mut SkillStore, skill_id: &str, shared_with: &str) {
+        let conn = store.conn_mut();
+        conn.execute(
+            "INSERT INTO skill_events (
+                 invocation_id, skill_id, turn_id, event_kind, index_generation, created_at
+             ) VALUES (?1, ?1, 'turn-1', 'invoked', 1, 10)",
+            [skill_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_stats (skill_id, invoked_count, updated_at)
+             VALUES (?, 1, 10)",
+            [skill_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_daily_stats (
+                 skill_id, day_start, aggregate_version, through_event_id,
+                 invoked_count, direct_success_count, direct_failure_count,
+                 timeout_count, oom_count, policy_fault_count, latency_total_us
+             ) VALUES (?, 0, 1, 1, 1, 1, 0, 0, 0, 0, 5)",
+            [skill_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_feedback (
+                 feedback_id, idempotency_key, skill_id, actor_id, feedback_kind,
+                 reason_code, state, created_at, updated_at
+             ) VALUES ('fb-1', 'idem-1', ?, 'actor', 'negative', 'wrong', 'active', 10, 10)",
+            [skill_id],
+        )
+        .unwrap();
+        for (evidence, turn) in [("owned", "turn-owned"), ("shared", "turn-shared")] {
+            conn.execute(
+                "INSERT INTO skill_task_outcomes (
+                     evidence_id, turn_id, verify_passed, attempt, source_kind,
+                     source_id, production, created_at
+                 ) VALUES (?1, ?2, 1, 1, 'verify_command', ?1, 1, 10)",
+                rusqlite::params![evidence, turn],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO skill_task_outcome_links (evidence_id, skill_id) VALUES (?, ?)",
+                rusqlite::params![evidence, skill_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+             VALUES ('shared', ?)",
+            [shared_with],
+        )
+        .unwrap();
+        // A genuine no-library baseline: an outcome with no attribution at all.
+        conn.execute(
+            "INSERT INTO skill_task_outcomes (
+                 evidence_id, turn_id, verify_passed, attempt, source_kind,
+                 source_id, production, created_at
+             ) VALUES ('baseline', 'turn-baseline', 1, 1, 'verify_command', 'baseline', 1, 10)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn count_for(store: &SkillStore, table: &str, skill_id: &str) -> i64 {
+        store
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE skill_id = ?"),
+                [skill_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn surviving_outcomes(store: &SkillStore) -> Vec<String> {
+        let mut statement = store
+            .conn()
+            .prepare("SELECT evidence_id FROM skill_task_outcomes ORDER BY evidence_id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// d90k: a task outcome's own row is not skill-scoped, so nothing removed
+    /// it with the revision. It survived as an *unlinked* row, which is how
+    /// the store spells "this turn ran with no library" — the purged skill's
+    /// turns silently became no-library baseline evidence, turn IDs intact.
+    #[test]
+    fn privacy_purge_deletes_the_task_outcomes_the_purged_skill_alone_owned() {
+        let (root, mut store) = fixture();
+        let purged = artifact("function run() { return 1; }", "Purged telemetry owner");
+        let kept = artifact(
+            "function run() { return 1; } // kept",
+            "Surviving telemetry sharer",
+        );
+        store.insert_verified(&purged).unwrap();
+        store.insert_verified(&kept).unwrap();
+        seed_telemetry(&mut store, &purged.id, &kept.id);
+        assert_eq!(surviving_outcomes(&store).len(), 3);
+
+        RetentionService::new(&mut store)
+            .privacy_purge(&purged.id, "test_request", 10)
+            .unwrap();
+
+        assert_eq!(
+            surviving_outcomes(&store),
+            vec!["baseline".to_string(), "shared".to_string()],
+            "only the outcome the purged skill alone claimed may be deleted"
+        );
+        assert_eq!(
+            count_for(&store, "skill_task_outcome_links", &kept.id),
+            1,
+            "the surviving skill keeps its own attribution"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The purge deletes telemetry itself rather than trusting
+    /// `ON DELETE CASCADE`: the privacy guarantee must not rest on a
+    /// per-connection `PRAGMA foreign_keys` being set.
+    #[test]
+    fn privacy_purge_deletes_telemetry_without_relying_on_cascade() {
+        let (root, mut store) = fixture();
+        let purged = artifact("function run() { return 1; }", "Purged telemetry owner");
+        let kept = artifact(
+            "function run() { return 1; } // kept",
+            "Surviving telemetry sharer",
+        );
+        store.insert_verified(&purged).unwrap();
+        store.insert_verified(&kept).unwrap();
+        seed_telemetry(&mut store, &purged.id, &kept.id);
+        let tables = [
+            "skill_events",
+            "skill_stats",
+            "skill_daily_stats",
+            "skill_feedback",
+            "skill_task_outcome_links",
+        ];
+        for table in tables {
+            assert!(
+                count_for(&store, table, &purged.id) > 0,
+                "{table} must be seeded for this test to mean anything"
+            );
+        }
+        store
+            .conn_mut()
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+
+        RetentionService::new(&mut store)
+            .privacy_purge(&purged.id, "test_request", 10)
+            .unwrap();
+
+        for table in tables {
+            assert_eq!(
+                count_for(&store, table, &purged.id),
+                0,
+                "{table} kept telemetry for a purged skill"
+            );
+        }
+        assert_eq!(
+            count_for(&store, "skill_task_outcome_links", &kept.id),
+            1,
+            "the surviving skill's own attribution must not be swept up"
+        );
+        store
+            .conn_mut()
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }

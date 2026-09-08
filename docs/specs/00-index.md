@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.6.0
+- **Specification version**: 1.7.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-08
 
 ## Authority and conflict resolution
 
@@ -37,8 +37,20 @@ planning context only; it cannot override the cited section.
 | 2 | [phase-2-sandbox.md](phase-2-sandbox.md) | Delivered | `fetch()`, file allow-lists, Linux/macOS general-process isolation |
 | 3 | [phase-3-skill-library.md](phase-3-skill-library.md) | Delivered | Agent Skills import, immutable JS skill store, prompt-time hybrid retrieval, turn-scoped injection |
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
-| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
+| 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered (see reachability note) | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
+
+**Phase 5 reachability note.** "Delivered" in the row above means the phase owns those concerns and
+their contracts are implemented and regression-tested. It does not mean every one of them is
+reachable from the shipped binary. Reachable today: retrieval, attributed telemetry, automatic
+quarantine, retention/compaction, privacy purge, and the local-owner commands for import, stats,
+proposal listing, feedback, approval, rejection, root activation, **replacement promotion**, and
+**retirement**. Not reachable: `rollback_replacement` (a tested library operation with no
+production caller and no command), repair (`skills/repair.rs` is `#[cfg(test)]`), the evidence
+decision scheduler (`skills/scheduler.rs` is `#[cfg(test)]`), and automatic evidence-threshold
+promotion (`--promote-learned-skill` is an explicit human decision that records
+`evidence_threshold_promotion: false`). The owning spec's **Shipped-binary status** section is
+authoritative for this split.
 
 ### Skill Gym and task-outcome evidence
 
@@ -106,6 +118,34 @@ it never injects source or grants authority.
 This retrieval amendment is delivered. The model-issued query is explicit, bounded, metadata-only,
 and cannot install, approve, activate, or widen a skill.
 
+## Delivered corrections (2026-09-07)
+
+The 2026-09-07 review (and its round-2 adversarial pass) landed as code, not only as tracker text.
+The beads below are closed with their regression coverage; the remaining `review-2026-09-07` beads
+are still open and are mostly documentation work. No correction below changes the Phase 6 canonical
+checklist.
+
+| Correction | Owning spec | Bead |
+|------------|-------------|------|
+| Operator replacement promotion over an active or quarantined predecessor | Phase 5 | mini-agent-83k9 |
+| Retirement exposed as an administrative disable that preserves lineage | Phase 5 | mini-agent-w0zp |
+| Attributed negative/severe feedback on a `returned` invocation counts as a behavioural fault | Phase 5 | mini-agent-5mwn |
+| Canary route persisted and audited; unimplemented automatic fallback identified | Phase 5 | mini-agent-sdt9 |
+| Dead decision scheduler moved behind `#[cfg(test)]` | Phase 5 | mini-agent-fegd |
+| Unused visibility-snapshot module moved behind `#[cfg(test)]` | Phase 4 | mini-agent-2u34 |
+| Purge lifecycle/reference guard and named re-rooting | Phase 5 | mini-agent-zod2 |
+| Proposal listing, id-addressed approve/reject, and model/CLI-visible admission outcome | Phase 4 | mini-agent-f1gy, mini-agent-ahqj, mini-agent-16om, mini-agent-o99c |
+| Typed verification-failure classification instead of substring matching on diagnostics | Phase 4 | mini-agent-3ffo, mini-agent-lu0o, mini-agent-o3yr, mini-agent-tre6, mini-agent-u94h |
+| Deferred parking for stranded proposals and bounded import evaluation | Phase 4 | mini-agent-z26b, mini-agent-dztq, mini-agent-afxm |
+| Feedback validation, bounds, and quarantine reporting | Phase 5 | mini-agent-0rge, mini-agent-9ihc, mini-agent-8l2x, mini-agent-0fr1 |
+| Proposal attempt budget consumed after validation | Phase 4/6 | mini-agent-0zxl |
+| Learned-skill index hydration before the first prompt; no trusted skill block when no skill is selected | Phase 3 | mini-agent-kvdv, mini-agent-t0re |
+| Agent Skill active-digest selection on import | Phase 3 | mini-agent-mg4r |
+| Operator-visible reason when the containment gate removes JS and learned skills | Phase 6 | mini-agent-gdl0 |
+
+Skill Gym, harness, and provider/session corrections from the same review are owned by
+[`../agent/GYM.md`](../agent/GYM.md) and the provider documentation, not by this corpus.
+
 ## Feature relationships
 
 Cargo features are not phase-completion claims:
@@ -148,7 +188,7 @@ Cargo features are not phase-completion claims:
 | 2 | Phase 1 | Phase 2 acceptance criteria pass on Linux and macOS; Windows general-process availability additionally requires its cached native AppContainer preflight. Hosted reference-runner evidence proves the explicit-root, zero-capability network, private-storage, and Job observations recorded by the gate, not universal host ACL visibility. |
 | 3 | Foundation and Phase 1; Phase 2 is optional | Manual admission, full artifact identity, no-effect verification, prompt-time retrieval, and turn binding pass. |
 | 4 | Foundation, Phase 1, and Phase 3 | Proposals can reach human-approved, non-retrievable canary state; no proposal can become active automatically. |
-| 5 | Phases 1–4 and Foundation | Evidence attribution, deterministic routing, permitted Tier 0/1 replacement promotion, quarantine, repair, rollback, and retention gates pass. |
+| 5 | Phases 1–4 and Foundation | Evidence attribution, deterministic routing, permitted Tier 0/1 replacement promotion, quarantine, repair, rollback, and retention gates pass *as library contracts under test*. Binary reachability is tracked separately by the Phase 5 reachability note above; promotion is reachable only as an explicit local-owner action, and rollback, repair, and the decision scheduler are not reachable at all. |
 | 6 | Preserved Phase 1–5 contracts and both Phase 6 feasibility gates | The brokered runtime acceptance matrix passes on every enabled platform; no production JavaScript path runs in the parent or in an uncontained worker. |
 
 A phase may be decomposed while a prerequisite is open, but it cannot be marked delivered until

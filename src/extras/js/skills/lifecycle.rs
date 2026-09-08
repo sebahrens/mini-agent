@@ -1784,6 +1784,27 @@ fn read_invocation_evidence(
     Ok(evidence)
 }
 
+/// Inverse of `telemetry::task_outcome_source_columns`: decode one durable
+/// `(source_kind, source_id)` pair.
+///
+/// `gate_skipped` — a configured verify command whose gate did not run because
+/// the turn never touched the workspace — decodes to its own variant rather
+/// than to `NoVerifyCommand`, so promotion and audit keep seeing the reason the
+/// runner actually recorded. `None` means the row is undecodable and promotion
+/// must be held rather than guessing a source.
+fn task_outcome_source_from_columns(
+    source_kind: &str,
+    source_id: Option<String>,
+) -> Option<TaskOutcomeSource> {
+    match (source_kind, source_id) {
+        ("verify_command", Some(id)) => Some(TaskOutcomeSource::VerifyCommand(id)),
+        ("oracle", Some(id)) => Some(TaskOutcomeSource::Oracle(id)),
+        ("no_verify_command", None) => Some(TaskOutcomeSource::NoVerifyCommand),
+        ("gate_skipped", None) => Some(TaskOutcomeSource::GateSkipped),
+        _ => None,
+    }
+}
+
 fn read_task_outcomes(
     tx: &Transaction<'_>,
     skill_id: &str,
@@ -1804,15 +1825,10 @@ fn read_task_outcomes(
     while let Some(row) = rows.next()? {
         let source_kind: String = row.get(3)?;
         let source_id: Option<String> = row.get(4)?;
-        let source = match (source_kind.as_str(), source_id) {
-            ("verify_command", Some(id)) => TaskOutcomeSource::VerifyCommand(id),
-            ("oracle", Some(id)) => TaskOutcomeSource::Oracle(id),
-            ("no_verify_command", None) => TaskOutcomeSource::NoVerifyCommand,
-            _ => {
-                return Err(LifecycleError::PromotionHeld(
-                    "invalid durable task-outcome source".to_string(),
-                ));
-            }
+        let Some(source) = task_outcome_source_from_columns(&source_kind, source_id) else {
+            return Err(LifecycleError::PromotionHeld(
+                "invalid durable task-outcome source".to_string(),
+            ));
         };
         let attempt: i64 = row.get(2)?;
         outcomes.push(TaskOutcomeEvidence {
@@ -2046,6 +2062,36 @@ fn validate_lineage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v98t: a durable `gate_skipped` row must decode to its own variant. If
+    /// the arm is dropped the row becomes undecodable and every promotion that
+    /// reads the window is held, so this pins the decode, not just "not None".
+    #[test]
+    fn a_gate_skipped_row_decodes_to_its_own_source() {
+        assert_eq!(
+            task_outcome_source_from_columns("gate_skipped", None),
+            Some(TaskOutcomeSource::GateSkipped)
+        );
+        assert_eq!(
+            task_outcome_source_from_columns("no_verify_command", None),
+            Some(TaskOutcomeSource::NoVerifyCommand)
+        );
+        // The two skip reasons must stay distinguishable after a round trip
+        // through the durable columns.
+        let skipped = TaskOutcomeSource::GateSkipped;
+        let (kind, id) = super::super::telemetry::task_outcome_source_columns_for_test(&skipped);
+        assert_eq!(kind, "gate_skipped");
+        assert_eq!(id, None);
+        assert_eq!(
+            task_outcome_source_from_columns(kind, id.map(str::to_string)),
+            Some(TaskOutcomeSource::GateSkipped)
+        );
+        // A source id on a skip reason is not a valid row.
+        assert_eq!(
+            task_outcome_source_from_columns("gate_skipped", Some("x".to_string())),
+            None
+        );
+    }
 
     #[test]
     fn approval_failures_name_the_field_and_the_observed_value() {

@@ -40,11 +40,11 @@ Run production crate commands from the repository root:
 | Skill store (Phase 3) | `src/extras/js/skills/` |
 | Unit tests | `src/extras/js/tests/` |
 
-Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, alongside the existing bash tool injection at lines 230–265.
+Register `JsTool` in `src/agent/builder.rs` under `#[cfg(feature = "js")]`, inside `register_js_tool` / `register_js_tool_with_status`. Resolve the symbols rather than a line range — line numbers here drift.
 
 ## Invariants — never break these
 
-The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here. Delivered changes from the review are recorded under **Delivered amendments (2026-09-05)** in the owning spec and in `docs/specs/00-index.md`; preserve those contracts and close each named bead with its tests before describing later changes as delivered.
+The single authoritative Phase 6 containment checklist is **Phase 6 security invariants (canonical)** in `docs/specs/phase-6-brokered-js-runtime.md`. Read and preserve that checklist for every change to the JS runtime, broker, protocol, or sandbox; do not maintain a second copy here. Delivered changes from the reviews are recorded under **Delivered amendments (2026-09-05)** and **Delivered corrections (2026-09-07)** in the owning spec and in `docs/specs/00-index.md`; preserve those contracts and close each named bead with its tests before describing later changes as delivered.
 
 ## Skill library (Phase 3) invariants
 
@@ -52,8 +52,9 @@ The single authoritative Phase 6 containment checklist is **Phase 6 security inv
 - Skills ship with `tests: Vec<String>` (JS expressions evaluating to `true`)
 - Mutating tests changes the hash → invalidates the skill (integrity enforced structurally)
 - Identity-v1 artifacts are quarantined under Phase 6 until explicitly reproposed and reverified; never infer version-2 scopes
-- Retrieval via embedding cosine similarity on description field
-- Auto-admission (Phase 4) requires a held-out Rust integration test to pass
+- Retrieval is hybrid: HNSW dense candidates plus an FTS5/BM25 lexical query, fused by reciprocal rank (`skills/index.rs`) — not cosine similarity over the description alone
+- The default deterministic embedding backend is not a semantic model, so dense retrieval is disabled on it (`Embedder::supports_semantic_retrieval`, which zeroes `dense_candidate_limit`); with the default backend the effective ranking is lexical only
+- Auto-admission (Phase 4) gates on data-driven, content-addressed, human-approved held-out suites loaded from the store — not on a per-skill Rust test. Rust integration tests exercise the generic loader/selector/no-effect path; there is no compiled per-skill registry, and a proposal with no matching suite parks at `verified` + `held_out_suite_required`
 
 ## What NOT to do
 

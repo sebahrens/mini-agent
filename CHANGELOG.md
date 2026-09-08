@@ -11,9 +11,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Delivered the 2026-09-05 harness review amendments across brokered JavaScript containment,
   learned-skill identity, admission, retrieval, telemetry, lifecycle operations, and
   publication. The owning specifications now record these as delivered amendments.
-- Added background lifecycle jobs and explicit learned-skill operator commands, top-level
-  `await` support, a completion-verification gate, structured history persistence,
-  `skills_search`, and WAL-backed skill storage.
+- Added background learned-skill work — index rebuild and publication, raw-telemetry retention
+  compaction, automatic fault-based quarantine, and the opt-in proposal/admission workers — and
+  explicit learned-skill operator commands, top-level `await` support, a completion-verification
+  gate, structured history persistence, `skills_search`, and WAL-backed skill storage. There is no
+  background decision scheduler: that module is compiled only into the test build.
 - Hardened model-command containment, hook and permission scoping, replacement lineage,
   promotion evidence, and task-outcome attribution following the 2026-09-06 review.
 - Added the deterministic paired `task.json` learned-library regression harness and operator Skill
@@ -21,6 +23,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   outcome reporting. Added task utility columns to learned-skill statistics.
 - Fixed LSP workspace rebinding and bounded diagnostics, ACP cancellation ownership, VS Code
   request cancellation, session/history persistence, and parallel-test shared-state races.
+- Made the learned-skill operator surface usable end to end following the 2026-09-07 review: added
+  `--promote-learned-skill` (promote an approved replacement canary over an active or quarantined
+  predecessor, preserving lineage) and `--retire-learned-skill` (administrative disable that keeps
+  the revision and its lineage), added proposal listing and per-proposal admission outcomes, guarded
+  `--purge-learned-skill` against non-terminal targets and silent re-rooting, and counted attributed
+  negative or severe feedback on an invocation that returned as a behavioural fault. Rollback and
+  repair remain library-level contracts with no operator command; the unused decision-scheduler and
+  visibility-snapshot modules were moved behind `#[cfg(test)]`.
 
 ## [1.8.0] - 2026-09-06
 

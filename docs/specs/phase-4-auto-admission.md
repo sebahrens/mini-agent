@@ -1,10 +1,10 @@
 # Phase 4 — Agent Proposals and Human-Gated Admission
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.5.0
+- **Specification version**: 1.6.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-08
 - **Entry dependencies**: Foundation, Phase 1, and Phase 3 complete; Phase 2 is optional
 - **Exit dependency**: every acceptance criterion below and every Phase 4 blocker
 
@@ -44,8 +44,15 @@ adds the proposal and verification boundary, not autonomous learning. A proposal
 
 ```text
 agent proposal → pending → evaluating → verified → awaiting approval → canary
-                         └───────────────────────────────→ rejected (terminal)
+                         ├───────────────────────────────→ rejected (terminal)
+                         └───────────────────────────────→ deferred (reopenable)
 ```
+
+`deferred` parks a proposal whose *evaluation infrastructure* failed or whose claim budget was
+spent. It is not a judgement about the artifact: the authenticated reevaluation transition can
+return it to `pending`. No shipped command reopens a deferred row today — the only production
+caller of that transition is `--import-learned-skill`, and only for a `verified` +
+`held_out_suite_required` row after it imports a matching baseline.
 
 The evaluator:
 
@@ -84,7 +91,8 @@ mutable copy of canonical source that could drift from the final artifact.
 | `src/extras/js/skills/admission.rs` | IMPLEMENTED | Lease evaluator, review packet, retry classification, and approval orchestration |
 | `src/extras/js/skills/admission_store.rs` | IMPLEMENTED | Private optimistic canary/denial transactions |
 | `src/extras/js/skills/held_out.rs` | IMPLEMENTED | Trusted data-driven case store/loader and report binding |
-| `src/extras/js/skills/visibility.rs` | IMPLEMENTED | Active-only index, prompt manifest, and frozen turn-bundle boundary |
+| `src/extras/js/skills/turn.rs` | IMPLEMENTED | Active-only retrieval, prompt manifest, and frozen turn-bundle boundary (`TurnSkillBundle`, `SkillTurnContext`, `render_trusted_context`) |
+| `src/extras/js/skills/visibility.rs` | TEST-ONLY | Historical visibility-snapshot helper; `#[cfg(test)]` and read by no production path |
 | `src/extras/js/skills/verify.rs` | EXTENDED | Pure embedded/inherited/held-out execution |
 | `src/extras/js/skills/store.rs` | EXTENDED | Proposal/report/suite/approval schema and lifecycle primitives |
 | `src/extras/js/host.rs`, `skills/proposal.rs` | EXTENDED | Parent proposal effect service, bounds, durable queue handoff |
@@ -118,11 +126,17 @@ CREATE TABLE IF NOT EXISTS skill_proposals (
     next_attempt_at  INTEGER,
     lease_owner      TEXT,
     lease_expires_at INTEGER,
-    report_json      TEXT,
+    report_id        TEXT,
     reason_code      TEXT,
+    infrastructure_attempt_count INTEGER NOT NULL DEFAULT 0,
     CHECK (status IN (
-        'pending','evaluating','verified','rejected','awaiting_approval','approved'
-    ))
+        'pending','evaluating','deferred','verified','rejected',
+        'awaiting_approval','approved'
+    )),
+    CHECK ((status = 'deferred'
+            AND reason_code IN ('evaluation_infrastructure_deferred',
+                                'evaluation_attempts_exhausted'))
+           OR status <> 'deferred')
 );
 
 CREATE TABLE IF NOT EXISTS held_out_suites (
@@ -136,9 +150,25 @@ CREATE TABLE IF NOT EXISTS held_out_suites (
 );
 ```
 
+The shipped store is at `PRAGMA user_version` 13. Migration 11 → 12 rebuilt `skill_proposals`
+solely to widen the deferred reason-code CHECK so it also admits `evaluation_attempts_exhausted`,
+and 12 → 13 rebuilt `skill_task_outcomes` to admit the `gate_skipped` source.
+
 Identity-bearing fields remain in `skill_revisions`, initially with `status = 'pending'`.
 `skill_proposals` stores queue and evaluation metadata. Foreign keys and uniqueness constraints
 prevent a proposal from naming a different artifact after enqueue.
+
+`deferred` is a non-terminal parking state, not a verdict about the candidate. A proposal is
+parked there when the evaluation infrastructure — not the artifact — kept failing: the durable
+`infrastructure_attempt_count` reaching its bound records
+`evaluation_infrastructure_deferred`, and a proposal whose ordinary claim budget is spent while it
+is still `pending` or holding an expired `evaluating` lease is swept to
+`evaluation_attempts_exhausted`. Both reason codes are accepted by the same authenticated
+reevaluation transition that reopens a `verified` + `held_out_suite_required` row; reopening an
+exhausted row also clears its spent claim budget, and neither reopen alters identity-bearing bytes
+or resets a deterministic rejection. That transition currently has one production caller —
+`--import-learned-skill`, which uses it only for the `held_out_suite_required` case after importing
+a matching baseline — so a `deferred` row has no operator command to unpark it yet.
 
 Claims use persisted leases and retries so a crash cannot strand a row in `evaluating`.
 Evaluation reports bind proposal ID, artifact ID, verifier version, matched held-out suite hashes,
@@ -169,7 +199,7 @@ propose_skill({
   capability: {
     tier,
     grants: [
-      { kind: "read_file", workspace_prefixes: ["src/"] },
+      { kind: "read_file", workspace_prefixes: ["src"] },
       { kind: "fetch", origins: ["https://docs.rs"], methods: ["GET"] },
       { kind: "spawn", programs: ["cargo"] }
     ]
@@ -188,6 +218,12 @@ propose_skill({
 | `capability` | object | Tier plus exact structured target grants; must be internally consistent and Tier 0–2 |
 | `tags` | string[] | Optional normalized retrieval tags with count/length limits |
 | `predecessor_id` | string | Optional full immutable revision ID for a replacement proposal |
+
+The `workspace_prefixes` inside a `read_file` or `write_file` grant must already be in canonical
+form: the structure is validated, never rewritten to repair a bad separator. A prefix is rejected
+when it is empty, starts with `/`, **ends with `/`**, contains `\` or `:`, contains a control
+character, or has an empty, `.` or `..` component. The example above therefore writes `"src"`, not
+`"src/"`. The only rewriting applied is NFC normalization of each surviving path component.
 
 The historical Phase 4 host canonicalized a flat identity-v1 proposal. The current worker only
 decodes the bounded identity-v2 draft; the parent validates and canonicalizes it, writes durable
@@ -213,9 +249,19 @@ Example response:
 ```json
 {
   "id": "<64-character sha256>",
-  "status": "pending"
+  "proposal_id": "<proposal identifier>",
+  "status": "pending",
+  "report_id": null
 }
 ```
+
+`status` is the queue state observed at enqueue, not an admission decision. `pending` is only an
+acknowledgement that the durable row exists; evaluation runs afterwards on the admission worker.
+`report_id` is `null` until an evaluation report has been written, and an idempotent resubmission of
+an already-settled artifact answers with that settled status and its `report_id` instead. A caller
+that needs the outcome must read it back later — the session tracks its own enqueued proposals and
+reports settled outcomes on a later call, and the operator surface exposes the same decision through
+`--learned-skill-proposal`.
 
 The proposal-attempt limit is defense in depth, not an evidence threshold. It is initialized per
 session, applies before enqueue/evaluation work, and returns a non-panicking structured error when
@@ -232,7 +278,7 @@ impl AdmissionEvaluator {
         // 2. Reload artifact/predecessor and recompute canonical identity.
         // 3. Run embedded tests in the fresh no-effect verifier.
         // 4. Run all inherited predecessor regressions and matched held-out suites.
-        // 5. Verify exports/capability and exact/semantic duplicate policy.
+        // 5. Verify exports/capability and the exact contract-duplicate policy.
         // 6. Persist a structured report and mark verified or rejected.
         // 7. Generate a versioned embedding for verified artifacts off the request path.
         // 8. Move verified proposals to awaiting_approval; do not activate them.
@@ -263,8 +309,23 @@ the new higher tier.
 | Missing or failed predecessor regression | `inherited_regression_failed` |
 | Held-out case fails | `held_out_failed` |
 | Export/capability mismatch | `contract_invalid` |
-| Exact or policy-disallowed near duplicate | `duplicate_skill` |
-| Embedding unavailable after bounded retries | `embedding_unavailable` |
+| Duplicate contract against an active, canary, or awaiting-approval revision | `duplicate_skill` |
+| Verification infrastructure failed deterministically | `evaluation_infrastructure_unavailable` |
+
+The duplicate gate is an exact contract comparison, not a similarity search: it matches on the
+case-insensitive trimmed `description` together with the identical ordered export set, excluding the
+candidate's own lineage. It runs before verification and before any embedding exists for the
+candidate, so embedding- or vector-similarity near-duplicate detection is **out of scope for this
+phase** and would require reordering the pipeline. Retrieval-time collapsing of semantic
+near-duplicates is Phase 3's concern.
+
+Deferred parking uses its own reason codes and is not a rejection:
+
+| Parking outcome | Status | Reason code |
+|-----------------|--------|-------------|
+| No matching held-out suite | `verified` | `held_out_suite_required` |
+| Repeated verification infrastructure failure | `deferred` | `evaluation_infrastructure_deferred` |
+| Claim budget spent while pending or lease-expired | `deferred` | `evaluation_attempts_exhausted` |
 
 ---
 
@@ -297,11 +358,14 @@ If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and
 requests reevaluation. Agent-authored embedded tests alone never satisfy this gate.
 The authenticated reevaluation transition atomically returns only that blocked proposal and its
-revision to `pending`; it cannot reset deterministic rejection or alter identity-bearing bytes.
+revision to `pending`; it cannot reset deterministic rejection or alter identity-bearing bytes. It
+also accepts the two `deferred` reason codes above. In the shipped binary this transition is
+invoked from `--import-learned-skill` alone: importing a package whose held-out baseline is bundled
+with it imports the baseline and then requeues the blocked proposal in the same command.
 
 ## Promotion gate
 
-### Promotion gate — held-out Rust integration test
+### Promotion gate — trusted held-out suite
 
 At least one applicable trusted held-out suite must pass through the Rust-owned generic evaluator
 before human approval can create a canary. Checked-in Rust integration tests exercise this full
@@ -363,12 +427,17 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    declare up to 32 exact learned-JS identities; import resolves them only after verification and
    turn selection attaches only active revisions, so declaration never bypasses approval,
    activation, containment, or learned-skill budgets.
-3. **Stats surface** (mini-agent-i78t, delivered). Per-skill selections, invocations, success rate, and
-   last-use are readable by the operator.
+3. **Stats surface** (mini-agent-i78t, delivered). Per-skill selections, invocations, the `success`
+   column, and last-use are readable by the operator. `success` is a **return rate**, not a
+   correctness rate: its numerator counts terminal `returned` events and its denominator counts
+   `returned` plus `threw`/`timed_out`/`oom`/`capability_denied`. A revision that returns
+   semantically wrong data without throwing shows 100%. Correctness evidence lives in the separate
+   `tasks_with`, `passed_with`, and `pass_rate_without` columns, which are derived from
+   verifier/oracle task outcomes.
 4. **Replacement integrity** (2026-09-06, delivered). Approval derives and persists a replacement's
    `supersedes_id` and lineage root from the reviewed predecessor, so a real approved canary is
-   routable and remains rollback-capable. Semantic-duplicate evaluation excludes that exact
-   predecessor while still rejecting every unrelated duplicate. Capability comparison is a
+   routable and remains rollback-capable. Contract-duplicate evaluation excludes that exact
+   predecessor's lineage while still rejecting every unrelated duplicate. Capability comparison is a
    structural subset test over each scoped grant, never tier-only equivalence. The proposal attempt
    budget is consumed only after bounded payload and predecessor validation, and the admission
    worker renews its lease before the worst-case contained verification window.
@@ -390,8 +459,8 @@ All must pass under `cargo test --features js,skills`:
 - [x] Held-out suites are data-driven, content-addressed, human-approved, hidden from proposal APIs,
       and generic integration fixtures do not require a per-skill Rust registry.
 - [x] No matching held-out suite blocks approval; embedded-test success cannot activate a skill.
-- [x] Evaluator verifies exports/capability, semantic duplicates, and versioned embedding before
-      human review.
+- [x] Evaluator verifies exports/capability and the exact contract-duplicate policy before human
+      review, and generates the versioned embedding for a verified artifact off the request path.
 - [x] Human approval atomically transitions only an unchanged verified revision to canary, records
       audit data, and bumps index generation; stale rows and simulated failures fully roll back.
 - [x] Without Phase 5 routing, canary revisions remain absent from model manifests and JS bundles.

@@ -72,7 +72,7 @@ the `custom_providers` key in the config file:
 | `provider_type`               | string  | Must be one of the built-in provider types (`openrouter`, `openai`, `anthropic`, `gemini`, `ollama`).                                                                         |
 | `base_url`                    | string  | The API base URL.                                                                                                                                                             |
 | `api_key_env`                 | string  | Optional. Name of an environment variable holding the API key. Falls back to the provider-kind default if not set.                                                            |
-| `api_style`                   | string  | Optional. For OpenAI-based providers: `"responses"` (Responses API, default when no `base_url` is set) or `"completions"` (Chat Completions, default when `base_url` is set). |
+| `api_style`                   | string  | Optional. For OpenAI-based providers: `"responses"` (Responses API) or `"completions"` (Chat Completions). Custom providers always have a `base_url`, so this defaults to `"completions"`; set it explicitly for a Responses-only endpoint. |
 | `headers`                     | object  | Optional. HTTP headers to include in every request. Values support `${ENV_VAR}` expansion.                                                                                    |
 | `danger_accept_invalid_certs` | boolean | Optional. Disables TLS certificate verification (MITM risk — use with care).                                                                                                  |
 | `timeout_secs`                | integer | Optional. Overrides the default HTTP timeout.                                                                                                                                 |
@@ -128,9 +128,36 @@ The OpenAI provider supports two API transports:
   `base_url` is set, since most OpenAI-compatible gateways implement only this
   endpoint.
 
-Override with `api_style: "responses"` or `api_style: "completions"` on a
-custom provider, or set `api_style` on the built-in OpenAI provider to force a
-specific transport.
+`api_style` is a **custom-provider field only**: it is read from a
+`custom_providers` entry whose name matches the selected provider, and such an
+entry always has a `base_url`. There is no top-level `api_style` key, so the
+built-in `openai` provider cannot be given one — selected on its own it has no
+`base_url` and therefore always uses the Responses API.
+
+Because every custom provider carries a `base_url`, its default is
+`completions`. A gateway that implements only `/responses` (Azure's `v1`
+surface, a LiteLLM `/responses` route) must set `api_style` explicitly:
+
+```json
+{
+  "custom_providers": {
+    "azure-responses": {
+      "provider_type": "openai",
+      "base_url": "https://example.openai.azure.com/openai/v1",
+      "api_key_env": "AZURE_OPENAI_API_KEY",
+      "api_style": "responses"
+    }
+  }
+}
+```
+
+A custom provider may reuse the name `openai`, which shadows the built-in
+entirely; that is the way to attach a `base_url` and an `api_style` to that
+provider name.
+
+Reasoning effort, summary, encrypted reasoning content and Responses `store` are
+configured separately, in the `[reasoning]` config section — see
+[CONFIG.md](CONFIG.md#reasoning-controls-reasoning).
 
 ## Prompt caching
 

@@ -1,10 +1,10 @@
 # Phase 5 — Evidence-Based Self-Learning
 
 - **Document role**: normative phase specification
-- **Specification version**: 1.4.0
+- **Specification version**: 1.5.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-08
 - **Entry dependencies**: Foundation and Phases 1–4 complete
 - **Exit dependency**: every acceptance criterion below and every Phase 5 blocker
 - **Target scale**: up to 100,000 local/shared skill revisions
@@ -12,12 +12,33 @@
 **Delivers**: directly attributed skill telemetry, evidence-gated canary promotion, automatic
 quarantine, immutable repair revisions, supersession, rollback, and bounded audit history.
 
-**Shipped-binary status**: retrieval, directly attributed telemetry, evidence-based transitions,
-and proposal/admission workers are wired in skills-enabled builds. The workers start only when
-trusted `enable_skill_proposals = true` configuration opts in. Local-owner commands expose stats,
-targeted feedback, retention compaction, privacy purge, import, approval/rejection, and explicit
-root activation; evidence-based replacement promotion, repair, supersession, and rollback remain
-policy-owned library operations rather than unsafe generic mutation commands.
+**Shipped-binary status**: retrieval, directly attributed telemetry, and the proposal/admission
+workers are wired in skills-enabled builds. The workers start only when trusted
+`enable_skill_proposals = true` configuration opts in. Local-owner commands expose stats, targeted
+feedback, retention compaction, privacy purge, import, approval/rejection, explicit root
+activation (`--activate-learned-skill`), explicit replacement promotion
+(`--promote-learned-skill`), and administrative retirement (`--retire-learned-skill`).
+
+Not everything this specification describes is reachable from the shipped binary. Reading this
+document as a description of running behaviour requires the following corrections:
+
+- **Promotion** is reachable, but only as an *explicit operator* action. The automatic
+  evidence-threshold promotion path (`LifecycleService::promote_replacement` under
+  `PromotionPolicy`) has no production caller; `--promote-learned-skill` uses a separate
+  local-owner authorization that records `evidence_threshold_promotion: false` in its evidence
+  payload. No shipped code path promotes a canary because its evidence crossed a threshold.
+- **Rollback** (`rollback_replacement`) is a library operation with no production caller and no
+  operator command. Its transactional semantics below are implemented and tested, but nothing in
+  the binary invokes them.
+- **Repair** (`skills/repair.rs`) is compiled `#[cfg(test)]`. Repair-record construction and
+  repair-proposal submission exist only in the verification suite.
+- **The evidence-decision scheduler** (`skills/scheduler.rs`) is also compiled `#[cfg(test)]`:
+  nothing in production enqueues a held decision, so the module is deliberately kept out of the
+  production build. The `skill_decision_jobs` table it leases is still created by the schema
+  migrations and stays empty; a held automatic quarantine is logged and dropped rather than
+  queued.
+- **Automatic quarantine** *is* wired, on the telemetry ingestion path, together with the
+  index-rebuild and retention-compaction background work.
 
 The corpus authority and conflict rules are defined in
 [`00-index.md`](00-index.md). Phase 5 owns evidence-based lifecycle automation. It cannot bypass
@@ -290,7 +311,8 @@ but does not fabricate predecessor telemetry or a non-inferiority comparison. Th
 qualified-invocation gates below apply only to replacement canaries with an active predecessor.
 
 Replacement canary eligibility is deterministic, based on a stable hash of `(skill_id, turn_id)`,
-so retries do not switch revisions unpredictably. The canary share is bounded and configurable.
+so retries do not switch revisions unpredictably. The canary share is bounded by a fixed
+constant, not configuration.
 If no active lineage is selected, the model writes ordinary JS using the primitive host API.
 
 Routing occurs after retrieval selects a logical lineage and before the model-visible manifest is
@@ -300,9 +322,13 @@ turn therefore sees the same revision in its manifest and every JS call. Quarant
 are ineligible regardless of hash. Candidate and predecessor are not both injected as competing
 near-duplicates.
 
-Conservative replacement-canary defaults:
+Conservative replacement-canary constants. These are compiled-in values, **not** configuration:
+there is no configuration key for any of them. The only skill-related configuration keys are
+`embedding` and `enable_skill_proposals` (`src/config/mod.rs`).
 
-- maximum canary share: 10% of otherwise eligible turns;
+- maximum canary share: 10% of otherwise eligible turns
+  (`turn.rs`, `CANARY_SHARE_BASIS_POINTS = 1_000`; `router.rs` additionally refuses any request
+  above 1,000 basis points, so 10% is a hard ceiling and not merely a default);
 - minimum qualified invocations before `active`: 25;
 - evidence must span at least 25 distinct user turns because one revision receives at most one
   promotion evidence unit per turn;
@@ -319,8 +345,15 @@ requires a one-sided 95% Wilson upper bound no worse than the predecessor's boun
 configured non-inferiority margin. Thus 25 is a floor, not a promise that 25 observations always
 suffice. A replacement without enough predecessor data remains canary or requires human review.
 
-Without the Phase 5 policy service, no canary can activate. Thresholds are configuration, but every
-automatic decision stores the effective values and policy version.
+Without the Phase 5 policy service, no canary can activate. The thresholds are the fixed fields of
+`PromotionPolicy::conservative` (`skills/policy.rs`): `min_distinct_turns: 25`,
+`max_observed_error_rate: 0.05`, `non_inferiority_margin: 0.05`,
+`max_candidate_latency_ratio: 1.25`, `absolute_p95_latency_us: 5_000_000`, and
+`min_verified_task_passes: None`. `PromotionPolicy` is a serializable versioned struct, so a
+different policy *can* be constructed and persisted in code, but the shipped binary registers only
+the conservative constants (from root activation and from quarantine) and exposes no configuration
+key to change them. Every automatic decision still stores the effective values and the policy
+version.
 
 ---
 
@@ -337,9 +370,14 @@ when all conditions hold:
 2. Canonical identity, no-effect verification, mutation checks, and held-out cases pass.
 3. The replacement requests no additional capability.
 4. Shadow evaluation is no worse than the predecessor on every inherited case.
-5. A deterministic canary can fall back to the predecessor without replaying completed side
-   effects. Automatic fallback is therefore restricted to Tier 0 and explicitly idempotent
-   Tier 1 operations.
+5. The route is frozen before any effect runs, so a canary *could* be abandoned for the
+   predecessor without replaying completed side effects, and eligibility for that is restricted to
+   Tier 0 and explicitly idempotent Tier 1 operations. **Automatic fallback is not implemented.**
+   `router.rs` computes and freezes the route (`FrozenRoute`, including
+   `fallback_before_effects`) and `turn.rs` emits a canary-exposure audit record for every turn
+   that had an eligible candidate, but `FrozenRoute::may_fallback` has no production caller and
+   nothing in `JsTool` or the worker ever re-invokes the predecessor after a canary failure. A
+   failed canary invocation fails the step; it does not silently retry on the active revision.
 
 Promotion from canary to active requires at least 25 qualified candidate invocations, no severe
 faults, no regression, a direct error rate below 5%, and p95 latency no worse than 125% of the
@@ -365,18 +403,35 @@ Quarantine is immediate for:
 - held-out regression discovered after admission;
 - any timeout/OOM during canary;
 - corrupted embedding/model metadata that makes the revision unsafe to retrieve.
-- explicit strong negative user feedback targeted at a canary invocation or revision.
+- authenticated `severe` user feedback, carrying one of the enumerated safety reason codes,
+  targeted at an active or canary revision.
 
 Behavioral quarantine of an active revision requires directly attributed faults and a minimum
-sample window. Timeouts, OOMs, and capability denials are faults. A thrown exception counts only
-when active authenticated negative or severe feedback targets the exact invocation. The initial
-policy requires at least 20 invocations and at least 5 directly attributed faults before
-rate-based quarantine. Thresholds are configurable and versioned.
+sample window. Timeouts, OOMs, and capability denials are faults on their own. An invocation that
+**threw or returned** counts as a fault when active authenticated `negative` *or* `severe`
+feedback targets that exact invocation — so ordinary “wrong result” feedback on a successful
+return does enter the behavioral window. The policy requires at least 20 qualified invocations and
+at least 5 directly attributed faults in the window before rate-based quarantine. The window is the
+raw-event retention window, and the counts are the fixed `QuarantinePolicy::conservative`
+constants under policy version `phase5-quarantine-v1`; they are versioned but not configurable.
 
-A targeted report of an integrity, permission, or unsafe-effect problem is severe and may
-quarantine an active revision immediately. Ordinary “wrong result” feedback enters the behavioral
-window unless a human explicitly marks it severe. Model-generated feedback never triggers an
-automatic transition.
+`severe` is a distinct feedback *kind*, not an escalation flag on wrong-result feedback. It is
+restricted to the enumerated safety reason codes `integrity`, `permission_violation`, and
+`unsafe_effect` (`skills/feedback.rs`, `SEVERE_FEEDBACK_REASON_CODES`), and submitting it against
+an active or canary revision immediately enters the coordinator-backed quarantine transition. A
+human therefore cannot mark wrong-result feedback severe and cannot use it to quarantine a
+revision on the spot; the supported route for a revision that returns wrong data is `negative`
+feedback attributed to the exact invocation, which counts toward the behavioral window above. If
+the wrong result is itself a safety problem — corrupted or fabricated data, an effect outside the
+declared grants — the matching safety reason code applies and quarantine is immediate.
+
+Rate-based quarantine is evaluated on telemetry ingestion, over the skills named by terminal
+production events in the arriving batch. Submitting feedback does not itself re-evaluate the
+window: a revision that has crossed the fault threshold is quarantined the next time one of its
+invocations reports a terminal event. Operators who need containment now should use
+`--retire-learned-skill` (administrative disable, lineage preserved) or a severe safety report.
+
+Model-generated feedback never triggers an automatic transition.
 
 Quarantine uses the index coordinator's exclusive generation gate. It commits status, evidence,
 and a desired index generation in one SQLite transaction, then publishes a new immutable snapshot
@@ -409,6 +464,12 @@ quarantined and preserved. It never reactivates broken code merely because a rep
 Repair attempts have per-session and per-lineage limits. Repeated failures surface for human
 review rather than looping indefinitely.
 
+**Delivery status of this section**: `skills/repair.rs` is compiled `#[cfg(test)]`. Repair-record
+construction and repair-proposal submission exist only in the verification suite; no shipped code
+path builds a repair record from a quarantine, and no operator command emits one. The contract
+above is the design this module implements and is regression-tested against; it is not something a
+running binary does today.
+
 ---
 
 ## 10. Supersession and rollback
@@ -433,6 +494,50 @@ Missing or identity-ineligible predecessors, lineage cycles, stale row versions,
 failures leave every status unchanged and return a typed error. When no eligible predecessor
 exists, the lineage remains unavailable rather than falling back to identity v1. Rollback does not
 delete the failed replacement.
+
+### Delivery status and the operator surface
+
+Supersession is reachable; rollback is not.
+
+- `--promote-learned-skill <sha256>` performs the supersession transaction above as an explicit
+  local-owner action. It requires an approved **canary** whose proposal names a predecessor and
+  whose `supersedes_id` matches that predecessor. A lineage root is refused with a message pointing
+  at `--activate-learned-skill`; a candidate already `active` is reported as an idempotent no-op;
+  any other status is refused. The predecessor may be `active` (an ordinary replacement) or
+  `quarantined` (the emergency path), and any other predecessor status is refused. Lineage is
+  preserved rather than re-rooted, and the attempt is keyed on the observed candidate and
+  predecessor row versions and the index generation, so a retry over the same observation replays
+  exactly instead of colliding. It registers its own policy version
+  (`local-owner-operator-promotion-v1`) and records `evidence_threshold_promotion: false`: it is an
+  authenticated human decision, not an evidence-threshold promotion.
+- `--activate-learned-skill <sha256>` accepts **only** an approved lineage-root canary. A candidate
+  whose proposal carries a `predecessor_id` is refused with a message pointing at
+  `--promote-learned-skill`; an already-`active` revision is an idempotent no-op; any other status
+  is refused.
+- `--retire-learned-skill <sha256>` is the administrative disable named in section 2. It requires an
+  `active` revision, is idempotent once retired, keeps the revision, its lineage, and its audit, and
+  publishes through the same coordinated gate. Unlike `--purge-learned-skill` it deletes nothing.
+- **Rollback has no operator command and no production caller.** `rollback_replacement` is a tested
+  library operation only.
+
+Because rollback is unreachable, the emergency procedure for a defective **active** revision is
+promotion over a quarantined predecessor, not reactivation of one:
+
+1. Contain the defective revision. Either submit severe feedback with a safety reason code
+   (`--learned-skill-feedback <id> --learned-skill-feedback-kind severe
+   --learned-skill-feedback-reason integrity|permission_violation|unsafe_effect …`), which
+   quarantines an active or canary revision immediately, or use `--retire-learned-skill` when the
+   problem is not a safety fault. Note that quarantining the *predecessor* is what makes step 3
+   legal; retirement is not an accepted predecessor state for promotion.
+2. Get a corrected replacement to approved canary through the ordinary gates: import or propose it
+   naming the defective revision as its predecessor, then `--approve-learned-skill`.
+3. `--promote-learned-skill <replacement>`. The quarantined predecessor is superseded and the
+   replacement becomes active with lineage intact.
+
+If no replacement exists, the lineage stays unavailable: there is no shipped command that
+reactivates an earlier revision. `--purge-learned-skill` is not a substitute — it deletes the
+revision's bytes and re-roots any dependent replacement, which strips that replacement of its
+replacement evidence.
 
 ---
 
@@ -464,10 +569,17 @@ Targeted local-owner feedback is available without model initialization through
 restricted to the enumerated safety reason codes and immediately enters the coordinator-backed
 quarantine transition for an active or canary revision.
 
-Repair-record construction and repair-proposal submission are compiled only into the verification
-suite while the shipped learned-skill proposal pipeline is intentionally disabled. Shipping that
-surface before authenticated approval and activation exist would recreate a write-only proposal
-queue; it must be enabled with the complete operator workflow rather than as an isolated API.
+The learned-skill proposal pipeline now ships, opt-in and off by default. Trusted
+`enable_skill_proposals = true` configuration registers the `propose_skill` global and starts the
+bounded proposal/admission workers; without it the global is absent and no worker runs. The
+complete operator workflow that this was gated on now exists — listing, per-proposal outcome,
+approval, rejection, root activation, replacement promotion, and retirement — so a proposal is no
+longer written into a queue nothing can act on. Proposals still stop at `awaiting_approval`; the
+flag grants no authority to activate.
+
+Repair-record construction and repair-proposal submission remain the exception: `skills/repair.rs`
+is compiled `#[cfg(test)]` and is exercised only by the verification suite. That surface stays
+test-only until a shipped path produces repair records from quarantines.
 
 Key rotation changes only future correlation fingerprints; evidence snapshots retain opaque old
 fingerprints but cannot be reversed. Repair records derived from user data must pass redaction and
@@ -503,7 +615,8 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 1. **Fault-only quarantine** (mini-agent-lugc, delivered). Behavioral quarantine counts `timed_out`, `oom`,
    and `capability_denied`. A `threw` event counts only when active authenticated negative or severe
    feedback targets that exact invocation; an uncorroborated exception caused by caller input is
-   telemetry, not evidence against the revision.
+   telemetry, not evidence against the revision. (Widened on 2026-09-07 — see section 12c — so a
+   `returned` event with the same attributed feedback also counts.)
 2. **Canary ordering** (mini-agent-840z, delivered). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
 3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy
@@ -517,12 +630,16 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 
 ## 12b. Delivered task-outcome and lifecycle hardening (2026-09-06)
 
-1. **Task outcomes.** Schema version 11 records one bounded outcome for a completed turn with the
+1. **Task outcomes.** Schema version 11 added one bounded outcome row for a completed turn with the
    exact invoked learned-skill IDs, pass/fail, attempt, timestamp, and a closed source:
-   `verify_command` plus its SHA-256 identity, an evaluator `oracle` ID, or explicit
-   `no_verify_command`. Production is derived by the session constructor; setting
+   `verify_command` plus its SHA-256 identity, an evaluator `oracle` ID, explicit
+   `no_verify_command`, or `gate_skipped` for a turn that ran under a configured command without
+   touching the workspace. Production is derived by the session constructor; setting
    `MINI_AGENT_GYM=1` can only downgrade it. Gym and deterministic-evaluation evidence is therefore
-   retained for analysis but cannot qualify for production promotion.
+   retained for analysis but cannot qualify for production promotion, and neither
+   `no_verify_command` nor `gate_skipped` can become a pass or a failure. (The current store schema
+   is version 13; migration 11 → 12 widened the deferred proposal reason-code CHECK, and 12 → 13
+   widened the task-outcome source CHECK to admit `gate_skipped`.)
 2. **Promotion gate.** When a policy version sets `min_verified_task_passes`, promotion counts
    distinct production turns in the window where the candidate was actually invoked and a real
    verifier/oracle passed. That policy cannot fall through to the historical 25-invocation path.
@@ -534,6 +651,31 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 4. **Lifecycle safety.** Rollback clears the reactivated predecessor's stale
    `superseded_by_id`; replacement capability scopes must be a true subset of predecessor scopes;
    and long admission evaluation renews its durable lease before executing the contained suite.
+
+## 12c. Delivered corrections (2026-09-07)
+
+From the 2026-09-07 review. Each bead below is closed with its regression coverage.
+
+1. **Attributed feedback on a successful return** (mini-agent-5mwn). The behavioral-window join in
+   `skills/telemetry.rs` credits active `negative` or `severe` feedback on a terminal `returned`
+   event, not only on `threw`. Wrong-result feedback against an active revision is therefore no
+   longer inert. Section 8 is written against this behaviour.
+2. **Operator replacement promotion** (mini-agent-83k9). `--promote-learned-skill` promotes an
+   approved replacement canary over an `active` **or** `quarantined` predecessor as an explicit
+   local-owner action, preserving lineage. See section 10.
+3. **Retirement exposed** (mini-agent-w0zp). `--retire-learned-skill` reaches the previously
+   uncalled `retire_and_publish`, giving the administrative disable of section 2 an operator
+   command.
+4. **Decision scheduler gated out** (mini-agent-fegd). `skills/scheduler.rs` had no production
+   caller and was moved behind `#[cfg(test)]` rather than left as apparently-live machinery.
+5. **Canary route audited, fallback not implemented** (mini-agent-sdt9). The frozen route is
+   recorded on a per-turn canary-exposure audit record. `may_fallback` remains uncalled in
+   production; section 7 rule 5 is downgraded accordingly.
+6. **Purge guard** (mini-agent-zod2). `--purge-learned-skill` refuses a non-terminal target or one
+   with dependent revisions unless `--purge-learned-skill-force` is passed, and names every
+   revision a forced purge re-roots.
+
+---
 
 ## 13. Acceptance criteria
 
@@ -590,11 +732,16 @@ manager:
 | Lifecycle, root activation, supersession, rollback | `src/extras/js/skills/lifecycle.rs` |
 | Worker-attributed terminal events and parent ingestion | `src/extras/js/worker.rs`, `protocol.rs`, `types.rs`, `skills/telemetry.rs` |
 | Capability intersection and authoritative attribution | `src/extras/js/skills/capability.rs`, `src/extras/js/broker.rs`, `src/extras/js/tool.rs` |
-| Canary routing | `src/extras/js/skills/router.rs` |
-| Promotion evidence and leases | `src/extras/js/skills/policy.rs`, `scheduler.rs` |
+| Canary routing and per-turn bundle | `src/extras/js/skills/router.rs`, `turn.rs` |
+| Promotion evidence | `src/extras/js/skills/policy.rs` |
+| Decision leases (**test-only**, `#[cfg(test)]`; no production enqueue) | `src/extras/js/skills/scheduler.rs` |
 | Generation publication | `src/extras/js/skills/coordinator.rs` |
-| Feedback, quarantine, and repair | `src/extras/js/skills/feedback.rs`, `quarantine.rs`, `repair.rs` |
+| Feedback and quarantine | `src/extras/js/skills/feedback.rs`, `quarantine.rs` |
+| Repair (**test-only**, `#[cfg(test)]`) | `src/extras/js/skills/repair.rs` |
 | Redaction, retention, and purge | `src/extras/js/skills/privacy.rs`, `retention.rs` |
+
+Modules marked **test-only** are compiled under `#[cfg(test)]` and are not part of the shipped
+binary; see the shipped-binary status at the top of this document.
 
 This map is descriptive only. Phase completion still requires every acceptance criterion, entry
 dependency, named test, real-binary smoke, performance gate, and Beads child/audit closure.

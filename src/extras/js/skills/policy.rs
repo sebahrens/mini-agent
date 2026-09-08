@@ -56,6 +56,13 @@ pub enum TaskOutcomeSource {
     VerifyCommand(String),
     Oracle(String),
     NoVerifyCommand,
+    /// A verify command *is* configured, but the completion gate did not run
+    /// this turn because the turn never touched the workspace. Distinct from
+    /// `NoVerifyCommand`, which claims the gate could never have run at all;
+    /// keeping them apart is what stops an audit misattributing a read-only
+    /// turn to an unconfigured gate. Like `NoVerifyCommand` it carries no
+    /// pass/fail signal and is excluded from promotion evidence.
+    GateSkipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,7 +257,10 @@ pub fn evaluate_promotion_with_task_outcomes(
                     .any(|id| id == &context.candidate_id)
                 && outcome.created_at >= policy.window_start
                 && outcome.created_at <= policy.window_end
-                && !matches!(outcome.source, TaskOutcomeSource::NoVerifyCommand)
+                && !matches!(
+                    outcome.source,
+                    TaskOutcomeSource::NoVerifyCommand | TaskOutcomeSource::GateSkipped
+                )
         })
         .collect::<Vec<_>>();
     let verified_task_passes = relevant_task_outcomes
@@ -477,4 +487,140 @@ fn canonical_inputs(
         verified_task_failures,
         gates,
     })?)
+}
+
+#[cfg(test)]
+mod gate_skipped_evidence_tests {
+    use super::*;
+
+    fn calls(skill: &str, count: usize) -> Vec<InvocationEvidence> {
+        (0..count)
+            .map(|index| InvocationEvidence {
+                invocation_id: format!("{skill}-invocation-{index}"),
+                skill_id: skill.into(),
+                turn_id: format!("{skill}-turn-{index}"),
+                outcome: DirectOutcome::Success,
+                latency_us: 100,
+                production: true,
+                observability_complete: true,
+                created_at: 100,
+            })
+            .collect()
+    }
+
+    fn context(candidate_id: &str) -> PromotionContext {
+        PromotionContext {
+            candidate_id: candidate_id.into(),
+            predecessor_id: Some("predecessor".into()),
+            capability_tier: CapabilityTier::Pure,
+            capability_increased: false,
+            inherited_tests_passed: true,
+            held_out_tests_passed: true,
+            unresolved_negative_feedback: false,
+            identity_valid: true,
+            row_version_current: true,
+            generation_current: true,
+        }
+    }
+
+    fn outcome(
+        candidate_id: &str,
+        turn: &str,
+        verify_passed: bool,
+        source: TaskOutcomeSource,
+    ) -> TaskOutcomeEvidence {
+        TaskOutcomeEvidence {
+            turn_id: turn.into(),
+            skill_ids: vec![candidate_id.to_string()],
+            verify_passed,
+            attempt: 1,
+            source,
+            production: true,
+            created_at: 100,
+        }
+    }
+
+    /// v98t: a turn that ran under a configured verify command but never
+    /// touched the workspace records `GateSkipped`. It is auditable, but the
+    /// gate never ran, so promotion must not count it as evidence — exactly
+    /// like `NoVerifyCommand`.
+    #[test]
+    fn a_skipped_gate_is_never_counted_as_promotion_evidence() {
+        let candidate_id = "a".repeat(64);
+        let mut policy = PromotionPolicy::conservative("v1", 0, 200);
+        policy.min_verified_task_passes = Some(1);
+        let result = evaluate_promotion_with_task_outcomes(
+            &policy,
+            &context(&candidate_id),
+            &calls(&candidate_id, 100),
+            &calls("predecessor", 100),
+            &[
+                outcome(
+                    &candidate_id,
+                    "candidate-turn-0",
+                    true,
+                    TaskOutcomeSource::GateSkipped,
+                ),
+                outcome(
+                    &candidate_id,
+                    "candidate-turn-1",
+                    false,
+                    TaskOutcomeSource::GateSkipped,
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result.verified_task_passes, 0);
+        assert_eq!(result.verified_task_failures, 0);
+        assert_eq!(result.decision, PromotionDecision::Hold);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason == "insufficient_verified_task_passes"),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// The exclusion must be specific to the skip sources: a real verified
+    /// pass in the same shape still promotes, so the test above is pinning
+    /// `GateSkipped` and not a broken evidence path.
+    #[test]
+    fn a_real_verified_pass_still_promotes_in_the_same_shape() {
+        let candidate_id = "a".repeat(64);
+        let mut policy = PromotionPolicy::conservative("v1", 0, 200);
+        policy.min_verified_task_passes = Some(1);
+        let result = evaluate_promotion_with_task_outcomes(
+            &policy,
+            &context(&candidate_id),
+            &calls(&candidate_id, 100),
+            &calls("predecessor", 100),
+            &[outcome(
+                &candidate_id,
+                "candidate-turn-0",
+                true,
+                TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.verified_task_passes, 1);
+        assert_eq!(result.decision, PromotionDecision::Promote);
+    }
+
+    /// `GateSkipped` must serialise to the same token the durable store and
+    /// `telemetry.rs`/`lifecycle.rs` agree on.
+    #[test]
+    fn gate_skipped_serialises_under_its_own_tag() {
+        let json = serde_json::to_string(&TaskOutcomeSource::GateSkipped).unwrap();
+        assert!(json.contains("gate_skipped"), "{json}");
+        assert_ne!(
+            json,
+            serde_json::to_string(&TaskOutcomeSource::NoVerifyCommand).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskOutcomeSource>(&json).unwrap(),
+            TaskOutcomeSource::GateSkipped
+        );
+    }
 }

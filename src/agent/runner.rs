@@ -510,18 +510,19 @@ impl CompletionVerification {
     /// with `verify_passed = false` misattributes the reason in every audit
     /// built from task-outcome evidence.
     ///
-    /// `TaskOutcomeSource` lives in `src/extras/js/skills/policy.rs` and has no
-    /// variant for the untouched-workspace case, so that case deliberately
-    /// records nothing here rather than recording something false. Reusing
-    /// `Oracle` would be worse than silence: promotion counts every source
-    /// except `NoVerifyCommand` as evidence, so a read-only turn would be
-    /// admitted as a failing gate result.
+    /// `TaskOutcomeSource` (in `src/extras/js/skills/policy.rs`) therefore
+    /// carries a separate `GateSkipped` variant for the untouched-workspace
+    /// case, so the turn gets its own auditable source instead of being
+    /// silently dropped. Reusing `Oracle` would be worse than either: promotion
+    /// counts every source except `NoVerifyCommand` and `GateSkipped` as
+    /// evidence, so a read-only turn would be admitted as a failing gate
+    /// result.
     #[cfg(feature = "skills")]
     fn record_verification_skipped(&self, workspace_may_have_changed: bool) {
         let Some(source) = skipped_verification_source(self.has_command()) else {
             tracing::debug!(
                 workspace_may_have_changed,
-                "completion verification skipped under a configured command; no task outcome recorded"
+                "completion verification skipped with no source that honestly describes it; no task outcome recorded"
             );
             return;
         };
@@ -544,23 +545,28 @@ impl CompletionVerification {
 }
 
 /// Which task-outcome source describes a turn that finished without running
-/// the completion gate, or `None` when no source honestly describes it.
+/// the completion gate. `None` is reserved for a future skip reason no source
+/// honestly describes; every reason known today has one.
 ///
 /// `no_verify_command` claims the gate could never have run because nothing
 /// was configured. A configured command whose gate was skipped — the turn was
 /// read-only, so there was nothing to verify — is a different fact, and
 /// recording it as `no_verify_command` with `verify_passed = false`
-/// misattributes the reason to every audit built from this evidence.
-/// `TaskOutcomeSource` (in `src/extras/js/skills/policy.rs`) has no variant
-/// for the skipped-gate case, so it records nothing rather than something
-/// false; reusing `Oracle` would be worse than silence, because promotion
-/// counts every source except `NoVerifyCommand` as evidence and a read-only
-/// turn would then be admitted as a failing gate result.
+/// misattributes the reason to every audit built from this evidence. The two
+/// therefore get separate sources, `NoVerifyCommand` and `GateSkipped`
+/// (`src/extras/js/skills/policy.rs`). Neither may be reported as `Oracle`,
+/// because promotion counts every source except those two as evidence and a
+/// read-only turn would then be admitted as a failing gate result.
 #[cfg(feature = "skills")]
 fn skipped_verification_source(
     has_command: bool,
 ) -> Option<crate::extras::js::skills::policy::TaskOutcomeSource> {
-    (!has_command).then_some(crate::extras::js::skills::policy::TaskOutcomeSource::NoVerifyCommand)
+    use crate::extras::js::skills::policy::TaskOutcomeSource;
+    Some(if has_command {
+        TaskOutcomeSource::GateSkipped
+    } else {
+        TaskOutcomeSource::NoVerifyCommand
+    })
 }
 
 fn tool_may_mutate_workspace(name: &str) -> bool {
@@ -1832,22 +1838,21 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
     // The identity a call was replayed under, so its result can be paired with
     // it whether the call kept the provider's own ids or a rewritten identity.
     let mut replay_identities: HashMap<String, ReplayToolIdentity> = HashMap::new();
-    // A subagent tool-call record is a note about work a *nested* agent did
-    // while the parent's own tool call was still in flight. It carries no
-    // identity and no result, so it can never become a structured
-    // `function_call` — but emitting its prose where it was recorded would
-    // wedge an assistant text message between a structured call and its
-    // result, which Anthropic rejects outright and which costs the Responses
-    // path its call/result adjacency. The notes are therefore held until the
-    // open pair closes and replayed immediately after it.
-    let mut deferred_subagent_notes: Vec<String> = Vec::new();
+    // A subagent tool-call record describes work a *nested* agent did while the
+    // parent's own tool call was still in flight. Emitting it where it was
+    // recorded would wedge it between a structured call and its result, which
+    // Anthropic rejects outright and which costs the Responses path its
+    // call/result adjacency. Such records are therefore held until the open
+    // pair closes and replayed immediately after it.
+    let mut deferred_subagent_records: Vec<Message> = Vec::new();
+    // Identities already replayed as a structured subagent pair. A repeat
+    // would put the same `call_id` in the history twice.
+    let mut replayed_subagent_ids: HashSet<String> = HashSet::new();
 
     for msg in &replay_messages[first_kept..] {
         let structured_call_open = open_call_ids.len() > completed_call_ids.len();
-        if !structured_call_open && !deferred_subagent_notes.is_empty() {
-            for note in deferred_subagent_notes.drain(..) {
-                messages.push(Message::assistant(note));
-            }
+        if !structured_call_open && !deferred_subagent_records.is_empty() {
+            messages.append(&mut deferred_subagent_records);
             replay_kind = ReplayKind::Other;
         }
         match msg.role {
@@ -1951,21 +1956,97 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                 }
             }
             MessageRole::SubagentToolCall => {
-                let note = format!("[SubagentToolCall]: {}", msg.content);
+                let replayed = subagent_replay_messages(
+                    msg,
+                    &mut replayed_subagent_ids,
+                    &call_counts,
+                    &result_counts,
+                );
                 if structured_call_open {
-                    deferred_subagent_notes.push(note);
+                    deferred_subagent_records.extend(replayed);
                 } else {
-                    messages.push(Message::assistant(note));
+                    messages.extend(replayed);
+                    // A structured subagent pair ends on a `User` tool-result
+                    // message that belongs to that pair alone; a parent result
+                    // must not be appended into it.
                     replay_kind = ReplayKind::Other;
                 }
             }
         }
     }
-    for note in deferred_subagent_notes {
-        messages.push(Message::assistant(note));
-    }
+    messages.append(&mut deferred_subagent_records);
 
     messages
+}
+
+/// The tool result replayed for a subagent tool call.
+///
+/// The parent transcript records that a nested agent called a tool, never what
+/// the tool returned — no subagent tool-result event reaches the session — so
+/// the closing result says exactly that instead of inventing an output. It
+/// exists because a structured `function_call` with no result after it is the
+/// dangling call the Responses API rejects.
+const SUBAGENT_TOOL_RESULT_PLACEHOLDER: &str = "[no output recorded: this tool ran inside a subagent, whose result is not part of this \
+     transcript]";
+
+/// Replay one subagent tool-call record.
+///
+/// A record persisted with a synthetic identity and structured arguments
+/// replays as a `function_call` plus the result that closes it, both emitted
+/// together so the pair can never dangle, nothing can be wedged between them,
+/// and the result can never precede its call.
+///
+/// Everything else stays labelled prose: a legacy record written before
+/// subagent calls carried any structure, and any record whose identity is
+/// missing, already replayed, or shared with a parent tool record — replaying
+/// one `call_id` twice is exactly the protocol error this fallback avoids.
+fn subagent_replay_messages(
+    msg: &crate::session::SessionMessage,
+    replayed_ids: &mut HashSet<String>,
+    call_counts: &HashMap<&str, usize>,
+    result_counts: &HashMap<&str, usize>,
+) -> Vec<Message> {
+    let prose = || {
+        vec![Message::assistant(format!(
+            "[SubagentToolCall]: {}",
+            msg.content
+        ))]
+    };
+    let structured = match (&msg.tool_call_id, &msg.tool) {
+        (Some(id), Some(PersistedToolMessage::Call { name, arguments }))
+            if id.starts_with(crate::session::SUBAGENT_TOOL_CALL_ID_PREFIX)
+                && !call_counts.contains_key(id.as_str())
+                && !result_counts.contains_key(id.as_str()) =>
+        {
+            Some((id.to_string(), name.to_string(), arguments.clone()))
+        }
+        _ => None,
+    };
+    let Some((id, name, arguments)) = structured else {
+        return prose();
+    };
+    if !replayed_ids.insert(id.clone()) {
+        return prose();
+    }
+    let identity = replay_tool_identity(&id);
+    vec![
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call_with_call_id(
+                identity.clone(),
+                identity.clone(),
+                name,
+                arguments,
+            )),
+        },
+        Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: identity.clone(),
+                call_id: Some(identity),
+                content: OneOrMany::one(ToolResultContent::text(SUBAGENT_TOOL_RESULT_PLACEHOLDER)),
+            })),
+        },
+    ]
 }
 
 #[cfg(feature = "multimodal")]
@@ -8091,6 +8172,35 @@ mod replay_and_gate_attribution_tests {
             .any(|item| matches!(item, AssistantContent::ToolCall(_)))
     }
 
+    /// `(call_id, name, arguments)` of the first tool call in an assistant
+    /// message, or `None` when the message is not a structured call.
+    fn tool_call_parts(message: &Message) -> Option<(String, String, serde_json::Value)> {
+        let Message::Assistant { content, .. } = message else {
+            return None;
+        };
+        content.iter().find_map(|item| match item {
+            AssistantContent::ToolCall(call) => Some((
+                call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                call.function.name.clone(),
+                call.function.arguments.clone(),
+            )),
+            _ => None,
+        })
+    }
+
+    /// The `call_id` a user message's first tool result answers.
+    fn tool_result_call_id(message: &Message) -> Option<String> {
+        let Message::User { content } = message else {
+            return None;
+        };
+        content.iter().find_map(|item| match item {
+            rig::message::UserContent::ToolResult(result) => {
+                Some(result.call_id.clone().unwrap_or_else(|| result.id.clone()))
+            }
+            _ => None,
+        })
+    }
+
     fn assistant_text(message: &Message) -> Option<String> {
         let Message::Assistant { content, .. } = message else {
             return None;
@@ -8182,8 +8292,116 @@ mod replay_and_gate_attribution_tests {
         assert!(matches!(history.last(), Some(Message::User { .. })));
     }
 
+    /// mcja: a subagent tool call recorded through the session API now
+    /// replays as a real `function_call` carrying the nested tool's raw
+    /// arguments, closed by its own result so it can never dangle.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[test]
+    fn a_recorded_subagent_tool_call_replays_as_a_closed_structured_pair() {
+        let mut session = session();
+        session.add_subagent_tool_call("read", &serde_json::json!({"path": "src/main.rs"}));
+
+        let history = convert_history(&session);
+        assert_eq!(history.len(), 2, "{history:?}");
+        let (call_id, name, arguments) =
+            tool_call_parts(&history[0]).expect("a recorded subagent call replays structurally");
+        assert_eq!(name, "read");
+        assert_eq!(arguments, serde_json::json!({"path": "src/main.rs"}));
+        assert_eq!(
+            tool_result_call_id(&history[1]).as_deref(),
+            Some(call_id.as_str()),
+            "the closing result must answer the call it follows: {history:?}"
+        );
+        assert!(
+            history.iter().find_map(assistant_text).is_none(),
+            "the structured pair replaces the prose note: {history:?}"
+        );
+    }
+
+    /// The structured pair is still held out of an open parent pair: an
+    /// assistant `function_call` wedged between a parent call and its result
+    /// is rejected outright by Anthropic and costs Responses its adjacency.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[test]
+    fn a_structured_subagent_pair_is_deferred_out_of_an_open_parent_pair() {
+        let mut session = session();
+        session.add_message(MessageRole::User, "spawn a subagent");
+        session.add_tool_call_with_id("call-1", "task", &serde_json::json!({"prompts": ["find"]}));
+        session.add_subagent_tool_call("grep", &serde_json::json!({"pattern": "needle"}));
+        session.add_tool_result_with_id("call-1", "task", "subagent report");
+
+        let history = convert_history(&session);
+        let call_index = history
+            .iter()
+            .position(is_tool_call)
+            .expect("the parent task call must replay structurally");
+        assert!(
+            matches!(&history[call_index + 1], Message::User { .. }),
+            "the parent result must immediately follow its call: {history:?}"
+        );
+        let (subagent_call_id, name, _) = tool_call_parts(&history[call_index + 2])
+            .expect("the deferred subagent call follows the closed parent pair");
+        assert_eq!(name, "grep");
+        assert_eq!(
+            tool_result_call_id(&history[call_index + 3]).as_deref(),
+            Some(subagent_call_id.as_str()),
+            "the deferred pair must stay closed too: {history:?}"
+        );
+    }
+
+    /// A record written before subagent calls carried structure has no
+    /// identity and no arguments, so it can only stay labelled prose.
+    #[test]
+    fn a_legacy_subagent_record_still_replays_as_prose() {
+        let mut session = session();
+        session.add_message(MessageRole::SubagentToolCall, "read src/main.rs");
+
+        let history = convert_history(&session);
+        assert!(!history.iter().any(is_tool_call), "{history:?}");
+        assert_eq!(
+            history
+                .iter()
+                .filter_map(assistant_text)
+                .collect::<Vec<_>>(),
+            vec!["[SubagentToolCall]: read src/main.rs".to_string()],
+            "a legacy record has no structure to replay: {history:?}"
+        );
+    }
+
+    /// A repeated identity would put the same `call_id` in the replayed
+    /// history twice. The duplicate falls back to prose instead.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[test]
+    fn a_duplicated_subagent_identity_falls_back_to_prose() {
+        let mut session = session();
+        session.add_subagent_tool_call("read", &serde_json::json!({"path": "a.rs"}));
+        let duplicate = session.messages[0].clone();
+        session.messages.push(duplicate);
+
+        let history = convert_history(&session);
+        let structured = history
+            .iter()
+            .filter(|message| is_tool_call(message))
+            .count();
+        assert_eq!(
+            structured, 1,
+            "only the first record may claim the identity: {history:?}"
+        );
+        let prose = history
+            .iter()
+            .filter_map(assistant_text)
+            .collect::<Vec<_>>();
+        assert_eq!(prose.len(), 1, "{history:?}");
+        assert!(
+            prose[0].starts_with("[SubagentToolCall]: read"),
+            "the duplicate must survive as prose: {prose:?}"
+        );
+    }
+
     /// v98t: `no_verify_command` may only describe a turn with no configured
-    /// command. A configured command whose gate was skipped records nothing.
+    /// command. A configured command whose gate was skipped gets its own
+    /// source, `gate_skipped`, so an audit is not misattributed — and is not
+    /// silent either.
     #[cfg(feature = "skills")]
     #[test]
     fn a_configured_verify_command_is_never_recorded_as_no_verify_command() {
@@ -8198,13 +8416,34 @@ mod replay_and_gate_attribution_tests {
             CompletionVerification::from_config(&cfg, crate::sandbox::Sandbox::new(false, "bwrap"))
                 .expect("a configured verify command builds the gate");
         assert!(verification.has_command());
-        assert!(
-            skipped_verification_source(verification.has_command()).is_none(),
-            "a read-only turn under a configured command must not be attributed to a missing one"
+        assert_eq!(
+            skipped_verification_source(verification.has_command()),
+            Some(TaskOutcomeSource::GateSkipped),
+            "a read-only turn under a configured command is a skipped gate, not a missing one"
         );
-        assert!(matches!(
+        assert_eq!(
             skipped_verification_source(false),
             Some(TaskOutcomeSource::NoVerifyCommand)
-        ));
+        );
+    }
+
+    /// v98t: the skipped-gate turn must be recorded, not dropped. Reusing
+    /// `Oracle` would be worse than silence, so pin the exact variant.
+    #[cfg(feature = "skills")]
+    #[test]
+    fn a_skipped_gate_is_recorded_under_its_own_source() {
+        use crate::agent::runner::skipped_verification_source;
+        use crate::extras::js::skills::policy::TaskOutcomeSource;
+
+        let source = skipped_verification_source(true).expect("a skipped gate has a source");
+        assert!(
+            !matches!(
+                source,
+                TaskOutcomeSource::Oracle(_) | TaskOutcomeSource::VerifyCommand(_)
+            ),
+            "a skipped gate must never be laundered into promotion evidence"
+        );
+        assert_ne!(source, TaskOutcomeSource::NoVerifyCommand);
+        assert_eq!(source, TaskOutcomeSource::GateSkipped);
     }
 }

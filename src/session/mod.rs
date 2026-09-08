@@ -128,6 +128,14 @@ fn sha256(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
+/// Identity prefix for a subagent tool-call record.
+///
+/// A subagent record describes a tool a *nested* agent ran, never a call the
+/// parent model made, so its identity is deliberately outside every namespace
+/// a parent identity can occupy: provider ids (`toolu_...`, `call_...`,
+/// `fc_...`) and rig's `internal_<uuid>` lifecycle ids.
+pub(crate) const SUBAGENT_TOOL_CALL_ID_PREFIX: &str = "subagent_call_";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -937,7 +945,13 @@ impl Session {
             if message.role == MessageRole::User {
                 break;
             }
-            if !matches!(message.tool, Some(PersistedToolMessage::Call { .. })) {
+            // A subagent record also carries a `Call` payload, but it
+            // describes a *nested* agent's tool call and has no provider
+            // identity to adopt. Counting one here would shift the positional
+            // pairing and hand a parent call the wrong provider identity.
+            if message.role != MessageRole::ToolCall
+                || !matches!(message.tool, Some(PersistedToolMessage::Call { .. }))
+            {
                 continue;
             }
             let id = message
@@ -1145,12 +1159,43 @@ impl Session {
         }
     }
 
+    /// Record one tool call a *nested* agent made while the parent's own turn
+    /// was running.
+    ///
+    /// The record keeps a synthetic identity and the raw arguments in a
+    /// [`PersistedToolMessage::Call`] payload so `convert_history` can replay
+    /// it as a real `function_call` instead of flattening it to a lossy
+    /// `[SubagentToolCall]: ...` prose line. `content` stays the bounded
+    /// human-readable summary the UI, exports and the advisor already render.
+    ///
+    /// The parent never observes the *nested* tool's output — no subagent
+    /// tool-result event reaches this session — so no result record is written
+    /// here. Replay closes the pair itself; see
+    /// `runner::convert_history_uncached`.
     #[cfg(any(feature = "subagents", feature = "acp"))]
     pub fn add_subagent_tool_call(&mut self, name: &str, args: &serde_json::Value) {
-        self.add_message(
+        let id = self.next_subagent_tool_call_id();
+        self.add_message_with_tool_data(
             MessageRole::SubagentToolCall,
             &crate::ui::utils::format_tool_call_summary(name, args),
+            Some(id.as_str()),
+            Some(PersistedToolMessage::Call {
+                name: CompactString::new(name),
+                arguments: args.clone(),
+            }),
         );
+    }
+
+    /// A synthetic identity for the next subagent tool-call record.
+    ///
+    /// It must never be mistaken for an identity the parent model produced:
+    /// those are the provider's own (`toolu_...`, `call_...`, `fc_...`) or
+    /// rig's `internal_<uuid>` lifecycle id, so the prefix alone separates
+    /// them. The position suffix keeps live records distinct from one another,
+    /// which is what replay needs to refuse a duplicated identity.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
+    fn next_subagent_tool_call_id(&self) -> String {
+        format!("{SUBAGENT_TOOL_CALL_ID_PREFIX}{}", self.messages.len())
     }
 
     #[cfg(feature = "multimodal")]
@@ -1951,5 +1996,76 @@ mod preflight_tests {
         assert!(bounded.contains("storage unavailable"));
         assert!(!bounded.contains(&"M".repeat(80)));
         assert!(bounded.chars().count() < TOOL_RESULT_SAVE_THRESHOLD);
+    }
+}
+
+/// mcja: subagent tool records must persist enough structure to be replayed
+/// as a real tool call rather than flattened to assistant prose.
+#[cfg(test)]
+#[cfg(any(feature = "subagents", feature = "acp"))]
+mod subagent_tool_record_tests {
+    use super::*;
+
+    #[test]
+    fn a_subagent_tool_call_persists_its_identity_and_raw_arguments() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        let args = serde_json::json!({"path": "src/main.rs", "limit": 40});
+        session.add_subagent_tool_call("read", &args);
+
+        let record = &session.messages[0];
+        assert_eq!(record.role, MessageRole::SubagentToolCall);
+        let id = record
+            .tool_call_id
+            .as_deref()
+            .expect("a subagent record needs an identity to be replayable");
+        assert!(id.starts_with(SUBAGENT_TOOL_CALL_ID_PREFIX), "{id}");
+        let Some(PersistedToolMessage::Call { name, arguments }) = &record.tool else {
+            panic!(
+                "a subagent record must persist a structured call: {:?}",
+                record.tool
+            )
+        };
+        assert_eq!(name.as_str(), "read");
+        assert_eq!(arguments, &args);
+        // The bounded human-readable summary the UI and exports render is
+        // still the record's content, and is not the replay payload.
+        assert!(record.content.contains("read"), "{}", record.content);
+        assert!(
+            !record.content.contains("40"),
+            "the summary stays bounded; the raw arguments live in the replay payload: {}",
+            record.content
+        );
+    }
+
+    #[test]
+    fn live_subagent_records_do_not_share_an_identity() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_subagent_tool_call("read", &serde_json::json!({"path": "a.rs"}));
+        session.add_subagent_tool_call("read", &serde_json::json!({"path": "b.rs"}));
+
+        assert_ne!(
+            session.messages[0].tool_call_id,
+            session.messages[1].tool_call_id
+        );
+    }
+
+    /// A subagent record carries a `Call` payload but is not a call the parent
+    /// model made. Counting it while adopting provider identities would shift
+    /// the positional pairing and give a parent call the wrong provider id.
+    #[test]
+    fn subagent_records_are_invisible_to_provider_identity_adoption() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        session.add_message(MessageRole::User, "go");
+        session.add_tool_call_with_id("internal-1", "read", &serde_json::json!({"path": "a.rs"}));
+        session.add_subagent_tool_call("grep", &serde_json::json!({"pattern": "needle"}));
+
+        let indices = session
+            .trailing_unrecorded_tool_call_indices(1)
+            .expect("the parent call is the only adoptable record");
+        assert_eq!(indices, vec![1]);
+        assert!(
+            session.trailing_unrecorded_tool_call_indices(2).is_none(),
+            "the subagent record must not be counted as a second parent call"
+        );
     }
 }
