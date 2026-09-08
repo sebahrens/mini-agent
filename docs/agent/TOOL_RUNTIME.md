@@ -74,6 +74,12 @@ caller must first read the current file completely and then set
 content fingerprint before the atomic replacement, so an intervening edit
 invalidates the authorization.
 
+Headless loops save each iteration's prompt, completed tool calls and results,
+response, and token usage to the resumable session before validation or error
+propagation. A provider failure after a tool effect therefore leaves a record
+for `--continue`. `--no-session` suppresses these saves. If the iteration and
+the save both fail, the error reports both failures.
+
 The same wrapper is used for read-only `/btw` and exploration-subagent tool
 sets. Definition metadata that genuinely needs to vary while an agent is live
 must not be placed behind this wrapper; current tool metadata is fixed when its

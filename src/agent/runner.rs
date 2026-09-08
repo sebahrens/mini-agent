@@ -603,7 +603,7 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "hooks"))]
     pub(crate) fn without_compaction(
         event_rx: mpsc::Receiver<AgentEvent>,
         abort_handle: tokio::task::AbortHandle,
@@ -3247,8 +3247,9 @@ impl HeadlessTurn {
         }
     }
 
-    /// Convert to the plain result the non-headless callers expect, discarding
-    /// partial progress on failure.
+    /// Test convenience for assertions that only need the terminal result.
+    /// Production callers must retain partial progress before returning errors.
+    #[cfg(test)]
     pub(crate) fn into_result(
         self,
     ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)> {
