@@ -163,7 +163,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 body = job_body(self.workflow, job)
                 self.assertIn("name: Write source-free Phase 6 gate evidence", body)
                 self.assertIn("if: always()", body)
-                self.assertIn("raw_output = $false", body)
+                # macOS derives its evidence from the actual probe results in
+                # scripts/phase6_macos_evidence.py, which sets raw_output there;
+                # the other platforms still inline the PowerShell writer.
+                if job == "macos-worker-containment-gate":
+                    self.assertIn("scripts/phase6_macos_evidence.py", body)
+                else:
+                    self.assertIn("raw_output = $false", body)
                 self.assertIn("phase6-gate-evidence.json", body)
                 self.assertIn("phase6-gate-evidence.log", body)
                 self.assertIn("if-no-files-found: error", body)

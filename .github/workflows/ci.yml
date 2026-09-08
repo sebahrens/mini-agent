@@ -54,7 +54,10 @@ jobs:
         run: python3 -m unittest scripts.tests.test_check_feature_graph
 
       - name: Test Phase 6 cross-platform CI gate
-        run: python3 -m unittest scripts.tests.test_phase6_ci_workflow
+        run: >-
+          python3 -m unittest
+          scripts.tests.test_phase6_ci_workflow
+          scripts.tests.test_phase6_macos_evidence
 
       - name: Test harness evaluation CI policy
         run: python3 -m unittest scripts.tests.test_harness_eval_ci scripts.tests.test_gym
@@ -732,35 +735,31 @@ jobs:
           done
           echo 'PHASE6_ADVERSARIAL=passed' >> "$GITHUB_ENV"
 
+      # Availability, assurance and the native-gate field are derived from the
+      # actual step results, never from the matrix label: a runner whose
+      # production-binary containment matrix passed has a production worker,
+      # and the generator refuses to emit a summary that contradicts its own
+      # resource measurement.
       - name: Write source-free Phase 6 gate evidence
         if: always()
-        shell: pwsh
+        shell: bash
         run: |
-          $probe = if ($env:PHASE6_REAL_PROBE) { $env:PHASE6_REAL_PROBE } else { 'not-run' }
-          $adversarial = if ($env:PHASE6_ADVERSARIAL) { $env:PHASE6_ADVERSARIAL } else { 'not-run' }
-          $resource = if ($env:PHASE6_RESOURCE) { $env:PHASE6_RESOURCE } else { 'not-run' }
-          @{
-            schema_version = 1
-            platform = 'macos'
-            runner = '${{ matrix.os }}'
-            result = '${{ job.status }}'
-            containment = @{
-              backend = 'seatbelt'
-              assurance = 'deprecated-best-effort-fail-closed'
-              real_probe = $probe
-              production_binary_matrix = $probe
-              resource_measurement = $resource
-              native_resource_gate = 'unavailable-no-production-worker'
-            }
-            adversarial = @{
-              feature_rows = @('js', 'skills')
-              suites = $adversarial
-              zero_test_guard = 'enforced'
-            }
-            raw_output = $false
-          } | ConvertTo-Json -Depth 4 | Set-Content 'phase6-gate-evidence.json'
-          "PHASE6_GATE platform=macos runner=${{ matrix.os }} result=${{ job.status }} probe=$probe suites=$adversarial raw_output=false" |
-            Set-Content 'phase6-gate-evidence.log'
+          probe="${PHASE6_REAL_PROBE:-not-run}"
+          adversarial="${PHASE6_ADVERSARIAL:-not-run}"
+          if [ "${{ matrix.os }}" = 'macos-26' ]; then
+            resource="${PHASE6_RESOURCE:-not-run}"
+          else
+            resource='skipped-unsupported-runner'
+          fi
+          python3 scripts/phase6_macos_evidence.py \
+            --runner '${{ matrix.os }}' \
+            --job-status '${{ job.status }}' \
+            --probe "$probe" \
+            --adversarial "$adversarial" \
+            --resource "$resource" \
+            --json-out phase6-gate-evidence.json \
+            --log-out phase6-gate-evidence.log
+          cat phase6-gate-evidence.log
 
       - name: Archive source-free Phase 6 gate evidence
         if: always()
