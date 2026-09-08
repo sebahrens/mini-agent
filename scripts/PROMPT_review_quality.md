@@ -1,5 +1,9 @@
 # Review: Code Quality — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are auditing the mini-agent workspace for code quality: naming, documentation,
 test coverage, and adherence to project conventions.
 
@@ -66,8 +70,8 @@ mcp__narsil-mcp__find_dead_code()                 # untested paths often show as
 ```
 
 CLAUDE.md requires: "write tests for new non-TUI code". Check:
-- Every module in `src/extras/js/` (if it exists) should have a `#[cfg(test)]` block.
-- The `JsTool` channel types should have at minimum a type-assertion test.
+- Changed non-TUI behavior should have meaningful coverage in its owning tests; do not require a duplicate test module per file.
+- Production parent tool and protocol boundaries should retain Send/Sync and closed-wire coverage.
 - Host functions (`read_file`, `write_file`, `spawn`) should have integration tests.
 
 ### 4. Naming conventions
@@ -77,8 +81,8 @@ mcp__narsil-mcp__workspace_symbol_search("Js")    # check JS type naming
 mcp__narsil-mcp__workspace_symbol_search("js_")   # check function naming
 ```
 
-- Are `JsRequest`, `JsResponse`, `JsOutcome` named exactly per SPEC.md?
-- Are function names imperative verbs (e.g. `run_step`, `register_host_globals`)?
+- Do `RunStep`, `StepResult`, and `StepOutcome` match the current wire contract?
+- Are function names imperative verbs (e.g. `execute_verification`, `read_worker`)?
 - Are constants `SCREAMING_SNAKE_CASE` (e.g. `STEP_TIMEOUT`, `MEMORY_LIMIT`)?
 
 ### 5. Module structure

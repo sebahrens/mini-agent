@@ -1,5 +1,9 @@
 # Review: Performance — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are conducting a focused performance review of the mini-agent Rust workspace.
 
 ## Setup
@@ -30,13 +34,14 @@ Verification: <benchmark or test to confirm improvement>"
 
 ### 1. JS Runtime creation cost
 
-The architecture mandates a fresh `Runtime` per step (~500μs overhead, accepted).
+The architecture mandates a fresh `Runtime` per request. Measure current cold launch, process reuse,
+trusted-bytecode loading, and execution separately; do not assume a historical latency estimate.
 Verify the accepted cost has not crept beyond the design budget:
 
 ```
 mcp__narsil-mcp__find_symbols("Runtime::new")
-mcp__narsil-mcp__find_callers("js_run_step")
-mcp__narsil-mcp__get_call_graph("js_run_step")
+mcp__narsil-mcp__find_callers("execute_fresh_step")
+mcp__narsil-mcp__get_call_graph("execute_fresh_step")
 ```
 
 - Is `Runtime::new()` called exactly once per step (not more)?
@@ -51,7 +56,7 @@ mcp__narsil-mcp__find_symbols("oneshot")
 mcp__narsil-mcp__find_callers("JsTool::call")
 ```
 
-- Is the `JsRequest` sent with unnecessary clones of large strings?
+- Is the `RunStep` payload sent with unnecessary clones of large strings?
 - Is the `mpsc::Sender` shared efficiently (Arc or per-call clone)?
 - Can multiple JS requests queue up without backpressure, causing memory growth?
 

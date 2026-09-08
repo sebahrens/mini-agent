@@ -1,5 +1,9 @@
 # Review: Compound (Cross-Cutting Concerns) — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are conducting a cross-cutting review that examines concerns spanning multiple
 subsystems: error propagation, observability, configuration, and cross-feature interactions.
 
@@ -13,10 +17,10 @@ quality) so you can reference their findings and identify compound problems.
 3. Survey with narsil-mcp:
    ```
    mcp__narsil-mcp__get_code_graph()               # full cross-module call graph
-   mcp__narsil-mcp__get_data_flow("JsOutcome")     # trace error through the stack
-   mcp__narsil-mcp__get_data_flow("JsRequest")     # trace request lifecycle
+   mcp__narsil-mcp__get_data_flow("StepResult")     # trace error through the stack
+   mcp__narsil-mcp__get_data_flow("RunStep")     # trace request lifecycle
    mcp__narsil-mcp__find_callers("tracing")        # observability coverage
-   mcp__narsil-mcp__get_control_flow("run_step")   # control flow through step execution
+   mcp__narsil-mcp__get_control_flow("execute_inner_request")   # control flow through step execution
    ```
 
 ## Bead filing protocol
@@ -36,13 +40,13 @@ Verification: <how to test across the boundary>"
 ### 1. Error propagation consistency
 
 ```
-mcp__narsil-mcp__get_data_flow("JsOutcome::Error")
+mcp__narsil-mcp__get_data_flow("StepOutcome::Error")
 mcp__narsil-mcp__find_references("anyhow")
 mcp__narsil-mcp__find_references("thiserror")
 ```
 
-- Does `JsOutcome::Error(String)` surface the full JS stack trace to the LLM?
-- Is the error type consistent from JS thread → `JsTool::call` → agent loop → LLM prompt?
+- Do `StepResult` and `WorkerError` expose only closed codes and validated source-free metadata?
+- Is the error type consistent from worker protocol → supervisor → `JsTool::call` → agent loop → LLM prompt?
 - Are there places where `anyhow::Error` is used in library code (should be `thiserror`)?
 - Are errors swallowed silently at any cross-module boundary?
 
@@ -53,11 +57,12 @@ mcp__narsil-mcp__get_control_flow("set_interrupt_handler")
 mcp__narsil-mcp__find_callers("tokio::time::timeout")
 ```
 
-ARCHITECTURE.md: interrupt handler fires only during JS bytecode; blocking host calls
-need `tokio::time::timeout`. Check:
-- Is there a `tokio::time::timeout` wrapping the blocking `spawn()` call in the JS host?
-- If JS times out via interrupt, does the `JsOutcome::Timeout` propagate cleanly?
-- Is the same `STEP_TIMEOUT` constant used for both the interrupt deadline and the tokio timeout?
+The parent deadline includes launch, queueing, IPC, permission waits, and brokered effects.
+Worker interrupts enforce the request-local JS budget; operation timeouts may only shorten it.
+
+- Can any effect reset or extend the invocation deadline?
+- Does a worker interrupt retain resource-limit classification and trigger process recycling?
+- Are parent watchdog expiry and worker-reported source faults distinguished?
 
 ### 3. Feature gate interaction
 
@@ -79,7 +84,7 @@ mcp__narsil-mcp__find_callers("tracing::warn")
 ```
 
 - Is there a `tracing::info!` span around the JS step execution (start, duration, outcome)?
-- Are JS errors logged with enough context (step number, code snippet, error message)?
+- Do logs stay source-free while retaining closed error classes and validated stage/role metadata?
 - Is there a `tracing::warn!` for interrupt-triggered timeouts?
 - Is there instrumentation at the permission check boundary?
 
@@ -89,25 +94,24 @@ mcp__narsil-mcp__find_callers("tracing::warn")
 mcp__narsil-mcp__find_symbols("STEP_TIMEOUT")
 mcp__narsil-mcp__find_symbols("MEMORY_LIMIT")
 mcp__narsil-mcp__find_symbols("STACK_LIMIT")
-mcp__narsil-mcp__find_symbols("THREAD_STACK")
 ```
 
 SPEC.md defines exact constants. Check:
-- Are the constants defined in `src/extras/js/types.rs` (or `engine.rs`)?
+- Are the constants defined in `src/extras/js/types.rs`, the wire protocol, and platform containment modules?
 - Are they used consistently — no magic numbers elsewhere in the JS engine?
-- Are they overridable via CLI or config without modifying source code?
+- Can configuration accidentally widen a fixed runtime or containment limit?
 
 ### 6. Skill library integration with JS engine (Phase 3 cross-cut)
 
 ```
 mcp__narsil-mcp__find_symbols("SkillStore")
-mcp__narsil-mcp__find_call_path("run_step", "SkillStore")
+mcp__narsil-mcp__find_call_path("SkillRuntime", "SkillStore")
 ```
 
-If Phase 3 is being implemented alongside Phase 1:
-- Is the skill preamble injection happening before `ctx.eval(...)`, not after?
-- Does skill retrieval happen on the Tokio thread (async) or the JS thread (sync)?
-- Is there a performance risk if skill retrieval blocks the JS thread?
+For the delivered skill pipeline:
+- Is the frozen skill bundle available before model execution and installed before the model script?
+- Do retrieval and store access stay in the parent, outside the contained worker?
+- Can index hydration or retrieval leave the first prompt with an incorrectly empty skill bundle?
 
 ## Deduplication protocol
 

@@ -1,5 +1,9 @@
 # Review: Debate (Design Challenges) — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are a Tier 3 reviewer examining design decisions that have competing valid interpretations.
 Your role is to surface genuine tradeoffs, flag premature decisions, and challenge assumptions —
 not to find bugs or file implementation tasks.
@@ -34,57 +38,51 @@ Impact if wrong: <consequences of choosing the inferior option>"
 
 ## Design debates to investigate
 
-### 1. Runtime lifecycle: per-step vs per-request
+### 1. Fresh-runtime cost
 
-ARCHITECTURE.md mandates fresh `Runtime` per step (~500μs overhead). But:
-- What if the agent runs thousands of steps in one session — does 500μs × 1000 = 500ms matter?
-- Is there a safe way to pool Runtimes without the OOM risk? (QuickJS issue: allocator state after OOM)
-- Does the current spec document WHY reuse is forbidden, or just say it is?
+A fresh runtime per request is a resolved containment contract. Measure current worker startup,
+trusted-bytecode loading, and request execution separately before proposing an optimization.
 
-Use narsil-mcp to check if there's any comment or doc explaining the OOM invariant in code.
+- Can trusted preparation be reused without retaining request-local QuickJS state?
+- Does the current benchmark represent both cold and reused-process paths?
 
-### 2. Thread-per-JsTool vs thread pool
+### 2. Shared worker supervision
 
-Current design: one OS thread per `JsTool` instance. Alternative: a pool of N JS threads
-shared across all JsTool instances.
+The parent shares one serialized worker supervisor across tool rebuilds. Evaluate queueing and
+retirement policy within that contract; an in-process thread pool is not the current design.
 
-- Does one-thread-per-tool scale if the agent has many tool invocations in parallel?
-- Would a thread pool require Runtime reuse (breaking invariant 3)?
-- The `!Send` constraint eliminates shared state — is the per-tool thread the only safe model?
+- Does the reuse policy balance startup cost against resource exhaustion and idle cleanup?
+- Do queued requests retain independent cancellation and deadlines?
 
-### 3. Interrupt handler vs tokio::time::timeout
+### 3. Deadline coordination
 
-ARCHITECTURE.md: interrupt handler fires only during JS bytecode; blocking host calls
-need `tokio::time::timeout`. This creates two timeout mechanisms for one timeout budget.
+The total invocation deadline includes parent effects and permission waits. Worker interrupts and
+the parent watchdog serve different failure boundaries.
 
-- Should the total step timeout be `STEP_TIMEOUT` for everything, or separate budgets?
-- What happens if JS runs 25s of pure bytecode and then calls `spawn()` which takes 10s?
-  (Total = 35s, but STEP_TIMEOUT = 30s — does the interrupt catch it or not?)
-- Is the current design correct, or does it have an exploitable window?
+- Can shorter operation limits improve responsiveness without resetting the total budget?
+- Are worker-reported resource faults distinguishable from parent deadline expiry?
 
-### 4. Host global API: error model
+### 4. Closed host errors
 
-`read_file` returns `Result<string, string>` and `write_file` returns `Result<null, string>`.
-Alternative: throw JavaScript exceptions instead of returning Result.
+Brokered effect failures carry closed error codes across the ABI. Arbitrary exception text,
+source, and stacks must not become model-visible diagnostics.
 
-- Does returning strings-as-errors give LLMs better feedback than JS exceptions?
-- Does the current model interact correctly with the microtask queue drain?
-- Is there a risk of error messages being confused with successful string output?
+- Can callers distinguish actionable closed errors without leaking contents or secrets?
+- Do synchronous and promise failures preserve the same bounded contract?
 
-### 5. Skill library content-addressing
+### 5. Skill identity and discovery
 
-Skills are addressed by `sha256(source)[..16]` — a 64-bit prefix. Debate:
+Identity version 2 uses the full SHA-256 of the canonical execution/discovery payload, ABI,
+and structured capability scopes. A source-only or truncated hash is not an alternative contract.
 
-- Is 64 bits of collision resistance sufficient for a skill library that could grow to thousands?
-  (Birthday bound: 50% collision at ~4 billion skills — overkill or not?)
-- Should the ID be the full 256-bit hash, or is the 16-hex truncation in SPEC.md intentional?
-- Does truncating the ID change behavior if two skills have the same prefix?
+- Are retrieval and repair decisions bound to the exact immutable identity?
+- Can discovery metadata change without the required identity and verification updates?
 
 ### 6. JS vs Rust for tool implementation
 
 The spike chose JS as the scripting layer for tool logic. Debate:
 
-- For simple filesystem operations, is JS indirection worth the ~500μs Runtime creation cost?
+- For simple filesystem operations, is JS indirection worth the measured worker and runtime cost?
 - Should the host globals be richer (exposing more Rust functionality) to reduce JS code complexity?
 - Is there a class of tools that should always be pure Rust and never JS?
 

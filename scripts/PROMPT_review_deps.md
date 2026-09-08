@@ -1,5 +1,9 @@
 # Review: Dependencies — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are auditing the mini-agent workspace for dependency hygiene: Cargo.toml correctness,
 feature gate cleanliness, version pinning, and license compatibility.
 
@@ -37,7 +41,7 @@ The JS engine uses optional dependencies. Verify they are declared correctly:
 
 Read `Cargo.toml` and check:
 - `rquickjs = { version = "0.12", features = ["full"], optional = true }` — is `optional = true`?
-- `birdcage` (Phase 2) — is it declared as optional under `sandbox` feature?
+- Platform containment dependencies — do Cargo feature/target gates match the current Phase 2 and Phase 6 backends?
 - `fastembed` + `rusqlite` (Phase 3) — declared optional under `skills` feature?
 
 ### 2. Feature flag hygiene

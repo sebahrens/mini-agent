@@ -1,5 +1,9 @@
 # Review: Architecture — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are evaluating the current mini-agent architecture against the target architecture
 in ARCHITECTURE.md and the invariants in AGENTS.md.
 
@@ -33,21 +37,22 @@ Verification: <how to validate the improvement>"
 
 ## Architecture vectors to investigate
 
-### 1. Threading model correctness
+### 1. Worker ownership and containment
 
-The core invariant: QuickJS `Runtime`/`Context` are `!Send` and must live exclusively
-on the dedicated JS thread. `JsTool` must hold only `Send + Sync` types.
+QuickJS values and runtimes belong to the contained worker. `JsTool` and the parent supervisor
+must hold only `Send + Sync` parent-local data. Test fixtures may construct private runtimes;
+trace production callers before reporting a containment bypass.
 
 ```
 mcp__narsil-mcp__find_symbols("JsTool")
-mcp__narsil-mcp__get_symbol_definition("JsTool")   # check struct fields
-mcp__narsil-mcp__find_references("Runtime")         # Runtime must only appear in js_thread_main
-mcp__narsil-mcp__find_references("Context")         # same constraint
+mcp__narsil-mcp__get_symbol_definition("JsWorkerSupervisor")
+mcp__narsil-mcp__find_references("Runtime")
+mcp__narsil-mcp__find_references("Context")
 ```
 
-- Does `JsTool`'s struct definition contain any `!Send` field?
-- Is `Runtime` ever constructed outside the dedicated JS thread?
-- Is there any `unsafe` usage that overrides the `!Send` constraint?
+- Does any production or verification path construct QuickJS state in the parent?
+- Does each request get a fresh runtime with limits installed before evaluation?
+- Can tool rebuilds bypass the shared supervisor or launch an uncontained worker?
 
 ### 2. Tool registration architecture
 
@@ -67,7 +72,8 @@ mcp__narsil-mcp__find_symbols("BashTool")           # reference registration pat
 
 ### 3. Permission flow architecture
 
-ARCHITECTURE.md: every tool call must route through `check_perm` before execution.
+Trace native-tool permission checks and JavaScript parent-broker authorization separately;
+brokered effects must satisfy invocation grants, target narrowing, and session permission.
 
 ```
 mcp__narsil-mcp__find_callers("check_perm")

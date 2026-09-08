@@ -1,5 +1,9 @@
 # Review: Bug Hunter — mini-agent
 
+For JavaScript runtime review, use **Phase 6 security invariants (canonical)** in
+`docs/specs/phase-6-brokered-js-runtime.md` as the authority. Check current callers and behavior;
+retired Phase 1 symbols are not missing implementation requirements.
+
 You are conducting a focused bug-hunting review of the mini-agent Rust workspace.
 
 ## Setup
@@ -43,31 +47,31 @@ Priority: 0=critical, 1=high, 2=medium, 3=low.
 Use narsil-mcp to find the JS engine files first:
 ```
 mcp__narsil-mcp__find_symbols("JsTool")
-mcp__narsil-mcp__find_symbols("js_thread_main")
+mcp__narsil-mcp__find_symbols("JsWorkerSupervisor")
 mcp__narsil-mcp__find_symbols("Runtime")
 ```
 
 Then check:
-- Is `Runtime` ever reused across steps? (invariant 3 violation — OOM risk)
-- Is `set_memory_limit` called on every new `Runtime`? (invariant 4 violation)
-- Is `set_interrupt_handler` called before `ctx.eval(...)`? (invariant 5 violation)
+- Is `Runtime` ever reused across steps? (see the canonical fresh-runtime contract)
+- Is `set_memory_limit` called on every new `Runtime`? (before source evaluation)
+- Is `set_interrupt_handler` called before `ctx.eval(...)`? (before source evaluation)
 - Is the microtask queue drained after every eval? (`execute_pending_job` loop)
 - Does `JsTool` hold any `!Send` field (Runtime, Context, Rc, RefCell)?
-- Does `spawn()` from JS go through `Sandbox::wrap_command`? (invariant 6 violation)
-- Can the JS thread panic and take down the entire agent process?
+- Does `spawn()` from JS go through `Sandbox::wrap_command`? (through the parent broker)
+- Can a worker crash escape containment or leave the parent waiting indefinitely?
 
 ### 2. Channel and async safety
 
 ```
 mcp__narsil-mcp__find_symbols("mpsc")
 mcp__narsil-mcp__find_symbols("oneshot")
-mcp__narsil-mcp__get_data_flow("JsRequest")
+mcp__narsil-mcp__get_data_flow("RunStep")
 ```
 
-- Can a dropped `oneshot::Receiver` cause the JS thread to block forever?
+- Does dropping a caller cancel its invocation, release transport ownership, and reap the worker?
 - Are there `tokio::sync::Mutex` held across `.await` points?
-- Is there a timeout on blocking host calls (`spawn()`) in the JS thread?
-- What happens if the JS thread panics — does the `JsTool` propagate the error or hang?
+- Do parent-brokered effects respect the invocation deadline and cancellation?
+- Does worker termination reach `JsTool` as a closed error and allow a later call to recover?
 
 ### 3. Permission flow
 
