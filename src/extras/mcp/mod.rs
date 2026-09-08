@@ -187,17 +187,6 @@ impl McpClientManager {
         notices
     }
 
-    /// Collect tools from every connected server with the default
-    /// [`McpToolTimeouts`].
-    pub async fn collect_tools(
-        &self,
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-    ) -> Vec<McpTool> {
-        self.collect_tools_with_timeouts(permission, ask_tx, McpToolTimeouts::default())
-            .await
-    }
-
     /// Collect tools from every connected server.
     ///
     /// Each server's `tools/list` is bounded by `timeouts.list`, so one hung
@@ -575,7 +564,9 @@ mod tests {
     #[tokio::test]
     async fn collect_tools_empty_handles_returns_empty_vec() {
         let manager = McpClientManager::from_handles(Vec::new());
-        let tools = manager.collect_tools(None, None).await;
+        let tools = manager
+            .collect_tools_with_timeouts(None, None, McpToolTimeouts::default())
+            .await;
         assert!(tools.is_empty());
     }
 

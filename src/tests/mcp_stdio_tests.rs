@@ -457,7 +457,11 @@ fn permission_for(action: Action) -> Arc<Mutex<PermissionChecker>> {
 
 async fn call_fixture_tool(manager: &McpClientManager) -> serde_json::Value {
     let mut tools = manager
-        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
         .await;
     let tool = tools
         .iter_mut()
@@ -650,7 +654,11 @@ async fn mcp_stdio_end_to_end_path_absolute_args_env_and_permissions() {
         .unwrap();
     let denied_manager = McpClientManager::from_handles(vec![denied_handle]);
     let mut denied_tools = denied_manager
-        .collect_tools(Some(permission_for(Action::Deny)), None)
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Deny)),
+            None,
+            McpToolTimeouts::default(),
+        )
         .await;
     let denied = denied_tools
         .iter_mut()
@@ -1006,48 +1014,6 @@ fn permission_for_servers(entries: &[(&str, Action)]) -> Arc<Mutex<PermissionChe
 }
 
 #[tokio::test]
-async fn mcp_tools_list_hang_times_out_and_produces_notice() {
-    let fixture = FixtureBuild::compile();
-    let lease = fixture.lease("hang-tools-list");
-    let config = fixture.config(
-        fixture.executable.display().to_string(),
-        Vec::new(),
-        "hang-tools-list",
-        &lease,
-    );
-    let handle = McpClientHandle::connect(CompactString::new("slow"), &config)
-        .await
-        .expect("fixture initializes normally before hanging tools/list");
-    let mut manager = McpClientManager::from_handles(vec![handle]);
-
-    let timeouts = McpToolTimeouts {
-        list: Duration::from_millis(300),
-        call: Duration::from_secs(5),
-    };
-    let started = std::time::Instant::now();
-    let tools = tokio::time::timeout(
-        Duration::from_secs(5),
-        manager.collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts),
-    )
-    .await
-    .expect("tools/list against a hung server must be bounded");
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "collect_tools must return shortly after the list timeout"
-    );
-    assert!(tools.is_empty(), "a hung server contributes no tools");
-    let notices = manager.take_notices();
-    assert_eq!(notices.len(), 1, "notices: {notices:?}");
-    assert!(notices[0].contains("slow"), "{}", notices[0]);
-    assert!(notices[0].contains("timed out"), "{}", notices[0]);
-
-    let pid = wait_for_pid(&lease).await;
-    shutdown(manager).await;
-    assert_process_reaped(pid).await;
-    fixture.cleanup();
-}
-
-#[tokio::test]
 async fn mcp_tools_list_hang_does_not_block_other_servers() {
     let fixture = FixtureBuild::compile();
     let slow_lease = fixture.lease("hang-tools-list-slow");
@@ -1079,15 +1045,22 @@ async fn mcp_tools_list_hang_does_not_block_other_servers() {
         list: Duration::from_millis(300),
         call: Duration::from_secs(5),
     };
-    let tools = manager
-        .collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts)
-        .await;
+    let tools = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.collect_tools_with_timeouts(Some(permission_for(Action::Allow)), None, timeouts),
+    )
+    .await
+    .expect("a hung server must not prevent collection of healthy tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].server_name, "fast");
     assert_eq!(tools[0].name(), "probe");
     let notices = manager.take_notices();
-    assert_eq!(notices.len(), 1);
-    assert!(notices[0].contains("slow"));
+    assert_eq!(notices.len(), 1, "notices: {notices:?}");
+    assert_eq!(
+        notices[0],
+        "MCP server 'slow' tools unavailable: tools/list timed out after 300 ms"
+    );
+    assert!(manager.take_notices().is_empty(), "notices drain once");
 
     let slow_pid = wait_for_pid(&slow_lease).await;
     let fast_pid = wait_for_pid(&fast_lease).await;
@@ -1114,7 +1087,11 @@ async fn mcp_tools_list_error_produces_notice() {
     .unwrap();
     let mut manager = McpClientManager::from_handles(vec![handle]);
     let tools = manager
-        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
         .await;
     assert!(tools.is_empty());
     let notices = manager.take_notices();
@@ -1208,7 +1185,9 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
 
     // Permission keys stay `mcp_tool:{server}:{tool}` with the bare tool name.
     let permission = permission_for_servers(&[("alpha", Action::Allow), ("beta", Action::Deny)]);
-    let mut tools = manager.collect_tools(Some(permission), None).await;
+    let mut tools = manager
+        .collect_tools_with_timeouts(Some(permission), None, McpToolTimeouts::default())
+        .await;
     let mut names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
     names.sort();
     assert_eq!(
@@ -1432,7 +1411,9 @@ async fn mcp_generated_names_cannot_collide_with_an_unchanged_name() {
         ("beta", "probe"),
         ("gamma", "alpha__probe"),
     ]);
-    let tools = manager.collect_tools(Some(permission), None).await;
+    let tools = manager
+        .collect_tools_with_timeouts(Some(permission), None, McpToolTimeouts::default())
+        .await;
 
     let names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
     let unique: std::collections::HashSet<&String> = names.iter().collect();
@@ -1484,7 +1465,11 @@ async fn structured_fixture_output(mode: &str) -> Result<String, rig::tool::Tool
     .unwrap();
     let manager = McpClientManager::from_handles(vec![handle]);
     let tools = manager
-        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .collect_tools_with_timeouts(
+            Some(permission_for(Action::Allow)),
+            None,
+            McpToolTimeouts::default(),
+        )
         .await;
     let result = tools[0].call("{}".to_string()).await;
     let pid = wait_for_pid(&lease).await;
