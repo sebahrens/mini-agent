@@ -2115,10 +2115,10 @@ fn reconciliation_poll_delay(now: Instant, deadline: Instant) -> Duration {
 
 fn classify_worker_exit(status: ExitStatus) -> WorkerError {
     #[cfg(test)]
-    eprintln!(
-        "JS_TEST_WORKER_EXIT class={}",
-        test_worker_exit_class(status)
-    );
+    {
+        let class = test_worker_exit_class(status);
+        eprintln!("JS_TEST_WORKER_EXIT class={class}");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
