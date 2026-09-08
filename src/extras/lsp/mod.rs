@@ -319,8 +319,11 @@ impl LspManager {
         // Bind the file before server selection so an unapproved replacement
         // never reaches the language server.
         let file = crate::fs::open_stable_file(&path).await.ok()?;
-        let text = client::read_document_text(file).await.ok()?;
-        self.client_for(&path).await?.sync_text(&path, text).await
+        let document = client::read_document(file).await.ok()?;
+        self.client_for(&path)
+            .await?
+            .sync_document(&path, document)
+            .await
     }
 
     pub async fn notify_changed_relative(&self, relative: &Path) -> Option<u64> {
@@ -329,13 +332,13 @@ impl LspManager {
         if !file.metadata().ok()?.is_file() {
             return None;
         }
-        let text = client::read_document_text(tokio::fs::File::from_std(file))
+        let document = client::read_document(tokio::fs::File::from_std(file))
             .await
             .ok()?;
         let lookup = self.inner.workspace.root().join(relative);
         self.client_for(&lookup)
             .await?
-            .sync_text(&lookup, text)
+            .sync_document(&lookup, document)
             .await
     }
 
@@ -704,6 +707,8 @@ impl LspManager {
             client::SyncedDocument {
                 version,
                 allow_versionless,
+                identity: crate::fs::checked_path_metadata(&client::file_path(uri).unwrap())
+                    .unwrap(),
             },
         );
     }

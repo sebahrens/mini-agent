@@ -215,6 +215,17 @@ fn main() {
                 let uri = env::var("LSP_FIXTURE_CANONICAL_URI").unwrap_or_else(|_| wire_uri.into());
                 let version: i64 = body.split_once("\"version\":").unwrap().1
                     .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                if env::var("LSP_FIXTURE_DELAY_VERSION").ok().as_deref() == Some(&version.to_string())
+                    && uri.ends_with("/document.probe")
+                {
+                    fs::write(env::var_os("LSP_FIXTURE_READY_FILE").unwrap(), "ready").unwrap();
+                    let release = env::var_os("LSP_FIXTURE_RELEASE_FILE").unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                    while !std::path::Path::new(&release).exists() {
+                        assert!(std::time::Instant::now() < deadline, "diagnostic gate timed out");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
                 let mut publish = |uri: &str, version: i64| {
                     write_frame(&mut stdout, &format!(
                         "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"severity\":1,\"message\":\"fixture diagnostic version {version}\"}}]}}}}"
@@ -708,6 +719,158 @@ async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
 }
 
 #[tokio::test]
+async fn lsp_process_delayed_publication_rejects_replaced_source_identity() {
+    let fixture = FixtureBuild::compile("delayed-identity");
+    let mut results = Vec::new();
+    for relative in [false, true] {
+        for delayed_version in [1, 2] {
+            let workspace = fixture
+                .workspace(&format!("workspace-{relative}-{delayed_version}"))
+                .canonicalize()
+                .unwrap();
+            let source = workspace.join("document.probe");
+            let uri = file_uri(&source).unwrap();
+            let ready = workspace.join("ready");
+            let release = workspace.join("release");
+            let mut server = fixture.config("diagnostics", &workspace.join("lease"));
+            for (name, value) in [
+                ("LSP_FIXTURE_DELAY_VERSION", delayed_version.to_string()),
+                ("LSP_FIXTURE_READY_FILE", ready.display().to_string()),
+                ("LSP_FIXTURE_RELEASE_FILE", release.display().to_string()),
+            ] {
+                server.env.insert(name.into(), value);
+            }
+            let manager = LspManager::new(
+                &LspConfig {
+                    enabled: true,
+                    servers: HashMap::from([("fixture".into(), server)]),
+                },
+                workspace.clone(),
+            );
+            for version in 1..=delayed_version {
+                fs::write(&source, format!("original version {version}")).unwrap();
+                let baseline = if relative {
+                    manager
+                        .notify_changed_relative(Path::new("document.probe"))
+                        .await
+                } else {
+                    manager.notify_changed(&source).await
+                };
+                assert!(baseline.is_some());
+                if version < delayed_version {
+                    assert!(
+                        manager
+                            .diagnostics_block_for_edit(&source, baseline)
+                            .await
+                            .is_some()
+                    );
+                }
+            }
+            wait_for_file(&ready).await;
+            let before = manager.diagnostic_cache_entry_metrics(&uri);
+            fs::rename(&source, workspace.join("original.probe")).unwrap();
+            fs::write(&source, "replacement").unwrap();
+            fs::write(&release, "release").unwrap();
+            // A second document is a protocol barrier: its accepted diagnostic
+            // proves the reader has processed the preceding delayed reply.
+            let marker = workspace.join("marker.probe");
+            fs::write(&marker, "marker").unwrap();
+            let baseline = manager.notify_changed(&marker).await;
+            let barrier = manager.diagnostics_block_for_edit(&marker, baseline).await;
+            let after = manager.diagnostic_cache_entry_metrics(&uri);
+            let stale = manager
+                .diagnostics_block_since(&source, Duration::ZERO, None)
+                .await;
+            let baseline = if relative {
+                manager
+                    .notify_changed_relative(Path::new("document.probe"))
+                    .await
+            } else {
+                manager.notify_changed(&source).await
+            };
+            let refreshed = manager.diagnostics_block_for_edit(&source, baseline).await;
+            results.push((
+                relative,
+                delayed_version,
+                before,
+                after,
+                barrier,
+                stale,
+                refreshed,
+            ));
+            manager.shutdown().await;
+            drop(manager);
+        }
+    }
+    fixture.cleanup();
+    for (relative, version, before, after, barrier, stale, refreshed) in results {
+        let case = format!("relative={relative}, delayed_version={version}");
+        assert!(barrier.is_some(), "{case}: protocol barrier failed");
+        assert_eq!(
+            before, after,
+            "{case}: replaced-file publication changed cache"
+        );
+        assert!(
+            stale.is_none(),
+            "{case}: old-text diagnostics reached replacement"
+        );
+        assert!(
+            refreshed
+                .unwrap()
+                .contains(&format!("fixture diagnostic version {}", version + 1)),
+            "{case}: replacement could not synchronize"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
+    let fixture = FixtureBuild::compile("sync-capacity");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let sync_log = workspace.join("sync.log");
+    let mut server = fixture.config("diagnostics", &workspace.join("lease"));
+    server.env.insert(
+        "LSP_FIXTURE_SYNC_LOG".into(),
+        sync_log.display().to_string(),
+    );
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true,
+            servers: HashMap::from([("fixture".into(), server)]),
+        },
+        workspace.clone(),
+    );
+    let cap = crate::extras::lsp::client::MAX_DIAGNOSTIC_FILES;
+    let mut accepted = Vec::new();
+    for index in 0..=cap {
+        let source = workspace.join(format!("document-{index}.probe"));
+        fs::write(&source, "document").unwrap();
+        accepted.push(manager.notify_changed(&source).await.is_some());
+    }
+    let first = workspace.join("document-0.probe");
+    // Replacing a tracked file must release its old identity and keep the slot.
+    fs::rename(&first, workspace.join("original.probe")).unwrap();
+    fs::write(&first, "replacement").unwrap();
+    let baseline = manager.notify_changed(&first).await;
+    let updated = manager.diagnostics_block_for_edit(&first, baseline).await;
+    // The update reply is also a barrier for all preceding protocol frames.
+    let log = fs::read_to_string(&sync_log).unwrap();
+    manager.shutdown().await;
+    drop(manager);
+    fixture.cleanup();
+    assert!(accepted[..cap].iter().all(|accepted| *accepted));
+    assert!(
+        !accepted[cap],
+        "new document accepted above the sync ceiling"
+    );
+    assert!(baseline.is_some());
+    assert!(updated.unwrap().contains("fixture diagnostic version 2"));
+    assert_eq!(log.matches("textDocument/didOpen").count(), cap);
+    assert_eq!(log.matches("textDocument/didChange").count(), 1);
+    assert!(!log.contains(&format!("/document-{cap}.probe")));
+}
+
+#[tokio::test]
 async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     use crate::agent::tools::{
         EditArgs, WriteArgs,
@@ -778,7 +941,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
 }
 
 #[tokio::test]
-async fn lsp_process_oversized_document_does_not_poison_sync_state() {
+async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
     let fixture = FixtureBuild::compile("oversized-document");
     let workspace = fixture.workspace("workspace");
     let source = workspace.join("document.probe");
@@ -798,7 +961,16 @@ async fn lsp_process_oversized_document_does_not_poison_sync_state() {
     client.sync_file(&source).await;
     assert!(!sync_log.exists(), "oversized document was synchronized");
 
+    fs::write(&source, "original document").unwrap();
+    let original = crate::extras::lsp::client::read_stable_document(&source)
+        .await
+        .unwrap();
+    fs::rename(&source, workspace.join("original.probe")).unwrap();
     fs::write(&source, "small document").unwrap();
+    assert!(
+        client.sync_document(&source, original).await.is_none(),
+        "a file replaced after reading must not advance synchronization"
+    );
     client.sync_file(&source).await;
     let first = wait_for_file(&sync_log).await;
     assert!(first.contains("textDocument/didOpen"), "{first}");

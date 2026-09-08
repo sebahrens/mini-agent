@@ -22,12 +22,24 @@ use crate::config::types::{LspNetwork, LspServerConfig};
 use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
-pub(crate) async fn read_stable_text(path: &Path) -> std::io::Result<String> {
-    read_document_text(crate::fs::open_stable_file(path).await?).await
+pub(crate) struct Document {
+    text: String,
+    identity: crate::fs::CheckedMetadata,
+}
+
+pub(crate) async fn read_stable_document(path: &Path) -> std::io::Result<Document> {
+    read_document(crate::fs::open_stable_file(path).await?).await
+}
+
+/// Capture identity from the same authorized handle that supplies the text.
+pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Document> {
+    let identity = crate::fs::checked_tokio_file_metadata(&file).await?;
+    let text = read_document_text(file).await?;
+    Ok(Document { text, identity })
 }
 
 /// Bound reads on the authorized handle itself, including a file that grows
-/// after metadata inspection. Oversized documents never reach sync_text.
+/// after metadata inspection. Oversized documents never reach synchronization.
 pub(crate) async fn read_document_text(
     reader: impl tokio::io::AsyncRead + Unpin,
 ) -> std::io::Result<String> {
@@ -240,12 +252,13 @@ pub type DiagStore = Arc<Mutex<HashMap<String, FileDiags>>>;
 pub(crate) const MAX_DIAGNOSTIC_FILES: usize = MAX_DIAGNOSTIC_FILES_PER_SERVER;
 pub(crate) const MAX_DIAGNOSTIC_CACHE_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct SyncedDocument {
     pub(crate) version: i64,
     /// Versionless publishes are unambiguous only before the first change in
     /// an epoch, or after an exact versioned publish anchors that epoch.
     pub(crate) allow_versionless: bool,
+    pub(crate) identity: crate::fs::CheckedMetadata,
 }
 
 pub struct LspClient {
@@ -647,31 +660,25 @@ impl LspClient {
         notified.await;
     }
 
-    /// Sends caller-verified content to the server: `didOpen` on first touch,
-    /// full-content `didChange` afterwards. Disk access is deliberately owned
-    /// by `LspManager`, which binds a stable file handle after authorization.
+    /// Synchronize a file through the same authorized read path as the manager.
     pub async fn sync_file(&self, path: &Path) {
-        let Ok(text) = read_stable_text(path).await else {
+        let Ok(document) = read_stable_document(path).await else {
             return;
         };
-        let _ = self.sync_text(path, text).await;
+        let _ = self.sync_document(path, document).await;
     }
 
     /// Return the diagnostic publish counter captured for this sync, before
     /// the server can answer it. Callers must carry it into their wait.
-    pub async fn sync_text(&self, path: &Path, text: String) -> Option<u64> {
+    pub async fn sync_document(&self, path: &Path, document: Document) -> Option<u64> {
         self.workspace.validate().ok()?;
         let parent_path = std::fs::canonicalize(path).ok()?;
         let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
         let wire_uri = file_uri(&self.server_root.join(relative))?;
         let uri = file_uri(&parent_path)?;
-        if text.len() as u64 > MAX_DOCUMENT_BYTES {
-            tracing::debug!(
-                "lsp[{}]: document exceeds synchronization byte limit",
-                self.name
-            );
-            return None;
-        }
+        let Document { text, identity } = document;
+        let current = crate::fs::checked_path_metadata(&parent_path).ok()?;
+        crate::fs::ensure_same_file(&parent_path, &identity, &current).ok()?;
         let uri_str = uri.clone();
         enum Sync {
             Open,
@@ -679,10 +686,16 @@ impl LspClient {
         }
         let (action, baseline) = {
             let mut open = self.open.lock().unwrap();
+            // Match the diagnostic cache ceiling and bound retained source
+            // handles. Existing documents can still advance at capacity.
+            if !open.contains_key(&uri_str) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
+                return None;
+            }
             let action = match open.get_mut(&uri_str) {
                 Some(document) => {
                     document.version += 1;
                     document.allow_versionless = false;
+                    document.identity = identity;
                     Sync::Change(document.version)
                 }
                 None => {
@@ -691,6 +704,7 @@ impl LspClient {
                         SyncedDocument {
                             version: 1,
                             allow_versionless: true,
+                            identity,
                         },
                     );
                     Sync::Open
@@ -1059,7 +1073,7 @@ pub(crate) fn store_diagnostics(
     let Ok(canonical) = std::fs::canonicalize(path) else {
         return false;
     };
-    let Ok(identity) = crate::fs::checked_path_metadata(&canonical) else {
+    let Ok(mut identity) = crate::fs::checked_path_metadata(&canonical) else {
         return false;
     };
     if !identity.is_file() || identity.file_type().is_symlink() {
@@ -1077,6 +1091,12 @@ pub(crate) fn store_diagnostics(
         let Some(synced) = synced_versions.get_mut(&uri) else {
             return false;
         };
+        if crate::fs::ensure_same_file(&canonical, &synced.identity, &identity).is_err() {
+            return false;
+        }
+        // Retain the synchronized identity, sharing its handle with the cache.
+        // A later pathname replacement cannot relabel the server's old text.
+        identity = synced.identity.clone();
         match params.get("version") {
             Some(version) if !version.is_null() => {
                 let Some(published_version) = version.as_i64() else {

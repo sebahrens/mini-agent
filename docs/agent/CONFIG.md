@@ -2069,6 +2069,12 @@ Document synchronization reads at most 4 MiB plus one sentinel byte from the
 already-authorized file handle. Oversized or invalid UTF-8 documents are omitted
 without advancing the document version, and workspace-relative reads use the
 asynchronous file reader too.
+Each server tracks at most 128 synchronized documents, retaining the identity
+of the authorized read handle for each. Further new documents are omitted until
+the server restarts; updates to tracked documents continue at the limit. A reply
+is rejected if the source has been replaced since synchronization, including
+when its protocol version matches. Accepted cache entries share the synchronized
+identity, so a replacement racing cache insertion also invalidates the result.
 
 On Unix, the language server uses its inherited workspace descriptor in
 `rootUri` and document URIs. The parent translates those child-local URIs to

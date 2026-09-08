@@ -98,7 +98,7 @@ async fn lsp_sync_rejects_file_swapped_to_external_symlink_after_resolution() {
     std::os::unix::fs::symlink(&secret, &source).unwrap();
 
     assert!(
-        crate::extras::lsp::client::read_stable_text(&approved)
+        crate::extras::lsp::client::read_stable_document(&approved)
             .await
             .is_err()
     );
