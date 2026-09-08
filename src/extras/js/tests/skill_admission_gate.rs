@@ -104,8 +104,12 @@ fn evaluator(with_suite: bool) -> (PathBuf, AppPaths, AdmissionEvaluator, SkillA
     store
         .enqueue_proposal(&artifact, None, 10)
         .expect("proposal");
-    let evaluator =
-        AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-1").expect("evaluator");
+    let evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "worker-1",
+    )
+    .expect("evaluator");
     (root, paths, evaluator, artifact)
 }
 
@@ -437,9 +441,12 @@ fn replacement_with_unchanged_contract_is_admitted_with_lineage() {
     store
         .enqueue_proposal(&replacement, Some(&predecessor.id), 10)
         .expect("replacement proposal");
-    let mut evaluator =
-        AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-replacement")
-            .expect("evaluator");
+    let mut evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "worker-replacement",
+    )
+    .expect("evaluator");
 
     let report = evaluator
         .evaluate_next(20)
@@ -826,7 +833,8 @@ fn skill_admission_gate_embedding_outage_parks_without_rejecting_identity() {
         .expect("proposal");
     let embedder = Embedder::with_backend(Arc::new(UnavailableEmbedding)).expect("embedder");
     let mut evaluator =
-        AdmissionEvaluator::new(store, embedder, "retry-worker").expect("evaluator");
+        AdmissionEvaluator::new(store, std::sync::Arc::new(embedder), "retry-worker")
+            .expect("evaluator");
 
     let mut now = 1_000;
     for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
@@ -1151,8 +1159,12 @@ fn authenticated_approval_authorization_two_connections_consume_exactly_once() {
         let barrier = Arc::clone(&barrier);
         joins.push(std::thread::spawn(move || {
             let store = SkillStore::open_at(&paths).unwrap();
-            let mut evaluator =
-                AdmissionEvaluator::new(store, Embedder::new().unwrap(), worker).unwrap();
+            let mut evaluator = AdmissionEvaluator::new(
+                store,
+                std::sync::Arc::new(Embedder::new().unwrap()),
+                worker,
+            )
+            .unwrap();
             barrier.wait();
             evaluator.consume_canary_for_test(
                 &artifact_id,

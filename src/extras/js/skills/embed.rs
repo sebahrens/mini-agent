@@ -841,6 +841,18 @@ impl std::fmt::Debug for Embedder {
     }
 }
 
+/// Counts backend constructions so a test can prove that one compatible
+/// embedding configuration initializes exactly one expensive backend per
+/// session.
+#[cfg(test)]
+static BACKEND_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn backend_constructions_for_test() -> usize {
+    BACKEND_CONSTRUCTIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl Embedder {
     /// Create an embedder with the default deterministic backend.
     pub fn new() -> Result<Self, EmbeddingError> {
@@ -886,6 +898,8 @@ impl Embedder {
 
     /// Create an embedder with a custom backend.
     pub fn with_backend(backend: Arc<dyn EmbeddingBackend>) -> Result<Self, EmbeddingError> {
+        #[cfg(test)]
+        BACKEND_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let metadata = ModelMetadata {
             model_id: backend.model_id().to_string(),
             model_revision: backend.model_revision().to_string(),

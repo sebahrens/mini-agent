@@ -1081,8 +1081,12 @@ mod failure_attribution {
         store
             .enqueue_proposal(&artifact, None, 10)
             .expect("proposal");
-        let evaluator = AdmissionEvaluator::new(store, Embedder::new().unwrap(), "worker-1")
-            .expect("evaluator");
+        let evaluator = AdmissionEvaluator::new(
+            store,
+            std::sync::Arc::new(Embedder::new().unwrap()),
+            "worker-1",
+        )
+        .expect("evaluator");
         (root, evaluator, artifact)
     }
 

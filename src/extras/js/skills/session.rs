@@ -96,10 +96,19 @@ impl<T> WorkspaceServiceCache<T> {
         }
     }
 
-    async fn resolve<F, Fut>(&self, root: PathBuf, initialize: F) -> Option<Arc<T>>
+    /// Resolve the cached services for `root`, initializing them if needed.
+    ///
+    /// `degraded` reports a bundle that came up with some component missing.
+    /// Such a bundle is returned — its working components stay usable — but it
+    /// is not treated as final: the same bounded backoff that retries an
+    /// outright failure re-initializes it on a later turn, so a transiently
+    /// unavailable learned index, catalog, observation or proposal component
+    /// can recover without recreating the session by hand.
+    async fn resolve<F, Fut, D>(&self, root: PathBuf, initialize: F, degraded: D) -> Option<Arc<T>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<T>, String>>,
+        D: Fn(&T) -> Option<String>,
     {
         let cell = {
             let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
@@ -113,6 +122,31 @@ impl<T> WorkspaceServiceCache<T> {
                 });
             }
             let existing = slot.as_mut().expect("the slot was just populated");
+            // A cached bundle that is still missing a component is retried on
+            // the same schedule as a failure, and the working bundle is
+            // returned meanwhile.
+            let cached_degradation = match existing.services.get() {
+                Some(Some(services)) => degraded(services),
+                _ => None,
+            };
+            if let Some(reason) = cached_degradation {
+                existing.last_failure = Some(reason);
+                let retry_allowed = existing.attempts < SERVICE_INIT_MAX_ATTEMPTS
+                    && existing
+                        .retry_not_before
+                        .is_none_or(|deadline| Instant::now() >= deadline);
+                if retry_allowed {
+                    existing.retry_not_before =
+                        Some(Instant::now() + service_init_retry_delay(existing.attempts));
+                    existing.attempts = existing.attempts.saturating_add(1);
+                    existing.services = Arc::new(OnceCell::new());
+                } else {
+                    return existing
+                        .services
+                        .get()
+                        .and_then(|services| services.clone());
+                }
+            }
             if matches!(existing.services.get(), Some(None)) {
                 // The cached attempt failed. Retry only once the backoff has
                 // elapsed and the attempt budget still has room, so a later
@@ -173,15 +207,34 @@ impl<T> WorkspaceServiceCache<T> {
                 );
                 existing.last_failure = Some(reason);
             }
+        } else if let Some(services) = services.as_ref() {
+            // A healthy bundle clears the recorded disablement; a degraded one
+            // keeps it so the diagnostic surfaces name the missing component.
+            let degradation = degraded(services);
+            let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = slot.as_mut()
+                && existing.root == root
+            {
+                if degradation.is_some() && existing.retry_not_before.is_none() {
+                    // Arm the backoff now so the very next turn reuses this
+                    // usable bundle instead of re-running startup immediately.
+                    existing.retry_not_before =
+                        Some(Instant::now() + service_init_retry_delay(existing.attempts));
+                }
+                existing.last_failure = degradation;
+            }
         }
         services
     }
 
-    /// The current disablement for the tracked workspace, if any.
+    /// The current disablement or degradation for the tracked workspace.
     fn failure(&self) -> Option<SkillServiceFailure> {
         let slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
         let existing = slot.as_ref()?;
-        if matches!(existing.services.get(), Some(Some(_))) {
+        // A healthy bundle clears `last_failure`; a degraded one records the
+        // component that is missing, so an operator sees the disablement
+        // instead of an apparently healthy session with no learned skills.
+        if matches!(existing.services.get(), Some(Some(_))) && existing.last_failure.is_none() {
             return None;
         }
         Some(SkillServiceFailure {
@@ -232,12 +285,16 @@ impl SkillServiceOwner {
     ) -> Option<Arc<SkillSessionServices>> {
         let root = workspace.root().to_path_buf();
         self.cache
-            .resolve(root.clone(), || async {
-                #[cfg(test)]
-                self.initialization_attempts
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                SkillSessionServices::open(root, embedding, enable_proposals).await
-            })
+            .resolve(
+                root.clone(),
+                || async {
+                    #[cfg(test)]
+                    self.initialization_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SkillSessionServices::open(root, embedding, enable_proposals).await
+                },
+                SkillSessionServices::degradation,
+            )
             .await
     }
 
@@ -302,22 +359,30 @@ mod tests {
         let starts = Arc::new([const { AtomicUsize::new(0) }; 4]);
         let first_starts = Arc::clone(&starts);
         let first = cache
-            .resolve("workspace-a".into(), || async move {
-                for count in first_starts.iter() {
-                    count.fetch_add(1, Ordering::SeqCst);
-                }
-                Ok(Arc::new("services"))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    for count in first_starts.iter() {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Arc::new("services"))
+                },
+                |_| None,
+            )
             .await
             .expect("first service initialization");
         let second_starts = Arc::clone(&starts);
         let second = cache
-            .resolve("workspace-a".into(), || async move {
-                for count in second_starts.iter() {
-                    count.fetch_add(1, Ordering::SeqCst);
-                }
-                Ok(Arc::new("unexpected replacement"))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    for count in second_starts.iter() {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Arc::new("unexpected replacement"))
+                },
+                |_| None,
+            )
             .await
             .expect("cached services");
 
@@ -340,10 +405,14 @@ mod tests {
             let calls = Arc::clone(&calls);
             assert!(
                 cache
-                    .resolve("workspace-a".into(), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Err("store is busy".to_string())
-                    })
+                    .resolve(
+                        "workspace-a".into(),
+                        || async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Err("store is busy".to_string())
+                        },
+                        |_| None
+                    )
                     .await
                     .is_none()
             );
@@ -363,10 +432,14 @@ mod tests {
         let failing = Arc::clone(&calls);
         assert!(
             cache
-                .resolve("workspace-a".into(), || async move {
-                    failing.fetch_add(1, Ordering::SeqCst);
-                    Err("database is locked".to_string())
-                })
+                .resolve(
+                    "workspace-a".into(),
+                    || async move {
+                        failing.fetch_add(1, Ordering::SeqCst);
+                        Err("database is locked".to_string())
+                    },
+                    |_| None
+                )
                 .await
                 .is_none()
         );
@@ -385,10 +458,14 @@ mod tests {
         cache.expire_retry_backoff_for_test();
         let recovering = Arc::clone(&calls);
         let services = cache
-            .resolve("workspace-a".into(), || async move {
-                recovering.fetch_add(1, Ordering::SeqCst);
-                Ok(Arc::new(7_u8))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    recovering.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(7_u8))
+                },
+                |_| None,
+            )
             .await
             .expect("a transient failure must not disable skills for the session");
         assert_eq!(*services, 7);
@@ -400,6 +477,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_degraded_bundle_is_retried_instead_of_cached_as_healthy() {
+        let cache = WorkspaceServiceCache::<u8>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // The first bundle comes up with a component missing; it is usable, so
+        // it is returned, but it must not be cached as final.
+        let first = Arc::clone(&calls);
+        let services = cache
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    first.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(1_u8))
+                },
+                |value| (*value == 1).then(|| "learned_index:store busy".to_string()),
+            )
+            .await
+            .expect("a degraded bundle is still usable");
+        assert_eq!(*services, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let failure = cache
+            .failure()
+            .expect("a degraded bundle must be observable");
+        assert!(failure.reason.contains("learned_index"), "{failure}");
+
+        // Before the backoff elapses the same degraded bundle is reused.
+        let throttled = Arc::clone(&calls);
+        let services = cache
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    throttled.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(2_u8))
+                },
+                |value| (*value == 1).then(|| "learned_index:store busy".to_string()),
+            )
+            .await
+            .expect("the degraded bundle stays available");
+        assert_eq!(*services, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the retry must be throttled"
+        );
+
+        // Once the backoff elapses, a later turn re-initializes and recovers.
+        cache.expire_retry_backoff_for_test();
+        let recovering = Arc::clone(&calls);
+        let services = cache
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    recovering.fetch_add(1, Ordering::SeqCst);
+                    Ok(Arc::new(2_u8))
+                },
+                |value| (*value == 1).then(|| "learned_index:store busy".to_string()),
+            )
+            .await
+            .expect("the recovered bundle replaces the degraded one");
+        assert_eq!(*services, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cache.failure().is_none(),
+            "a recovered bundle must no longer report a degradation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanently_degraded_bundle_stops_at_the_attempt_budget() {
+        let cache = WorkspaceServiceCache::<u8>::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..(SERVICE_INIT_MAX_ATTEMPTS + 3) {
+            cache.expire_retry_backoff_for_test();
+            let attempt = Arc::clone(&calls);
+            let services = cache
+                .resolve(
+                    "workspace-a".into(),
+                    || async move {
+                        attempt.fetch_add(1, Ordering::SeqCst);
+                        Ok(Arc::new(1_u8))
+                    },
+                    |_| Some("learned_index:store busy".to_string()),
+                )
+                .await;
+            assert_eq!(services.as_deref(), Some(&1));
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) <= SERVICE_INIT_MAX_ATTEMPTS as usize + 1,
+            "a permanently degraded bundle must not retry without bound: {}",
+            calls.load(Ordering::SeqCst)
+        );
+        let failure = cache.failure().expect("the degradation stays observable");
+        assert!(failure.exhausted);
+    }
+
+    #[tokio::test]
     async fn a_persistent_initialization_failure_stops_at_the_attempt_budget() {
         let cache = WorkspaceServiceCache::<u8>::new();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -408,10 +582,14 @@ mod tests {
             let calls = Arc::clone(&calls);
             assert!(
                 cache
-                    .resolve("workspace-a".into(), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Err("permanently broken".to_string())
-                    })
+                    .resolve(
+                        "workspace-a".into(),
+                        || async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Err("permanently broken".to_string())
+                        },
+                        |_| None
+                    )
                     .await
                     .is_none()
             );
@@ -431,11 +609,19 @@ mod tests {
     async fn workspace_rebind_gets_a_fresh_service_bundle() {
         let cache = WorkspaceServiceCache::new();
         let first = cache
-            .resolve("workspace-a".into(), || async { Ok(Arc::new(1_u8)) })
+            .resolve(
+                "workspace-a".into(),
+                || async { Ok(Arc::new(1_u8)) },
+                |_| None,
+            )
             .await
             .unwrap();
         let second = cache
-            .resolve("workspace-b".into(), || async { Ok(Arc::new(2_u8)) })
+            .resolve(
+                "workspace-b".into(),
+                || async { Ok(Arc::new(2_u8)) },
+                |_| None,
+            )
             .await
             .unwrap();
 
@@ -449,19 +635,27 @@ mod tests {
         let first = WorkspaceServiceCache::new();
         let second = WorkspaceServiceCache::new();
         let first_service = first
-            .resolve("workspace-a".into(), || async {
-                Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
-                    "first",
-                ))))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async {
+                    Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
+                        "first",
+                    ))))
+                },
+                |_| None,
+            )
             .await
             .unwrap();
         let second_service = second
-            .resolve("workspace-a".into(), || async {
-                Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
-                    "second",
-                ))))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async {
+                    Ok(Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(
+                        "second",
+                    ))))
+                },
+                |_| None,
+            )
             .await
             .unwrap();
 
@@ -649,13 +843,17 @@ mod tests {
         let cache = WorkspaceServiceCache::new();
         let probe = Arc::clone(&drops);
         let service = cache
-            .resolve("workspace-a".into(), || async move {
-                Ok(Arc::new([
-                    DropProbe(Arc::clone(&probe)),
-                    DropProbe(Arc::clone(&probe)),
-                    DropProbe(probe),
-                ]))
-            })
+            .resolve(
+                "workspace-a".into(),
+                || async move {
+                    Ok(Arc::new([
+                        DropProbe(Arc::clone(&probe)),
+                        DropProbe(Arc::clone(&probe)),
+                        DropProbe(probe),
+                    ]))
+                },
+                |_| None,
+            )
             .await
             .unwrap();
         drop(service);
@@ -706,6 +904,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Startup opens SQLite (running an FTS schema-write probe with a busy
+    /// timeout) and constructs embedding backends. Doing that inside the async
+    /// future stalls timers, cancellation and the UI, so this pins that a
+    /// contended startup leaves the executor responsive.
+    #[tokio::test]
+    async fn startup_keeps_the_async_executor_responsive_while_sqlite_is_busy() {
+        use std::time::{Duration, Instant};
+
+        use crate::extras::js::skills::store::SkillStore;
+
+        let (root, paths) = app_paths();
+        // Create the store first so the writer below contends with startup
+        // rather than racing its creation.
+        drop(SkillStore::open_at(&paths).expect("store"));
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let lock_paths = paths.clone();
+        let holder = std::thread::spawn(move || {
+            let mut store = SkillStore::open_at(&lock_paths).expect("store");
+            let tx = store
+                .connection_mut()
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("write lock");
+            held_tx.send(()).expect("signal");
+            std::thread::sleep(Duration::from_millis(400));
+            tx.rollback().expect("release");
+        });
+        held_rx.recv().expect("the writer must take the lock");
+
+        let timer = tokio::spawn(async {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+
+        let started = Instant::now();
+        let services = super::SkillSessionServices::open_with_paths(paths, None, false).await;
+        let startup_elapsed = started.elapsed();
+        let timer_elapsed = timer.await.expect("timer task");
+        holder.join().expect("writer thread");
+
+        assert!(
+            timer_elapsed < Duration::from_millis(200),
+            "the 20ms timer ran after {timer_elapsed:?}; startup blocked the executor"
+        );
+        // The startup itself did wait on the contended store, which is what
+        // makes the timer assertion meaningful.
+        assert!(
+            startup_elapsed >= Duration::from_millis(100),
+            "the fixture must actually contend with the writer: {startup_elapsed:?}"
+        );
+        drop(services);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_proposal_enabled_bundle_initializes_one_embedding_backend() {
+        use crate::extras::js::skills::embed::backend_constructions_for_test;
+
+        let (root, paths) = app_paths();
+        let before = backend_constructions_for_test();
+        let started = super::SkillSessionServices::start_components(&paths, None, true)
+            .expect("startup components");
+        let constructed = backend_constructions_for_test() - before;
+        assert_eq!(
+            constructed, 1,
+            "retrieval, telemetry and admission must share one initialized backend"
+        );
+        assert!(
+            started.degraded.is_empty(),
+            "a healthy startup must report no degraded component: {:?}",
+            started.degraded
+        );
+        drop(started);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn production_proposal_services_enqueue_into_the_durable_admission_queue() {
         use crate::extras::js::skills::proposal::{JsCapability, JsExport, JsProposal};
@@ -746,6 +1021,14 @@ struct ObservationServices {
     telemetry: Arc<TelemetryDispatcher>,
 }
 
+/// The startup components built on one blocking worker.
+struct StartedComponents {
+    runtime: SkillRuntime,
+    observation: Option<ObservationServices>,
+    proposals: Option<ProposalServices>,
+    degraded: Vec<String>,
+}
+
 struct ProposalServices {
     service: ProposalEffectService,
     _proposal_worker: ProposalWorker,
@@ -757,6 +1040,10 @@ pub(crate) struct SkillSessionServices {
     runtime: Arc<SkillRuntime>,
     observation: Option<ObservationServices>,
     proposals: Option<ProposalServices>,
+    /// Components that were unavailable when this bundle started. A bundle
+    /// with any of these is usable but not healthy, so the service cache
+    /// re-initializes it under bounded backoff instead of caching it forever.
+    degraded: Vec<String>,
     turn_gate: Arc<tokio::sync::Mutex<()>>,
     search_gate: tokio::sync::Mutex<()>,
     trusted_context: RwLock<Arc<String>>,
@@ -771,10 +1058,16 @@ impl SkillSessionServices {
             runtime: Arc::new(runtime),
             observation: None,
             proposals: None,
+            degraded: Vec::new(),
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
             search_gate: tokio::sync::Mutex::new(()),
             trusted_context: RwLock::new(Arc::new(String::new())),
         })
+    }
+
+    /// Why this bundle is not fully healthy, if it is not.
+    fn degradation(&self) -> Option<String> {
+        (!self.degraded.is_empty()).then(|| self.degraded.join("; "))
     }
 
     async fn open(
@@ -798,14 +1091,20 @@ impl SkillSessionServices {
         embedding: Option<EmbeddingConfig>,
         enable_proposals: bool,
     ) -> Result<Arc<Self>, String> {
-        let runtime_paths = paths.clone();
-        let runtime_embedding = embedding.clone();
-        let runtime = match crate::agent::runner::spawn_blocking_scoped(move || {
-            SkillRuntime::open_with_learned_js(&runtime_paths, runtime_embedding.as_ref(), true)
+        let startup_paths = paths.clone();
+        let startup_embedding = embedding.clone();
+        // Every startup component blocks: SQLite opens run an FTS schema-write
+        // probe with a busy timeout, and the local embedding backend
+        // initializes (and may download) an ONNX model. Running any of that
+        // inside the async future stalls timers, cancellation and the UI, so
+        // the whole phase — not just runtime construction — runs on a tracked
+        // blocking worker.
+        let started = match crate::agent::runner::spawn_blocking_scoped(move || {
+            Self::start_components(&startup_paths, startup_embedding.as_ref(), enable_proposals)
         })
         .await
         {
-            Ok(Ok(runtime)) => Arc::new(runtime),
+            Ok(Ok(started)) => started,
             Ok(Err(error)) => {
                 // The store may simply be busy behind another process's
                 // migration; the caller retries this under its own backoff.
@@ -815,6 +1114,13 @@ impl SkillSessionServices {
                 return Err(format!("skill discovery startup worker failed: {error}"));
             }
         };
+        let StartedComponents {
+            runtime,
+            observation,
+            proposals,
+            degraded,
+        } = started;
+        let runtime = Arc::new(runtime);
         // Hydrate once, synchronously and bounded, so the first prepared turn
         // leases a published generation instead of the empty startup index. Every
         // failure mode degrades to the previous stale-while-revalidate behaviour.
@@ -825,19 +1131,52 @@ impl SkillSessionServices {
             runtime.schedule_learned_rebuild();
         }
 
-        let observation = match Self::start_observation_services(&paths, embedding.as_ref()) {
+        Ok(Arc::new(Self {
+            runtime,
+            observation,
+            proposals,
+            degraded,
+            turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+            search_gate: tokio::sync::Mutex::new(()),
+            trusted_context: RwLock::new(Arc::new(String::new())),
+        }))
+    }
+
+    /// Build every startup component on one blocking worker, sharing a single
+    /// initialized embedding backend.
+    ///
+    /// Retrieval, the telemetry coordinator and admission used to each call
+    /// `Embedder::from_config`, so a proposal-enabled session initialized the
+    /// local model three times and retained two of them. One compatible
+    /// configuration now yields one backend.
+    fn start_components(
+        paths: &crate::paths::AppPaths,
+        embedding: Option<&EmbeddingConfig>,
+        enable_proposals: bool,
+    ) -> Result<StartedComponents, String> {
+        let embedder =
+            Arc::new(Embedder::from_config(embedding).map_err(|error| error.to_string())?);
+        let mut degraded = Vec::new();
+        let runtime =
+            SkillRuntime::open_with_shared_embedder(paths, Arc::clone(&embedder), true, true)
+                .map_err(|error| error.to_string())?;
+        degraded.extend(runtime.degraded_components().iter().cloned());
+
+        let observation = match Self::start_observation_services(paths, Arc::clone(&embedder)) {
             Ok(services) => Some(services),
             Err(error) => {
                 tracing::warn!(error = %error, "learned-skill telemetry is disabled");
+                degraded.push(format!("observation:{error}"));
                 None
             }
         };
 
         let proposals = if enable_proposals {
-            match Self::start_proposal_services(&paths, embedding.as_ref()) {
+            match Self::start_proposal_services_with_embedder(paths, Arc::clone(&embedder)) {
                 Ok(services) => Some(services),
                 Err(error) => {
                     tracing::warn!(error = %error, "learned-skill proposals are disabled");
+                    degraded.push(format!("proposals:{error}"));
                     None
                 }
             }
@@ -845,19 +1184,27 @@ impl SkillSessionServices {
             None
         };
 
-        Ok(Arc::new(Self {
+        Ok(StartedComponents {
             runtime,
             observation,
             proposals,
-            turn_gate: Arc::new(tokio::sync::Mutex::new(())),
-            search_gate: tokio::sync::Mutex::new(()),
-            trusted_context: RwLock::new(Arc::new(String::new())),
-        }))
+            degraded,
+        })
     }
 
+    #[cfg(test)]
     fn start_proposal_services(
         paths: &crate::paths::AppPaths,
         embedding: Option<&EmbeddingConfig>,
+    ) -> Result<ProposalServices, String> {
+        let embedder =
+            Arc::new(Embedder::from_config(embedding).map_err(|error| error.to_string())?);
+        Self::start_proposal_services_with_embedder(paths, embedder)
+    }
+
+    fn start_proposal_services_with_embedder(
+        paths: &crate::paths::AppPaths,
+        embedder: Arc<Embedder>,
     ) -> Result<ProposalServices, String> {
         let proposal_worker = ProposalQueue::start_store_worker(
             SkillStore::open_at(paths).map_err(|error| error.to_string())?,
@@ -867,7 +1214,7 @@ impl SkillSessionServices {
         .map_err(|error| error.to_string())?;
         let evaluator = AdmissionEvaluator::new(
             SkillStore::open_at(paths).map_err(|error| error.to_string())?,
-            Embedder::from_config(embedding).map_err(|error| error.to_string())?,
+            embedder,
             format!("session-{}", uuid::Uuid::new_v4()),
         )
         .map_err(|error| error.to_string())?;
@@ -886,12 +1233,10 @@ impl SkillSessionServices {
 
     fn start_observation_services(
         paths: &crate::paths::AppPaths,
-        embedding: Option<&EmbeddingConfig>,
+        embedder: Arc<Embedder>,
     ) -> Result<ObservationServices, String> {
-        let telemetry_embedder =
-            Arc::new(Embedder::from_config(embedding).map_err(|error| error.to_string())?);
         let (coordinator, _) =
-            shared_coordinator(paths, telemetry_embedder).map_err(|error| error.to_string())?;
+            shared_coordinator(paths, embedder).map_err(|error| error.to_string())?;
         let telemetry = Arc::new(
             TelemetryDispatcher::spawn_session_scoped_with_coordinator(paths, coordinator)
                 .map_err(|error| error.to_string())?,
@@ -935,6 +1280,9 @@ impl SkillSessionServices {
             runtime: Arc::new(self.runtime.fork_for_read_only_child()),
             observation: None,
             proposals: None,
+            // A read-only child deliberately runs without observation or
+            // proposals; that is not a degradation of the parent bundle.
+            degraded: Vec::new(),
             turn_gate: Arc::new(tokio::sync::Mutex::new(())),
             search_gate: tokio::sync::Mutex::new(()),
             trusted_context: RwLock::new(Arc::new(String::new())),

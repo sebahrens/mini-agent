@@ -36,7 +36,9 @@ const WORKER_IDLE_POLL: Duration = Duration::from_millis(100);
 
 pub(crate) struct AdmissionEvaluator {
     store: SkillStore,
-    embedder: Embedder,
+    /// Shared with retrieval and the telemetry coordinator: one compatible
+    /// embedding configuration initializes one backend per session.
+    embedder: Arc<Embedder>,
     worker_id: String,
     #[cfg(test)]
     verification_failure: Option<VerificationError>,
@@ -51,7 +53,7 @@ pub(crate) struct AdmissionEvaluator {
 impl AdmissionEvaluator {
     pub(crate) fn new(
         store: SkillStore,
-        embedder: Embedder,
+        embedder: Arc<Embedder>,
         worker_id: impl Into<String>,
     ) -> Result<Self, AdmissionError> {
         let worker_id = worker_id.into();

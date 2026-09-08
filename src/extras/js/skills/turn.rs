@@ -255,6 +255,8 @@ pub struct SkillRuntime {
     learned: Option<Arc<IndexCoordinator>>,
     agent_skills: Option<Arc<AgentSkillState>>,
     startup_diagnostics: Vec<String>,
+    /// Components that could not be opened; empty when the runtime is healthy.
+    degraded: Vec<String>,
     turn_context: Arc<SkillTurnContext>,
     learned_policy: RetrievalPolicy,
     agent_policy: AgentSkillSearchPolicy,
@@ -283,6 +285,21 @@ impl SkillRuntime {
         learned_js_enabled: bool,
     ) -> Result<Self, super::embed::EmbeddingError> {
         let embedder = Arc::new(Embedder::from_config(embedding_config)?);
+        Self::open_with_shared_embedder(paths, embedder, learned_js_enabled, false)
+    }
+
+    /// Open a runtime on an already initialized embedding backend.
+    ///
+    /// `track_degradation` records components that came up unavailable so the
+    /// session cache can retry them, instead of caching a runtime with an empty
+    /// learned index as permanently healthy.
+    pub(crate) fn open_with_shared_embedder(
+        paths: &AppPaths,
+        embedder: Arc<Embedder>,
+        learned_js_enabled: bool,
+        track_degradation: bool,
+    ) -> Result<Self, super::embed::EmbeddingError> {
+        let mut degraded = Vec::new();
         let mut diagnostics = Vec::new();
         let semantic_retrieval_enabled = embedder.supports_semantic_retrieval();
         if !semantic_retrieval_enabled {
@@ -293,7 +310,14 @@ impl SkillRuntime {
             match shared_coordinator(paths, Arc::clone(&embedder)) {
                 Ok((coordinator, _created)) => Some(coordinator),
                 Err(error) => {
+                    // The store may be busy behind another writer, and its FTS
+                    // probe reports that as a missing feature. Record it so the
+                    // session cache retries rather than treating a runtime with
+                    // no learned index as healthy for the whole session.
                     diagnostics.push(format!("learned_js_store_unavailable:{error}"));
+                    if track_degradation {
+                        degraded.push(format!("learned_index:{error}"));
+                    }
                     None
                 }
             }
@@ -305,6 +329,9 @@ impl SkillRuntime {
             Ok(state) => Some(Arc::new(state)),
             Err(error) => {
                 diagnostics.push(format!("agent_skill_catalog_unavailable:{error}"));
+                if track_degradation {
+                    degraded.push(format!("agent_skill_catalog:{error}"));
+                }
                 None
             }
         };
@@ -321,6 +348,7 @@ impl SkillRuntime {
             learned,
             agent_skills,
             startup_diagnostics: diagnostics,
+            degraded,
             turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
             learned_policy,
             agent_policy: AgentSkillSearchPolicy::default(),
@@ -328,6 +356,12 @@ impl SkillRuntime {
             #[cfg(test)]
             background_rebuild_disabled: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Components that were unavailable at startup, for the session cache's
+    /// bounded retry.
+    pub(crate) fn degraded_components(&self) -> &[String] {
+        &self.degraded
     }
 
     /// Whether this runtime may schedule the stale-while-revalidate rebuild.
@@ -408,6 +442,7 @@ impl SkillRuntime {
             learned: self.learned.clone(),
             agent_skills: self.agent_skills.clone(),
             startup_diagnostics: self.startup_diagnostics.clone(),
+            degraded: self.degraded.clone(),
             turn_context: Arc::new(SkillTurnContext::new(TurnSkillBundle::empty(revision))),
             learned_policy: self.learned_policy.clone(),
             agent_policy: self.agent_policy.clone(),

@@ -735,7 +735,7 @@ fn reevaluate_skill(
     let admin = AdminIdentity::authenticated("local-owner")?;
     let mut evaluator = AdmissionEvaluator::new(
         SkillStore::open_at(paths)?,
-        Embedder::from_config(embedding)?,
+        std::sync::Arc::new(Embedder::from_config(embedding)?),
         format!("local-reevaluate-{}", uuid::Uuid::new_v4()),
     )?;
     evaluator
@@ -1138,7 +1138,7 @@ fn import_package_within(
 
     let mut evaluator = AdmissionEvaluator::new(
         SkillStore::open_at(paths)?,
-        Embedder::from_config(embedding)?,
+        std::sync::Arc::new(Embedder::from_config(embedding)?),
         format!("local-import-{}", uuid::Uuid::new_v4()),
     )?;
     let existing = SkillStore::open_at(paths)?
@@ -1332,7 +1332,7 @@ fn review_proposal(
     let now = current_timestamp().context("failed to resolve review timestamp")?;
     let mut evaluator = AdmissionEvaluator::new(
         SkillStore::open_at(paths)?,
-        Embedder::from_config(embedding)?,
+        std::sync::Arc::new(Embedder::from_config(embedding)?),
         format!("local-review-{}", uuid::Uuid::new_v4()),
     )?;
     let outcome = evaluator

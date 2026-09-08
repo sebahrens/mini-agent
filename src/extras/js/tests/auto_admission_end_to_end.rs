@@ -105,9 +105,12 @@ impl HumanReviewer for Approver {
 async fn turn_scope_joins_real_admission_and_telemetry_workers() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("admission store");
-    let evaluator =
-        AdmissionEvaluator::new(store, Embedder::new().expect("embedder"), "scope-worker")
-            .expect("evaluator");
+    let evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().expect("embedder")),
+        "scope-worker",
+    )
+    .expect("evaluator");
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     let (admission, telemetry) = work_scope
         .run(async {
@@ -168,7 +171,12 @@ async fn auto_admission_end_to_end_proposal_to_non_retrievable_canary() {
     drop(tool);
 
     let store = SkillStore::open_at(&paths).expect("evaluator store");
-    let evaluator = AdmissionEvaluator::new(store, Embedder::new().unwrap(), "e2e-worker").unwrap();
+    let evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "e2e-worker",
+    )
+    .unwrap();
     let admission_worker = AdmissionWorker::start(evaluator).expect("admission worker");
     let inspector = SkillStore::open_at(&paths).expect("inspector");
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -192,8 +200,12 @@ async fn auto_admission_end_to_end_proposal_to_non_retrievable_canary() {
     drop(admission_worker);
 
     let store = SkillStore::open_at(&paths).expect("review store");
-    let mut evaluator =
-        AdmissionEvaluator::new(store, Embedder::new().unwrap(), "review-worker").unwrap();
+    let mut evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "review-worker",
+    )
+    .unwrap();
     let outcome = evaluator
         .review_and_admit(&skill_id, &Approver, 30)
         .expect("human approval");
@@ -280,8 +292,12 @@ async fn auto_admission_failure_matrix_rejects_bypasses_and_reproposal_is_termin
     drop(tool);
 
     let store = SkillStore::open_at(&paths).expect("evaluator store");
-    let mut evaluator =
-        AdmissionEvaluator::new(store, Embedder::new().unwrap(), "failure-worker").unwrap();
+    let mut evaluator = AdmissionEvaluator::new(
+        store,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+        "failure-worker",
+    )
+    .unwrap();
     let rejected = evaluator.evaluate_next(20).unwrap().unwrap();
     assert_eq!(rejected.outcome, "rejected");
     assert_eq!(
