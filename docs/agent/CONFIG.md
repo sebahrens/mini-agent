@@ -2099,7 +2099,12 @@ recent full-document sync, preventing delayed pre-edit results from satisfying
 a post-edit diagnostics wait. The wait uses a publish counter captured while
 advancing the synchronized document version, before sending `didOpen` or
 `didChange`, so a fast reply is recognized even if it arrives before the waiter
-starts. Versioned diagnostic support is advertised.
+starts. The writer lock covers content revalidation, version advancement and
+frame publication, so concurrent callers cannot send `didChange` ahead of
+`didOpen` or consume a version for bytes that changed while queued. One transport
+deadline covers the queue and publication; timeout or cancellation stops the
+server rather than retaining partially synchronized state. Versioned diagnostic
+support is advertised.
 Versionless initial publishes and clears (including an explicit JSON
 `version: null`) remain accepted while the sync epoch is unchanged; after an
 edit they fail closed until an exact versioned publish anchors the new epoch.

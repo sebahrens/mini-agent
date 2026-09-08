@@ -297,6 +297,13 @@ impl SyncedDocument {
     }
 }
 
+#[cfg(test)]
+struct SyncProbe {
+    queued: oneshot::Sender<()>,
+    advanced: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
 pub struct LspClient {
     name: String,
     stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
@@ -310,6 +317,8 @@ pub struct LspClient {
     server_root: PathBuf,
     /// Parent-canonical uri → last synced document version.
     open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
+    #[cfg(test)]
+    sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
 }
 
 impl LspClient {
@@ -581,6 +590,8 @@ impl LspClient {
             workspace,
             server_root,
             open,
+            #[cfg(test)]
+            sync_probes: Mutex::new(std::collections::VecDeque::new()),
         });
 
         let init_params = json!({
@@ -707,102 +718,151 @@ impl LspClient {
         let _ = self.sync_document(path, document).await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_sync_for_test(
+        &self,
+    ) -> (
+        oneshot::Receiver<()>,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+    ) {
+        let (queued_tx, queued_rx) = oneshot::channel();
+        let (advanced_tx, advanced_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.sync_probes.lock().unwrap().push_back(SyncProbe {
+            queued: queued_tx,
+            advanced: advanced_tx,
+            release: release_rx,
+        });
+        (queued_rx, advanced_rx, release_tx)
+    }
+
     /// Return the diagnostic publish counter captured for this sync, before
     /// the server can answer it. Callers must carry it into their wait.
     pub async fn sync_document(&self, path: &Path, document: Document) -> Option<u64> {
+        #[cfg(test)]
+        let probe = self.sync_probes.lock().unwrap().pop_front();
+        #[cfg(test)]
+        let probe = probe.map(|probe| {
+            let _ = probe.queued.send(());
+            (probe.advanced, probe.release)
+        });
+        let mut write = TransportWriteGuard {
+            shutdown_tx: self.shutdown_tx.clone(),
+            complete: false,
+        };
+        // One deadline includes the queue, validation and frame publication.
+        // The stdin lock keeps document versions in the order sent on the wire.
+        let outcome = tokio::time::timeout(notify_timeout(), async {
+            let mut stdin = self.stdin.lock().await;
+            if self.is_stopped() {
+                return Ok(None);
+            }
+            let Some((uri, wire_uri)) = self.document_uris(path, &document).await else {
+                return Ok(None);
+            };
+            let Document {
+                text,
+                identity,
+                content,
+            } = document;
+            enum Sync {
+                Open,
+                Change(i64),
+            }
+            let (action, baseline) = {
+                let mut open = self.open.lock().unwrap();
+                // Match the diagnostic cache ceiling and bound retained source
+                // handles. Existing documents can still advance at capacity.
+                if !open.contains_key(&uri) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
+                    return Ok(None);
+                }
+                let action = match open.get_mut(&uri) {
+                    Some(document) => {
+                        document.version += 1;
+                        document.allow_versionless = false;
+                        document.identity = identity;
+                        document.content = content;
+                        Sync::Change(document.version)
+                    }
+                    None => {
+                        open.insert(
+                            uri.clone(),
+                            SyncedDocument {
+                                version: 1,
+                                allow_versionless: true,
+                                identity,
+                                content,
+                            },
+                        );
+                        Sync::Open
+                    }
+                };
+                // Match the reader's open-then-diags lock order; a publication
+                // from the previous epoch cannot satisfy this sync's wait.
+                let baseline = self
+                    .diags
+                    .lock()
+                    .unwrap()
+                    .get(&uri)
+                    .map_or(0, |diagnostics| diagnostics.version);
+                (action, baseline)
+            }; // State locks are released before writing; stdin stays locked.
+            #[cfg(test)]
+            if let Some((advanced, release)) = probe {
+                let _ = advanced.send(());
+                let _ = release.await;
+            }
+            let (method, params) = match action {
+                Sync::Open => (
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": wire_uri, "languageId": language_id(path),
+                            "version": 1, "text": text
+                        }
+                    }),
+                ),
+                Sync::Change(version) => (
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": wire_uri, "version": version },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                ),
+            };
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "method": method, "params": params,
+            }))
+            .map_err(std::io::Error::other)?;
+            rpc::write_frame(&mut *stdin, &body).await?;
+            Ok::<_, std::io::Error>(Some(baseline))
+        })
+        .await;
+        write.complete = matches!(outcome, Ok(Ok(_)));
+        if !write.complete {
+            // Cancellation also arms this cleanup through the write guard.
+            // Never retain a client whose advanced version lacks a full frame.
+            self.shutdown().await;
+        }
+        outcome.ok().and_then(Result::ok).flatten()
+    }
+
+    /// Validate after acquiring the writer: queued callers may have read bytes
+    /// that changed while another notification was being published.
+    async fn document_uris(&self, path: &Path, document: &Document) -> Option<(String, String)> {
         self.workspace.validate().ok()?;
         let parent_path = std::fs::canonicalize(path).ok()?;
         let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
         let wire_uri = file_uri(&self.server_root.join(relative))?;
         let uri = file_uri(&parent_path)?;
-        let Document {
-            text,
-            identity,
-            content,
-        } = document;
-        if !content_matches(&identity, Some(content)).await {
+        if !content_matches(&document.identity, Some(document.content)).await {
             return None;
         }
         self.workspace.validate().ok()?;
         let current = crate::fs::checked_path_metadata(&parent_path).ok()?;
-        crate::fs::ensure_same_file(&parent_path, &identity, &current).ok()?;
-        let uri_str = uri.clone();
-        enum Sync {
-            Open,
-            Change(i64),
-        }
-        let (action, baseline) = {
-            let mut open = self.open.lock().unwrap();
-            // Match the diagnostic cache ceiling and bound retained source
-            // handles. Existing documents can still advance at capacity.
-            if !open.contains_key(&uri_str) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
-                return None;
-            }
-            let action = match open.get_mut(&uri_str) {
-                Some(document) => {
-                    document.version += 1;
-                    document.allow_versionless = false;
-                    document.identity = identity;
-                    document.content = content;
-                    Sync::Change(document.version)
-                }
-                None => {
-                    open.insert(
-                        uri_str.clone(),
-                        SyncedDocument {
-                            version: 1,
-                            allow_versionless: true,
-                            identity,
-                            content,
-                        },
-                    );
-                    Sync::Open
-                }
-            };
-            // Match the reader's lock order (document versions, then diagnostics).
-            // Holding the version lock excludes a late publish for the previous
-            // document from becoming the completion of this synchronization.
-            let baseline = self
-                .diags
-                .lock()
-                .unwrap()
-                .get(&uri_str)
-                .map_or(0, |diagnostics| diagnostics.version);
-            (action, baseline)
-        }; // locks released before any await
-        let sent = match action {
-            Sync::Open => {
-                self.notify(
-                    "textDocument/didOpen",
-                    json!({
-                        "textDocument": {
-                            "uri": wire_uri,
-                            "languageId": language_id(path),
-                            "version": 1,
-                            "text": text
-                        }
-                    }),
-                )
-                .await
-            }
-            Sync::Change(v) => {
-                self.notify(
-                    "textDocument/didChange",
-                    json!({
-                        "textDocument": { "uri": wire_uri, "version": v },
-                        "contentChanges": [{ "text": text }]
-                    }),
-                )
-                .await
-            }
-        };
-        if sent {
-            return Some(baseline);
-        }
-        // A failed protocol write makes the cached client unusable. Complete
-        // process-tree cleanup so the next matching edit can start fresh.
-        self.shutdown().await;
-        None
+        crate::fs::ensure_same_file(&parent_path, &document.identity, &current).ok()?;
+        Some((uri, wire_uri))
     }
 }
 

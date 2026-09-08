@@ -992,6 +992,154 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn lsp_process_concurrent_sync_preserves_document_version_order() {
+    let fixture = FixtureBuild::compile("sync-order");
+    let mut results = Vec::new();
+    for rewrite_queued in [false, true] {
+        let workspace = fixture.workspace(&format!("workspace-{rewrite_queued}"));
+        let source = workspace.join("document.probe");
+        fs::write(&source, "document").unwrap();
+        let sync_log = workspace.join("sync.log");
+        let mut cfg = fixture.config("normal", &fixture.path("lease"));
+        cfg.env.insert(
+            "LSP_FIXTURE_SYNC_LOG".into(),
+            sync_log.display().to_string(),
+        );
+        let client = spawn_client(&cfg, &workspace, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (_, first_advanced, release_first) = client.pause_next_sync_for_test();
+        let first_client = client.clone();
+        let first_path = source.clone();
+        let first = tokio::spawn(async move {
+            let document = crate::extras::lsp::client::read_stable_document(&first_path)
+                .await
+                .unwrap();
+            first_client.sync_document(&first_path, document).await
+        });
+        first_advanced.await.unwrap();
+        let (second_queued, mut second_advanced, release_second) =
+            client.pause_next_sync_for_test();
+        let second_client = client.clone();
+        let second_path = source.clone();
+        let second = tokio::spawn(async move {
+            let document = crate::extras::lsp::client::read_stable_document(&second_path)
+                .await
+                .unwrap();
+            second_client.sync_document(&second_path, document).await
+        });
+        second_queued.await.unwrap();
+        // On this current-thread runtime the second task must reach its next
+        // suspension before this receiver resumes: the writer lock, or its probe
+        // if it incorrectly advanced state while the first frame was paused.
+        let advanced_early = second_advanced.try_recv().is_ok();
+        if rewrite_queued {
+            rewrite_preserving_length_and_mtime(&source);
+        }
+        let (first_result, second_result) = if advanced_early {
+            release_second.send(()).unwrap();
+            let second_result = second.await.unwrap();
+            release_first.send(()).unwrap();
+            (first.await.unwrap(), second_result)
+        } else {
+            release_first.send(()).unwrap();
+            let first_result = first.await.unwrap();
+            if !rewrite_queued {
+                second_advanced.await.unwrap();
+            }
+            let _ = release_second.send(());
+            (first_result, second.await.unwrap())
+        };
+        let recovery = if rewrite_queued {
+            let current = crate::extras::lsp::client::read_stable_document(&source)
+                .await
+                .unwrap();
+            client.sync_document(&source, current).await
+        } else {
+            None
+        };
+        wait_for_file_contains(&sync_log, "textDocument/didOpen").await;
+        let log = wait_for_file_contains(&sync_log, "textDocument/didChange").await;
+        client.shutdown().await;
+        results.push((
+            rewrite_queued,
+            advanced_early,
+            first_result,
+            second_result,
+            recovery,
+            log,
+        ));
+    }
+    fixture.cleanup();
+    for (rewrite_queued, advanced_early, first_result, second_result, recovery, log) in results {
+        assert!(first_result.is_some());
+        assert_eq!(
+            second_result.is_none(),
+            rewrite_queued,
+            "queued content validation: {log}"
+        );
+        if rewrite_queued {
+            assert!(recovery.is_some(), "skipped sync poisoned the client");
+        }
+        let messages: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2, "{log}");
+        assert!(
+            !advanced_early,
+            "second sync advanced before the first frame was sent: {log}"
+        );
+        for (message, method, version) in [
+            (&messages[0], "textDocument/didOpen", 1),
+            (&messages[1], "textDocument/didChange", 2),
+        ] {
+            assert_eq!(message["method"], method, "{log}");
+            assert_eq!(
+                message["params"]["textDocument"]["version"], version,
+                "{log}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn lsp_process_cancelled_document_sync_reaps_server_before_reuse() {
+    let fixture = FixtureBuild::compile("cancelled-sync");
+    let workspace = fixture.workspace("workspace");
+    let source = workspace.join("document.probe");
+    fs::write(&source, "document").unwrap();
+    let lease = fixture.path("lease");
+    let client = spawn_client(
+        &fixture.config("normal", &lease),
+        &workspace,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let pid = wait_for_pid(&lease).await;
+    let (_, advanced, _release) = client.pause_next_sync_for_test();
+    let caller = client.clone();
+    let path = source.clone();
+    let sync = tokio::spawn(async move { caller.sync_file(&path).await });
+    advanced.await.unwrap();
+    sync.abort();
+    assert!(sync.await.unwrap_err().is_cancelled());
+    // Do not explicitly shut down until cancellation itself has reaped it.
+    assert_process_reaped(pid).await;
+    client.shutdown().await;
+    let document = crate::extras::lsp::client::read_stable_document(&source)
+        .await
+        .unwrap();
+    let reused = client.sync_document(&source, document).await;
+    fixture.cleanup();
+    assert!(
+        reused.is_none(),
+        "partially synchronized client remained reusable"
+    );
+}
+
 #[tokio::test]
 async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
     let fixture = FixtureBuild::compile("oversized-document");
