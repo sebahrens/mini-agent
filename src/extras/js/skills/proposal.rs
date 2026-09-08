@@ -856,6 +856,8 @@ impl ProposalEffectService {
     /// once the bounded queue command is handed off, cancellation returns the
     /// truthful unknown-outcome class while the blocking waiter drains on the
     /// blocking pool.
+    // Test-only: the host prepares the effect first and calls execute_prepared_cancellable.
+    #[cfg(test)]
     pub(crate) async fn execute_cancellable(
         &self,
         proposal: JsProposal,

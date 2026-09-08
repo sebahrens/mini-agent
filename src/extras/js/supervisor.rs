@@ -507,6 +507,8 @@ impl JsWorkerSupervisor {
     /// Execute using the parent-created identity that also binds the invocation broker.
     ///
     /// The identity remains method-local and is never retained once the invocation finishes.
+    // Test-only: production always supplies a deadline via execute_bound_with_deadline.
+    #[cfg(test)]
     pub(crate) async fn execute_bound(
         &self,
         invocation: InvocationId,

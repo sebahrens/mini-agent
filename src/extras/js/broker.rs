@@ -1411,6 +1411,8 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         }
     }
 
+    // Test-only: production retires grants through erase_authority / consume paths.
+    #[cfg(test)]
     pub(crate) fn revoke_grant(&mut self, grant_id: &GrantId) -> bool {
         if self.grants.remove(grant_id).is_some() {
             self.retired_grants.insert(grant_id.clone());
@@ -1432,6 +1434,8 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         self.erase_authority(InvocationState::Recycled);
     }
 
+    // Test-only assertion helper for grant-table teardown.
+    #[cfg(test)]
     pub(crate) fn tracked_grant_count(&self) -> usize {
         self.grants.len() + self.retired_grants.len()
     }
@@ -1657,6 +1661,9 @@ fn path_scope_contains(prefix: &str, target: &str) -> bool {
 
 /// Resolve a program once to the executable identity carried through scope,
 /// permission, durable audit, and execution.
+// Test-only: production resolves through resolve_program_identity_controlled so the
+// preparation checkpoints stay observable and cancellable.
+#[cfg(test)]
 pub(crate) fn resolve_program_identity(
     program: &str,
 ) -> Result<SpawnExecutableIdentity, EffectServiceError> {

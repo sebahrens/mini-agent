@@ -415,6 +415,8 @@ impl SkillStore {
     ///
     /// Recomputes and validates the identity before insertion. Caller identity
     /// is never trusted.
+    // Test-only: production admission inserts through the admission gate, never directly.
+    #[cfg(test)]
     pub fn insert_verified(&mut self, artifact: &SkillArtifact) -> Result<(), StoreError> {
         artifact.verify_identity()?;
         let verification = super::verify::verify_skill(artifact)?;
@@ -604,17 +606,6 @@ impl SkillStore {
             }
         }
         Ok(artifacts)
-    }
-
-    pub fn active_count(&self) -> Result<usize, StoreError> {
-        let count = self.db.query_row(
-            "SELECT COUNT(*) FROM skill_revisions
-              WHERE status = 'active' AND identity_version = 2",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        usize::try_from(count)
-            .map_err(|_| StoreError::Constraint("active skill count is invalid".to_string()))
     }
 
     /// Check the duplicate-admission policy without loading executable source.

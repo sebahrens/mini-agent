@@ -239,10 +239,25 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Run Clippy (${{ matrix.features }})
-        # Feature-isolated rows intentionally compile shared Phase 6 types that
-        # are consumed only by another supported row. Keep Clippy strict for
-        # real diagnostics without treating that cross-row dead code as an
-        # error in every individual configuration.
+        # `-A dead-code` hides two distinct things and cannot be dropped yet.
+        #
+        # 1. Cross-row dead code: feature-isolated rows intentionally compile
+        #    shared Phase 6 types that are consumed only by another supported
+        #    row, so an item that is live in the default build is dead in
+        #    `--no-default-features`.
+        # 2. Residual whole-crate dead code that no supported row consumes:
+        #    `context::load_architecture`, `fs::resolve_workspace_path`,
+        #    `extras::hooks::subprocess::run_shell_condition`,
+        #    `context::prompts::zerostack_dir`, and
+        #    `extras::js::skills::scheduler::run_one` currently have no caller
+        #    at all. Each needs its own wire-up-or-delete decision.
+        #
+        # The learned-skill (`extras/js/skills`) surface itself is now gated:
+        # test-only items carry `#[cfg(test)]`, and the two places that still
+        # need an escape hatch carry a narrow `allow(dead_code)` with a comment
+        # naming exactly what it hides. Drop this flag once (2) is resolved and
+        # a full matrix run is clean; keep it until then so the rows still fail
+        # on real diagnostics.
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings -A dead-code
 
   test:

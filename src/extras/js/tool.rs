@@ -756,8 +756,10 @@ impl JsTool {
         self
     }
 
-    #[cfg(feature = "skills")]
-    #[cfg_attr(test, allow(dead_code))]
+    // Test-only: production wires a session-shared dispatcher through
+    // `with_shared_telemetry`. The previous `cfg_attr(test, allow(dead_code))` was
+    // inverted -- it silenced the lint in exactly the build where the fn is live.
+    #[cfg(all(feature = "skills", test))]
     pub(crate) fn with_telemetry(
         mut self,
         telemetry: crate::extras::js::skills::telemetry::TelemetryDispatcher,

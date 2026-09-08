@@ -1,9 +1,8 @@
-//! Shared privacy primitives for opaque correlation and bounded redaction.
+//! Shared privacy primitives for bounded redaction of learned-skill telemetry.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
-use sha2::{Digest, Sha256};
 
 /// Whole PEM private-key blocks, including the multi-line body.
 static PRIVATE_KEY_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
@@ -84,22 +83,6 @@ impl Redactor {
             .iter()
             .any(|secret| value.contains(secret))
     }
-}
-
-pub fn keyed_fingerprint(key: &[u8], version: &str, value: &str) -> Option<String> {
-    if key.is_empty() || version.is_empty() {
-        return None;
-    }
-    let mut digest = Sha256::new();
-    digest.update(b"mini-agent/private-fingerprint/v1");
-    for part in [key, version.as_bytes(), value.as_bytes()] {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    Some(format!(
-        "{version}:{}",
-        crate::hex::encode_lower(digest.finalize())
-    ))
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {

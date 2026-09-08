@@ -267,12 +267,14 @@ impl SkillStore {
 }
 ```
 
-In Phase 3, manual insertion verifies the artifact first and stores it as active. `get`, index
-loading, and later promotion paths recompute canonical identity and reject or quarantine invalid
-rows before returning source. In Phase 3, `list_retrievable` returns only `active` rows. The schema
-reserves `canary` for Phase 4, but canaries remain non-retrievable until the Phase 5 router can
-attach them as alternatives to an active lineage. They are never independent search competitors.
-Pending, quarantined, superseded, retired, and rejected rows never enter an index snapshot.
+`insert_verified` is the direct manual-insertion entry and is now compiled under `#[cfg(test)]`:
+every production write goes through the admission gate, which performs the same verification before
+it commits. `get`, index loading, and later promotion paths recompute canonical identity and reject
+or quarantine invalid rows before returning source. In Phase 3, `list_retrievable` returns only
+`active` rows. The schema reserves `canary` for Phase 4, but canaries remain non-retrievable until
+the Phase 5 router can attach them as alternatives to an active lineage. They are never independent
+search competitors. Pending, quarantined, superseded, retired, and rejected rows never enter an
+index snapshot.
 
 `retire` is the normal reversible removal path. `purge` is an explicit privacy operation and must
 delete dependent embeddings/index data transactionally. Not-found, collision, stale-version,

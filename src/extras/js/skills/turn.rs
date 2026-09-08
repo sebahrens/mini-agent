@@ -182,6 +182,7 @@ pub struct SkillRuntime {
 }
 
 impl SkillRuntime {
+    #[cfg(test)]
     pub(crate) fn learned_dense_candidate_limit_for_test(&self) -> usize {
         self.learned_policy.dense_candidate_limit
     }

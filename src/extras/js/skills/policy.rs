@@ -211,6 +211,9 @@ pub enum PolicyError {
     Json(#[from] serde_json::Error),
 }
 
+// Test-only no-task-outcome convenience wrapper. Production evaluates promotion through
+// [`evaluate_promotion_with_task_outcomes`] (lifecycle.rs), which must never drop task evidence.
+#[cfg(test)]
 pub fn evaluate_promotion(
     policy: &PromotionPolicy,
     context: &PromotionContext,

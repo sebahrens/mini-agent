@@ -88,6 +88,8 @@ pub struct FeedbackCommand {
     pub reason_text: Option<String>,
 }
 
+// Test-only: only [`FeedbackService::change_state`] consumes this, and that is cfg(test).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackState {
     Active,
@@ -95,6 +97,7 @@ pub enum FeedbackState {
     Retracted,
 }
 
+#[cfg(test)]
 impl FeedbackState {
     fn token(self) -> &'static str {
         match self {
@@ -132,6 +135,7 @@ pub enum FeedbackError {
         skill_id: String,
     },
     #[error("feedback record `{feedback_id}` does not exist")]
+    #[cfg(test)]
     UnknownFeedback { feedback_id: String },
     #[error("feedback field `{field}` is invalid: {rule}")]
     InvalidFeedback {
@@ -152,6 +156,7 @@ pub enum FeedbackError {
     #[error("idempotency key was reused for different feedback")]
     IdempotencyConflict,
     #[error("feedback state transition is stale or illegal")]
+    #[cfg(test)]
     InvalidStateTransition,
 }
 
@@ -317,6 +322,9 @@ impl<'a> FeedbackService<'a> {
         Ok(feedback_id)
     }
 
+    // Test-only: there is no operator surface that resolves or retracts feedback, so
+    // nothing in production drives this transition. Kept for the state-machine test.
+    #[cfg(test)]
     pub fn change_state(
         &mut self,
         actor: &AuthenticatedActor,

@@ -598,6 +598,8 @@ impl<'a> LifecycleService<'a> {
         read_revision(self.store.connection(), skill_id)
     }
 
+    // Test-only: production reads generations through the index coordinator.
+    #[cfg(test)]
     pub fn index_generations(&self) -> Result<(i64, i64), LifecycleError> {
         Ok(self.store.connection().query_row(
             "SELECT desired_generation, applied_generation

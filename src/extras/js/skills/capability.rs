@@ -8,7 +8,7 @@ use crate::extras::js::protocol::{
     HttpHeader, HttpMethod, InvocationId, MAX_EFFECTS_PER_STEP,
 };
 
-use super::{CapabilityManifest, CapabilityTier, HostCapability, IdentityError};
+use super::{CapabilityManifest, HostCapability, IdentityError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillExecutionAttribution {
@@ -17,6 +17,10 @@ pub struct SkillExecutionAttribution {
     pub manifest: CapabilityManifest,
 }
 
+// Test-only, with [`CapabilityContext`]: the production narrowing path is
+// [`InvocationCapabilityRuntime`], whose denials are typed
+// `CapabilityError::{Revoked, InvalidInvocation, DispatchDenied}` instead.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityDenied {
     pub skill_id: String,
@@ -25,11 +29,11 @@ pub struct CapabilityDenied {
     pub reason: CapabilityDenialReason,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityDenialReason {
     Undeclared,
     SessionDenied,
-    InvalidManifest,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +43,7 @@ pub enum CapabilityError {
     #[error("invalid immutable capability manifest: {0}")]
     InvalidManifest(#[from] IdentityError),
     #[error("skill capability denied")]
+    #[cfg(test)]
     Denied(CapabilityDenied),
     #[error("invocation authorization is missing or invalid")]
     InvalidInvocation,
@@ -217,6 +222,8 @@ impl InvocationCapabilityRuntime {
         }
     }
 
+    // Test-only: production always builds the runtime with a real broker dispatcher.
+    #[cfg(test)]
     pub(crate) fn deny_all() -> Self {
         Self::new(|_| Err(CapabilityError::DispatchDenied))
     }
@@ -599,12 +606,17 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
 
 /// Cloneable execution context shared by the JS wrappers and host globals for
 /// one dedicated JS thread. Nested scopes intersect manifests.
+///
+/// Test-only. Production narrowing is [`InvocationCapabilityRuntime`], which binds
+/// one parent-created invocation grant per call; this older ambient stack is reached
+/// only through the `cfg(test)` `SkillCapabilityGate` in `host.rs`.
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct CapabilityContext {
     stack: Arc<Mutex<Vec<SkillExecutionAttribution>>>,
-    denials: Arc<Mutex<Vec<CapabilityDenied>>>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for CapabilityContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let depth = self.stack.lock().map(|stack| stack.len()).unwrap_or(0);
@@ -615,6 +627,7 @@ impl std::fmt::Debug for CapabilityContext {
     }
 }
 
+#[cfg(test)]
 impl CapabilityContext {
     pub fn enter(
         &self,
@@ -703,31 +716,11 @@ impl CapabilityContext {
     }
 
     fn deny(&self, denial: CapabilityDenied) -> Result<(), CapabilityError> {
-        if let Ok(mut denials) = self.denials.lock() {
-            // A single JS step has a bounded event response. Retain the first
-            // direct policy faults and drop repeated loop noise.
-            if denials.len() < 256 {
-                denials.push(denial.clone());
-            }
-        }
         Err(CapabilityError::Denied(denial))
-    }
-
-    pub fn take_denials(&self) -> Vec<CapabilityDenied> {
-        self.denials
-            .lock()
-            .map(|mut denials| std::mem::take(&mut *denials))
-            .unwrap_or_default()
     }
 
     pub fn current(&self) -> Option<SkillExecutionAttribution> {
         self.stack.lock().ok()?.last().cloned()
-    }
-
-    pub fn clear(&self) {
-        if let Ok(mut stack) = self.stack.lock() {
-            stack.clear();
-        }
     }
 }
 
@@ -745,11 +738,13 @@ fn validate_attribution(attribution: &SkillExecutionAttribution) -> Result<(), C
     Ok(())
 }
 
+#[cfg(test)]
 pub struct CapabilityGuard {
     context: CapabilityContext,
     active: bool,
 }
 
+#[cfg(test)]
 impl Drop for CapabilityGuard {
     fn drop(&mut self) {
         if self.active {
@@ -757,10 +752,6 @@ impl Drop for CapabilityGuard {
             self.active = false;
         }
     }
-}
-
-pub fn tier_may_automate(tier: CapabilityTier) -> bool {
-    matches!(tier, CapabilityTier::Pure | CapabilityTier::ReadOnly)
 }
 
 #[cfg(test)]

@@ -300,6 +300,8 @@ impl ImmutableSkillIndex {
         self.len() == 0
     }
 
+    // Test-only: production reads membership through the coordinator lease snapshot.
+    #[cfg(test)]
     pub(crate) fn contains_id(&self, id: &str) -> bool {
         self.by_id
             .get(id)
@@ -347,6 +349,7 @@ impl ImmutableSkillIndex {
     }
 
     /// Exact full-scan oracle retained for ANN recall and regression audits.
+    #[cfg(test)]
     pub fn search_exact_with_metrics(
         &self,
         query_text: &str,

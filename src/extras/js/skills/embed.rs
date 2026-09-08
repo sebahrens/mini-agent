@@ -686,7 +686,11 @@ struct QueryCache {
     max_entries: usize,
     max_bytes: usize,
     current_bytes: usize,
+    // Counters maintained unconditionally so cache behaviour is identical in both
+    // builds, but only ever read back through the `cfg(test)` `stats()` reporter.
+    #[cfg_attr(not(test), allow(dead_code))]
     hits: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     evictions: u64,
     /// Monotonic generation counter for last-used tracking.
     /// Incremented on each cache hit to avoid O(n) list manipulations.
@@ -784,6 +788,7 @@ impl QueryCache {
         self.entries.insert(key, entry);
     }
 
+    #[cfg(test)]
     fn stats(&self) -> CacheStats {
         CacheStats {
             entries: self.entries.len(),
@@ -793,6 +798,7 @@ impl QueryCache {
         }
     }
 
+    #[cfg(test)]
     fn clear(&mut self) {
         self.entries.clear();
         self.current_bytes = 0;
@@ -800,6 +806,9 @@ impl QueryCache {
 }
 
 /// Observable cache statistics.
+///
+/// Test-only: nothing in production reports embedder cache occupancy.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheStats {
     pub entries: usize,
@@ -1017,11 +1026,15 @@ impl Embedder {
     }
 
     /// Get observable cache statistics.
+    ///
+    /// Test-only: the sole caller is the `cfg(test)` `SkillRuntime::embedding_cache_stats`.
+    #[cfg(test)]
     pub async fn cache_stats(&self) -> CacheStats {
         self.cache.lock().await.stats()
     }
 
     /// Clear the cache (for testing).
+    #[cfg(test)]
     pub async fn clear_cache(&self) {
         self.cache.lock().await.clear();
     }
@@ -1055,6 +1068,9 @@ impl SkillDocument {
     }
 
     /// Add an export.
+    ///
+    /// Test-only: production builds documents through [`SkillDocument::with_exports`].
+    #[cfg(test)]
     pub fn with_export(mut self, name: String, signature: String) -> Self {
         self.exports.push((name, signature));
         self

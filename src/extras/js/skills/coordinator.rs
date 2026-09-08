@@ -248,6 +248,8 @@ impl IndexCoordinator {
     /// Resolve one eligible replacement canary against the exact applied
     /// generation. Synchronous callers must keep this off async executors;
     /// turn preparation uses [`Self::routing_context`] instead.
+    // Test-only: production resolves canaries through routing_context.
+    #[cfg(test)]
     pub fn replacement_candidate(
         &self,
         active_id: &str,
@@ -389,6 +391,8 @@ impl IndexCoordinator {
 
     /// Load the durable routing key. Synchronous callers must keep this off
     /// async executors; turn preparation uses the generation-cached context.
+    // Test-only: production reads the key through the generation-cached routing_context.
+    #[cfg(test)]
     pub fn routing_key(&self) -> Result<[u8; 32], CoordinatorError> {
         let mut store = self.store.lock().map_err(|_| CoordinatorError::Poisoned)?;
         let generation = store.generation_state()?.applied_generation;

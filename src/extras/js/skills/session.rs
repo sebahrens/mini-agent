@@ -243,6 +243,12 @@ impl SkillServiceOwner {
 
     /// Why learned skills are currently unavailable, for `/status` and the
     /// trusted-context diagnostics. `None` while they are healthy.
+    ///
+    /// Not yet read by any surface: the startup banner reports only the
+    /// containment-preflight refusal (`startup::js_runtime_banner_lines`), not a
+    /// runtime service-cache failure. The allow hides exactly this accessor until a
+    /// diagnostics surface consumes it; do not widen it to the enclosing impl.
+    #[allow(dead_code)]
     pub(crate) fn disabled_diagnostic(&self) -> Option<SkillServiceFailure> {
         self.cache.failure()
     }

@@ -6,7 +6,10 @@
 //! JSON strings. Invocation capability construction is deliberately owned by Phase 6 A17.
 
 use rquickjs::context::EvalOptions;
-use rquickjs::function::{Args, IntoArgs, Rest};
+use rquickjs::function::{Args, Rest};
+// `IntoArgs` is only needed by the cfg(test) by-name wrapper caller below.
+#[cfg(test)]
+use rquickjs::function::IntoArgs;
 use rquickjs::object::Property;
 use rquickjs::{
     Context, Ctx, Exception, FromJs, Function, Module, Object, Persistent, Runtime, Value,
@@ -673,6 +676,9 @@ fn evaluate_global_bytecode(ctx: &Ctx<'_>, bytecode: &[u8]) -> rquickjs::Result<
 /// The caller must invoke this before model source evaluation. Any error rejects the whole
 /// request; in particular, a pending initialization job is intentionally not drained because
 /// running it would execute stored source after the loader has rejected the artifact.
+// Test-only: production always loads through
+// `load_artifact_with_bound_exports_bytecode` (or the verification variant).
+#[cfg(test)]
 pub(crate) fn load_artifact(
     runtime: &Runtime,
     model_context: &Context,
@@ -682,6 +688,9 @@ pub(crate) fn load_artifact(
 }
 
 /// Load an ABI-v2 artifact whose wrappers inject a fresh, revocable invocation capability.
+// Test-only: production always loads through
+// `load_artifact_with_bound_exports_bytecode` (or the verification variant).
+#[cfg(test)]
 pub(crate) fn load_artifact_with_capabilities(
     runtime: &Runtime,
     model_context: &Context,
@@ -700,6 +709,9 @@ pub(crate) fn load_artifact_with_capabilities(
 }
 
 /// Install Rust-owned model dispatchers backed by fresh parent authority for every call.
+// Test-only: production always loads through
+// `load_artifact_with_bound_exports_bytecode` (or the verification variant).
+#[cfg(test)]
 pub(crate) fn load_artifact_with_bound_exports(
     runtime: &Runtime,
     model_context: &Context,
@@ -771,6 +783,9 @@ pub(crate) fn load_artifact_with_bound_exports_for_verification(
 ///
 /// The guard is installed immediately around `Function::call`. Wrapper statement one claims the
 /// handle before argument encoding can execute model-controlled proxy traps or re-enter a wrapper.
+// Test-only: production dispatches bound exports through
+// `call_function_with_capability_args`, not by name off the globals object.
+#[cfg(test)]
 pub(crate) fn call_export_with_capability<'js, A, R>(
     ctx: &Ctx<'js>,
     export_name: &str,
@@ -786,6 +801,7 @@ where
     call_function_with_capability(&wrapper, capabilities, handle, arguments)
 }
 
+#[cfg(test)]
 fn call_function_with_capability<'js, A, R>(
     wrapper: &Function<'js>,
     capabilities: &InvocationCapabilityRuntime,
@@ -1329,8 +1345,11 @@ pub(super) fn skill_effect_exception(
         CapabilityError::EffectFailed(code) => effect_error_code_token(*code),
         CapabilityError::InvalidArguments => "invalid_target",
         CapabilityError::DispatchDenied => "denied",
-        CapabilityError::Denied(_)
-        | CapabilityError::Revoked
+        // `CapabilityError::Denied` only exists in test builds; it belongs to the
+        // ambient `CapabilityContext` stack, which production never enters.
+        #[cfg(test)]
+        CapabilityError::Denied(_) => "capability_denied",
+        CapabilityError::Revoked
         | CapabilityError::InvalidInvocation
         | CapabilityError::InvalidAttribution
         | CapabilityError::InvalidManifest(_) => "capability_denied",

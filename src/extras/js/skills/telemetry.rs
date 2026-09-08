@@ -634,19 +634,12 @@ pub enum DispatchError {
 
 impl TelemetryDispatcher {
     /// Spawn the bounded off-JS-thread SQLite ingestion worker.
+    // Test-only. This builds a dispatcher WITHOUT an index coordinator, so its worker
+    // silently skips apply_automatic_quarantine. Production must use
+    // spawn_session_scoped_with_coordinator; do not un-gate this for production use.
+    #[cfg(test)]
     pub fn spawn(paths: &crate::paths::AppPaths) -> Result<Self, DispatchError> {
         Self::spawn_inner(paths, None, crate::agent::runner::current_work_guard())
-    }
-
-    pub fn spawn_with_coordinator(
-        paths: &crate::paths::AppPaths,
-        coordinator: std::sync::Arc<super::coordinator::IndexCoordinator>,
-    ) -> Result<Self, DispatchError> {
-        Self::spawn_inner(
-            paths,
-            Some(coordinator),
-            crate::agent::runner::current_work_guard(),
-        )
     }
 
     pub(crate) fn spawn_session_scoped_with_coordinator(

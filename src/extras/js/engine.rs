@@ -317,8 +317,11 @@ pub(crate) fn js_thread_main(
     }
 }
 
-// pub(crate) required: Phase 3's verify_skill() calls this cross-module
-#[cfg_attr(feature = "skills", allow(dead_code))]
+// Only the `not(feature = "skills")` arm of `js_thread_main` calls this; with
+// `skills` the loop goes through `run_step_with_skills`. Gating the definition the
+// same way replaces the previous `cfg_attr(feature = "skills", allow(dead_code))`
+// (whose comment claimed a `verify_skill` caller that does not exist).
+#[cfg(not(feature = "skills"))]
 pub(crate) fn run_step(
     code: &str,
     sandbox: &Sandbox,
