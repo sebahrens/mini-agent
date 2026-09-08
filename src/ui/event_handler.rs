@@ -286,7 +286,7 @@ pub async fn handle_agent_event(
             renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
         }
         AgentEvent::CompactionBoundary { .. } => {}
-        AgentEvent::Error(e) => {
+        AgentEvent::Error { message: e, .. } => {
             run.was_reasoning = false;
             run.is_running = false;
             run.pending_compaction_pressure = None;

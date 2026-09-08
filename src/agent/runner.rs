@@ -2409,6 +2409,17 @@ where
         let mut completion_had_tool_call = false;
         let mut exhausted_budget_after_completion = None;
         let mut completed_interactions: Vec<Message> = Vec::new();
+        // Canonical messages for work that already completed when a terminal
+        // failure ends the turn. Clients that commit history only on `Done`
+        // would otherwise have no record of an effect that already happened.
+        macro_rules! completed_so_far {
+            () => {{
+                tool_calls.finalize_unresolved(&mut interactions);
+                let mut retained = std::mem::take(&mut completed_interactions);
+                retained.append(&mut interactions);
+                retained
+            }};
+        }
         // `None` means the initial prompt. Continuations install only their
         // small replacement instruction instead of cloning the initial prompt.
         let mut stream_prompt: Option<String> = None;
@@ -2438,9 +2449,12 @@ where
 
         if max_turns == 0 {
             let _ = event_tx
-                .send(AgentEvent::Error(CompactString::from(
-                    "Agent exhausted its maximum turn budget (0) before starting.",
-                )))
+                .send(AgentEvent::error_with(
+                    CompactString::from(
+                        "Agent exhausted its maximum turn budget (0) before starting.",
+                    ),
+                    Vec::new(),
+                ))
                 .await;
             return;
         }
@@ -2483,7 +2497,10 @@ where
                     tracing::error!("agent stream start failed after retries: {error}");
                     let error = retry::with_context_length_hint(&error.to_string());
                     let _ = event_tx
-                        .send(AgentEvent::Error(CompactString::new(error)))
+                        .send(AgentEvent::error_with(
+                            CompactString::new(error),
+                            Vec::new(),
+                        ))
                         .await;
                     return;
                 }
@@ -2527,9 +2544,12 @@ where
                                     )
                                     .await;
                                     let _ = event_tx
-                                        .send(AgentEvent::Error(CompactString::from(
-                                            token_budget_exhaustion_message(used, budget),
-                                        )))
+                                        .send(AgentEvent::error_with(
+                                            CompactString::from(token_budget_exhaustion_message(
+                                                used, budget,
+                                            )),
+                                            completed_so_far!(),
+                                        ))
                                         .await;
                                     return;
                                 }
@@ -2550,9 +2570,10 @@ where
                                     )
                                     .await;
                                     let _ = event_tx
-                                        .send(AgentEvent::Error(CompactString::new(
-                                            error.to_string(),
-                                        )))
+                                        .send(AgentEvent::error_with(
+                                            CompactString::new(error.to_string()),
+                                            completed_so_far!(),
+                                        ))
                                         .await;
                                     return;
                                 }
@@ -2597,9 +2618,12 @@ where
                             )
                             .await;
                             let _ = event_tx
-                                .send(AgentEvent::Error(CompactString::from(
-                                    token_budget_exhaustion_message(used, budget),
-                                )))
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(token_budget_exhaustion_message(
+                                        used, budget,
+                                    )),
+                                    completed_so_far!(),
+                                ))
                                 .await;
                             return;
                         }
@@ -2621,9 +2645,12 @@ where
                             )
                             .await;
                             let _ = event_tx
-                                .send(AgentEvent::Error(CompactString::from(
-                                    token_budget_exhaustion_message(used, budget),
-                                )))
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(token_budget_exhaustion_message(
+                                        used, budget,
+                                    )),
+                                    completed_so_far!(),
+                                ))
                                 .await;
                             return;
                         }
@@ -2678,7 +2705,10 @@ where
                             Err(error) => {
                                 tracing::error!(error, "agent final history invariant failed");
                                 let _ = event_tx
-                                    .send(AgentEvent::Error(CompactString::from(error)))
+                                    .send(AgentEvent::error_with(
+                                        CompactString::from(error),
+                                        completed_so_far!(),
+                                    ))
                                     .await;
                                 return;
                             }
@@ -2723,9 +2753,10 @@ where
                             > 0
                         {
                             let _ = event_tx
-                                .send(AgentEvent::Error(CompactString::from(
-                                    UNRESOLVED_TOOL_CALLS_ERROR,
-                                )))
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(UNRESOLVED_TOOL_CALLS_ERROR),
+                                    completed_so_far!(),
+                                ))
                                 .await;
                             return;
                         }
@@ -2760,9 +2791,12 @@ where
                                         break;
                                     }
                                     let _ = event_tx
-                                        .send(AgentEvent::Error(CompactString::from(format!(
-                                            "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
-                                        ))))
+                                        .send(AgentEvent::error_with(
+                                            CompactString::from(format!(
+                                                "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
+                                            )),
+                                            completed_so_far!(),
+                                        ))
                                         .await;
                                     return;
                                 }
@@ -2810,9 +2844,12 @@ where
                                 "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                             );
                             let _ = event_tx
-                                .send(AgentEvent::Error(CompactString::from(
-                                    "Agent returned empty response too many times, aborting.",
-                                )))
+                                .send(AgentEvent::error_with(
+                                    CompactString::from(
+                                        "Agent returned empty response too many times, aborting.",
+                                    ),
+                                    completed_so_far!(),
+                                ))
                                 .await;
                             return;
                         }
@@ -2879,9 +2916,12 @@ where
                                 )
                                 .await;
                                 let _ = event_tx
-                                    .send(AgentEvent::Error(CompactString::from(
-                                        token_budget_exhaustion_message(used, budget),
-                                    )))
+                                    .send(AgentEvent::error_with(
+                                        CompactString::from(token_budget_exhaustion_message(
+                                            used, budget,
+                                        )),
+                                        completed_so_far!(),
+                                    ))
                                     .await;
                                 return;
                             }
@@ -2917,7 +2957,10 @@ where
                         tracing::error!("agent stream error: {e}");
                         let error = retry::with_context_length_hint(&e.to_string());
                         let _ = event_tx
-                            .send(AgentEvent::Error(CompactString::new(error)))
+                            .send(AgentEvent::error_with(
+                                CompactString::new(error),
+                                completed_so_far!(),
+                            ))
                             .await;
                         return;
                     }
@@ -2938,7 +2981,10 @@ where
                     "agent stream EOF budget exhausted"
                 );
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::new(error.to_string())))
+                    .send(AgentEvent::error_with(
+                        CompactString::new(error.to_string()),
+                        completed_so_far!(),
+                    ))
                     .await;
                 return;
             }
@@ -2949,9 +2995,12 @@ where
                     "agent: maximum turn budget ({max_turns}) exhausted before continuation"
                 );
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::from(format!(
-                        "Agent exhausted its maximum turn budget ({max_turns}) before completing."
-                    ))))
+                    .send(AgentEvent::error_with(
+                        CompactString::from(format!(
+                            "Agent exhausted its maximum turn budget ({max_turns}) before completing."
+                        )),
+                        completed_so_far!(),
+                    ))
                     .await;
                 return;
             }
@@ -2962,10 +3011,13 @@ where
                     "agent: cumulative token budget exhausted before continuation ({used}/{budget})"
                 );
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::from(format!(
-                        "Agent exhausted its cumulative token budget ({used}/{budget}) before \
-                         completing. Compact the session or raise turn_token_budget before retrying."
-                    ))))
+                    .send(AgentEvent::error_with(
+                        CompactString::from(format!(
+                            "Agent exhausted its cumulative token budget ({used}/{budget}) before \
+                             completing. Compact the session or raise turn_token_budget before retrying."
+                        )),
+                        completed_so_far!(),
+                    ))
                     .await;
                 return;
             }
@@ -3870,7 +3922,7 @@ mod tests {
                     crate::event::AgentEvent::Done { .. } => {
                         panic!("compaction request must stop before the next model call")
                     }
-                    crate::event::AgentEvent::Error(error) => {
+                    crate::event::AgentEvent::Error { message: error, .. } => {
                         panic!("unexpected runner error: {error}")
                     }
                     _ => {}
@@ -3931,7 +3983,7 @@ mod tests {
                     crate::event::AgentEvent::CompactionBoundary { .. } => {
                         panic!("a text-only response has no tool-result boundary")
                     }
-                    crate::event::AgentEvent::Error(error) => {
+                    crate::event::AgentEvent::Error { message: error, .. } => {
                         panic!("unexpected runner error: {error}")
                     }
                     _ => {}
@@ -3971,7 +4023,7 @@ mod tests {
                         panic!("zero usage must not publish a decision request")
                     }
                     crate::event::AgentEvent::Done { response, .. } => break response,
-                    crate::event::AgentEvent::Error(error) => {
+                    crate::event::AgentEvent::Error { message: error, .. } => {
                         panic!("unexpected runner error: {error}")
                     }
                     _ => {}
@@ -4005,7 +4057,7 @@ mod tests {
         );
         let interactive_error = loop {
             match runner.event_rx.recv().await.expect("runner terminal event") {
-                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),
                 crate::event::AgentEvent::Done { .. } => {
                     panic!("context overflow must not produce interactive success")
                 }
@@ -4083,7 +4135,9 @@ mod tests {
                     assert_eq!(response, "recovered");
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -4138,7 +4192,7 @@ mod tests {
                     assert_eq!(response, "recovered");
                     break interactions;
                 }
-                crate::event::AgentEvent::Error(error) => {
+                crate::event::AgentEvent::Error { message: error, .. } => {
                     panic!("transient second-call error was not recovered: {error}")
                 }
                 _ => {}
@@ -4248,7 +4302,7 @@ mod tests {
                 crate::event::AgentEvent::Retrying { attempt, max } => {
                     retries.push((attempt, max));
                 }
-                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),
                 crate::event::AgentEvent::Done { .. } => {
                     panic!("exhausted transient errors must not succeed")
                 }
@@ -4637,7 +4691,7 @@ mod tests {
                     assert_eq!(response, "changed approach");
                     break interactions;
                 }
-                crate::event::AgentEvent::Error(error) => {
+                crate::event::AgentEvent::Error { message: error, .. } => {
                     panic!("loop correction should recover: {error}")
                 }
                 _ => {}
@@ -4874,7 +4928,7 @@ mod tests {
                     output: diagnostic,
                 } => verification_events.push((attempt, max, passed, diagnostic.to_string())),
                 crate::event::AgentEvent::Done { response, .. } => break response.to_string(),
-                crate::event::AgentEvent::Error(error) => {
+                crate::event::AgentEvent::Error { message: error, .. } => {
                     panic!("verification retry should recover: {error}")
                 }
                 _ => {}
@@ -4957,7 +5011,7 @@ mod tests {
                     assert!(!passed);
                     attempts.push(attempt);
                 }
-                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),
                 crate::event::AgentEvent::Done { response, .. } => {
                     panic!("failed verification must not emit done: {response}")
                 }
@@ -5345,7 +5399,8 @@ mod tests {
             while let Some(event) = runner.event_rx.recv().await {
                 match event {
                     crate::event::AgentEvent::SubagentToolCall { name, .. } => markers.push(name),
-                    crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_) => {
+                    crate::event::AgentEvent::Done { .. }
+                    | crate::event::AgentEvent::Error { .. } => {
                         break;
                     }
                     _ => {}
@@ -5450,7 +5505,7 @@ mod tests {
         while let Some(event) = runner.event_rx.recv().await {
             if matches!(
                 event,
-                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_)
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. }
             ) {
                 break;
             }
@@ -5510,7 +5565,7 @@ mod tests {
         while let Some(event) = runner.event_rx.recv().await {
             if matches!(
                 event,
-                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error(_)
+                crate::event::AgentEvent::Done { .. } | crate::event::AgentEvent::Error { .. }
             ) {
                 break;
             }
@@ -5607,7 +5662,7 @@ mod tests {
         let interactions = loop {
             match runner.event_rx.recv().await {
                 Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
-                Some(crate::event::AgentEvent::Error(error)) => {
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                     panic!("batched tool run failed: {error}")
                 }
                 Some(_) => {}
@@ -5696,7 +5751,7 @@ mod tests {
             loop {
                 match runner.event_rx.recv().await {
                     Some(crate::event::AgentEvent::Done { .. }) => break,
-                    Some(crate::event::AgentEvent::Error(error)) => {
+                    Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                         panic!("parallel batch failed: {error}")
                     }
                     Some(_) => {}
@@ -5756,7 +5811,7 @@ mod tests {
                     result_lifecycle_ids.push(id)
                 }
                 Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
-                Some(crate::event::AgentEvent::Error(error)) => {
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                     panic!("duplicate-ID run failed: {error}")
                 }
                 Some(_) => {}
@@ -5895,7 +5950,7 @@ mod tests {
         let actual = loop {
             match runner.event_rx.recv().await {
                 Some(crate::event::AgentEvent::Done { interactions, .. }) => break interactions,
-                Some(crate::event::AgentEvent::Error(error)) => {
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                     panic!("output-retry runner failed: {error}")
                 }
                 Some(_) => {}
@@ -5942,7 +5997,7 @@ mod tests {
         let mut error = None;
         while let Some(event) = runner.event_rx.recv().await {
             match event {
-                crate::event::AgentEvent::Error(message) => {
+                crate::event::AgentEvent::Error { message, .. } => {
                     error = Some(message);
                     break;
                 }
@@ -6105,7 +6160,9 @@ mod tests {
                     response = Some(done.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6150,7 +6207,9 @@ mod tests {
                     response = Some(done.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6186,7 +6245,7 @@ mod tests {
         let mut error = None;
         while let Some(event) = runner.event_rx.recv().await {
             match event {
-                crate::event::AgentEvent::Error(message) => {
+                crate::event::AgentEvent::Error { message, .. } => {
                     error = Some(message.to_string());
                     break;
                 }
@@ -6243,7 +6302,9 @@ mod tests {
                     done = Some(response.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6300,7 +6361,9 @@ mod tests {
                     response = Some(done.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6354,7 +6417,9 @@ mod tests {
                     done = Some(response.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6476,7 +6541,7 @@ mod tests {
                         assert_eq!(response, "betweenrecovered");
                         break;
                     }
-                    crate::event::AgentEvent::Error(error) => {
+                    crate::event::AgentEvent::Error { message: error, .. } => {
                         panic!("unexpected interactive error: {error}")
                     }
                     _ => {}
@@ -6584,7 +6649,7 @@ mod tests {
                     assert_eq!(output, UNKNOWN_TOOL_OUTCOME);
                     result_id = Some(id.to_string());
                 }
-                crate::event::AgentEvent::Error(error) => break error.to_string(),
+                crate::event::AgentEvent::Error { message: error, .. } => break error.to_string(),
                 crate::event::AgentEvent::Done { .. } => {
                     panic!("pending calls must never produce interactive success")
                 }
@@ -6677,7 +6742,9 @@ mod tests {
                     done_interactions = Some(interactions);
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6871,7 +6938,9 @@ mod tests {
                     done = Some(response.to_string());
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -6933,7 +7002,9 @@ mod tests {
                 crate::event::AgentEvent::ToolCall { id, .. } => call_ids.push(id.to_string()),
                 crate::event::AgentEvent::ToolResult { id, .. } => result_ids.push(id.to_string()),
                 crate::event::AgentEvent::Done { .. } => break,
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -7013,7 +7084,7 @@ mod tests {
                 crate::event::AgentEvent::Retrying { .. } => {
                     panic!("streamed text must not trigger empty-response retry")
                 }
-                crate::event::AgentEvent::Error(error) => {
+                crate::event::AgentEvent::Error { message: error, .. } => {
                     panic!("streamed text must complete successfully: {error}")
                 }
                 _ => {}
@@ -7044,7 +7115,9 @@ mod tests {
         );
         let interactive_error = loop {
             match runner.event_rx.recv().await {
-                Some(crate::event::AgentEvent::Error(error)) => break error.to_string(),
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
+                    break error.to_string();
+                }
                 Some(crate::event::AgentEvent::Done { response, .. }) => {
                     panic!("zero budget unexpectedly completed: {response}")
                 }
@@ -7711,7 +7784,9 @@ mod tests {
         );
         let interactive_error = loop {
             match runner.event_rx.recv().await {
-                Some(crate::event::AgentEvent::Error(error)) => break error.to_string(),
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
+                    break error.to_string();
+                }
                 Some(crate::event::AgentEvent::Done { response, .. }) => {
                     panic!("over-budget tool completion unexpectedly finished: {response}")
                 }
@@ -7785,7 +7860,7 @@ mod tests {
                 Some(crate::event::AgentEvent::Done { response, .. }) => {
                     break response.to_string();
                 }
-                Some(crate::event::AgentEvent::Error(error)) => {
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                     panic!("terminal text response must be preserved: {error}")
                 }
                 Some(_) => {}
@@ -7854,7 +7929,7 @@ mod tests {
                 Some(crate::event::AgentEvent::Done { response, .. }) => {
                     break response.to_string();
                 }
-                Some(crate::event::AgentEvent::Error(error)) => {
+                Some(crate::event::AgentEvent::Error { message: error, .. }) => {
                     panic!("run without a turn budget must not exhaust: {error}")
                 }
                 Some(_) => {}
@@ -7918,7 +7993,9 @@ mod tests {
                     assert_eq!(response, "done");
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }
@@ -7996,7 +8073,9 @@ mod tests {
                     assert_eq!(response, "done");
                     break;
                 }
-                crate::event::AgentEvent::Error(error) => panic!("unexpected error: {error}"),
+                crate::event::AgentEvent::Error { message: error, .. } => {
+                    panic!("unexpected error: {error}")
+                }
                 _ => {}
             }
         }

@@ -1325,6 +1325,7 @@ async fn completion_verification_gate_records_both_task_outcome_source_kinds() {
             None,
         )
         .await
+        .into_result()
         .unwrap_or_else(|error| panic!("verification-gate run failed: {error:#}"));
         assert_eq!(response, "done", "verification-gate terminal response");
         assert_eq!(

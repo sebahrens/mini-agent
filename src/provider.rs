@@ -1132,7 +1132,7 @@ fn spawn_blocked_runner(
     let join = tokio::spawn(async move {
         if start_rx.await.is_ok() {
             let _ = event_tx
-                .send(AgentEvent::Error(CompactString::from(feedback)))
+                .send(AgentEvent::error(CompactString::from(feedback)))
                 .await;
         }
         drop(event_tx);

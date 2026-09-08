@@ -1649,7 +1649,15 @@ async fn relay_prompt_events(
         let event = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return respond_cancelled_after_runner(responder, &mut rx, registration).await;
+                return respond_cancelled_after_runner(
+                    prompt_text,
+                    history,
+                    responder,
+                    &mut rx,
+                    registration,
+                    None,
+                )
+                .await;
             }
             event = rx.recv() => event,
         };
@@ -1787,10 +1795,28 @@ async fn relay_prompt_events(
                 while rx.recv().await.is_some() {}
                 break interactions;
             }
-            AgentEvent::Error(err) => {
+            AgentEvent::Error {
+                message: err,
+                interactions: partial,
+            } => {
                 while rx.recv().await.is_some() {}
                 if !registration.complete_and_settle() {
-                    return respond_cancelled_after_runner(responder, &mut rx, registration).await;
+                    return respond_cancelled_after_runner(
+                        prompt_text,
+                        history,
+                        responder,
+                        &mut rx,
+                        registration,
+                        Some(partial),
+                    )
+                    .await;
+                }
+                // A tool effect can complete before the failure. Commit the
+                // prompt and that progress so the next prompt sees the same
+                // history the workspace already reflects, instead of an empty
+                // turn that invites repeating the effect.
+                if !partial.is_empty() {
+                    history.commit_completed_turn(prompt_text, partial);
                 }
                 // Surface the error to the client instead of silently
                 // reporting EndTurn.
@@ -1810,7 +1836,15 @@ async fn relay_prompt_events(
     };
 
     if !registration.complete_and_settle() {
-        return respond_cancelled_after_runner(responder, &mut rx, registration).await;
+        return respond_cancelled_after_runner(
+            prompt_text,
+            history,
+            responder,
+            &mut rx,
+            registration,
+            Some(completed_interactions),
+        )
+        .await;
     }
 
     history.commit_completed_turn(prompt_text, completed_interactions);
@@ -1820,14 +1854,34 @@ async fn relay_prompt_events(
 }
 
 async fn respond_cancelled_after_runner(
+    prompt_text: &str,
+    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
     responder: Responder<PromptResponse>,
     rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     registration: &TurnRegistration,
+    known_progress: Option<Vec<rig::completion::Message>>,
 ) -> Result<(), agent_client_protocol::Error> {
     // The abort handle closes this channel only after the model/tool future and
     // every sender it owns have been dropped. Waiting here makes cancellation a
     // true completion boundary before the ACP request and session are released.
-    while rx.recv().await.is_some() {}
+    // Drain for a terminal event too: a runner that reached one before the
+    // abort landed carries the canonical messages for work it completed.
+    let mut progress = known_progress;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Done { interactions, .. } | AgentEvent::Error { interactions, .. }
+                if !interactions.is_empty() =>
+            {
+                progress = Some(interactions);
+            }
+            _ => {}
+        }
+    }
+    // Cancellation before any work occurred still rolls the turn back: an empty
+    // progress set commits nothing.
+    if let Some(progress) = progress.filter(|progress| !progress.is_empty()) {
+        history.commit_completed_turn(prompt_text, progress);
+    }
     let _ = respond_terminal(registration, responder, StopReason::Cancelled);
     Ok(())
 }
@@ -1861,7 +1915,7 @@ mod history_tests {
         while let Some(event) = events.recv().await {
             match event {
                 AgentEvent::Done { interactions, .. } => return interactions,
-                AgentEvent::Error(error) => panic!("fake ACP turn failed: {error}"),
+                AgentEvent::Error { message: error, .. } => panic!("fake ACP turn failed: {error}"),
                 _ => {}
             }
         }
@@ -4599,5 +4653,147 @@ mod tcp_authentication_tests {
             .expect("a valid peer must not be blocked by a partial peer")
             .unwrap();
         assert_eq!(authenticated_address, valid_address);
+    }
+}
+
+#[cfg(test)]
+mod partial_turn_tests {
+    use super::*;
+    use rig::agent::AgentBuilder;
+    use rig::completion::Message;
+    use rig::test_utils::{MockCompletionModel, MockError, MockStreamEvent};
+    use rig::tool::ToolDyn;
+
+    /// Run a scripted turn that writes a real file and then fails, returning
+    /// the runner's terminal event.
+    async fn failing_turn_after_a_write(root: &std::path::Path) -> AgentEvent {
+        let write = Box::new(
+            crate::agent::tools::WriteTool::new(None, None, None)
+                .with_workspace(root.to_path_buf()),
+        ) as Box<dyn ToolDyn>;
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "acp-write",
+                    "write",
+                    serde_json::json!({ "path": "effect.txt", "content": "written\n" }),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::Error(MockError::provider(
+                "invalid_request_error: bad request",
+            ))],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tools(vec![write])
+            .default_max_turns(4)
+            .build();
+        let runner = crate::agent::runner::spawn_agent(
+            agent,
+            "write the file".to_string(),
+            Vec::<Message>::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut events = runner.event_rx;
+        let mut terminal = None;
+        while let Some(event) = events.recv().await {
+            if matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+                terminal = Some(event);
+            }
+        }
+        terminal.expect("the runner must reach a terminal event")
+    }
+
+    fn temp_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-acp-partial-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::canonicalize(&root).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_carries_the_completed_tool_messages() {
+        let root = temp_root();
+        let terminal = failing_turn_after_a_write(&root).await;
+        let AgentEvent::Error {
+            message,
+            interactions,
+        } = terminal
+        else {
+            panic!("expected a terminal failure");
+        };
+        assert!(message.contains("invalid_request_error"), "{message}");
+        assert!(
+            root.join("effect.txt").is_file(),
+            "the scripted write must have reached the workspace"
+        );
+        assert!(
+            !interactions.is_empty(),
+            "a failure after a completed tool call must carry its messages"
+        );
+
+        // Committing that progress makes the next prompt see the same history
+        // the workspace already reflects.
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn("write the file", interactions);
+        let next = history.snapshot();
+        assert!(
+            !next.is_empty(),
+            "the next prompt must not receive an empty history after a refusal"
+        );
+        assert!(
+            next.iter().any(|message| matches!(
+                message,
+                Message::User { content }
+                    if content
+                        .iter()
+                        .any(|item| matches!(item, rig::message::UserContent::ToolResult(_)))
+            )),
+            "the completed tool result must be retained: {next:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_progress_commits_nothing() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![MockStreamEvent::Error(
+            MockError::provider("invalid_request_error: refused before any work"),
+        )]]);
+        let agent = AgentBuilder::new(model).default_max_turns(2).build();
+        let runner = crate::agent::runner::spawn_agent(
+            agent,
+            "do nothing".to_string(),
+            Vec::<Message>::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut events = runner.event_rx;
+        let mut terminal = None;
+        while let Some(event) = events.recv().await {
+            if matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+                terminal = Some(event);
+            }
+        }
+        let AgentEvent::Error { interactions, .. } =
+            terminal.expect("a terminal failure is expected")
+        else {
+            panic!("expected a terminal failure");
+        };
+        assert!(
+            interactions.is_empty(),
+            "a refusal before any work must retain nothing: {interactions:?}"
+        );
     }
 }

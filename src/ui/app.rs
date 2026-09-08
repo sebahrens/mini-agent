@@ -1154,7 +1154,7 @@ impl<'a> App<'a> {
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
-        let terminal_error = matches!(&event, AgentEvent::Error(_));
+        let terminal_error = matches!(&event, AgentEvent::Error { .. });
         let compaction_boundary_interactions = match &event {
             AgentEvent::CompactionBoundary { interactions } => Some(interactions.clone()),
             _ => None,
@@ -1196,7 +1196,7 @@ impl<'a> App<'a> {
                 self.run.awaiting_compaction_relief = false;
                 self.run.pending_compaction_pressure = None;
             }
-            AgentEvent::Error(_) => {
+            AgentEvent::Error { .. } => {
                 self.run.awaiting_compaction_relief = false;
                 self.run.pending_compaction_pressure = None;
             }

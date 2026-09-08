@@ -58,7 +58,14 @@ pub enum AgentEvent {
         agent_type: CompactString,
         source: CompactString,
     },
-    Error(CompactString),
+    /// A terminal failure, with the canonical messages for work that already
+    /// completed in this turn. A tool effect can happen and a later provider
+    /// failure end the turn; a client that commits history only on `Done`
+    /// would otherwise have no record of the effect.
+    Error {
+        message: CompactString,
+        interactions: Vec<rig::completion::Message>,
+    },
     Retrying {
         attempt: usize,
         max: usize,
@@ -90,6 +97,27 @@ pub enum AgentEvent {
         /// never need to reconstruct model interactions from display events.
         interactions: Vec<rig::completion::Message>,
     },
+}
+
+impl AgentEvent {
+    /// A terminal failure with no completed work to retain.
+    pub fn error(message: impl Into<CompactString>) -> Self {
+        Self::Error {
+            message: message.into(),
+            interactions: Vec::new(),
+        }
+    }
+
+    /// A terminal failure that happened after `interactions` already completed.
+    pub fn error_with(
+        message: impl Into<CompactString>,
+        interactions: Vec<rig::completion::Message>,
+    ) -> Self {
+        Self::Error {
+            message: message.into(),
+            interactions,
+        }
+    }
 }
 
 /// Events emitted by an isolated `/btw` side-question run. Kept as a separate
