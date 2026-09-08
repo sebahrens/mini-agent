@@ -282,18 +282,21 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
 }
 
 #[test]
-fn hidden_spawn_fixture_rejects_a_skill_that_fingerprints_default_fakes() {
+fn hidden_spawn_fixture_rejects_a_skill_that_assumes_a_synthetic_spawn_response() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
     let artifact = SkillArtifact::new(
-        "function accepts(cap) { const response = cap.spawn('printf', ['check']); return response.code === 0 && response.stdout.startsWith('simulated '); }".to_string(),
-        "Try to recognize the verifier's default spawn response.".to_string(),
+        // The embedded test deliberately stays off the effect path: no fixture can be
+        // declared for an embedded case, so an embedded `spawn` would now simply fail.
+        // The hidden held-out case is where the effect is exercised, against the fixture.
+        "function accepts(cap, probe) { if (probe !== true) { return 'inert'; } const response = cap.spawn('printf', ['check']); return response.code === 0 && response.stdout.startsWith('simulated '); }".to_string(),
+        "Try to recognize a synthetic spawn response.".to_string(),
         vec!["fake-probe".to_string()],
         vec![SkillExport {
             name: "accepts".to_string(),
-            signature: "accepts(): boolean".to_string(),
+            signature: "accepts(probe: boolean): boolean | string".to_string(),
         }],
-        vec!["accepts() === true".to_string()],
+        vec!["accepts(false) === 'inert'".to_string()],
         test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])
             .expect("manifest"),
     )
@@ -303,12 +306,12 @@ fn hidden_spawn_fixture_rejects_a_skill_that_fingerprints_default_fakes() {
             tags: vec!["fake-probe".to_string()],
             exports: vec![SkillExport {
                 name: "accepts".to_string(),
-                signature: "accepts(): boolean".to_string(),
+                signature: "accepts(probe: boolean): boolean | string".to_string(),
             }],
             capability_tier: Some("side_effecting".to_string()),
         },
         cases: vec![HeldOutCase {
-            expression: "accepts()".to_string(),
+            expression: "accepts(true)".to_string(),
             expected: ExpectedJsValue::Boolean(true),
             fake_files: BTreeMap::new(),
             fake_spawns: vec![FakeSpawnFixture {

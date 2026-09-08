@@ -1422,6 +1422,14 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // Distiller test fixtures: `output` is a persisted tool-result field, not a
+    // process output.
+    (
+        "src/extras/js/skills/distill.rs",
+        "output: CompactString::new(\"6\"),",
+        2,
+        "NON-PROCESS",
+    ),
     // Learned-skill operator commands: `status` here is a lifecycle status
     // rendered into a log field or an error message, never a process exit.
     (
@@ -2647,6 +2655,19 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             "2ae1572a8e3e684cff68f2fdcdb44d0c5ee3808f1bb261e9b1818446ee024674",
             1,
         )],
+    ),
+    (
+        "src/extras/js/skills/distill.rs",
+        &[
+            (
+                "2be6da2b6d2f946def7179a79bb891007b3c71f31406926a8b009dd076c998ad",
+                1,
+            ),
+            (
+                "49458cd07accf0772709b9032c5603c438da7143e59d2b1c443cc8715967a292",
+                1,
+            ),
+        ],
     ),
     (
         "src/extras/js/skills/operations.rs",

@@ -316,6 +316,8 @@ reference — package format, held-out suites, feedback semantics, stats columns
 
 | Flag | Description |
 | ---- | ----------- |
+| `--distill-learned-skill <SESSION_ID> <TOOL_CALL_ID>` | Turn the JavaScript of one persisted `js` tool call into a proposal package for `--import-learned-skill`, then exit. Asks the configured provider **once** to generalize the snippet; without a usable answer it writes a `TODO`-marked scaffold instead and says so. Imports, verifies, approves and activates nothing. See [SKILLS.md](SKILLS.md#distilling-a-recorded-javascript-tool-call). |
+| `--distill-learned-skill-out <PATH>` | Write that package to `PATH` instead of `<local-data>/skills/distilled/<tool-call-id>.json`. Either way an existing file is never overwritten — a distilled package is an editable draft. Only valid with `--distill-learned-skill`. |
 | `--import-learned-skill <DIR_OR_JSON>` | Import and contained-verify learned-skill JSON package(s) for approval. A directory imports 1–32 sorted `.json` files. |
 | `--install-learned-skill-seeds` | Import and contained-verify the five bundled pure seed packages. Reports each seed independently and is idempotent. |
 | `--list-learned-skill-proposals` | List proposals still awaiting an operator decision, as TSV, then exit. A `verified` proposal whose reason is `held_out_suite_required` is listed but is not approvable. |
@@ -349,7 +351,14 @@ handles all of them. For example:
 ```text
 learned-skill import: id=<sha256> proposal_id=<sha256> status=awaiting_approval reason_code=- report_id=<sha256> idempotent=false next_attempt_at=- blocked_by=-
 learned-skill feedback: id=<sha256> feedback_id=<sha256> kind=severe status=quarantined quarantine=applied quarantine_reason=-
+learned-skill distill: path=<path> id=<sha256> export=<name> tier=pure tests=2 held_out_cases=3 generalization=model effects=- complete=true
 ```
+
+`--distill-learned-skill` adds one or two follow-up lines after that shared line: a
+`learned-skill distill note:` line whenever it fell back to a scaffold or saw effect globals in the
+recording, and always a `learned-skill distill next:` line carrying the exact
+`--import-learned-skill` command to run. Under `--learned-skill-json` all of it collapses into the
+one JSON object, which carries the extra `note` and `next_command` fields.
 
 ## General
 

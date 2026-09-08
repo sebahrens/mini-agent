@@ -109,14 +109,18 @@ fn readonly_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
 /// Create a skill with SideEffecting capability.
 fn sideeffecting_skill() -> Result<SkillArtifact, Box<dyn std::error::Error>> {
     Ok(SkillArtifact::new(
-        "function deploy(cap) { return cap.spawn('printf', []); }".to_string(),
+        // The grant is what these tests persist and read back; the export must
+        // not actually spawn. An embedded test has no fixture channel, so an
+        // undeclared effect fails the case — this assertion used to pass only
+        // because the fake invented a successful `printf`.
+        "function deploy(cap) { return typeof cap.spawn === 'function'; }".to_string(),
         "Deploy the application.".to_string(),
         vec!["deploy".to_string()],
         vec![SkillExport {
             name: "deploy".to_string(),
-            signature: "() => object".to_string(),
+            signature: "() => bool".to_string(),
         }],
-        vec!["deploy().code === 0".to_string()],
+        vec!["deploy() === true".to_string()],
         test_manifest(CapabilityTier::SideEffecting, vec![HostCapability::Spawn])?,
     )?)
 }

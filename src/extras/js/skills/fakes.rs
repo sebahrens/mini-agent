@@ -7,6 +7,10 @@
 //! - Record/replay: all I/O is recorded and can be inspected
 //! - Virtual: they never access the real filesystem, network, or process launcher
 //! - Scoped: state resets for each artifact verification
+//! - Fixture-only: every effect a case exercises must be declared as a fixture. An
+//!   undeclared read, spawn, or fetch fails and is recorded as a failed attempt; the
+//!   fakes never invent a response, because a verification that passes against an
+//!   invented response is not evidence.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,7 +21,14 @@ use crate::extras::js::skills::{CapabilityManifest, HostCapability};
 
 /// Version of the fake host implementation. Bumping this invalidates existing
 /// verification reports.
-pub const FAKES_VERSION: u32 = 3;
+///
+/// Version 4 made an unfixtured `spawn` and an unfixtured `fetch` fail the way an
+/// unseeded `read_file` already did. Earlier versions answered an undeclared effect
+/// with a synthetic success (`simulated <program> completed` with exit code 0, and an
+/// HTTP 200 JSON body), so a candidate that shelled out to a real executable or
+/// depended on a real HTTP response could pass on a response the harness invented.
+/// Reports produced under those versions are not evidence and must not be reused.
+pub const FAKES_VERSION: u32 = 4;
 
 /// Maximum total size of all virtual files in bytes.
 const FAKES_TOTAL_FILE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
@@ -78,6 +89,23 @@ impl VerificationTranscriptBudget {
     pub(crate) fn exceeded(&self) -> bool {
         self.state.lock().unwrap().exceeded
     }
+}
+
+/// The failure an undeclared spawn produces, naming the exact command that had no fixture.
+///
+/// Verification has no real process launcher, so the only honest answer to a command the
+/// verifier was never given a response for is "missing fixture". The program and its exact
+/// argument vector are named so a skill author can declare the fixture the case needs.
+fn missing_spawn_fixture(program: &str, args: &[String]) -> String {
+    format!("Spawn fixture not found: {program} {args:?}")
+}
+
+/// The failure an undeclared fetch produces, naming the exact request that had no fixture.
+///
+/// The method is the normalized (uppercase) one the fixture table is keyed by, so the message
+/// names the request as the fixture must declare it.
+fn missing_fetch_fixture(method: &str, url: &str) -> String {
+    format!("Fetch fixture not found: {method} {url}")
 }
 
 fn string_wire_upper_bound(value: &str) -> usize {
@@ -448,7 +476,9 @@ impl FakeHostGlobals {
         result
     }
 
-    /// Simulate a spawn operation. Fails if not declared in capability manifest.
+    /// Replay a spawn fixture. Fails if `spawn` is not declared in the capability
+    /// manifest, if the operation cap is reached, or if no fixture declares this exact
+    /// program and argument vector.
     pub fn spawn(&self, program: &str, args: &[String]) -> Result<FakeSpawnResponse, String> {
         if !self.manifest.allows(HostCapability::Spawn) {
             return Err("spawn not declared in capability manifest".to_string());
@@ -465,29 +495,28 @@ impl FakeHostGlobals {
             return Err("spawn limit exceeded".to_string());
         }
 
-        let response = state
-            .spawn_fixtures
-            .get(&(program.to_string(), args.to_vec()))
-            .cloned()
-            .unwrap_or_else(|| FakeSpawnResponse {
-                stdout: format!("simulated {program} completed\n"),
-                stderr: String::new(),
-                code: 0,
-                timed_out: false,
-                stdout_truncated: false,
-                stderr_truncated: false,
-            });
-        let result_json = serde_json::to_string(&response).map_err(|error| error.to_string())?;
-        let result = Ok(result_json);
+        // An unfixtured command has no honest answer: fabricating one would let a
+        // candidate that shells out to a real executable pass on invented evidence.
+        // The attempt is still recorded, exactly as an unseeded `read_file` is.
+        let key = (program.to_string(), args.to_vec());
+        let response = state.spawn_fixtures.get(&key).cloned();
+        let recorded = match &response {
+            Some(response) => {
+                Ok(serde_json::to_string(response).map_err(|error| error.to_string())?)
+            }
+            None => Err(missing_spawn_fixture(program, args)),
+        };
         state.transcript.spawns.push(FakeSpawnRecord {
-            program: program.to_string(),
-            args: args.to_vec(),
-            result: result.clone(),
+            program: key.0,
+            args: key.1,
+            result: recorded,
         });
-        Ok(response)
+        response.ok_or_else(|| missing_spawn_fixture(program, args))
     }
 
-    /// Simulate a fetch operation. Fails if not declared in capability manifest.
+    /// Replay a fetch fixture. Fails if `fetch` is not declared in the capability
+    /// manifest, if the operation cap is reached, or if no fixture declares this exact
+    /// method and URL.
     pub fn fetch(&self, url: &str, method: &str) -> Result<FakeFetchResponse, String> {
         if !self.manifest.allows(HostCapability::Fetch) {
             return Err("fetch not declared in capability manifest".to_string());
@@ -504,28 +533,26 @@ impl FakeHostGlobals {
             return Err("fetch limit exceeded".to_string());
         }
 
+        // An unfixtured request has no honest answer: fabricating a 200 would let a
+        // candidate that depends on a real HTTP response pass on invented evidence.
+        // The attempt is still recorded, exactly as an unseeded `read_file` is.
         let normalized_method = method.to_ascii_uppercase();
         let response = state
             .fetch_fixtures
             .get(&(url.to_string(), normalized_method.clone()))
-            .cloned()
-            .unwrap_or_else(|| FakeFetchResponse {
-                status: 200,
-                body: serde_json::json!({
-                    "ok": true,
-                    "method": normalized_method,
-                    "url": url,
-                })
-                .to_string(),
-            });
-        let result_json = serde_json::to_string(&response).map_err(|error| error.to_string())?;
-        let result = Ok(result_json);
+            .cloned();
+        let recorded = match &response {
+            Some(response) => {
+                Ok(serde_json::to_string(response).map_err(|error| error.to_string())?)
+            }
+            None => Err(missing_fetch_fixture(&normalized_method, url)),
+        };
         state.transcript.fetches.push(FakeFetchRecord {
             url: url.to_string(),
             method: method.to_string(),
-            result,
+            result: recorded,
         });
-        Ok(response)
+        response.ok_or_else(|| missing_fetch_fixture(&normalized_method, url))
     }
 }
 

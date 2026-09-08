@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(report.identity_version, s.identity_version);
         assert_eq!(report.capability, s.capability);
         assert!(report.verifier_version > 0);
-        assert_eq!(report.fakes_version, 3);
+        assert_eq!(report.fakes_version, 4);
         assert!(report.memory_limit > 0);
         assert!(report.stack_limit > 0);
     }
@@ -1293,5 +1293,152 @@ mod failure_attribution {
             Some("canary".to_string())
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Every effect a case exercises must be declared as a fixture.
+///
+/// Before fakes v4 an unfixtured `spawn` answered `simulated <program> completed` with
+/// exit code 0 and an unfixtured `fetch` answered HTTP 200 with a synthetic JSON body,
+/// while an unseeded `read_file` failed with `File not found:`. A candidate that shelled
+/// out to a real executable or depended on a real HTTP response therefore passed its
+/// embedded tests and its held-out suite against a response the harness invented, and was
+/// admitted on evidence that proved nothing. Both undeclared effects now fail the way
+/// `read_file` always did, the attempt is still recorded in the transcript, and a declared
+/// fixture still replays unchanged.
+#[cfg(test)]
+mod undeclared_effect_fixtures {
+    use crate::extras::js::skills::fakes::{
+        FakeFetchFixture, FakeFetchResponse, FakeSpawnFixture, FakeSpawnResponse,
+    };
+    use crate::extras::js::skills::held_out::ExpectedJsValue;
+    use crate::extras::js::skills::verify::verify_held_out_case;
+    use crate::extras::js::skills::{
+        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
+    };
+    use std::collections::BTreeMap;
+
+    /// The embedded test is never executed here: `verify_held_out_case` sends exactly one
+    /// held-out case, which is the only kind of case that can carry fixtures.
+    fn probe_artifact(source: &str, capability: HostCapability) -> SkillArtifact {
+        SkillArtifact::new(
+            source.to_string(),
+            "undeclared effect probe".to_string(),
+            vec![],
+            vec![SkillExport {
+                name: "probe".to_string(),
+                signature: "probe(): string".to_string(),
+            }],
+            vec!["typeof probe === 'function'".to_string()],
+            test_manifest(CapabilityTier::SideEffecting, vec![capability]).expect("manifest"),
+        )
+        .expect("artifact")
+    }
+
+    #[test]
+    fn an_unfixtured_spawn_fails_and_a_declared_fixture_still_replays() {
+        let skill = probe_artifact(
+            "function probe(cap) { try { const r = cap.spawn('printf', ['check']); return 'ok:' + r.code + ':' + r.stdout; } catch (_) { return 'threw'; } }",
+            HostCapability::Spawn,
+        );
+
+        let undeclared = verify_held_out_case(
+            &skill,
+            "probe()",
+            &ExpectedJsValue::String("threw".to_string()),
+            &BTreeMap::new(),
+            &[],
+            &[],
+        )
+        .expect("an unfixtured spawn must fail inside the skill instead of fabricating a success");
+        assert_eq!(
+            undeclared.spawns.len(),
+            1,
+            "the unfixtured attempt must still be recorded: {undeclared:?}"
+        );
+        assert_eq!(undeclared.spawns[0].program, "printf");
+        assert_eq!(undeclared.spawns[0].args.as_slice(), ["check"]);
+        assert_eq!(
+            undeclared.spawns[0].result,
+            Err(r#"Spawn fixture not found: printf ["check"]"#.to_string()),
+            "the failure must name the program and arguments that had no fixture"
+        );
+
+        let declared = verify_held_out_case(
+            &skill,
+            "probe()",
+            &ExpectedJsValue::String("ok:7:hello\n".to_string()),
+            &BTreeMap::new(),
+            &[FakeSpawnFixture {
+                program: "printf".to_string(),
+                args: vec!["check".to_string()],
+                response: FakeSpawnResponse {
+                    stdout: "hello\n".to_string(),
+                    stderr: String::new(),
+                    code: 7,
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            }],
+            &[],
+        )
+        .expect("a declared spawn fixture must still replay unchanged");
+        assert_eq!(declared.spawns.len(), 1);
+        assert!(
+            declared.spawns[0].result.is_ok(),
+            "a fixtured spawn must record a successful replay: {declared:?}"
+        );
+    }
+
+    #[test]
+    fn an_unfixtured_fetch_fails_and_a_declared_fixture_still_replays() {
+        let skill = probe_artifact(
+            "function probe(cap) { try { const r = cap.fetch('https://example.com'); return 'ok:' + r.status + ':' + r.body; } catch (_) { return 'threw'; } }",
+            HostCapability::Fetch,
+        );
+
+        let undeclared = verify_held_out_case(
+            &skill,
+            "probe()",
+            &ExpectedJsValue::String("threw".to_string()),
+            &BTreeMap::new(),
+            &[],
+            &[],
+        )
+        .expect("an unfixtured fetch must fail inside the skill instead of fabricating a 200");
+        assert_eq!(
+            undeclared.fetches.len(),
+            1,
+            "the unfixtured attempt must still be recorded: {undeclared:?}"
+        );
+        assert_eq!(undeclared.fetches[0].url, "https://example.com");
+        assert_eq!(
+            undeclared.fetches[0].result,
+            Err("Fetch fixture not found: GET https://example.com".to_string()),
+            "the failure must name the method and URL that had no fixture"
+        );
+
+        let declared = verify_held_out_case(
+            &skill,
+            "probe()",
+            &ExpectedJsValue::String("ok:204:seeded".to_string()),
+            &BTreeMap::new(),
+            &[],
+            &[FakeFetchFixture {
+                url: "https://example.com".to_string(),
+                method: "GET".to_string(),
+                response: FakeFetchResponse {
+                    status: 204,
+                    body: "seeded".to_string(),
+                },
+            }],
+        )
+        .expect("a declared fetch fixture must still replay unchanged");
+        assert_eq!(declared.fetches.len(), 1);
+        assert!(
+            declared.fetches[0].result.is_ok(),
+            "a fixtured fetch must record a successful replay: {declared:?}"
+        );
     }
 }

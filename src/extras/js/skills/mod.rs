@@ -31,6 +31,9 @@ pub mod admission;
 mod admission_store;
 pub mod capability;
 pub mod coordinator;
+/// Offline distillation of a recorded JavaScript tool call into an importable
+/// learned-skill proposal package.
+pub mod distill;
 pub mod embed;
 pub mod fakes;
 pub mod feedback;

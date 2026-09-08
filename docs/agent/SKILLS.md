@@ -115,6 +115,8 @@ Learned-skill lifecycle commands run before provider initialization and use the 
 directory as their OS-account authentication boundary:
 
 ```text
+mini-agent --distill-learned-skill <session-id> <tool-call-id> \
+  [--distill-learned-skill-out <path.json>]
 mini-agent --import-learned-skill <package.json|directory>
 mini-agent --install-learned-skill-seeds
 mini-agent --list-learned-skill-proposals
@@ -177,9 +179,11 @@ ID, or explicit `no_verify_command`. Production status comes from the session co
 evidence cannot fall back to invocation counts when the task threshold is unmet.
 
 The operator Skill Gym is documented in [GYM.md](GYM.md). It exercises paired no-library/library
-tasks and the real lifecycle/store boundary, but its evidence is non-production. There is no
-shipped successful-step distiller: converting recorded JavaScript into a `propose_skill` draft is
-deferred work, and a gym report never changes lifecycle state by itself.
+tasks and the real lifecycle/store boundary, but its evidence is non-production, and a gym report
+never changes lifecycle state by itself. Converting recorded JavaScript into a proposal package is
+`--distill-learned-skill`, described in
+[Distilling a recorded JavaScript tool call](#distilling-a-recorded-javascript-tool-call); it
+writes a file for the same human-gated import route and admits nothing on its own.
 
 ## The `_cap` calling convention
 
@@ -337,6 +341,106 @@ rather than leaving a partial library.
 }
 ```
 
+## Distilling a recorded JavaScript tool call
+
+Everything above assumes a package already exists. `--distill-learned-skill` is how one gets
+written from work the agent already did:
+
+```text
+mini-agent --distill-learned-skill <session-id> <tool-call-id>
+```
+
+The two arguments name a persisted `js` tool call. `<session-id>` is a session under
+`<state>/sessions`; `<tool-call-id>` is the `tool_call_id` of a message whose role is `tool_call`
+and whose payload is a `js` call. A `tool_result` or `subagent_tool_call` record with the same id
+is refused by name rather than silently distilled — a subagent record carries a different payload.
+
+The command:
+
+1. loads the session and extracts the `code` argument of that call;
+2. asks the operator's configured provider **once** to rewrite the snippet as a named function with
+   parameters instead of the values that were hard-coded for that one session, plus a description,
+   embedded tests and hidden held-out expressions;
+3. validates that draft against the real proposal and held-out types, canonicalizes it, and builds
+   the held-out selector from the **canonicalized artifact** so the suite matches the artifact
+   shipped beside it;
+4. writes a `{proposal, held_out_suites}` file and prints the path and the next command.
+
+Nothing is imported, verified, approved or activated. The output is a file; the human is still the
+approver.
+
+The default destination is `<local-data>/skills/distilled/<sanitized-tool-call-id>.json`;
+`--distill-learned-skill-out <path>` chooses another. **An existing file is never overwritten** —
+a distilled package is a draft meant to be edited, so a second run against an occupied destination
+fails and names the two ways out (remove the file, or pass a different `--distill-learned-skill-out`).
+
+### What the model does and does not decide
+
+The model supplies text only: an export name and signature, a description, a source body, test
+expressions, held-out expressions and tags. Everything with an admission or containment
+consequence is built in Rust and is not negotiable:
+
+- **`capability` is always `{"tier": "pure", "grants": []}`.** Verification hands a skill fakes
+  rather than real effects, and an undeclared effect fails the case outright, so pure computation
+  over the call's arguments is the only distillation target that can be honestly evaluated
+  offline. If the recording called `read_file`, `spawn`, `fetch` or any other host global, the
+  report names them on a `learned-skill distill note:` line and the operator must widen
+  `capability` and add `fake_files`/`fake_spawns`/`fake_fetches` by hand before importing.
+- **Every held-out case expects the boolean `true`**, never a value the model chose.
+- **The selector** is the artifact's normalized tags, its exports and its tier — not text the model
+  wrote.
+- A generation whose `source` does not declare `function <name>(_cap, …)` is **rejected**, because
+  argument 0 is the injected capability object (see
+  [The `_cap` calling convention](#the-_cap-calling-convention)). So is a test or held-out
+  expression that does not look like a boolean assertion: `run()` is refused, `run() === 2` is
+  kept.
+- Every distilled proposal carries the tag `distilled`.
+
+### When the model is unavailable
+
+If there is no usable provider, the request times out, the reply does not parse, or the draft
+fails any check above, the command does **not** fail silently and does **not** write a broken file.
+It writes a scaffold instead: the recorded snippet wrapped in `function distilledStep(_cap) { … }`,
+with `TODO` comments naming every part a human must finish, and prints
+
+```text
+learned-skill distill: path=… id=… export=distilledStep tier=pure tests=1 held_out_cases=1 generalization=scaffold effects=- complete=false
+learned-skill distill note: generalization unavailable (<reason>); complete every TODO marker in the file before importing.
+learned-skill distill next: mini-agent --import-learned-skill …
+```
+
+A scaffold is a valid package — it loads through the same `deny_unknown_fields` shape — but its
+test and its held-out case both reference an undefined identifier on purpose, so an unfinished
+scaffold cannot pass verification and cannot be admitted by accident. `generalization=scaffold`
+and `complete=false` say which path was taken.
+
+### The whole loop
+
+```text
+$ mini-agent --distill-learned-skill 2026-09-08-a1b2c3 toolu_01XYZ
+learned-skill distill: path=/…/skills/distilled/toolu_01XYZ.json id=9f… export=normalizeSemver tier=pure tests=2 held_out_cases=3 generalization=model effects=- complete=true
+learned-skill distill next: mini-agent --import-learned-skill /…/skills/distilled/toolu_01XYZ.json
+```
+
+The emitted file is a package exactly like the worked example above: one `proposal` with
+`capability.tier` `pure` and the `distilled` tag, and one `held_out_suites` entry whose selector
+names that artifact's tags, exports and tier, with one boolean case per held-out expression.
+
+Read it before importing — it is a draft, and the source is about to become an immutable identity.
+Then run the ordinary route:
+
+```text
+mini-agent --import-learned-skill /…/skills/distilled/toolu_01XYZ.json
+# -> learned-skill import: id=9f… status=awaiting_approval …
+mini-agent --approve-learned-skill 9f…
+mini-agent --activate-learned-skill 9f…
+```
+
+Import registers the trusted baseline, enqueues the immutable artifact and evaluates it in the
+contained worker; approval moves it to a non-retrievable canary; activation publishes the
+lineage-root skill. Editing the file changes its id, so an edit means importing a different
+proposal, not amending this one.
+
 ## What verification can see
 
 Admission verification runs the artifact in the broker-only worker with the effect handler that
@@ -363,13 +467,13 @@ For a declared effect the fakes behave as follows, and the difference matters:
 | --- | --- | --- |
 | `read_file` | returns the `fake_files` contents | fails the call with `File not found: <path>` |
 | `write_file` | writes into the virtual file map | — |
-| `spawn` | returns the matching `fake_spawns` response | returns a **synthetic success**: `stdout` = `simulated <program> completed`, exit code 0 |
-| `fetch` | returns the matching `fake_fetches` response | returns a **synthetic** HTTP 200 with a small JSON body echoing the method and URL |
+| `spawn` | returns the matching `fake_spawns` response | fails the call with `Spawn fixture not found: <program> <args>` |
+| `fetch` | returns the matching `fake_fetches` response | fails the call with `Fetch fixture not found: <METHOD> <url>` |
 
-So a skill that genuinely depends on a real `rg`, or on a specific HTTP response body, is not
-actually tested at admission: the unfixtured call succeeds against a fabricated result. Pin the
-behaviour you rely on with `fake_spawns`/`fake_fetches`, and treat a green admission report as
-evidence about the code, not about the host.
+The fakes never invent a response: a skill that depends on a real `rg` or on a specific HTTP
+response body must pin that behaviour with `fake_spawns`/`fake_fetches`, or the case fails. Even
+so, treat a green admission report as evidence about the code against the fixtures it was given,
+not about the host.
 
 ## `verified` with `held_out_suite_required`
 

@@ -365,6 +365,44 @@ pub struct Cli {
 
     #[cfg(feature = "skills")]
     #[arg(
+        long = "distill-learned-skill",
+        value_names = ["SESSION_ID", "TOOL_CALL_ID"],
+        num_args = 2,
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "learned_skill_proposal",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill",
+            "retire_learned_skill",
+            "reevaluate_learned_skill"
+        ],
+        help = "Distil the JavaScript of one persisted tool call into a learned-skill proposal \
+                package for --import-learned-skill: reads the session's `js` tool call, asks the \
+                configured provider once to generalize it, and writes the package. Nothing is \
+                imported, verified or approved"
+    )]
+    pub distill_learned_skill: Option<Vec<String>>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "distill-learned-skill-out",
+        value_name = "PATH",
+        requires = "distill_learned_skill",
+        help = "Write the distilled package to this path instead of the default under the \
+                learned-skill data directory"
+    )]
+    pub distill_learned_skill_out: Option<std::path::PathBuf>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
         long = "learned-skill-json",
         visible_alias = "json",
         help = "Emit learned-skill operator command results as one JSON object per line"
@@ -1353,6 +1391,79 @@ mod tests {
             !Cli::try_parse_from(["mini-agent"])
                 .unwrap()
                 .learned_skill_json
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn distill_learned_skill_takes_a_session_and_tool_call_and_conflicts_with_its_siblings() {
+        let distilled = Cli::try_parse_from([
+            "mini-agent",
+            "--distill-learned-skill",
+            "session-1",
+            "toolu_01",
+        ])
+        .unwrap();
+        assert_eq!(
+            distilled.distill_learned_skill,
+            Some(vec!["session-1".to_string(), "toolu_01".to_string()])
+        );
+        assert!(distilled.distill_learned_skill_out.is_none());
+
+        // Both values are required: one identifier cannot name a tool call.
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--distill-learned-skill", "session-1"]).is_err()
+        );
+
+        let redirected = Cli::try_parse_from([
+            "mini-agent",
+            "--distill-learned-skill",
+            "session-1",
+            "toolu_01",
+            "--distill-learned-skill-out",
+            "draft.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            redirected.distill_learned_skill_out,
+            Some(std::path::PathBuf::from("draft.json"))
+        );
+        // The destination is meaningless without the command that fills it.
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--distill-learned-skill-out", "draft.json"])
+                .is_err()
+        );
+
+        for conflicting in [
+            "--learned-skill-stats",
+            "--list-learned-skill-proposals",
+            "--compact-learned-skill-events",
+            "--install-learned-skill-seeds",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "mini-agent",
+                    "--distill-learned-skill",
+                    "session-1",
+                    "toolu_01",
+                    conflicting,
+                ])
+                .is_err(),
+                "{conflicting} must conflict with --distill-learned-skill"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--distill-learned-skill",
+                "session-1",
+                "toolu_01",
+                "--import-learned-skill",
+                "package.json",
+            ])
+            .is_err(),
+            "distillation writes the package --import-learned-skill later reads; they are two \
+             separate operator steps"
         );
     }
 }

@@ -287,6 +287,21 @@ async fn run_inner() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Distillation is the only learned-skill command that reaches a provider,
+    // so it sits apart from the store-only operator funnel below. It still
+    // writes nothing to the library: its output is a package file the operator
+    // reviews and then hands to `--import-learned-skill`.
+    #[cfg(feature = "skills")]
+    if let Some(target) = cli.distill_learned_skill.as_deref() {
+        let [session_id, tool_call_id] = target else {
+            anyhow::bail!("--distill-learned-skill takes exactly a session id and a tool call id");
+        };
+        extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id)
+            .await
+            .map_err(operator_command_failure)?;
+        return Ok(());
+    }
+
     #[cfg(feature = "skills")]
     if cli.purge_learned_skill.is_some()
         || cli.compact_learned_skill_events

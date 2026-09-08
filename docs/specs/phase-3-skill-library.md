@@ -472,6 +472,28 @@ permission service, process launcher, or network. Unconfigured operations fail d
 Trusted held-out cases may supply hidden fake responses and assert the recorded call transcript.
 Embedded tests cannot inspect hidden fixtures or replace fake implementations.
 
+**Every effect a skill exercises under verification must be declared as a fixture, and an
+undeclared effect fails the case.** The fakes replay declared fixtures; they never invent a
+response. An unseeded `read_file` fails with `File not found: <path>`, an unfixtured `spawn`
+fails with `Spawn fixture not found: <program> <args>`, and an unfixtured `fetch` fails with
+`Fetch fixture not found: <METHOD> <url>`. Each failure names the missing declaration so a skill
+author can supply it, and each undeclared attempt is still recorded in the transcript as an
+attempt with a failed result, so the transcript remains a complete record of what the candidate
+tried to do. Fixtures can only be attached to a trusted held-out case, so a Tier 2 candidate
+proves its effect behaviour there; an embedded test that reaches for `read_file`, `spawn`, or
+`fetch` has no fixture to replay and therefore fails. `write_file` needs no fixture: it records
+into the case's own virtual filesystem instead of consuming a response the verifier would have
+to supply, and a later `read_file` of a path the same case wrote replays that write.
+
+Until fakes version 4 this held only for `read_file`. An unfixtured `spawn` returned a synthetic
+`simulated <program> completed` with exit code 0, and an unfixtured `fetch` returned a synthetic
+HTTP 200 JSON body. A proposed skill that shelled out to a real executable, or that depended on a
+real HTTP response, therefore passed both its embedded tests and its held-out suite against a
+response the harness had invented, and was admitted on evidence that proved nothing about its
+behaviour — the mechanism behind a skill reporting complete success while returning semantically
+wrong data. `FAKES_VERSION` is 4; reports produced under an earlier fakes version are not
+evidence and are refused by the admission gate.
+
 Delivered Phase 3 verification errors included the stage/test index and bounded stack information
 but never activated or persisted the artifact. Phase 6 supersedes stack/message disclosure with its
 stable sanitized error code, closed stage/script role, and source-free numeric location metadata.
@@ -547,6 +569,8 @@ All must pass under `cargo test --features js,skills`:
 - [x] No-effect verification requires nonempty exact-boolean tests, gives Tier 0 no host globals,
       gives Tier 1/2 only declared deterministic in-memory fakes, and mutation checks prove every
       declared export affects at least one test.
+- [x] An effect with no declared fixture fails the case and is recorded as a failed attempt:
+      `read_file`, `spawn`, and `fetch` all behave alike, and no fake fabricates a success.
 - [x] Embeddings are generated at admission/migration and tagged with model revision/dimensions.
 - [x] The fastembed model and bounded query cache are reused; request-time retrieval never lazily
       embeds a stored skill.
