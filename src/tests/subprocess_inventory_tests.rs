@@ -2025,6 +2025,26 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/sandbox.rs", "status.success(),", 1, "NON-PROCESS"),
+    // FakeStep response fields in the rendered-output budget regressions.
+    // These vec! bodies contain no process receiver or terminal call.
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"x\\n\".repeat(160)),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(String::new()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(response.into()),",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Err(\"boom\".into()),",
@@ -2064,7 +2084,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"must not start\".into()),",
-        5,
+        6,
         "NON-PROCESS",
     ),
     (
@@ -2781,6 +2801,18 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/subagents/task_tool.rs",
         &[
+            (
+                "e56ebbde3b87e7449cf7d734dabaddf4963dbf3c2548ae0a7c393bf165a29b14",
+                1,
+            ),
+            (
+                "8736900ea9356e3180408c8a88e523bfb2e418de1adfd6255713e395822e6f41",
+                1,
+            ),
+            (
+                "a77ad0065bc0cc36c152ac342277fdeff0edce4ae455e44c3a686dab6c5bd3a3",
+                1,
+            ),
             (
                 "5b355171d273f77d7a74c57959ccae1ff1c7f4e15189cc8f15c170bf3be44c3b",
                 1,
