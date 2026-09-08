@@ -912,7 +912,7 @@ fn write_package(path: &Path, package: &DistilledPackage) -> anyhow::Result<()> 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        crate::fs::ensure_private_directory(parent).with_context(|| {
+        crate::fs::ensure_export_parent_directory(parent).with_context(|| {
             format!(
                 "failed to create the distilled-package directory {}",
                 parent.display()
@@ -922,7 +922,7 @@ fn write_package(path: &Path, package: &DistilledPackage) -> anyhow::Result<()> 
     let mut bytes =
         serde_json::to_vec_pretty(package).context("failed to serialize distilled package")?;
     bytes.push(b'\n');
-    crate::fs::private_atomic_create_sync(path, &bytes).map_err(|error| {
+    crate::fs::private_atomic_create_export_sync(path, &bytes).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow::anyhow!(
                 "{} already exists; a distilled package is a draft, so it is never overwritten. \
@@ -1423,5 +1423,87 @@ mod tests {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(name, "toolu_01-------etc.json", "{name}");
         assert!(path.parent().unwrap().ends_with("distilled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporting_preserves_an_existing_destination_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o755u32, 0o770] {
+            let root = std::env::temp_dir().join(format!(
+                "skill-distill-export-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            let path = root.join("draft.json");
+            let (package, _) = package_from_generation(generation(), "session-1", "call-target")
+                .expect("a well-formed generation");
+
+            write_package(&path, &package).expect("export");
+            let after = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                after, mode,
+                "an operator's own output directory must keep its permissions"
+            );
+            // The draft itself stays private.
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+
+            // A refused second export must not change the directory either.
+            let error = write_package(&path, &package).expect_err("a draft is never overwritten");
+            assert!(format!("{error:#}").contains("already exists"));
+            let after = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(after, mode);
+
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_export_directory_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "skill-distill-export-new-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let nested = root.join("nested");
+        let path = nested.join("draft.json");
+        let (package, _) = package_from_generation(generation(), "session-1", "call-target")
+            .expect("a well-formed generation");
+
+        write_package(&path, &package).expect("export");
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a directory this export created stays private");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_export_destination_behind_a_symlinked_parent_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "skill-distill-export-link-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let (package, _) = package_from_generation(generation(), "session-1", "call-target")
+            .expect("a well-formed generation");
+
+        let error = write_package(&link.join("draft.json"), &package)
+            .expect_err("a symlinked output parent must be refused");
+        assert!(!real.join("draft.json").exists(), "{error:#}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

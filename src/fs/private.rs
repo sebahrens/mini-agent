@@ -39,6 +39,23 @@ fn open_existing_stage<T>(_stage: &'static str, result: std::io::Result<T>) -> s
 
 #[cfg(unix)]
 pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
+    ensure_directory_inner(path, true)
+}
+
+/// Create the parent of a user-selected export destination.
+///
+/// Application-private state is created and repaired at 0700, but an operator's
+/// own output directory is not application state: an export must not silently
+/// narrow the permissions or ACLs of a directory that already exists. Missing
+/// components are still created privately, and the no-follow/ownership checks
+/// are unchanged.
+#[cfg(unix)]
+pub(crate) fn ensure_export_directory(path: &Path) -> std::io::Result<()> {
+    ensure_directory_inner(path, false)
+}
+
+#[cfg(unix)]
+fn ensure_directory_inner(path: &Path, repair_existing: bool) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
     if path.file_name().is_none() {
@@ -48,6 +65,11 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
         ));
     }
 
+    let existed = match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(stage_error("directory_inspection", error)),
+    };
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder
@@ -71,9 +93,11 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
         .map_err(|error| stage_error("directory_open_identity", error))?;
     super::ensure_same_file(path, &before, &opened)
         .map_err(|error| stage_error("directory_initial_revalidation", error))?;
-    directory
-        .set_permissions(std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| stage_error("directory_permissions", error))?;
+    if repair_existing || !existed {
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| stage_error("directory_permissions", error))?;
+    }
     let after = super::checked_path_metadata(path)
         .map_err(|error| stage_error("directory_final_identity", error))?;
     super::ensure_same_file(path, &opened, &after)
@@ -171,13 +195,32 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_create_with_parent_policy(path, bytes, true)
+}
+
+/// Create a private, create-only file at a user-selected export destination.
+///
+/// The file itself keeps 0600 and the atomic no-follow publication; only the
+/// treatment of an already existing parent differs from `atomic_create`.
+#[cfg(unix)]
+pub(crate) fn atomic_create_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_create_with_parent_policy(path, bytes, false)
+}
+
+#[cfg(unix)]
+fn atomic_create_with_parent_policy(
+    path: &Path,
+    bytes: &[u8],
+    repair_existing_parent: bool,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "private file must have a parent directory",
         )
     })?;
-    ensure_directory(parent).map_err(|error| stage_error("create_parent", error))?;
+    ensure_directory_inner(parent, repair_existing_parent)
+        .map_err(|error| stage_error("create_parent", error))?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(std::io::Error::new(
@@ -246,13 +289,26 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{atomic_create, atomic_write, ensure_directory, open_existing};
+pub(crate) use windows::{
+    atomic_create, atomic_create_export, atomic_write, ensure_directory, ensure_export_directory,
+    open_existing,
+};
 
 #[cfg(all(test, windows))]
 pub(crate) use windows::dacl_sddl;
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn ensure_directory(_path: &Path) -> std::io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn ensure_export_directory(_path: &Path) -> std::io::Result<()> {
+    Err(unsupported())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn atomic_create_export(_path: &Path, _bytes: &[u8]) -> std::io::Result<()> {
     Err(unsupported())
 }
 
@@ -678,6 +734,16 @@ mod windows {
     }
 
     pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
+        ensure_directory_inner(path, true)
+    }
+
+    /// See the Unix `ensure_export_directory`: an operator's existing output
+    /// directory keeps its ACL, while missing components are created private.
+    pub(crate) fn ensure_export_directory(path: &Path) -> std::io::Result<()> {
+        ensure_directory_inner(path, false)
+    }
+
+    fn ensure_directory_inner(path: &Path, repair_existing: bool) -> std::io::Result<()> {
         if path.file_name().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -697,7 +763,7 @@ mod windows {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    ensure_directory(parent)?;
+                    ensure_directory_inner(parent, repair_existing)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -707,7 +773,11 @@ mod windows {
                 if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
                     && metadata.is_dir() =>
             {
-                repair_path(path, true)
+                if repair_existing {
+                    repair_path(path, true)
+                } else {
+                    Ok(())
+                }
             }
             Ok(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -840,6 +910,13 @@ mod windows {
     }
 
     pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        atomic_write_mode(path, bytes, true)
+    }
+
+    pub(crate) fn atomic_create_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        // The Windows publication path creates the file with a private
+        // descriptor and never rewrites an existing parent's ACL, so the export
+        // variant differs only in the directory policy applied by the caller.
         atomic_write_mode(path, bytes, true)
     }
 
