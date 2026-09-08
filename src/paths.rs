@@ -213,13 +213,28 @@ impl WorkspaceBinding {
         result
     }
 
+    /// Replace a workspace file whose contents the caller does not claim to have
+    /// based its replacement on. Only inode identity is enforced.
     pub(crate) fn replace_relative_atomic(
         &self,
         path: &Path,
         content: &[u8],
         expected: &crate::fs::CheckedMetadata,
     ) -> io::Result<()> {
-        self.replace_relative_atomic_with_hook(path, content, expected, || {})
+        self.replace_relative_atomic_with_hook(path, content, expected, None, || {})
+    }
+
+    /// Replace a workspace file only while it still holds exactly the bytes the
+    /// replacement was computed from. An editor or background job that rewrote
+    /// the same inode after the agent read it is not overwritten.
+    pub(crate) fn replace_relative_atomic_expecting(
+        &self,
+        path: &Path,
+        content: &[u8],
+        expected: &crate::fs::CheckedMetadata,
+        base: &crate::fs::ContentDigest,
+    ) -> io::Result<()> {
+        self.replace_relative_atomic_with_hook(path, content, expected, Some(base), || {})
     }
 
     fn replace_relative_atomic_with_hook(
@@ -227,6 +242,7 @@ impl WorkspaceBinding {
         path: &Path,
         content: &[u8],
         expected: &crate::fs::CheckedMetadata,
+        base: Option<&crate::fs::ContentDigest>,
         before_final_identity_check: impl FnOnce(),
     ) -> io::Result<()> {
         if !expected.is_file() {
@@ -246,6 +262,12 @@ impl WorkspaceBinding {
             ));
         }
         crate::fs::ensure_same_file(&path, expected, &current_metadata)?;
+        if let Some(base) = base
+            && !base.matches_file(&current)?
+        {
+            return Err(crate::fs::stale_content_error(&path));
+        }
+        drop(current);
         let temp = sibling_temp_name(&name);
         let result = (|| {
             let mut options = cap_std::fs::OpenOptions::new();
@@ -271,11 +293,34 @@ impl WorkspaceBinding {
                 ));
             }
             crate::fs::ensure_same_file(&path, expected, &current_metadata)?;
+            if let Some(base) = base
+                && !base.matches_file(&current)?
+            {
+                return Err(crate::fs::stale_content_error(&path));
+            }
             drop(current);
             before_final_identity_check();
             exchange_relative(&parent, &temp, &name)?;
 
             if entry_matches_regular_file(&parent, &temp, expected)? {
+                // The exchange displaced the approved inode to `temp`. Validate
+                // its contents at the publication point rather than before it,
+                // so a rewrite of that inode racing the final check is still
+                // caught and rolled back.
+                if let Some(base) = base {
+                    let displaced = open_file_no_follow(&parent, &temp)?;
+                    let unchanged = base.matches_file(&displaced)?;
+                    drop(displaced);
+                    if !unchanged {
+                        restore_after_failed_exchange(
+                            &parent,
+                            &temp,
+                            &name,
+                            &replacement_metadata,
+                        )?;
+                        return Err(crate::fs::stale_content_error(&path));
+                    }
+                }
                 parent.remove_file(&temp)?;
                 return Ok(());
             }
@@ -778,6 +823,7 @@ mod workspace_binding_tests {
             Path::new("target.txt"),
             b"agent replacement",
             &expected,
+            None,
             || std::fs::rename(root.join("concurrent.txt"), root.join("target.txt")).unwrap(),
         );
 
@@ -822,6 +868,7 @@ mod workspace_binding_tests {
             Path::new("directory-target"),
             b"agent replacement",
             &expected,
+            None,
             || {
                 std::fs::rename(
                     root.join("directory-target"),
@@ -846,6 +893,7 @@ mod workspace_binding_tests {
             Path::new("symlink-target"),
             b"agent replacement",
             &expected,
+            None,
             || {
                 std::fs::rename(
                     root.join("symlink-target"),
@@ -867,6 +915,117 @@ mod workspace_binding_tests {
             "referent"
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_replacement_rejects_a_concurrent_in_place_rewrite() {
+        let root = temp_root("stale-content");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "old contents").unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        let base = crate::fs::ContentDigest::of(b"old contents");
+        drop(opened);
+
+        // Same inode, new contents: identity is unchanged, so only the content
+        // snapshot can reject this replacement.
+        std::fs::write(&target, "concurrent user change").unwrap();
+        let result = binding.replace_relative_atomic_expecting(
+            Path::new("file.txt"),
+            b"agent edit based on old contents",
+            &expected,
+            &base,
+        );
+
+        assert!(result.is_err(), "stale replacement must not publish");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "concurrent user change",
+            "the newer user contents must survive"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_replacement_rejects_a_same_length_rewrite() {
+        let root = temp_root("stale-same-length");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "aaaa").unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        let base = crate::fs::ContentDigest::of(b"aaaa");
+        drop(opened);
+
+        std::fs::write(&target, "bbbb").unwrap();
+        let result = binding.replace_relative_atomic_expecting(
+            Path::new("file.txt"),
+            b"cccc",
+            &expected,
+            &base,
+        );
+
+        assert!(result.is_err(), "a same-length rewrite must be rejected");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "bbbb");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_replacement_publishes_when_contents_are_unchanged() {
+        let root = temp_root("fresh-content");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "old contents").unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        let base = crate::fs::ContentDigest::of(b"old contents");
+        drop(opened);
+
+        binding
+            .replace_relative_atomic_expecting(
+                Path::new("file.txt"),
+                b"agent edit",
+                &expected,
+                &base,
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "agent edit");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_replacement_rejects_a_rewrite_racing_the_publication_point() {
+        let root = temp_root("stale-at-publication");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "old contents").unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        let base = crate::fs::ContentDigest::of(b"old contents");
+        drop(opened);
+
+        // Rewrite the approved inode after the pre-publication check has run.
+        // Only the post-exchange revalidation can observe this, and it must
+        // roll the exchange back.
+        let raced = target.clone();
+        let result = binding.replace_relative_atomic_with_hook(
+            Path::new("file.txt"),
+            b"agent edit based on old contents",
+            &expected,
+            Some(&base),
+            move || std::fs::write(&raced, "concurrent user change").unwrap(),
+        );
+
+        assert!(result.is_err(), "a rewrite racing publication must not win");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "concurrent user change"
+        );
+        let entries = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(entries, 1, "rollback must leave no temporary files behind");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -907,6 +1066,7 @@ mod windows_workspace_binding_tests {
             Path::new("target.txt"),
             b"agent replacement",
             &expected,
+            None,
             || {
                 std::fs::rename(&target, &displaced).unwrap();
                 std::fs::rename(&raced, &target).unwrap();

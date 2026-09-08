@@ -488,6 +488,15 @@ impl std::ops::Deref for CheckedMetadata {
     }
 }
 
+impl CheckedMetadata {
+    /// The retained descriptor for the approved object. Only callers that know
+    /// the handle was opened readable may read through it; `checked_path_metadata`
+    /// uses `O_PATH` on Linux.
+    pub(crate) fn handle(&self) -> &std::fs::File {
+        &self.handle
+    }
+}
+
 fn checked_owned_file(
     file: std::fs::File,
     metadata: std::fs::Metadata,
@@ -611,6 +620,84 @@ pub(crate) async fn checked_tokio_file_metadata(
     {
         checked_owned_file(file, metadata)
     }
+}
+
+/// Digest of the exact bytes a caller read before computing a replacement.
+///
+/// Inode identity cannot detect an in-place rewrite of the same file, so a
+/// guarded replacement carries this snapshot from the read that produced the
+/// new contents and refuses to publish over anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentDigest {
+    len: u64,
+    hash: [u8; 32],
+}
+
+impl ContentDigest {
+    pub(crate) fn of(bytes: &[u8]) -> Self {
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        Self {
+            len: bytes.len() as u64,
+            hash: hasher.finalize().into(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether `file` still holds exactly the snapshotted bytes.
+    ///
+    /// Reading is bounded by the snapshot length plus one byte, so a file that
+    /// grew since the read is rejected without allocating its new contents.
+    pub(crate) fn matches_reader(&self, file: &mut impl std::io::Read) -> std::io::Result<bool> {
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut seen: u64 = 0;
+        loop {
+            let read = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            seen = seen.saturating_add(read as u64);
+            if seen > self.len {
+                return Ok(false);
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if seen != self.len {
+            return Ok(false);
+        }
+        let hash: [u8; 32] = hasher.finalize().into();
+        Ok(hash == self.hash)
+    }
+
+    /// Whether the regular file behind `file` still holds the snapshotted
+    /// bytes. The descriptor is read from its start without disturbing the
+    /// caller's cursor.
+    pub(crate) fn matches_file(&self, file: &std::fs::File) -> std::io::Result<bool> {
+        let mut handle = file.try_clone()?;
+        std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(0))?;
+        self.matches_reader(&mut handle)
+    }
+}
+
+/// The bytes a replacement was computed from are no longer the bytes on disk.
+pub(crate) fn stale_content_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "File changed after it was read: {}. Re-read the file and retry; the newer contents were kept.",
+            path.display()
+        ),
+    )
 }
 
 #[derive(Debug)]
@@ -947,6 +1034,7 @@ pub(crate) async fn atomic_write_resolved(
         path.as_ref(),
         contents.as_ref(),
         None,
+        None,
         AtomicWriteCancellation::default(),
     )
     .await
@@ -964,6 +1052,25 @@ pub(crate) async fn atomic_write_resolved_checked(
         path.as_ref(),
         contents.as_ref(),
         Some(approved_parent),
+        None,
+        AtomicWriteCancellation::default(),
+    )
+    .await
+}
+
+/// Replace an approved absolute path only while it still holds exactly the
+/// bytes the replacement was computed from.
+pub(crate) async fn atomic_write_resolved_expecting(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+    approved_parent: CheckedMetadata,
+    base: ContentDigest,
+) -> std::io::Result<()> {
+    atomic_write_resolved_inner(
+        path.as_ref(),
+        contents.as_ref(),
+        Some(approved_parent),
+        Some(base),
         AtomicWriteCancellation::default(),
     )
     .await
@@ -979,6 +1086,7 @@ pub(crate) async fn atomic_write_resolved_checked_cancellable(
         path.as_ref(),
         contents.as_ref(),
         Some(approved_parent),
+        None,
         cancellation,
     )
     .await
@@ -988,6 +1096,7 @@ async fn atomic_write_resolved_inner(
     path: &Path,
     contents: &[u8],
     approved_parent: Option<CheckedMetadata>,
+    expected_content: Option<ContentDigest>,
     cancellation: AtomicWriteCancellation,
 ) -> std::io::Result<()> {
     tracing::debug!(
@@ -1007,6 +1116,7 @@ async fn atomic_write_resolved_inner(
             &path,
             &contents,
             approved_parent.as_ref(),
+            expected_content.as_ref(),
             AtomicWriteMode::Replace,
             AtomicWriteFailure::None,
             &cancellation,
@@ -1052,6 +1162,7 @@ pub(crate) async fn atomic_create_resolved_checked_cancellable(
             &path,
             &contents,
             Some(&approved_parent),
+            None,
             AtomicWriteMode::CreateNew,
             AtomicWriteFailure::None,
             &cancellation,
@@ -1072,6 +1183,7 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
         path,
         contents,
         None,
+        None,
         AtomicWriteMode::Replace,
         AtomicWriteFailure::None,
         &AtomicWriteCancellation::default(),
@@ -1088,6 +1200,7 @@ pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Resul
         root,
         path,
         contents,
+        None,
         None,
         AtomicWriteMode::CreateNew,
         AtomicWriteFailure::None,
@@ -1106,6 +1219,7 @@ pub(crate) fn atomic_write_within_sync(
         path,
         contents,
         None,
+        None,
         AtomicWriteMode::Replace,
         AtomicWriteFailure::None,
         &AtomicWriteCancellation::default(),
@@ -1123,6 +1237,7 @@ pub(crate) fn atomic_write_with_failure_sync(
         approved_root,
         path,
         contents,
+        None,
         None,
         AtomicWriteMode::Replace,
         if fail_rename {
@@ -1197,11 +1312,13 @@ fn relative_target<'a>(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn atomic_write_within_sync_impl(
     approved_root: &Path,
     path: &Path,
     contents: &[u8],
     approved_parent: Option<&CheckedMetadata>,
+    expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
@@ -1242,6 +1359,7 @@ fn atomic_write_within_sync_impl(
             contents,
             &approved_root_metadata,
             approved_parent,
+            expected_content,
             mode,
             failure,
             cancellation,
@@ -1277,6 +1395,7 @@ fn atomic_write_platform(
     contents: &[u8],
     approved_root: &CheckedMetadata,
     approved_parent: Option<&CheckedMetadata>,
+    expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
@@ -1637,6 +1756,28 @@ fn atomic_write_platform(
         unlink_owned_temp(&directory, &temp_name, &temp_identity);
         return Err(error);
     }
+    // Inode identity cannot see an in-place rewrite of the approved file, so a
+    // caller that computed its replacement from the previous bytes verifies
+    // them here, immediately before the publication decision.
+    if let Some(expected) = expected_content {
+        let unchanged = match current_target.as_ref() {
+            Some(target) => expected.matches_file(target.handle()),
+            None => Ok(false),
+        };
+        let unchanged = match unchanged {
+            Ok(unchanged) => unchanged,
+            Err(error) => {
+                drop(temp);
+                unlink_owned_temp(&directory, &temp_name, &temp_identity);
+                return Err(error);
+            }
+        };
+        if !unchanged {
+            drop(temp);
+            unlink_owned_temp(&directory, &temp_name, &temp_identity);
+            return Err(stale_content_error(&target_path));
+        }
+    }
 
     let current_directory_metadata =
         match open_parent(canonical_root, relative_parent, approved_root)
@@ -1751,6 +1892,7 @@ fn atomic_write_platform(
     contents: &[u8],
     approved_root: &CheckedMetadata,
     approved_parent: Option<&CheckedMetadata>,
+    expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
@@ -2042,6 +2184,26 @@ fn atomic_write_platform(
             delete_open_file(&file);
             return Err(path_changed_error(&target));
         }
+        // See the Unix implementation: identity alone cannot detect an
+        // in-place rewrite of the approved file.
+        if let Some(expected) = expected_content {
+            let unchanged = match std::fs::File::open(&target) {
+                Ok(current) => expected.matches_file(&current),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            };
+            match unchanged {
+                Ok(true) => {}
+                Ok(false) => {
+                    delete_open_file(&file);
+                    return Err(stale_content_error(&target));
+                }
+                Err(error) => {
+                    delete_open_file(&file);
+                    return Err(error);
+                }
+            }
+        }
     }
 
     let publish_result = cancellation.publish(|| {
@@ -2069,6 +2231,7 @@ fn atomic_write_platform(
     contents: &[u8],
     approved_root: &CheckedMetadata,
     approved_parent: Option<&CheckedMetadata>,
+    expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,

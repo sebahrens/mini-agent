@@ -1064,7 +1064,9 @@ async fn test_hash_empty_replacement_deletes_line_without_requiring_tag_space() 
 async fn test_similarity_fuzzy_fallback_has_a_hard_work_bound() {
     select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("bounded_fuzzy.txt");
-    let content = (0..20_000)
+    // Stay inside the default 1 MiB edit budget while still exceeding the
+    // bounded fuzzy-match cell budget.
+    let content = (0..14_000)
         .map(|index| format!("content line {index:05} with enough padding to be expensive"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1110,4 +1112,161 @@ async fn test_edit_rejects_non_utf8_file() {
         original,
         "file must be left untouched"
     );
+}
+
+// ── File-size budget and stale-content guard ───────────────────────────
+
+/// Build a workspace-bound edit tool with an explicit byte budget.
+fn bounded_edit_tool(root: &std::path::Path, limit: u64) -> edit::EditTool {
+    edit::EditTool::new(None, None)
+        .with_max_text_file_size(limit)
+        .with_workspace(root.to_path_buf())
+}
+
+fn edit_temp_root(label: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("mini-agent-edit-{label}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::canonicalize(&root).unwrap()
+}
+
+fn search_replace_block(search: &str, replace: &str) -> String {
+    format!("<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE")
+}
+
+fn block_args(path: &str, search: &str, replace: &str, replace_all: bool) -> EditArgs {
+    EditArgs {
+        path: path.into(),
+        replace_all,
+        block: Some(search_replace_block(search, replace)),
+        file_crc: None,
+        edits: None,
+    }
+}
+
+#[tokio::test]
+async fn edit_accepts_a_file_at_the_size_limit_and_rejects_one_above_it() {
+    select_edit_system(EditSystem::Similarity);
+    let root = edit_temp_root("size-limit");
+    let prefix = "needle\n";
+    let limit = 4096u64;
+
+    // limit - 1, limit, limit + 1 bytes.
+    for (name, size, expected_ok) in [
+        ("under.txt", limit - 1, true),
+        ("exact.txt", limit, true),
+        ("over.txt", limit + 1, false),
+    ] {
+        let filler = "x".repeat(size as usize - prefix.len());
+        let contents = format!("{prefix}{filler}");
+        std::fs::write(root.join(name), &contents).unwrap();
+        let tool = bounded_edit_tool(&root, limit);
+        let result = tool.call(block_args(name, "needle", "found!", false)).await;
+        assert_eq!(
+            result.is_ok(),
+            expected_ok,
+            "{name} ({size} bytes) against a {limit}-byte limit: {result:?}"
+        );
+        let after = std::fs::read_to_string(root.join(name)).unwrap();
+        if expected_ok {
+            assert!(after.starts_with("found!"));
+        } else {
+            assert_eq!(after, contents, "a rejected edit must not change bytes");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn edit_rejects_a_large_file_under_the_default_limit() {
+    select_edit_system(EditSystem::Similarity);
+    let root = edit_temp_root("default-limit");
+    std::fs::write(
+        root.join("large.txt"),
+        format!("needle\n{}", "x".repeat(2 * 1024 * 1024)),
+    )
+    .unwrap();
+    let tool = edit::EditTool::new(None, None).with_workspace(root.clone());
+    let result = tool
+        .call(block_args("large.txt", "needle", "replacement", false))
+        .await;
+    assert!(
+        result.is_err(),
+        "the default 1 MiB budget must apply to edit: {result:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn edit_rejects_a_replacement_that_expands_past_the_limit() {
+    select_edit_system(EditSystem::Similarity);
+    let root = edit_temp_root("expansion");
+    let limit = 4096u64;
+    let contents = "a\na\na\na\n";
+    std::fs::write(root.join("grow.txt"), contents).unwrap();
+    let tool = bounded_edit_tool(&root, limit);
+    let replacement = "b".repeat(2048);
+    let result = tool
+        .call(block_args("grow.txt", "a", &replacement, true))
+        .await;
+    assert!(
+        result.is_err(),
+        "replace_all must not publish an oversized result: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("grow.txt")).unwrap(),
+        contents
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn edit_rejects_an_invalid_mode_without_reading_the_file() {
+    select_edit_system(EditSystem::Similarity);
+    let root = edit_temp_root("invalid-mode");
+    std::fs::write(
+        root.join("large.txt"),
+        format!("needle\n{}", "x".repeat(2 * 1024 * 1024)),
+    )
+    .unwrap();
+    let tool = bounded_edit_tool(&root, 64);
+    let result = tool
+        .call(EditArgs {
+            path: "large.txt".into(),
+            replace_all: false,
+            block: None,
+            file_crc: None,
+            edits: None,
+        })
+        .await;
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("Provide either 'block'"),
+        "an unusable mode must be reported before the size check: {error}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn edit_rejects_replace_all_in_hashedit_mode_before_reading() {
+    select_edit_system(EditSystem::Hashedit);
+    let root = edit_temp_root("replace-all-hashedit");
+    std::fs::write(root.join("file.txt"), "hello\n").unwrap();
+    let tool = bounded_edit_tool(&root, 4096);
+    let result = tool
+        .call(EditArgs {
+            path: "file.txt".into(),
+            replace_all: true,
+            block: None,
+            file_crc: Some(crc32_hex(b"hello\n")),
+            edits: Some(vec![EditOp {
+                line: Some("1|00000000 hello".into()),
+                lines: None,
+                text: "bye".into(),
+            }]),
+        })
+        .await;
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("'replace_all' is only supported"), "{error}");
+    std::fs::remove_dir_all(root).unwrap();
 }

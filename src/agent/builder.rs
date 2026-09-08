@@ -596,6 +596,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let edit_tool = tools::EditTool::new_with_tracker(
             permission.clone(),
             ask_tx.clone(),
+            max_text_file_size,
             read_tracker.clone(),
         )
         .with_workspace_binding(workspace.clone());

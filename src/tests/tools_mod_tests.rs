@@ -452,7 +452,7 @@ async fn edit_file_version_change_invalidates_every_session_tracker() {
     let other_tracker = ReadTracker::new(true);
     let owner_read = ReadTool::new_with_tracker(None, None, None, 100, owner_tracker.clone());
     let other_read = ReadTool::new_with_tracker(None, None, None, 100, other_tracker);
-    let owner_edit = EditTool::new_with_tracker(None, None, owner_tracker);
+    let owner_edit = EditTool::new_with_tracker(None, None, None, owner_tracker);
     let read_args = || ReadArgs {
         path: path.clone(),
         offset: None,
@@ -495,7 +495,7 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
     symlink(&target, &alias).unwrap();
     let tracker = ReadTracker::new(true);
     let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone());
-    let edit = EditTool::new_with_tracker(None, None, tracker);
+    let edit = EditTool::new_with_tracker(None, None, None, tracker);
     let alias_args = || ReadArgs {
         path: alias.to_string_lossy().into_owned(),
         offset: None,

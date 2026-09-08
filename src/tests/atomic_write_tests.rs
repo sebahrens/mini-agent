@@ -672,3 +672,64 @@ async fn no_torn_reads_during_rewrites() {
     assert_eq!(torn, 0, "reader observed {torn} torn/partial states");
     assert_eq!(temp_residue(dir.path()), 0);
 }
+
+// ── Content-snapshot guard on approved absolute paths ───────────────────
+
+#[tokio::test]
+async fn expecting_write_rejects_an_in_place_rewrite_of_the_same_inode() {
+    let dir = TempDir::new("expecting_stale");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old contents").unwrap();
+    let base = crate::fs::ContentDigest::of(b"old contents");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+
+    // Same inode, new contents.
+    std::fs::write(&path, "concurrent user change").unwrap();
+    let result = crate::fs::atomic_write_resolved_expecting(
+        &path,
+        "agent output from stale contents",
+        approved_parent,
+        base,
+    )
+    .await;
+
+    assert!(result.is_err(), "a stale replacement must not publish");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "concurrent user change"
+    );
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn expecting_write_publishes_when_the_snapshot_still_matches() {
+    let dir = TempDir::new("expecting_fresh");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old contents").unwrap();
+    let base = crate::fs::ContentDigest::of(b"old contents");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+
+    crate::fs::atomic_write_resolved_expecting(&path, "agent output", approved_parent, base)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "agent output");
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+#[tokio::test]
+async fn expecting_write_rejects_a_same_length_rewrite() {
+    let dir = TempDir::new("expecting_same_length");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "aaaa").unwrap();
+    let base = crate::fs::ContentDigest::of(b"aaaa");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+
+    std::fs::write(&path, "bbbb").unwrap();
+    let result =
+        crate::fs::atomic_write_resolved_expecting(&path, "cccc", approved_parent, base).await;
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "bbbb");
+    assert_eq!(temp_residue(dir.path()), 0);
+}

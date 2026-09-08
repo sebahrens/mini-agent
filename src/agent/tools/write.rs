@@ -230,10 +230,11 @@ impl Tool for WriteTool {
                     {
                         return Err(overwrite_not_authorized(&expanded));
                     }
-                    workspace.replace_relative_atomic(
+                    workspace.replace_relative_atomic_expecting(
                         relative,
                         args.content.as_bytes(),
                         &expected,
+                        &crate::fs::ContentDigest::of(&current),
                     )?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace
@@ -291,9 +292,9 @@ impl Tool for WriteTool {
             ) {
                 return Err(overwrite_not_authorized(&expanded));
             }
-            true
+            Some(crate::fs::ContentDigest::of(&current))
         } else {
-            false
+            None
         };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -312,8 +313,9 @@ impl Tool for WriteTool {
             )
         })?)
         .await?;
-        if existing {
-            crate::fs::atomic_write_resolved_checked(path, &args.content, approved_parent).await?;
+        if let Some(base) = existing {
+            crate::fs::atomic_write_resolved_expecting(path, &args.content, approved_parent, base)
+                .await?;
         } else {
             crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent)
                 .await

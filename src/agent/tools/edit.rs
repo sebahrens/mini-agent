@@ -12,11 +12,17 @@ use crate::config::types::EditSystem;
 #[cfg(feature = "lsp")]
 use crate::extras::lsp::LspManager;
 
+/// Same default as the read and write tools: an edit that would have to
+/// materialize more than this many bytes in the unsandboxed parent is refused
+/// before the file is opened.
+const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
+
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     workspace: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read_tracker: ReadTracker,
+    max_text_file_size: u64,
     /// When `Some`, edited files are synced to their language server and
     /// fresh diagnostics are appended to the tool result.
     #[cfg(feature = "lsp")]
@@ -26,12 +32,19 @@ pub struct EditTool {
 impl EditTool {
     #[cfg(test)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self::new_with_tracker(permission, ask_tx, ReadTracker::new(true))
+        Self::new_with_tracker(permission, ask_tx, None, ReadTracker::new(true))
+    }
+
+    #[cfg(test)]
+    pub fn with_max_text_file_size(mut self, max_text_file_size: u64) -> Self {
+        self.max_text_file_size = max_text_file_size;
+        self
     }
 
     pub(crate) fn new_with_tracker(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
+        max_text_file_size: Option<u64>,
         read_tracker: ReadTracker,
     ) -> Self {
         EditTool {
@@ -39,6 +52,7 @@ impl EditTool {
             ask_tx,
             workspace: None,
             read_tracker,
+            max_text_file_size: max_text_file_size.unwrap_or(DEFAULT_MAX_TEXT_SIZE),
             #[cfg(feature = "lsp")]
             lsp: None,
         }
@@ -802,6 +816,13 @@ fn reject_overlapping_ranges(
 
 // ── Tool implementation ──────────────────────────────────────────────────
 
+fn file_too_large(path: &str, size: u64, limit: u64) -> ToolError {
+    ToolError::Msg(format!(
+        "Cannot edit '{}': the file is {} bytes, above the {}-byte limit. Use bash (sed/awk) for very large files or raise max_text_file_size.",
+        path, size, limit
+    ))
+}
+
 impl Tool for EditTool {
     const NAME: &'static str = "edit";
 
@@ -852,6 +873,19 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, args: EditArgs) -> Result<String, ToolError> {
+        // Reject an unusable argument combination before opening or reading the
+        // target: an invalid mode must never allocate a large file first.
+        if args.block.is_none() && (args.file_crc.is_none() || args.edits.is_none()) {
+            return Err(ToolError::Msg(
+                "Provide either 'block' (SEARCH/REPLACE) or 'file_crc'+'edits' (hashedit). Inspect the edit tool schema and the latest read output to choose the active format."
+                    .to_string(),
+            ));
+        }
+        if args.block.is_none() && args.replace_all {
+            return Err(ToolError::Msg(
+                "'replace_all' is only supported with SEARCH/REPLACE blocks.".to_string(),
+            ));
+        }
         let workspace_root =
             crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let requested =
@@ -919,8 +953,24 @@ impl Tool for EditTool {
             )
             .await?
         };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).await?;
+        // The edit tool rewrites the whole file, so both the source and the
+        // result must fit the configured text budget. Check the recorded size
+        // first, then bound the read itself so a file growing after the stat
+        // cannot allocate past the budget in the unsandboxed parent.
+        let limit = self.max_text_file_size;
+        let recorded = file.metadata().await?.len();
+        if recorded > limit {
+            return Err(file_too_large(&expanded, recorded, limit));
+        }
+        let mut bytes = Vec::with_capacity(recorded.min(limit) as usize);
+        let mut bounded = (&mut file).take(limit.saturating_add(1));
+        bounded.read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > limit {
+            return Err(file_too_large(&expanded, bytes.len() as u64, limit));
+        }
+        // Inode identity alone cannot detect an in-place rewrite of this file,
+        // so publication is bound to the exact bytes the edit was computed from.
+        let base = crate::fs::ContentDigest::of(&bytes);
         // Fail closed on invalid UTF-8: the whole file is rewritten, so a lossy
         // decode would replace every invalid byte (even in untouched regions)
         // with U+FFFD and silently corrupt e.g. Latin-1 files.
@@ -979,10 +1029,21 @@ impl Tool for EditTool {
         }
 
         let output = modified;
+        let output_bytes = output.len() as u64;
+        if output_bytes > limit {
+            return Err(ToolError::Msg(format!(
+                "Edit rejected: the result would be {output_bytes} bytes, above the {limit}-byte limit for '{expanded}'. Split the change or raise max_text_file_size."
+            )));
+        }
         let excerpts = resulting_excerpts(&output, &resulting_spans);
 
         if let (Some(workspace), Some(expected)) = (&self.workspace, &capability_metadata) {
-            workspace.replace_relative_atomic(relative, output.as_bytes(), expected)?;
+            workspace.replace_relative_atomic_expecting(
+                relative,
+                output.as_bytes(),
+                expected,
+                &base,
+            )?;
         } else {
             let resolved = resolved.expect("external edit must resolve an ambient path");
             let current = tokio::fs::canonicalize(&requested).await?;
@@ -992,10 +1053,11 @@ impl Tool for EditTool {
                     expanded
                 )));
             }
-            crate::fs::atomic_write_resolved_checked(
+            crate::fs::atomic_write_resolved_expecting(
                 &resolved,
                 &output,
                 approved_parent.expect("external edit must capture its parent"),
+                base,
             )
             .await?;
         }
