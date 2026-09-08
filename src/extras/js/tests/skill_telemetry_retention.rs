@@ -51,232 +51,203 @@ fn fixture() -> (std::path::PathBuf, SkillStore, SkillArtifact) {
     (root, store, skill)
 }
 
-#[test]
-fn telemetry_dispatch_retries_busy_writer_without_dropping_batch() {
-    let root = std::env::temp_dir().join(format!("telemetry-busy-{}", uuid::Uuid::new_v4()));
-    let paths = paths(&root);
-    let mut store = SkillStore::open_at(&paths).unwrap();
-    let skill = SkillArtifact::new(
-        "function run() { return true; }".into(),
-        "Telemetry contention fixture".into(),
-        vec![],
-        vec![SkillExport {
-            name: "run".into(),
-            signature: "() => bool".into(),
-        }],
-        vec!["run()".into()],
-        CapabilityManifest::pure(),
-    )
-    .unwrap();
-    store.insert_verified(&skill).unwrap();
-
-    let journal_mode: String = store
-        .conn()
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .unwrap();
-    let busy_timeout_ms: i64 = store
-        .conn()
-        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
-        .unwrap();
-    assert_eq!(journal_mode, "wal");
-    assert_eq!(busy_timeout_ms, 5_000);
-
-    let dispatcher =
-        TelemetryDispatcher::spawn_with_busy_timeout_for_test(&paths, Duration::from_millis(1))
-            .unwrap();
-    let blocker = store
-        .conn_mut()
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
-    let batch = EventBatch::new(vec![SkillEvent {
+fn selected_batch(skill: &SkillArtifact, turn_id: &str) -> EventBatch {
+    EventBatch::new(vec![SkillEvent {
         invocation_id: None,
         skill_id: skill.id.clone(),
-        turn_id: "busy-turn".into(),
-        tool_call_id: Some("busy-tool".into()),
+        turn_id: turn_id.into(),
+        tool_call_id: Some("tool".into()),
         kind: SkillEventKind::Selected,
         export_name: None,
         outcome: None,
         latency_us: None,
         retrieval_score: Some(1.0),
         retrieval_rank: Some(0),
-        query_fingerprint: Some("busy-query".into()),
+        query_fingerprint: Some("query".into()),
         index_generation: 0,
         evidence_complete: true,
         production: true,
         argument_shape: None,
         created_at: 2_000_000_000,
     }])
-    .unwrap();
-    dispatcher.try_dispatch(batch).unwrap();
+    .unwrap()
+}
 
-    let retry_deadline = Instant::now() + Duration::from_secs(2);
-    while dispatcher.busy_retries_for_test() == 0 && Instant::now() < retry_deadline {
+fn dispatch_evidence(
+    dispatcher: &TelemetryDispatcher,
+    skill: &SkillArtifact,
+    turn_id: &str,
+    task_outcome: bool,
+) {
+    if task_outcome {
+        dispatcher
+            .record_task_outcome(TaskOutcomeEvidence {
+                turn_id: turn_id.into(),
+                skill_ids: vec![],
+                verify_passed: true,
+                attempt: 1,
+                source: TaskOutcomeSource::Oracle("contention-test".into()),
+                production: true,
+                evidence_complete: true,
+                created_at: 2_000_000_001,
+            })
+            .unwrap();
+    } else {
+        dispatcher
+            .try_dispatch(selected_batch(skill, turn_id))
+            .unwrap();
+    }
+}
+
+fn evidence_counts(store: &SkillStore) -> (i64, i64) {
+    store
+        .conn()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM skill_events),
+                (SELECT COUNT(*) FROM skill_task_outcomes)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(
-        dispatcher.busy_retries_for_test() > 0,
-        "the worker never observed the forced writer contention"
-    );
-    blocker.rollback().unwrap();
+    true
+}
 
-    let persistence_deadline = Instant::now() + Duration::from_secs(3);
-    let persisted = loop {
-        let count: i64 = store
+#[test]
+fn telemetry_dispatch_retries_busy_writer_without_dropping_evidence() {
+    for task_outcome in [false, true] {
+        let (root, mut store, skill) = fixture();
+        // Exercise the actual dispatcher configuration, not a test-only SQLite timeout.
+        let dispatcher = TelemetryDispatcher::spawn(&paths(&root)).unwrap();
+        let (journal_mode, busy_timeout): (String, i64) = store
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM skill_events
-                 WHERE skill_id = ? AND turn_id = 'busy-turn' AND event_kind = 'selected'",
-                [&skill.id],
-                |row| row.get(0),
+                "SELECT journal_mode, timeout FROM pragma_journal_mode, pragma_busy_timeout",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        if count == 1 || Instant::now() >= persistence_deadline {
-            break count;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(persisted, 1, "the retained busy batch was not persisted");
-    assert_eq!(dispatcher.observability_lost_for_test(), 0);
-
-    drop(dispatcher);
-    drop(store);
-    std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(
+            busy_timeout, 5_000,
+            "ordinary store connections retain their timeout"
+        );
+        let blocker = store
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        dispatch_evidence(&dispatcher, &skill, "busy-turn", task_outcome);
+        let observed_contention = wait_until(Duration::from_secs(7), || {
+            dispatcher.busy_retries_for_test() > 0 || dispatcher.observability_lost_for_test() > 0
+        });
+        let retried = dispatcher.busy_retries_for_test() > 0;
+        let lost = dispatcher.observability_lost_for_test();
+        // Release the writer before asserting, so even a broken retry loop can join.
+        blocker.rollback().unwrap();
+        drop(dispatcher);
+        let counts = evidence_counts(&store);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(observed_contention, "worker did not encounter contention");
+        assert_eq!(
+            lost, 0,
+            "task_outcome={task_outcome}: busy evidence was discarded"
+        );
+        assert!(retried, "task_outcome={task_outcome}: worker did not retry");
+        assert_eq!(counts, if task_outcome { (0, 1) } else { (1, 0) });
+    }
 }
 
 #[test]
 fn telemetry_shutdown_does_not_wait_for_an_external_writer() {
-    let root = std::env::temp_dir().join(format!("telemetry-shutdown-{}", uuid::Uuid::new_v4()));
-    let paths = paths(&root);
-    let mut store = SkillStore::open_at(&paths).unwrap();
-    let skill = SkillArtifact::new(
-        "function run() { return true; }".into(),
-        "Telemetry shutdown fixture".into(),
-        vec![],
-        vec![SkillExport {
-            name: "run".into(),
-            signature: "() => bool".into(),
-        }],
-        vec!["run()".into()],
-        CapabilityManifest::pure(),
-    )
-    .unwrap();
-    store.insert_verified(&skill).unwrap();
-
-    let mut dispatcher =
-        TelemetryDispatcher::spawn_with_busy_timeout_for_test(&paths, Duration::from_millis(1))
-            .unwrap();
+    let (root, mut store, skill) = fixture();
+    let mut dispatcher = TelemetryDispatcher::spawn(&paths(&root)).unwrap();
     dispatcher.set_shutdown_budget_for_test(Duration::from_millis(200));
-
-    // Hold the write lock for far longer than the shutdown budget.
+    let probe = dispatcher.shutdown_probe_for_test();
     let blocker = store
         .conn_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    let batch = EventBatch::new(vec![SkillEvent {
-        invocation_id: None,
-        skill_id: skill.id.clone(),
-        turn_id: "shutdown-turn".into(),
-        tool_call_id: Some("shutdown-tool".into()),
-        kind: SkillEventKind::Selected,
-        export_name: None,
-        outcome: None,
-        latency_us: None,
-        retrieval_score: Some(1.0),
-        retrieval_rank: Some(0),
-        query_fingerprint: Some("shutdown-query".into()),
-        index_generation: 0,
-        evidence_complete: true,
-        production: true,
-        argument_shape: None,
-        created_at: 2_000_000_000,
-    }])
-    .unwrap();
-    dispatcher.try_dispatch(batch).unwrap();
-
-    let retry_deadline = Instant::now() + Duration::from_secs(2);
-    while dispatcher.busy_retries_for_test() == 0 && Instant::now() < retry_deadline {
-        std::thread::sleep(Duration::from_millis(5));
+    // Fill the queue with both command types. A separate busy_timeout or flush
+    // budget per command would multiply the shutdown delay across this tail.
+    for n in 0..64 {
+        dispatch_evidence(&dispatcher, &skill, &format!("shutdown-{n}"), n % 2 == 1);
     }
-    assert!(
-        dispatcher.busy_retries_for_test() > 0,
-        "the worker never entered the busy-retry loop"
-    );
-
-    // Teardown must not wait for the external writer. Without a bounded flush
-    // budget this join never returns while the lock is held.
-    let started = Instant::now();
-    drop(dispatcher);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "telemetry teardown waited for the external writer: {elapsed:?}"
-    );
-
-    // The writer is still holding the lock: teardown did not depend on it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        drop(dispatcher);
+        done_tx.send(()).unwrap();
+    });
+    let completed_while_locked = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    // A watchdog releases the writer even on regression: this test must fail,
+    // not hang for five seconds per queued item (or forever).
     blocker.rollback().unwrap();
+    join.join().unwrap();
+    let (_, lost) = probe();
+    let counts = evidence_counts(&store);
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        completed_while_locked,
+        "shutdown depended on releasing the writer"
+    );
+    assert_eq!(
+        lost, 64,
+        "every discarded queue command must be accounted for"
+    );
+    assert_eq!(counts, (0, 0));
 }
 
 #[test]
-fn telemetry_shutdown_still_flushes_a_transiently_busy_batch() {
-    let root = std::env::temp_dir().join(format!("telemetry-flush-{}", uuid::Uuid::new_v4()));
-    let paths = paths(&root);
-    let mut store = SkillStore::open_at(&paths).unwrap();
-    let skill = SkillArtifact::new(
-        "function run() { return true; }".into(),
-        "Telemetry flush fixture".into(),
-        vec![],
-        vec![SkillExport {
-            name: "run".into(),
-            signature: "() => bool".into(),
-        }],
-        vec!["run()".into()],
-        CapabilityManifest::pure(),
-    )
-    .unwrap();
-    store.insert_verified(&skill).unwrap();
-
-    let dispatcher =
-        TelemetryDispatcher::spawn_with_busy_timeout_for_test(&paths, Duration::from_millis(1))
+fn telemetry_shutdown_flushes_uncontended_and_transiently_busy_evidence() {
+    for contended in [false, true] {
+        let (root, mut store, skill) = fixture();
+        let dispatcher = TelemetryDispatcher::spawn(&paths(&root)).unwrap();
+        let probe = dispatcher.shutdown_probe_for_test();
+        let blocker = contended.then(|| {
+            store
+                .conn_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap()
+        });
+        dispatch_evidence(&dispatcher, &skill, "flush-event", false);
+        dispatch_evidence(&dispatcher, &skill, "flush-outcome", true);
+        let retried = !contended
+            || wait_until(Duration::from_secs(7), || {
+                dispatcher.busy_retries_for_test() > 0
+            });
+        let join = std::thread::spawn(move || drop(dispatcher));
+        let shutdown_started = wait_until(Duration::from_secs(1), || probe().0);
+        blocker
+            .map(|blocker| blocker.rollback())
+            .transpose()
             .unwrap();
-    let batch = EventBatch::new(vec![SkillEvent {
-        invocation_id: None,
-        skill_id: skill.id.clone(),
-        turn_id: "flush-turn".into(),
-        tool_call_id: Some("flush-tool".into()),
-        kind: SkillEventKind::Selected,
-        export_name: None,
-        outcome: None,
-        latency_us: None,
-        retrieval_score: Some(1.0),
-        retrieval_rank: Some(0),
-        query_fingerprint: Some("flush-query".into()),
-        index_generation: 0,
-        evidence_complete: true,
-        production: true,
-        argument_shape: None,
-        created_at: 2_000_000_000,
-    }])
-    .unwrap();
-    dispatcher.try_dispatch(batch).unwrap();
-    drop(dispatcher);
-
-    let count: i64 = store
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM skill_events
-             WHERE skill_id = ? AND turn_id = 'flush-turn' AND event_kind = 'selected'",
-            [&skill.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        count, 1,
-        "an uncontended batch must still flush on shutdown"
-    );
-    drop(store);
-    std::fs::remove_dir_all(root).unwrap();
+        join.join().unwrap();
+        let (_, lost) = probe();
+        let counts = evidence_counts(&store);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(retried, "worker did not encounter the writer lock");
+        assert!(
+            shutdown_started,
+            "writer must release after shutdown starts"
+        );
+        assert_eq!(lost, 0);
+        assert_eq!(
+            counts,
+            (1, 1),
+            "contended={contended}: shutdown lost evidence"
+        );
+    }
 }
 
 #[test]

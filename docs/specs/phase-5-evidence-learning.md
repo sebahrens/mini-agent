@@ -620,8 +620,14 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 2. **Canary ordering** (mini-agent-840z, delivered). When several canaries supersede one active revision,
    routing selects by age and observed invocation count, never by lexicographic identity.
 3. **Store concurrency** (mini-agent-pwf2, delivered). The store opens with WAL journaling and a busy
-   timeout; every read-modify-write transaction begins `IMMEDIATE`. Dropping a telemetry batch
-   because of `SQLITE_BUSY` is a defect covered by a contention test.
+   timeout; every read-modify-write transaction begins `IMMEDIATE`. The telemetry worker disables
+   SQLite's native busy timeout on its own connection and retries both event batches and task
+   outcomes with capped backoff, preserving FIFO attribution. Shutdown gives the entire ingestion
+   queue one 1.5-second flush budget, checked before each attempt; evidence discarded after that
+   deadline increments the observability-loss counter. This bounds writer-contention retries, not
+   the execution time of an already-running transaction or subsequent quarantine/index work.
+   Contention tests use the production connection configuration and real competing writers to
+   cover ordinary recovery, transient shutdown contention, and a locked queue tail.
 4. **Corrupt rows** (mini-agent-jj8b, delivered). A row whose embedding cannot be decoded is
    skipped and reported like a malformed artifact row; it never darkens the index or triggers a
    rebuild on every turn, and repeated rebuild failures back off.

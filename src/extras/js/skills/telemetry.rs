@@ -39,8 +39,7 @@ const QUARANTINE_SAFETY_ATTEMPTS: u32 = 3;
 #[derive(Debug, Default)]
 struct TelemetryShutdownState {
     requested: AtomicBool,
-    /// Instant, as nanoseconds since the process-start baseline, after which a
-    /// busy retry gives up. Only meaningful once `requested` is set.
+    /// Shared deadline for draining queued evidence after shutdown is requested.
     deadline: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
@@ -612,6 +611,8 @@ pub struct IngestionReport {
 pub enum TelemetryError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error("telemetry shutdown flush budget elapsed")]
+    ShutdownBudgetElapsed,
     #[error("event batch exceeds the configured bound")]
     BatchTooLarge,
     #[error("event is missing its stable invocation ID")]
@@ -717,6 +718,13 @@ impl TelemetryDispatcher {
         mut store: SkillStore,
         coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
     ) -> Result<Self, DispatchError> {
+        // This worker owns its busy retries. A native SQLite wait would block
+        // inside each attempt, outliving the shared shutdown flush deadline.
+        // Other store connections retain their normal busy timeout.
+        store
+            .connection()
+            .busy_timeout(Duration::ZERO)
+            .map_err(super::store::StoreError::from)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
@@ -730,7 +738,10 @@ impl TelemetryDispatcher {
                 while let Ok(command) = rx.recv() {
                     let TelemetryCommand::Events(batch) = command else {
                         if let TelemetryCommand::TaskOutcome(outcome) = command
-                            && ingest_task_outcome(&mut store, &outcome).is_err()
+                            && ingest_retrying_busy(&worker_busy_retries, &worker_shutdown, || {
+                                ingest_task_outcome(&mut store, &outcome)
+                            })
+                            .is_err()
                         {
                             worker_observability_lost.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(
@@ -739,12 +750,9 @@ impl TelemetryDispatcher {
                         }
                         continue;
                     };
-                    match ingest_retrying_busy(
-                        &mut store,
-                        &batch,
-                        &worker_busy_retries,
-                        &worker_shutdown,
-                    ) {
+                    match ingest_retrying_busy(&worker_busy_retries, &worker_shutdown, || {
+                        TelemetryIngestor::new(&mut store).ingest(&batch)
+                    }) {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
@@ -776,19 +784,6 @@ impl TelemetryDispatcher {
             join: Some(join),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spawn_with_busy_timeout_for_test(
-        paths: &crate::paths::AppPaths,
-        busy_timeout: Duration,
-    ) -> Result<Self, DispatchError> {
-        let store = SkillStore::open_at(paths)?;
-        store
-            .connection()
-            .busy_timeout(busy_timeout)
-            .map_err(super::store::StoreError::from)?;
-        Self::spawn_with_store(store, None)
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {
@@ -925,45 +920,40 @@ fn ingest_task_outcome(
     Ok(())
 }
 
-fn ingest_retrying_busy(
-    store: &mut SkillStore,
-    batch: &EventBatch,
+fn ingest_retrying_busy<T>(
     busy_retries: &AtomicU64,
     shutdown: &TelemetryShutdown,
-) -> Result<IngestionReport, TelemetryError> {
+    mut ingest: impl FnMut() -> Result<T, TelemetryError>,
+) -> Result<T, TelemetryError> {
     let mut delay = TELEMETRY_BUSY_RETRY_INITIAL;
     let mut attempts = 0u64;
     loop {
-        match TelemetryIngestor::new(store).ingest(batch) {
+        // Check before every attempt, including the first attempt for the next
+        // queued command: the entire queue shares one shutdown budget.
+        if shutdown
+            .remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
+            return Err(TelemetryError::ShutdownBudgetElapsed);
+        }
+        match ingest() {
             Err(error) if error.is_sqlite_busy() => {
                 busy_retries.fetch_add(1, Ordering::Relaxed);
                 attempts = attempts.saturating_add(1);
-                // Retain the batch in this worker and retry with capped backoff.
+                // Both command types retain their position in the FIFO queue.
                 // Log only exponentially spaced attempts, and never payloads.
                 if attempts.is_power_of_two() {
                     tracing::warn!(
-                        event_count = batch.events().len(),
                         attempts,
                         retry_delay_ms = delay.as_millis(),
-                        "skill telemetry store is busy; retaining batch for retry"
+                        "skill telemetry store is busy; retaining evidence for retry"
                     );
                 }
                 // A healthy session retries until the writer frees the store.
-                // After shutdown the retry is bounded: an external writer that
-                // keeps the lock must not hold the process open, so the batch
-                // is given up and recorded as unrecoverable evidence loss.
-                let sleep = match shutdown.remaining() {
-                    Some(remaining) if remaining.is_zero() => {
-                        tracing::warn!(
-                            event_count = batch.events().len(),
-                            attempts,
-                            "skill telemetry shutdown budget elapsed while the store was busy"
-                        );
-                        return Err(error);
-                    }
-                    Some(remaining) => delay.min(remaining),
-                    None => delay,
-                };
+                // Teardown limits backoff to the remaining shared flush budget.
+                let sleep = shutdown
+                    .remaining()
+                    .map_or(delay, |remaining| delay.min(remaining));
                 std::thread::sleep(sleep);
                 delay = delay.saturating_mul(2).min(TELEMETRY_BUSY_RETRY_MAX);
             }
@@ -1076,6 +1066,14 @@ impl TelemetryDispatcher {
     #[cfg(test)]
     pub(crate) fn set_shutdown_budget_for_test(&mut self, budget: Duration) {
         self.shutdown_budget = budget;
+    }
+
+    /// Observe teardown after moving the dispatcher to a joining thread.
+    #[cfg(test)]
+    pub(crate) fn shutdown_probe_for_test(&self) -> impl Fn() -> (bool, u64) + use<> {
+        let shutdown = self.shutdown.clone();
+        let lost = Arc::clone(&self.observability_lost);
+        move || (shutdown.remaining().is_some(), lost.load(Ordering::Relaxed))
     }
 
     #[cfg(test)]
