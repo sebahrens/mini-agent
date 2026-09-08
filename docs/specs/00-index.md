@@ -146,6 +146,42 @@ checklist.
 Skill Gym, harness, and provider/session corrections from the same review are owned by
 [`../agent/GYM.md`](../agent/GYM.md) and the provider documentation, not by this corpus.
 
+## Delivered corrections (2026-09-08)
+
+The 2026-09-08 release code review (epic `mini-agent-wldr`) landed as code. All 27 findings are
+closed with their regression coverage. No correction below changes the Phase 6 canonical checklist;
+the macOS publisher still independently hashes both pinned descriptors on every publication.
+
+| Correction | Owning spec | Bead |
+|------------|-------------|------|
+| Guarded file replacement carries the read's exact bytes into publication and rolls back a stale exchange | Phase 2 (workspace authority) | mini-agent-wldr.1 |
+| Learned-skill export destinations keep an existing parent's permissions; application state stays private | Phase 4 | mini-agent-wldr.2 |
+| Edit tool bounded by `max_text_file_size` on input, growth and result | Phase 2 | mini-agent-wldr.3 |
+| Multi-session discovery isolates per-entry failures; exact loading stays fail-closed | — (session storage) | mini-agent-wldr.4 |
+| LSP transport writes and notifications bounded; a timed-out partial frame reaps the server | — (LSP) | mini-agent-wldr.5 |
+| MCP registered names allocated injectively against one used-name set | — (MCP) | mini-agent-wldr.6 |
+| MCP `structuredContent` preserved; unsupported content kinds reported explicitly | — (MCP) | mini-agent-wldr.7 |
+| Streamed Markdown publishes boundaries inside fences and bounds unbroken constructs | — (UI) | mini-agent-wldr.8 |
+| Fence delimiter length, character, indentation and closing-line rules honored while streaming | — (UI) | mini-agent-wldr.9 |
+| Nightly evaluation metrics extracted and schema-validated independently of libtest progress text | — (CI) | mini-agent-wldr.10 |
+| Bounded line reading with incremental UTF-8 validation and a defined growth policy | Phase 2 | mini-agent-wldr.11 |
+| Explicit provider connect and stream-inactivity deadlines for built-in and custom providers | — (provider) | mini-agent-wldr.12 |
+| Hook decisions owned per invocation token | — (hooks) | mini-agent-wldr.13 |
+| Every hook `ask` enforced before execution, independent of the inner permission key | — (hooks) | mini-agent-wldr.14 |
+| Post-tool hooks receive the arguments that actually executed | — (hooks) | mini-agent-wldr.15 |
+| Partial learned-skill startup reported and retried instead of cached as healthy | Phase 3/4 | mini-agent-wldr.16 |
+| Observation and proposal startup moved to a tracked blocking worker | Phase 4 | mini-agent-wldr.17 |
+| One embedding backend shared by retrieval, telemetry and admission | Phase 3 | mini-agent-wldr.18 |
+| macOS fresh-worker phases profiled; cold-start target restated as a reviewed exception | Phase 6 | mini-agent-wldr.19 |
+| macOS Phase 6 gate evidence derived from the validated probe result | Phase 6 | mini-agent-wldr.20 |
+| Task outcomes attributed to every skill selected during the turn | Phase 5 | mini-agent-wldr.21 |
+| Turn evidence completeness persisted; incomplete turns excluded from utility and baselines | Phase 5 | mini-agent-wldr.22 |
+| Telemetry shutdown bounded and cancel-aware | Phase 5 | mini-agent-wldr.23 |
+| Headless turns persist completed effects and usage before failing | — (runner) | mini-agent-wldr.24 |
+| Safety-immediate quarantine applies despite pending index publication | Phase 5 | mini-agent-wldr.25 |
+| ACP retains a protocol-valid partial turn on failure or cancellation | — (ACP) | mini-agent-wldr.26 |
+| Skill utility statistics computed with grouped set queries | Phase 5 | mini-agent-wldr.27 |
+
 ## Feature relationships
 
 Cargo features are not phase-completion claims:
