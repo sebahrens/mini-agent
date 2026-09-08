@@ -266,78 +266,90 @@ fn estimate_round_trips_saved(direct_successes: u64, declared_effect_methods: u6
     direct_successes.saturating_mul(declared_effect_methods.saturating_sub(1))
 }
 
+/// Read per-revision usage and utility statistics.
+///
+/// The counts are computed with grouped set operations rather than correlated
+/// subqueries per revision. The previous shape re-scanned every task outcome and
+/// every baseline for each retained revision — and ran a further source-scope
+/// search inside each baseline scan — so doubling the corpus multiplied the
+/// query work roughly eightfold. Grouping once and joining the results per
+/// revision keeps the exact source-kind/source-id and production matching, the
+/// distinct-turn semantics, and the absent-baseline `n/a` behavior.
 fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> {
     let mut statement = store.connection().prepare(
-        "SELECT revision.id, revision.status,
+        "WITH qualified AS (
+             SELECT outcome.evidence_id, outcome.turn_id, outcome.verify_passed,
+                    outcome.source_kind, outcome.source_id, outcome.production
+               FROM skill_task_outcomes AS outcome
+              WHERE outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')
+         ),
+         linked AS (
+             SELECT link.skill_id, qualified.turn_id, qualified.verify_passed,
+                    qualified.source_kind, qualified.source_id, qualified.production
+               FROM skill_task_outcome_links AS link
+               JOIN qualified ON qualified.evidence_id = link.evidence_id
+         ),
+         observed AS (
+             SELECT skill_id,
+                    COUNT(DISTINCT CASE WHEN production = 1 THEN turn_id END)
+                        AS tasks_with,
+                    COUNT(DISTINCT CASE WHEN production = 1 AND verify_passed = 1
+                                        THEN turn_id END) AS passed_with,
+                    COUNT(DISTINCT CASE WHEN production = 0 THEN turn_id END)
+                        AS gym_tasks
+               FROM linked
+              GROUP BY skill_id
+         ),
+         scopes AS (
+             SELECT DISTINCT skill_id, source_kind, source_id
+               FROM linked
+              WHERE production = 1
+         ),
+         baselines AS (
+             SELECT qualified.turn_id, qualified.verify_passed,
+                    qualified.source_kind, qualified.source_id
+               FROM qualified
+              WHERE qualified.production = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM skill_task_outcome_links AS absent
+                     WHERE absent.evidence_id = qualified.evidence_id
+                )
+         ),
+         baseline_counts AS (
+             SELECT scopes.skill_id,
+                    COUNT(DISTINCT baselines.turn_id) AS baseline_tasks,
+                    COUNT(DISTINCT CASE WHEN baselines.verify_passed = 1
+                                        THEN baselines.turn_id END) AS baseline_passes
+               FROM scopes
+               JOIN baselines
+                 ON baselines.source_kind = scopes.source_kind
+                AND baselines.source_id IS scopes.source_id
+              GROUP BY scopes.skill_id
+         ),
+         last_invoked AS (
+             SELECT skill_id, MAX(created_at) AS last_used
+               FROM skill_events
+              WHERE event_kind = 'invoked'
+              GROUP BY skill_id
+         )
+         SELECT revision.id, revision.status,
                 COALESCE(stats.invoked_count, 0),
                 COALESCE(stats.direct_success_count, 0),
                 COALESCE(stats.direct_failure_count, 0),
-                (SELECT MAX(event.created_at) FROM skill_events AS event
-                  WHERE event.skill_id = revision.id AND event.event_kind = 'invoked'),
-                (SELECT COUNT(DISTINCT outcome.turn_id)
-                   FROM skill_task_outcome_links AS link
-                   JOIN skill_task_outcomes AS outcome
-                     ON outcome.evidence_id = link.evidence_id
-                  WHERE link.skill_id = revision.id
-                    AND outcome.production = 1
-                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
-                (SELECT COUNT(DISTINCT CASE WHEN outcome.verify_passed = 1
-                                           THEN outcome.turn_id END)
-                   FROM skill_task_outcome_links AS link
-                   JOIN skill_task_outcomes AS outcome
-                     ON outcome.evidence_id = link.evidence_id
-                  WHERE link.skill_id = revision.id
-                    AND outcome.production = 1
-                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
-                (SELECT COUNT(DISTINCT baseline.turn_id)
-                   FROM skill_task_outcomes AS baseline
-                  WHERE baseline.production = 1
-                    AND baseline.source_kind NOT IN ('no_verify_command', 'gate_skipped')
-                    AND NOT EXISTS (
-                        SELECT 1 FROM skill_task_outcome_links AS absent
-                         WHERE absent.evidence_id = baseline.evidence_id
-                    )
-                    AND EXISTS (
-                        SELECT 1
-                          FROM skill_task_outcomes AS observed
-                          JOIN skill_task_outcome_links AS observed_link
-                            ON observed_link.evidence_id = observed.evidence_id
-                         WHERE observed_link.skill_id = revision.id
-                           AND observed.production = 1
-                           AND observed.source_kind = baseline.source_kind
-                           AND observed.source_id IS baseline.source_id
-                    )),
-                (SELECT COUNT(DISTINCT CASE WHEN baseline.verify_passed = 1
-                                           THEN baseline.turn_id END)
-                   FROM skill_task_outcomes AS baseline
-                  WHERE baseline.production = 1
-                    AND baseline.source_kind NOT IN ('no_verify_command', 'gate_skipped')
-                    AND NOT EXISTS (
-                        SELECT 1 FROM skill_task_outcome_links AS absent
-                         WHERE absent.evidence_id = baseline.evidence_id
-                    )
-                    AND EXISTS (
-                        SELECT 1
-                          FROM skill_task_outcomes AS observed
-                          JOIN skill_task_outcome_links AS observed_link
-                            ON observed_link.evidence_id = observed.evidence_id
-                         WHERE observed_link.skill_id = revision.id
-                           AND observed.production = 1
-                           AND observed.source_kind = baseline.source_kind
-                           AND observed.source_id IS baseline.source_id
-                    )),
-                (SELECT COUNT(DISTINCT outcome.turn_id)
-                   FROM skill_task_outcome_links AS link
-                   JOIN skill_task_outcomes AS outcome
-                     ON outcome.evidence_id = link.evidence_id
-                  WHERE link.skill_id = revision.id
-                    AND outcome.production = 0
-                    AND outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')),
+                last_invoked.last_used,
+                COALESCE(observed.tasks_with, 0),
+                COALESCE(observed.passed_with, 0),
+                COALESCE(baseline_counts.baseline_tasks, 0),
+                COALESCE(baseline_counts.baseline_passes, 0),
+                COALESCE(observed.gym_tasks, 0),
                 COALESCE(stats.user_positive_count, 0),
                 COALESCE(stats.user_negative_count, 0),
                 revision.capability_json
            FROM skill_revisions AS revision
            LEFT JOIN skill_stats AS stats ON stats.skill_id = revision.id
+           LEFT JOIN observed ON observed.skill_id = revision.id
+           LEFT JOIN baseline_counts ON baseline_counts.skill_id = revision.id
+           LEFT JOIN last_invoked ON last_invoked.skill_id = revision.id
           WHERE revision.identity_version = 2
           ORDER BY COALESCE(stats.invoked_count, 0) DESC, revision.id",
     )?;
@@ -1943,6 +1955,191 @@ mod tests {
         );
 
         assert_eq!(estimate_round_trips_saved(6, 3), 12);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Build `revisions` retained skills, each with one observed production
+    /// task and one no-library baseline under a shared oracle, and return how
+    /// long `load_skill_stats` takes over that corpus.
+    fn stats_latency_for(
+        revisions: usize,
+        shared_scope: bool,
+    ) -> (std::time::Duration, Vec<SkillUsageStats>) {
+        let (root, paths, _) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        let mut ids = Vec::with_capacity(revisions);
+        for index in 0..revisions {
+            let artifact = SkillArtifact::new(
+                format!("function run() {{ return {index}; }}"),
+                format!("Scaling fixture {index}"),
+                vec![],
+                vec![SkillExport {
+                    name: "run".into(),
+                    signature: "() => number".into(),
+                }],
+                vec![format!("run() === {index}")],
+                CapabilityManifest::pure(),
+            )
+            .unwrap();
+            store.insert_verified(&artifact).unwrap();
+            ids.push(artifact.id.clone());
+        }
+        for (index, id) in ids.iter().enumerate() {
+            // One observed task attributed to this revision, and one baseline
+            // turn with no link at all, under the same oracle scope. A shared
+            // scope makes every baseline comparable to every skill; distinct
+            // scopes are the ordinary case, where each skill has one.
+            let scope = if shared_scope {
+                "shared-oracle".to_string()
+            } else {
+                format!("oracle-{index}")
+            };
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, created_at
+                     ) VALUES (?, ?, 1, 1, 'oracle', ?, 1, 42)",
+                    rusqlite::params![format!("observed-{index}"), format!("turn-{index}"), scope],
+                )
+                .unwrap();
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+                     VALUES (?, ?)",
+                    rusqlite::params![format!("observed-{index}"), id],
+                )
+                .unwrap();
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, created_at
+                     ) VALUES (?, ?, 0, 1, 'oracle', ?, 1, 42)",
+                    rusqlite::params![
+                        format!("baseline-{index}"),
+                        format!("baseline-turn-{index}"),
+                        scope
+                    ],
+                )
+                .unwrap();
+        }
+
+        // Warm the page cache, then take the best of three runs so an unlucky
+        // scheduling slice cannot decide the outcome.
+        let rows = load_skill_stats(&store).unwrap();
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let _ = load_skill_stats(&store).unwrap();
+            best = best.min(started.elapsed());
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+        (best, rows)
+    }
+
+    #[test]
+    fn usage_stats_do_not_rescan_every_baseline_for_every_revision() {
+        let (small, _) = stats_latency_for(20, false);
+        let (large, rows) = stats_latency_for(80, false);
+
+        // With one oracle scope per skill, each revision's comparison group is
+        // its own baseline turn.
+        assert_eq!(rows.len(), 80);
+        for row in &rows {
+            assert_eq!(row.tasks_with, 1);
+            assert_eq!(row.passed_with, 1);
+            assert_eq!(row.baseline_tasks, 1);
+            assert_eq!(row.baseline_passes, 0);
+            assert_eq!(row.gym_tasks, 0);
+        }
+
+        // The previous shape scanned every baseline and every observed task for
+        // every revision, so doubling both sets multiplied its work by roughly
+        // seven. Quadrupling here must stay near the corpus growth itself; the
+        // bound is loose enough to survive a noisy runner.
+        let floor = std::time::Duration::from_micros(200);
+        let small = small.max(floor);
+        assert!(
+            large <= small * 8,
+            "stats query work grew faster than the corpus: 20 revisions {small:?}, \
+             80 revisions {large:?}"
+        );
+    }
+
+    #[test]
+    fn usage_stats_compare_against_every_baseline_sharing_a_scope() {
+        let (_, rows) = stats_latency_for(40, true);
+        assert_eq!(rows.len(), 40);
+        for row in &rows {
+            assert_eq!(row.tasks_with, 1);
+            assert_eq!(
+                row.baseline_tasks, 40,
+                "every baseline under the shared oracle is comparable"
+            );
+            assert_eq!(row.baseline_passes, 0);
+        }
+    }
+
+    #[test]
+    fn usage_stats_keep_scopes_and_attempts_separate() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+
+        // Two source scopes: only baselines under a scope this skill was
+        // actually observed in may count as its comparison group.
+        for (evidence_id, turn_id, source_id, linked, passed) in [
+            ("observed-a", "turn-a", "oracle-a", true, 1),
+            ("baseline-a", "turn-b", "oracle-a", false, 1),
+            ("baseline-b", "turn-c", "oracle-b", false, 0),
+        ] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, created_at
+                     ) VALUES (?, ?, ?, 1, 'oracle', ?, 1, 42)",
+                    rusqlite::params![evidence_id, turn_id, passed, source_id],
+                )
+                .unwrap();
+            if linked {
+                store
+                    .conn_mut()
+                    .execute(
+                        "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+                         VALUES (?, ?)",
+                        rusqlite::params![evidence_id, artifact.id],
+                    )
+                    .unwrap();
+            }
+        }
+        // A second attempt on the same turn must not double-count it.
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_task_outcomes (
+                     evidence_id, turn_id, verify_passed, attempt, source_kind,
+                     source_id, production, created_at
+                 ) VALUES ('baseline-a2', 'turn-b', 0, 2, 'oracle', 'oracle-a', 1, 43)",
+                rusqlite::params![],
+            )
+            .unwrap();
+
+        let rows = load_skill_stats(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tasks_with, 1);
+        assert_eq!(
+            rows[0].baseline_tasks, 1,
+            "only the observed scope's baseline turn counts, once"
+        );
+        assert_eq!(rows[0].baseline_passes, 1);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
