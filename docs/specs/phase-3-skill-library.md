@@ -45,6 +45,13 @@ after teardown creates and hydrates a fresh coordinator. Admission and telemetry
 to the session, so keeping them alive cannot prevent an individual agent turn from settling.
 Their teardown joins remain tracked by the scope that performs the teardown.
 
+The session-service cache counts each completed initialization once against a four-attempt
+budget, whether it fails outright or returns a degraded bundle. Completion updates the failure
+and retry deadline before publishing the cached result, so concurrent callers join one attempt.
+Only the exact initialization cell may update its slot; a delayed result from before a workspace
+rebind cannot overwrite a newer slot for the same path. Healthy cached services remain reusable
+without consuming further attempts.
+
 Retrieving inside `engine::run_step` from model-generated JavaScript is prohibited. At that point
 the model has already written its code and cannot discover an injected function, and embedding
 raw JS against English descriptions produces a cross-domain query. Embedding and retrieval live

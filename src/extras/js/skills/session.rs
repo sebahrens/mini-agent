@@ -122,109 +122,63 @@ impl<T> WorkspaceServiceCache<T> {
                 });
             }
             let existing = slot.as_mut().expect("the slot was just populated");
-            // A cached bundle that is still missing a component is retried on
-            // the same schedule as a failure, and the working bundle is
-            // returned meanwhile.
-            let cached_degradation = match existing.services.get() {
-                Some(Some(services)) => degraded(services),
-                _ => None,
+            let retry_needed = match existing.services.get() {
+                Some(Some(services)) => {
+                    existing.last_failure = degraded(services);
+                    existing.last_failure.is_some()
+                }
+                Some(None) => true,
+                // Join the in-flight initialization instead of replacing it.
+                None => false,
             };
-            if let Some(reason) = cached_degradation {
-                existing.last_failure = Some(reason);
-                let retry_allowed = existing.attempts < SERVICE_INIT_MAX_ATTEMPTS
-                    && existing
+            if retry_needed {
+                if existing.attempts >= SERVICE_INIT_MAX_ATTEMPTS
+                    || existing
                         .retry_not_before
-                        .is_none_or(|deadline| Instant::now() >= deadline);
-                if retry_allowed {
-                    existing.retry_not_before =
-                        Some(Instant::now() + service_init_retry_delay(existing.attempts));
-                    existing.attempts = existing.attempts.saturating_add(1);
-                    existing.services = Arc::new(OnceCell::new());
-                } else {
-                    return existing
-                        .services
-                        .get()
-                        .and_then(|services| services.clone());
-                }
-            }
-            if matches!(existing.services.get(), Some(None)) {
-                // The cached attempt failed. Retry only once the backoff has
-                // elapsed and the attempt budget still has room, so a later
-                // turn can recover from a transient failure without letting
-                // every rebuild churn on a permanent one.
-                if existing.attempts >= SERVICE_INIT_MAX_ATTEMPTS {
-                    return None;
-                }
-                if existing
-                    .retry_not_before
-                    .is_some_and(|deadline| Instant::now() < deadline)
+                        .is_some_and(|deadline| Instant::now() < deadline)
                 {
-                    return None;
+                    return existing.services.get().and_then(Clone::clone);
                 }
-                // Throttle concurrent callers while this retry is in flight.
-                existing.retry_not_before =
-                    Some(Instant::now() + service_init_retry_delay(existing.attempts));
                 existing.services = Arc::new(OnceCell::new());
             }
             Arc::clone(&existing.services)
         };
 
-        let reported = Arc::new(Mutex::new(None::<String>));
-        let sink = Arc::clone(&reported);
-        let services = cell
-            .get_or_init(move || async move {
-                match initialize().await {
-                    Ok(services) => Some(services),
-                    Err(reason) => {
-                        *sink.lock().unwrap_or_else(|error| error.into_inner()) = Some(reason);
-                        None
-                    }
-                }
-            })
-            .await
-            .clone();
-
-        // Only the caller that actually ran the failed attempt charges the
-        // budget; callers that joined an in-flight attempt do not.
-        let reason = reported
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(reason) = reason {
+        let initializing_cell = Arc::clone(&cell);
+        cell.get_or_init(move || async move {
+            let result = initialize().await;
+            let failure = match &result {
+                Ok(services) => degraded(services),
+                Err(reason) => Some(reason.clone()),
+            };
+            // Commit metadata before OnceCell publishes the result. Only the
+            // initializer charges the budget; all waiters observe one attempt.
+            // A root can be rebound A -> B -> A while this await is in flight,
+            // so root equality alone cannot identify the current generation.
             let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(existing) = slot.as_mut()
                 && existing.root == root
+                && Arc::ptr_eq(&existing.services, &initializing_cell)
             {
                 existing.attempts = existing.attempts.saturating_add(1);
-                existing.retry_not_before =
-                    Some(Instant::now() + service_init_retry_delay(existing.attempts));
-                tracing::warn!(
-                    workspace = %existing.root.display(),
-                    attempt = existing.attempts,
-                    max_attempts = SERVICE_INIT_MAX_ATTEMPTS,
-                    error = %reason,
-                    "learned-skill services failed to initialize"
-                );
-                existing.last_failure = Some(reason);
-            }
-        } else if let Some(services) = services.as_ref() {
-            // A healthy bundle clears the recorded disablement; a degraded one
-            // keeps it so the diagnostic surfaces name the missing component.
-            let degradation = degraded(services);
-            let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(existing) = slot.as_mut()
-                && existing.root == root
-            {
-                if degradation.is_some() && existing.retry_not_before.is_none() {
-                    // Arm the backoff now so the very next turn reuses this
-                    // usable bundle instead of re-running startup immediately.
-                    existing.retry_not_before =
-                        Some(Instant::now() + service_init_retry_delay(existing.attempts));
+                existing.retry_not_before = failure
+                    .as_ref()
+                    .map(|_| Instant::now() + service_init_retry_delay(existing.attempts));
+                if let Err(reason) = &result {
+                    tracing::warn!(
+                        workspace = %existing.root.display(),
+                        attempt = existing.attempts,
+                        max_attempts = SERVICE_INIT_MAX_ATTEMPTS,
+                        error = %reason,
+                        "learned-skill services failed to initialize"
+                    );
                 }
-                existing.last_failure = degradation;
+                existing.last_failure = failure;
             }
-        }
-        services
+            result.ok()
+        })
+        .await
+        .clone()
     }
 
     /// The current disablement or degradation for the tracked workspace.
@@ -545,64 +499,164 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_permanently_degraded_bundle_stops_at_the_attempt_budget() {
-        let cache = WorkspaceServiceCache::<u8>::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-
-        for _ in 0..(SERVICE_INIT_MAX_ATTEMPTS + 3) {
-            cache.expire_retry_backoff_for_test();
-            let attempt = Arc::clone(&calls);
-            let services = cache
-                .resolve(
-                    "workspace-a".into(),
-                    || async move {
-                        attempt.fetch_add(1, Ordering::SeqCst);
-                        Ok(Arc::new(1_u8))
-                    },
-                    |_| Some("learned_index:store busy".to_string()),
-                )
-                .await;
-            assert_eq!(services.as_deref(), Some(&1));
-        }
-        assert!(
-            calls.load(Ordering::SeqCst) <= SERVICE_INIT_MAX_ATTEMPTS as usize + 1,
-            "a permanently degraded bundle must not retry without bound: {}",
-            calls.load(Ordering::SeqCst)
-        );
-        let failure = cache.failure().expect("the degradation stays observable");
-        assert!(failure.exhausted);
-    }
-
-    #[tokio::test]
-    async fn a_persistent_initialization_failure_stops_at_the_attempt_budget() {
-        let cache = WorkspaceServiceCache::<u8>::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        for _ in 0..(SERVICE_INIT_MAX_ATTEMPTS + 3) {
-            cache.expire_retry_backoff_for_test();
-            let calls = Arc::clone(&calls);
-            assert!(
+    async fn failed_and_degraded_initializations_share_one_exact_attempt_budget() {
+        for outcomes in [
+            [Err("failed"), Err("failed")],
+            [Ok(1_u8), Ok(1_u8)],
+            [Ok(1_u8), Err("failed")],
+            [Err("failed"), Ok(1_u8)],
+        ] {
+            let cache = WorkspaceServiceCache::<u8>::new();
+            let calls = AtomicUsize::new(0);
+            for _ in 0..(SERVICE_INIT_MAX_ATTEMPTS + 3) {
+                cache.expire_retry_backoff_for_test();
                 cache
                     .resolve(
                         "workspace-a".into(),
-                        || async move {
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            Err("permanently broken".to_string())
+                        || async {
+                            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                            outcomes[attempt % outcomes.len()]
+                                .map(Arc::new)
+                                .map_err(str::to_string)
                         },
-                        |_| None
+                        |_| Some("component missing".to_string()),
+                    )
+                    .await;
+                let failure = cache.failure().expect("unsuccessful startup stays visible");
+                assert_eq!(
+                    failure.attempts as usize,
+                    calls.load(Ordering::SeqCst),
+                    "each completed attempt is charged once: {outcomes:?}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                SERVICE_INIT_MAX_ATTEMPTS as usize,
+                "{outcomes:?}"
+            );
+            assert!(cache.failure().unwrap().exhausted);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_initialization_cannot_change_a_rebound_workspace_slot() {
+        for (stale, current) in [
+            (Err("stale failure"), Ok(2_u8)),
+            (Ok(2), Err("current failure")),
+            (Ok(1), Ok(2)),
+        ] {
+            let cache = Arc::new(WorkspaceServiceCache::<u8>::new());
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let old_cache = Arc::clone(&cache);
+            let old = tokio::spawn(async move {
+                old_cache
+                    .resolve(
+                        "workspace-a".into(),
+                        || async {
+                            started_tx.send(()).unwrap();
+                            release_rx.await.unwrap();
+                            stale.map(Arc::new).map_err(str::to_string)
+                        },
+                        |value| (*value == 1).then(|| "stale degradation".into()),
                     )
                     .await
-                    .is_none()
+            });
+            started_rx.await.unwrap();
+            cache
+                .resolve("workspace-b".into(), || async { Ok(Arc::new(3)) }, |_| None)
+                .await
+                .unwrap();
+            let replacement = cache
+                .resolve(
+                    "workspace-a".into(),
+                    || async { current.map(Arc::new).map_err(str::to_string) },
+                    |_| None,
+                )
+                .await;
+            let failure = cache.failure();
+            release_tx.send(()).unwrap();
+            old.await.unwrap();
+            assert_eq!(
+                cache.failure(),
+                failure,
+                "a superseded completion changed the current slot: {stale:?}"
             );
+            let cached = cache
+                .resolve(
+                    "workspace-a".into(),
+                    || async { panic!("replacement must remain cached") },
+                    |_| None,
+                )
+                .await;
+            match (replacement, cached) {
+                (Some(expected), Some(actual)) => assert!(Arc::ptr_eq(&expected, &actual)),
+                (None, None) => {}
+                _ => panic!("the replacement service changed"),
+            }
         }
+    }
 
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            SERVICE_INIT_MAX_ATTEMPTS as usize,
-            "retries must stop once the attempt budget is spent"
+    #[tokio::test]
+    async fn degraded_initialization_publishes_backoff_before_waking_waiters() {
+        let cache = Arc::new(WorkspaceServiceCache::<u8>::new());
+        let (reported_tx, reported_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reported_tx = std::sync::Mutex::new(Some(reported_tx));
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first_cache = Arc::clone(&cache);
+        let first = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                first_cache
+                    .resolve(
+                        "workspace-a".into(),
+                        || async { Ok(Arc::new(1)) },
+                        |_| {
+                            reported_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send(())
+                                .unwrap();
+                            release_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
+                            Some("component missing".into())
+                        },
+                    )
+                    .await
+                    .unwrap()
+            })
+        });
+        reported_rx.await.unwrap();
+        let replacement_calls = AtomicUsize::new(0);
+        let second = cache.resolve(
+            "workspace-a".into(),
+            || async {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(2))
+            },
+            |_| Some("component missing".into()),
         );
-        let failure = cache.failure().expect("the disablement must stay visible");
-        assert!(failure.exhausted);
-        assert_eq!(failure.attempts, SERVICE_INIT_MAX_ATTEMPTS);
+        tokio::pin!(second);
+        let polled = futures::poll!(&mut second);
+        let completed_before_metadata = polled.is_ready();
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap();
+        let second = match polled {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => second.await,
+        }
+        .unwrap();
+        assert!(
+            !completed_before_metadata,
+            "a caller saw the result before retry metadata was published"
+        );
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]
