@@ -875,7 +875,14 @@ where
     })
 }
 
-#[cfg(any(feature = "hooks", test))]
+#[cfg(feature = "mcp")]
+pub(crate) fn current_work_scope_is_cancelled() -> bool {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| scope.is_cancelled())
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "hooks", feature = "mcp", test))]
 pub(crate) async fn current_work_scope_cancelled() {
     let scope = AGENT_WORK_SCOPE.try_with(Arc::clone).ok();
     match scope {

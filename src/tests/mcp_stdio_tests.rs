@@ -1013,6 +1013,72 @@ fn permission_for_servers(entries: &[(&str, Action)]) -> Arc<Mutex<PermissionChe
     ))
 }
 
+#[cfg(feature = "acp")]
+#[tokio::test]
+async fn acp_cancelled_mcp_startup_reaps_ready_and_initializing_servers() {
+    let fixture = FixtureBuild::compile();
+    let mut servers = HashMap::new();
+    let mut active_leases = Vec::new();
+    for index in 0..10 {
+        let name = format!("startup-{index:02}");
+        let lease = fixture.lease(&name);
+        servers.insert(
+            name,
+            fixture.config(
+                fixture.executable.display().to_string(),
+                Vec::new(),
+                if index == 0 { "normal" } else { "hang-init" },
+                &lease,
+            ),
+        );
+        active_leases.push(lease);
+    }
+    let queued_lease = active_leases.pop().unwrap();
+    let cfg = Config {
+        mcp_servers: Some(servers),
+        ..Config::default()
+    };
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let cancelled = tokio::sync::Notify::new();
+    let pids;
+    {
+        let connecting =
+            crate::extras::acp::connect_prompt_mcp(&cfg, &workspace, &scope, cancelled.notified());
+        tokio::pin!(connecting);
+        pids = tokio::select! {
+            result = &mut connecting => panic!("startup unexpectedly finished before cancellation: {}", result.is_some()),
+            pids = async {
+                let mut pids = Vec::new();
+                for lease in &active_leases { pids.push(wait_for_pid(lease).await); }
+                pids
+            } => pids,
+        };
+        // The ninth live process proves that the healthy first server finished
+        // initialization and released its slot. Eight hung handshakes now fill
+        // the startup limit, leaving the last configured server queued.
+        assert!(!queued_lease.exists());
+        cancelled.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut connecting)
+            .await
+            .expect("ACP cancellation must not wait for the MCP initialization timeout");
+        assert!(result.is_none());
+    }
+    assert!(
+        !queued_lease.exists(),
+        "cancelled queued connections must never spawn"
+    );
+    for pid in pids {
+        assert!(
+            !process_is_alive(pid),
+            "MCP process {pid} must be reaped before ACP startup returns"
+        );
+    }
+    assert_eq!(scope.active_children(), 0);
+    drop(workspace);
+    fixture.cleanup();
+}
+
 #[tokio::test]
 async fn mcp_tools_list_hang_does_not_block_other_servers() {
     let fixture = FixtureBuild::compile();

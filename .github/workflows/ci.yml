@@ -1902,14 +1902,11 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      - name: Test MCP stdio config wiring
-        run: cargo test --locked --no-default-features --features mcp mcp_stdio_config
+      - name: Test MCP stdio lifecycle and ACP startup cancellation
+        run: cargo test --locked --no-default-features --features mcp,acp mcp_stdio
 
-      - name: Test MCP stdio end to end
-        run: cargo test --locked --no-default-features --features mcp mcp_stdio_end_to_end
-
-      - name: Test MCP stdio failure cleanup
-        run: cargo test --locked --no-default-features --features mcp mcp_stdio_failure_cleanup
+      - name: Test MCP HTTP and OAuth initialization bounds
+        run: cargo test --locked --no-default-features --features mcp,acp mcp_http_tests
 
   lsp-lifecycle:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

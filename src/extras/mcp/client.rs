@@ -47,31 +47,73 @@ pub struct McpClientHandle {
 }
 
 struct OwnedStdioTransport {
-    inner: TokioChildProcess,
-    process_group: Option<u32>,
+    inner: Option<TokioChildProcess>,
+    cleanup_complete: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl OwnedStdioTransport {
-    fn new(inner: TokioChildProcess) -> Self {
-        Self {
-            process_group: inner.id(),
-            inner,
-        }
+    fn new(inner: TokioChildProcess) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (cleanup_complete, completion) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                inner: Some(inner),
+                cleanup_complete: Some(cleanup_complete),
+            },
+            completion,
+        )
     }
 
-    fn terminate_tree(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.process_group.take() {
+    fn start_cleanup(&mut self, graceful: bool) -> Option<JoinHandle<std::io::Result<()>>> {
+        let inner = self.inner.take()?;
+        let process_group = inner.id();
+        // Taking the owned child also closes its protocol pipes. Keep ownership
+        // in one cleanup task so cancellation cannot detach an untracked wait
+        // inside RMCP's ChildWithCleanup destructor.
+        let child = inner.into_inner();
+        let completion = self.cleanup_complete.take();
+        if !graceful {
+            Self::terminate_tree(process_group);
+        }
+        Some(tokio::spawn(async move {
+            let result = if let Some(mut child) = child {
+                let exited = if graceful {
+                    tokio::time::timeout(Duration::from_secs(3), child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .is_some()
+                } else {
+                    false
+                };
+                if exited {
+                    Ok(())
+                } else {
+                    Self::terminate_tree(process_group);
+                    Box::into_pin(child.kill()).await
+                }
+            } else {
+                Ok(())
+            };
+            Self::terminate_tree(process_group);
+            if let Some(completion) = completion {
+                let _ = completion.send(());
+            }
+            result
+        }))
+    }
+
+    fn terminate_tree(process_group: Option<u32>) {
+        if let Some(pid) = process_group {
             crate::sandbox::kill_process_group_if_live(pid);
         }
-        #[cfg(not(unix))]
-        self.process_group.take();
     }
 }
 
 impl Drop for OwnedStdioTransport {
     fn drop(&mut self) {
-        self.terminate_tree();
+        // The task retains child ownership through kill/reap. Initialization
+        // cancellation waits on cleanup_complete before returning to ACP.
+        drop(self.start_cleanup(false));
     }
 }
 
@@ -82,22 +124,29 @@ impl Transport<RoleClient> for OwnedStdioTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        self.inner.send(item)
-    }
-
-    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        self.inner.receive()
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let send = self.inner.as_mut().map(|inner| inner.send(item));
         async move {
-            let result = self.inner.graceful_shutdown().await;
-            // A descendant may still own the group after the direct child is
-            // reaped. The post-reap helper checks membership before signalling
-            // so an empty/recycled pgid is not killed blindly.
-            self.terminate_tree();
-            result
+            match send {
+                Some(send) => send.await,
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "MCP transport is closed",
+                )),
+            }
+        }
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        match self.inner.as_mut() {
+            Some(inner) => inner.receive().await,
+            None => None,
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        match self.start_cleanup(true) {
+            Some(cleanup) => cleanup.await.map_err(std::io::Error::other)?,
+            None => Ok(()),
         }
     }
 }
@@ -145,6 +194,9 @@ impl McpClientHandle {
         initialize_timeout: Duration,
         workspace: &std::path::Path,
     ) -> anyhow::Result<Self> {
+        if crate::agent::runner::current_work_scope_is_cancelled() {
+            anyhow::bail!("MCP connection cancelled");
+        }
         match config {
             McpServerConfig::Command {
                 command,
@@ -189,37 +241,51 @@ impl McpClientHandle {
                                 "",
                             )
                         })?;
-                let transport = OwnedStdioTransport::new(transport);
+                let (transport, cleanup_complete) = OwnedStdioTransport::new(transport);
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
                     stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
-                let running_service =
-                    match tokio::time::timeout(initialize_timeout, serve_client((), transport))
-                        .await
-                    {
-                        Ok(Ok(service)) => service,
-                        Ok(Err(_)) => {
-                            return Err(stdio_connect_error(
-                                &server_name,
-                                "initialization failed".to_string(),
-                                stderr_task,
-                                stderr_buffer,
-                            )
-                            .await);
-                        }
-                        Err(_) => {
-                            return Err(stdio_connect_error(
-                                &server_name,
-                                format!(
-                                    "initialization timed out after {} ms",
-                                    initialize_timeout.as_millis()
-                                ),
-                                stderr_task,
-                                stderr_buffer,
-                            )
-                            .await);
-                        }
-                    };
+                let initialized = tokio::select! {
+                    biased;
+                    _ = crate::agent::runner::current_work_scope_cancelled() => None,
+                    result = tokio::time::timeout(initialize_timeout, serve_client((), transport)) => Some(result),
+                };
+                let running_service = match initialized {
+                    None => {
+                        let _ = cleanup_complete.await;
+                        return Err(stdio_connect_error(
+                            &server_name,
+                            "initialization cancelled".into(),
+                            stderr_task,
+                            stderr_buffer,
+                        )
+                        .await);
+                    }
+                    Some(Ok(Ok(service))) => service,
+                    Some(Ok(Err(_))) => {
+                        let _ = cleanup_complete.await;
+                        return Err(stdio_connect_error(
+                            &server_name,
+                            "initialization failed".to_string(),
+                            stderr_task,
+                            stderr_buffer,
+                        )
+                        .await);
+                    }
+                    Some(Err(_)) => {
+                        let _ = cleanup_complete.await;
+                        return Err(stdio_connect_error(
+                            &server_name,
+                            format!(
+                                "initialization timed out after {} ms",
+                                initialize_timeout.as_millis()
+                            ),
+                            stderr_task,
+                            stderr_buffer,
+                        )
+                        .await);
+                    }
+                };
                 Ok(Self {
                     server_name,
                     trusted_identity: config.trusted_identity(),
@@ -231,7 +297,11 @@ impl McpClientHandle {
                 headers,
                 oauth,
             } => {
-                validate_mcp_server_url(url).await?;
+                tokio::select! {
+                    biased;
+                    _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
+                    result = validate_mcp_server_url(url) => result?,
+                }
                 let mut handle = Self::connect_http_with_timeout(
                     server_name,
                     url,
@@ -307,7 +377,12 @@ impl McpClientHandle {
                 })
             }
         };
-        let running_service = match tokio::time::timeout(initialize_timeout, connect).await {
+        let initialized = tokio::select! {
+            biased;
+            _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP HTTP connection cancelled"),
+            result = tokio::time::timeout(initialize_timeout, connect) => result,
+        };
+        let running_service = match initialized {
             Ok(result) => result?,
             Err(_) => anyhow::bail!(
                 "MCP HTTP connection failed for '{server_name}': initialization timed out after {} ms",
@@ -601,7 +676,7 @@ async fn validate_mcp_server_url(value: &str) -> anyhow::Result<()> {
         vec![address]
     } else {
         let resolver_host = host.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::agent::runner::spawn_blocking_scoped(move || {
             (resolver_host.as_str(), port)
                 .to_socket_addrs()
                 .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())

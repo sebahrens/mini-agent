@@ -1258,7 +1258,7 @@ impl CredentialStore for FileCredentialStore {
     {
         let store = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.read_blocking())
+            crate::agent::runner::spawn_blocking_scoped(move || store.read_blocking())
                 .await
                 .map_err(|_| storage_error("worker", std::io::ErrorKind::Other))?
         })
@@ -1274,7 +1274,7 @@ impl CredentialStore for FileCredentialStore {
     {
         let store = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.write_blocking(&credentials))
+            crate::agent::runner::spawn_blocking_scoped(move || store.write_blocking(&credentials))
                 .await
                 .map_err(|_| storage_error("worker", std::io::ErrorKind::Other))?
         })
@@ -1287,7 +1287,7 @@ impl CredentialStore for FileCredentialStore {
     {
         let store = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.clear_blocking().map(|_| ()))
+            crate::agent::runner::spawn_blocking_scoped(move || store.clear_blocking().map(|_| ()))
                 .await
                 .map_err(|_| storage_error("worker", std::io::ErrorKind::Other))?
         })

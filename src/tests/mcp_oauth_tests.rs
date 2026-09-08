@@ -45,6 +45,74 @@ fn test_credentials(client_id: &str) -> StoredCredentials {
     StoredCredentials::new(client_id.to_string(), None, Vec::new(), None)
 }
 
+#[tokio::test]
+async fn cancelled_credential_operations_remain_owned_until_disk_work_finishes() {
+    use futures::FutureExt;
+    use rmcp::transport::auth::CredentialStore;
+    use std::time::Duration;
+
+    for operation in ["load", "save", "clear"] {
+        let root = TempDir::new(operation);
+        let settings = OAuthSettings::default();
+        let store = oauth::FileCredentialStore::for_paths(
+            &test_paths(root.path()),
+            "scope-fixture",
+            "https://example.com",
+            &settings,
+        )
+        .unwrap();
+        store.write_blocking(&test_credentials("before")).unwrap();
+        let (scope, started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        {
+            let work = scope.run(async {
+                match operation {
+                    "load" => {
+                        store.load().await.unwrap();
+                    }
+                    "save" => store.save(test_credentials("after")).await.unwrap(),
+                    "clear" => store.clear().await.unwrap(),
+                    _ => unreachable!(),
+                }
+            });
+            tokio::pin!(work);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = &mut work => panic!("{operation} completed without entering the scoped disk worker"),
+                    _ = async {
+                        loop {
+                            if started.try_recv().is_ok() { break; }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    } => {},
+                }
+            }).await.expect("credential I/O must register with the active work scope");
+            scope.cancellation_handle().cancel();
+        }
+        assert!(
+            scope.wait_idle().now_or_never().is_none(),
+            "{operation}: dropping the caller must not release running disk work"
+        );
+        release.release();
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+            .await
+            .unwrap();
+        let retained = store
+            .read_blocking()
+            .unwrap()
+            .map(|credentials| credentials.client_id);
+        assert_eq!(
+            retained.as_deref(),
+            match operation {
+                "load" => Some("before"),
+                "save" => Some("after"),
+                "clear" => None,
+                _ => unreachable!(),
+            }
+        );
+    }
+}
+
 #[test]
 fn url_server_without_oauth_parses() {
     let json = r#"{ "url": "https://example.com/mcp" }"#;

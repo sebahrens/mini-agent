@@ -143,6 +143,9 @@ prefix, the next pass carries that recap forward. A failed summary or one that
 covers no complete turn triggers bounded eviction with an explicit recap notice.
 Cancellation interrupts a pending summary; completed passes remain committed,
 and the unsummarized history remains available to a later prompt.
+Cancellation during MCP startup interrupts pending initialization and prevents
+queued servers from starting. ACP closes connected servers and waits for started
+processes to be reaped before returning the cancelled response.
 
 ## Permission bridge
 

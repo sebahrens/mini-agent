@@ -1491,13 +1491,19 @@ async fn run_prompt(
 
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
+    let work_scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(feature = "mcp")]
     let mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
-        crate::startup::connect_headless_mcp(&state.cfg, &workspace).await
+        let Some(manager) =
+            connect_prompt_mcp(&state.cfg, &workspace, &work_scope, control.cancelled()).await
+        else {
+            let _ = respond_terminal(registration, responder, StopReason::Cancelled);
+            return Ok(());
+        };
+        manager
     } else {
         None
     };
-    let work_scope = crate::agent::runner::AgentWorkScope::new();
     let tool_output_session_id = session_id.to_string();
     let Some(agent) = run_owned_pre_run(
         &control,
@@ -1565,6 +1571,29 @@ async fn run_prompt(
         manager.shutdown().await;
     }
     result
+}
+
+#[cfg(feature = "mcp")]
+pub(crate) async fn connect_prompt_mcp(
+    cfg: &Config,
+    workspace: &Arc<crate::paths::WorkspaceBinding>,
+    work_scope: &Arc<crate::agent::runner::AgentWorkScope>,
+    cancelled: impl Future<Output = ()>,
+) -> Option<Option<crate::extras::mcp::McpClientManager>> {
+    let connecting = work_scope.run(crate::startup::connect_headless_mcp(cfg, workspace));
+    tokio::pin!(connecting);
+    tokio::select! {
+        biased;
+        _ = cancelled => {
+            work_scope.cancellation_handle().cancel();
+            // Initializing clients observe the scope and await their process
+            // cleanup. Successfully connected siblings still need explicit close.
+            if let Some(manager) = connecting.await { manager.shutdown().await; }
+            work_scope.wait_idle().await;
+            None
+        }
+        manager = &mut connecting => Some(manager),
+    }
 }
 
 async fn run_owned_pre_run<T>(

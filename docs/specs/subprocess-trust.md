@@ -82,6 +82,17 @@ to change first.
 | `TC-INTERNAL-VERIFICATION` — `verify_workflow_only_headless_relevance`; hidden Windows AppContainer runtime probe | mini-agent authors fixed Bash/PowerShell/native probe behavior from checked-in policy; no user/model text enters argv. | Repository workspace for workflow verification; fresh private fixtures for the Windows probe. | Workflow verification inherits ambient credentials; the Windows probe uses the helper's narrow environment and private profile storage. | The Windows probe covers explicit-root reads/writes, path and executable stability, zero capabilities, absent loopback exemption, failed IPv4/IPv6 TCP connections, omitted handles, descendant Job retention, and crash-stale cleanup. Zero capabilities plus the exemption check are the protocol-independent network proof; connectionless UDP send completion is not evidence of delivery. | Internal verifiers, not model or broker authority. Windows traverses the production helper, AppContainer attributes, handle ACLs, private desktop, creation-time Job, and parent-death path. | A fixed hidden verification flag is the audit identity; record policy version and outcome. | The Windows probe is CI-bounded and cleanup-attested; the workflow verifier's raw `.status()` remains a gap. | Workflow verification is Unix-only; the AppContainer runtime probe is Windows-only. |
 | `TC-LIFECYCLE-HELPER` — `Sandbox::run_built_output_command`, `Sandbox::run_built_status_command`, and `sandbox::kill_process_group` | The owning caller supplies an already-constructed command; the helper adds no argv grammar or authority. | The owning constructor sets cwd. | The owning constructor defines environment policy. | The owning constructor defines filesystem/network authority. | Host lifecycle supervision does not change caller trust. | Audit belongs to the owning caller and survives caller drop. | Finite deadlines and output caps; Unix process-group signalling and Windows helper Job termination both drain descendants before completion. | Unix uses process groups; Windows delegates exact-tree termination to the AppContainer helper. |
 
+ACP MCP startup runs under the prompt's work scope. Cancellation interrupts
+stdio initialization, HTTP/OAuth setup, and queued connection attempts. The
+stdio adapter retains the owned child through a single cleanup task and exposes
+cleanup completion to the initializer; dropping a handshake must not report
+completion while RMCP is still reaping its child in the background. Already
+connected siblings are explicitly closed before ACP returns `Cancelled`.
+Successful shutdown retains the three-second graceful-exit allowance, followed
+by forced cleanup when needed. Blocking DNS validation and OAuth credential
+reads, saves, and clears are tracked by the same work scope and drained before
+cancellation completes.
+
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.
