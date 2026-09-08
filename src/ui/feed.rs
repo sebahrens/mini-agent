@@ -106,18 +106,56 @@ struct BlockRenderCache {
 #[derive(Clone, Debug)]
 struct MdCache {
     width: usize,
-    /// Byte offset where markdown is definitely finalized (e.g., after "\n\n").
-    /// Lines for text[0..stable_len] are cached in stable_lines and don't need
-    /// to be re-parsed on the next incremental extension.
+    /// Byte offset where markdown is definitely finalized: after a top-level
+    /// blank line, or after any completed line inside a replayable fence.
     stable_len: usize,
-    /// Lines parsed up to stable_len. This is the stable prefix that won't
-    /// change if text is extended beyond stable_len (within the same width).
-    stable_lines: Arc<Vec<LineEntry>>,
+    /// The fence open at `stable_len`, replayed when the suffix after it is
+    /// parsed on its own.
+    stable_fence: Option<OpenFence>,
+    /// Row segments covering text[0..stable_len]. Extending the stable prefix
+    /// pushes another shared segment instead of cloning the completed rows, so
+    /// a streaming chunk never copies the whole prefix.
+    stable_segments: Vec<Arc<Vec<LineEntry>>>,
     /// Byte length of the parsed prefix: up to the last completed line for
     /// running blocks, the full text once finalized.
     parsed_len: usize,
-    /// All lines parsed so far (for text[0..parsed_len]).
-    lines: Arc<Vec<LineEntry>>,
+    /// Rows for text[stable_len..parsed_len].
+    suffix: Arc<Vec<LineEntry>>,
+}
+
+impl MdCache {
+    fn has_rows(&self) -> bool {
+        self.stable_segments
+            .iter()
+            .any(|segment| !segment.is_empty())
+    }
+
+    fn segments(&self) -> Vec<Arc<Vec<LineEntry>>> {
+        let mut segments: Vec<Arc<Vec<LineEntry>>> = self
+            .stable_segments
+            .iter()
+            .filter(|segment| !segment.is_empty())
+            .map(Arc::clone)
+            .collect();
+        if !self.suffix.is_empty() {
+            segments.push(Arc::clone(&self.suffix));
+        }
+        segments
+    }
+}
+
+/// A fenced code block that is still open at a stable boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenFence {
+    /// The exact opening delimiter line. Replaying it in front of a suffix
+    /// reproduces the parser state the suffix was written in.
+    opener: CompactString,
+    character: u8,
+    length: usize,
+    /// Whether the fence opened at top level. A fence inside a list or an
+    /// indented block cannot be reproduced from its opening line alone, so it
+    /// publishes no stable boundary.
+    replayable: bool,
 }
 
 impl Block {
@@ -691,32 +729,86 @@ fn plain_block_lines(block: &Block, width: usize) -> Vec<LineEntry> {
     result
 }
 
-/// Find the byte offset of the last finalized markdown block boundary.
+/// Split a completed line into a fence delimiter run, if it is one.
 ///
-/// A blank line is only a stable boundary if we're at top-level: not inside
-/// a fenced code block, indented code block, or loose list. `start` must
-/// already be a known top-level boundary, which lets streaming callers scan
-/// only the newly unstable suffix instead of repeatedly scanning the prefix.
+/// Returns the delimiter character, its run length, the line's indentation and
+/// the text after the run.
+fn fence_delimiter(line: &str) -> Option<(u8, usize, usize, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let character = match rest.as_bytes().first() {
+        Some(b'`') => b'`',
+        Some(b'~') => b'~',
+        _ => return None,
+    };
+    let length = rest.bytes().take_while(|byte| *byte == character).count();
+    if length < 3 {
+        return None;
+    }
+    Some((character, length, indent, &rest[length..]))
+}
+
+/// Whether `line` opens a fenced code block, per CommonMark: a backtick fence's
+/// info string may not contain a backtick.
+fn fence_opening(line: &str) -> Option<(u8, usize, usize)> {
+    let (character, length, indent, info) = fence_delimiter(line)?;
+    if character == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((character, length, indent))
+}
+
+/// Whether `line` closes `open`: the same character, at least as long as the
+/// opening run, and nothing but whitespace after it. A shorter run, a different
+/// character or trailing text stays ordinary code content.
+fn fence_closing(line: &str, open: &OpenFence) -> bool {
+    match fence_delimiter(line) {
+        Some((character, length, _, suffix)) => {
+            character == open.character && length >= open.length && suffix.trim().is_empty()
+        }
+        None => false,
+    }
+}
+
+/// The last finalized markdown boundary in `text[start..up_to]`, plus the fence
+/// open at that boundary.
 ///
-/// Correctness note: This approach safely handles:
-/// - Fenced code blocks (``` / ~~~) containing blank lines: blank lines inside
-///   fences are not boundaries
-/// - Loose lists: blank lines between list items don't close the list
+/// A blank line is a boundary only at top level: not inside a fenced code
+/// block, an indented code block, or a loose list. Inside a *replayable* fence
+/// (one opened at top level) every completed line is a boundary, because code
+/// content renders verbatim and the opening delimiter alone reproduces the
+/// parser state — this is what keeps a long fenced response linear instead of
+/// re-parsing the whole fence for every new line.
 ///
-/// Limitation: Within a single long fenced block with no blank lines at
-/// top-level, we degrade to O(n²) per-line re-parsing within that block.
-/// This is acceptable as long-lived fences are less common than mixed content.
-fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
+/// Constructs that publish no boundary of their own — a paragraph, a tight
+/// list, a fence inside a list — would otherwise be re-parsed in full for every
+/// completed line. Once such a run exceeds `MAX_UNSTABLE_WINDOW` bytes the
+/// boundary is forced forward, which bounds the parsing a single streamed chunk
+/// can cost. A forced split can render a very long unbroken construct slightly
+/// differently while it streams; finalizing the block re-parses the whole text,
+/// so the completed rendering is unaffected.
+///
+/// `start` must be a boundary previously returned by this function, and
+/// `entry_fence` the fence reported with it.
+fn find_stable_boundary(
+    text: &str,
+    start: usize,
+    up_to: usize,
+    entry_fence: Option<&OpenFence>,
+) -> (usize, Option<OpenFence>) {
     let up_to = up_to.min(text.len());
     let start = start.min(up_to);
     let search_text = &text[start..up_to];
 
-    let mut in_fence = false;
-    let mut fence_char: Option<char> = None; // '`' or '~'
+    let mut fence: Option<OpenFence> = entry_fence.cloned();
     let mut in_list = false;
     let mut in_indented_code = false;
     let mut deferred_blank = None;
     let mut last_stable_pos = start;
+    let mut last_stable_fence = entry_fence.cloned();
     let mut byte_pos = start;
 
     // split_inclusive excludes a synthetic empty line after a trailing newline,
@@ -729,30 +821,22 @@ fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let line_end = byte_pos + completed_line.len();
 
-        // Check if this line opens/closes a fence. Fences must start at line
-        // beginning (with optional leading whitespace, which we skip).
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let fence_char_candidate = if trimmed.starts_with("```") { '`' } else { '~' };
-
-            if in_fence && fence_char == Some(fence_char_candidate) {
-                // Closing the fence.
-                in_fence = false;
-                fence_char = None;
-            } else if !in_fence {
-                // Opening a new fence.
-                in_fence = true;
-                fence_char = Some(fence_char_candidate);
+        if let Some(open) = fence.clone() {
+            if fence_closing(line, &open) {
+                fence = None;
+                if open.replayable {
+                    last_stable_pos = line_end;
+                    last_stable_fence = None;
+                }
+            } else if open.replayable {
+                last_stable_pos = line_end;
+                last_stable_fence = Some(open);
             }
             byte_pos = line_end;
             continue;
         }
 
-        if in_fence {
-            byte_pos = line_end;
-            continue;
-        }
-
+        let trimmed = line.trim_start();
         let indent = line.len().saturating_sub(trimmed.len());
         if trimmed.is_empty() {
             if in_list || in_indented_code {
@@ -762,6 +846,7 @@ fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
                 deferred_blank.get_or_insert(line_end);
             } else {
                 last_stable_pos = line_end;
+                last_stable_fence = None;
             }
             byte_pos = line_end;
             continue;
@@ -772,9 +857,26 @@ fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
             let continues_indented_code = in_indented_code && indent >= 4;
             if !continues_list && !continues_indented_code {
                 last_stable_pos = blank_end;
+                last_stable_fence = None;
                 in_list = false;
                 in_indented_code = false;
             }
+        }
+
+        if let Some((character, length, _)) = fence_opening(line) {
+            let open = OpenFence {
+                opener: CompactString::from(line),
+                character,
+                length,
+                replayable: !in_list && !in_indented_code,
+            };
+            if open.replayable {
+                last_stable_pos = line_end;
+                last_stable_fence = Some(open.clone());
+            }
+            fence = Some(open);
+            byte_pos = line_end;
+            continue;
         }
 
         if is_list_item(trimmed) {
@@ -784,11 +886,23 @@ fn find_stable_boundary(text: &str, start: usize, up_to: usize) -> usize {
             in_indented_code = true;
         }
 
+        if line_end - last_stable_pos > MAX_UNSTABLE_WINDOW {
+            last_stable_pos = line_end;
+            last_stable_fence = None;
+            in_list = false;
+            in_indented_code = false;
+            deferred_blank = None;
+        }
+
         byte_pos = line_end;
     }
 
-    last_stable_pos
+    (last_stable_pos, last_stable_fence)
 }
+
+/// Largest run of text without a natural markdown boundary that is re-parsed on
+/// every streamed chunk before a boundary is forced.
+const MAX_UNSTABLE_WINDOW: usize = 4 * 1024;
 
 fn is_list_item(trimmed: &str) -> bool {
     if ["- ", "+ ", "* "]
@@ -822,11 +936,7 @@ fn contains_global_markdown_definition(text: &str) -> bool {
 /// Lay out an agent block as shared completed-markdown and ephemeral tail
 /// segments. Appending a token to the tail never clones completed rows.
 fn agent_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
-    let completed = agent_completed_lines(feed, block, width);
-    let mut segments = Vec::with_capacity(2);
-    if !completed.is_empty() {
-        segments.push(completed);
-    }
+    let mut segments = agent_completed_lines(feed, block, width);
     let tail = agent_tail_lines(block, width, segments.is_empty());
     if !tail.is_empty() {
         segments.push(Arc::new(tail));
@@ -834,15 +944,57 @@ fn agent_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec
     segments
 }
 
+/// Longest stable segment that a newly finalized region is merged into rather
+/// than appended after, so a long stream does not accumulate one segment per
+/// chunk.
+const MD_SEGMENT_COALESCE_ROWS: usize = 64;
+
+/// Render `text` knowing which fence, if any, is open at its start.
+///
+/// Replaying the opening delimiter reproduces the parser state, so the rows for
+/// a suffix that begins inside a fence are exactly the rows a full parse would
+/// place there. `pulldown-cmark` closes an unterminated fence at end of input,
+/// which emits the code block's trailing empty row and the blank separator
+/// after it. Both belong to the fence's real close, so they are dropped
+/// whenever the region itself ends inside the fence and re-appear once a region
+/// contains the close (or is the last region of a running block).
+fn render_region(
+    feed: &Feed,
+    text: &str,
+    entry_fence: Option<&OpenFence>,
+    width: usize,
+    ends_inside_fence: bool,
+) -> Vec<LineEntry> {
+    let mut rows = match entry_fence {
+        Some(fence) => {
+            let mut replayed = String::with_capacity(fence.opener.len() + 1 + text.len());
+            replayed.push_str(&fence.opener);
+            replayed.push('\n');
+            replayed.push_str(text);
+            parse_agent_markdown(feed, &replayed, width)
+        }
+        None => parse_agent_markdown(feed, text, width),
+    };
+    if ends_inside_fence {
+        // Closing a code block emits the blank separator row, and the code
+        // accumulator's trailing newline emits one empty code row. Both belong
+        // to the fence's real close, which has not been seen yet.
+        for _ in 0..2 {
+            if rows.last().is_some_and(|row| row.text.is_empty()) {
+                rows.pop();
+            }
+        }
+    }
+    rows
+}
+
 /// Lay out the completed portion of an agent block as markdown.
 ///
-/// The markdown parse of the completed prefix is memoized in the block's
-/// `MdCache`. To avoid O(n^2) re-parsing during streaming, the cache tracks
-/// a "stable boundary" (e.g., after a blank line) where markdown is finalized.
-/// When completed_len extends within the same stable boundary, only the new
-/// portion (stable_len..completed_len) is re-parsed and appended. Mutators
-/// that rewrite text (`replace_last`, `finalize_last`) clear the cache explicitly.
-fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<LineEntry>> {
+/// The parse is memoized in the block's `MdCache`, which tracks a stable
+/// boundary where markdown is finalized. Extending past that boundary only
+/// re-parses `stable_len..completed_len`, and finalized rows are kept as shared
+/// segments so a streaming chunk never copies the completed prefix.
+fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
     // Text parsed as markdown: the whole block once finalized, or only the
     // completed lines (up to the last newline) while streaming.
     let completed_len = if block.running {
@@ -860,88 +1012,148 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Arc<Vec<Li
         return cached;
     }
 
-    // Mutators that can replace text clear md_cache, so a same-width cache
-    // with a shorter parsed prefix is known to be an append-only extension.
+    // Mutators that can replace text clear md_cache, so a same-width cache with
+    // a shorter parsed prefix is known to be an append-only extension.
     let incremental_base = {
         let cache = block.md_cache.borrow();
         cache.as_ref().and_then(|cache| {
             (cache.width == width && cache.parsed_len < completed_len).then(|| {
                 (
                     cache.stable_len,
-                    Arc::clone(&cache.stable_lines),
+                    cache.stable_fence.clone(),
+                    cache.stable_segments.clone(),
+                    cache.has_rows(),
                     cache.parsed_len,
                 )
             })
         })
     };
 
-    if let Some((previous_stable_len, previous_stable_lines, _previous_parsed_len)) =
-        incremental_base.filter(|(_, _, previous_parsed_len)| {
-            !contains_global_markdown_definition(&block.text[*previous_parsed_len..completed_len])
-        })
+    if let Some((previous_stable_len, previous_fence, mut stable_segments, mut has_rows, _)) =
+        incremental_base.filter(
+            |(previous_stable_len, previous_fence, _, _, previous_parsed_len)| {
+                // A link or footnote definition can change how an earlier reference
+                // renders, so its arrival invalidates the cached prefix. Nothing
+                // inside a fence is a definition, so a region that stays inside one
+                // never needs the check.
+                let (_, fence_at_end) = find_stable_boundary(
+                    &block.text,
+                    *previous_stable_len,
+                    completed_len,
+                    previous_fence.as_ref(),
+                );
+                let stays_in_fence = previous_fence.is_some() && fence_at_end == *previous_fence;
+                stays_in_fence
+                    || !contains_global_markdown_definition(
+                        &block.text[*previous_parsed_len..completed_len],
+                    )
+            },
+        )
     {
-        let stable_len = find_stable_boundary(&block.text, previous_stable_len, completed_len);
-        let suffix =
-            parse_agent_markdown(feed, &block.text[previous_stable_len..completed_len], width);
-        let mut lines = previous_stable_lines.as_ref().clone();
-        lines.extend_from_slice(&suffix);
-        prefix_agent_first_line(&mut lines);
+        let (stable_len, stable_fence) = find_stable_boundary(
+            &block.text,
+            previous_stable_len,
+            completed_len,
+            previous_fence.as_ref(),
+        );
 
-        let stable_lines = if stable_len == previous_stable_len {
-            Arc::clone(&previous_stable_lines)
-        } else if stable_len == completed_len {
-            Arc::new(lines.clone())
-        } else {
-            let mut stable_lines = previous_stable_lines.as_ref().clone();
-            stable_lines.extend(parse_agent_markdown(
+        if stable_len > previous_stable_len {
+            let mut finalized = render_region(
                 feed,
                 &block.text[previous_stable_len..stable_len],
+                previous_fence.as_ref(),
                 width,
-            ));
-            prefix_agent_first_line(&mut stable_lines);
-            Arc::new(stable_lines)
-        };
+                stable_fence.is_some(),
+            );
+            if !has_rows && !finalized.is_empty() {
+                prefix_agent_first_line(&mut finalized);
+                has_rows = true;
+            }
+            push_stable_segment(&mut stable_segments, finalized);
+        }
 
-        let cached_lines = Arc::new(lines);
+        let mut suffix = render_region(
+            feed,
+            &block.text[stable_len..completed_len],
+            stable_fence.as_ref(),
+            width,
+            false,
+        );
+        if !has_rows && !suffix.is_empty() {
+            prefix_agent_first_line(&mut suffix);
+        }
 
-        *block.md_cache.borrow_mut() = Some(MdCache {
+        let cache = MdCache {
             width,
             stable_len,
-            stable_lines,
+            stable_fence,
+            stable_segments,
             parsed_len: completed_len,
-            lines: Arc::clone(&cached_lines),
-        });
-
-        return cached_lines;
+            suffix: Arc::new(suffix),
+        };
+        let segments = cache.segments();
+        *block.md_cache.borrow_mut() = Some(cache);
+        return segments;
     }
 
-    // Full re-parse: need to establish a new stable boundary or handle width change.
-    let stable_len = find_stable_boundary(&block.text, 0, completed_len);
-    let mut full_parsed = parse_agent_markdown(feed, &block.text[..completed_len], width);
-    prefix_agent_first_line(&mut full_parsed);
+    // Full re-parse: a new stable boundary must be established, or the width
+    // changed and every row has to be laid out again.
+    let (stable_len, stable_fence) = find_stable_boundary(&block.text, 0, completed_len, None);
+    let mut stable_segments: Vec<Arc<Vec<LineEntry>>> = Vec::new();
+    let mut has_rows = false;
+    if stable_len > 0 {
+        let mut finalized = render_region(
+            feed,
+            &block.text[..stable_len],
+            None,
+            width,
+            stable_fence.is_some(),
+        );
+        if !finalized.is_empty() {
+            prefix_agent_first_line(&mut finalized);
+            has_rows = true;
+        }
+        stable_segments.push(Arc::new(finalized));
+    }
+    let mut suffix = render_region(
+        feed,
+        &block.text[stable_len..completed_len],
+        stable_fence.as_ref(),
+        width,
+        false,
+    );
+    if !has_rows && !suffix.is_empty() {
+        prefix_agent_first_line(&mut suffix);
+    }
 
-    // Compute stable lines: parse only up to the stable boundary.
-    let stable_lines = if stable_len == completed_len {
-        Arc::new(full_parsed.clone())
-    } else if stable_len > 0 {
-        let mut stable = parse_agent_markdown(feed, &block.text[..stable_len], width);
-        prefix_agent_first_line(&mut stable);
-        Arc::new(stable)
-    } else {
-        Arc::new(Vec::new())
-    };
-
-    let cached_lines = Arc::new(full_parsed);
-
-    *block.md_cache.borrow_mut() = Some(MdCache {
+    let cache = MdCache {
         width,
         stable_len,
-        stable_lines,
+        stable_fence,
+        stable_segments,
         parsed_len: completed_len,
-        lines: Arc::clone(&cached_lines),
-    });
+        suffix: Arc::new(suffix),
+    };
+    let segments = cache.segments();
+    *block.md_cache.borrow_mut() = Some(cache);
+    segments
+}
 
-    cached_lines
+/// Append newly finalized rows, merging into a short trailing segment so the
+/// segment list stays proportional to content rather than to chunk count.
+fn push_stable_segment(segments: &mut Vec<Arc<Vec<LineEntry>>>, rows: Vec<LineEntry>) {
+    if rows.is_empty() {
+        return;
+    }
+    if let Some(last) = segments.last_mut()
+        && last.len() < MD_SEGMENT_COALESCE_ROWS
+    {
+        let mut merged = last.as_ref().clone();
+        merged.extend(rows);
+        *last = Arc::new(merged);
+        return;
+    }
+    segments.push(Arc::new(rows));
 }
 
 fn prefix_agent_first_line(lines: &mut [LineEntry]) {
@@ -981,16 +1193,16 @@ fn agent_tail_lines(block: &Block, width: usize, needs_prefix: bool) -> Vec<Line
     lines
 }
 
-/// Return the memoized markdown layout when it matches `(width, stable_len, parsed_len)`.
+/// Return the memoized markdown layout when it matches `(width, parsed_len)`.
 fn cached_agent_lines(
     block: &Block,
     width: usize,
     parsed_len: usize,
-) -> Option<Arc<Vec<LineEntry>>> {
+) -> Option<Vec<Arc<Vec<LineEntry>>>> {
     let cache = block.md_cache.borrow();
     let cache = cache.as_ref()?;
     if cache.width == width && cache.parsed_len == parsed_len {
-        Some(Arc::clone(&cache.lines))
+        Some(cache.segments())
     } else {
         None
     }

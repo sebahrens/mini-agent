@@ -886,3 +886,170 @@ fn finalize_block_is_noop_out_of_range_or_not_running() {
     assert!(!feed.is_streaming(0));
     assert!(!feed.is_streaming(7));
 }
+
+// ── Fenced streaming: linear work and exact delimiter rules ────────────
+
+/// Stream `lines` one at a time into a running agent block, laying out after
+/// each, and return the total bytes handed to the markdown parser.
+fn stream_lines_and_measure(lines: &[String]) -> (usize, usize) {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    let mut source_bytes = 0;
+    for line in lines {
+        source_bytes += line.len();
+        assert!(feed.append_to_last(line));
+        let _ = feed.lines(80);
+    }
+    (source_bytes, feed.markdown_bytes_parsed())
+}
+
+fn fenced_source(line_count: usize) -> Vec<String> {
+    let mut lines = vec!["```rust\n".to_string()];
+    for index in 0..line_count {
+        lines.push(format!("    let value_{index:04} = compute({index:04});\n"));
+    }
+    lines
+}
+
+#[test]
+fn streaming_a_long_fence_parses_a_bounded_multiple_of_its_source() {
+    let lines = fenced_source(1_000);
+    let (source_bytes, parsed_bytes) = stream_lines_and_measure(&lines);
+    assert!(
+        parsed_bytes <= source_bytes * 4,
+        "a fenced response must not re-parse the fence per line: \
+         source={source_bytes}, parsed={parsed_bytes}, ratio={:.1}x",
+        parsed_bytes as f64 / source_bytes as f64
+    );
+}
+
+#[test]
+fn streaming_fence_parsing_work_grows_near_linearly() {
+    let mut ratios = Vec::new();
+    for count in [1_000usize, 2_000, 4_000] {
+        let lines = fenced_source(count);
+        let (source_bytes, parsed_bytes) = stream_lines_and_measure(&lines);
+        ratios.push(parsed_bytes as f64 / source_bytes as f64);
+    }
+    // Quadratic work would multiply the ratio with every doubling.
+    assert!(
+        ratios[2] <= ratios[0] * 1.5,
+        "fence parsing work is not near-linear: {ratios:?}"
+    );
+}
+
+/// Parsed bytes per source byte for a construct that publishes no markdown
+/// boundary of its own, at 1k/2k/4k lines. Bounded per-chunk work makes this
+/// ratio flat; quadratic work multiplies it with every doubling.
+fn unbroken_construct_ratios(line: impl Fn(usize) -> String) -> Vec<f64> {
+    [1_000usize, 2_000, 4_000]
+        .into_iter()
+        .map(|count| {
+            let lines: Vec<String> = (0..count).map(&line).collect();
+            let (source_bytes, parsed_bytes) = stream_lines_and_measure(&lines);
+            parsed_bytes as f64 / source_bytes as f64
+        })
+        .collect()
+}
+
+#[test]
+fn streaming_a_long_list_does_not_grow_quadratically() {
+    let ratios =
+        unbroken_construct_ratios(|index| format!("- item {index:04} with descriptive text\n"));
+    assert!(
+        ratios[2] <= ratios[0] * 1.5,
+        "list streaming work is not near-linear: {ratios:?}"
+    );
+}
+
+#[test]
+fn streaming_a_long_paragraph_does_not_grow_quadratically() {
+    let ratios = unbroken_construct_ratios(|index| {
+        format!("sentence {index:04} continuing the same paragraph\n")
+    });
+    assert!(
+        ratios[2] <= ratios[0] * 1.5,
+        "paragraph streaming work is not near-linear: {ratios:?}"
+    );
+}
+
+/// Stream `text` one line at a time and compare the result with a from-scratch
+/// parse of the same text.
+fn assert_streamed_matches_fresh(text: &str) {
+    let mut feed = Feed::new();
+    feed.push_streaming_block(BlockStyle::Agent);
+    for line in text.split_inclusive('\n') {
+        assert!(feed.append_to_last(line));
+        let _ = feed.lines(80);
+    }
+    let streamed = feed.lines(80);
+
+    let mut fresh = Feed::new();
+    fresh.push_block(BlockStyle::Agent, text);
+    let reparsed = fresh.lines(80);
+
+    assert_eq!(
+        streamed.len(),
+        reparsed.len(),
+        "line count mismatch for {text:?}:\nstreamed={:?}\nfresh={:?}",
+        streamed.iter().map(|line| &line.text).collect::<Vec<_>>(),
+        reparsed.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+    for (index, (actual, expected)) in streamed.iter().zip(reparsed.iter()).enumerate() {
+        assert_eq!(actual.text, expected.text, "line {index} text for {text:?}");
+        assert_eq!(
+            actual.color, expected.color,
+            "line {index} color for {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_shorter_delimiter_inside_a_longer_fence_stays_code() {
+    // A four-backtick fence is not closed by an embedded three-backtick line,
+    // so the literal '#' after it must never be streamed as a heading.
+    assert_streamed_matches_fresh("````\ncode\n```\n\n# literal header\n````\n\nafter\n");
+}
+
+#[test]
+fn fence_delimiter_lengths_and_characters_round_trip() {
+    for delimiter in ["```", "````", "`````", "~~~", "~~~~"] {
+        let text = format!("{delimiter}\ninner\n\n# not a heading\n{delimiter}\n\ndone\n");
+        assert_streamed_matches_fresh(&text);
+    }
+}
+
+#[test]
+fn a_tilde_fence_is_not_closed_by_backticks() {
+    assert_streamed_matches_fresh("~~~\ncode\n```\n\n# literal\n~~~\n\nafter\n");
+}
+
+#[test]
+fn a_closing_delimiter_with_trailing_text_does_not_close_the_fence() {
+    assert_streamed_matches_fresh("```\ncode\n``` not a close\n\n# literal\n```\n\nafter\n");
+}
+
+#[test]
+fn an_indented_fence_round_trips() {
+    assert_streamed_matches_fresh("  ```rust\n  fn main() {}\n\n# literal\n  ```\n\nafter\n");
+}
+
+#[test]
+fn an_info_string_with_a_backtick_does_not_open_a_fence() {
+    assert_streamed_matches_fresh("``` not`valid\n\n# heading\n\nafter\n");
+}
+
+#[test]
+fn a_fence_inside_a_list_round_trips() {
+    assert_streamed_matches_fresh("- item\n\n  ```\n  code\n  ```\n\n- next\n");
+}
+
+#[test]
+fn an_unterminated_fence_round_trips_while_streaming() {
+    assert_streamed_matches_fresh("intro\n\n```rust\nfn a() {}\nfn b() {}\n");
+}
+
+#[test]
+fn a_blank_line_inside_a_fence_round_trips() {
+    assert_streamed_matches_fresh("```\nalpha\n\nbeta\n```\n\nafter\n");
+}
