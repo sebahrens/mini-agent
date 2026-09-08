@@ -3224,7 +3224,12 @@ mod protocol_tests {
         tokio::time::timeout(Duration::from_secs(1), worker_built.notified())
             .await
             .expect("builder should return an owner of a production worker");
-        assert_eq!(work_scope.active_children(), 1);
+        // The production telemetry worker deliberately holds no scope guard while
+        // it runs: `TelemetryDispatcher::drop` scopes the join instead, with a
+        // bounded flush budget. So the builder's result owns a worker without
+        // making the scope non-idle, and only the settlement assertions below
+        // describe the contract. Asserting a live child here would re-assert the
+        // test-only work guard that was removed with `current_work_guard`.
         assert!(control.cancel());
         release_builder.notify_one();
         let result = match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
