@@ -267,8 +267,14 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         // listed here because otherwise they fail completely silently — the tool
         // is simply absent and `--learned-skill-stats` keeps answering, so the
         // operator has no way to learn that skills are off or why.
-        write_ok(ctx.renderer, "runtime (read-only):");
-        for line in runtime_status_lines(&crate::provider::js_runtime_report()) {
+        write_ok(ctx.renderer, "runtime availability (read-only):");
+        #[cfg(feature = "skills")]
+        let service_failure = ctx.skill_services.disabled_diagnostic(ctx.workspace.root());
+        for line in runtime_status_lines(
+            &crate::provider::js_runtime_report(),
+            #[cfg(feature = "skills")]
+            service_failure.as_ref(),
+        ) {
             write_result(ctx.renderer, line);
         }
     } else {
@@ -308,15 +314,29 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 ///
 /// Kept pure and separate from the renderer so the verbatim containment refusal
 /// reason is unit-testable without a terminal.
-fn runtime_status_lines(report: &crate::provider::JsRuntimeReport) -> Vec<String> {
-    vec![
+fn runtime_status_lines(
+    report: &crate::provider::JsRuntimeReport,
+    #[cfg(feature = "skills")] service_failure: Option<
+        &crate::extras::js::skills::session::SkillServiceFailure,
+    >,
+) -> Vec<String> {
+    let lines = vec![
         format!("  {:<8}{}", "js", availability_label(&report.javascript)),
         format!(
             "  {:<8}{}",
             "skills",
             availability_label(&report.learned_skills)
         ),
-    ]
+    ];
+    #[cfg(feature = "skills")]
+    let lines = {
+        let mut lines = lines;
+        if let Some(failure) = service_failure {
+            lines.push(crate::ui::events::sanitize_output(&format!("  {failure}")).to_string());
+        }
+        lines
+    };
+    lines
 }
 
 /// `on` / `off (<verbatim reason>)` / `not compiled`, matching the `on`/`off`
@@ -564,7 +584,11 @@ mod runtime_status_tests {
             },
         };
 
-        let lines = runtime_status_lines(&report);
+        let lines = runtime_status_lines(
+            &report,
+            #[cfg(feature = "skills")]
+            None,
+        );
 
         assert_eq!(lines.len(), 2);
         let js = &lines[0];
@@ -585,7 +609,11 @@ mod runtime_status_tests {
             learned_skills: RuntimeAvailability::Available,
         };
 
-        let lines = runtime_status_lines(&report);
+        let lines = runtime_status_lines(
+            &report,
+            #[cfg(feature = "skills")]
+            None,
+        );
 
         assert_eq!(lines.len(), 2);
         for line in &lines {
@@ -601,9 +629,51 @@ mod runtime_status_tests {
             learned_skills: RuntimeAvailability::NotCompiled,
         };
 
-        let lines = runtime_status_lines(&report);
+        let lines = runtime_status_lines(
+            &report,
+            #[cfg(feature = "skills")]
+            None,
+        );
 
         assert!(lines[1].contains("not compiled"), "{}", lines[1]);
         assert!(!lines[1].contains("off"), "{}", lines[1]);
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn service_health_reports_partial_failure_and_retry_state_separately() {
+        use crate::extras::js::skills::session::SkillServiceFailure;
+
+        let report = JsRuntimeReport {
+            javascript: RuntimeAvailability::Available,
+            learned_skills: RuntimeAvailability::Available,
+        };
+        let healthy = runtime_status_lines(&report, None);
+        for (degraded, exhausted, state) in [
+            (false, false, "unavailable"),
+            (false, true, "disabled"),
+            (true, false, "degraded"),
+            (true, true, "degraded"),
+        ] {
+            let failure = SkillServiceFailure {
+                workspace_root: "workspace-a".into(),
+                attempts: if exhausted { 4 } else { 1 },
+                exhausted,
+                degraded,
+                reason: "\u{1b}[31mstore busy\u{1b}[0m".to_string(),
+            };
+            let lines = runtime_status_lines(&report, Some(&failure));
+            assert_eq!(&lines[..2], healthy.as_slice());
+            let retry = if exhausted {
+                "retry budget exhausted after 4 initialization attempts"
+            } else {
+                "attempt 1 of 4, retrying"
+            };
+            assert_eq!(
+                lines[2],
+                format!("  learned skills are {state} for workspace-a ({retry}): store busy")
+            );
+            assert_eq!(lines.len(), 3);
+        }
     }
 }

@@ -154,7 +154,7 @@ You are in read-only mode. Only read files and explore.
 | `/reasoning` | Toggle LLM reasoning on/off (requires model support). |
 | `/thinking` | Alias for `/reasoning`. |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
-| `/toggle` | Show available toggleable features. |
+| `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
 | `/toggle todo [on\|off]` | Enable or disable todo-list tools. |
 
 ## Memory (feature-gated)

@@ -49,28 +49,36 @@ fn service_init_retry_delay(attempts: u32) -> Duration {
 ///
 /// Initialization failures used to exist only as a `tracing::warn!`, so a
 /// silently disabled session looked identical to one with no learned skills.
-/// `/status` and the trusted-context diagnostics render this instead.
+/// Bare `/toggle` renders this separately from worker containment availability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SkillServiceFailure {
     pub(crate) workspace_root: PathBuf,
     pub(crate) attempts: u32,
     pub(crate) exhausted: bool,
+    pub(crate) degraded: bool,
     pub(crate) reason: String,
 }
 
 impl std::fmt::Display for SkillServiceFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let root = self.workspace_root.display();
+        let state = if self.degraded {
+            "degraded"
+        } else if self.exhausted {
+            "disabled"
+        } else {
+            "unavailable"
+        };
         if self.exhausted {
             write!(
                 formatter,
-                "learned skills are disabled for {root} after {} failed initialization attempts: {}",
+                "learned skills are {state} for {root} (retry budget exhausted after {} initialization attempts): {}",
                 self.attempts, self.reason
             )
         } else {
             write!(
                 formatter,
-                "learned skills are unavailable for {root} (attempt {} of {SERVICE_INIT_MAX_ATTEMPTS}, retrying): {}",
+                "learned skills are {state} for {root} (attempt {} of {SERVICE_INIT_MAX_ATTEMPTS}, retrying): {}",
                 self.attempts, self.reason
             )
         }
@@ -195,6 +203,7 @@ impl<T> WorkspaceServiceCache<T> {
             workspace_root: existing.root.clone(),
             attempts: existing.attempts,
             exhausted: existing.attempts >= SERVICE_INIT_MAX_ATTEMPTS,
+            degraded: matches!(existing.services.get(), Some(Some(_))),
             reason: existing.last_failure.clone()?,
         })
     }
@@ -252,16 +261,15 @@ impl SkillServiceOwner {
             .await
     }
 
-    /// Why learned skills are currently unavailable, for `/status` and the
-    /// trusted-context diagnostics. `None` while they are healthy.
-    ///
-    /// Not yet read by any surface: the startup banner reports only the
-    /// containment-preflight refusal (`startup::js_runtime_banner_lines`), not a
-    /// runtime service-cache failure. The allow hides exactly this accessor until a
-    /// diagnostics surface consumes it; do not widen it to the enclosing impl.
-    #[allow(dead_code)]
-    pub(crate) fn disabled_diagnostic(&self) -> Option<SkillServiceFailure> {
-        self.cache.failure()
+    /// Current-workspace service health for bare `/toggle`. A previous
+    /// workspace's cached diagnostic must not describe the active workspace.
+    pub(crate) fn disabled_diagnostic(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Option<SkillServiceFailure> {
+        self.cache
+            .failure()
+            .filter(|failure| failure.workspace_root == workspace)
     }
 
     #[cfg(test)]
@@ -402,6 +410,7 @@ mod tests {
             .expect("a failed initialization must be observable");
         assert_eq!(failure.attempts, 1);
         assert!(!failure.exhausted);
+        assert!(!failure.degraded);
         assert_eq!(failure.reason, "database is locked");
         assert!(
             failure.to_string().contains("database is locked"),
@@ -455,6 +464,7 @@ mod tests {
             .failure()
             .expect("a degraded bundle must be observable");
         assert!(failure.reason.contains("learned_index"), "{failure}");
+        assert!(failure.degraded);
 
         // Before the backoff elapses the same degraded bundle is reused.
         let throttled = Arc::clone(&calls);
@@ -524,6 +534,10 @@ mod tests {
                     .await;
                 let failure = cache.failure().expect("unsuccessful startup stays visible");
                 assert_eq!(
+                    failure.degraded,
+                    outcomes[(calls.load(Ordering::SeqCst) - 1) % outcomes.len()].is_ok()
+                );
+                assert_eq!(
                     failure.attempts as usize,
                     calls.load(Ordering::SeqCst),
                     "each completed attempt is charged once: {outcomes:?}"
@@ -536,6 +550,41 @@ mod tests {
             );
             assert!(cache.failure().unwrap().exhausted);
         }
+    }
+
+    #[tokio::test]
+    async fn owner_diagnostic_tracks_the_active_workspace_and_clears_after_recovery() {
+        let owner = super::SkillServiceOwner::new();
+        let workspace = std::path::Path::new("workspace-a");
+        owner
+            .cache
+            .resolve(
+                workspace.into(),
+                || async { Err("store busy".to_string()) },
+                |_| None,
+            )
+            .await;
+        assert_eq!(
+            owner.disabled_diagnostic(workspace).unwrap().reason,
+            "store busy"
+        );
+        assert!(
+            owner
+                .disabled_diagnostic(std::path::Path::new("workspace-b"))
+                .is_none()
+        );
+
+        let (root, paths) = app_paths();
+        std::fs::create_dir_all(&root).unwrap();
+        let services = SkillSessionServices::for_test(&paths);
+        owner.cache.expire_retry_backoff_for_test();
+        owner
+            .cache
+            .resolve(workspace.into(), || async { Ok(services) }, |_| None)
+            .await;
+        assert!(owner.disabled_diagnostic(workspace).is_none());
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
