@@ -192,6 +192,11 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
+      - name: Install and verify pinned npm
+        run: |
+          npm install --global "$(node --print "require('./package.json').packageManager")"
+          test "npm@$(npm --version)" = "$(node --print "require('./package.json').packageManager")"
+
       - name: Install locked extension dependencies
         run: npm ci --no-audit --no-fund
 

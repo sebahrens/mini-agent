@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -24,10 +25,29 @@ class VsCodeCiWorkflowTests(unittest.TestCase):
             raise AssertionError("workflow job 'vscode' is missing")
         cls.body = match.group("body")
 
-    def test_job_uses_pinned_node_and_extension_working_directory(self) -> None:
-        self.assertIn("node-version-file: editors/vscode/.nvmrc", self.body)
-        self.assertIn("working-directory: editors/vscode", self.body)
-        self.assertIn("cache-dependency-path: editors/vscode/package-lock.json", self.body)
+    def test_ci_and_release_install_the_manifest_toolchain_before_dependencies(self) -> None:
+        manifest = json.loads((REPOSITORY_ROOT / "editors/vscode/package.json").read_text())
+        self.assertRegex(manifest["packageManager"], r"^npm@\d+\.\d+\.\d+$")
+        release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text()
+        release_job = re.search(
+            r"(?ms)^  vscode-vsix:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+            release,
+        )
+        self.assertIsNotNone(release_job, "the native release job must exist")
+        for name, body in (("ci", self.body), ("release", release_job.group("body"))):
+            with self.subTest(workflow=name):
+                self.assertIn("node-version-file: editors/vscode/.nvmrc", body)
+                self.assertIn("working-directory: editors/vscode", body)
+                self.assertIn("cache-dependency-path: editors/vscode/package-lock.json", body)
+                # A version assertion alone cannot install the resolver declared
+                # by packageManager. Both workflows must actually select it, from
+                # the extension directory, before resolving its lockfile.
+                install = "npm install --global \"$(node --print \"require('./package.json').packageManager\")\""
+                verify = "test \"npm@$(npm --version)\" = \"$(node --print \"require('./package.json').packageManager\")\""
+                self.assertIn(install, body)
+                self.assertIn(verify, body)
+                self.assertLess(body.index(install), body.index(verify))
+                self.assertLess(body.index(verify), body.index("npm ci --no-audit --no-fund"))
 
     def test_job_runs_every_required_extension_gate(self) -> None:
         for command in (

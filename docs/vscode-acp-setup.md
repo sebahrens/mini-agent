@@ -69,6 +69,25 @@ No API key is required: the bundled binary is started over stdio, and the model
 provider key comes from the agent's own config or environment
 (`--api-key` on the CLI is the provider key, not an ACP credential).
 
+### Develop the extension
+
+Use the Node version in `editors/vscode/.nvmrc` and the npm version declared by
+`packageManager` in `editors/vscode/package.json`. CI and release packaging install
+and verify that npm pin before resolving dependencies. npm 10 can crash while
+updating Vitest's optional peers on Node 22; the pinned npm 11 resolver handles
+that dependency graph.
+
+From `editors/vscode`, after selecting the pinned Node version:
+
+```bash
+npm install --global "$(node --print "require('./package.json').packageManager")"
+npm ci --no-audit --no-fund
+npm run typecheck
+npm run lint
+npm test
+npm audit --audit-level=high
+```
+
 ## Generic ACP clients over TCP
 
 Other ACP clients can connect over TCP, which is useful when the agent runs on a

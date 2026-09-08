@@ -100,7 +100,7 @@
     "package:linux-arm64": "node ./scripts/package-target.mjs linux-arm64",
     "sbom": "node ./scripts/generate-sbom.mjs"
   },
-  "packageManager": "npm@10.8.2",
+  "packageManager": "npm@11.6.2",
   "devDependencies": {
     "@types/node": "20.17.30",
     "@types/vscode": "1.90.0",
