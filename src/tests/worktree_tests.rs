@@ -1935,7 +1935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_and_non_force_cleanup_use_explicit_repository_context() {
+    async fn merge_and_cleanup_use_explicit_repository_context() {
         let repo = TempRepo::new("merge main");
         let remote = repo.path().with_extension("bare remote");
         let worktree = repo.path().with_extension("linked worktree");
@@ -1994,7 +1994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_cleanup_never_removes_a_worktree_that_became_dirty() {
+    async fn cleanup_never_removes_a_worktree_that_became_dirty() {
         let repo = TempRepo::new("dirty force cleanup");
         let remote = repo.path().with_extension("dirty force cleanup remote");
         let worktree = repo.path().with_extension("dirty force cleanup worktree");
@@ -2032,9 +2032,9 @@ mod tests {
         assert_eq!(outcome, MergeOutcome::Success);
         std::fs::write(worktree.join("late-untracked.txt"), "keep me\n").unwrap();
 
-        let error = complete_merge_force(&mut state)
+        let error = complete_merge(&mut state)
             .await
-            .expect_err("force cleanup must fail closed on late dirt");
+            .expect_err("cleanup must fail closed on late dirt");
 
         assert!(error.contains("became dirty"), "unexpected error: {error}");
         assert_eq!(
@@ -2471,7 +2471,7 @@ mod tests {
         git(&worktree, ["commit", "-m", "later source commit"]);
         let later_oid = git_stdout(&worktree, ["rev-parse", "HEAD"]);
 
-        let error = complete_merge_force(&mut state)
+        let error = complete_merge(&mut state)
             .await
             .expect_err("changed source ref must fail closed");
 

@@ -1238,6 +1238,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn set_calibration(&mut self, input_tokens: u64, output_tokens: u64) {
         self.set_calibration_with_cleared_tool_results(input_tokens, output_tokens, 0);
     }
@@ -1490,11 +1491,7 @@ impl Session {
         reserve_tokens: u64,
         keep_recent: usize,
     ) -> bool {
-        if self.context_window == 0 {
-            return false;
-        }
-        self.effective_context_tokens_after_tool_result_pruning(keep_recent)
-            > self.context_window.saturating_sub(reserve_tokens)
+        self.needs_compaction_with_pending_after_tool_result_pruning(reserve_tokens, 0, keep_recent)
     }
 
     pub fn needs_compaction_with_pending_after_tool_result_pruning(
@@ -1562,26 +1559,6 @@ impl Session {
             }
         }
         cut_idx
-    }
-
-    pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
-        if self.context_window == 0 {
-            return false;
-        }
-        self.effective_context_tokens() > self.context_window.saturating_sub(reserve_tokens)
-    }
-
-    /// Like `needs_compaction` but also accounts for `pending_tokens` that
-    /// will be added to the request (pending user prompt, pending media).
-    /// Use this for pre-dispatch preflight so compaction decisions include
-    /// the payload that is about to be sent.
-    pub fn needs_compaction_with_pending(&self, reserve_tokens: u64, pending_tokens: u64) -> bool {
-        if self.context_window == 0 {
-            return false;
-        }
-        self.effective_context_tokens()
-            .saturating_add(pending_tokens)
-            > self.context_window.saturating_sub(reserve_tokens)
     }
 
     /// Returns true when the pending payload cannot fit even if the entire
@@ -1758,86 +1735,70 @@ fn apply_token_estimate_delta(value: u64, old: u64, new: u64) -> u64 {
 mod preflight_tests {
     use super::*;
 
-    fn session_with(context_window: u64, overhead: u64, message_tokens: u64) -> Session {
-        let mut s = Session::new("openai", "model", context_window, "");
-        s.overhead_tokens = overhead;
-        if message_tokens > 0 {
-            s.add_message(MessageRole::User, &"x".repeat(message_tokens as usize));
+    #[test]
+    fn active_compaction_gates_use_cold_or_calibrated_context_at_the_budget_boundary() {
+        for calibrated in [false, true] {
+            let mut session = Session::new("openai", "model", 1_000, "");
+            session.overhead_tokens = 20;
+            session.add_message(MessageRole::User, "existing conversation");
+            let anchor = if calibrated {
+                session.set_calibration_with_cleared_tool_results(150, 10, 0);
+                160
+            } else {
+                20 + Session::estimate_tokens("existing conversation")
+            };
+            session.add_message(MessageRole::Assistant, "new tail");
+            let context = anchor + Session::estimate_tokens("new tail");
+            let reserve = 20;
+            for (pending, extra_room, compact) in [(0, 0, false), (1, 0, true), (1, 1, false)] {
+                session.context_window = context + reserve + extra_room;
+                assert_eq!(
+                    session.needs_compaction_with_pending_after_tool_result_pruning(
+                        reserve, pending, 0
+                    ),
+                    compact,
+                    "calibrated={calibrated}, pending={pending}, extra_room={extra_room}"
+                );
+                if pending == 0 {
+                    assert!(!session.needs_compaction_after_tool_result_pruning(reserve, 0));
+                }
+            }
+            session.context_window = context + reserve - 1;
+            assert!(session.needs_compaction_after_tool_result_pruning(reserve, 0));
+            // Both operands are positive, so removing saturation really overflows.
+            assert!(
+                session.needs_compaction_with_pending_after_tool_result_pruning(0, u64::MAX, 0)
+            );
+            assert!(session.needs_compaction_after_tool_result_pruning(u64::MAX, 0));
         }
-        s
     }
 
     #[test]
-    fn needs_compaction_with_pending_zero_window_never_triggers() {
-        let s = session_with(0, 0, 0);
-        assert!(!s.needs_compaction_with_pending(0, 999_999));
+    fn unknown_context_window_disables_both_preflight_decisions() {
+        let mut session = Session::new("openai", "model", 0, "");
+        session.overhead_tokens = 50;
+        session.add_message(MessageRole::User, "existing conversation");
+        assert!(!session.needs_compaction_after_tool_result_pruning(u64::MAX, 0));
+        assert!(
+            !session.needs_compaction_with_pending_after_tool_result_pruning(u64::MAX, u64::MAX, 0)
+        );
+        assert!(!session.is_irreducible_with_pending(u64::MAX, u64::MAX));
     }
 
     #[test]
-    fn needs_compaction_with_pending_fits_when_sum_under_budget() {
-        // window=100, reserve=20, budget=80; effective=30, pending=40 => 70 <= 80
-        let s = session_with(100, 20, 10);
-        assert!(!s.needs_compaction_with_pending(20, 40));
-    }
-
-    #[test]
-    fn needs_compaction_with_pending_triggers_when_pending_overflows() {
-        // window=100, reserve=20, budget=80; effective=30, pending=60 => 90 > 80
-        let s = session_with(100, 20, 10);
-        assert!(s.needs_compaction_with_pending(20, 60));
-    }
-
-    #[test]
-    fn needs_compaction_with_pending_saturates_arithmetic_safely() {
-        let s = session_with(100, 0, 0);
-        // Huge pending: saturating_add must not panic or wrap.
-        assert!(s.needs_compaction_with_pending(0, u64::MAX));
-    }
-
-    #[test]
-    fn is_irreducible_zero_window_never_triggers() {
-        let s = session_with(0, 0, 0);
-        assert!(!s.is_irreducible_with_pending(0, 999_999));
-    }
-
-    #[test]
-    fn is_irreducible_when_overhead_plus_pending_fills_window() {
-        // window=100, reserve=20, budget=80; overhead=40, pending=40 => 80 >= 80
-        let s = session_with(100, 40, 0);
-        assert!(s.is_irreducible_with_pending(20, 40));
-    }
-
-    #[test]
-    fn is_irreducible_false_when_overhead_plus_pending_fits() {
-        // window=100, reserve=20, budget=80; overhead=20, pending=30 => 50 < 80
-        let s = session_with(100, 20, 0);
-        assert!(!s.is_irreducible_with_pending(20, 30));
-    }
-
-    #[test]
-    fn is_irreducible_saturates_arithmetic_safely() {
-        let s = session_with(100, 0, 0);
-        assert!(s.is_irreducible_with_pending(0, u64::MAX));
-    }
-
-    #[test]
-    fn calibrated_session_needs_compaction_with_pending_uses_calibrated_anchor() {
-        let mut s = session_with(200, 0, 0);
-        // Simulate calibration: 150 tokens used, 5 messages counted.
-        s.calibrated_tokens = 150;
-        s.calibrated_msg_count = 0;
-        // calibrated=150, pending=30 => 180; window=200, reserve=10, budget=190 => no compact
-        assert!(!s.needs_compaction_with_pending(10, 30));
-        // pending=60 => 210 > 190 => compact needed
-        assert!(s.needs_compaction_with_pending(10, 60));
-    }
-
-    #[test]
-    fn unknown_context_window_zero_never_triggers() {
-        // A session where context_window is still 0 (unknown) must not fire.
-        let s = session_with(0, 50, 20);
-        assert!(!s.needs_compaction_with_pending(10, 100));
-        assert!(!s.is_irreducible_with_pending(10, 100));
+    fn irreducible_payload_boundary_excludes_reducible_history_and_saturates() {
+        let mut session = Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 20;
+        session.add_message(MessageRole::User, &"history".repeat(100));
+        // Only overhead and pending payload are irreducible; history can be summarized.
+        for (pending, irreducible) in [(59, false), (60, true), (61, true), (u64::MAX, true)] {
+            assert_eq!(
+                session.is_irreducible_with_pending(20, pending),
+                irreducible,
+                "pending={pending}"
+            );
+        }
+        assert!(session.is_irreducible_with_pending(u64::MAX, 0));
     }
 
     #[test]
@@ -1898,7 +1859,7 @@ mod preflight_tests {
         session.context_window = full;
         let reserve = full - budget;
 
-        assert!(session.needs_compaction(reserve));
+        assert!(session.needs_compaction_after_tool_result_pruning(reserve, usize::MAX));
         assert!(!session.needs_compaction_after_tool_result_pruning(reserve, 1));
         assert!(
             session.needs_compaction_with_pending_after_tool_result_pruning(

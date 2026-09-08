@@ -390,29 +390,6 @@ fn add_message_updates_updated_at() {
 }
 
 #[test]
-fn needs_compaction_when_over_threshold() {
-    let mut s = Session::new("openai", "gpt-4", 1000, "");
-    s.add_message(MessageRole::User, &"x".repeat(900 * 4)); // ~900 tokens
-    // With context_window=1000, reserve=200, threshold is 800
-    // We have ~900 tokens, so should need compaction
-    assert!(s.needs_compaction(200));
-}
-
-#[test]
-fn needs_compaction_when_under_threshold() {
-    let mut s = Session::new("openai", "gpt-4", 1000, "");
-    s.add_message(MessageRole::User, "short");
-    // Very few tokens, should not need compaction
-    assert!(!s.needs_compaction(200));
-}
-
-#[test]
-fn needs_compaction_zero_context_window() {
-    let s = Session::new("openai", "gpt-4", 0, "");
-    assert!(!s.needs_compaction(200));
-}
-
-#[test]
 fn update_context_window_changes_value() {
     let mut s = Session::new("openai", "gpt-4", 128000, "");
     s.update_context_window(256000);

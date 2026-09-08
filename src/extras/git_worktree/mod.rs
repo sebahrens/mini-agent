@@ -1994,16 +1994,6 @@ async fn restore_and_verify_original(state: &MergeState) -> (bool, Vec<String>) 
 }
 
 pub async fn complete_merge(state: &mut MergeState) -> Result<(), String> {
-    complete_merge_with_force(state, false).await
-}
-
-pub async fn complete_merge_force(state: &mut MergeState) -> Result<(), String> {
-    // Compatibility entry point: destructive dirty-worktree cleanup is no
-    // longer supported, even when the deprecated flag is configured.
-    complete_merge_with_force(state, true).await
-}
-
-async fn complete_merge_with_force(state: &mut MergeState, _force: bool) -> Result<(), String> {
     if state.repository_guard.is_none() {
         state.repository_guard = Some(acquire_repository(&state.info.main_repo_path).await?);
     }
