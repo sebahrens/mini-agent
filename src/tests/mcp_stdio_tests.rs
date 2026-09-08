@@ -702,10 +702,13 @@ async fn mcp_command_transport_uses_the_explicit_workspace() {
         .unwrap();
     let manager = McpClientManager::from_handles(vec![handle]);
 
-    assert_eq!(
-        call_fixture_tool(&manager).await["cwd"],
-        workspace.canonicalize().unwrap().display().to_string()
-    );
+    let report = call_fixture_tool(&manager).await;
+    // Windows current_dir can omit the verbatim prefix returned by canonicalize.
+    // Compare resolved directories, so equivalent native path spellings agree.
+    let child_cwd = Path::new(report["cwd"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(child_cwd, workspace.canonicalize().unwrap());
     shutdown(manager).await;
     fixture.cleanup();
 }
