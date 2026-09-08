@@ -610,7 +610,20 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        let result = verify_skill(&s);
+        // Losing the worker outright is a transient launch/transport failure on
+        // a loaded runner, not a verification outcome, so it is retried rather
+        // than accepted: a genuinely broken interrupt still fails both attempts.
+        // This adds no accepted outcome to the match below.
+        let mut result = verify_skill(&s);
+        if matches!(
+            &result,
+            Err(VerificationError::InfrastructureUnavailable(message))
+                if message == "worker unavailable"
+        ) {
+            eprintln!("infinite-source verification lost its worker; retrying once");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            result = verify_skill(&s);
+        }
         let interrupted = match &result {
             Err(VerificationError::SourceEvaluationFailed(_)) => true,
             // The worker's own interrupt handler normally fires first, but if

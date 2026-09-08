@@ -228,6 +228,7 @@ impl Tool for JobStatusTool {
 
 /// Source-compatibility alias for integrations that still construct the old
 /// Rust type. The model-visible tool name is always `shell`.
+#[cfg(test)]
 pub type BashTool = ShellTool;
 
 fn render_streams(stdout: &[u8], stderr: &[u8]) -> String {

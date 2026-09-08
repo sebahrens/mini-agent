@@ -115,6 +115,7 @@ pub struct WriteTodoList {
 }
 
 impl WriteTodoList {
+    #[cfg(test)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         Self::new_with_store(permission, ask_tx, TodoStore::default())
     }

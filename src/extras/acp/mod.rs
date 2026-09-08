@@ -4043,8 +4043,10 @@ mod workspace_tests {
     async fn concurrent_workspace_context_and_core_tools_remain_isolated() {
         let (_container, first, second) = roots();
         let base_context = crate::context::load(true);
-        let first_context = base_context.for_workspace(false, &first);
-        let second_context = base_context.for_workspace(false, &second);
+        let first_binding = crate::paths::WorkspaceBinding::capture(&first).unwrap();
+        let second_binding = crate::paths::WorkspaceBinding::capture(&second).unwrap();
+        let first_context = base_context.for_workspace_binding(false, &first_binding);
+        let second_context = base_context.for_workspace_binding(false, &second_binding);
         let first_agents = first_context.agents.as_deref().unwrap_or_default();
         let second_agents = second_context.agents.as_deref().unwrap_or_default();
         assert!(first_agents.contains("FIRST_CONTEXT_SENTINEL"));

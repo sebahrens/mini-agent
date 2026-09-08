@@ -1109,6 +1109,7 @@ impl FindFilesTool {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
         self.with_workspace_binding(crate::agent::tools::capture_workspace_binding(root.into()))
     }

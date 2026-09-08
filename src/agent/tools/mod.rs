@@ -68,6 +68,8 @@ pub(crate) fn resolve_tool_path(workspace_root: Option<&Path>, path: &str) -> Pa
     }
 }
 
+// Test fixtures accept paths; production captures one binding before building tools.
+#[cfg(test)]
 pub(crate) fn capture_workspace_binding(root: PathBuf) -> Arc<crate::paths::WorkspaceBinding> {
     Arc::new(
         crate::paths::WorkspaceBinding::capture(&root)

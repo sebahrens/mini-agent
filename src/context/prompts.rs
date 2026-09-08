@@ -173,13 +173,6 @@ pub fn load() -> HashMap<String, String> {
     load_with_paths(&paths)
 }
 
-pub(crate) fn load_for_workspace(workspace_root: &std::path::Path) -> HashMap<String, String> {
-    let paths = crate::paths::process_paths()
-        .and_then(|paths| paths.with_workspace_root(workspace_root))
-        .expect("canonical workspace must produce application paths");
-    load_with_paths(&paths)
-}
-
 pub(crate) fn load_for_workspace_binding(
     workspace: &crate::paths::WorkspaceBinding,
 ) -> HashMap<String, String> {

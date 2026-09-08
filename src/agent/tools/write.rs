@@ -98,11 +98,13 @@ impl WriteTool {
         }
     }
 
+    #[cfg(test)]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace = Some(crate::agent::tools::capture_workspace_binding(root));
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_workspace(self, root: impl Into<PathBuf>) -> Self {
         self.with_workspace_root(root.into())
     }

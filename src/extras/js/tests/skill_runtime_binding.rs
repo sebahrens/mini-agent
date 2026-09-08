@@ -67,6 +67,14 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
 
 async fn call_pure_skill_with_transport_retry(artifact: &SkillArtifact, code: &str) -> String {
     const MAX_ATTEMPTS: usize = 3;
+    // A retry with no delay is barely a retry: the three attempts used to run
+    // inside ~150 ms, so a transient condition with any duration — a previous
+    // worker still being reaped, its publication lease not yet released — failed
+    // all three. A fresh macOS worker takes on the order of a second to reach
+    // authenticated Ready (docs/benchmarks/2026-09-08-macos-worker-cold-start.md),
+    // so the backoff is scaled to that. This widens no accepted outcome: the
+    // final attempt still panics.
+    let mut backoff = std::time::Duration::from_millis(250);
     for attempt in 1..=MAX_ATTEMPTS {
         let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(artifact, 0)]));
         match tool
@@ -80,8 +88,11 @@ async fn call_pure_skill_with_transport_retry(artifact: &SkillArtifact, code: &s
                 if message == "JavaScript worker transport failed" && attempt < MAX_ATTEMPTS =>
             {
                 eprintln!(
-                    "skill runtime binding test transport failed on attempt {attempt}; retrying with a fresh supervisor"
+                    "skill runtime binding test transport failed on attempt {attempt}; \
+                     retrying with a fresh supervisor after {backoff:?}"
                 );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(3);
                 continue;
             }
             Err(error) => panic!("skill runtime binding call failed on attempt {attempt}: {error}"),

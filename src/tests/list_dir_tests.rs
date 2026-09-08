@@ -1,92 +1,79 @@
 use crate::agent::tools::list_dir::format_size;
+use crate::agent::tools::{ListDirArgs, ListDirTool};
+use rig::tool::Tool;
 
 #[test]
-fn format_0_bytes() {
-    assert_eq!(format_size(0), "0 B");
+fn format_size_preserves_unit_boundaries_and_fractional_units() {
+    for (bytes, expected) in [
+        (0, "0 B"),
+        (1, "1 B"),
+        (512, "512 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KB"),
+        (1536, "1.5 KB"),
+        (2048, "2.0 KB"),
+        (2560, "2.5 KB"),
+        (1_047_552, "1023.0 KB"),
+        (1_048_576, "1.0 MB"),
+        (1_073_741_824, "1.0 GB"),
+        (2_199_023_255_552, "2048.0 GB"),
+    ] {
+        assert_eq!(format_size(bytes), expected, "bytes={bytes}");
+    }
 }
 
-#[test]
-fn format_1_byte() {
-    assert_eq!(format_size(1), "1 B");
+struct TestDirectory(std::path::PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("mini-agent-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        Self(root)
+    }
 }
 
-#[test]
-fn format_1023_bytes() {
-    assert_eq!(format_size(1023), "1023 B");
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
-#[test]
-fn format_1024_bytes_1_kb() {
-    assert_eq!(format_size(1024), "1.0 KB");
-}
+#[tokio::test]
+async fn list_dir_reports_actual_child_counts_and_empty_directories() {
+    let root = TestDirectory::new();
+    std::fs::create_dir(root.0.join("empty")).unwrap();
+    std::fs::create_dir_all(root.0.join("populated/nested")).unwrap();
+    std::fs::write(root.0.join("populated/file.txt"), "contents").unwrap();
+    let tool = ListDirTool::new(None, None, None).with_workspace(&root.0);
 
-#[test]
-fn format_1536_bytes() {
-    assert_eq!(format_size(1536), "1.5 KB");
-}
-
-#[test]
-fn format_1048576_bytes_1_mb() {
-    assert_eq!(format_size(1048576), "1.0 MB");
-}
-
-#[test]
-fn format_1073741824_bytes_1_gb() {
-    assert_eq!(format_size(1073741824), "1.0 GB");
-}
-
-#[test]
-fn format_above_gb_remains_gb() {
-    // 2 TB
-    assert_eq!(format_size(2_199_023_255_552), "2048.0 GB");
-}
-
-#[test]
-fn format_512_bytes() {
-    assert_eq!(format_size(512), "512 B");
-}
-
-#[test]
-fn format_2048_bytes() {
-    assert_eq!(format_size(2048), "2.0 KB");
-}
-
-#[test]
-fn format_2560_bytes() {
-    assert_eq!(format_size(2560), "2.5 KB");
-}
-
-#[test]
-fn format_large_kb() {
-    assert_eq!(format_size(1_047_552), "1023.0 KB");
-}
-
-use crate::agent::tools::list_dir::count_dir_entries;
-
-#[test]
-fn count_empty_dir() {
-    let dir = std::env::temp_dir().join(format!("zs_empty_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    assert_eq!(count_dir_entries(&dir), 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn count_dir_with_files() {
-    let dir = std::env::temp_dir().join(format!("zs_files_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.txt"), b"a").unwrap();
-    std::fs::write(dir.join("b.txt"), b"b").unwrap();
-    assert_eq!(count_dir_entries(&dir), 2);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn count_nonexistent_dir() {
+    let listing = tool.call(ListDirArgs { path: None }).await.unwrap();
+    let rows: Vec<Vec<_>> = listing
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect())
+        .collect();
     assert_eq!(
-        count_dir_entries(std::path::Path::new("/nonexistent_xyz_test")),
-        0
+        rows,
+        vec![vec!["[dir(0)]", "empty"], vec!["[dir(2)]", "populated"]]
     );
+
+    let listing = tool
+        .call(ListDirArgs {
+            path: Some("empty".into()),
+        })
+        .await
+        .unwrap();
+    assert!(listing.ends_with("\n(empty directory)"), "{listing}");
+}
+
+#[tokio::test]
+async fn list_dir_rejects_missing_directory_instead_of_reporting_empty() {
+    let root = TestDirectory::new();
+    let result = ListDirTool::new(None, None, None)
+        .with_workspace(&root.0)
+        .call(ListDirArgs {
+            path: Some("missing".into()),
+        })
+        .await;
+    assert!(result.is_err(), "missing directory must fail: {result:?}");
 }

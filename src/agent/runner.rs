@@ -603,6 +603,7 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
+    #[cfg(test)]
     pub(crate) fn without_compaction(
         event_rx: mpsc::Receiver<AgentEvent>,
         abort_handle: tokio::task::AbortHandle,
@@ -1671,6 +1672,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn convert_history(session: &Session) -> Vec<Message> {
     convert_history_shared_with_tool_result_retention(
         session,
@@ -2185,6 +2187,7 @@ fn take_new_interactions(interactions: &mut Vec<Message>) -> Vec<Message> {
 /// note describing the in-flight turn so the side question can see what the
 /// agent is doing right now. The returned messages are a by-value snapshot; the
 /// session is never mutated, so there is nothing to roll back afterwards.
+#[cfg(test)]
 pub fn build_btw_snapshot(
     session: &Session,
     turn_trace: &[CompactString],
@@ -3104,14 +3107,10 @@ where
     )
 }
 
-/// Headless (`-p`, `--loop`) counterpart to [`spawn_agent`]'s turn loop.
-/// Deliberately drives its own manual loop instead of rig's
-/// `.max_turns(max_turns)` combinator: `max_turns` is an opaque black box
-/// that only ever yields a single terminal `FinalResponse` for the whole
-/// session, with no seam to inject "one more turn" after it — exactly what a
-/// `Stop` hook needs to do. Each stream is explicitly bounded to the unused
-/// portion of the agent's `default_max_turns`, so hook continuations share one
-/// model-call budget with the initial stream.
+/// Test convenience for the headless turn loop with default verification and
+/// stream policies. Production uses [`run_print_with_verification`] so it can
+/// persist partial progress on failure.
+#[cfg(test)]
 pub async fn run_print<M, H>(
     agent: &Agent<M>,
     prompt: &str,
@@ -3187,6 +3186,7 @@ where
 // `spawn_agent_with_start_mode`), so a params struct would only add a second
 // place to keep the two signatures in sync.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn run_print_with_stream_policy<M, H>(
     agent: &Agent<M>,
     prompt: &str,

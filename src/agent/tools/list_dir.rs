@@ -22,12 +22,6 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
-pub(crate) fn count_dir_entries(path: &Path) -> u64 {
-    std::fs::read_dir(path)
-        .map(|rd| rd.count() as u64)
-        .unwrap_or(0)
-}
-
 pub struct ListDirTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -59,6 +53,7 @@ impl ListDirTool {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_workspace(self, root: impl Into<std::path::PathBuf>) -> Self {
         self.with_workspace_binding(crate::agent::tools::capture_workspace_binding(root.into()))
     }
