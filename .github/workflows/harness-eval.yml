@@ -33,12 +33,20 @@ jobs:
             tee -a "$RUNNER_TEMP/harness-eval.log"
           cargo test --locked persona_regression_eval -- --ignored --nocapture --test-threads=1 2>&1 |
             tee -a "$RUNNER_TEMP/harness-eval.log"
-          grep '^HARNESS_EVAL ' "$RUNNER_TEMP/harness-eval.log" |
-            sed 's/^HARNESS_EVAL //' > "$RUNNER_TEMP/harness-eval.jsonl"
-          test "$(wc -l < "$RUNNER_TEMP/harness-eval.jsonl")" -eq 5
-          grep '^PERSONA_EVAL ' "$RUNNER_TEMP/harness-eval.log" |
-            sed 's/^PERSONA_EVAL //' > "$RUNNER_TEMP/persona-eval.jsonl"
-          test "$(wc -l < "$RUNNER_TEMP/persona-eval.jsonl")" -eq 9
+          # libtest prints its progress line and the test's first captured
+          # record on the same line, so a line-anchored grep drops exactly that
+          # record. The extractor matches the marker anywhere, validates each
+          # record as JSON against its schema, and enforces the counts.
+          python3 scripts/harness_eval_metrics.py \
+            --marker HARNESS_EVAL \
+            --log "$RUNNER_TEMP/harness-eval.log" \
+            --out "$RUNNER_TEMP/harness-eval.jsonl" \
+            --expect 5
+          python3 scripts/harness_eval_metrics.py \
+            --marker PERSONA_EVAL \
+            --log "$RUNNER_TEMP/harness-eval.log" \
+            --out "$RUNNER_TEMP/persona-eval.jsonl" \
+            --expect 9
 
       # The library-axis eval is cfg-gated on `skills` + `sandbox`, and its
       # module on `js` + `subagents`. `skills` is not a default feature, so the
@@ -56,13 +64,15 @@ jobs:
             tests::harness_eval_tests::task_json_library_axis_uses_real_store_and_records_oracles \
             -- --exact --nocapture --test-threads=1 2>&1 |
             tee -a "$RUNNER_TEMP/library-axis-eval.log"
-          grep '^HARNESS_EVAL ' "$RUNNER_TEMP/library-axis-eval.log" |
-            sed 's/^HARNESS_EVAL //' > "$RUNNER_TEMP/library-axis-eval.jsonl"
           # The record count tracks the task document, which grows; assert the
           # shape instead, so a silently skipped or single-armed run still fails.
-          test "$(wc -l < "$RUNNER_TEMP/library-axis-eval.jsonl")" -gt 0
-          grep -q '"library":"none"' "$RUNNER_TEMP/library-axis-eval.jsonl"
-          grep -q '"library":"library"' "$RUNNER_TEMP/library-axis-eval.jsonl"
+          python3 scripts/harness_eval_metrics.py \
+            --marker HARNESS_EVAL \
+            --log "$RUNNER_TEMP/library-axis-eval.log" \
+            --out "$RUNNER_TEMP/library-axis-eval.jsonl" \
+            --min 1 \
+            --require library=none \
+            --require library=library
 
       - name: Archive harness metrics
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -73,3 +83,15 @@ jobs:
             ${{ runner.temp }}/persona-eval.jsonl
             ${{ runner.temp }}/library-axis-eval.jsonl
           if-no-files-found: error
+
+      # A failed extraction or a failed test is exactly when the raw output is
+      # needed, so archive the logs even then.
+      - name: Archive harness diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harness-eval-logs
+          path: |
+            ${{ runner.temp }}/harness-eval.log
+            ${{ runner.temp }}/library-axis-eval.log
+          if-no-files-found: warn
