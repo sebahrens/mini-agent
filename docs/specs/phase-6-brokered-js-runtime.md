@@ -922,6 +922,14 @@ against the exact model script. Stored-skill and verifier diagnostics never carr
 metadata contains no filename, function name, property/key name, target, ordinal, effect result,
 or other source-derived string.
 
+Verification infrastructure failures retain the parent-defined closed worker
+reason, distinguishing containment, launch, transport, protocol, build identity,
+prompt deadline, unknown effect outcome, stale generation, identity exhaustion,
+and invalid blocking-runtime use. They remain infrastructure failures for
+admission; the reason contains no worker exception text or operating-system error
+payload. Parent watchdog expiry and cumulative native CPU exhaustion also remain
+infrastructure failures rather than evidence against a skill's source.
+
 Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
 explicitly allowlisted `syntax`, `exception`, and `invalid_result` JavaScript errors may leave the
 contained process warm, but the worker still creates a fresh QuickJS `Runtime` for the next

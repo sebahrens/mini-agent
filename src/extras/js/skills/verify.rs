@@ -428,7 +428,9 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
         | WorkerError::StaleGeneration
         | WorkerError::IdentityExhausted
         | WorkerError::BlockingVerifyInAsyncRuntime => {
-            VerificationError::InfrastructureUnavailable("worker unavailable".into())
+            // WorkerError is a closed, fieldless parent enum. Its static reason
+            // distinguishes infrastructure faults without exposing worker text.
+            VerificationError::InfrastructureUnavailable(error.to_string())
         }
         // The 30-second verification deadline is fixed before the job is queued and
         // the wait includes queueing behind interactive JS calls, so a busy session

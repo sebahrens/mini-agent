@@ -1064,12 +1064,16 @@ mod tests {
 
     #[test]
     fn a_proposal_enabled_bundle_initializes_one_embedding_backend() {
-        use crate::extras::js::skills::embed::backend_constructions_for_test;
+        use crate::extras::js::skills::embed::{Embedder, backend_constructions_for_test};
 
         let (root, paths) = app_paths();
         let before = backend_constructions_for_test();
+        let unrelated = std::thread::spawn(|| {
+            let _ = Embedder::new().expect("unrelated backend");
+        });
         let started = super::SkillSessionServices::start_components(&paths, None, true)
             .expect("startup components");
+        unrelated.join().unwrap();
         let constructed = backend_constructions_for_test() - before;
         assert_eq!(
             constructed, 1,

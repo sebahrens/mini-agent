@@ -1121,9 +1121,8 @@ mod scheduler_tests {
         Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationResult,
     };
     use crate::extras::js::skills::verify::{
-        SourceFailure, TestResult, test_result, validate_worker_result, worker_error,
+        SourceFailure, TestResult, test_result, validate_worker_result,
     };
-    use crate::extras::js::supervisor::WorkerError;
 
     fn assert_never_permanently_rejects(error: &VerificationError, context: &str) {
         let failure = classify_verification(
@@ -1135,31 +1134,6 @@ mod scheduler_tests {
             matches!(failure, EvaluationFailure::Infrastructure { .. }),
             "{context} must classify as retryable infrastructure; otherwise the proposal identity is permanently rejected"
         );
-    }
-
-    #[test]
-    fn parent_side_verification_timeout_is_retryable_admission_infrastructure() {
-        // The 30s deadline is fixed before the job is queued and the wait
-        // includes queueing behind interactive JS, so a busy session must not
-        // be able to permanently reject an innocent proposal.
-        let error = worker_error(WorkerError::TimedOut);
-        assert!(
-            matches!(error, VerificationError::InfrastructureUnavailable(_)),
-            "parent-side deadline expiry is not attributable to the skill source"
-        );
-        assert_never_permanently_rejects(&error, "a parent-side verification deadline");
-    }
-
-    #[test]
-    fn native_cpu_exhaustion_is_retryable_admission_infrastructure() {
-        // RLIMIT_CPU is cumulative per worker process and worker processes are
-        // reused, so earlier interactive JS can exhaust it for this proposal.
-        let error = worker_error(WorkerError::NativeCpuLimit);
-        assert!(
-            matches!(error, VerificationError::InfrastructureUnavailable(_)),
-            "a cumulative per-process CPU cap is not attributable to the skill source"
-        );
-        assert_never_permanently_rejects(&error, "a native CPU limit kill");
     }
 
     #[test]

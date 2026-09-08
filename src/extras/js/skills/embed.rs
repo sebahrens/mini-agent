@@ -841,16 +841,17 @@ impl std::fmt::Debug for Embedder {
     }
 }
 
-/// Counts backend constructions so a test can prove that one compatible
-/// embedding configuration initializes exactly one expensive backend per
-/// session.
 #[cfg(test)]
-static BACKEND_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static BACKEND_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
+/// Counts constructions on the current thread. Session component startup is
+/// synchronous on one blocking worker; unrelated test threads must not affect
+/// its count. Do not measure across an async suspension or thread migration.
 #[cfg(test)]
 pub(crate) fn backend_constructions_for_test() -> usize {
-    BACKEND_CONSTRUCTIONS.load(std::sync::atomic::Ordering::SeqCst)
+    BACKEND_CONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
 impl Embedder {
@@ -899,7 +900,7 @@ impl Embedder {
     /// Create an embedder with a custom backend.
     pub fn with_backend(backend: Arc<dyn EmbeddingBackend>) -> Result<Self, EmbeddingError> {
         #[cfg(test)]
-        BACKEND_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        BACKEND_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         let metadata = ModelMetadata {
             model_id: backend.model_id().to_string(),
             model_revision: backend.model_revision().to_string(),

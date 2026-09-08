@@ -494,32 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn native_cpu_exhaustion_is_retryable_verification_infrastructure() {
-        // `RLIMIT_CPU` is a cumulative per-process cap and worker processes are
-        // reused for many invocations, so earlier interactive JS or earlier
-        // seeds can exhaust it while an innocent proposal happens to be running.
-        let error = worker_error(WorkerError::NativeCpuLimit);
-        assert!(
-            matches!(error, VerificationError::InfrastructureUnavailable(_)),
-            "a cumulative per-process CPU kill is not attributable to the skill source: {error:?}"
-        );
-        assert!(error.is_infrastructure());
-    }
-
-    #[test]
-    fn parent_side_verification_timeout_is_retryable_verification_infrastructure() {
-        // The 30s deadline is fixed before the job is queued and the wait
-        // includes queueing behind interactive JS calls, so only a
-        // worker-reported interrupt is attributable to the skill source.
-        let error = worker_error(WorkerError::TimedOut);
-        assert!(
-            matches!(error, VerificationError::InfrastructureUnavailable(_)),
-            "a parent-side deadline is not attributable to the skill source: {error:?}"
-        );
-        assert!(error.is_infrastructure());
-    }
-
-    #[test]
     fn worker_contract_mismatch_is_verification_infrastructure() {
         let mismatch = crate::extras::js::skills::verify::validate_worker_result(
             &crate::extras::js::protocol::VerificationResult {
@@ -573,12 +547,60 @@ mod tests {
     }
 
     #[test]
-    fn containment_outage_is_retryable_verification_infrastructure() {
-        assert!(matches!(
-            worker_error(WorkerError::ContainmentUnavailable),
-            VerificationError::InfrastructureUnavailable(message)
-                if message == "worker unavailable"
-        ));
+    fn worker_failures_preserve_closed_infrastructure_reasons() {
+        // These reasons are parent-defined: no worker text, source, or OS error
+        // is needed to distinguish a launch failure from a lost transport.
+        for (worker, expected) in [
+            (
+                WorkerError::ContainmentUnavailable,
+                "JavaScript worker containment is unavailable",
+            ),
+            (WorkerError::Launch, "JavaScript worker launch failed"),
+            (WorkerError::Transport, "JavaScript worker transport failed"),
+            (
+                WorkerError::Protocol,
+                "JavaScript worker violated its protocol",
+            ),
+            (
+                WorkerError::BuildMismatch,
+                "JavaScript worker build identity differs from the parent",
+            ),
+            (
+                WorkerError::PermissionPromptTimedOut,
+                "JavaScript permission prompt was not answered before the invocation deadline",
+            ),
+            (
+                WorkerError::EffectOutcomeUnknown,
+                "JavaScript effect completed with an unknown outcome",
+            ),
+            (
+                WorkerError::StaleGeneration,
+                "JavaScript worker returned a stale process generation",
+            ),
+            (
+                WorkerError::IdentityExhausted,
+                "JavaScript worker supervisor identity space is exhausted",
+            ),
+            (
+                WorkerError::BlockingVerifyInAsyncRuntime,
+                "blocking JavaScript verification cannot run inside a Tokio runtime",
+            ),
+            (
+                WorkerError::TimedOut,
+                "worker verification deadline expired before the worker reported a result",
+            ),
+            (
+                WorkerError::NativeCpuLimit,
+                "worker process exhausted its cumulative native CPU budget",
+            ),
+        ] {
+            let error = worker_error(worker);
+            assert!(error.is_infrastructure(), "{worker:?}: {error:?}");
+            let VerificationError::InfrastructureUnavailable(reason) = error else {
+                panic!("{worker:?}: wrong verification failure class");
+            };
+            assert_eq!(reason, expected, "{worker:?}");
+        }
     }
 
     #[test]
