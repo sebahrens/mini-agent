@@ -765,8 +765,10 @@ async fn lsp_process_manager_restarts_stopped_server() {
 }
 
 /// Restores the production transport write deadline when the test ends.
+#[cfg(unix)]
 struct WriteDeadlineOverride;
 
+#[cfg(unix)]
 impl WriteDeadlineOverride {
     fn set(value: Duration) -> Self {
         crate::extras::lsp::client::set_write_timeout_for_test(Some(value));
@@ -774,12 +776,20 @@ impl WriteDeadlineOverride {
     }
 }
 
+#[cfg(unix)]
 impl Drop for WriteDeadlineOverride {
     fn drop(&mut self) {
         crate::extras::lsp::client::set_write_timeout_for_test(None);
     }
 }
 
+/// A child whose stdin pipe fills is a deterministic Unix fixture: the parent's
+/// write blocks once the pipe buffer is full and the child stops reading.
+/// Windows anonymous pipes buffer a document of this size without blocking, so
+/// the same fixture cannot stall the writer there. The deadline itself is
+/// platform-independent — it wraps the shared writer lock plus the frame write
+/// and flush for every request and notification on all platforms.
+#[cfg(unix)]
 #[tokio::test]
 async fn lsp_process_stalled_writer_is_bounded_and_reaped() {
     let fixture = FixtureBuild::compile("stalled-writer");
@@ -832,6 +842,9 @@ async fn lsp_process_stalled_writer_is_bounded_and_reaped() {
     fixture.cleanup();
 }
 
+/// See `lsp_process_stalled_writer_is_bounded_and_reaped` for why the
+/// full-pipe fixture is Unix-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn lsp_process_queued_writer_is_bounded_for_every_caller() {
     let fixture = FixtureBuild::compile("queued-writer");
