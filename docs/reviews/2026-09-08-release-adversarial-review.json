@@ -3,7 +3,7 @@
   "review_date": "2026-09-08",
   "baseline": "6021ba1cee1725d52930e17d239b305d6ed9ad66",
   "epic": "mini-agent-wldr",
-  "status": "in_progress",
+  "status": "review_complete",
   "findings": [
     {
       "id": "mini-agent-wldr.1",
@@ -354,20 +354,50 @@
       "required_change": "Persist and retry direct safety-triggered quarantine across publication lag and optimistic conflicts. Re-read current revision/generation state under the coordinator's mutation gate, apply the safety transition atomically, and publish a removal-only snapshot when a full rebuild is unavailable. Do not bypass stale-state checks, wait for another invocation to fail, or leave a known-unsafe revision available while a durable quarantine decision is pending.",
       "verification": "Apply docs/reviews/2026-09-08-probes-telemetry.patch and run cargo test --features skills release_review_probe_pending_index_generation -- --nocapture. It currently reports status=active and visible_after_rebuild=true instead of quarantine. Require a capability-denied skill to become ineligible despite desired/applied generation lag. Cover canary timeout/OOM, concurrent generation changes, rebuild failure, process restart and duplicate terminal delivery; assert a single durable transition/evidence record and no re-enable after recovery.",
       "id": "mini-agent-wldr.25"
+    },
+    {
+      "title": "ACP forgets completed tool effects when a turn fails or is cancelled",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/acp/mod.rs:1644-1683,1700-1730,1786-1838 (relay_prompt_events and cancellation completion)",
+      "evidence": [
+        "ACP forwards ToolCall and ToolResult notifications to the editor but only commits SessionHistory after AgentEvent::Done. Error, cancellation and channel-end branches return without retaining any partial interactions. An in-memory ACP protocol probe wrote a real temporary file, emitted its completed tool call/result and then a terminal error. The client correctly received Refusal, but its next prompt received history=[], despite the file still containing the completed write. The explicit cancellation branch has the same history omission; only the error path was dynamically reproduced. This is separate from headless .24 because ACP owns a different relay and session-history commit boundary."
+      ],
+      "required_change": "Retain a protocol-valid partial turn when ACP work fails or is cancelled after progress. Carry canonical completed tool messages, provider call IDs and reasoning from the runner, finalize unresolved calls as interrupted, and commit the prompt plus that progress before releasing the session. Preserve the Refusal/Cancelled response and preserve rollback for a cancellation before any work occurs; do not turn a failed operation into EndTurn success.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-acp.patch and run cargo test --features acp,skills release_review_probe_acp -- --nocapture. Currently the next prompt receives an empty history after a completed write and refusal. Add in-memory protocol tests for cancellation after a completed tool result, channel closure, partial text/reasoning and cancellation before start; assert retained call/result pairing, cross-session isolation and unchanged generation-safe cancellation behavior.",
+      "id": "mini-agent-wldr.26"
+    },
+    {
+      "title": "Skill statistics repeatedly scan task baselines and approach cubic work as history grows",
+      "priority": "P2",
+      "confidence": 0.97,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/js/skills/operations.rs:268-344 (load_skill_stats baseline subqueries); src/extras/js/skills/store.rs:3707-3710 (task-outcome indexes)",
+      "evidence": [
+        "For every retained revision, load_skill_stats separately counts baseline tasks and baseline passes by scanning all task outcomes and running another correlated observed-skill/source match for each baseline. A hermetic probe extracts the exact production SQL and uses a reduced SQLite schema with the relevant production indexes. With one observed task and one no-library baseline per revision under a shared oracle, 20/40/80 revisions executed approximately 177,700 / 1,215,400 / 8,942,800 VM steps: doubling data multiplied work 6.84x then 7.36x. EXPLAIN shows a baseline scan inside a correlated subquery and a further source-index search inside it. This measurement used local SQLite 3.53.2 rather than the Rust-bundled build; measured times were 3/21/174 ms and are illustrative only. An initial larger run was explicitly interrupted and is not used as completed evidence."
+      ],
+      "required_change": "Compute qualified outcome groups, per-skill observed source scopes and comparable baseline counts in set-based grouped queries or bounded pre-aggregations, then join the results once per revision. Avoid rescanning every baseline and every observed task for every skill. Preserve exact source-kind/source-id and production matching, distinct-turn semantics, absent-baseline n/a behavior, and exclusion of incomplete evidence required by .22.",
+      "verification": "Run python3 docs/reviews/2026-09-08-stats-scaling.py from the repository root; its recorded query plan and VM-step counts are in docs/reviews/2026-09-08-stats-scaling.json. Add a regression on the actual Rust-bundled SQLite/schema through load_skill_stats at increasing revision/outcome counts, verify exact utility results, and demonstrate that doubling both sets no longer multiplies query work approximately 8x. Include repeated oracle IDs, many source scopes, production/gym traffic, multiple attempts and missing baselines; report bounded latency at the documented retained-corpus scale.",
+      "id": "mini-agent-wldr.27"
     }
   ],
   "residual_risks": [
-    "This is a review checkpoint, not a claim that the release is fully audited or bug-free.",
-    "Learned-skill admission/lifecycle/telemetry interleavings, broader provider/session cancellation and platform packaging runtime contracts remain to be completed under the epic. Canonical worker/broker/containment boundaries received source, hostile-test and dedicated CI artifact review; this is not a proof against every possible native exploit.",
+    "Review and issue filing are complete for the recorded scope; the 27 implementation findings remain open. This is not release approval or a claim that the code is bug-free.",
+    "Admission authorization/optimistic transactions, lifecycle replacement, retention watermark/purge, provider retry/cancellation settlement and installer/archive/MSI source contracts received a final source/test-coverage pass. No additional defect was confirmed beyond the filed findings. Full cross-platform installer execution and exhaustive concurrency exploration were not performed locally. Canonical worker/broker/containment boundaries received source, hostile-test and dedicated CI artifact review; this is not a proof against every possible native exploit.",
     "Linux/Windows runtime behavior has not been exercised locally, but baseline CI containment and resource artifacts were downloaded and inspected, including Windows standard-user evidence. These establish behavior on the recorded runners only. The macOS gate-summary inconsistency is tracked in .20.",
     "Performance test failure in the restricted initial run was not reproduced in the unrestricted full suite; no separate performance-regression finding was inferred from that timing sample."
   ],
   "testing_gaps": [
-    "Nineteen targeted regressions covering eighteen findings are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
+    "Twenty targeted Rust regressions covering nineteen findings are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
     "Read long-line allocation and provider-inactivity findings are code-confirmed; implementation beads require instrumented/hermetic regressions.",
     "Nightly workflow policy tests assert command strings, not correctness of record extraction.",
     "Repeated local embedding-model construction is code-confirmed; construction-count and ONNX memory measurements are acceptance work for .18.",
-    "Headless failure persistence (.24) is code-confirmed; its bead requires a hermetic fake-model test across runner failure and saved-session reload."
+    "Headless failure persistence (.24) is code-confirmed; its bead requires a hermetic fake-model test across runner failure and saved-session reload.",
+    "ACP error-after-effect history loss (.26) was reproduced in memory; cancellation shares the source omission and still needs the explicit regression required by its bead.",
+    "Statistics scaling (.27) was measured using exact production SQL and relevant indexes on a reduced system-SQLite fixture; actual Rust-bundled SQLite/schema performance is required acceptance work. The saved script bounds each sample to 50 million VM steps."
   ],
   "objective": "Thorough release code review covering bugs, issues and performance bottlenecks, with atomic beads specifying what to change, where and how to verify."
 }

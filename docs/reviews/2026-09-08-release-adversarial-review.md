@@ -1,8 +1,8 @@
 # Release code review — 2026-09-08
 
-Review checkpoint at `6021ba1cee1725d52930e17d239b305d6ed9ad66` (v1.8.0). Tracking epic: **mini-agent-wldr**, in progress. No production fixes are included in this checkpoint.
+Reviewed baseline: `6021ba1cee1725d52930e17d239b305d6ed9ad66` (v1.8.0). Tracking epic: **mini-agent-wldr**. Review and issue filing are complete; the epic remains open for its implementation findings. No production fixes are included.
 
-Twenty-five atomic findings are filed: **13 P1, 12 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
+Twenty-seven atomic findings are filed: **14 P1, 13 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
 
 | Bead | Priority | Finding | Evidence |
 |---|---|---|---|
@@ -31,6 +31,8 @@ Twenty-five atomic findings are filed: **13 P1, 12 P2**. Each bead records the a
 | mini-agent-wldr.23 | P1 | Telemetry retry on a busy SQLite writer can prevent process shutdown indefinitely | Failing targeted regression |
 | mini-agent-wldr.24 | P1 | A failed headless turn discards completed tool history and usage after effects already ran | Code trace |
 | mini-agent-wldr.25 | P1 | Immediate skill quarantine is lost when index publication is pending | Failing targeted regression |
+| mini-agent-wldr.26 | P1 | ACP forgets completed tool effects when a turn fails or is cancelled | Failing targeted regression for the error path; cancellation code trace |
+| mini-agent-wldr.27 | P2 | Skill statistics approach cubic query work as retained history grows | Exact production SQL on an indexed system-SQLite fixture |
 
 ## Verification evidence
 
@@ -52,8 +54,11 @@ git apply docs/reviews/2026-09-08-probes-integrations.patch
 git apply docs/reviews/2026-09-08-probes-hooks.patch
 git apply docs/reviews/2026-09-08-probes-skill-startup.patch
 git apply docs/reviews/2026-09-08-probes-telemetry.patch
-cargo test --features skills,lsp,hooks release_review_probe -- --nocapture
+git apply docs/reviews/2026-09-08-probes-acp.patch
+cargo test --features acp,skills,lsp,hooks release_review_probe -- --nocapture
 ```
+
+The ACP patch covers .26. Its in-memory protocol test wrote a real temporary file, emitted a completed tool call/result, then returned a terminal error. The next prompt received an empty history despite the completed effect. The test failed under `cargo test --features acp,skills release_review_probe_acp -- --nocapture`; its temporary source edit was removed. Cancellation follows the same source omission but was not dynamically reproduced. Across the six patches, 20 Rust probes cover 19 findings.
 
 The telemetry patch covers .21–.23 and .25. All four probes failed using local fixtures under `cargo test --features skills`: an earlier invocation lost its outcome link after an actual mid-turn search, an observability-lost turn became a no-skill baseline, runtime shutdown waited 879 ms for a separate SQLite writer, and a pending index generation caused immediate quarantine to be skipped permanently. The temporary source edits were removed after execution.
 
@@ -84,6 +89,18 @@ Observed failures:
 - Runtime teardown waited 879 ms for a writer whose external watchdog released it after 700 ms; the retry loop has no shutdown bound.
 - A capability-denied skill remained active and visible after the pending index generation rebuilt.
 
+## Statistics scaling evidence
+
+Run `python3 docs/reviews/2026-09-08-stats-scaling.py` from the repository root. The [recorded results and query plan](2026-09-08-stats-scaling.json) use the exact SQL extracted from `load_skill_stats`, with the relevant production indexes and one observed task plus one baseline per revision under the same oracle.
+
+| Revisions | Outcomes | SQLite VM steps (rounded to 100) | Illustrative elapsed time |
+|---:|---:|---:|---:|
+| 20 | 40 | 177,700 | 3 ms |
+| 40 | 80 | 1,215,400 | 21 ms |
+| 80 | 160 | 8,942,800 | 174 ms |
+
+Doubling the fixture multiplied work by 6.84 and 7.36. The correlated baseline scans and nested source lookups explain the growth (.27). This uses system SQLite 3.53.2 and a reduced schema, not the application’s bundled SQLite; that distinction is part of the bead’s acceptance criteria. Each sample has a 50-million-VM-step abort bound. An initial larger run was explicitly interrupted and is not used as completed evidence.
+
 ## Platform evidence
 
 The baseline run’s actual containment summaries and aggregate measurements are preserved in [platform evidence](2026-09-08-platform-evidence.json), with original run and artifact identifiers. The dedicated gates reported success on Linux, macOS 15/26 and Windows; Windows also passed under a separate non-admin user. The macOS 26 summary mislabels availability despite recording a running worker (.20).
@@ -98,7 +115,8 @@ Each record uses an installed v1.8.0 debug production binary, 10 warmups and 100
 
 ## Scope and limits
 
-Completed in this checkpoint: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, current CI failure analysis, and targeted hook concurrency/verdict/input-rewrite attacks, skill-startup contention/recovery probes, inspection of the actual cross-platform containment/resource artifacts, task-outcome attribution and completeness, telemetry teardown, quarantine/publication interleavings, and headless terminal-failure persistence. Packaging source checks confirmed that all-zero pre-release recipe checksums are intentional and rejected by the post-release validation gate; no recipe-checksum defect was inferred. The containment pass traced descriptor closure and empty-root Linux launch, seccomp finalization, macOS one-time-image/guardian launch, Windows LPAC creation attributes and Job limits, bounded wire framing, supervisor I/O cancellation, and grant/audit revalidation. Existing hostile tests were inspected for denied execution, durable audit ordering, fresh runtimes, bounded jobs and redaction; the baseline suite and dedicated platform gates provide execution evidence. No additional authority-expansion finding was confirmed in that pass. The prior closed reviews were treated as leads, not proof of current behavior.
+Review coverage: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, current CI failure analysis, and targeted hook concurrency/verdict/input-rewrite attacks, skill-startup contention/recovery probes, inspection of the actual cross-platform containment/resource artifacts, task-outcome attribution and completeness, telemetry teardown, quarantine/publication interleavings, and headless terminal-failure persistence. Packaging source checks confirmed that all-zero pre-release recipe checksums are intentional and rejected by the post-release validation gate; no recipe-checksum defect was inferred. The containment pass traced descriptor closure and empty-root Linux launch, seccomp finalization, macOS one-time-image/guardian launch, Windows LPAC creation attributes and Job limits, bounded wire framing, supervisor I/O cancellation, and grant/audit revalidation. Existing hostile tests were inspected for denied execution, durable audit ordering, fresh runtimes, bounded jobs and redaction; the baseline suite and dedicated platform gates provide execution evidence. No additional authority-expansion finding was confirmed in that pass. The prior closed reviews were treated as leads, not proof of current behavior.
 
-This checkpoint does **not** establish completion of the full release review. Remaining coverage under the active epic includes learned-skill admission/lifecycle/telemetry interleavings, broader provider/session cancellation, and platform packaging runtime contracts. Containment findings and measurements apply to the reviewed code and recorded reference runners; they do not establish safety against every possible native exploit. No claim is made that all possible bugs have been found. Findings .11, .12, .18 and .24 are code-confirmed rather than dynamically reproduced; their beads require bounded-memory, stalled-provider, embedding-construction and headless-failure persistence tests.
+The final local pass also inspected admission authorization and optimistic commits, lifecycle replacement state validation, retention watermark and purge behavior, runner cancellation settlement, TUI partial-progress persistence, ACP terminal paths, and installer/archive/MSI contracts. Existing admission tests cover stale reviews, exact authorization binding, rollback and concurrent consumption; retention tests cover idempotent compaction and ineligible-prefix boundaries. No additional defect was confirmed beyond the filed findings in that pass.
 
+Review and issue filing are complete for this scope. The 27 findings remain open for implementation and acceptance testing; this report does not approve the release. Cross-platform installer execution and exhaustive concurrency exploration were not performed locally. Containment findings and measurements apply to the reviewed code and recorded reference runners; they do not establish safety against every possible native exploit. Findings .11, .12, .18 and .24 are code-confirmed rather than dynamically reproduced; their beads require bounded-memory, stalled-provider, embedding-construction and headless-failure persistence tests. ACP cancellation and statistics performance on the actual bundled database remain explicit acceptance work under .26 and .27.

@@ -1,0 +1,82 @@
+--- a/src/extras/acp/mod.rs
++++ b/src/extras/acp/mod.rs
+@@ -2436,6 +2436,79 @@
+     }
+ 
+     #[tokio::test]
++    async fn release_review_probe_acp_failed_turn_preserves_completed_effect_history() {
++        let workspace = ProtocolTempDir::new();
++        let effect = workspace.path().join("effect.txt");
++        let observed = Arc::new(StdMutex::new(Vec::<Message>::new()));
++        let fixture: PromptFixture = {
++            let effect = effect.clone();
++            let observed = observed.clone();
++            Arc::new(move |prompt, history| {
++                let effect = effect.clone();
++                let observed = observed.clone();
++                Box::pin(async move {
++                    if prompt == "mutate" {
++                        std::fs::write(&effect, "already changed").unwrap();
++                        Ok(vec![
++                            AgentEvent::ToolCall {
++                                id: "review-completed-write".into(),
++                                name: "write".into(),
++                                args: serde_json::json!({"path":"effect.txt","content":"already changed"}),
++                            },
++                            AgentEvent::ToolResult {
++                                id: "review-completed-write".into(),
++                                name: "write".into(),
++                                output: "write completed".into(),
++                            },
++                            AgentEvent::Error("fixture terminal provider error".into()),
++                        ])
++                    } else {
++                        *observed.lock().unwrap() = history;
++                        Ok(vec![done(&prompt, vec![Message::assistant("next turn")])])
++                    }
++                })
++            })
++        };
++        let state = fixture_state(fixture);
++        let cwd = workspace.path().to_path_buf();
++        Client
++            .builder()
++            .on_receive_notification(
++                async |_notification: SessionNotification, _cx| Ok(()),
++                agent_client_protocol::on_receive_notification!(),
++            )
++            .connect_with(InMemoryAgent(state), async move |cx| {
++                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
++                    .block_task()
++                    .await?;
++                let session = cx
++                    .send_request(NewSessionRequest::new(cwd))
++                    .block_task()
++                    .await?
++                    .session_id;
++                let first = cx
++                    .send_request(prompt(session.clone(), "mutate"))
++                    .block_task()
++                    .await?;
++                assert_eq!(first.stop_reason, StopReason::Refusal);
++                let next = cx
++                    .send_request(prompt(session, "continue"))
++                    .block_task()
++                    .await?;
++                assert_eq!(next.stop_reason, StopReason::EndTurn);
++                Ok(())
++            })
++            .await
++            .unwrap();
++        assert_eq!(std::fs::read_to_string(effect).unwrap(), "already changed");
++        let history = serde_json::to_string(&*observed.lock().unwrap()).unwrap();
++        assert!(
++            history.contains("review-completed-write"),
++            "next ACP prompt lost completed write after refusal: {history}"
++        );
++    }
++
++    #[tokio::test]
+     async fn in_memory_protocol_preserves_history_isolation_rollback_and_tool_ids() {
+         let observed = Arc::new(StdMutex::new(Vec::<(String, Vec<Message>)>::new()));
+         let answered_from_context = Arc::new(AtomicBool::new(false));
