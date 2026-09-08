@@ -1924,6 +1924,10 @@ jobs:
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
+      - name: Test Windows atomic publication and sharing contracts
+        if: matrix.os == 'windows-latest'
+        run: cargo test --locked --no-default-features --features lsp atomic_write_tests
+
       - name: Test LSP process lifecycle
         run: cargo test --locked --no-default-features --features lsp lsp_process
 

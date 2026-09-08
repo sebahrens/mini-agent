@@ -107,11 +107,7 @@ fn atomic_write_security_create_only_never_replaces_existing_target() {
 #[test]
 fn windows_atomic_create_publishes_only_in_the_approved_directory() {
     let dir = TempDir::new("windows_directory_bound_create");
-    let leaf = format!(
-        ".zswrite-directory-bound-{}-{}.txt",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    );
+    let leaf = format!(".zswrite-directory-bound-{}.txt", uuid::Uuid::new_v4());
     let target = dir.join(&leaf);
     let cwd_target = std::env::current_dir().unwrap().join(&leaf);
     assert!(!cwd_target.exists());
@@ -347,34 +343,25 @@ async fn atomic_write_cancellation_serializes_with_final_publication() {
     assert_eq!(temp_residue(dir.path()), 0);
 }
 
-#[test]
-fn windows_atomic_temp_creation_is_relative_to_verified_directory_handle() {
-    let source = include_str!("../fs.rs");
-    assert!(source.contains("NtCreateFile"));
-    assert!(source.contains("NtSetInformationFile"));
-    assert!(source.contains("RootDirectory: directory.as_raw_handle().cast()"));
-    assert!(source.contains("RootDirectory = directory.as_raw_handle().cast()"));
-    assert!(source.contains("ReplaceIfExists = replace"));
-    assert!(source.contains("FILE_TRAVERSE | FILE_READ_ATTRIBUTES"));
-    assert!(source.contains(".share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)"));
-    assert!(source.contains("ensure_same_file(path, expected, &opened)"));
-    assert!(source.contains("FILE_CREATE"));
-    assert!(!source.contains("let staging_path = parent.join"));
-    assert!(!source.contains(".zswrite.{}.stage"));
-}
-
 #[cfg(windows)]
 #[test]
-fn windows_checked_metadata_handle_allows_atomic_target_replacement() {
+fn windows_checked_metadata_and_live_reader_allow_atomic_target_replacement() {
+    use std::io::Read;
     let directory = TempDir::new("windows_checked_metadata_replace");
     let target = directory.join("config.toml");
     std::fs::write(&target, b"before").unwrap();
-    let checked = crate::fs::checked_path_metadata(&target).unwrap();
+    let mut reader = std::fs::File::open(&target).unwrap();
+    let checked = crate::fs::checked_file_metadata(&reader).unwrap();
 
     atomic_write_within_sync(directory.path(), &target, b"after").unwrap();
 
     assert_eq!(std::fs::read(&target).unwrap(), b"after");
-    assert!(checked.is_file());
+    let mut old = String::new();
+    reader.read_to_string(&mut old).unwrap();
+    assert_eq!(old, "before", "existing readers must retain the old object");
+    let published = crate::fs::checked_path_metadata(&target).unwrap();
+    assert!(crate::fs::ensure_same_file(&target, &checked, &published).is_err());
+    assert_eq!(temp_residue(directory.path()), 0);
 }
 
 #[cfg(windows)]

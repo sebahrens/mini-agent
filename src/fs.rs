@@ -1944,7 +1944,8 @@ fn atomic_write_platform(
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+        FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
@@ -1992,8 +1993,12 @@ fn atomic_write_platform(
         let words = required.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // FileRenameInformation provides either atomic replacement or
-        // create-only publication through `ReplaceIfExists`. The native API
+        // Extended POSIX replacement preserves existing readers of the old
+        // object, including the handles retained by LSP identity tracking.
+        // Ordinary FileRenameInformation rejects those open targets even when
+        // they share deletion. Create-only publication keeps the ordinary class.
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+        // The native API
         // accepts a relative leaf together with the same retained,
         // identity-verified directory handle used for temp creation. The Win32
         // SetFileInformationByHandle wrapper does not preserve this native
@@ -2002,7 +2007,11 @@ fn atomic_write_platform(
         // name. Both handles and the buffer remain live across every bounded
         // retry of the same final publication call.
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = replace;
+            (*information).Anonymous.Flags = if replace {
+                FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
+            } else {
+                0
+            };
             (*information).RootDirectory = directory.as_raw_handle().cast();
             (*information).FileNameLength = name_bytes as u32;
             std::ptr::copy_nonoverlapping(
@@ -2023,7 +2032,11 @@ fn atomic_write_platform(
                         &mut io_status,
                         information.cast(),
                         required as u32,
-                        FileRenameInformation,
+                        if replace {
+                            FileRenameInformationEx
+                        } else {
+                            FileRenameInformation
+                        },
                     )
                 };
                 if status >= 0 {

@@ -937,6 +937,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
     let mut outputs = Vec::new();
     let mut stale_results = Vec::new();
+    let mut rejected_edits = Vec::new();
     for relative in [false, true] {
         let name = format!("tool-{relative}.probe");
         let path = if relative {
@@ -945,6 +946,8 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             workspace.join(name).to_string_lossy().into_owned()
         };
         outputs.push((
+            relative,
+            "write",
             1,
             write
                 .call(WriteArgs {
@@ -954,27 +957,42 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
                 })
                 .await,
         ));
-        outputs.push((
-            2,
-            edit.call(EditArgs {
+        let source = workspace.join(&path);
+        let uri = file_uri(&source).unwrap();
+        let edited = edit
+            .call(EditArgs {
                 path: path.clone(),
                 block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".into()),
                 replace_all: false,
                 file_crc: None,
                 edits: None,
             })
-            .await,
-        ));
+            .await;
+        let checked_edit_unsupported = cfg!(windows) && relative;
+        if checked_edit_unsupported {
+            // Windows bound replacements deliberately refuse publication when
+            // no atomic expected-identity exchange is available. The refusal
+            // must leave both the file and its synchronized version unchanged.
+            rejected_edits.push((
+                edited,
+                fs::read_to_string(&source).unwrap(),
+                manager
+                    .diagnostics_block_since(&source, Duration::ZERO, None)
+                    .await,
+            ));
+        } else {
+            outputs.push((relative, "edit", 2, edited));
+        }
         outputs.push((
-            3,
+            relative,
+            "query",
+            if checked_edit_unsupported { 2 } else { 3 },
             query
                 .call(LspArgs {
                     path: Some(path.clone()),
                 })
                 .await,
         ));
-        let source = workspace.join(&path);
-        let uri = file_uri(&source).unwrap();
         let binding = manager.bind_diagnostic_uri(&uri).await.unwrap();
         rewrite_preserving_length_and_mtime(&source);
         stale_results.push((
@@ -1002,8 +1020,20 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
         );
         assert_eq!(aggregate.unwrap(), "No diagnostics.");
     }
-    for (version, result) in outputs {
-        let output = result.expect("file tool must succeed");
+    for (edited, content, diagnostic) in rejected_edits {
+        let error = edited.expect_err("Windows checked edit must refuse publication");
+        assert!(
+            error
+                .to_string()
+                .contains("atomic compare-and-replace is unsupported"),
+            "{error}"
+        );
+        assert_eq!(content, "before");
+        assert!(diagnostic.unwrap().contains("fixture diagnostic version 1"));
+    }
+    for (relative, operation, version, result) in outputs {
+        let output =
+            result.unwrap_or_else(|error| panic!("{operation}, relative={relative}: {error}"));
         assert!(
             output.contains(&format!("fixture diagnostic version {version}")),
             "{output}"

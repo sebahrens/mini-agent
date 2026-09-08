@@ -1296,6 +1296,11 @@ competing rename. These checked workspace replacements therefore fail closed
 on Windows without changing the target; create-only `write` and `js/write_file`
 operations remain available.
 
+Ordinary Windows atomic replacements retain existing readers of the old file,
+including LSP's identity-tracking handles; newly opened readers see the complete
+replacement. Handles that deny delete sharing still prevent publication and
+follow the bounded sharing-lock retry policy.
+
 Bash commands have a mandatory 30-second deadline. A tool call's optional
 `timeout` value is milliseconds and can only lower that deadline. Captured raw
 output is limited to 1 MiB of stdout, 1 MiB of stderr, and 1.5 MiB combined;
