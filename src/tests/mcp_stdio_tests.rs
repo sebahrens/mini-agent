@@ -1332,13 +1332,13 @@ async fn mcp_generated_names_cannot_collide_with_an_unchanged_name() {
         leases.push(lease);
         handles.push(handle);
     }
-    let mut manager = McpClientManager::from_handles(handles);
+    let manager = McpClientManager::from_handles(handles);
     let permission = permission_for_named_tools(&[
         ("alpha", "probe"),
         ("beta", "probe"),
         ("gamma", "alpha__probe"),
     ]);
-    let mut tools = manager.collect_tools(Some(permission), None).await;
+    let tools = manager.collect_tools(Some(permission), None).await;
 
     let names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
     let unique: std::collections::HashSet<&String> = names.iter().collect();
@@ -1349,9 +1349,9 @@ async fn mcp_generated_names_cannot_collide_with_an_unchanged_name() {
     );
 
     // Every call must still reach the server it was collected from.
-    for index in 0..tools.len() {
-        let expected = tools[index].server_name.to_string();
-        let output = tools[index]
+    for tool in &tools {
+        let expected = tool.server_name.to_string();
+        let output = tool
             .call("{}".to_string())
             .await
             .unwrap_or_else(|error| panic!("{expected} must be callable: {error}"));
@@ -1384,8 +1384,8 @@ async fn structured_fixture_output(mode: &str) -> Result<String, rig::tool::Tool
     )
     .await
     .unwrap();
-    let mut manager = McpClientManager::from_handles(vec![handle]);
-    let mut tools = manager
+    let manager = McpClientManager::from_handles(vec![handle]);
+    let tools = manager
         .collect_tools(Some(permission_for(Action::Allow)), None)
         .await;
     let result = tools[0].call("{}".to_string()).await;

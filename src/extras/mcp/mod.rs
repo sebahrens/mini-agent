@@ -408,6 +408,92 @@ impl McpClientManager {
     }
 }
 
+/// Longest tool name accepted by the strictest supported provider schema.
+const MAX_REGISTERED_TOOL_NAME: usize = 64;
+
+/// Final registered name for every `(server, bare tool)` pair, in input order.
+///
+/// A bare name exposed by more than one server is namespaced as
+/// `<server>__<tool>`, but that generated name can equal another server's
+/// unchanged name, or another generated name (`a__b` + tool `c` collides with
+/// server `a` + tool `b__c`). Names are therefore allocated against one used
+/// set: unchanged names are reserved first, then generated names in input
+/// order, each disambiguated if it is already taken. The result is injective,
+/// so the collected catalog never registers one name twice and a requested
+/// tool cannot route to the wrong server.
+fn allocate_registered_tool_names(entries: &[(String, String)]) -> Vec<String> {
+    let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (server, bare) in entries {
+        let servers = owners.entry(bare.as_str()).or_default();
+        if !servers.contains(&server.as_str()) {
+            servers.push(server.as_str());
+        }
+    }
+
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut names: Vec<Option<String>> = vec![None; entries.len()];
+    // Reserve every name that keeps its bare form first, so a generated name
+    // can never displace one.
+    for (index, (_, bare)) in entries.iter().enumerate() {
+        let shared = owners.get(bare.as_str()).is_some_and(|s| s.len() > 1);
+        if !shared && used.insert(bare.clone()) {
+            names[index] = Some(bare.clone());
+        }
+    }
+    for (index, (server, bare)) in entries.iter().enumerate() {
+        if names[index].is_some() {
+            continue;
+        }
+        let candidate = McpTool::namespaced_name(server, bare).to_string();
+        names[index] = Some(allocate_registered_name(candidate, &mut used));
+    }
+    names
+        .into_iter()
+        .map(|name| name.expect("every entry is allocated"))
+        .collect()
+}
+
+/// Reduce `name` to the character set every supported provider accepts and
+/// make it unique within `used`, reserving the result.
+fn allocate_registered_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = truncate_registered_name(&sanitized, MAX_REGISTERED_TOOL_NAME);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for suffix in 2..u32::MAX {
+        let tail = format!("_{suffix}");
+        let head = truncate_registered_name(&base, MAX_REGISTERED_TOOL_NAME - tail.len());
+        let candidate = format!("{head}{tail}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("a unique registered tool name is always reachable")
+}
+
+/// Truncate on a character boundary; the sanitizer already removed every
+/// non-ASCII character, but keep this total for any future relaxation.
+fn truncate_registered_name(name: &str, limit: usize) -> String {
+    if name.len() <= limit {
+        return name.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -600,90 +686,4 @@ mod tests {
         ];
         assert_eq!(allocate(&entries), allocate(&entries));
     }
-}
-
-/// Longest tool name accepted by the strictest supported provider schema.
-const MAX_REGISTERED_TOOL_NAME: usize = 64;
-
-/// Final registered name for every `(server, bare tool)` pair, in input order.
-///
-/// A bare name exposed by more than one server is namespaced as
-/// `<server>__<tool>`, but that generated name can equal another server's
-/// unchanged name, or another generated name (`a__b` + tool `c` collides with
-/// server `a` + tool `b__c`). Names are therefore allocated against one used
-/// set: unchanged names are reserved first, then generated names in input
-/// order, each disambiguated if it is already taken. The result is injective,
-/// so the collected catalog never registers one name twice and a requested
-/// tool cannot route to the wrong server.
-fn allocate_registered_tool_names(entries: &[(String, String)]) -> Vec<String> {
-    let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (server, bare) in entries {
-        let servers = owners.entry(bare.as_str()).or_default();
-        if !servers.contains(&server.as_str()) {
-            servers.push(server.as_str());
-        }
-    }
-
-    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut names: Vec<Option<String>> = vec![None; entries.len()];
-    // Reserve every name that keeps its bare form first, so a generated name
-    // can never displace one.
-    for (index, (_, bare)) in entries.iter().enumerate() {
-        let shared = owners.get(bare.as_str()).is_some_and(|s| s.len() > 1);
-        if !shared && used.insert(bare.clone()) {
-            names[index] = Some(bare.clone());
-        }
-    }
-    for (index, (server, bare)) in entries.iter().enumerate() {
-        if names[index].is_some() {
-            continue;
-        }
-        let candidate = McpTool::namespaced_name(server, bare).to_string();
-        names[index] = Some(allocate_registered_name(candidate, &mut used));
-    }
-    names
-        .into_iter()
-        .map(|name| name.expect("every entry is allocated"))
-        .collect()
-}
-
-/// Reduce `name` to the character set every supported provider accepts and
-/// make it unique within `used`, reserving the result.
-fn allocate_registered_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let base = truncate_registered_name(&sanitized, MAX_REGISTERED_TOOL_NAME);
-    if used.insert(base.clone()) {
-        return base;
-    }
-    for suffix in 2..u32::MAX {
-        let tail = format!("_{suffix}");
-        let head = truncate_registered_name(&base, MAX_REGISTERED_TOOL_NAME - tail.len());
-        let candidate = format!("{head}{tail}");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-    }
-    unreachable!("a unique registered tool name is always reachable")
-}
-
-/// Truncate on a character boundary; the sanitizer already removed every
-/// non-ASCII character, but keep this total for any future relaxation.
-fn truncate_registered_name(name: &str, limit: usize) -> String {
-    if name.len() <= limit {
-        return name.to_string();
-    }
-    let mut end = limit;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    name[..end].to_string()
 }

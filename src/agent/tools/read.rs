@@ -342,8 +342,8 @@ impl Tool for ReadTool {
             }
             if terminated {
                 // A carriage return immediately before the newline is part of
-                // the terminator and belongs to neither the CRC nor the excerpt.
-                held_cr = false;
+                // the terminator: the held byte is simply dropped, belonging to
+                // neither the CRC nor the excerpt.
                 if hashedit {
                     file_crc.update(b"\n");
                 }
