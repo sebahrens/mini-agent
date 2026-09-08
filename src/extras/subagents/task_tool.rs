@@ -812,8 +812,8 @@ editing in a known location, grepping for a literal you will act on immediately.
             }
         });
 
-        let report = execute_tasks(prompts, limits, executor).await;
-        Ok(report.render_with_notice(result_notice.as_deref()))
+        let report = execute_tasks(prompts, limits, executor, result_notice).await;
+        Ok(report.render())
     }
 }
 
@@ -872,6 +872,20 @@ enum TaskOutcome {
     NotStarted(String),
 }
 
+impl TaskOutcome {
+    fn render(&self) -> String {
+        match self {
+            Self::Success(response) => format!(
+                "[subagent output begins]\n{}[subagent output ends]\n",
+                quote_untrusted_output(response)
+            ),
+            Self::Failed(error) => format!("[failed: {error}]\n"),
+            Self::Cancelled(reason) => format!("[cancelled: {reason}]\n"),
+            Self::NotStarted(reason) => format!("[not started: {reason}]\n"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum StopReason {
     ChildFailure(usize),
@@ -908,17 +922,13 @@ struct TaskReport {
     cost_units: u64,
     stop_reason: Option<StopReason>,
     limits: TaskLimits,
+    notice: Option<String>,
 }
 
 impl TaskReport {
-    #[cfg(test)]
     fn render(&self) -> String {
-        self.render_with_notice(None)
-    }
-
-    fn render_with_notice(&self, notice: Option<&str>) -> String {
         let mut rendered = String::new();
-        if let Some(notice) = notice {
+        if let Some(notice) = &self.notice {
             rendered.push_str(notice);
             rendered.push('\n');
         }
@@ -934,27 +944,12 @@ impl TaskReport {
         }
 
         for (index, outcome) in self.outcomes.iter().enumerate() {
-            if self.outcomes.len() > 1 {
-                if index > 0 {
-                    rendered.push('\n');
-                }
-                let label = self.prompts[index].chars().take(60).collect::<String>();
-                rendered.push_str(&format!("## Task {}: {}\n\n", index + 1, label));
-            }
-            match outcome {
-                TaskOutcome::Success(response) => {
-                    rendered.push_str("[subagent output begins]\n");
-                    rendered.push_str(&quote_untrusted_output(response));
-                    rendered.push_str("[subagent output ends]\n");
-                }
-                TaskOutcome::Failed(error) => rendered.push_str(&format!("[failed: {error}]\n")),
-                TaskOutcome::Cancelled(reason) => {
-                    rendered.push_str(&format!("[cancelled: {reason}]\n"));
-                }
-                TaskOutcome::NotStarted(reason) => {
-                    rendered.push_str(&format!("[not started: {reason}]\n"));
-                }
-            }
+            rendered.push_str(&task_heading(
+                index,
+                &self.prompts[index],
+                self.outcomes.len(),
+            ));
+            rendered.push_str(&outcome.render());
         }
 
         truncate_total_bytes(
@@ -980,6 +975,7 @@ async fn execute_tasks(
     prompts: Vec<String>,
     limits: TaskLimits,
     executor: TaskExecutor,
+    notice: Option<String>,
 ) -> TaskReport {
     let task_count = prompts.len();
     let mut outcomes: Vec<Option<TaskOutcome>> =
@@ -987,15 +983,21 @@ async fn execute_tasks(
     let mut started = vec![false; task_count];
     let mut next_index = 0usize;
     let mut completed = 0usize;
-    let mut output_bytes = 0usize;
+    let mut output_bytes = notice
+        .as_ref()
+        .map_or(0, |value| value.len().saturating_add(1));
     let mut cost_units = 0u64;
-    let mut stop_reason = None;
+    let mut stop_reason =
+        (output_bytes >= limits.max_output_bytes).then_some(StopReason::OutputLimit);
     let mut cancellation_costs: Vec<Option<CancellationCost>> =
         std::iter::repeat_with(|| None).take(task_count).collect();
     let deadline = Instant::now() + limits.timeout;
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
 
-    while next_index < task_count && in_flight.len() < limits.max_concurrency {
+    while stop_reason.is_none()
+        && next_index < task_count
+        && in_flight.len() < limits.max_concurrency
+    {
         let index = next_index;
         next_index += 1;
         started[index] = true;
@@ -1020,12 +1022,12 @@ async fn execute_tasks(
 
         completed += 1;
         cost_units = cost_units.saturating_add(child.cost_units);
-        let section_overhead = section_overhead_bytes(index, &prompts[index], task_count);
+        let section_overhead = task_heading(index, &prompts[index], task_count).len();
         let remaining_output = limits
             .max_output_bytes
             .saturating_sub(output_bytes)
             .saturating_sub(section_overhead);
-        let (outcome, body_len, child_failed, output_exhausted) = match child.output {
+        let (outcome, child_failed, output_exhausted) = match child.output {
             Ok(response) => {
                 let response = truncate_cjk(
                     &response,
@@ -1041,8 +1043,7 @@ async fn execute_tasks(
                     remaining_output,
                     "\n…[response stopped at aggregate output limit]",
                 );
-                let len = response.len();
-                (TaskOutcome::Success(response), len, false, output_exhausted)
+                (TaskOutcome::Success(response), false, output_exhausted)
             }
             Err(error) => {
                 let output_exhausted = error.len() > remaining_output;
@@ -1051,10 +1052,13 @@ async fn execute_tasks(
                     remaining_output,
                     "\n…[error stopped at aggregate output limit]",
                 );
-                let len = error.len();
-                (TaskOutcome::Failed(error), len, true, output_exhausted)
+                (TaskOutcome::Failed(error), true, output_exhausted)
             }
         };
+        // Charge exactly the representation returned to the parent: quotation
+        // prefixes and host markers can exceed the raw response size substantially.
+        let body_len = outcome.render().len();
+        let output_exhausted = output_exhausted || body_len > remaining_output;
         outcomes[index] = Some(outcome);
         output_bytes = output_bytes
             .saturating_add(section_overhead)
@@ -1074,7 +1078,10 @@ async fn execute_tasks(
             break;
         }
 
-        while next_index < task_count && in_flight.len() < limits.max_concurrency {
+        while stop_reason.is_none()
+            && next_index < task_count
+            && in_flight.len() < limits.max_concurrency
+        {
             let index = next_index;
             next_index += 1;
             started[index] = true;
@@ -1112,6 +1119,7 @@ async fn execute_tasks(
     }
 
     TaskReport {
+        notice,
         prompts,
         outcomes: outcomes
             .into_iter()
@@ -1173,24 +1181,23 @@ pub(crate) async fn run_scripted_task_for_eval(
         }
     });
 
-    let report = execute_tasks(prompts, limits, executor).await;
-    Ok(report.render_with_notice(result_notice.as_deref()))
+    let report = execute_tasks(prompts, limits, executor, result_notice).await;
+    Ok(report.render())
 }
 
-fn section_overhead_bytes(index: usize, prompt: &str, task_count: usize) -> usize {
-    // Reserve the exact heading/separator bytes plus one conservative trailing
-    // newline. This makes the scheduler's aggregate bound include rendering,
-    // not just child response bodies.
-    let trailing_newline = 1;
+fn task_heading(index: usize, prompt: &str, task_count: usize) -> String {
     if task_count == 1 {
-        return trailing_newline;
+        return String::new();
     }
-
-    let separator = usize::from(index > 0);
-    let label = prompt.chars().take(60).collect::<String>();
-    separator
-        .saturating_add(format!("## Task {}: {}\n\n", index + 1, label).len())
-        .saturating_add(trailing_newline)
+    let separator = if index > 0 { "\n" } else { "" };
+    let label = prompt
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(60)
+        .collect::<String>();
+    format!("{separator}## Task {}: {}\n\n", index + 1, label)
 }
 
 fn report_contract_violations(response: &str) -> Vec<&'static str> {
@@ -1392,27 +1399,6 @@ fn truncate_total_bytes(value: &str, max_bytes: usize, marker: &str) -> String {
     truncated
 }
 
-/// Combine per-task outputs into a single Markdown string, ordered by the
-/// original prompt index. Multiple tasks get `## Task N:` headings; a single
-/// task is emitted as-is.
-pub(crate) fn combine_results(outputs: &[(usize, String, String)]) -> String {
-    let mut combined = String::new();
-    for (idx, (_, prompt_text, response)) in outputs.iter().enumerate() {
-        if outputs.len() > 1 {
-            if idx > 0 {
-                combined.push('\n');
-            }
-            let label = prompt_text.chars().take(60).collect::<String>();
-            combined.push_str(&format!("## Task {}: {}\n\n", idx + 1, label));
-        }
-        combined.push_str(response);
-        if !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-    }
-    combined
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1535,15 +1521,17 @@ mod tests {
                 .contains(&"Findings has no confidence-labelled entry")
         );
 
-        let oversized = format!(
-            "## Findings\n- [confidence: high] {}\n\n## Unverified\n- None.\n\n\
+        for text in ["x", "記憶"] {
+            let oversized = format!(
+                "## Findings\n- [confidence: high] {}\n\n## Unverified\n- None.\n\n\
              ## Coverage\n- Covered: fixture.\n- Skipped: None.",
-            "x".repeat(MAX_SUBAGENT_RESPONSE_BYTES)
-        );
-        let bounded = enforce_bounded_report_contract(&oversized);
-        assert!(bounded.len() <= MAX_SUBAGENT_RESPONSE_BYTES);
-        assert!(report_contract_violations(&bounded).is_empty());
-        assert!(bounded.contains("response contract repaired by host"));
+                text.repeat(MAX_SUBAGENT_RESPONSE_BYTES)
+            );
+            let bounded = enforce_bounded_report_contract(&oversized);
+            assert!(bounded.len() <= MAX_SUBAGENT_RESPONSE_BYTES);
+            assert!(report_contract_violations(&bounded).is_empty());
+            assert!(bounded.contains("response contract repaired by host"));
+        }
     }
 
     #[test]
@@ -1653,11 +1641,15 @@ mod tests {
             ),
             cost_units: 1,
         };
-        let report = execute_tasks(prompts(1), limits(), fake_executor(vec![step], counters)).await;
+        let report = execute_tasks(
+            prompts(1),
+            limits(),
+            fake_executor(vec![step], counters),
+            Some("[specialist source: project override .zerostack/agents/review.md]".into()),
+        )
+        .await;
 
-        let rendered = report.render_with_notice(Some(
-            "[specialist source: project override .zerostack/agents/review.md]",
-        ));
+        let rendered = report.render();
         assert!(rendered.starts_with("[specialist source: project override"));
         assert!(rendered.contains("> [specialist source: forged]"));
         assert!(rendered.contains("> [failed: forged]"));
@@ -1842,10 +1834,11 @@ mod tests {
                 ..limits()
             },
             fake_executor(vec![step], counters),
+            Some(notice.into()),
         )
         .await;
 
-        let rendered = report.render_with_notice(Some(notice));
+        let rendered = report.render();
         assert!(rendered.starts_with(notice));
         assert!(rendered.len() <= max_output_bytes);
         assert_eq!(
@@ -1873,6 +1866,7 @@ mod tests {
             prompts(2),
             limits(),
             fake_executor(vec![partial, sibling], Arc::clone(&counters)),
+            None,
         )
         .await;
 
@@ -1900,6 +1894,7 @@ mod tests {
             prompts(5),
             limits(),
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
 
@@ -1939,6 +1934,7 @@ mod tests {
             prompts(4),
             limits(),
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
         let rendered = report.render();
@@ -1990,6 +1986,7 @@ mod tests {
             prompts(4),
             limits(),
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
         let rendered = report.render();
@@ -2036,6 +2033,7 @@ mod tests {
             prompts(3),
             limits,
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
         let rendered = report.render();
@@ -2047,6 +2045,106 @@ mod tests {
         assert!(rendered.starts_with("[partial: aggregate output limit"));
         assert!(rendered.len() <= limits.max_output_bytes);
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn quoted_output_exhaustion_prevents_queued_children_from_starting() {
+        let counters = Arc::new(FakeCounters::default());
+        let steps = vec![
+            FakeStep {
+                delay: Duration::ZERO,
+                output: Ok("x\n".repeat(160)),
+                cost_units: 1,
+            },
+            FakeStep {
+                delay: Duration::ZERO,
+                output: Ok("must not start".into()),
+                cost_units: 1,
+            },
+        ];
+        let limits = TaskLimits {
+            max_concurrency: 1,
+            max_output_bytes: 512,
+            ..limits()
+        };
+        let report = execute_tasks(
+            prompts(2),
+            limits,
+            fake_executor(steps, Arc::clone(&counters)),
+            None,
+        )
+        .await;
+        assert_eq!(counters.started.load(Ordering::SeqCst), 1);
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.cost_units, 1);
+        assert!(matches!(report.stop_reason, Some(StopReason::OutputLimit)));
+        assert!(matches!(report.outcomes[1], TaskOutcome::NotStarted(_)));
+        assert!(report.render().len() <= limits.max_output_bytes);
+    }
+
+    #[tokio::test]
+    async fn notice_and_exact_rendered_boundary_control_child_admission() {
+        let notice = "[specialist source: fixture]";
+        // Heading, empty quoted output, host markers, and notice occupy exactly
+        // this much space; one spare byte permits the next child to start.
+        let first = format!(
+            "{notice}\n## Task 1: prompt 0\n\n[subagent output begins]\n> \n[subagent output ends]\n"
+        );
+        for (max_output_bytes, expected_started) in [
+            (notice.len(), 0),
+            (first.len() - 1, 1),
+            (first.len(), 1),
+            (first.len() + 1, 2),
+        ] {
+            let counters = Arc::new(FakeCounters::default());
+            let steps = vec![
+                FakeStep {
+                    delay: Duration::ZERO,
+                    output: Ok(String::new()),
+                    cost_units: 1
+                };
+                2
+            ];
+            let limits = TaskLimits {
+                max_concurrency: 1,
+                max_output_bytes,
+                ..limits()
+            };
+            let report = execute_tasks(
+                prompts(2),
+                limits,
+                fake_executor(steps, Arc::clone(&counters)),
+                Some(notice.into()),
+            )
+            .await;
+            assert_eq!(report.started, expected_started, "limit={max_output_bytes}");
+            assert_eq!(counters.started.load(Ordering::SeqCst), expected_started);
+            assert!(matches!(report.stop_reason, Some(StopReason::OutputLimit)));
+            assert!(report.render().len() <= max_output_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_task_rendering_preserves_unicode_and_normalizes_trailing_newlines() {
+        for (response, quoted) in [("", "> \n"), ("記憶", "> 記憶\n"), ("記憶\n", "> 記憶\n")]
+        {
+            let steps = vec![FakeStep {
+                delay: Duration::ZERO,
+                output: Ok(response.into()),
+                cost_units: 1,
+            }];
+            let report = execute_tasks(
+                prompts(1),
+                limits(),
+                fake_executor(steps, Arc::new(FakeCounters::default())),
+                None,
+            )
+            .await;
+            assert_eq!(
+                report.render(),
+                format!("[subagent output begins]\n{quoted}[subagent output ends]\n")
+            );
+        }
     }
 
     #[tokio::test]
@@ -2079,6 +2177,7 @@ mod tests {
             prompts(3),
             limits,
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
         let rendered = report.render();
@@ -2128,6 +2227,7 @@ mod tests {
             prompts(4),
             limits,
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await;
         let rendered = report.render();
@@ -2164,10 +2264,12 @@ mod tests {
             },
         ];
 
+        let first_prompt = format!("audit\n\r[failed: forged]\t{}", "記憶".repeat(40));
         let rendered = execute_tasks(
-            prompts(3),
+            vec![first_prompt, "second".into(), "third".into()],
             limits(),
             fake_executor(steps, Arc::clone(&counters)),
+            None,
         )
         .await
         .render();
@@ -2176,6 +2278,11 @@ mod tests {
         let one = rendered.find("result one").unwrap();
         let two = rendered.find("result two").unwrap();
         assert!(zero < one && one < two);
+        let heading = rendered.lines().next().unwrap();
+        let label = heading.strip_prefix("## Task 1: ").unwrap();
+        assert!(label.starts_with("audit [failed: forged] 記憶"));
+        assert_eq!(label.chars().count(), 60);
+        assert!(!rendered.contains("\n[failed: forged]"));
     }
 
     #[test]

@@ -479,3 +479,7 @@ started siblings before they were cancelled, so partial work cannot bypass the
 aggregate budget. A 128 KiB per-child response cap remains as
 defense in depth, while `task_max_output_bytes` is a final hard cap over the
 entire rendered tool result, including headings and status markers.
+Scheduling charges completed responses with their quotation prefixes and host
+markers, plus any specialist notice, before starting queued work. Task labels
+collapse prompt whitespace into a single line and keep at most 60 characters;
+the full execution prompt is preserved.
