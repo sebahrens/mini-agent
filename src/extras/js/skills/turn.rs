@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use sha2::{Digest, Sha256};
 
 use super::coordinator::IndexCoordinator;
-use super::embed::Embedder;
+use super::embed::{Embedder, ModelMetadata};
 use super::index::{RetrievalPolicy, SkillIndex, manifest_size};
 use super::router::{FrozenRoute, RouteKind, RouteRequest, route};
 use super::{CapabilityManifest, SkillArtifact, SkillExport};
@@ -25,7 +25,9 @@ const CANARY_SHARE_BASIS_POINTS: u16 = 1_000;
 const MAX_TRUSTED_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_RESOURCE_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_AGENT_RESOURCE_INVENTORY_BYTES: usize = 8 * 1024;
-type CoordinatorRegistry = Mutex<HashMap<String, Arc<IndexCoordinator>>>;
+// Share live session services without making this process-wide lookup their owner.
+type CoordinatorKey = (std::path::PathBuf, ModelMetadata);
+type CoordinatorRegistry = Mutex<HashMap<CoordinatorKey, Weak<IndexCoordinator>>>;
 static COORDINATORS: OnceLock<CoordinatorRegistry> = OnceLock::new();
 
 struct AgentSkillState {
@@ -996,23 +998,17 @@ pub(crate) fn shared_coordinator(
     embedder: Arc<Embedder>,
 ) -> Result<(Arc<IndexCoordinator>, bool), super::coordinator::CoordinatorError> {
     let model = embedder.model_metadata();
-    let key = format!(
-        "{}\0{}\0{}\0{}\0{}",
-        paths.learned_skills_db().display(),
-        model.model_id,
-        model.model_revision,
-        model.dimensions,
-        model.normalized
-    );
+    let key = (paths.learned_skills_db(), model.clone());
     let registry = COORDINATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
         .map_err(|_| super::coordinator::CoordinatorError::Poisoned)?;
-    if let Some(coordinator) = registry.get(&key) {
-        return Ok((Arc::clone(coordinator), false));
+    registry.retain(|_, coordinator| coordinator.strong_count() > 0);
+    if let Some(coordinator) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok((coordinator, false));
     }
     let coordinator = Arc::new(IndexCoordinator::open(paths, embedder)?);
-    registry.insert(key, Arc::clone(&coordinator));
+    registry.insert(key, Arc::downgrade(&coordinator));
     Ok((coordinator, true))
 }
 
@@ -1491,6 +1487,98 @@ mod tests {
             project_dir: None,
         };
         (root, paths)
+    }
+
+    #[test]
+    fn shared_coordinator_lives_only_as_long_as_its_owners() {
+        let (root, paths) = temp_paths();
+        let embedder = Arc::new(Embedder::new().unwrap());
+        let (first, initialized) = shared_coordinator(&paths, Arc::clone(&embedder)).unwrap();
+        assert!(initialized);
+        let lifetime = Arc::downgrade(&first);
+        let (second, initialized) = shared_coordinator(&paths, Arc::clone(&embedder)).unwrap();
+        assert!(!initialized);
+        assert!(Arc::ptr_eq(&first, &second));
+        drop(first);
+        assert!(
+            lifetime.upgrade().is_some(),
+            "the remaining owner keeps the coordinator alive"
+        );
+        drop(second);
+        assert!(
+            lifetime.upgrade().is_none(),
+            "the registry must not retain the database and index after their last owner exits"
+        );
+
+        let mut other_paths = paths.clone();
+        other_paths.local_data_dir = root.join("another-local-data");
+        let (other, _) = shared_coordinator(&other_paths, Arc::clone(&embedder)).unwrap();
+        assert!(
+            COORDINATORS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .values()
+                .all(|cached| !Weak::ptr_eq(cached, &lifetime)),
+            "a lookup must prune expired entries from other workspaces"
+        );
+        drop(other);
+
+        let (reopened, initialized) = shared_coordinator(&paths, embedder).unwrap();
+        assert!(
+            initialized,
+            "a reopened coordinator must hydrate its new index"
+        );
+        let reopened_lifetime = Arc::downgrade(&reopened);
+        drop(reopened);
+        assert!(reopened_lifetime.upgrade().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn shared_coordinator_does_not_alias_lossy_database_paths() {
+        use crate::extras::js::skills::{coordinator::CoordinatorError, store::StoreError};
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+        #[cfg(windows)]
+        use std::os::windows::ffi::OsStringExt;
+
+        let (root, mut first_paths) = temp_paths();
+        first_paths.local_data_dir = root.join("data-\u{fffd}");
+        let mut other_paths = first_paths.clone();
+        #[cfg(unix)]
+        let other_component = OsString::from_vec(b"data-\xff".to_vec());
+        #[cfg(windows)]
+        let other_component = OsString::from_wide(&[100, 97, 116, 97, 45, 0xd800]);
+        other_paths.local_data_dir = root.join(other_component);
+        assert_ne!(
+            first_paths.learned_skills_db(),
+            other_paths.learned_skills_db()
+        );
+        assert_eq!(
+            first_paths.learned_skills_db().display().to_string(),
+            other_paths.learned_skills_db().display().to_string()
+        );
+        let embedder = Arc::new(Embedder::new().unwrap());
+        let (first, _) = shared_coordinator(&first_paths, Arc::clone(&embedder)).unwrap();
+        match shared_coordinator(&other_paths, embedder) {
+            Ok((other, initialized)) => {
+                assert!(
+                    !Arc::ptr_eq(&first, &other),
+                    "distinct database paths must not share a coordinator"
+                );
+                assert!(initialized);
+            }
+            // Filesystems/SQLite may reject non-UTF-8 paths. Such a path must
+            // still reach its own open attempt, never a different cached store.
+            Err(CoordinatorError::Store(StoreError::Io(_) | StoreError::Sqlite(_))) => {}
+            Err(error) => panic!("unexpected coordinator failure: {error}"),
+        }
+        drop(first);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

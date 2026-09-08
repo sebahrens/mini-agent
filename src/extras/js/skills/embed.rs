@@ -672,7 +672,7 @@ pub mod fastembed_backend {
 }
 
 /// Immutable metadata about an embedding model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelMetadata {
     pub model_id: String,
     pub model_revision: String,

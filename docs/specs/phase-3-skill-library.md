@@ -36,6 +36,15 @@ generation. The LLM receives a compact manifest containing selected IDs, descrip
 signatures, and capability tiers. Every JS tool invocation in that turn receives exactly the
 same immutable source snapshot.
 
+Learned-skill coordinators are shared by live services for the same database and embedding
+backend. Its key preserves the exact filesystem path and each model metadata field; lossy
+display text is never a database identity. The process-wide lookup holds weak references and
+prunes expired entries on lookup;
+it does not retain database connections or indexes after their final owner exits. Reopening
+after teardown creates and hydrates a fresh coordinator. Admission and telemetry workers belong
+to the session, so keeping them alive cannot prevent an individual agent turn from settling.
+Their teardown joins remain tracked by the scope that performs the teardown.
+
 Retrieving inside `engine::run_step` from model-generated JavaScript is prohibited. At that point
 the model has already written its code and cannot discover an injected function, and embedding
 raw JS against English descriptions produces a cross-domain query. Embedding and retrieval live
