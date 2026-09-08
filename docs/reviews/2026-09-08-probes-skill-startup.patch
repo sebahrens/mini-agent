@@ -1,0 +1,91 @@
+--- a/src/extras/js/skills/session.rs
++++ b/src/extras/js/skills/session.rs
+@@ -740,6 +740,88 @@
+         drop(services);
+         let _ = std::fs::remove_dir_all(root);
+     }
++    #[tokio::test(flavor = "current_thread")]
++    async fn release_review_probe_busy_startup_recovers_learned_skills_after_unlock() {
++        use crate::extras::js::skills::store::SkillStore;
++        use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
++        let (root, paths) = app_paths();
++        let artifact = SkillArtifact::new(
++            "function reviewRecovery(_cap, value) { return value.trim(); }".into(),
++            "Trim text for startup recovery".into(),
++            vec!["trim".into()],
++            vec![SkillExport {
++                name: "reviewRecovery".into(),
++                signature: "reviewRecovery(value: string): string".into(),
++            }],
++            vec!["reviewRecovery(' x ') === 'x'".into()],
++            CapabilityManifest::pure(),
++        )
++        .unwrap();
++        let mut store = SkillStore::open_at(&paths).unwrap();
++        store.insert_verified(&artifact).unwrap();
++        let lock = rusqlite::Connection::open(store.database_path()).unwrap();
++        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
++        let cache = WorkspaceServiceCache::new();
++        let first = cache
++            .resolve(root.clone(), || {
++                SkillSessionServices::open_with_paths(paths.clone(), None, false)
++            })
++            .await
++            .unwrap();
++        let missing_before_unlock = first.learned_index_len_for_test();
++        lock.execute_batch("ROLLBACK").unwrap();
++        cache.expire_retry_backoff_for_test();
++        let second = cache
++            .resolve(root.clone(), || {
++                SkillSessionServices::open_with_paths(paths.clone(), None, false)
++            })
++            .await
++            .unwrap();
++        second.prepare_prompt("trim text startup recovery").await;
++        let count_after_unlock = second.learned_index_len_for_test();
++        let diagnostic = cache.failure().map(|f| f.reason);
++        drop((first, second, cache, lock, store));
++        let _ = std::fs::remove_dir_all(root);
++        assert_eq!(
++            missing_before_unlock, 0,
++            "lock must prevent initial learned index startup"
++        );
++        assert_eq!(
++            count_after_unlock, 1,
++            "later turn never recovers after unlocking; cache diagnostic={diagnostic:?}"
++        );
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn release_review_probe_observation_startup_keeps_executor_responsive() {
++        use crate::extras::js::skills::embed::Embedder;
++        use crate::extras::js::skills::turn::shared_coordinator;
++        let (root, paths) = app_paths();
++        let (coordinator, _) =
++            shared_coordinator(&paths, Arc::new(Embedder::new().unwrap())).unwrap();
++        let lock = rusqlite::Connection::open(paths.learned_skills_db()).unwrap();
++        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
++        let unlocker = std::thread::spawn(move || {
++            std::thread::sleep(std::time::Duration::from_millis(400));
++            lock.execute_batch("ROLLBACK").unwrap();
++        });
++        let started = std::time::Instant::now();
++        let (elapsed, services) = tokio::join!(
++            async {
++                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++                started.elapsed()
++            },
++            async { SkillSessionServices::start_observation_services(&paths, None) }
++        );
++        unlocker.join().unwrap();
++        assert!(services.is_ok());
++        drop((services, coordinator));
++        let _ = std::fs::remove_dir_all(root);
++        assert!(
++            elapsed < std::time::Duration::from_millis(200),
++            "async executor timer blocked for {elapsed:?}"
++        );
++    }
+ }
+ 
+ struct ObservationServices {

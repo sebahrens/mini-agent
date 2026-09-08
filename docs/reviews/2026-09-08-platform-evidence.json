@@ -1,0 +1,566 @@
+{
+  "source_run": "https://github.com/sebahrens/mini-agent/actions/runs/34190987872",
+  "source_revision": "6021ba1cee1725d52930e17d239b305d6ed9ad66",
+  "artifact_ids": {
+    "js-worker-resource-baseline": 10042741041,
+    "phase6-worker-gate-linux": 10042435687,
+    "phase6-worker-gate-macos-15": 10042315994,
+    "phase6-worker-gate-macos-26": 10042686980,
+    "phase6-worker-gate-windows": 10042716838
+  },
+  "artifacts": {
+    "js-worker-resource-baseline/js-worker-baseline.json": {
+      "schema_version": 1,
+      "benchmark": "mini-agent-js-worker",
+      "evidence_state": "complete_for_recorded_platforms",
+      "profile": "debug",
+      "sampling": {
+        "warmups": 10,
+        "samples": 100,
+        "percentile": "nearest-rank",
+        "variance": "unbiased sample variance in microseconds squared",
+        "documented_p95_variance_ratio": 0.15
+      },
+      "targets": {
+        "cold_ready_us": {
+          "linux": 250000.0,
+          "macos": 300000.0,
+          "windows": 750000.0
+        },
+        "warm_pure_call_us": 10000.0,
+        "broker_ipc_4kib_us": 10000.0,
+        "idle_private_bytes": 33554432,
+        "post_cancel_recovery_us": 1000000.0,
+        "maximum_worker_processes": 1,
+        "idle_runtimes": 0
+      },
+      "security_ceilings": {
+        "native_memory_bytes": 268435456,
+        "native_cpu_seconds": 35,
+        "relationship_to_targets": "enforced security ceilings; never inferred from benchmark measurements",
+        "verification": "verified by the platform containment probe job, separately from this benchmark"
+      },
+      "platform_evidence": [
+        {
+          "status": "measured",
+          "run": {
+            "machine": {
+              "host": "GitHub Actions 1000020211",
+              "os": "linux",
+              "arch": "x86_64",
+              "kernel": "Linux 6.17.0-1022-azure",
+              "cpu": "AMD EPYC 9V74 80-Core Processor",
+              "logical_cpus": 4,
+              "memory_bytes": 16766414848,
+              "binary_profile": "debug",
+              "package_version": "1.8.0",
+              "build_identity": "1.8.0+26f0323e5ee9270f638bd3c3771e3733a7919c7d8f13279895c897db59fb6510"
+            },
+            "containment": {
+              "backend": "bubblewrap",
+              "assurance": "enforced"
+            },
+            "latency": {
+              "cold_ready": {
+                "samples": 100,
+                "mean_us": 12779.875350000006,
+                "p50_us": 12766.075,
+                "p95_us": 12930.896,
+                "variance_us2": 5752.928913482316,
+                "standard_deviation_us": 75.8480646653711,
+                "minimum_us": 12619.205,
+                "maximum_us": 13054.928
+              },
+              "warm_pure_call": {
+                "samples": 100,
+                "mean_us": 1083.45273,
+                "p50_us": 1083.371,
+                "p95_us": 1102.58,
+                "variance_us2": 116.61972395666656,
+                "standard_deviation_us": 10.799061253491738,
+                "minimum_us": 1050.992,
+                "maximum_us": 1118.013
+              },
+              "broker_ipc_4kib": {
+                "samples": 100,
+                "mean_us": 1481.7892900000004,
+                "p50_us": 1478.305,
+                "p95_us": 1528.932,
+                "variance_us2": 773.2086661675753,
+                "standard_deviation_us": 27.806629895900283,
+                "minimum_us": 1433.788,
+                "maximum_us": 1555.101
+              },
+              "post_cancel_recovery": {
+                "samples": 100,
+                "mean_us": 19837.77306,
+                "p50_us": 19482.126,
+                "p95_us": 23734.647,
+                "variance_us2": 1482384.441851027,
+                "standard_deviation_us": 1217.53211121967,
+                "minimum_us": 19081.153,
+                "maximum_us": 24819.625
+              }
+            },
+            "idle_private_memory": {
+              "samples": 100,
+              "mean_bytes": 20684800.0,
+              "maximum_bytes": 20684800,
+              "measurement": "/proc/<pid>/smaps_rollup Private_Clean + Private_Dirty + Private_Hugetlb"
+            },
+            "counts": {
+              "maximum_observed_worker_processes": 1,
+              "maximum_observed_containment_helper_processes": 2,
+              "idle_worker_processes": 1,
+              "worker_process_observation_kind": "linux_proc_exact_executable_tree",
+              "worker_process_observation": "bounded /proc descendant traversal after authenticated Ready; exact worker matched by the configured installed debug executable device and inode; helpers counted separately",
+              "idle_runtimes": 0,
+              "idle_runtime_observation_kind": "protocol_lifecycle_proof",
+              "idle_runtime_observation": "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime"
+            },
+            "target_results": {
+              "cold_ready": true,
+              "warm_pure_call": true,
+              "broker_ipc_4kib": true,
+              "idle_private_memory": true,
+              "post_cancel_recovery": true,
+              "one_worker_zero_idle_runtimes": true,
+              "timing_targets_are_informational": true
+            },
+            "comparison": {
+              "reference_machine": {
+                "host": "GitHub Actions 1000020211",
+                "os": "linux",
+                "arch": "x86_64",
+                "kernel": "Linux 6.17.0-1022-azure",
+                "cpu": "AMD EPYC 9V74 80-Core Processor",
+                "logical_cpus": 4,
+                "memory_bytes": 16766414848,
+                "binary_profile": "debug",
+                "package_version": "1.8.0",
+                "build_identity": "1.8.0+26f0323e5ee9270f638bd3c3771e3733a7919c7d8f13279895c897db59fb6510"
+              },
+              "reference_containment": {
+                "backend": "bubblewrap",
+                "assurance": "enforced"
+              },
+              "previous_build_identity": "1.8.0+26f0323e5ee9270f638bd3c3771e3733a7919c7d8f13279895c897db59fb6510",
+              "metrics": {
+                "broker_ipc_4kib": {
+                  "previous_p95_us": 1515.825,
+                  "current_p95_us": 1528.932,
+                  "p95_relative_delta": 0.008646776507842244,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "cold_ready": {
+                  "previous_p95_us": 12977.548,
+                  "current_p95_us": 12930.896,
+                  "p95_relative_delta": 0.0035948239220536917,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "post_cancel_recovery": {
+                  "previous_p95_us": 19688.108,
+                  "current_p95_us": 23734.647,
+                  "p95_relative_delta": 0.2055321415343719,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": false
+                },
+                "warm_pure_call": {
+                  "previous_p95_us": 1089.333,
+                  "current_p95_us": 1102.58,
+                  "p95_relative_delta": 0.012160652435940012,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                }
+              },
+              "all_within_documented_variance": false,
+              "informational_only": true
+            }
+          }
+        },
+        {
+          "status": "measured",
+          "run": {
+            "machine": {
+              "host": "GitHub Actions 1000020173",
+              "os": "macos",
+              "arch": "aarch64",
+              "kernel": "Darwin 25.6.0",
+              "cpu": "Apple M1 (Virtual)",
+              "logical_cpus": 3,
+              "memory_bytes": 7516192768,
+              "binary_profile": "debug",
+              "package_version": "1.8.0",
+              "build_identity": "1.8.0+b1a898bc9643e42e46a562f2ba04a51b0794d164073a30d31880b4f167892dad"
+            },
+            "containment": {
+              "backend": "seatbelt",
+              "assurance": "deprecated-best-effort"
+            },
+            "latency": {
+              "cold_ready": {
+                "samples": 100,
+                "mean_us": 1744889.4434099996,
+                "p50_us": 1713913.875,
+                "p95_us": 1879391.042,
+                "variance_us2": 7788811589.006841,
+                "standard_deviation_us": 88254.24402830064,
+                "minimum_us": 1638818.292,
+                "maximum_us": 2143054.3329999996
+              },
+              "warm_pure_call": {
+                "samples": 100,
+                "mean_us": 1039.9175100000002,
+                "p50_us": 1011.917,
+                "p95_us": 1231.75,
+                "variance_us2": 16641.06709059586,
+                "standard_deviation_us": 129.00026004080712,
+                "minimum_us": 845.458,
+                "maximum_us": 1542.375
+              },
+              "broker_ipc_4kib": {
+                "samples": 100,
+                "mean_us": 1417.02296,
+                "p50_us": 1382.625,
+                "p95_us": 1713.0,
+                "variance_us2": 27374.354691149896,
+                "standard_deviation_us": 165.45197094972875,
+                "minimum_us": 1066.083,
+                "maximum_us": 1897.25
+              },
+              "post_cancel_recovery": {
+                "samples": 100,
+                "mean_us": 1759442.403680001,
+                "p50_us": 1738776.25,
+                "p95_us": 1900944.708,
+                "variance_us2": 6695596822.210378,
+                "standard_deviation_us": 81826.62660901021,
+                "minimum_us": 1589496.292,
+                "maximum_us": 2065063.542
+              }
+            },
+            "idle_private_memory": {
+              "samples": 100,
+              "mean_bytes": 4211712.0,
+              "maximum_bytes": 4211712,
+              "measurement": "vmmap -summary Physical footprint"
+            },
+            "counts": {
+              "maximum_observed_worker_processes": 1,
+              "maximum_observed_containment_helper_processes": 1,
+              "idle_worker_processes": 1,
+              "worker_process_observation_kind": "macos_guardian_process_group",
+              "worker_process_observation": "bounded libproc enumeration after authenticated Ready; the authenticated guardian owns its dedicated process group; exactly one live non-guardian member is the worker and the guardian is counted separately",
+              "idle_runtimes": 0,
+              "idle_runtime_observation_kind": "protocol_lifecycle_proof",
+              "idle_runtime_observation": "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime"
+            },
+            "target_results": {
+              "cold_ready": false,
+              "warm_pure_call": true,
+              "broker_ipc_4kib": true,
+              "idle_private_memory": true,
+              "post_cancel_recovery": false,
+              "one_worker_zero_idle_runtimes": true,
+              "timing_targets_are_informational": true
+            },
+            "comparison": {
+              "reference_machine": {
+                "host": "GitHub Actions 1000020173",
+                "os": "macos",
+                "arch": "aarch64",
+                "kernel": "Darwin 25.6.0",
+                "cpu": "Apple M1 (Virtual)",
+                "logical_cpus": 3,
+                "memory_bytes": 7516192768,
+                "binary_profile": "debug",
+                "package_version": "1.8.0",
+                "build_identity": "1.8.0+b1a898bc9643e42e46a562f2ba04a51b0794d164073a30d31880b4f167892dad"
+              },
+              "reference_containment": {
+                "backend": "seatbelt",
+                "assurance": "deprecated-best-effort"
+              },
+              "previous_build_identity": "1.8.0+b1a898bc9643e42e46a562f2ba04a51b0794d164073a30d31880b4f167892dad",
+              "metrics": {
+                "broker_ipc_4kib": {
+                  "previous_p95_us": 1383.083,
+                  "current_p95_us": 1713.0,
+                  "p95_relative_delta": 0.2385373835120523,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": false
+                },
+                "cold_ready": {
+                  "previous_p95_us": 2678267.792,
+                  "current_p95_us": 1879391.042,
+                  "p95_relative_delta": 0.29828113244920806,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": false
+                },
+                "post_cancel_recovery": {
+                  "previous_p95_us": 2172205.292,
+                  "current_p95_us": 1900944.708,
+                  "p95_relative_delta": 0.12487796848623092,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "warm_pure_call": {
+                  "previous_p95_us": 839.125,
+                  "current_p95_us": 1231.75,
+                  "p95_relative_delta": 0.4678981081483689,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": false
+                }
+              },
+              "all_within_documented_variance": false,
+              "informational_only": true
+            }
+          }
+        },
+        {
+          "status": "measured",
+          "run": {
+            "machine": {
+              "host": "runnervmeef0v",
+              "os": "windows",
+              "arch": "x86_64",
+              "kernel": "Microsoft Windows Server 2025 Datacenter 10.0.26100 build 26100",
+              "cpu": "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD",
+              "logical_cpus": 4,
+              "memory_bytes": 17178693632,
+              "binary_profile": "debug",
+              "package_version": "1.8.0",
+              "build_identity": "1.8.0+e66c31d6d3ae9ba5edf2dc05476af5709ba192b049669ca6332937f429ddddb1"
+            },
+            "containment": {
+              "backend": "windows-lpac",
+              "assurance": "enforced"
+            },
+            "latency": {
+              "cold_ready": {
+                "samples": 100,
+                "mean_us": 28145.534,
+                "p50_us": 28068.2,
+                "p95_us": 29391.9,
+                "variance_us2": 746000.7071151511,
+                "standard_deviation_us": 863.7133246136424,
+                "minimum_us": 26579.4,
+                "maximum_us": 32311.199999999997
+              },
+              "warm_pure_call": {
+                "samples": 100,
+                "mean_us": 1835.6469999999997,
+                "p50_us": 1825.2,
+                "p95_us": 1938.7,
+                "variance_us2": 2872.9649404040397,
+                "standard_deviation_us": 53.60004608583877,
+                "minimum_us": 1746.8,
+                "maximum_us": 2077.5
+              },
+              "broker_ipc_4kib": {
+                "samples": 100,
+                "mean_us": 2420.9480000000003,
+                "p50_us": 2408.6,
+                "p95_us": 2517.8,
+                "variance_us2": 4990.895854545451,
+                "standard_deviation_us": 70.64627275762997,
+                "minimum_us": 2310.6,
+                "maximum_us": 2771.6
+              },
+              "post_cancel_recovery": {
+                "samples": 100,
+                "mean_us": 37663.446,
+                "p50_us": 37561.6,
+                "p95_us": 39498.6,
+                "variance_us2": 915837.214428283,
+                "standard_deviation_us": 956.9938424192096,
+                "minimum_us": 36097.7,
+                "maximum_us": 42328.2
+              }
+            },
+            "idle_private_memory": {
+              "samples": 100,
+              "mean_bytes": 2211840.0,
+              "maximum_bytes": 2211840,
+              "measurement": "Get-Process PrivateMemorySize64"
+            },
+            "counts": {
+              "maximum_observed_worker_processes": 1,
+              "maximum_observed_containment_helper_processes": 0,
+              "idle_worker_processes": 1,
+              "worker_process_observation_kind": "windows_owned_job_direct_process_proof",
+              "worker_process_observation": "direct CreateProcessW application PID from WorkerChild::contained; active process count queried from the owned creation-time Job; Job handle is not a helper process",
+              "idle_runtimes": 0,
+              "idle_runtime_observation_kind": "protocol_lifecycle_proof",
+              "idle_runtime_observation": "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime"
+            },
+            "target_results": {
+              "cold_ready": true,
+              "warm_pure_call": true,
+              "broker_ipc_4kib": true,
+              "idle_private_memory": true,
+              "post_cancel_recovery": true,
+              "one_worker_zero_idle_runtimes": true,
+              "timing_targets_are_informational": true
+            },
+            "comparison": {
+              "reference_machine": {
+                "host": "runnervmeef0v",
+                "os": "windows",
+                "arch": "x86_64",
+                "kernel": "Microsoft Windows Server 2025 Datacenter 10.0.26100 build 26100",
+                "cpu": "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD",
+                "logical_cpus": 4,
+                "memory_bytes": 17178693632,
+                "binary_profile": "debug",
+                "package_version": "1.8.0",
+                "build_identity": "1.8.0+e66c31d6d3ae9ba5edf2dc05476af5709ba192b049669ca6332937f429ddddb1"
+              },
+              "reference_containment": {
+                "backend": "windows-lpac",
+                "assurance": "enforced"
+              },
+              "previous_build_identity": "1.8.0+e66c31d6d3ae9ba5edf2dc05476af5709ba192b049669ca6332937f429ddddb1",
+              "metrics": {
+                "broker_ipc_4kib": {
+                  "previous_p95_us": 2583.0,
+                  "current_p95_us": 2517.8,
+                  "p95_relative_delta": 0.02524196670538127,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "cold_ready": {
+                  "previous_p95_us": 28812.1,
+                  "current_p95_us": 29391.9,
+                  "p95_relative_delta": 0.020123489783806084,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "post_cancel_recovery": {
+                  "previous_p95_us": 40519.2,
+                  "current_p95_us": 39498.6,
+                  "p95_relative_delta": 0.025188058994254543,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                },
+                "warm_pure_call": {
+                  "previous_p95_us": 2055.4,
+                  "current_p95_us": 1938.7,
+                  "p95_relative_delta": 0.05677726963121536,
+                  "allowed_relative_delta": 0.15,
+                  "within_documented_variance": true
+                }
+              },
+              "all_within_documented_variance": true,
+              "informational_only": true
+            }
+          }
+        }
+      ]
+    },
+    "phase6-worker-gate-linux/phase6-gate-evidence.json": {
+      "raw_output": false,
+      "adversarial": {
+        "suites": "passed",
+        "zero_test_guard": "enforced",
+        "feature_rows": [
+          "js",
+          "skills"
+        ]
+      },
+      "result": "success",
+      "platform": "linux",
+      "schema_version": 1,
+      "containment": {
+        "backend": "bubblewrap",
+        "native_resource_gate": "rlimit-seccomp-probed",
+        "assurance": "enforced",
+        "real_probe": "passed"
+      },
+      "runner": "ubuntu-latest"
+    },
+    "phase6-worker-gate-macos-15/phase6-gate-evidence.json": {
+      "platform": "macos",
+      "adversarial": {
+        "suites": "passed",
+        "zero_test_guard": "enforced",
+        "feature_rows": [
+          "js",
+          "skills"
+        ]
+      },
+      "containment": {
+        "assurance": "deprecated-best-effort-fail-closed",
+        "resource_measurement": "not-run",
+        "native_resource_gate": "unavailable-no-production-worker",
+        "production_binary_matrix": "passed",
+        "real_probe": "passed",
+        "backend": "seatbelt"
+      },
+      "raw_output": false,
+      "runner": "macos-15",
+      "schema_version": 1,
+      "result": "success"
+    },
+    "phase6-worker-gate-macos-26/phase6-gate-evidence.json": {
+      "platform": "macos",
+      "result": "success",
+      "containment": {
+        "native_resource_gate": "unavailable-no-production-worker",
+        "backend": "seatbelt",
+        "real_probe": "passed",
+        "production_binary_matrix": "passed",
+        "assurance": "deprecated-best-effort-fail-closed",
+        "resource_measurement": "recorded"
+      },
+      "adversarial": {
+        "suites": "passed",
+        "zero_test_guard": "enforced",
+        "feature_rows": [
+          "js",
+          "skills"
+        ]
+      },
+      "runner": "macos-26",
+      "raw_output": false,
+      "schema_version": 1
+    },
+    "phase6-worker-gate-windows/phase6-gate-evidence.json": {
+      "containment": {
+        "real_probe": "passed",
+        "backend": "windows-lpac",
+        "standard_user_probe": "passed",
+        "assurance": "enforced",
+        "native_resource_gate": "job-limits-probed",
+        "resource_measurement": "recorded"
+      },
+      "adversarial": {
+        "suites": "passed",
+        "zero_test_guard": "enforced",
+        "feature_rows": [
+          "js",
+          "skills"
+        ]
+      },
+      "runner": "windows-latest",
+      "platform": "windows",
+      "schema_version": 1,
+      "raw_output": false,
+      "result": "success"
+    },
+    "phase6-worker-gate-windows/phase6-standard-user-evidence.json": {
+      "schema_version": 1,
+      "protected_control": "system-owned-read-execute-only",
+      "raw_output": false,
+      "environment": "new-allowlisted-non-admin",
+      "account": "separate-local-standard-user",
+      "install": "cargo-debug-js",
+      "containment_probe": "passed",
+      "administrator": false,
+      "platform": "windows",
+      "public_cached_status": "available-enforced"
+    }
+  }
+}
