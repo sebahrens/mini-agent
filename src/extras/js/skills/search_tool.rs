@@ -45,7 +45,7 @@ impl Tool for SkillsSearchTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Search installed skills using a model-generated query. Returns bounded discovery metadata: Agent Skill names/descriptions/digests and learned-JS IDs/descriptions/export signatures. The selected learned-JS bundle is re-frozen for subsequent tool calls. Call this tool by itself and wait for its result before invoking a newly discovered JS export. It is read-only and cannot approve, activate, install, or widen a skill's capabilities."
+        "Search installed skills using a model-generated query. On a default build this matches words, not meaning: the query is reduced to its most distinctive terms and any of them may match, so name the concrete nouns you expect in a skill's description rather than paraphrasing the goal. Returns bounded discovery metadata: Agent Skill names/descriptions/digests and learned-JS IDs/descriptions/export signatures. The selected learned-JS bundle is re-frozen for subsequent tool calls. Call this tool by itself and wait for its result before invoking a newly discovered JS export. It is read-only and cannot approve, activate, install, or widen a skill's capabilities."
             .to_string()
     }
 

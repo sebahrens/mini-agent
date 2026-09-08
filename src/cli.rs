@@ -200,7 +200,11 @@ pub struct Cli {
         long = "learned-skill-feedback-kind",
         value_name = "KIND",
         value_parser = ["positive", "negative", "severe"],
-        requires = "learned_skill_feedback"
+        requires = "learned_skill_feedback",
+        help = "How the invocation behaved: positive, negative, or severe",
+        long_help = "How the invocation behaved. `severe` is the containment signal: it quarantines \
+                     a canary or active revision immediately, and only accepts one of the three \
+                     safety reason codes. Report wrong output as `negative`."
     )]
     pub learned_skill_feedback_kind: Option<String>,
 
@@ -208,7 +212,12 @@ pub struct Cli {
     #[arg(
         long = "learned-skill-feedback-reason",
         value_name = "CODE",
-        requires = "learned_skill_feedback"
+        requires = "learned_skill_feedback",
+        help = "Why: severe accepts only integrity, permission_violation or unsafe_effect",
+        long_help = "Why the invocation is being reported. For `severe` this must be exactly one \
+                     of `integrity`, `permission_violation` or `unsafe_effect`. For `positive` and \
+                     `negative` it is a free-form code of 1-64 bytes using lowercase letters and \
+                     underscores."
     )]
     pub learned_skill_feedback_reason: Option<String>,
 
@@ -216,7 +225,11 @@ pub struct Cli {
     #[arg(
         long = "learned-skill-feedback-key",
         value_name = "KEY",
-        requires = "learned_skill_feedback"
+        requires = "learned_skill_feedback",
+        help = "Idempotency key, 1-128 bytes of [A-Za-z0-9._:-]",
+        long_help = "Idempotency key for this report, 1-128 bytes of letters, digits and `. _ : -`. \
+                     Resubmitting the same key with the same content is a no-op; reusing it with \
+                     different content is rejected."
     )]
     pub learned_skill_feedback_key: Option<String>,
 
@@ -224,7 +237,11 @@ pub struct Cli {
     #[arg(
         long = "learned-skill-feedback-invocation",
         value_name = "SHA256",
-        requires = "learned_skill_feedback"
+        requires = "learned_skill_feedback",
+        help = "Attribute the report to one invocation id (64 lowercase hex)",
+        long_help = "Attribute the report to a single invocation, as a 64-character lowercase hex \
+                     id. The invocation must still be in raw telemetry, which is compacted after \
+                     the retention window, and must belong to the skill being reported."
     )]
     pub learned_skill_feedback_invocation: Option<String>,
 
@@ -320,6 +337,31 @@ pub struct Cli {
                 unlike --purge-learned-skill"
     )]
     pub retire_learned_skill: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "reevaluate-learned-skill",
+        value_name = "SHA256",
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "learned_skill_proposal",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill",
+            "retire_learned_skill"
+        ],
+        help = "Requeue a parked learned-skill proposal as the authenticated local owner: one \
+                verified with held_out_suite_required, or deferred after an infrastructure \
+                outage or an exhausted attempt budget"
+    )]
+    pub reevaluate_learned_skill: Option<String>,
 
     #[cfg(feature = "skills")]
     #[arg(

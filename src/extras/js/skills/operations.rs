@@ -61,6 +61,7 @@ pub(crate) enum LibraryOperation<'a> {
     Activate(&'a str),
     Promote(&'a str),
     Retire(&'a str),
+    Reevaluate(&'a str),
 }
 
 /// Explicit privacy purge of one revision.
@@ -685,7 +686,57 @@ fn run_library_operation(
         LibraryOperation::Activate(id) => activate_skill(id, paths, embedding),
         LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
         LibraryOperation::Retire(id) => retire_skill(id, paths, embedding),
+        LibraryOperation::Reevaluate(id) => reevaluate_skill(id, paths, embedding),
     }
+}
+
+/// Requeue a proposal that admission parked, without an identical re-import.
+///
+/// A proposal reaches `verified` with `held_out_suite_required` when no enabled
+/// suite matched it, and `deferred` when the verification infrastructure was
+/// unavailable or its attempt budget ran out. All three are recoverable, but
+/// the only shipped route was re-importing the byte-identical package, which an
+/// operator cannot do at all for a proposal the model authored.
+fn reevaluate_skill(
+    skill_id: &str,
+    paths: &AppPaths,
+    embedding: Option<&EmbeddingConfig>,
+) -> anyhow::Result<()> {
+    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let proposal = store
+        .get_proposal(skill_id)?
+        .context("learned-skill proposal not found")?;
+    let status = proposal_status(proposal.status);
+    let reason = proposal.reason_code.clone();
+    drop(store);
+
+    let admin = AdminIdentity::authenticated("local-owner")?;
+    let mut evaluator = AdmissionEvaluator::new(
+        SkillStore::open_at(paths)?,
+        Embedder::from_config(embedding)?,
+        format!("local-reevaluate-{}", uuid::Uuid::new_v4()),
+    )?;
+    evaluator
+        .request_reevaluation(&proposal.proposal_id, &admin, current_timestamp()?)
+        .with_context(|| {
+            format!(
+                "learned-skill re-evaluation requires a proposal parked as verified with \
+                 held_out_suite_required or as deferred; proposal {} is {status}{}",
+                proposal.proposal_id,
+                reason
+                    .as_deref()
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default()
+            )
+        })?;
+    OperatorReport::new("reevaluate")
+        .with("id", proposal.skill_id.as_str())
+        .with("proposal_id", proposal.proposal_id.as_str())
+        .with("previous_status", status)
+        .with("previous_reason", reason.as_deref().unwrap_or("-"))
+        .with("status", "pending")
+        .emit();
+    Ok(())
 }
 
 /// Import every bundled seed, reporting each one independently.
@@ -2930,6 +2981,56 @@ mod tests {
             contain_severe_feedback(store, &operation, &attribution, &paths, None, 101).unwrap();
         assert_eq!(outcome, "applied");
         assert_eq!(detail, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A proposal parked by the attempt-exhaustion sweep is recoverable without
+    /// re-importing the byte-identical package, which is the only route an
+    /// operator has for a proposal the model authored.
+    #[test]
+    fn reevaluation_requeues_a_proposal_parked_by_the_attempt_sweep() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        let queued = store
+            .enqueue_proposal(&artifact, None, current_timestamp().unwrap())
+            .unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "UPDATE skill_proposals SET attempt_count = ?1 WHERE proposal_id = ?2",
+                rusqlite::params![
+                    crate::extras::js::skills::store::MAX_EVALUATION_ATTEMPTS,
+                    &queued.proposal_id
+                ],
+            )
+            .unwrap();
+        let parked = store
+            .sweep_exhausted_proposals(current_timestamp().unwrap())
+            .unwrap();
+        assert_eq!(parked, vec![queued.proposal_id.clone()]);
+        let before = store.get_proposal(&queued.proposal_id).unwrap().unwrap();
+        assert_eq!(before.status, ProposalStatus::Deferred);
+        drop(store);
+
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Reevaluate(&queued.proposal_id)),
+            &paths,
+            None,
+        )
+        .expect("a parked proposal must be requeueable");
+
+        let store = SkillStore::open_at(&paths).unwrap();
+        let after = store.get_proposal(&queued.proposal_id).unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            ProposalStatus::Pending,
+            "re-evaluation must return the proposal to the queue"
+        );
+        assert_eq!(after.reason_code, None);
+        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 

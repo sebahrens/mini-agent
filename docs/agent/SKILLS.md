@@ -125,6 +125,7 @@ mini-agent --reject-learned-skill <full-sha256>
 mini-agent --activate-learned-skill <full-sha256>
 mini-agent --promote-learned-skill <full-sha256>
 mini-agent --retire-learned-skill <full-sha256>
+mini-agent --reevaluate-learned-skill <full-sha256>
 mini-agent --compact-learned-skill-events
 mini-agent --purge-learned-skill <full-sha256> [--purge-learned-skill-force]
 mini-agent --learned-skill-feedback <full-sha256> \
@@ -399,13 +400,18 @@ Caused by:
     proposal is not awaiting approval
 ```
 
-There is no re-evaluation flag. The only way to unblock it is to **re-import the identical package
-with a matching held-out suite**: importing the same proposal alongside a `held_out_suites` entry
-whose selector matches the artifact stores that baseline first, then requeues the blocked proposal
-for another evaluation. "Identical" is literal — the proposal is content-addressed, so any change
-to `source`, `description`, `exports`, `tests`, `capability` or `tags` produces a different id and a
-different proposal. In practice that means a proposal that arrived through the in-agent
-`propose_skill` global, whose exact source an operator does not have, cannot be unblocked at all.
+There are two ways to unblock it. `--reevaluate-learned-skill <id>` returns the proposal to the
+queue directly, and is the only route for a proposal that arrived through the in-agent
+`propose_skill` global, whose exact source an operator does not have. It also recovers a proposal
+parked as `deferred`, whether by a verification infrastructure outage or by an exhausted attempt
+budget. Requeueing on its own does not supply the missing baseline, so import the matching suite
+first unless the selector is what changed.
+
+The other route is to **re-import the identical package with a matching held-out suite**: importing
+the same proposal alongside a `held_out_suites` entry whose selector matches the artifact stores
+that baseline first, then requeues the blocked proposal automatically. "Identical" is literal — the
+proposal is content-addressed, so any change to `source`, `description`, `exports`, `tests`,
+`capability` or `tags` produces a different id and a different proposal.
 
 The usual cause is a selector that does not match: a tag the artifact does not carry (both sides are
 trimmed and lower-cased, so case is not the problem — a missing or misspelled tag is), an `exports`
