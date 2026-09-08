@@ -843,8 +843,11 @@ fn session_storage_permissions_reject_symlinks_and_non_regular_targets_without_m
     session.id = SESSION_ID.into();
     let error = save_session(&session).expect_err("session symlink must be rejected");
     assert!(error.to_string().contains("owned regular file"));
-    let error =
-        find_sessions_by_prefix(SESSION_ID).expect_err("session symlink read must be rejected");
+    // Multi-session discovery skips the unsafe entry rather than failing the
+    // whole search, while the exact lookup stays fail-closed.
+    let found = find_sessions_by_prefix(SESSION_ID).expect("discovery must stay available");
+    assert!(found.is_empty(), "an unsafe entry must never be decoded");
+    let error = load_session_exact(SESSION_ID).expect_err("exact load must stay fail-closed");
     assert!(error.to_string().contains("refusing unsafe session file"));
     assert!(delete_session(SESSION_ID).is_err());
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
@@ -1142,6 +1145,78 @@ fn old_format_session_without_provenance_still_loads_and_replays_rewritten() {
             .iter()
             .any(|item| matches!(item, rig::message::AssistantContent::Reasoning(_))),
         "an old session must replay exactly as it did, with no reasoning item"
+    );
+    drop(env);
+}
+
+// ── Per-entry isolation in multi-session discovery ─────────────────────
+
+#[cfg(unix)]
+#[test]
+fn one_unsafe_session_entry_does_not_hide_healthy_sessions() {
+    let env = setup_test_env();
+    let session = Session::new("openai", "gpt-4", 128000, "");
+    save_session(&session).unwrap();
+    // A broken symlink is rejected by the private reader; it must not abort an
+    // unrelated search.
+    std::os::unix::fs::symlink(
+        env.dir.join("missing"),
+        env.dir.join("sessions/broken.json"),
+    )
+    .unwrap();
+
+    let found = find_sessions_by_prefix(&session.id).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, session.id);
+
+    let by_name = crate::session::storage::find_session_by_name(&session.name).unwrap();
+    assert_eq!(by_name.map(|found| found.id), Some(session.id.clone()));
+
+    let recent = crate::session::storage::find_recent_sessions(10).unwrap();
+    assert!(recent.iter().any(|found| found.id == session.id));
+
+    // The unsafe entry is skipped, never followed or removed.
+    assert!(
+        std::fs::symlink_metadata(env.dir.join("sessions/broken.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    drop(env);
+}
+
+#[test]
+fn invalid_session_json_is_skipped_by_discovery() {
+    let env = setup_test_env();
+    let session = Session::new("openai", "gpt-4", 128000, "");
+    save_session(&session).unwrap();
+    std::fs::write(env.dir.join("sessions/garbage.json"), "{not json").unwrap();
+
+    let found = find_sessions_by_prefix(&session.id).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, session.id);
+    drop(env);
+}
+
+#[test]
+fn recent_session_limit_counts_decoded_sessions_only() {
+    let env = setup_test_env();
+    let mut saved = Vec::new();
+    for _ in 0..3 {
+        let session = Session::new("openai", "gpt-4", 128000, "");
+        save_session(&session).unwrap();
+        saved.push(session.id.clone());
+        // Distinct mtimes so ordering is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Newer than every valid session, so it sorts first.
+    std::fs::write(env.dir.join("sessions/newest.json"), "{not json").unwrap();
+
+    let recent = crate::session::storage::find_recent_sessions(2).unwrap();
+    assert_eq!(
+        recent.len(),
+        2,
+        "a broken newest entry must not consume a result slot"
     );
     drop(env);
 }

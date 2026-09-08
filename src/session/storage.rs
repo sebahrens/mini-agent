@@ -172,6 +172,60 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// At most this many per-entry diagnostics are emitted for one discovery call;
+/// the rest are summarized so a corrupted directory cannot flood the log.
+const MAX_DISCOVERY_DIAGNOSTICS: usize = 5;
+
+/// Per-entry failures encountered while enumerating saved sessions.
+#[derive(Default)]
+struct SkippedEntries {
+    reported: usize,
+    total: usize,
+}
+
+impl SkippedEntries {
+    fn note(&mut self, path: &Path, error: &dyn std::fmt::Display) {
+        self.total += 1;
+        if self.reported < MAX_DISCOVERY_DIAGNOSTICS {
+            self.reported += 1;
+            tracing::warn!("session discovery skipped {}: {}", path.display(), error);
+        }
+    }
+
+    fn finish(&self, operation: &str) {
+        if self.total > self.reported {
+            tracing::warn!(
+                "session discovery ({}) skipped {} entries in total",
+                operation,
+                self.total
+            );
+        }
+    }
+}
+
+/// Decode one candidate session file during multi-session discovery.
+///
+/// Discovery must stay available when an unrelated entry is unsafe, unreadable,
+/// invalid or disappears mid-iteration, so those entries are skipped with a
+/// bounded diagnostic instead of aborting the whole search. Exact-identifier
+/// loading (`load_session_exact`) stays fail-closed.
+fn read_discovered_session(path: &Path, skipped: &mut SkippedEntries) -> Option<Session> {
+    let json = match read_private_string(path) {
+        Ok(json) => json,
+        Err(error) => {
+            skipped.note(path, &error);
+            return None;
+        }
+    };
+    match serde_json::from_str::<Session>(&json) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            skipped.note(path, &error);
+            None
+        }
+    }
+}
+
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     if disabled("sessions") {
         return Ok(Vec::new());
@@ -181,20 +235,24 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     };
     let lower = prefix.to_lowercase();
     let mut sessions: Vec<Session> = Vec::new();
+    let mut skipped = SkippedEntries::default();
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                skipped.note(&dir, &error);
+                continue;
+            }
+        };
         if path.extension().is_some_and(|e| e == "json")
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Some(session) = read_discovered_session(&path, &mut skipped)
+            && (stem.starts_with(prefix) || session.name.to_lowercase().contains(&lower))
         {
-            let json = read_private_string(&path)?;
-            if let Ok(session) = serde_json::from_str::<Session>(&json)
-                && (stem.starts_with(prefix) || session.name.to_lowercase().contains(&lower))
-            {
-                sessions.push(session);
-            }
+            sessions.push(session);
         }
     }
+    skipped.finish("prefix search");
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     sessions.dedup_by(|a, b| a.id == b.id);
     tracing::debug!(
@@ -242,18 +300,24 @@ pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
         return Ok(None);
     };
     let lower = name.to_lowercase();
+    let mut skipped = SkippedEntries::default();
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            let json = read_private_string(&path)?;
-            if let Ok(session) = serde_json::from_str::<Session>(&json)
-                && session.name.to_lowercase() == lower
-            {
-                return Ok(Some(session));
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                skipped.note(&dir, &error);
+                continue;
             }
+        };
+        if path.extension().is_some_and(|e| e == "json")
+            && let Some(session) = read_discovered_session(&path, &mut skipped)
+            && session.name.to_lowercase() == lower
+        {
+            skipped.finish("name search");
+            return Ok(Some(session));
         }
     }
+    skipped.finish("name search");
     Ok(None)
 }
 
@@ -281,12 +345,18 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     entries.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut sessions: Vec<Session> = Vec::new();
-    for (_, path) in entries.iter().take(limit) {
-        let json = read_private_string(path)?;
-        if let Ok(session) = serde_json::from_str::<Session>(&json) {
+    let mut skipped = SkippedEntries::default();
+    // The limit applies to sessions that actually decoded: a run of broken
+    // recent files must not hide older valid sessions.
+    for (_, path) in entries.iter() {
+        if sessions.len() == limit {
+            break;
+        }
+        if let Some(session) = read_discovered_session(path, &mut skipped) {
             sessions.push(session);
         }
     }
+    skipped.finish("recent sessions");
     tracing::debug!(
         "find_recent_sessions(limit={}): {} results",
         limit,
