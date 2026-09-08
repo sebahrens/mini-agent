@@ -1,0 +1,295 @@
+--- a/src/extras/js/tests/skill_telemetry_retention.rs
++++ b/src/extras/js/tests/skill_telemetry_retention.rs
+@@ -419,3 +419,212 @@
+     assert_eq!(invoked, 2);
+     std::fs::remove_dir_all(root).unwrap();
+ }
++
++#[tokio::test]
++async fn release_review_probe_search_keeps_outcomes_linked_to_earlier_invocations() {
++    use crate::agent::runner::TaskOutcomeRecorder;
++    use crate::extras::js::skills::turn::SkillRuntime;
++    use std::sync::Arc;
++    let (root, store, skill) = fixture();
++    let runtime = SkillRuntime::open(&paths(&root), None).unwrap();
++    runtime.settle_learned_rebuild_for_test().await;
++    runtime.prepare_turn("Retention fixture").await;
++    let initial = runtime.turn_context().snapshot();
++    assert!(initial.skills.iter().any(|s| s.id == skill.id));
++    let dispatcher = Arc::new(TelemetryDispatcher::spawn(&paths(&root)).unwrap());
++    let invocation = stable_invocation_id(&initial.turn_id, "review-tool", &skill.id, "run", 0);
++    let event = |kind, outcome, latency| SkillEvent {
++        invocation_id: Some(invocation.clone()),
++        skill_id: skill.id.clone(),
++        turn_id: initial.turn_id.clone(),
++        tool_call_id: Some("review-tool".into()),
++        kind,
++        export_name: Some("run".into()),
++        outcome,
++        latency_us: latency,
++        retrieval_score: Some(1.0),
++        retrieval_rank: Some(0),
++        query_fingerprint: None,
++        index_generation: 0,
++        evidence_complete: true,
++        production: true,
++        argument_shape: None,
++        created_at: 2_000_000_000,
++    };
++    dispatcher
++        .try_dispatch(
++            EventBatch::new(vec![
++                event(SkillEventKind::Invoked, None, None),
++                event(SkillEventKind::Returned, Some("fulfilled".into()), Some(5)),
++            ])
++            .unwrap(),
++        )
++        .unwrap();
++    runtime.refreeze_turn("zxqjvnmoplk unrelated").await;
++    let final_bundle = runtime.turn_context().snapshot();
++    assert_eq!(initial.turn_id, final_bundle.turn_id);
++    assert!(final_bundle.skills.is_empty());
++    let recorder = TaskOutcomeRecorder::new(dispatcher.clone(), runtime.turn_context(), true);
++    recorder.record_oracle("review-oracle", true, 1);
++    drop((recorder, dispatcher));
++    let deadline = Instant::now() + Duration::from_secs(2);
++    loop {
++        let count: i64 = store
++            .conn()
++            .query_row(
++                "SELECT COUNT(*) FROM skill_task_outcomes WHERE turn_id=?",
++                [&initial.turn_id],
++                |r| r.get(0),
++            )
++            .unwrap();
++        if count > 0 {
++            break;
++        }
++        assert!(Instant::now() < deadline, "outcome must persist");
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    let links: i64 = store
++        .conn()
++        .query_row(
++            "SELECT COUNT(*) FROM skill_task_outcome_links WHERE skill_id=?",
++            [&skill.id],
++            |r| r.get(0),
++        )
++        .unwrap();
++    drop((runtime, store));
++    let _ = std::fs::remove_dir_all(root);
++    assert_eq!(
++        links, 1,
++        "skills_search erased attribution for a skill invoked earlier in the same turn"
++    );
++}
++
++#[test]
++fn release_review_probe_telemetry_shutdown_does_not_wait_for_external_writer() {
++    let (root, store, skill) = fixture();
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap();
++    let dispatcher = runtime.block_on(async {
++        TelemetryDispatcher::spawn_with_busy_timeout_for_test(
++            &paths(&root),
++            Duration::from_millis(1),
++        )
++        .unwrap()
++    });
++    let lock = rusqlite::Connection::open(store.database_path()).unwrap();
++    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
++    dispatcher
++        .try_dispatch(
++            EventBatch::new(vec![SkillEvent {
++                invocation_id: None,
++                skill_id: skill.id,
++                turn_id: "review-shutdown".into(),
++                tool_call_id: None,
++                kind: SkillEventKind::Selected,
++                export_name: None,
++                outcome: None,
++                latency_us: None,
++                retrieval_score: None,
++                retrieval_rank: None,
++                query_fingerprint: None,
++                index_generation: 0,
++                evidence_complete: true,
++                production: true,
++                argument_shape: None,
++                created_at: 2_000_000_000,
++            }])
++            .unwrap(),
++        )
++        .unwrap();
++    let deadline = Instant::now() + Duration::from_secs(2);
++    while dispatcher.busy_retries_for_test() == 0 && Instant::now() < deadline {
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    assert!(dispatcher.busy_retries_for_test() > 0);
++    runtime.block_on(async { drop(dispatcher) });
++    let unlocker = std::thread::spawn(move || {
++        std::thread::sleep(Duration::from_millis(700));
++        lock.execute_batch("ROLLBACK").unwrap();
++    });
++    let started = Instant::now();
++    drop(runtime);
++    let elapsed = started.elapsed();
++    unlocker.join().unwrap();
++    drop(store);
++    let _ = std::fs::remove_dir_all(root);
++    assert!(
++        elapsed < Duration::from_millis(300),
++        "runtime teardown waited {elapsed:?} for a separate SQLite writer"
++    );
++}
++
++#[test]
++fn release_review_probe_pending_index_generation_does_not_drop_immediate_quarantine() {
++    use crate::extras::js::skills::coordinator::IndexCoordinator;
++    use crate::extras::js::skills::embed::Embedder;
++    use std::sync::Arc;
++    let (root, mut store, skill) = fixture();
++    let embedder = Arc::new(Embedder::new().unwrap());
++    let model = embedder.model_metadata().clone();
++    let coordinator = Arc::new(IndexCoordinator::open(&paths(&root), embedder).unwrap());
++    coordinator.rebuild_and_publish().unwrap();
++    let dispatcher = TelemetryDispatcher::spawn_session_scoped_with_coordinator(
++        &paths(&root),
++        coordinator.clone(),
++    )
++    .unwrap();
++    store
++        .request_generation(
++            &model.model_id,
++            &model.model_revision,
++            model.dimensions,
++            model.normalized,
++        )
++        .unwrap();
++    let state = store.generation_state().unwrap();
++    assert!(state.desired_generation > state.applied_generation);
++    let invocation = stable_invocation_id("review-quarantine", "tool", &skill.id, "run", 0);
++    let now = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_secs() as i64;
++    let event = |kind| SkillEvent {
++        invocation_id: Some(invocation.clone()),
++        skill_id: skill.id.clone(),
++        turn_id: "review-quarantine".into(),
++        tool_call_id: Some("tool".into()),
++        kind,
++        export_name: Some("run".into()),
++        outcome: None,
++        latency_us: None,
++        retrieval_score: None,
++        retrieval_rank: None,
++        query_fingerprint: None,
++        index_generation: state.applied_generation,
++        evidence_complete: true,
++        production: true,
++        argument_shape: None,
++        created_at: now,
++    };
++    dispatcher
++        .try_dispatch(
++            EventBatch::new(vec![
++                event(SkillEventKind::Invoked),
++                event(SkillEventKind::CapabilityDenied),
++            ])
++            .unwrap(),
++        )
++        .unwrap();
++    drop(dispatcher);
++    coordinator.rebuild_and_publish().unwrap();
++    let status = store.metadata(&skill.id).unwrap().unwrap().status;
++    let visible = coordinator.lease().unwrap().contains_id(&skill.id);
++    drop((coordinator, store));
++    let _ = std::fs::remove_dir_all(root);
++    assert_eq!(
++        status, "quarantined",
++        "the only safety event was dropped while index publication was pending; visible_after_rebuild={visible}"
++    );
++}
+--- a/src/extras/js/skills/operations.rs
++++ b/src/extras/js/skills/operations.rs
+@@ -1948,6 +1948,77 @@
+     }
+ 
+     #[test]
++    fn release_review_probe_observability_loss_is_not_a_no_skill_baseline() {
++        use crate::extras::js::skills::policy::{TaskOutcomeEvidence, TaskOutcomeSource};
++        use crate::extras::js::skills::telemetry::{
++            EventBatch, SkillEvent, SkillEventKind, TelemetryDispatcher, stable_invocation_id,
++        };
++        let (root, paths, artifact) = fixture();
++        let mut store = SkillStore::open_at(&paths).unwrap();
++        store.insert_verified(&artifact).unwrap();
++        let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();
++        for (turn, lost) in [("review-observed", false), ("review-evidence-lost", true)] {
++            let invocation =
++                stable_invocation_id(turn, "tool", &artifact.id, &artifact.exports[0].name, 0);
++            let event = |kind, complete| SkillEvent {
++                invocation_id: if lost { None } else { Some(invocation.clone()) },
++                skill_id: artifact.id.clone(),
++                turn_id: turn.into(),
++                tool_call_id: Some("tool".into()),
++                kind,
++                export_name: if lost {
++                    None
++                } else {
++                    Some(artifact.exports[0].name.clone())
++                },
++                outcome: None,
++                latency_us: None,
++                retrieval_score: None,
++                retrieval_rank: None,
++                query_fingerprint: None,
++                index_generation: 0,
++                evidence_complete: complete,
++                production: true,
++                argument_shape: None,
++                created_at: 2_000_000_000,
++            };
++            let events = if lost {
++                vec![event(SkillEventKind::ObservabilityLost, false)]
++            } else {
++                vec![
++                    event(SkillEventKind::Invoked, true),
++                    event(SkillEventKind::Returned, true),
++                ]
++            };
++            dispatcher
++                .try_dispatch(EventBatch::new(events).unwrap())
++                .unwrap();
++            dispatcher
++                .record_task_outcome(TaskOutcomeEvidence {
++                    turn_id: turn.into(),
++                    skill_ids: vec![artifact.id.clone()],
++                    verify_passed: true,
++                    attempt: 1,
++                    source: TaskOutcomeSource::Oracle("review-oracle".into()),
++                    production: true,
++                    created_at: 2_000_000_001,
++                })
++                .unwrap();
++        }
++        drop(dispatcher);
++        let rows = load_skill_stats(&store).unwrap();
++        let baseline = rows[0].baseline_tasks;
++        let with = rows[0].tasks_with;
++        drop(store);
++        let _ = std::fs::remove_dir_all(root);
++        assert_eq!(with, 1);
++        assert_eq!(
++            baseline, 0,
++            "a turn with lost invocation evidence was counted as a no-skill baseline"
++        );
++    }
++
++    #[test]
+     fn usage_stats_distinguish_an_absent_baseline_from_a_failing_one() {
+         let (root, paths, artifact) = fixture();
+         let mut store = SkillStore::open_at(&paths).unwrap();

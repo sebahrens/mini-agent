@@ -284,6 +284,76 @@
       "required_change": "Generate availability, assurance and native resource evidence from the actual validated probe result, distinguishing unsupported hosts, available deprecated-best-effort containment, failed probes and not-run steps. Do not infer success solely from the matrix label or emit completed native checks after an earlier failure. Preserve source-free output and validate consistency between gate and resource artifacts.",
       "verification": "Add behavior-level tests for evidence generation covering successful macOS 26, unsupported macOS 15, preflight refusal and a skipped/failed native probe. Assert that measured production-worker resources cannot coexist with unavailable-no-production-worker and that assurance matches the runtime's typed status. Run both macOS CI rows and inspect the generated JSON. Contradictory baseline artifacts are preserved in docs/reviews/2026-09-08-platform-evidence.json.",
       "id": "mini-agent-wldr.20"
+    },
+    {
+      "title": "Mid-turn skills_search removes task-outcome credit for skills invoked before the search",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/agent/runner.rs:386-410 (TaskOutcomeRecorder::record); src/extras/js/skills/turn.rs:343-362; src/extras/js/skills/telemetry.rs:810-826",
+      "evidence": [
+        "TaskOutcomeRecorder snapshots only the final selected skill bundle. ingest_task_outcome checks durable invocations only for IDs present in that snapshot. A real SkillRuntime probe selected and invoked a skill, re-froze the same turn with an unrelated search, and recorded a successful oracle through TaskOutcomeRecorder. The outcome persisted but had zero links to the previously invoked skill. Preserving turn_id across searches does not preserve the union of invoked skills. Utility statistics and lifecycle task evidence omit that actual invocation; an empty final bundle can also create a false no-library baseline."
+      ],
+      "required_change": "Attribute task outcomes to the complete set of qualified durable invocations for the parent-owned turn, independent of the latest retrieval bundle. Alternatively retain a parent-authoritative per-turn invocation set across every search. Preserve selected-but-unused exclusion, production/gym isolation, bounded cardinality, idempotency and stale/purged-revision handling.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-telemetry.patch and run cargo test --features skills release_review_probe_search_keeps_outcomes_linked_to_earlier_invocations -- --nocapture. It currently persists zero links instead of one. Cover A invoked then search B, A and B both invoked, an empty final bundle, multiple completion-verification attempts and selected-but-unused candidates. Assert task evidence and displayed utility count all actual invoked revisions once per turn.",
+      "id": "mini-agent-wldr.21"
+    },
+    {
+      "title": "Lost invocation telemetry is counted as a successful no-skill baseline",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/js/skills/telemetry.rs:795-858,977-985; src/extras/js/skills/operations.rs:292-328; src/extras/js/tool.rs:1407-1432",
+      "evidence": [
+        "When invocation events are rejected or dropped, ingest_task_outcome silently removes the unmatched skill IDs and still persists the successful task outcome. load_skill_stats interprets absence of outcome links as a no-skill baseline and does not exclude observability-lost turns. A dispatcher probe recorded one healthy linked task plus a turn with an explicit ObservabilityLost event, then successful outcomes for both. The production stats loader counted the lost-evidence turn as one baseline task instead of excluding it. A session counter/log saying positive evidence was excluded does not enforce that exclusion in durable outcomes."
+      ],
+      "required_change": "Persist a parent-authoritative per-turn evidence-completeness/attribution state and distinguish verified no-invocation turns from unknown/lost evidence. Exclude incomplete turns from positive utility and baseline comparisons even when no invocation row survived. Preserve real selected-but-unused/no-library baselines and make queue saturation or rejected worker telemetry update completeness without relying on the same saturated queue.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-telemetry.patch and run cargo test --features skills release_review_probe_observability_loss_is_not_a_no_skill_baseline -- --nocapture. It currently reports baseline_tasks=1 instead of0. Add rejected-worker-batch, saturated/disconnected queue, delayed persistence and clean selected-but-unused cases; verify restart persistence and production/gym separation. Assert incomplete evidence changes neither positive skill outcomes nor no-library baseline pass rates.",
+      "id": "mini-agent-wldr.22"
+    },
+    {
+      "title": "Telemetry retry on a busy SQLite writer can prevent process shutdown indefinitely",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/js/skills/telemetry.rs:861-889,954-970; src/main.rs: application runtime teardown",
+      "evidence": [
+        "ingest_retrying_busy retries forever with capped sleep but no shutdown signal or deadline. Dropping TelemetryDispatcher closes its queue and joins the worker directly or through Tokio spawn_blocking. Closing the sender cannot interrupt the in-flight busy loop; Tokio runtime destruction waits for the blocking join. A real SQLite BEGIN IMMEDIATE probe entered the retry loop, dropped the dispatcher, and measured runtime teardown. It waited 878.678 ms until a separate thread released the writer after700 ms; it has no terminating condition if that writer remains locked."
+      ],
+      "required_change": "Make telemetry shutdown cancel-aware with a bounded flush/drain policy that can interrupt busy retries and blocking waits. Preserve accepted evidence via a durable retry/outbox path or explicitly record unrecoverable observability loss; do not leave an unbounded join on the runtime blocking pool. Keep healthy-session retries reliable and avoid leaking owned workers after teardown.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-telemetry.patch and run cargo test --features skills release_review_probe_telemetry_shutdown_does_not_wait_for_external_writer -- --nocapture. The700 ms unlock is a probe watchdog, not a prescribed production deadline. Add an isolated-process test retaining the SQLite lock beyond the configured shutdown budget; require bounded exit and documented evidence recovery/loss behavior. Also verify ordinary transient contention still persists accepted batches and repeated session teardown leaves no threads.",
+      "id": "mini-agent-wldr.23"
+    },
+    {
+      "title": "A failed headless turn discards completed tool history and usage after effects already ran",
+      "priority": "P1",
+      "confidence": 0.98,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/agent/runner.rs:3202-3216,3440-3485,3518-3519; src/startup.rs:1505-1561 (dispatch_print)",
+      "evidence": [
+        "The headless runner accumulates tool interactions and usage, but returns a plain anyhow error when a non-retryable stream error, exhausted retry/turn/token budget or failed completion verification occurs. dispatch_print immediately propagates response_result? before persist_headless_turn, charge_usage_delta and save_session. Therefore a write/edit/command can complete, a later provider failure can terminate the turn, and the saved session contains neither the prompt nor completed tool records or incurred usage. A resumed session has no durable record of the effects and may repeat them. This finding is code-confirmed; no live provider or terminal signal test was run."
+      ],
+      "required_change": "Carry partial headless turn state on terminal failure, including completed tool calls/results, observed usage and interrupted pending-call markers. Persist that state and an explicit failure outcome before returning a nonzero exit code, using the same order/replay identities as successful turns. Preserve --no-session behavior and ensure partial persistence failures are reported without presenting the task as successful.",
+      "verification": "Add a hermetic fake-model headless-dispatch test that performs a real temporary-file edit, then emits a non-retryable error or exhausts retries. Assert nonzero/failure status while the reloaded session retains the prompt, exact completed tool record and observed usage; --continue must see the completed effect. Cover token/turn budget failure, verification failure, an unresolved tool call, JSON output and --no-session. Never convert the failure into an Ok truncated response.",
+      "id": "mini-agent-wldr.24"
+    },
+    {
+      "title": "Immediate skill quarantine is lost when index publication is pending",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/js/skills/telemetry.rs:1009-1097; src/extras/js/skills/quarantine.rs:113-127,219-233; src/extras/js/skills/coordinator.rs: generation publication",
+      "evidence": [
+        "Automatic quarantine is evaluated only for terminal events in the arriving telemetry batch. It sets generation_current from desired_generation == applied_generation; the policy holds on false and the caller only logs the error, without scheduling a retry. In a real dispatcher/coordinator probe, an active skill had a pending index generation when its Invoked and CapabilityDenied events arrived. After telemetry drained and the index rebuilt, the skill was still active and present in the published index. A single safety event can therefore be permanently ignored during ordinary publication lag, contrary to the immediate-quarantine contract."
+      ],
+      "required_change": "Persist and retry direct safety-triggered quarantine across publication lag and optimistic conflicts. Re-read current revision/generation state under the coordinator's mutation gate, apply the safety transition atomically, and publish a removal-only snapshot when a full rebuild is unavailable. Do not bypass stale-state checks, wait for another invocation to fail, or leave a known-unsafe revision available while a durable quarantine decision is pending.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-telemetry.patch and run cargo test --features skills release_review_probe_pending_index_generation -- --nocapture. It currently reports status=active and visible_after_rebuild=true instead of quarantine. Require a capability-denied skill to become ineligible despite desired/applied generation lag. Cover canary timeout/OOM, concurrent generation changes, rebuild failure, process restart and duplicate terminal delivery; assert a single durable transition/evidence record and no re-enable after recovery.",
+      "id": "mini-agent-wldr.25"
     }
   ],
   "residual_risks": [
@@ -293,9 +363,11 @@
     "Performance test failure in the restricted initial run was not reproduced in the unrestricted full suite; no separate performance-regression finding was inferred from that timing sample."
   ],
   "testing_gaps": [
-    "Fifteen targeted regressions covering fourteen findings are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
+    "Nineteen targeted regressions covering eighteen findings are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
     "Read long-line allocation and provider-inactivity findings are code-confirmed; implementation beads require instrumented/hermetic regressions.",
     "Nightly workflow policy tests assert command strings, not correctness of record extraction.",
-    "Repeated local embedding-model construction is code-confirmed; construction-count and ONNX memory measurements are acceptance work for .18."
-  ]
+    "Repeated local embedding-model construction is code-confirmed; construction-count and ONNX memory measurements are acceptance work for .18.",
+    "Headless failure persistence (.24) is code-confirmed; its bead requires a hermetic fake-model test across runner failure and saved-session reload."
+  ],
+  "objective": "Thorough release code review covering bugs, issues and performance bottlenecks, with atomic beads specifying what to change, where and how to verify."
 }

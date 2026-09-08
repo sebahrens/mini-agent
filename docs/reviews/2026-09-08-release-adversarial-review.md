@@ -1,8 +1,8 @@
-# Release adversarial review — 2026-09-08
+# Release code review — 2026-09-08
 
 Review checkpoint at `6021ba1cee1725d52930e17d239b305d6ed9ad66` (v1.8.0). Tracking epic: **mini-agent-wldr**, in progress. No production fixes are included in this checkpoint.
 
-Twenty atomic findings are filed: **10 P1, 10 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
+Twenty-five atomic findings are filed: **13 P1, 12 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
 
 | Bead | Priority | Finding | Evidence |
 |---|---|---|---|
@@ -26,6 +26,11 @@ Twenty atomic findings are filed: **10 P1, 10 P2**. Each bead records the affect
 | mini-agent-wldr.18 | P2 | Proposal-enabled learned-skill sessions load the local embedding model three times | Code trace |
 | mini-agent-wldr.19 | P2 | macOS worker cold startup and cancellation recovery exceed the recorded latency targets | Current CI artifacts |
 | mini-agent-wldr.20 | P2 | macOS 26 CI evidence incorrectly reports that no production worker is available | Current CI artifacts |
+| mini-agent-wldr.21 | P2 | Mid-turn skills_search removes task-outcome credit for skills invoked before the search | Failing targeted regression |
+| mini-agent-wldr.22 | P2 | Lost invocation telemetry is counted as a successful no-skill baseline | Failing targeted regression |
+| mini-agent-wldr.23 | P1 | Telemetry retry on a busy SQLite writer can prevent process shutdown indefinitely | Failing targeted regression |
+| mini-agent-wldr.24 | P1 | A failed headless turn discards completed tool history and usage after effects already ran | Code trace |
+| mini-agent-wldr.25 | P1 | Immediate skill quarantine is lost when index publication is pending | Failing targeted regression |
 
 ## Verification evidence
 
@@ -46,8 +51,11 @@ git apply docs/reviews/2026-09-08-probes-core.patch
 git apply docs/reviews/2026-09-08-probes-integrations.patch
 git apply docs/reviews/2026-09-08-probes-hooks.patch
 git apply docs/reviews/2026-09-08-probes-skill-startup.patch
+git apply docs/reviews/2026-09-08-probes-telemetry.patch
 cargo test --features skills,lsp,hooks release_review_probe -- --nocapture
 ```
+
+The telemetry patch covers .21–.23 and .25. All four probes failed using local fixtures under `cargo test --features skills`: an earlier invocation lost its outcome link after an actual mid-turn search, an observability-lost turn became a no-skill baseline, runtime shutdown waited 879 ms for a separate SQLite writer, and a pending index generation caused immediate quarantine to be skipped permanently. The temporary source edits were removed after execution.
 
 The skill-startup patch covers .16–.17. Both probes failed under `cargo test --features skills release_review_probe -- --nocapture`: a real SQLite write lock caused permanently empty learned retrieval after unlock, and observation startup blocked a current-thread timer for 416 ms. The recovery test exercises the actual workspace cache and full service opener; the responsiveness probe targets the synchronous startup helper invoked directly by the full opener.
 
@@ -71,6 +79,10 @@ Observed failures:
 - A pre-hook changed the executed path to `actual-target`, while the post-hook envelope still identified `original-target`.
 - Releasing a SQLite writer after degraded startup left one installed skill undiscoverable on the next turn, with no cache failure diagnostic.
 - A 400 ms SQLite writer delayed the observation-startup probe’s 20 ms async timer by 416 ms.
+- Mid-turn search left a previously invoked skill with zero task-outcome links.
+- An explicit observability-lost turn counted as one no-skill baseline task.
+- Runtime teardown waited 879 ms for a writer whose external watchdog released it after 700 ms; the retry loop has no shutdown bound.
+- A capability-denied skill remained active and visible after the pending index generation rebuilt.
 
 ## Platform evidence
 
@@ -86,7 +98,7 @@ Each record uses an installed v1.8.0 debug production binary, 10 warmups and 100
 
 ## Scope and limits
 
-Completed in this checkpoint: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, current CI failure analysis, and targeted hook concurrency/verdict/input-rewrite attacks, skill-startup contention/recovery probes, and inspection of the actual cross-platform containment/resource artifacts. The containment pass traced descriptor closure and empty-root Linux launch, seccomp finalization, macOS one-time-image/guardian launch, Windows LPAC creation attributes and Job limits, bounded wire framing, supervisor I/O cancellation, and grant/audit revalidation. Existing hostile tests were inspected for denied execution, durable audit ordering, fresh runtimes, bounded jobs and redaction; the baseline suite and dedicated platform gates provide execution evidence. No additional authority-expansion finding was confirmed in that pass. The prior closed reviews were treated as leads, not proof of current behavior.
+Completed in this checkpoint: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, current CI failure analysis, and targeted hook concurrency/verdict/input-rewrite attacks, skill-startup contention/recovery probes, inspection of the actual cross-platform containment/resource artifacts, task-outcome attribution and completeness, telemetry teardown, quarantine/publication interleavings, and headless terminal-failure persistence. Packaging source checks confirmed that all-zero pre-release recipe checksums are intentional and rejected by the post-release validation gate; no recipe-checksum defect was inferred. The containment pass traced descriptor closure and empty-root Linux launch, seccomp finalization, macOS one-time-image/guardian launch, Windows LPAC creation attributes and Job limits, bounded wire framing, supervisor I/O cancellation, and grant/audit revalidation. Existing hostile tests were inspected for denied execution, durable audit ordering, fresh runtimes, bounded jobs and redaction; the baseline suite and dedicated platform gates provide execution evidence. No additional authority-expansion finding was confirmed in that pass. The prior closed reviews were treated as leads, not proof of current behavior.
 
-This checkpoint does **not** establish completion of the full release review. Remaining coverage under the active epic includes learned-skill admission/lifecycle/telemetry interleavings, broader provider/session cancellation, and platform packaging runtime contracts. Containment findings and measurements apply to the reviewed code and recorded reference runners; they do not establish safety against every possible native exploit. No claim is made that all possible bugs have been found. Findings .11, .12 and .18 are code-confirmed rather than dynamically reproduced; their beads require bounded-memory, stalled-provider and embedding-construction regression tests.
+This checkpoint does **not** establish completion of the full release review. Remaining coverage under the active epic includes learned-skill admission/lifecycle/telemetry interleavings, broader provider/session cancellation, and platform packaging runtime contracts. Containment findings and measurements apply to the reviewed code and recorded reference runners; they do not establish safety against every possible native exploit. No claim is made that all possible bugs have been found. Findings .11, .12, .18 and .24 are code-confirmed rather than dynamically reproduced; their beads require bounded-memory, stalled-provider, embedding-construction and headless-failure persistence tests.
 
