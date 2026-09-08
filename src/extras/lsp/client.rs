@@ -90,6 +90,51 @@ fn valid_percent_escapes(bytes: &[u8]) -> bool {
 }
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Deadline covering writer-lock acquisition plus the frame write and flush.
+///
+/// A server that initializes successfully and then stops reading fills its
+/// stdin pipe. Without this bound, synchronizing an ordinary document blocks
+/// the calling file tool — and its shared or exclusive tool lane — forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for a notification, which has no response to wait for and so had no
+/// bound of its own.
+const NOTIFY_TIMEOUT: Duration = WRITE_TIMEOUT;
+
+/// Test override for the transport write deadline, in milliseconds. Zero keeps
+/// the production value.
+#[cfg(test)]
+static WRITE_TIMEOUT_MS_FOR_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_write_timeout_for_test(value: Option<Duration>) {
+    WRITE_TIMEOUT_MS_FOR_TEST.store(
+        value.map(|value| value.as_millis() as u64).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+}
+
+fn write_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let millis = WRITE_TIMEOUT_MS_FOR_TEST.load(Ordering::Relaxed);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    WRITE_TIMEOUT
+}
+
+fn notify_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let millis = WRITE_TIMEOUT_MS_FOR_TEST.load(Ordering::Relaxed);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    NOTIFY_TIMEOUT
+}
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -325,7 +370,14 @@ impl LspClient {
                         (Some(_), Some(id)) => {
                             let reply = json!({"jsonrpc": "2.0", "id": id, "result": Value::Null});
                             let body = serde_json::to_vec(&reply).unwrap_or_default();
-                            if !write_owned_frame(&stdin, &shutdown_tx, &body).await {
+                            if !write_owned_frame_with_deadline(
+                                &stdin,
+                                &shutdown_tx,
+                                &body,
+                                write_timeout(),
+                            )
+                            .await
+                            {
                                 break;
                             }
                         }
@@ -473,10 +525,22 @@ impl LspClient {
             Ok(body) => body,
             Err(_) => return None,
         };
-        if !write_owned_frame(&self.stdin, &self.shutdown_tx, &body).await {
+        // The deadline covers the write and the response wait together, so a
+        // server that stops reading cannot consume the whole budget before the
+        // response timer even starts.
+        let started = tokio::time::Instant::now();
+        if !write_owned_frame_with_deadline(
+            &self.stdin,
+            &self.shutdown_tx,
+            &body,
+            timeout.min(write_timeout()),
+        )
+        .await
+        {
             return None;
         }
-        match tokio::time::timeout(timeout, rx).await {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, rx).await {
             Ok(Ok(resp)) => Some(resp),
             _ => {
                 tracing::debug!("lsp[{}]: '{}' timed out", self.name, method);
@@ -498,7 +562,13 @@ impl LspClient {
     async fn notify(&self, method: &str, params: Value) -> bool {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
         if let Ok(body) = serde_json::to_vec(&msg) {
-            return write_owned_frame(&self.stdin, &self.shutdown_tx, &body).await;
+            return write_owned_frame_with_deadline(
+                &self.stdin,
+                &self.shutdown_tx,
+                &body,
+                notify_timeout(),
+            )
+            .await;
         }
         false
     }
@@ -643,19 +713,29 @@ impl Drop for TransportWriteGuard {
     }
 }
 
-async fn write_owned_frame(
+/// Write one frame under `deadline`, which covers waiting for the shared writer
+/// lock as well as the write and flush.
+///
+/// A frame that could not be written in full leaves the transport in an
+/// undefined state, so a timeout is a terminal transport failure: the guard
+/// reaps the server rather than letting later requests desynchronize.
+async fn write_owned_frame_with_deadline(
     stdin: &Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
     shutdown_tx: &mpsc::UnboundedSender<()>,
     body: &[u8],
+    deadline: Duration,
 ) -> bool {
     let mut write = TransportWriteGuard {
         shutdown_tx: shutdown_tx.clone(),
         complete: false,
     };
-    let mut stdin = stdin.lock().await;
-    let result = rpc::write_frame(&mut *stdin, body).await;
-    write.complete = result.is_ok();
-    result.is_ok()
+    let written = tokio::time::timeout(deadline, async {
+        let mut stdin = stdin.lock().await;
+        rpc::write_frame(&mut *stdin, body).await
+    })
+    .await;
+    write.complete = matches!(written, Ok(Ok(())));
+    write.complete
 }
 
 /// Protocol tasks drained, and stop signals raised, once the server exits.
