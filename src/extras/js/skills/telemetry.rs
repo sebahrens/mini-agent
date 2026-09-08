@@ -31,6 +31,9 @@ const TELEMETRY_BUSY_RETRY_MAX: Duration = Duration::from_millis(250);
 /// external process holds the SQLite write lock — potentially forever, and on
 /// the Tokio blocking pool, which then blocks runtime teardown.
 const TELEMETRY_SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_millis(1_500);
+/// How many times a safety-triggered quarantine is re-applied against re-read
+/// revision and generation state before it is reported as failed.
+const QUARANTINE_SAFETY_ATTEMPTS: u32 = 3;
 
 /// Cancellation state shared with the ingestion worker.
 #[derive(Debug, Default)]
@@ -1178,19 +1181,72 @@ fn apply_automatic_quarantine(
             generation_current: generation.desired_generation == generation.applied_generation,
         };
         let policy = QuarantinePolicy::conservative("phase5-quarantine-v1");
-        if let Err(error) = QuarantineExecutor::new(coordinator).apply(
-            &policy,
-            &evidence,
-            status,
-            row_version,
-            generation.desired_generation as i64,
-            now,
-        ) {
-            tracing::warn!(
-                skill_id = %skill_id,
-                error = %error,
-                "automatic skill quarantine held or failed"
-            );
+        // A safety-triggered decision is retried against freshly re-read
+        // revision and generation state, so an optimistic conflict with a
+        // concurrent lifecycle write cannot silently drop it. Attempts are
+        // bounded: a permanently ineligible revision must not spin.
+        let immediate = reason.is_immediate();
+        let attempts = if immediate {
+            QUARANTINE_SAFETY_ATTEMPTS
+        } else {
+            1
+        };
+        let mut status = status;
+        let mut row_version = row_version;
+        let mut evidence = evidence;
+        let mut desired_generation = generation.desired_generation;
+        for attempt in 1..=attempts {
+            match QuarantineExecutor::new(coordinator).apply(
+                &policy,
+                &evidence,
+                status,
+                row_version,
+                desired_generation as i64,
+                now,
+            ) {
+                Ok(_) => break,
+                Err(error) => {
+                    let retryable = immediate && attempt < attempts;
+                    tracing::warn!(
+                        skill_id = %skill_id,
+                        error = %error,
+                        attempt,
+                        retryable,
+                        "automatic skill quarantine held or failed"
+                    );
+                    if !retryable {
+                        break;
+                    }
+                    // Re-read the revision and generation the decision applies
+                    // to; a concurrent transition may have moved either.
+                    let Ok((current_status, current_row_version)) = store.connection().query_row(
+                        "SELECT status, row_version FROM skill_revisions WHERE id = ?",
+                        [&skill_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    ) else {
+                        break;
+                    };
+                    let Some(current_status) = LifecycleStatus::from_token(&current_status) else {
+                        break;
+                    };
+                    if !matches!(
+                        current_status,
+                        LifecycleStatus::Canary | LifecycleStatus::Active
+                    ) {
+                        // Already quarantined or retired by another writer.
+                        break;
+                    }
+                    let Ok(current_generation) = store.generation_state() else {
+                        break;
+                    };
+                    status = current_status;
+                    row_version = current_row_version;
+                    desired_generation = current_generation.desired_generation;
+                    evidence.row_version_current = true;
+                    evidence.generation_current = current_generation.desired_generation
+                        == current_generation.applied_generation;
+                }
+            }
         }
     }
 }

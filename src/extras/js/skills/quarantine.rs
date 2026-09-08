@@ -110,7 +110,17 @@ pub fn evaluate_with_attribution(
     {
         return QuarantineDecision::Hold("invalid_policy");
     }
-    if !evidence.row_version_current || !evidence.generation_current {
+    if !evidence.row_version_current {
+        return QuarantineDecision::Hold("stale_state");
+    }
+    // A safety-immediate reason must not wait for a pending index generation to
+    // be applied: quarantine publishes a removal-only snapshot, which takes
+    // effect regardless of publication lag. Leaving a known-unsafe revision
+    // available until the next rebuild lands — or until another invocation
+    // fails — would contradict the immediate-quarantine contract. A
+    // threshold-based decision still holds, because its inputs are only
+    // meaningful against the applied generation.
+    if !evidence.generation_current && !evidence.reason.is_immediate() {
         return QuarantineDecision::Hold("stale_state");
     }
     if !evidence.evidence_complete {
