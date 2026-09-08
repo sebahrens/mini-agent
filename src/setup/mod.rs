@@ -1262,6 +1262,8 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                         api_style: None,
                         headers: HashMap::new(),
                         timeout_secs: None,
+                        connect_timeout_secs: None,
+                        stream_idle_timeout_secs: None,
                         model: None,
                     },
                 );
@@ -1793,6 +1795,8 @@ mod tests {
                 api_style: None,
                 headers: HashMap::new(),
                 timeout_secs: None,
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 model: None,
             },
         );

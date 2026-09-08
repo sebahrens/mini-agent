@@ -12,6 +12,8 @@ fn custom_provider(provider_type: &str) -> CustomProviderConfig {
         api_style: None,
         headers: HashMap::new(),
         timeout_secs: None,
+        connect_timeout_secs: None,
+        stream_idle_timeout_secs: None,
         model: None,
     }
 }

@@ -1565,13 +1565,49 @@ pub(crate) fn expand_env(value: &str) -> anyhow::Result<String> {
 /// When the provider is not custom (`custom == None`) and TLS is not disabled,
 /// the resulting client is equivalent to `reqwest::Client::default()`, so the
 /// behavior of existing providers is unchanged.
+/// Deadline for establishing a provider connection.
+///
+/// The locked `reqwest` release defaults `connect_timeout`, `read_timeout` and
+/// `timeout` to `None`, so without these bounds a peer that accepts a request
+/// and then stalls keeps a turn alive forever and no error ever reaches the
+/// retry logic.
+pub(crate) const DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Deadline between successive reads of a provider response. It covers the wait
+/// for headers and the wait between streamed events, and resets on every read,
+/// so a long healthy stream is never interrupted.
+pub(crate) const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+
+/// Connect deadline for `custom`, falling back to the documented default.
+pub(crate) fn resolve_connect_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
+    Duration::from_secs(
+        custom
+            .and_then(|cfg| cfg.connect_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS)
+            .max(1),
+    )
+}
+
+/// Stream-inactivity deadline for `custom`, falling back to the documented
+/// default.
+pub(crate) fn resolve_stream_idle_timeout(custom: Option<&CustomProviderConfig>) -> Duration {
+    Duration::from_secs(
+        custom
+            .and_then(|cfg| cfg.stream_idle_timeout_secs)
+            .unwrap_or(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+            .max(1),
+    )
+}
+
 pub(crate) fn build_http_client(
     provider_name: &str,
     danger_accept_invalid_certs: bool,
     custom: Option<&CustomProviderConfig>,
     base_url: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(resolve_connect_timeout(custom))
+        .read_timeout(resolve_stream_idle_timeout(custom));
     if is_localhost(base_url) {
         // Disable connection pooling for local LLM servers (notably
         // llama.cpp's cpp-httplib) which close idle keep-alive
@@ -1709,65 +1745,88 @@ pub fn create_client(
         .with_custom_provider_name(Some(provider_name));
     let key = resolver.resolve()?;
 
+    // Every provider kind gets a client carrying the connect and
+    // stream-inactivity bounds; the locked reqwest default has none.
+    let custom = custom_providers.get(provider_name);
+    let http_client = build_http_client(
+        provider_name,
+        config.danger_accept_invalid_certs,
+        custom,
+        base_url.as_deref(),
+    )?;
     match config.kind {
-        ProviderKind::OpenAI => {
-            let custom = custom_providers.get(provider_name);
-            let http_client = build_http_client(
-                provider_name,
-                config.danger_accept_invalid_certs,
-                custom,
-                base_url.as_deref(),
-            )?;
-            Ok(AnyClient::OpenAI(build_openai_client(
-                &key,
-                base_url.as_deref(),
-                custom,
-                http_client,
-            )?))
-        }
-        ProviderKind::Anthropic => build_anthropic_client(&key, base_url.as_deref()),
-        ProviderKind::Gemini => build_gemini_client(&key, base_url.as_deref()),
-        ProviderKind::Ollama => build_ollama_client(&key, base_url.as_deref()),
-        ProviderKind::OpenRouter => build_openrouter_client(&key, base_url.as_deref()),
+        ProviderKind::OpenAI => Ok(AnyClient::OpenAI(build_openai_client(
+            &key,
+            base_url.as_deref(),
+            custom,
+            http_client,
+        )?)),
+        ProviderKind::Anthropic => build_anthropic_client(&key, base_url.as_deref(), http_client),
+        ProviderKind::Gemini => build_gemini_client(&key, base_url.as_deref(), http_client),
+        ProviderKind::Ollama => build_ollama_client(&key, base_url.as_deref(), http_client),
+        ProviderKind::OpenRouter => build_openrouter_client(&key, base_url.as_deref(), http_client),
     }
 }
 
 macro_rules! build_provider_client {
-    ($client_ty:ty, $variant:ident, $key_expr:expr, $base_url:expr) => {{
+    ($client_ty:ty, $variant:ident, $key_expr:expr, $base_url:expr, $http:expr) => {{
         let key = $key_expr;
         let builder = match $base_url {
-            Some(u) => <$client_ty>::builder().api_key(key).base_url(u),
-            None => <$client_ty>::builder().api_key(key),
+            Some(u) => <$client_ty>::builder()
+                .api_key(key)
+                .base_url(u)
+                .http_client($http),
+            None => <$client_ty>::builder().api_key(key).http_client($http),
         };
         Ok(AnyClient::$variant(builder.build()?))
     }};
 }
 
-fn build_anthropic_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
-    build_provider_client!(anthropic::Client, Anthropic, key, base_url)
+fn build_anthropic_client(
+    key: &str,
+    base_url: Option<&str>,
+    http: reqwest::Client,
+) -> anyhow::Result<AnyClient> {
+    build_provider_client!(anthropic::Client, Anthropic, key, base_url, http)
 }
 
-fn build_gemini_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
-    build_provider_client!(gemini::Client, Gemini, key, base_url)
+fn build_gemini_client(
+    key: &str,
+    base_url: Option<&str>,
+    http: reqwest::Client,
+) -> anyhow::Result<AnyClient> {
+    build_provider_client!(gemini::Client, Gemini, key, base_url, http)
 }
 
-fn build_ollama_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
+fn build_ollama_client(
+    key: &str,
+    base_url: Option<&str>,
+    http: reqwest::Client,
+) -> anyhow::Result<AnyClient> {
     build_provider_client!(
         ollama::Client,
         Ollama,
         ollama::OllamaApiKey::from(key),
-        base_url
+        base_url,
+        http
     )
 }
 
-fn build_openrouter_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
+fn build_openrouter_client(
+    key: &str,
+    base_url: Option<&str>,
+    http: reqwest::Client,
+) -> anyhow::Result<AnyClient> {
     // Expanded from `build_provider_client!` so we can chain OpenRouter's
     // builder-only app-identity calls: these set `X-OpenRouter-Title` /
     // `HTTP-Referer` / `X-OpenRouter-Categories` so mini-agent's traffic is
     // attributed in OpenRouter's dashboards instead of showing up anonymously.
     let builder = match base_url {
-        Some(u) => openrouter::Client::builder().api_key(key).base_url(u),
-        None => openrouter::Client::builder().api_key(key),
+        Some(u) => openrouter::Client::builder()
+            .api_key(key)
+            .base_url(u)
+            .http_client(http),
+        None => openrouter::Client::builder().api_key(key).http_client(http),
     };
     let builder = builder
         .with_app_identity(crate::product::PUBLIC_NAME, crate::product::REPOSITORY_URL)

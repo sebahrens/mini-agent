@@ -2201,6 +2201,8 @@ mod tests {
                 api_style: None,
                 headers: std::collections::HashMap::new(),
                 timeout_secs: Some(1),
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 model: None,
             },
         );

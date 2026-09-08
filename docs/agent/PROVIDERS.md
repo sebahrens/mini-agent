@@ -75,8 +75,20 @@ the `custom_providers` key in the config file:
 | `api_style`                   | string  | Optional. For OpenAI-based providers: `"responses"` (Responses API) or `"completions"` (Chat Completions). Custom providers always have a `base_url`, so this defaults to `"completions"`; set it explicitly for a Responses-only endpoint. |
 | `headers`                     | object  | Optional. HTTP headers to include in every request. Values support `${ENV_VAR}` expansion.                                                                                    |
 | `danger_accept_invalid_certs` | boolean | Optional. Disables TLS certificate verification (MITM risk — use with care).                                                                                                  |
-| `timeout_secs`                | integer | Optional. Overrides the default HTTP timeout.                                                                                                                                 |
+| `timeout_secs`                | integer | Optional. Total deadline for a request, from connect until the response body finishes. Unset by default, because a long streamed turn has no meaningful total bound.           |
+| `connect_timeout_secs`        | integer | Optional. Deadline for establishing the connection. Defaults to 30.                                                                                                           |
+| `stream_idle_timeout_secs`    | integer | Optional. Deadline between successive reads of a response, covering the wait for headers and the wait between streamed events. It resets on every read, so a long healthy stream is never interrupted. Defaults to 120. |
 | `model`                       | string  | Optional. Default model name for this provider. Used when no model is specified via `--model` or `ZS_MODEL`.                                                                  |
+
+### Connection and stream deadlines
+
+Every provider client — built-in and custom alike — is built with a connect
+deadline and a stream-inactivity deadline. Without them a peer that accepts a
+request and then stalls, before headers or between streamed events, keeps a turn
+alive indefinitely and never produces the error that would trigger a retry. Both
+bounds are overridable per provider with the `connect_timeout_secs` and
+`stream_idle_timeout_secs` entries above; a value of `0` is clamped to one
+second rather than disabling the bound.
 
 ### Header variable expansion
 

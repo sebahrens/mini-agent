@@ -394,6 +394,8 @@ fn cfg(api_style: Option<ApiStyle>) -> CustomProviderConfig {
         api_style,
         headers: std::collections::HashMap::new(),
         timeout_secs: None,
+        connect_timeout_secs: None,
+        stream_idle_timeout_secs: None,
         model: None,
     }
 }
@@ -675,6 +677,8 @@ fn resolve_custom_provider() {
             api_style: None,
             headers: HashMap::new(),
             timeout_secs: None,
+            connect_timeout_secs: None,
+            stream_idle_timeout_secs: None,
             model: None,
         },
     );
@@ -731,6 +735,8 @@ async fn anthropic_custom_base_appends_v1_messages() {
             api_style: None,
             headers: HashMap::new(),
             timeout_secs: None,
+            connect_timeout_secs: None,
+            stream_idle_timeout_secs: None,
             model: None,
         },
     );
@@ -932,6 +938,8 @@ async fn openrouter_anthropic_request_sends_automatic_tail_cache_control() {
             api_style: None,
             headers: HashMap::new(),
             timeout_secs: None,
+            connect_timeout_secs: None,
+            stream_idle_timeout_secs: None,
             model: None,
         },
     );
@@ -1048,4 +1056,181 @@ fn openai_completions_preserves_extra_body_without_reasoning_config() {
     assert_eq!(openai_completions_extra_body(None, None), None);
     let empty = ReasoningConfig::default();
     assert_eq!(openai_completions_extra_body(None, Some(&empty)), None);
+}
+
+// ── Provider connect and stream-inactivity deadlines ───────────────────
+
+use std::time::Instant;
+
+fn timeout_cfg(connect_secs: u64, idle_secs: u64) -> CustomProviderConfig {
+    CustomProviderConfig {
+        provider_type: "openai".into(),
+        base_url: "http://127.0.0.1/v1".to_string(),
+        api_key_env: None,
+        danger_accept_invalid_certs: None,
+        api_style: None,
+        headers: std::collections::HashMap::new(),
+        timeout_secs: None,
+        connect_timeout_secs: Some(connect_secs),
+        stream_idle_timeout_secs: Some(idle_secs),
+        model: None,
+    }
+}
+
+#[test]
+fn provider_timeouts_fall_back_to_documented_defaults() {
+    use crate::provider::{
+        DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS,
+        resolve_connect_timeout, resolve_stream_idle_timeout,
+    };
+
+    assert_eq!(
+        resolve_connect_timeout(None),
+        Duration::from_secs(DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        resolve_stream_idle_timeout(None),
+        Duration::from_secs(DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS)
+    );
+
+    let overridden = timeout_cfg(3, 7);
+    assert_eq!(
+        resolve_connect_timeout(Some(&overridden)),
+        Duration::from_secs(3)
+    );
+    assert_eq!(
+        resolve_stream_idle_timeout(Some(&overridden)),
+        Duration::from_secs(7)
+    );
+
+    // A zero would disable the bound entirely; it is clamped instead.
+    let zeroed = timeout_cfg(0, 0);
+    assert_eq!(
+        resolve_connect_timeout(Some(&zeroed)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        resolve_stream_idle_timeout(Some(&zeroed)),
+        Duration::from_secs(1)
+    );
+}
+
+/// Serve one connection with `handler`, returning the bound address.
+async fn stalling_server<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
+where
+    F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            handler(stream).await;
+        }
+    });
+    (format!("http://{address}/"), handle)
+}
+
+#[tokio::test]
+async fn a_peer_that_stalls_before_headers_fails_within_the_idle_bound() {
+    let (url, server) = stalling_server(|mut stream| async move {
+        use tokio::io::AsyncReadExt;
+        // Accept and read the request, then never send a response.
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    })
+    .await;
+
+    let custom = timeout_cfg(5, 1);
+    let client =
+        crate::provider::build_http_client("stalling", false, Some(&custom), None).unwrap();
+    let started = Instant::now();
+    let result = client.get(&url).send().await;
+    let elapsed = started.elapsed();
+
+    assert!(result.is_err(), "a stalled peer must not hang the turn");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the idle bound must fire promptly, took {elapsed:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_peer_that_stalls_between_events_fails_within_the_idle_bound() {
+    let (url, server) = stalling_server(|mut stream| async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  5\r\ndata:\r\n",
+            )
+            .await;
+        let _ = stream.flush().await;
+        // Then stall forever mid-stream.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    })
+    .await;
+
+    let custom = timeout_cfg(5, 1);
+    let client =
+        crate::provider::build_http_client("stalling", false, Some(&custom), None).unwrap();
+    let started = Instant::now();
+    let result = async {
+        let response = client.get(&url).send().await?;
+        response.bytes().await
+    }
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a stream that stalls after one event must not hang the turn"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the idle bound must fire promptly, took {elapsed:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_slow_but_healthy_stream_is_not_interrupted() {
+    let (url, server) = stalling_server(|mut stream| async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Drain the request; unread bytes make a close send RST and discard the
+        // response the client is still reading.
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await;
+        let _ = stream.flush().await;
+        // Six chunks, each well inside the deadline but together past it: the
+        // bound must reset on every read.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = stream.write_all(b"4\r\nping\r\n").await;
+            let _ = stream.flush().await;
+        }
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+        let _ = stream.flush().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    })
+    .await;
+
+    let custom = timeout_cfg(5, 2);
+    let client = crate::provider::build_http_client("slow", false, Some(&custom), None).unwrap();
+    let body = async {
+        let response = client.get(&url).send().await?;
+        response.bytes().await
+    }
+    .await
+    .expect("a slow healthy stream must complete");
+
+    assert_eq!(body.len(), 24, "expected six 4-byte chunks");
+    server.abort();
 }

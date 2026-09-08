@@ -178,6 +178,16 @@ pub struct CustomProviderConfig {
     pub headers: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Deadline for establishing the connection, in seconds. Defaults to
+    /// `DEFAULT_PROVIDER_CONNECT_TIMEOUT_SECS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// Deadline between successive reads of a response, in seconds. It resets
+    /// on every read, so a long healthy stream is never interrupted, but a peer
+    /// that stalls before headers or between events cannot keep a turn alive
+    /// forever. Defaults to `DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<CompactString>,
 }
