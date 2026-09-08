@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
 
@@ -26,6 +26,57 @@ pub const MAX_EVENT_ID_BYTES: usize = 256;
 pub const MAX_EVENT_TOKEN_BYTES: usize = 128;
 const TELEMETRY_BUSY_RETRY_INITIAL: Duration = Duration::from_millis(10);
 const TELEMETRY_BUSY_RETRY_MAX: Duration = Duration::from_millis(250);
+/// How long the worker may keep retrying a busy writer after shutdown was
+/// requested. Without a bound, dropping the dispatcher waits for whatever
+/// external process holds the SQLite write lock — potentially forever, and on
+/// the Tokio blocking pool, which then blocks runtime teardown.
+const TELEMETRY_SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Cancellation state shared with the ingestion worker.
+#[derive(Debug, Default)]
+struct TelemetryShutdownState {
+    requested: AtomicBool,
+    /// Instant, as nanoseconds since the process-start baseline, after which a
+    /// busy retry gives up. Only meaningful once `requested` is set.
+    deadline: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TelemetryShutdown(Arc<TelemetryShutdownState>);
+
+impl TelemetryShutdown {
+    /// Signal shutdown and start the bounded flush budget.
+    fn request(&self, budget: Duration) {
+        {
+            let mut deadline = self
+                .0
+                .deadline
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if deadline.is_none() {
+                *deadline = Some(std::time::Instant::now() + budget);
+            }
+        }
+        self.0.requested.store(true, Ordering::Release);
+    }
+
+    /// `Some(remaining)` once shutdown was requested; `None` while running.
+    fn remaining(&self) -> Option<Duration> {
+        if !self.0.requested.load(Ordering::Acquire) {
+            return None;
+        }
+        let deadline = self
+            .0
+            .deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        Some(
+            deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_default(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -613,6 +664,8 @@ pub struct TelemetryDispatcher {
     test_batch_tx: Option<SyncSender<EventBatch>>,
     observability_lost: Arc<AtomicU64>,
     busy_retries: Arc<AtomicU64>,
+    shutdown: TelemetryShutdown,
+    shutdown_budget: Duration,
     join: Option<std::thread::JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
 }
@@ -668,6 +721,8 @@ impl TelemetryDispatcher {
         let worker_observability_lost = Arc::clone(&observability_lost);
         let busy_retries = Arc::new(AtomicU64::new(0));
         let worker_busy_retries = Arc::clone(&busy_retries);
+        let shutdown = TelemetryShutdown::default();
+        let worker_shutdown = shutdown.clone();
         let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
@@ -684,7 +739,12 @@ impl TelemetryDispatcher {
                         }
                         continue;
                     };
-                    match ingest_retrying_busy(&mut store, &batch, &worker_busy_retries) {
+                    match ingest_retrying_busy(
+                        &mut store,
+                        &batch,
+                        &worker_busy_retries,
+                        &worker_shutdown,
+                    ) {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
@@ -711,6 +771,8 @@ impl TelemetryDispatcher {
             test_batch_tx: None,
             observability_lost,
             busy_retries,
+            shutdown,
+            shutdown_budget: TELEMETRY_SHUTDOWN_FLUSH_BUDGET,
             join: Some(join),
             runtime: tokio::runtime::Handle::try_current().ok(),
         })
@@ -867,6 +929,7 @@ fn ingest_retrying_busy(
     store: &mut SkillStore,
     batch: &EventBatch,
     busy_retries: &AtomicU64,
+    shutdown: &TelemetryShutdown,
 ) -> Result<IngestionReport, TelemetryError> {
     let mut delay = TELEMETRY_BUSY_RETRY_INITIAL;
     let mut attempts = 0u64;
@@ -885,7 +948,23 @@ fn ingest_retrying_busy(
                         "skill telemetry store is busy; retaining batch for retry"
                     );
                 }
-                std::thread::sleep(delay);
+                // A healthy session retries until the writer frees the store.
+                // After shutdown the retry is bounded: an external writer that
+                // keeps the lock must not hold the process open, so the batch
+                // is given up and recorded as unrecoverable evidence loss.
+                let sleep = match shutdown.remaining() {
+                    Some(remaining) if remaining.is_zero() => {
+                        tracing::warn!(
+                            event_count = batch.events().len(),
+                            attempts,
+                            "skill telemetry shutdown budget elapsed while the store was busy"
+                        );
+                        return Err(error);
+                    }
+                    Some(remaining) => delay.min(remaining),
+                    None => delay,
+                };
+                std::thread::sleep(sleep);
                 delay = delay.saturating_mul(2).min(TELEMETRY_BUSY_RETRY_MAX);
             }
             result => return result,
@@ -958,6 +1037,10 @@ pub(crate) fn behavioral_window_counts_for_test(
 
 impl Drop for TelemetryDispatcher {
     fn drop(&mut self) {
+        // Closing the queue cannot interrupt a busy-retry loop already in
+        // flight, so shutdown is signalled explicitly with a bounded flush
+        // budget before the join.
+        self.shutdown.request(self.shutdown_budget);
         self.tx.take();
         if let Some(join) = self.join.take() {
             if join.is_finished() {
@@ -988,6 +1071,13 @@ impl TelemetryDispatcher {
         );
     }
 
+    /// Shorten the post-shutdown flush budget. Used by tests that hold the
+    /// SQLite write lock past teardown on purpose.
+    #[cfg(test)]
+    pub(crate) fn set_shutdown_budget_for_test(&mut self, budget: Duration) {
+        self.shutdown_budget = budget;
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sender_for_test(tx: SyncSender<EventBatch>) -> Self {
         Self {
@@ -995,6 +1085,8 @@ impl TelemetryDispatcher {
             test_batch_tx: Some(tx),
             observability_lost: Arc::new(AtomicU64::new(0)),
             busy_retries: Arc::new(AtomicU64::new(0)),
+            shutdown: TelemetryShutdown::default(),
+            shutdown_budget: TELEMETRY_SHUTDOWN_FLUSH_BUDGET,
             join: None,
             runtime: None,
         }

@@ -144,6 +144,142 @@ fn telemetry_dispatch_retries_busy_writer_without_dropping_batch() {
 }
 
 #[test]
+fn telemetry_shutdown_does_not_wait_for_an_external_writer() {
+    let root = std::env::temp_dir().join(format!("telemetry-shutdown-{}", uuid::Uuid::new_v4()));
+    let paths = paths(&root);
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let skill = SkillArtifact::new(
+        "function run() { return true; }".into(),
+        "Telemetry shutdown fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "run".into(),
+            signature: "() => bool".into(),
+        }],
+        vec!["run()".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    store.insert_verified(&skill).unwrap();
+
+    let mut dispatcher =
+        TelemetryDispatcher::spawn_with_busy_timeout_for_test(&paths, Duration::from_millis(1))
+            .unwrap();
+    dispatcher.set_shutdown_budget_for_test(Duration::from_millis(200));
+
+    // Hold the write lock for far longer than the shutdown budget.
+    let blocker = store
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let batch = EventBatch::new(vec![SkillEvent {
+        invocation_id: None,
+        skill_id: skill.id.clone(),
+        turn_id: "shutdown-turn".into(),
+        tool_call_id: Some("shutdown-tool".into()),
+        kind: SkillEventKind::Selected,
+        export_name: None,
+        outcome: None,
+        latency_us: None,
+        retrieval_score: Some(1.0),
+        retrieval_rank: Some(0),
+        query_fingerprint: Some("shutdown-query".into()),
+        index_generation: 0,
+        evidence_complete: true,
+        production: true,
+        argument_shape: None,
+        created_at: 2_000_000_000,
+    }])
+    .unwrap();
+    dispatcher.try_dispatch(batch).unwrap();
+
+    let retry_deadline = Instant::now() + Duration::from_secs(2);
+    while dispatcher.busy_retries_for_test() == 0 && Instant::now() < retry_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        dispatcher.busy_retries_for_test() > 0,
+        "the worker never entered the busy-retry loop"
+    );
+
+    // Teardown must not wait for the external writer. Without a bounded flush
+    // budget this join never returns while the lock is held.
+    let started = Instant::now();
+    drop(dispatcher);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "telemetry teardown waited for the external writer: {elapsed:?}"
+    );
+
+    // The writer is still holding the lock: teardown did not depend on it.
+    blocker.rollback().unwrap();
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn telemetry_shutdown_still_flushes_a_transiently_busy_batch() {
+    let root = std::env::temp_dir().join(format!("telemetry-flush-{}", uuid::Uuid::new_v4()));
+    let paths = paths(&root);
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let skill = SkillArtifact::new(
+        "function run() { return true; }".into(),
+        "Telemetry flush fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "run".into(),
+            signature: "() => bool".into(),
+        }],
+        vec!["run()".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    store.insert_verified(&skill).unwrap();
+
+    let dispatcher =
+        TelemetryDispatcher::spawn_with_busy_timeout_for_test(&paths, Duration::from_millis(1))
+            .unwrap();
+    let batch = EventBatch::new(vec![SkillEvent {
+        invocation_id: None,
+        skill_id: skill.id.clone(),
+        turn_id: "flush-turn".into(),
+        tool_call_id: Some("flush-tool".into()),
+        kind: SkillEventKind::Selected,
+        export_name: None,
+        outcome: None,
+        latency_us: None,
+        retrieval_score: Some(1.0),
+        retrieval_rank: Some(0),
+        query_fingerprint: Some("flush-query".into()),
+        index_generation: 0,
+        evidence_complete: true,
+        production: true,
+        argument_shape: None,
+        created_at: 2_000_000_000,
+    }])
+    .unwrap();
+    dispatcher.try_dispatch(batch).unwrap();
+    drop(dispatcher);
+
+    let count: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM skill_events
+             WHERE skill_id = ? AND turn_id = 'flush-turn' AND event_kind = 'selected'",
+            [&skill.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "an uncontended batch must still flush on shutdown"
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn task_outcome_is_ordered_after_invocations_and_ignores_uninvoked_skills() {
     let (root, store, skill) = fixture();
     let paths = paths(&root);
