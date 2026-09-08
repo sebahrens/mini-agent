@@ -95,17 +95,19 @@ impl Tool for LspTool {
 
                 // Manager access begins only after the capability-bound read
                 // path is authorized. Operational LSP failure remains open.
-                if bound_relative {
-                    self.manager.notify_changed_relative(relative).await;
+                let baseline = if bound_relative {
+                    self.manager.notify_changed_relative(relative).await
                 } else {
-                    self.manager.notify_changed(&path).await;
-                }
+                    self.manager.notify_changed(&path).await
+                };
                 let diagnostics = if bound_relative {
                     self.manager
-                        .diagnostics_block_relative(relative, QUERY_WAIT)
+                        .diagnostics_block_relative(relative, QUERY_WAIT, baseline)
                         .await
                 } else {
-                    self.manager.diagnostics_block(&path, QUERY_WAIT).await
+                    self.manager
+                        .diagnostics_block_since(&path, QUERY_WAIT, baseline)
+                        .await
                 };
                 let output = diagnostics
                     .map(|block| block.trim_start().to_string())

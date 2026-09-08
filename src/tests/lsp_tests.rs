@@ -587,7 +587,7 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new contents");
-    manager.notify_changed(&file).await;
+    let _ = manager.notify_changed(&file).await;
 
     let query_manager = manager.clone();
     let query_file = file.clone();

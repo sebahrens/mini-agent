@@ -2065,15 +2065,30 @@ only the remaining capped lines while the binding is live, and releases its
 descriptor before opening the next candidate. Large or high-volume workspaces
 therefore cannot cause unbounded diagnostic cloning or file-handle use.
 
+Document synchronization reads at most 4 MiB plus one sentinel byte from the
+already-authorized file handle. Oversized or invalid UTF-8 documents are omitted
+without advancing the document version, and workspace-relative reads use the
+asynchronous file reader too.
+
+On Unix, the language server uses its inherited workspace descriptor in
+`rootUri` and document URIs. The parent translates those child-local URIs to
+canonical workspace paths before cache lookup and version checks; servers that
+return canonical workspace URIs are supported too. Translation validates the
+retained workspace identity and rejects traversal, outside paths, and symlink
+aliases. The parent never resolves the child's descriptor as its own.
+
 Cache entries are accepted only for canonical file URIs that still resolve to
 regular files; symlink aliases and alternate URI spellings are discarded. The
 client also accepts a publish only when its document version matches the most
 recent full-document sync, preventing delayed pre-edit results from satisfying
-a post-edit diagnostics wait. Versioned diagnostic support is advertised.
+a post-edit diagnostics wait. The wait uses a publish counter captured while
+advancing the synchronized document version, before sending `didOpen` or
+`didChange`, so a fast reply is recognized even if it arrives before the waiter
+starts. Versioned diagnostic support is advertised.
 Versionless initial publishes and clears (including an explicit JSON
 `version: null`) remain accepted while the sync epoch is unchanged; after an
 edit they fail closed until an exact versioned publish anchors the new epoch.
-The diagnostic cache retains at most 256 distinct file entries, at most 256
+The diagnostic cache retains at most 128 distinct file entries, at most 50
 diagnostics per entry, and at most 2 MiB of accounted retained diagnostic data
 in aggregate. Messages are truncated to 1,024 UTF-8 bytes and unused extension
 payloads such as arbitrary JSON `data` are discarded before cache commit.

@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lsp_types::DiagnosticSeverity;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 use crate::config::types::LspConfig;
@@ -268,7 +267,7 @@ impl LspManager {
             name,
             cfg,
             self.inner.workspace.root(),
-            self.inner.workspace.try_clone_directory_file().ok(),
+            Some(self.inner.workspace.clone()),
             self.inner.diags.clone(),
             self.inner.diag_notify.clone(),
         )
@@ -312,52 +311,32 @@ impl LspManager {
 
     /// Syncs a file's disk content with its language server (no-op when no
     /// server handles the extension or the server failed to start).
-    pub async fn notify_changed(&self, path: &Path) {
-        let Ok(path) = std::fs::canonicalize(path) else {
-            return;
-        };
+    pub async fn notify_changed(&self, path: &Path) -> Option<u64> {
+        let path = std::fs::canonicalize(path).ok()?;
         if !self.handles(&path) {
-            return;
+            return None;
         }
-        // Open and bind the file identity before a server is selected or
-        // launched. If a path approved by the caller is replaced by a symlink
-        // while permission is pending, the replacement content is never read
-        // and never reaches an LSP process.
-        let Ok(mut file) = crate::fs::open_stable_file(&path).await else {
-            return;
-        };
-        let mut text = String::new();
-        if file.read_to_string(&mut text).await.is_err() {
-            return;
-        }
-        if let Some(client) = self.client_for(&path).await {
-            client.sync_text(&path, text).await;
-        }
+        // Bind the file before server selection so an unapproved replacement
+        // never reaches the language server.
+        let file = crate::fs::open_stable_file(&path).await.ok()?;
+        let text = client::read_document_text(file).await.ok()?;
+        self.client_for(&path).await?.sync_text(&path, text).await
     }
 
-    pub async fn notify_changed_relative(&self, relative: &Path) {
-        if self.inner.workspace.validate().is_err() {
-            return;
+    pub async fn notify_changed_relative(&self, relative: &Path) -> Option<u64> {
+        self.inner.workspace.validate().ok()?;
+        let file = self.inner.workspace.open_relative(relative).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
         }
-        let Ok(mut file) = self.inner.workspace.open_relative(relative) else {
-            return;
-        };
-        let Ok(metadata) = file.metadata() else {
-            return;
-        };
-        if !metadata.is_file() {
-            return;
-        }
-        let mut text = String::new();
-        use std::io::Read as _;
-        if file.read_to_string(&mut text).is_err() {
-            return;
-        }
-        let logical = client::workspace_service_root(self.inner.workspace.root()).join(relative);
+        let text = client::read_document_text(tokio::fs::File::from_std(file))
+            .await
+            .ok()?;
         let lookup = self.inner.workspace.root().join(relative);
-        if let Some(client) = self.client_for(&lookup).await {
-            client.sync_text(&logical, text).await;
-        }
+        self.client_for(&lookup)
+            .await?
+            .sync_text(&lookup, text)
+            .await
     }
 
     /// Stops and reaps every language-server process currently owned by this
@@ -378,7 +357,20 @@ impl LspManager {
     /// Diagnostics block for one file, formatted for appending to a tool
     /// result. Waits up to `wait` for the publish following the last sync.
     /// `None` when the file is clean or has no server.
+    #[cfg(test)]
     pub async fn diagnostics_block(&self, path: &Path, wait: Duration) -> Option<String> {
+        self.diagnostics_block_since(path, wait, None).await
+    }
+
+    /// Wait from the counter captured by synchronization, including a publish
+    /// that arrived before this future was polled. Without a completed sync,
+    /// retain the existing bounded cache-refresh behavior.
+    pub async fn diagnostics_block_since(
+        &self,
+        path: &Path,
+        wait: Duration,
+        baseline: Option<u64>,
+    ) -> Option<String> {
         if !self.handles(path) {
             return None;
         }
@@ -387,14 +379,14 @@ impl LspManager {
         // cache identity is expected to be stale here. Its version remains the
         // synchronization baseline while we wait for a publish tied to the new
         // identity; stale diagnostics themselves are never returned.
-        let v0 = self
-            .inner
-            .diags
-            .lock()
-            .unwrap()
-            .get(&uri)
-            .map(|d| d.version)
-            .unwrap_or(0);
+        let v0 = baseline.unwrap_or_else(|| {
+            self.inner
+                .diags
+                .lock()
+                .unwrap()
+                .get(&uri)
+                .map_or(0, |diagnostics| diagnostics.version)
+        });
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             // Register before inspecting the version so a publish between the
@@ -419,6 +411,7 @@ impl LspManager {
                 break; // timeout: use whatever is stored
             }
         }
+        self.inner.workspace.validate().ok()?;
         let store = self.inner.diags.lock().unwrap();
         let file = store.get(&uri)?;
         if !diagnostic_identity_is_current(&uri, file) {
@@ -430,21 +423,42 @@ impl LspManager {
     /// Compact diagnostics block for one file. Errors and warnings only,
     /// capped at [`MAX_DIAG_LINES`]. `None` when the file is clean or has no
     /// server.
-    pub async fn diagnostics_block_for_edit(&self, path: &Path) -> Option<String> {
-        self.diagnostics_block(path, DIAG_WAIT).await
+    pub async fn diagnostics_block_for_edit(
+        &self,
+        path: &Path,
+        baseline: Option<u64>,
+    ) -> Option<String> {
+        self.diagnostics_block_since(path, DIAG_WAIT, baseline)
+            .await
     }
 
     pub async fn diagnostics_block_relative(
         &self,
         relative: &Path,
         wait: Duration,
+        baseline: Option<u64>,
     ) -> Option<String> {
-        let service = client::workspace_service_root(self.inner.workspace.root()).join(relative);
-        self.diagnostics_block(&service, wait).await
+        self.inner.workspace.validate().ok()?;
+        let parent = self
+            .inner
+            .workspace
+            .root()
+            .join(relative)
+            .canonicalize()
+            .ok()?;
+        if !parent.starts_with(self.inner.workspace.root()) {
+            return None;
+        }
+        self.diagnostics_block_since(&parent, wait, baseline).await
     }
 
-    pub async fn diagnostics_block_for_relative_edit(&self, relative: &Path) -> Option<String> {
-        self.diagnostics_block_relative(relative, DIAG_WAIT).await
+    pub async fn diagnostics_block_for_relative_edit(
+        &self,
+        relative: &Path,
+        baseline: Option<u64>,
+    ) -> Option<String> {
+        self.diagnostics_block_relative(relative, DIAG_WAIT, baseline)
+            .await
     }
 
     /// All files that currently have diagnostics, formatted for the

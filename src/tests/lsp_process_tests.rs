@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
+use rig::tool::Tool;
 use tokio::sync::Notify;
 
 use crate::config::types::{LspConfig, LspNetwork, LspServerConfig};
@@ -208,6 +209,24 @@ fn main() {
             if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
                 let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
                 writeln!(file, "{body}").unwrap();
+            }
+            if mode == "diagnostics" {
+                let wire_uri = body.split_once("\"uri\":").unwrap().1.split('"').nth(1).unwrap();
+                let uri = env::var("LSP_FIXTURE_CANONICAL_URI").unwrap_or_else(|_| wire_uri.into());
+                let version: i64 = body.split_once("\"version\":").unwrap().1
+                    .chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap();
+                let mut publish = |uri: &str, version: i64| {
+                    write_frame(&mut stdout, &format!(
+                        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",\"version\":{version},\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"severity\":1,\"message\":\"fixture diagnostic version {version}\"}}]}}}}"
+                    ));
+                };
+                if let Ok(outside) = env::var("LSP_FIXTURE_OUTSIDE_URI") {
+                    publish(&outside, version);
+                }
+                // A stale reply must not advance the parent's publish counter.
+                for version in [version - 1, version] {
+                    publish(&uri, version);
+                }
             }
         } else if body.contains("\"method\":\"mini-agent/test\"") {
             if let Some(path) = env::var_os("LSP_FIXTURE_REQUEST_FILE") {
@@ -576,6 +595,189 @@ async fn lsp_process_pending_request_cancellation_removes_entry() {
 }
 
 #[tokio::test]
+async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
+    let fixture = FixtureBuild::compile("diagnostic-publication");
+    let outside = fixture.path("outside.probe");
+    fs::write(&outside, "outside workspace").unwrap();
+    let outside_uri = file_uri(&outside.canonicalize().unwrap()).unwrap();
+    let mut results = Vec::new();
+    for (relative, canonical_reply) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let workspace = fixture
+            .workspace(&format!("workspace-{relative}-{canonical_reply}"))
+            .canonicalize()
+            .unwrap();
+        let source = workspace.join("document.probe");
+        let uri = file_uri(&source).unwrap();
+        let mut server = fixture.config("diagnostics", &fixture.path("diagnostics.lease"));
+        server
+            .env
+            .insert("LSP_FIXTURE_OUTSIDE_URI".into(), outside_uri.clone());
+        if canonical_reply {
+            server
+                .env
+                .insert("LSP_FIXTURE_CANONICAL_URI".into(), uri.clone());
+        }
+        let manager = LspManager::new(
+            &LspConfig {
+                enabled: true,
+                servers: HashMap::from([("fixture".into(), server)]),
+            },
+            workspace.clone(),
+        );
+        for version in [1, 2] {
+            fs::write(&source, format!("document version {version}")).unwrap();
+            let baseline = if relative {
+                manager
+                    .notify_changed_relative(Path::new("document.probe"))
+                    .await
+            } else {
+                manager.notify_changed(&source).await
+            };
+            // Let the real reply arrive before starting the waiter. A baseline
+            // sampled after sync would miss this reply and wait for another.
+            let published = tokio::time::timeout(Duration::from_secs(2), async {
+                while manager
+                    .diagnostic_cache_entry_metrics(&uri)
+                    .is_none_or(|(counter, _)| counter <= baseline.unwrap_or(0))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let output = tokio::time::timeout(Duration::from_millis(250), async {
+                if relative {
+                    manager
+                        .diagnostics_block_for_relative_edit(Path::new("document.probe"), baseline)
+                        .await
+                } else {
+                    manager.diagnostics_block_for_edit(&source, baseline).await
+                }
+            })
+            .await;
+            results.push((
+                relative,
+                canonical_reply,
+                version,
+                baseline,
+                published,
+                manager.diagnostic_cache_entry_metrics(&uri),
+                manager.diagnostic_candidate_uris() == vec![uri.clone()],
+                output,
+            ));
+        }
+        manager.shutdown().await;
+    }
+    fixture.cleanup();
+    for (
+        relative,
+        canonical_reply,
+        version,
+        baseline,
+        published,
+        entry,
+        only_expected_uri,
+        output,
+    ) in results
+    {
+        let case =
+            format!("relative={relative}, canonical_reply={canonical_reply}, version={version}");
+        assert!(baseline.is_some(), "{case}: synchronization failed");
+        assert!(
+            published,
+            "{case}: real publication never reached the parent cache"
+        );
+        assert_eq!(
+            entry,
+            Some((version, 1)),
+            "{case}: stale reply was accepted"
+        );
+        assert!(
+            only_expected_uri,
+            "{case}: outside-workspace reply was accepted"
+        );
+        let output = output
+            .expect("already-published diagnostics must not wait for a second publish")
+            .expect("server diagnostic must reach the caller");
+        assert!(
+            output.contains(&format!("fixture diagnostic version {version}")),
+            "{case}: {output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
+    use crate::agent::tools::{
+        EditArgs, WriteArgs,
+        edit::EditTool,
+        lsp::{LspArgs, LspTool},
+        write::WriteTool,
+    };
+    let fixture = FixtureBuild::compile("tool-diagnostics");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true,
+            servers: HashMap::from([(
+                "fixture".into(),
+                fixture.config("diagnostics", &fixture.path("tools.lease")),
+            )]),
+        },
+        workspace.clone(),
+    );
+    let write = WriteTool::new(None, None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    let edit = EditTool::new(None, None)
+        .with_workspace(workspace.clone())
+        .with_lsp(Some(manager.clone()));
+    let query = LspTool::new(manager.clone(), None, None);
+    crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+    let mut outputs = Vec::new();
+    for relative in [false, true] {
+        let name = format!("tool-{relative}.probe");
+        let path = if relative {
+            name
+        } else {
+            workspace.join(name).to_string_lossy().into_owned()
+        };
+        outputs.push((
+            1,
+            write
+                .call(WriteArgs {
+                    path: path.clone(),
+                    content: "before".into(),
+                    overwrite: false,
+                })
+                .await,
+        ));
+        outputs.push((
+            2,
+            edit.call(EditArgs {
+                path: path.clone(),
+                block: Some("<<<<<<< SEARCH\nbefore\n=======\nafter\n>>>>>>> REPLACE".into()),
+                replace_all: false,
+                file_crc: None,
+                edits: None,
+            })
+            .await,
+        ));
+        outputs.push((3, query.call(LspArgs { path: Some(path) }).await));
+    }
+    manager.shutdown().await;
+    fixture.cleanup();
+    for (version, result) in outputs {
+        let output = result.expect("file tool must succeed");
+        assert!(
+            output.contains(&format!("fixture diagnostic version {version}")),
+            "{output}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn lsp_process_oversized_document_does_not_poison_sync_state() {
     let fixture = FixtureBuild::compile("oversized-document");
     let workspace = fixture.workspace("workspace");
@@ -727,7 +929,7 @@ async fn lsp_process_manager_restarts_stopped_server() {
         workspace.clone(),
     );
 
-    manager.notify_changed(&source).await;
+    let _ = manager.notify_changed(&source).await;
     let first_pid = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let launches = fs::read_to_string(&launch_log).unwrap_or_default();
@@ -743,7 +945,7 @@ async fn lsp_process_manager_restarts_stopped_server() {
 
     let second_pid = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            manager.notify_changed(&source).await;
+            let _ = manager.notify_changed(&source).await;
             let launches = fs::read_to_string(&launch_log).unwrap_or_default();
             if let Some(pid) = launch_pids(&launches).get(1).copied() {
                 break pid;

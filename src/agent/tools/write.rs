@@ -251,8 +251,11 @@ impl Tool for WriteTool {
             }
             #[cfg(feature = "lsp")]
             if let Some(lsp) = &self.lsp {
-                lsp.notify_changed_relative(relative).await;
-                if let Some(block) = lsp.diagnostics_block_for_relative_edit(relative).await {
+                let baseline = lsp.notify_changed_relative(relative).await;
+                if let Some(block) = lsp
+                    .diagnostics_block_for_relative_edit(relative, baseline)
+                    .await
+                {
                     result.push_str(&block);
                 }
             }
@@ -332,8 +335,8 @@ impl Tool for WriteTool {
 
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &self.lsp {
-            lsp.notify_changed(path).await;
-            if let Some(block) = lsp.diagnostics_block_for_edit(path).await {
+            let baseline = lsp.notify_changed(path).await;
+            if let Some(block) = lsp.diagnostics_block_for_edit(path, baseline).await {
                 result.push_str(&block);
             }
         }

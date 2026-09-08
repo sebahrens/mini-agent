@@ -1127,15 +1127,16 @@ impl Tool for EditTool {
         #[cfg(feature = "lsp")]
         if let Some(lsp) = &self.lsp {
             let file = std::path::Path::new(&path);
-            if capability_metadata.is_some() {
-                lsp.notify_changed_relative(relative).await;
+            let baseline = if capability_metadata.is_some() {
+                lsp.notify_changed_relative(relative).await
             } else {
-                lsp.notify_changed(file).await;
-            }
+                lsp.notify_changed(file).await
+            };
             let diagnostics = if capability_metadata.is_some() {
-                lsp.diagnostics_block_for_relative_edit(relative).await
+                lsp.diagnostics_block_for_relative_edit(relative, baseline)
+                    .await
             } else {
-                lsp.diagnostics_block_for_edit(file).await
+                lsp.diagnostics_block_for_edit(file, baseline).await
             };
             if let Some(block) = diagnostics {
                 result.push_str(&block);

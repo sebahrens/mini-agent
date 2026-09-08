@@ -23,9 +23,25 @@ use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
 pub(crate) async fn read_stable_text(path: &Path) -> std::io::Result<String> {
-    let mut file = crate::fs::open_stable_file(path).await?;
+    read_document_text(crate::fs::open_stable_file(path).await?).await
+}
+
+/// Bound reads on the authorized handle itself, including a file that grows
+/// after metadata inspection. Oversized documents never reach sync_text.
+pub(crate) async fn read_document_text(
+    reader: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<String> {
     let mut text = String::new();
-    file.read_to_string(&mut text).await?;
+    reader
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_string(&mut text)
+        .await?;
+    if text.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LSP document exceeds synchronization byte limit",
+        ));
+    }
     Ok(text)
 }
 
@@ -240,7 +256,10 @@ pub struct LspClient {
     shutdown_tx: mpsc::UnboundedSender<()>,
     stopped: Arc<AtomicBool>,
     stopped_notify: Arc<Notify>,
-    /// uri → last synced document version.
+    diags: DiagStore,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    server_root: PathBuf,
+    /// Parent-canonical uri → last synced document version.
     open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
 }
 
@@ -251,7 +270,7 @@ impl LspClient {
         name: &str,
         cfg: &LspServerConfig,
         root: &Path,
-        workspace_handle: Option<std::fs::File>,
+        workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
         diags: DiagStore,
         diag_notify: Arc<Notify>,
     ) -> Option<Arc<Self>> {
@@ -259,7 +278,7 @@ impl LspClient {
             name,
             cfg,
             root,
-            workspace_handle,
+            workspace,
             diags,
             diag_notify,
             INIT_TIMEOUT,
@@ -291,7 +310,7 @@ impl LspClient {
         name: &str,
         cfg: &LspServerConfig,
         root: &Path,
-        workspace_handle: Option<std::fs::File>,
+        workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
         diags: DiagStore,
         diag_notify: Arc<Notify>,
         initialize_timeout: Duration,
@@ -304,6 +323,17 @@ impl LspClient {
                 tracing::debug!("lsp[{name}]: launch denied: {error}");
             })
             .ok()?;
+        let use_descriptor_root = workspace.is_some();
+        let workspace = match workspace {
+            Some(workspace) => workspace,
+            None => Arc::new(crate::paths::WorkspaceBinding::capture(&root).ok()?),
+        };
+        workspace.validate().ok()?;
+        let workspace_handle = if use_descriptor_root {
+            Some(workspace.try_clone_directory_file().ok()?)
+        } else {
+            None
+        };
         let server_root = bind_workspace_handle(&mut command, workspace_handle, &root)
             .map_err(|error| tracing::debug!("lsp[{name}]: workspace bind failed: {error}"))
             .ok()?;
@@ -344,8 +374,12 @@ impl LspClient {
             let pending = pending.clone();
             let stdin = stdin.clone();
             let open = open.clone();
+            let diags = diags.clone();
             let server_name = name.to_string();
             let workspace_uri = root_uri.clone();
+            let parent_workspace_uri = file_uri(workspace.root())?;
+            let workspace = workspace.clone();
+            let server_root = server_root.clone();
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let mut stdout = rpc::FrameReader::new(stdout);
@@ -386,12 +420,33 @@ impl LspClient {
                             if m == "textDocument/publishDiagnostics"
                                 && let Some(params) = msg.get("params")
                             {
-                                match validate_diagnostic_envelope(&workspace_uri, params) {
+                                let envelope =
+                                    match validate_diagnostic_envelope(&workspace_uri, params) {
+                                        DiagnosticStoreOutcome::Ignored => {
+                                            validate_diagnostic_envelope(
+                                                &parent_workspace_uri,
+                                                params,
+                                            )
+                                        }
+                                        outcome => outcome,
+                                    };
+                                match envelope {
                                     DiagnosticStoreOutcome::Stored => {
+                                        let Some(uri) = params
+                                            .get("uri")
+                                            .and_then(Value::as_str)
+                                            .and_then(|uri| {
+                                                parent_diagnostic_uri(&workspace, &server_root, uri)
+                                            })
+                                        else {
+                                            continue;
+                                        };
+                                        let mut params = params.clone();
+                                        params["uri"] = Value::String(uri);
                                         if store_diagnostics(
                                             &diags,
                                             &server_name,
-                                            params,
+                                            &params,
                                             Some(&open),
                                         ) {
                                             diag_notify.notify_waiters();
@@ -470,6 +525,9 @@ impl LspClient {
             shutdown_tx,
             stopped,
             stopped_notify,
+            diags,
+            workspace,
+            server_root,
             open,
         });
 
@@ -596,28 +654,32 @@ impl LspClient {
         let Ok(text) = read_stable_text(path).await else {
             return;
         };
-        self.sync_text(path, text).await;
+        let _ = self.sync_text(path, text).await;
     }
 
-    pub async fn sync_text(&self, path: &Path, text: String) {
-        let Some(uri) = file_uri(path) else {
-            return;
-        };
+    /// Return the diagnostic publish counter captured for this sync, before
+    /// the server can answer it. Callers must carry it into their wait.
+    pub async fn sync_text(&self, path: &Path, text: String) -> Option<u64> {
+        self.workspace.validate().ok()?;
+        let parent_path = std::fs::canonicalize(path).ok()?;
+        let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
+        let wire_uri = file_uri(&self.server_root.join(relative))?;
+        let uri = file_uri(&parent_path)?;
         if text.len() as u64 > MAX_DOCUMENT_BYTES {
             tracing::debug!(
                 "lsp[{}]: document exceeds synchronization byte limit",
                 self.name
             );
-            return;
+            return None;
         }
         let uri_str = uri.clone();
         enum Sync {
             Open,
             Change(i64),
         }
-        let action = {
+        let (action, baseline) = {
             let mut open = self.open.lock().unwrap();
-            match open.get_mut(&uri_str) {
+            let action = match open.get_mut(&uri_str) {
                 Some(document) => {
                     document.version += 1;
                     document.allow_versionless = false;
@@ -625,7 +687,7 @@ impl LspClient {
                 }
                 None => {
                     open.insert(
-                        uri_str,
+                        uri_str.clone(),
                         SyncedDocument {
                             version: 1,
                             allow_versionless: true,
@@ -633,15 +695,25 @@ impl LspClient {
                     );
                     Sync::Open
                 }
-            }
-        }; // lock released before any await
+            };
+            // Match the reader's lock order (document versions, then diagnostics).
+            // Holding the version lock excludes a late publish for the previous
+            // document from becoming the completion of this synchronization.
+            let baseline = self
+                .diags
+                .lock()
+                .unwrap()
+                .get(&uri_str)
+                .map_or(0, |diagnostics| diagnostics.version);
+            (action, baseline)
+        }; // locks released before any await
         let sent = match action {
             Sync::Open => {
                 self.notify(
                     "textDocument/didOpen",
                     json!({
                         "textDocument": {
-                            "uri": uri,
+                            "uri": wire_uri,
                             "languageId": language_id(path),
                             "version": 1,
                             "text": text
@@ -654,7 +726,7 @@ impl LspClient {
                 self.notify(
                     "textDocument/didChange",
                     json!({
-                        "textDocument": { "uri": uri, "version": v },
+                        "textDocument": { "uri": wire_uri, "version": v },
                         "contentChanges": [{ "text": text }]
                     }),
                 )
@@ -662,11 +734,12 @@ impl LspClient {
             }
         };
         if sent {
-            return;
+            return Some(baseline);
         }
         // A failed protocol write makes the cached client unusable. Complete
         // process-tree cleanup so the next matching edit can start fresh.
         self.shutdown().await;
+        None
     }
 }
 
@@ -908,6 +981,43 @@ enum DiagnosticStoreOutcome {
     Stored,
     Ignored,
     LimitExceeded,
+}
+
+/// Translate the server's descriptor namespace without ever resolving that
+/// descriptor in the parent. Canonical server replies are also accepted, but
+/// every spelling must name a file inside the retained workspace authority.
+fn parent_diagnostic_uri(
+    workspace: &crate::paths::WorkspaceBinding,
+    server_root: &Path,
+    raw_uri: &str,
+) -> Option<String> {
+    workspace.validate().ok()?;
+    let path = file_path(raw_uri)?;
+    if file_uri(&path).as_deref() != Some(raw_uri) {
+        return None;
+    }
+    // File URIs use ordinary drive/UNC paths on Windows, while captured
+    // filesystem roots may use verbatim prefixes. Compare in URI path form.
+    let wire_root = file_path(&file_uri(server_root)?)?;
+    let parent_root = file_path(&file_uri(workspace.root())?)?;
+    let relative = path
+        .strip_prefix(&wire_root)
+        .or_else(|_| path.strip_prefix(&parent_root))
+        .ok()?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let parent = workspace.root().join(relative);
+    // Reject symlink aliases, traversal and non-canonical spellings before
+    // attaching a server message to the parent's diagnostic cache identity.
+    if std::fs::canonicalize(&parent).ok()? != parent {
+        return None;
+    }
+    workspace.validate().ok()?;
+    file_uri(&parent)
 }
 
 fn validate_diagnostic_envelope(workspace_uri: &str, params: &Value) -> DiagnosticStoreOutcome {
@@ -1177,5 +1287,118 @@ fn language_id(path: &Path) -> &'static str {
             "md" => "markdown",
             _ => "plaintext",
         },
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn document_reads_stop_at_the_sync_limit_before_allocating_the_full_input() {
+        for size in [
+            MAX_DOCUMENT_BYTES - 1,
+            MAX_DOCUMENT_BYTES,
+            MAX_DOCUMENT_BYTES + 1,
+            MAX_DOCUMENT_BYTES * 2,
+        ] {
+            let mut reader = std::io::Cursor::new(vec![b'x'; size as usize]);
+            let result = read_document_text(&mut reader).await;
+            assert_eq!(reader.position(), size.min(MAX_DOCUMENT_BYTES + 1));
+            if size <= MAX_DOCUMENT_BYTES {
+                assert_eq!(result.unwrap().len() as u64, size);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+        }
+        let unicode = "é".repeat(MAX_DOCUMENT_BYTES as usize / 2);
+        assert_eq!(
+            read_document_text(unicode.as_bytes()).await.unwrap(),
+            unicode
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_uri_mapping_rejects_escapes_aliases_and_replaced_workspaces() {
+        let temp = std::env::temp_dir().join(format!("lsp-uri-mapping-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("document.rs");
+        std::fs::write(&source, "document").unwrap();
+        let outside = root.parent().unwrap().join("outside.rs");
+        std::fs::write(&outside, "outside").unwrap();
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
+        let manager = super::super::LspManager::new(
+            &crate::config::types::LspConfig::default(),
+            workspace.clone(),
+        );
+        let server_root = workspace_service_root(&root);
+        let wire_uri = file_uri(&server_root.join("document.rs")).unwrap();
+        let parent_uri = file_uri(&source).unwrap();
+        for uri in [&wire_uri, &parent_uri] {
+            assert_eq!(
+                parent_diagnostic_uri(&workspace, &server_root, uri),
+                Some(parent_uri.clone())
+            );
+        }
+        let wire_root_uri = file_uri(&server_root).unwrap();
+        for uri in [
+            file_uri(&outside).unwrap(),
+            format!("{wire_root_uri}/%2e%2e/outside.rs"),
+            format!("{wire_root_uri}/child%2F..%2F..%2Foutside.rs"),
+            format!("{wire_root_uri}/%64ocument.rs"),
+            format!("{wire_uri}?query=1"),
+            format!("{wire_uri}#fragment"),
+            "file:///invalid%escape".into(),
+            "https://example.test/document.rs".into(),
+        ] {
+            assert_eq!(
+                parent_diagnostic_uri(&workspace, &server_root, &uri),
+                None,
+                "{uri}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&source, root.join("alias.rs")).unwrap();
+            let alias = file_uri(&server_root.join("alias.rs")).unwrap();
+            assert_eq!(
+                parent_diagnostic_uri(&workspace, &server_root, &alias),
+                None
+            );
+            let moved = root.with_file_name("moved");
+            std::fs::rename(&root, &moved).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("document.rs"), "replacement").unwrap();
+            assert_eq!(
+                parent_diagnostic_uri(&workspace, &server_root, &wire_uri),
+                None
+            );
+            assert_eq!(
+                parent_diagnostic_uri(&workspace, &server_root, &parent_uri),
+                None
+            );
+            // Model a publication racing the root replacement after translation.
+            // Result formatting must revalidate authority as well as the inode.
+            manager.inject_diagnostics(
+                &parent_uri,
+                "rust",
+                vec![lsp_types::Diagnostic {
+                    severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                    message: "replacement workspace diagnostic".into(),
+                    ..Default::default()
+                }],
+            );
+            assert!(
+                manager
+                    .diagnostics_block_since(&source, Duration::ZERO, Some(0))
+                    .await
+                    .is_none()
+            );
+        }
+        drop(manager);
+        drop(workspace);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }
