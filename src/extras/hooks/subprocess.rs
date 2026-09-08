@@ -701,24 +701,9 @@ pub(crate) async fn run_hook_with_limits(
 }
 
 /// Runs an `if` condition using its documented shell-command semantics.
-pub(crate) async fn run_shell_condition(
-    condition: &str,
-    stdin_json: &[u8],
-    timeout: std::time::Duration,
-    project_dir: &str,
-    policy: &HookPolicy,
-) -> HookOutput {
-    let (shell, flag) = if cfg!(windows) {
-        ("powershell", "-Command")
-    } else {
-        // The common hook launcher resolves this bare name to an absolute
-        // executable before constructing the sandbox command.
-        ("sh", "-c")
-    };
-    let args = vec![flag.to_string(), condition.to_string()];
-    run_hook_with_policy(shell, Some(&args), stdin_json, timeout, project_dir, policy).await
-}
-
+///
+/// Every dispatcher path holds an execution-root lease, so this is the only
+/// condition entry point; the rootless variant it replaced had no caller.
 pub(crate) async fn run_shell_condition_at_root(
     condition: &str,
     stdin_json: &[u8],

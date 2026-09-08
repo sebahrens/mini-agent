@@ -4,6 +4,113 @@ use crate::extras::js::skills::{
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 
+/// A store with one retained skill and one registered policy version.
+fn scheduler_fixture(label: &str) -> (std::path::PathBuf, SkillStore, String) {
+    let root = std::env::temp_dir().join(format!("scheduler-{label}-{}", uuid::Uuid::new_v4()));
+    let env = PathEnvironment {
+        platform: if cfg!(target_os = "macos") {
+            PathPlatform::MacOs
+        } else if cfg!(target_os = "windows") {
+            PathPlatform::Windows
+        } else {
+            PathPlatform::Linux
+        },
+        home_dir: None,
+        config_base: Some(root.clone()),
+        data_base: Some(root.clone()),
+        local_data_base: Some(root.clone()),
+        state_base: Some(root.clone()),
+        cache_base: Some(root.clone()),
+        workspace_root: None,
+        overrides: Default::default(),
+    };
+    let mut store = SkillStore::open_at(&AppPaths::resolve(&env).unwrap()).unwrap();
+    let skill = SkillArtifact::new(
+        "function run() { return true; }".into(),
+        "Scheduler fixture".into(),
+        vec![],
+        vec![SkillExport {
+            name: "run".into(),
+            signature: "() => bool".into(),
+        }],
+        vec!["run()".into()],
+        CapabilityManifest::pure(),
+    )
+    .unwrap();
+    store.insert_verified(&skill).unwrap();
+    store
+        .conn_mut()
+        .execute(
+            "INSERT INTO skill_policy_versions VALUES ('v1', '{}', 0)",
+            [],
+        )
+        .unwrap();
+    (root, store, skill.id.clone())
+}
+
+/// `run_one` is the orchestration entry point the scheduler will use once the
+/// quarantine path enqueues its held decisions: it leases one due decision,
+/// dispatches it, and completes or reschedules it. The other methods are
+/// covered above; this pins the composition, including that a dispatch failure
+/// leaves the decision retryable rather than completed.
+#[test]
+fn run_one_leases_dispatches_and_settles_exactly_one_due_decision() {
+    let (root, mut store, skill_id) = scheduler_fixture("run-one");
+    let mut scheduler = PolicyScheduler::new(&mut store);
+    scheduler
+        .enqueue("decision-a", &skill_id, "v1", 10)
+        .unwrap();
+
+    // Nothing is due yet.
+    let dispatched = std::cell::RefCell::new(Vec::new());
+    assert!(
+        !scheduler
+            .run_one("worker-a", 5, 5, 1, 60, |lease| {
+                dispatched.borrow_mut().push(lease.decision_id.clone());
+                Ok(())
+            })
+            .unwrap(),
+        "a decision that is not due must not be leased"
+    );
+    assert!(dispatched.borrow().is_empty());
+
+    // A failing dispatch reschedules instead of completing.
+    assert!(
+        scheduler
+            .run_one("worker-a", 10, 5, 1, 60, |lease| {
+                dispatched.borrow_mut().push(lease.decision_id.clone());
+                Err("transient")
+            })
+            .unwrap()
+    );
+    assert_eq!(dispatched.borrow().as_slice(), ["decision-a"]);
+    assert!(
+        scheduler.lease_due("worker-b", 10, 5).unwrap().is_none(),
+        "a rescheduled decision must not be immediately leasable again"
+    );
+
+    // Once the backoff elapses it is dispatched again, and a successful
+    // dispatch completes it for good.
+    assert!(
+        scheduler
+            .run_one("worker-b", 100, 5, 1, 60, |lease| {
+                dispatched.borrow_mut().push(lease.decision_id.clone());
+                Ok(())
+            })
+            .unwrap()
+    );
+    assert_eq!(dispatched.borrow().len(), 2);
+    assert!(
+        !scheduler
+            .run_one("worker-c", 200, 5, 1, 60, |_| Ok(()))
+            .unwrap(),
+        "a completed decision must never be dispatched again"
+    );
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn decision_leases_are_restart_safe_and_stale_workers_cannot_complete() {
     let root = std::env::temp_dir().join(format!("scheduler-{}", uuid::Uuid::new_v4()));

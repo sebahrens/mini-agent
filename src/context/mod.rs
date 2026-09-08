@@ -596,11 +596,11 @@ mod repository_context_tests {
     }
 }
 
-#[cfg(feature = "archmd")]
-pub(crate) fn load_architecture() -> Option<String> {
-    walk_context_files(std::env::current_dir().ok().as_deref()).1
-}
-
+/// Read the architecture document for an explicit workspace.
+///
+/// There is deliberately no process-CWD variant: workspace authority is passed
+/// explicitly so a worktree switch never depends on the process working
+/// directory (see `PermissionChecker::rebind_working_dir`).
 #[cfg(feature = "archmd")]
 pub(crate) fn load_architecture_from(workspace_root: &Path) -> Option<String> {
     walk_context_files(Some(workspace_root)).1

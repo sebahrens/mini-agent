@@ -11,13 +11,6 @@ pub fn global_dir() -> PathBuf {
         .prompts_dir()
 }
 
-pub fn zerostack_dir() -> PathBuf {
-    crate::paths::process_paths()
-        .expect("startup must initialize application paths")
-        .project_prompts_dir()
-        .expect("startup workspace must have a project path")
-}
-
 /// Where a loaded prompt came from. Only the source decides whether prompt
 /// header directives are honored: embedded and user prompts are the user's own
 /// configuration, while `.zerostack/prompts` is repository content that an
@@ -509,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zerostack_dir_missing_is_ok() {
+    fn a_workspace_without_project_prompts_still_loads_the_embedded_set() {
         let td = TestDir::new();
         let prompts = td.load();
         assert!(prompts.contains_key("code"));
