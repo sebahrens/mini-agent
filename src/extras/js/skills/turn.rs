@@ -131,14 +131,44 @@ impl TurnSkillBundle {
 }
 
 /// Send + Sync per-agent cell. Replacement happens only at a user-turn boundary.
+/// At most this many distinct skills are attributed to one turn's outcome, so
+/// a model that re-searches repeatedly cannot grow the attribution set without
+/// bound.
+const MAX_TURN_ATTRIBUTION_SKILLS: usize = 64;
+
+/// Parent-owned state for the turn currently in flight.
+#[derive(Default)]
+struct TurnAttribution {
+    turn_id: String,
+    /// Every skill selected during this turn, across mid-turn re-freezes. A
+    /// task outcome is attributed to this union rather than to whichever
+    /// bundle happened to be current when the outcome was recorded.
+    selected: Vec<String>,
+    /// False once the parent knows telemetry for this turn was lost or
+    /// rejected, so the turn cannot be read back as verified evidence.
+    evidence_complete: bool,
+}
+
 pub struct SkillTurnContext {
     current: RwLock<Arc<TurnSkillBundle>>,
+    attribution: RwLock<TurnAttribution>,
 }
 
 impl SkillTurnContext {
     pub fn new(initial: TurnSkillBundle) -> Self {
+        let attribution = TurnAttribution {
+            turn_id: initial.turn_id.clone(),
+            selected: initial
+                .skills
+                .iter()
+                .map(|skill| skill.id.clone())
+                .take(MAX_TURN_ATTRIBUTION_SKILLS)
+                .collect(),
+            evidence_complete: true,
+        };
         Self {
             current: RwLock::new(Arc::new(initial)),
+            attribution: RwLock::new(attribution),
         }
     }
 
@@ -149,7 +179,59 @@ impl SkillTurnContext {
             .unwrap_or_else(|error| Arc::clone(&error.into_inner()))
     }
 
+    /// Every skill selected during the current turn.
+    ///
+    /// A mid-turn `skills_search` replaces the bundle but does not end the
+    /// turn, so attributing an outcome to the latest bundle alone would orphan
+    /// a skill that was invoked before the search.
+    pub fn turn_selected_skill_ids(&self) -> Vec<String> {
+        let attribution = self
+            .attribution
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        attribution.selected.clone()
+    }
+
+    /// Whether every telemetry event this turn produced was accepted.
+    pub fn evidence_complete(&self) -> bool {
+        self.attribution
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .evidence_complete
+    }
+
+    /// Record that telemetry for the current turn was lost or rejected. The
+    /// parent owns this bit, so a saturated or disconnected queue cannot hide
+    /// the loss from the evidence it would otherwise contaminate.
+    pub fn mark_evidence_lost(&self) {
+        let mut attribution = self
+            .attribution
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        attribution.evidence_complete = false;
+    }
+
     pub fn replace(&self, bundle: TurnSkillBundle) {
+        {
+            let mut attribution = self
+                .attribution
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            if attribution.turn_id != bundle.turn_id {
+                // A new user turn: attribution and completeness start fresh.
+                attribution.turn_id = bundle.turn_id.clone();
+                attribution.selected.clear();
+                attribution.evidence_complete = true;
+            }
+            for skill in &bundle.skills {
+                if attribution.selected.len() >= MAX_TURN_ATTRIBUTION_SKILLS {
+                    break;
+                }
+                if !attribution.selected.iter().any(|id| id == &skill.id) {
+                    attribution.selected.push(skill.id.clone());
+                }
+            }
+        }
         match self.current.write() {
             Ok(mut current) => *current = Arc::new(bundle),
             Err(error) => *error.into_inner() = Arc::new(bundle),
@@ -1219,6 +1301,98 @@ mod tests {
     use super::*;
     use crate::extras::js::skills::CapabilityManifest;
     use crate::extras::js::skills::router::RouteKind;
+
+    fn attribution_skill(id: &str) -> ResolvedSkill {
+        ResolvedSkill {
+            id: id.to_string(),
+            identity_version: 2,
+            abi_version: 2,
+            description: "fixture".into(),
+            tags: vec![],
+            exports: vec![],
+            tests: vec![],
+            capability: CapabilityManifest::pure(),
+            source: "function run() { return 1; }".into(),
+            score_bits: 1.0f32.to_bits(),
+            rank: 0,
+            route: None,
+        }
+    }
+
+    fn attribution_bundle(turn_id: &str, skill_ids: &[&str]) -> TurnSkillBundle {
+        TurnSkillBundle {
+            turn_id: turn_id.to_string(),
+            query_fingerprint: "query".into(),
+            embedding_model_revision: "model".into(),
+            index_generation: 1,
+            skills: skill_ids.iter().map(|id| attribution_skill(id)).collect(),
+        }
+    }
+
+    #[test]
+    fn a_mid_turn_search_keeps_earlier_selections_attributable() {
+        let context = SkillTurnContext::new(attribution_bundle("turn-1", &["skill-a"]));
+        // A mid-turn `skills_search` re-freezes the same turn with a different
+        // bundle; the skill invoked before the search must stay attributable.
+        context.replace(attribution_bundle("turn-1", &["skill-b"]));
+
+        let mut selected = context.turn_selected_skill_ids();
+        selected.sort();
+        assert_eq!(selected, vec!["skill-a".to_string(), "skill-b".to_string()]);
+        assert_eq!(
+            context.snapshot().skills.len(),
+            1,
+            "the bundle still changes"
+        );
+    }
+
+    #[test]
+    fn an_empty_final_bundle_does_not_erase_the_turn_attribution() {
+        let context = SkillTurnContext::new(attribution_bundle("turn-1", &["skill-a"]));
+        context.replace(attribution_bundle("turn-1", &[]));
+        assert_eq!(
+            context.turn_selected_skill_ids(),
+            vec!["skill-a".to_string()],
+            "an empty search result must not create a false no-library turn"
+        );
+    }
+
+    #[test]
+    fn a_new_turn_starts_a_fresh_attribution_set() {
+        let context = SkillTurnContext::new(attribution_bundle("turn-1", &["skill-a"]));
+        context.replace(attribution_bundle("turn-2", &["skill-b"]));
+        assert_eq!(
+            context.turn_selected_skill_ids(),
+            vec!["skill-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_attribution_set_is_bounded() {
+        let context = SkillTurnContext::new(attribution_bundle("turn-1", &[]));
+        for index in 0..(MAX_TURN_ATTRIBUTION_SKILLS + 20) {
+            let id = format!("skill-{index}");
+            context.replace(attribution_bundle("turn-1", &[id.as_str()]));
+        }
+        assert_eq!(
+            context.turn_selected_skill_ids().len(),
+            MAX_TURN_ATTRIBUTION_SKILLS
+        );
+    }
+
+    #[test]
+    fn evidence_completeness_is_per_turn_and_parent_owned() {
+        let context = SkillTurnContext::new(attribution_bundle("turn-1", &["skill-a"]));
+        assert!(context.evidence_complete());
+        context.mark_evidence_lost();
+        assert!(!context.evidence_complete());
+        // A re-freeze of the same turn keeps the loss.
+        context.replace(attribution_bundle("turn-1", &["skill-b"]));
+        assert!(!context.evidence_complete());
+        // A new turn starts clean.
+        context.replace(attribution_bundle("turn-2", &["skill-c"]));
+        assert!(context.evidence_complete());
+    }
 
     #[test]
     fn learned_manifest_explains_callable_globals_without_routing_internals() {

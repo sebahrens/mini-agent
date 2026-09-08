@@ -203,6 +203,7 @@ fn task_outcome_is_ordered_after_invocations_and_ignores_uninvoked_skills() {
             attempt: 1,
             source: TaskOutcomeSource::VerifyCommand("abc123".into()),
             production: true,
+            evidence_complete: true,
             created_at: 2_000_000_001,
         })
         .unwrap();

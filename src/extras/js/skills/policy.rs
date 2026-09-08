@@ -75,6 +75,11 @@ pub struct TaskOutcomeEvidence {
     pub attempt: u32,
     pub source: TaskOutcomeSource,
     pub production: bool,
+    /// False when the parent knows telemetry for this turn was lost or
+    /// rejected. Incomplete evidence must contribute neither to skill utility
+    /// nor to the no-library baseline, because absence of invocation links
+    /// cannot then be read as a verified no-skill run.
+    pub evidence_complete: bool,
     pub created_at: i64,
 }
 
@@ -539,6 +544,7 @@ mod gate_skipped_evidence_tests {
             attempt: 1,
             source,
             production: true,
+            evidence_complete: true,
             created_at: 100,
         }
     }

@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
@@ -3926,6 +3926,22 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                 "schema migration left a foreign-key violation in {table}"
             )));
         }
+    }
+
+    // A turn whose telemetry was lost or rejected is not verified evidence:
+    // the absence of invocation links must not read as a no-skill baseline.
+    // The parent stamps completeness onto the outcome itself, so a saturated
+    // queue cannot hide the loss from the comparison it would contaminate.
+    if current_version < 14 {
+        migration_step(db, 14, true, || {
+            db.execute_batch(
+                "ALTER TABLE skill_task_outcomes
+                     ADD COLUMN evidence_complete INTEGER NOT NULL DEFAULT 1
+                     CHECK (evidence_complete IN (0, 1));
+                 PRAGMA user_version = 14;",
+            )?;
+            Ok(())
+        })?;
     }
 
     Ok(())

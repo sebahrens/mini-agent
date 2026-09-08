@@ -1842,6 +1842,7 @@ fn read_task_outcomes(
             })?,
             source,
             production: row.get(5)?,
+            evidence_complete: true,
             created_at: row.get(6)?,
         });
     }

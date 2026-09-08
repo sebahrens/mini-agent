@@ -2961,21 +2961,25 @@ mod protocol_tests {
                         .block_task()
                         .await
                 });
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    while !shell_pid_file.exists() || !descendant_pid_file.exists() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("production BashTool should start its process tree");
-                let shell_pid = std::fs::read_to_string(&shell_pid_file)
-                    .unwrap()
-                    .parse::<u32>()
-                    .unwrap();
-                let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
-                    .unwrap()
-                    .parse::<u32>()
-                    .unwrap();
+                // A file can exist before its contents are flushed, so wait for
+                // a parsable pid rather than for the path to appear.
+                let read_pid = |path: std::path::PathBuf| async move {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if let Ok(text) = std::fs::read_to_string(&path)
+                                && let Ok(pid) = text.trim().parse::<u32>()
+                                && pid != 0
+                            {
+                                return pid;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("production BashTool should publish its process tree")
+                };
+                let shell_pid = read_pid(shell_pid_file.clone()).await;
+                let descendant_pid = read_pid(descendant_pid_file.clone()).await;
 
                 cx.send_notification(CancelNotification::new(session))?;
                 let response = tokio::time::timeout(Duration::from_secs(2), blocked)

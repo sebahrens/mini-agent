@@ -166,6 +166,7 @@ fn configured_task_outcome_gate_cannot_fall_back_to_invocation_counts() {
         attempt: 1,
         source: TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
         production: true,
+        evidence_complete: true,
         created_at: 100,
     };
     let result = evaluate_promotion_with_task_outcomes(
@@ -194,6 +195,7 @@ fn no_verify_command_is_auditable_but_never_counts_as_a_pass() {
         attempt: 1,
         source: TaskOutcomeSource::NoVerifyCommand,
         production: true,
+        evidence_complete: true,
         created_at: 100,
     };
     let result = evaluate_promotion_with_task_outcomes(

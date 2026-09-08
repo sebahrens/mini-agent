@@ -282,6 +282,16 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
                     outcome.source_kind, outcome.source_id, outcome.production
                FROM skill_task_outcomes AS outcome
               WHERE outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')
+                -- A turn whose telemetry was lost or rejected is unknown, not
+                -- a verified no-skill run: exclude it from utility and from the
+                -- baseline comparison alike.
+                AND outcome.evidence_complete = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM skill_events AS lost
+                     WHERE lost.turn_id = outcome.turn_id
+                       AND lost.event_kind = 'observability_lost'
+                       AND lost.production = outcome.production
+                )
          ),
          linked AS (
              SELECT link.skill_id, qualified.turn_id, qualified.verify_passed,
@@ -2140,6 +2150,116 @@ mod tests {
             "only the observed scope's baseline turn counts, once"
         );
         assert_eq!(rows[0].baseline_passes, 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_stats_exclude_turns_whose_evidence_was_lost() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+
+        // One healthy linked task, one healthy baseline, and one turn whose
+        // telemetry the parent knows was lost. The lost turn must count as
+        // neither utility nor baseline.
+        for (evidence_id, turn_id, linked, complete) in [
+            ("healthy-observed", "turn-observed", true, 1),
+            ("healthy-baseline", "turn-baseline", false, 1),
+            ("lost-baseline", "turn-lost", false, 0),
+        ] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, evidence_complete, created_at
+                     ) VALUES (?, ?, 1, 1, 'oracle', 'shared-oracle', 1, ?, 42)",
+                    rusqlite::params![evidence_id, turn_id, complete],
+                )
+                .unwrap();
+            if linked {
+                store
+                    .conn_mut()
+                    .execute(
+                        "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+                         VALUES (?, ?)",
+                        rusqlite::params![evidence_id, artifact.id],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let rows = load_skill_stats(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tasks_with, 1);
+        assert_eq!(
+            rows[0].baseline_tasks, 1,
+            "a turn with lost evidence is not a verified no-skill baseline"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_stats_exclude_turns_with_a_recorded_observability_loss() {
+        let (root, paths, artifact) = fixture();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        store.insert_verified(&artifact).unwrap();
+
+        for (evidence_id, turn_id) in [
+            ("healthy-baseline", "turn-baseline"),
+            ("lost-baseline", "turn-lost"),
+        ] {
+            store
+                .conn_mut()
+                .execute(
+                    "INSERT INTO skill_task_outcomes (
+                         evidence_id, turn_id, verify_passed, attempt, source_kind,
+                         source_id, production, evidence_complete, created_at
+                     ) VALUES (?, ?, 1, 1, 'oracle', 'shared-oracle', 1, 1, 42)",
+                    rusqlite::params![evidence_id, turn_id],
+                )
+                .unwrap();
+        }
+        // The observed task keeps the skill's scope comparable to the
+        // baselines above.
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_task_outcomes (
+                     evidence_id, turn_id, verify_passed, attempt, source_kind,
+                     source_id, production, evidence_complete, created_at
+                 ) VALUES ('observed', 'turn-observed', 1, 1, 'oracle', 'shared-oracle', 1, 1, 42)",
+                rusqlite::params![],
+            )
+            .unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
+                 VALUES ('observed', ?)",
+                rusqlite::params![artifact.id],
+            )
+            .unwrap();
+        // An explicit loss event for one baseline turn.
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO skill_events (
+                    invocation_id, skill_id, turn_id, event_kind, index_generation,
+                    evidence_complete, production, created_at
+                 ) VALUES (?, ?, 'turn-lost', 'observability_lost', 0, 0, 1, 42)",
+                rusqlite::params!["b".repeat(64), artifact.id],
+            )
+            .unwrap();
+
+        let rows = load_skill_stats(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].baseline_tasks, 1,
+            "a turn with a recorded observability loss must not be a baseline"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

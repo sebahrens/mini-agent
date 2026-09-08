@@ -1195,6 +1195,7 @@ impl Tool for JsTool {
         #[cfg(feature = "skills")]
         dispatch_skill_telemetry(
             self.telemetry.as_deref(),
+            &self.skill_turn_context,
             &skill_bundle,
             &skill_tool_call_id,
             &response.outcome,
@@ -1359,6 +1360,7 @@ fn build_skill_call_authority(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_skill_telemetry(
     dispatcher: Option<&crate::extras::js::skills::telemetry::TelemetryDispatcher>,
+    turn_context: &crate::extras::js::skills::turn::SkillTurnContext,
     bundle: &crate::extras::js::skills::turn::TurnSkillBundle,
     tool_call_id: &str,
     step_outcome: &StepOutcome,
@@ -1372,12 +1374,14 @@ fn dispatch_skill_telemetry(
     };
 
     let Some(capability_denials) = capability_denials else {
+        turn_context.mark_evidence_lost();
         record_observability_lost(dispatcher, "capability_denial_binding_unavailable");
         return false;
     };
     let mut skills = Vec::with_capacity(bundle.skills.len());
     for skill in &bundle.skills {
         let Ok(retrieval_rank) = u32::try_from(skill.rank) else {
+            turn_context.mark_evidence_lost();
             record_observability_lost(dispatcher, "parent_binding_unavailable");
             return false;
         };
@@ -1407,6 +1411,7 @@ fn dispatch_skill_telemetry(
     let batch = match bind_worker_events(&context, worker_events) {
         Ok(batch) => batch,
         Err(_) => {
+            turn_context.mark_evidence_lost();
             record_observability_lost(dispatcher, "invalid_worker_batch");
             if let Some(dispatcher) = dispatcher
                 && let Ok(lost) = observability_lost_batch(&context)
@@ -1421,12 +1426,16 @@ fn dispatch_skill_telemetry(
         return true;
     }
     let Some(dispatcher) = dispatcher else {
+        turn_context.mark_evidence_lost();
         record_observability_lost(None, "dispatcher_unavailable");
         return false;
     };
     match dispatcher.try_dispatch(batch) {
         Ok(()) => true,
         Err(_) => {
+            // The queue that would carry the loss report is the one that just
+            // rejected this batch, so the parent records the loss itself.
+            turn_context.mark_evidence_lost();
             dispatcher.record_observability_lost("dispatch_failed");
             false
         }
@@ -2114,8 +2123,10 @@ mod js_permission_bridge {
         forged.evidence_complete = true;
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let dispatcher = TelemetryDispatcher::from_sender_for_test(tx);
+        let turn_context = crate::extras::js::skills::turn::SkillTurnContext::new(bundle.clone());
         assert!(!dispatch_skill_telemetry(
             Some(&dispatcher),
+            &turn_context,
             &bundle,
             "parent-turn:js:0",
             &StepOutcome::Value("ok".into()),
@@ -2143,10 +2154,12 @@ mod js_permission_bridge {
         use crate::extras::js::skills::telemetry::TelemetryDispatcher;
 
         let (bundle, injected) = telemetry_fixture();
+        let turn_context = crate::extras::js::skills::turn::SkillTurnContext::new(bundle.clone());
         let (saturated_tx, saturated_rx) = std::sync::mpsc::sync_channel(0);
         let saturated = TelemetryDispatcher::from_sender_for_test(saturated_tx);
         assert!(!dispatch_skill_telemetry(
             Some(&saturated),
+            &turn_context,
             &bundle,
             "parent-turn:js:0",
             &StepOutcome::Value("ok".into()),
@@ -2163,6 +2176,7 @@ mod js_permission_bridge {
         let disconnected = TelemetryDispatcher::from_sender_for_test(disconnected_tx);
         assert!(!dispatch_skill_telemetry(
             Some(&disconnected),
+            &turn_context,
             &bundle,
             "parent-turn:js:0",
             &StepOutcome::Value("ok".into()),
@@ -2172,6 +2186,10 @@ mod js_permission_bridge {
             false,
         ));
         assert_eq!(disconnected.observability_lost_for_test(), 1);
+        assert!(
+            !turn_context.evidence_complete(),
+            "a rejected batch must mark the turn's evidence incomplete"
+        );
     }
 
     #[tokio::test]

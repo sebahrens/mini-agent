@@ -831,11 +831,15 @@ fn ingest_task_outcome(
     }))
     .map_err(|_| TelemetryError::InvalidEvent)?;
     let evidence_id = crate::hex::encode_lower(Sha256::digest(canonical));
+    // A turn that recorded fewer invocation links than the parent selected is
+    // not by itself incomplete — selected-but-unused skills are ordinary. The
+    // parent's own completeness bit is what distinguishes a verified
+    // no-invocation turn from one whose telemetry was lost.
     tx.execute(
         "INSERT OR IGNORE INTO skill_task_outcomes (
              evidence_id, turn_id, verify_passed, attempt,
-             source_kind, source_id, production, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             source_kind, source_id, production, evidence_complete, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             evidence_id,
             outcome.turn_id,
@@ -844,6 +848,7 @@ fn ingest_task_outcome(
             source_kind,
             source_id,
             i64::from(outcome.production),
+            i64::from(outcome.evidence_complete),
             outcome.created_at,
         ],
     )?;

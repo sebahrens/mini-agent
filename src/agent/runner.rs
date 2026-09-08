@@ -402,14 +402,23 @@ impl TaskOutcomeRecorder {
         };
         let evidence = crate::extras::js::skills::policy::TaskOutcomeEvidence {
             turn_id: bundle.turn_id.clone(),
-            skill_ids: bundle.skills.iter().map(|skill| skill.id.clone()).collect(),
+            // Every skill selected during this turn, not just the bundle a
+            // mid-turn search happened to leave current. Skills that were never
+            // invoked are still excluded downstream, where durable invocation
+            // events decide attribution.
+            skill_ids: self.turn_context.turn_selected_skill_ids(),
             verify_passed,
             attempt: attempt.max(1),
             source,
             production: self.production,
+            // An outcome whose turn already lost telemetry is not verified
+            // evidence: it must count neither as skill utility nor as a
+            // no-library baseline.
+            evidence_complete: self.turn_context.evidence_complete(),
             created_at,
         };
         if self.dispatcher.record_task_outcome(evidence).is_err() {
+            self.turn_context.mark_evidence_lost();
             self.dispatcher
                 .record_observability_lost("task_outcome_dispatch_failed");
         }
