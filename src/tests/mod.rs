@@ -119,7 +119,7 @@ mod mcp_http_tests;
 #[cfg(all(test, feature = "mcp"))]
 mod mcp_oauth_tests;
 #[cfg(all(test, feature = "mcp"))]
-mod mcp_stdio_tests;
+pub(crate) mod mcp_stdio_tests;
 #[cfg(all(test, feature = "memory"))]
 mod memory_tests;
 #[cfg(test)]

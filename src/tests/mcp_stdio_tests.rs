@@ -228,6 +228,14 @@ fn main() {
         }
     }
 
+    if mode == "gated-eof" {
+        let lease = env::var_os("MCP_FIXTURE_LEASE_FILE").unwrap();
+        let lease = std::path::PathBuf::from(lease);
+        fs::write(lease.with_extension("eof"), std::process::id().to_string()).unwrap();
+        while !lease.with_extension("release").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     if mode == "hang-eof" {
         loop {
             thread::sleep(Duration::from_secs(60));
@@ -242,15 +250,15 @@ fn main() {
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-struct FixtureBuild {
-    root: PathBuf,
-    executable: PathBuf,
+pub(crate) struct FixtureBuild {
+    pub(crate) root: PathBuf,
+    pub(crate) executable: PathBuf,
     path_dir: PathBuf,
     path_command: String,
 }
 
 impl FixtureBuild {
-    fn compile() -> Self {
+    pub(crate) fn compile() -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("mini agent mcp stdio {} {id}", std::process::id()));
@@ -302,7 +310,7 @@ impl FixtureBuild {
         }
     }
 
-    fn lease(&self, name: &str) -> PathBuf {
+    pub(crate) fn lease(&self, name: &str) -> PathBuf {
         self.root.join(format!("{name}.lease"))
     }
 
@@ -310,7 +318,7 @@ impl FixtureBuild {
         self.root.join(format!("{name}.descendant"))
     }
 
-    fn config(
+    pub(crate) fn config(
         &self,
         command: String,
         args: Vec<String>,
@@ -355,7 +363,7 @@ impl FixtureBuild {
         }
     }
 
-    fn cleanup(self) {
+    pub(crate) fn cleanup(self) {
         fs::remove_dir_all(&self.root).unwrap_or_else(|error| {
             panic!(
                 "fixture directory could not be removed; a child may still be running ({}): {error}",
@@ -383,7 +391,7 @@ impl PathGuard {
     }
 }
 
-async fn wait_for_pid(path: &Path) -> u32 {
+pub(crate) async fn wait_for_pid(path: &Path) -> u32 {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(value) = fs::read_to_string(path)
@@ -403,7 +411,7 @@ async fn wait_for_pid(path: &Path) -> u32 {
     })
 }
 
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         Command::new("kill")

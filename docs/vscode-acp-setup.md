@@ -145,7 +145,11 @@ Cancellation interrupts a pending summary; completed passes remain committed,
 and the unsummarized history remains available to a later prompt.
 Cancellation during MCP startup interrupts pending initialization and prevents
 queued servers from starting. ACP closes connected servers and waits for started
-processes to be reaped before returning the cancelled response.
+processes to be reaped before returning the cancelled response. The same cleanup
+boundary applies after agent preparation and every completed or failed model
+turn: the response, active turn registration, and history lock remain held until
+MCP shutdown finishes. Cancellation arriving during shutdown still cancels that
+turn; any completed tool progress remains in its history.
 
 ## Permission bridge
 

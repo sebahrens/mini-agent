@@ -456,6 +456,8 @@ struct AcpState {
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
     runner_fixture: Option<RunnerFixture>,
+    #[cfg(all(test, feature = "mcp"))]
+    mcp_fixture: StdMutex<Option<crate::extras::mcp::McpClientManager>>,
     #[cfg(test)]
     prompt_exit_barrier: Option<Arc<PromptExitBarrier>>,
 }
@@ -703,6 +705,8 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         prompt_fixture: None,
         #[cfg(test)]
         runner_fixture: None,
+        #[cfg(all(test, feature = "mcp"))]
+        mcp_fixture: StdMutex::new(None),
         #[cfg(test)]
         prompt_exit_barrier: None,
     });
@@ -1309,12 +1313,108 @@ async fn run_prompt(
     control: Arc<TurnControl>,
     registration: &TurnRegistration,
 ) -> Result<(), agent_client_protocol::Error> {
+    #[cfg(all(not(test), feature = "mcp"))]
+    let mut mcp_manager = None;
+    #[cfg(all(test, feature = "mcp"))]
+    let mut mcp_manager = lock_unpoisoned(&state.mcp_fixture).take();
+    let result = execute_prompt(
+        state,
+        prompt_text,
+        session_id.clone(),
+        &mut history,
+        workspace,
+        context,
+        read_tracker,
+        todo_store,
+        sandbox,
+        #[cfg(feature = "js")]
+        js_session_state,
+        #[cfg(feature = "skills")]
+        skill_services,
+        cx.clone(),
+        control,
+        #[cfg(feature = "mcp")]
+        &mut mcp_manager,
+    )
+    .await;
+    // Keep the history lock and generation registered until every per-prompt
+    // server is closed, including cancellation during agent/runner preparation.
+    #[cfg(feature = "mcp")]
+    if let Some(manager) = mcp_manager {
+        manager.shutdown().await;
+    }
+    let mut outcome = result?;
+    if !registration.complete_and_settle() {
+        outcome.reason = StopReason::Cancelled;
+    }
+    if let Some(progress) = outcome.progress
+        && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
+    {
+        history.commit_completed_turn(prompt_text, progress);
+    }
+    if outcome.reason == StopReason::Refusal
+        && let Some(error) = outcome.error
+    {
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
+            "[error: {error}]"
+        ))));
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::AgentMessageChunk(chunk),
+        ));
+    }
+    let _ = respond_terminal(registration, responder, outcome.reason);
+    Ok(())
+}
+
+struct PromptOutcome {
+    reason: StopReason,
+    progress: Option<Vec<Message>>,
+    error: Option<String>,
+}
+
+impl PromptOutcome {
+    fn cancelled(progress: Option<Vec<Message>>) -> Self {
+        Self {
+            reason: StopReason::Cancelled,
+            progress,
+            error: None,
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            reason: StopReason::Refusal,
+            progress: None,
+            error: Some(error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_prompt(
+    state: &AcpState,
+    prompt_text: &str,
+    session_id: SessionId,
+    history: &mut SessionHistory,
+    workspace: Arc<crate::paths::WorkspaceBinding>,
+    context: Arc<ContextFiles>,
+    read_tracker: crate::agent::tools::ReadTracker,
+    todo_store: crate::agent::tools::TodoStore,
+    sandbox: crate::sandbox::Sandbox,
+    #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
+    #[cfg(feature = "skills")] skill_services: Arc<
+        crate::extras::js::skills::session::SkillServiceOwner,
+    >,
+    cx: ConnectionTo<Client>,
+    control: Arc<TurnControl>,
+    #[cfg(feature = "mcp")] mcp_manager: &mut Option<crate::extras::mcp::McpClientManager>,
+) -> Result<PromptOutcome, agent_client_protocol::Error> {
     if control.is_cancelled() {
-        let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-        return Ok(());
+        return Ok(PromptOutcome::cancelled(None));
     }
     if let Err(error) = workspace.validate() {
-        return respond_prompt_failure(session_id, responder, cx, registration, error.to_string());
+        return Ok(PromptOutcome::failed(error.to_string()));
     }
     #[cfg(feature = "hooks")]
     crate::extras::hooks::set_active_workspace(workspace.root());
@@ -1331,22 +1431,11 @@ async fn run_prompt(
         let paused_runner = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-                return Ok(());
+                return Ok(PromptOutcome::cancelled(None));
             }
             runner = fixture(prompt_text.to_owned(), prior_history.clone()) => runner,
         };
-        return relay_paused_runner(
-            prompt_text,
-            session_id,
-            history,
-            responder,
-            cx,
-            control,
-            paused_runner,
-            registration,
-        )
-        .await;
+        return Ok(relay_paused_runner(session_id, cx, control, paused_runner).await);
     }
 
     #[cfg(test)]
@@ -1356,15 +1445,14 @@ async fn run_prompt(
         let fixture_result = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-                return Ok(());
+                return Ok(PromptOutcome::cancelled(None));
             }
             result = fixture(prompt_text.to_owned(), prior_history) => result,
         };
         let events = match fixture_result {
             Ok(events) => events,
             Err(error) => {
-                return respond_prompt_failure(session_id, responder, cx, registration, error);
+                return Ok(PromptOutcome::failed(error));
             }
         };
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(events.len().max(1));
@@ -1374,17 +1462,7 @@ async fn run_prompt(
             })?;
         }
         drop(event_tx);
-        return relay_prompt_events(
-            prompt_text,
-            session_id,
-            history,
-            responder,
-            cx,
-            control,
-            event_rx,
-            registration,
-        )
-        .await;
+        return Ok(relay_prompt_events(session_id, cx, control, event_rx).await);
     }
 
     let workspace_root = workspace.root();
@@ -1392,13 +1470,7 @@ async fn run_prompt(
         match crate::permission::resolve_configured_execution_authority(&state.cli, &state.cfg) {
             Ok(resolved) => resolved,
             Err(error) => {
-                return respond_prompt_failure(
-                    session_id,
-                    responder,
-                    cx,
-                    registration,
-                    error.to_string(),
-                );
+                return Ok(PromptOutcome::failed(error.to_string()));
             }
         }
         .0;
@@ -1442,13 +1514,7 @@ async fn run_prompt(
     ) {
         Ok(client) => client,
         Err(error) => {
-            return respond_prompt_failure(
-                session_id,
-                responder,
-                cx,
-                registration,
-                error.to_string(),
-            );
+            return Ok(PromptOutcome::failed(error.to_string()));
         }
     };
 
@@ -1480,8 +1546,7 @@ async fn run_prompt(
             })
             .await;
         if compacted.is_none() {
-            let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-            return Ok(());
+            return Ok(PromptOutcome::cancelled(None));
         }
     }
     let prior_history =
@@ -1493,17 +1558,18 @@ async fn run_prompt(
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     #[cfg(feature = "mcp")]
-    let mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
-        let Some(manager) =
-            connect_prompt_mcp(&state.cfg, &workspace, &work_scope, control.cancelled()).await
-        else {
-            let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-            return Ok(());
+    {
+        *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
+            let Some(manager) =
+                connect_prompt_mcp(&state.cfg, &workspace, &work_scope, control.cancelled()).await
+            else {
+                return Ok(PromptOutcome::cancelled(None));
+            };
+            manager
+        } else {
+            None
         };
-        manager
-    } else {
-        None
-    };
+    }
     let tool_output_session_id = session_id.to_string();
     let Some(agent) = run_owned_pre_run(
         &control,
@@ -1534,8 +1600,7 @@ async fn run_prompt(
     )
     .await
     else {
-        let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-        return Ok(());
+        return Ok(PromptOutcome::cancelled(None));
     };
 
     let Some(paused_runner) = run_owned_pre_run(
@@ -1552,25 +1617,9 @@ async fn run_prompt(
     )
     .await
     else {
-        let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-        return Ok(());
+        return Ok(PromptOutcome::cancelled(None));
     };
-    let result = relay_paused_runner(
-        prompt_text,
-        session_id,
-        history,
-        responder,
-        cx,
-        control,
-        paused_runner,
-        registration,
-    )
-    .await;
-    #[cfg(feature = "mcp")]
-    if let Some(manager) = mcp_manager {
-        manager.shutdown().await;
-    }
-    result
+    Ok(relay_paused_runner(session_id, cx, control, paused_runner).await)
 }
 
 #[cfg(feature = "mcp")]
@@ -1619,95 +1668,40 @@ async fn run_owned_pre_run<T>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn relay_paused_runner(
-    prompt_text: &str,
     session_id: SessionId,
-    history: tokio::sync::OwnedMutexGuard<SessionHistory>,
-    responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
-    registration: &TurnRegistration,
-) -> Result<(), agent_client_protocol::Error> {
+) -> PromptOutcome {
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
-        while runner.event_rx.recv().await.is_some() {}
-        let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-        return Ok(());
+        return cancelled_after_runner(&mut runner.event_rx).await;
     }
-    relay_prompt_events(
-        prompt_text,
-        session_id,
-        history,
-        responder,
-        cx,
-        control,
-        runner.event_rx,
-        registration,
-    )
-    .await
+    relay_prompt_events(session_id, cx, control, runner.event_rx).await
 }
 
-fn respond_prompt_failure(
-    session_id: SessionId,
-    responder: Responder<PromptResponse>,
-    cx: ConnectionTo<Client>,
-    registration: &TurnRegistration,
-    error: String,
-) -> Result<(), agent_client_protocol::Error> {
-    if !registration.complete_and_settle() {
-        let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-        return Ok(());
-    }
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
-        "[error: {error}]"
-    ))));
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id,
-        SessionUpdate::AgentMessageChunk(chunk),
-    ));
-    let _ = respond_terminal(registration, responder, StopReason::Refusal);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn relay_prompt_events(
-    prompt_text: &str,
     session_id: SessionId,
-    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
-    responder: Responder<PromptResponse>,
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
-    registration: &TurnRegistration,
-) -> Result<(), agent_client_protocol::Error> {
-    let completed_interactions = loop {
+) -> PromptOutcome {
+    loop {
         let event = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                return respond_cancelled_after_runner(
-                    prompt_text,
-                    history,
-                    responder,
-                    &mut rx,
-                    registration,
-                    None,
-                )
-                .await;
+                return cancelled_after_runner(&mut rx).await;
             }
             event = rx.recv() => event,
         };
         let Some(event) = event else {
-            if control.is_cancelled() {
-                let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-            } else if registration.complete_and_settle() {
-                let _ = respond_terminal(registration, responder, StopReason::Refusal);
-            } else {
-                let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-            }
-            return Ok(());
+            return PromptOutcome {
+                reason: StopReason::Refusal,
+                progress: None,
+                error: None,
+            };
         };
         match event {
             AgentEvent::Token(text) => {
@@ -1824,87 +1818,36 @@ async fn relay_prompt_events(
             }
             AgentEvent::CompactionBoundary { .. } => {
                 tracing::error!("interactive-only compaction boundary reached ACP");
-                if registration.complete_and_settle() {
-                    let _ = respond_terminal(registration, responder, StopReason::Refusal);
-                }
-                return Ok(());
+                control.cancel();
+                return cancelled_after_runner(&mut rx).await;
             }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
-                break interactions;
+                return PromptOutcome {
+                    reason: StopReason::EndTurn,
+                    progress: Some(interactions),
+                    error: None,
+                };
             }
             AgentEvent::Error {
-                message: err,
-                interactions: partial,
+                message,
+                interactions,
             } => {
                 while rx.recv().await.is_some() {}
-                if !registration.complete_and_settle() {
-                    return respond_cancelled_after_runner(
-                        prompt_text,
-                        history,
-                        responder,
-                        &mut rx,
-                        registration,
-                        Some(partial),
-                    )
-                    .await;
-                }
-                // A tool effect can complete before the failure. Commit the
-                // prompt and that progress so the next prompt sees the same
-                // history the workspace already reflects, instead of an empty
-                // turn that invites repeating the effect.
-                if !partial.is_empty() {
-                    history.commit_completed_turn(prompt_text, partial);
-                }
-                // Surface the error to the client instead of silently
-                // reporting EndTurn.
-                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
-                    "[error: {}]",
-                    err
-                ))));
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(chunk),
-                );
-                let _ = cx.send_notification(notif);
-                let _ = respond_terminal(registration, responder, StopReason::Refusal);
-                return Ok(());
+                return PromptOutcome {
+                    reason: StopReason::Refusal,
+                    progress: Some(interactions),
+                    error: Some(message.to_string()),
+                };
             }
         }
-    };
-
-    if !registration.complete_and_settle() {
-        return respond_cancelled_after_runner(
-            prompt_text,
-            history,
-            responder,
-            &mut rx,
-            registration,
-            Some(completed_interactions),
-        )
-        .await;
     }
-
-    history.commit_completed_turn(prompt_text, completed_interactions);
-
-    let _ = respond_terminal(registration, responder, StopReason::EndTurn);
-    Ok(())
 }
 
-async fn respond_cancelled_after_runner(
-    prompt_text: &str,
-    mut history: tokio::sync::OwnedMutexGuard<SessionHistory>,
-    responder: Responder<PromptResponse>,
-    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
-    registration: &TurnRegistration,
-    known_progress: Option<Vec<rig::completion::Message>>,
-) -> Result<(), agent_client_protocol::Error> {
-    // The abort handle closes this channel only after the model/tool future and
-    // every sender it owns have been dropped. Waiting here makes cancellation a
-    // true completion boundary before the ACP request and session are released.
-    // Drain for a terminal event too: a runner that reached one before the
-    // abort landed carries the canonical messages for work it completed.
-    let mut progress = known_progress;
+async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> PromptOutcome {
+    // Channel closure follows the model/tool future and all owned work. Retain
+    // any terminal progress that beat cancellation so effects aren't repeated.
+    let mut progress = None;
     while let Some(event) = rx.recv().await {
         match event {
             AgentEvent::Done { interactions, .. } | AgentEvent::Error { interactions, .. }
@@ -1915,13 +1858,7 @@ async fn respond_cancelled_after_runner(
             _ => {}
         }
     }
-    // Cancellation before any work occurred still rolls the turn back: an empty
-    // progress set commits nothing.
-    if let Some(progress) = progress.filter(|progress| !progress.is_empty()) {
-        history.commit_completed_turn(prompt_text, progress);
-    }
-    let _ = respond_terminal(registration, responder, StopReason::Cancelled);
-    Ok(())
+    PromptOutcome::cancelled(progress)
 }
 
 #[cfg(test)]
@@ -2507,6 +2444,8 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
         })
     }
@@ -2521,6 +2460,8 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
         })
     }
@@ -2538,6 +2479,8 @@ mod protocol_tests {
             shell_search_path: std::env::var_os("PATH"),
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: Some(prompt_exit_barrier),
         })
     }
@@ -2571,6 +2514,8 @@ mod protocol_tests {
             shell_search_path: Some(std::ffi::OsString::from("bin")),
             prompt_fixture: None,
             runner_fixture: None,
+            #[cfg(feature = "mcp")]
+            mcp_fixture: StdMutex::new(None),
             prompt_exit_barrier: None,
         };
 
@@ -3315,37 +3260,6 @@ mod protocol_tests {
             .expect("connection teardown must drop provider work");
     }
 
-    #[tokio::test]
-    async fn cancellation_drops_blocking_pre_run_work() {
-        let control = Arc::new(TurnControl::new());
-        let work_started = Arc::new(tokio::sync::Notify::new());
-        let work_dropped = Arc::new(tokio::sync::Notify::new());
-        let task = tokio::spawn({
-            let control = control.clone();
-            let work_started = work_started.clone();
-            let work_dropped = work_dropped.clone();
-            async move {
-                tokio::select! {
-                    biased;
-                    _ = control.cancelled() => false,
-                    _ = async move {
-                        let _drop_signal = NotifyOnDrop(work_dropped);
-                        work_started.notify_one();
-                        std::future::pending::<()>().await;
-                    } => true,
-                }
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), work_started.notified())
-            .await
-            .expect("pre-run hook/build work should start");
-        assert!(control.cancel());
-        assert!(!task.await.unwrap());
-        tokio::time::timeout(Duration::from_secs(1), work_dropped.notified())
-            .await
-            .expect("cancellation must drop blocking hook/build work");
-    }
-
     #[cfg(feature = "skills")]
     #[tokio::test]
     async fn cancelled_pre_run_drops_production_worker_result_before_waiting_idle() {
@@ -3703,6 +3617,172 @@ mod protocol_tests {
             })
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn mcp_stdio_teardown_precedes_terminal_response_and_session_settlement() {
+        use crate::extras::mcp::{McpClientManager, client::McpClientHandle};
+        use crate::tests::mcp_stdio_tests::{FixtureBuild, process_is_alive, wait_for_pid};
+
+        let server = FixtureBuild::compile();
+        for case in [
+            "done",
+            "error",
+            "closed",
+            "prepare-error",
+            "compaction",
+            "prepare-cancel",
+            "cleanup-cancel",
+        ] {
+            let lease = server.lease(case);
+            let handle = McpClientHandle::connect(
+                case.into(),
+                &server.config(
+                    server.executable.display().to_string(),
+                    Vec::new(),
+                    "gated-eof",
+                    &lease,
+                ),
+            )
+            .await
+            .unwrap();
+            let pid = wait_for_pid(&lease).await;
+            let preparing = Arc::new(Notify::new());
+            let fixture: PromptFixture = {
+                let preparing = preparing.clone();
+                Arc::new(move |prompt, _| {
+                    let preparing = preparing.clone();
+                    Box::pin(async move {
+                        if prompt == "next" {
+                            return Ok(vec![done("next", vec![Message::assistant("next")])]);
+                        }
+                        match case {
+                            "prepare-cancel" => {
+                                preparing.notify_one();
+                                std::future::pending().await
+                            }
+                            "prepare-error" => Err("preparation failed".to_string()),
+                            "error" => Ok(vec![AgentEvent::Error {
+                                message: "tool failed".into(),
+                                interactions: vec![Message::assistant("effect recorded")],
+                            }]),
+                            "closed" => Ok(Vec::new()),
+                            "compaction" => Ok(vec![AgentEvent::CompactionBoundary {
+                                interactions: Vec::new(),
+                            }]),
+                            _ => Ok(vec![done(
+                                "done",
+                                vec![Message::assistant("effect recorded")],
+                            )]),
+                        }
+                    })
+                })
+            };
+            let state = fixture_state(fixture);
+            *lock_unpoisoned(&state.mcp_fixture) =
+                Some(McpClientManager::from_handles(vec![handle]));
+            let workspace = ProtocolTempDir::new();
+            let cwd = workspace.path().to_path_buf();
+            let inspect_state = state.clone();
+            Client
+                .builder()
+                .on_receive_notification(
+                    async |_notification: SessionNotification, _cx| Ok(()),
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(InMemoryAgent(state), async move |cx| {
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let session = cx
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?
+                        .session_id;
+                    let request_cx = cx.clone();
+                    let request_session = session.clone();
+                    let response = tokio::spawn(async move {
+                        request_cx
+                            .send_request(prompt(request_session, case))
+                            .block_task()
+                            .await
+                    });
+                    if case == "prepare-cancel" {
+                        tokio::time::timeout(Duration::from_secs(2), preparing.notified())
+                            .await
+                            .unwrap();
+                        assert!(receive_cancel(&inspect_state, &session).is_some());
+                    }
+                    // EOF proves that the real transport has entered graceful
+                    // shutdown. The child cannot exit until the release file.
+                    assert_eq!(wait_for_pid(&lease.with_extension("eof")).await, pid);
+                    assert!(
+                        process_is_alive(pid),
+                        "{case}: fixture must still hold cleanup open"
+                    );
+                    let history = inspect_state
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session)
+                        .unwrap()
+                        .history
+                        .clone();
+                    assert!(
+                        history.try_lock().is_err(),
+                        "{case}: history released during shutdown"
+                    );
+                    assert!(
+                        !response.is_finished(),
+                        "{case}: response preceded server exit"
+                    );
+                    assert!(
+                        cx.send_request(prompt(session.clone(), "overlapping"))
+                            .block_task()
+                            .await
+                            .is_err(),
+                        "{case}: generation settled during shutdown"
+                    );
+                    if case == "cleanup-cancel" {
+                        assert!(
+                            receive_cancel(&inspect_state, &session).is_some(),
+                            "cancellation during teardown must still find the active generation"
+                        );
+                    }
+                    std::fs::write(lease.with_extension("release"), b"exit").unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(2), response)
+                        .await
+                        .unwrap()
+                        .unwrap()?;
+                    let expected = match case {
+                        "prepare-cancel" | "cleanup-cancel" | "compaction" => StopReason::Cancelled,
+                        "done" => StopReason::EndTurn,
+                        _ => StopReason::Refusal,
+                    };
+                    assert_eq!(response.stop_reason, expected, "{case}");
+                    assert!(
+                        !process_is_alive(pid),
+                        "{case}: child outlived terminal response"
+                    );
+                    let expected_history = match case {
+                        "done" | "error" | "cleanup-cancel" => {
+                            vec![Message::user(case), Message::assistant("effect recorded")]
+                        }
+                        _ => Vec::new(),
+                    };
+                    assert_eq!(history.lock().await.snapshot(), expected_history, "{case}");
+                    let next = cx
+                        .send_request(prompt(session, "next"))
+                        .block_task()
+                        .await?;
+                    assert_eq!(next.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        server.cleanup();
     }
 
     #[tokio::test]

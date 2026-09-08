@@ -91,7 +91,12 @@ connected siblings are explicitly closed before ACP returns `Cancelled`.
 Successful shutdown retains the three-second graceful-exit allowance, followed
 by forced cleanup when needed. Blocking DNS validation and OAuth credential
 reads, saves, and clears are tracked by the same work scope and drained before
-cancellation completes.
+cancellation completes. After startup, the outer ACP prompt owner retains the
+manager through agent preparation and event relay. It awaits shutdown before
+settling the generation, committing terminal progress, responding, or releasing
+the session history lock. Early preparation cancellation follows this same
+boundary; cancellation during cleanup can still select `Cancelled` without
+discarding completed progress.
 
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
