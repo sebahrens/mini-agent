@@ -249,6 +249,18 @@ impl ToolDyn for McpTool {
                     }
                     error_msg.push_str(text);
                 }
+                // A failing server may describe the failure only in
+                // structuredContent; without it the model sees a bare
+                // "returned an error" and cannot act on the reason.
+                if let Some(structured) = &result.structured_content
+                    && let Some(rendered) = render_structured_content(structured)
+                    && rendered != error_msg
+                {
+                    if !error_msg.is_empty() {
+                        error_msg.push('\n');
+                    }
+                    error_msg.push_str(&rendered);
+                }
                 let msg = if error_msg.is_empty() {
                     "MCP tool returned an error".to_string()
                 } else {
@@ -264,6 +276,7 @@ impl ToolDyn for McpTool {
             }
 
             let mut content = String::new();
+            let mut unsupported = 0_usize;
             for item in result.content {
                 match item {
                     ContentBlock::Text(t) => content.push_str(&t.text),
@@ -280,10 +293,33 @@ impl ToolDyn for McpTool {
                         rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => {
                             content.push_str(blob);
                         }
-                        _ => {}
+                        _ => unsupported += 1,
                     },
-                    _ => {}
+                    _ => unsupported += 1,
                 }
+            }
+            // A successful result may carry its whole payload in
+            // structuredContent with an empty `content` array. Dropping it
+            // leaves the model with empty delimiters, so it may repeat a
+            // side-effecting call or invent an answer. Render it whenever it
+            // is not already the text the server also sent, so a server that
+            // duplicates its payload does not double the output.
+            if let Some(structured) = &result.structured_content
+                && let Some(rendered) = render_structured_content(structured)
+                && content.trim() != rendered.trim()
+            {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&rendered);
+            }
+            if unsupported > 0 {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&format!(
+                    "[{unsupported} content block(s) of a kind this client cannot render were omitted]"
+                ));
             }
             if let Some(msg) = coaching {
                 content = format!("{}\n\n{}", msg, content);
@@ -295,6 +331,18 @@ impl ToolDyn for McpTool {
             ))
         })
     }
+}
+
+/// Render a successful result's `structuredContent` for the model.
+///
+/// `null` carries nothing a caller can use, so it is treated as absent; every
+/// other value is rendered as pretty JSON, which stays inside the existing
+/// output size and spill limits.
+fn render_structured_content(structured: &serde_json::Value) -> Option<String> {
+    if structured.is_null() {
+        return None;
+    }
+    serde_json::to_string_pretty(structured).ok()
 }
 
 #[cfg(test)]

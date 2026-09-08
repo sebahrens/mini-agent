@@ -320,41 +320,39 @@ impl McpClientManager {
         all_tools
     }
 
-    /// Rename every tool whose bare name is exposed by more than one server to
-    /// `<server>__<tool>`. Deterministic because `tools` follows the sorted
-    /// server order established by `connect_all_in`.
+    /// Allocate one final registered name per tool against a single set of
+    /// names already in use.
+    ///
+    /// A bare name exposed by more than one server becomes `<server>__<tool>`,
+    /// but that generated name can equal another server's unchanged name, or
+    /// another generated name (`a__b` + tool `c` collides with server `a` +
+    /// tool `b__c`). Allocating against the complete used-name set — unchanged
+    /// names first, then generated ones in sorted server order — keeps the
+    /// mapping injective, so a requested tool can never route to the wrong
+    /// server. Permission identities keep the bare tool name.
     fn namespace_duplicate_tool_names(&self, tools: &mut [McpTool]) {
-        let mut owners: HashMap<String, Vec<CompactString>> = HashMap::new();
-        for tool in tools.iter() {
-            let servers = owners.entry(tool.definition.name.to_string()).or_default();
-            if !servers.contains(&tool.server_name) {
-                servers.push(tool.server_name.clone());
+        let entries: Vec<(String, String)> = tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool.server_name.to_string(),
+                    tool.definition.name.to_string(),
+                )
+            })
+            .collect();
+        let allocated = allocate_registered_tool_names(&entries);
+        let mut renamed: Vec<String> = Vec::new();
+        for (tool, name) in tools.iter_mut().zip(allocated) {
+            if tool.registered_name.as_str() != name {
+                tool.registered_name = CompactString::new(&name);
+                renamed.push(name);
             }
         }
-        let mut colliding: Vec<String> = owners
-            .into_iter()
-            .filter(|(_, servers)| servers.len() > 1)
-            .map(|(name, _)| name)
-            .collect();
-        colliding.sort_unstable();
-        if colliding.is_empty() {
+        if renamed.is_empty() {
             return;
         }
-
         let mut notice = String::from("MCP tool name collision; registered as ");
-        let mut first = true;
-        for tool in tools.iter_mut() {
-            let bare = tool.definition.name.as_ref();
-            if !colliding.iter().any(|name| name == bare) {
-                continue;
-            }
-            tool.registered_name = McpTool::namespaced_name(&tool.server_name, bare);
-            if !first {
-                notice.push_str(", ");
-            }
-            first = false;
-            notice.push_str(&tool.registered_name);
-        }
+        notice.push_str(&renamed.join(", "));
         notice.push_str(" (permission keys keep the bare tool name)");
         self.push_tool_notice(notice);
     }
@@ -514,4 +512,178 @@ mod tests {
         assert_eq!(manager.take_notices(), vec![CompactString::new("first")]);
         assert!(manager.take_notices().is_empty());
     }
+
+    fn allocate(entries: &[(&str, &str)]) -> Vec<String> {
+        let owned: Vec<(String, String)> = entries
+            .iter()
+            .map(|(server, tool)| ((*server).to_string(), (*tool).to_string()))
+            .collect();
+        allocate_registered_tool_names(&owned)
+    }
+
+    fn assert_unique(names: &[String]) {
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate registered names: {names:?}"
+        );
+    }
+
+    #[test]
+    fn unique_bare_names_are_registered_unchanged() {
+        let names = allocate(&[("alpha", "one"), ("beta", "two")]);
+        assert_eq!(names, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn a_generated_name_never_collides_with_an_unchanged_one() {
+        // alpha/probe and beta/probe both namespace to `<server>__probe`, while
+        // gamma already exposes a unique tool literally called `alpha__probe`.
+        let names = allocate(&[
+            ("alpha", "probe"),
+            ("beta", "probe"),
+            ("gamma", "alpha__probe"),
+        ]);
+        assert_unique(&names);
+        assert_eq!(names[2], "alpha__probe", "an unchanged name keeps its form");
+        assert_ne!(names[0], names[2]);
+        assert_eq!(names[1], "beta__probe");
+    }
+
+    #[test]
+    fn separator_collisions_between_generated_names_are_disambiguated() {
+        // server `a__b` + tool `c` and server `a` + tool `b__c` both want
+        // `a__b__c` once each bare name is shared.
+        let names = allocate(&[
+            ("a__b", "c"),
+            ("other", "c"),
+            ("a", "b__c"),
+            ("another", "b__c"),
+        ]);
+        assert_unique(&names);
+        assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn a_repeated_definition_from_one_server_still_gets_a_distinct_name() {
+        let names = allocate(&[("alpha", "probe"), ("alpha", "probe")]);
+        assert_unique(&names);
+    }
+
+    #[test]
+    fn registered_names_stay_within_provider_limits() {
+        let long_server = "s".repeat(50);
+        let long_tool = "t".repeat(50);
+        let names = allocate(&[
+            (long_server.as_str(), long_tool.as_str()),
+            ("other", long_tool.as_str()),
+        ]);
+        assert_unique(&names);
+        for name in &names {
+            assert!(name.len() <= MAX_REGISTERED_TOOL_NAME, "{name}");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_is_deterministic_for_the_same_catalog() {
+        let entries = [
+            ("alpha", "probe"),
+            ("beta", "probe"),
+            ("gamma", "alpha__probe"),
+            ("alpha", "probe"),
+        ];
+        assert_eq!(allocate(&entries), allocate(&entries));
+    }
+}
+
+/// Longest tool name accepted by the strictest supported provider schema.
+const MAX_REGISTERED_TOOL_NAME: usize = 64;
+
+/// Final registered name for every `(server, bare tool)` pair, in input order.
+///
+/// A bare name exposed by more than one server is namespaced as
+/// `<server>__<tool>`, but that generated name can equal another server's
+/// unchanged name, or another generated name (`a__b` + tool `c` collides with
+/// server `a` + tool `b__c`). Names are therefore allocated against one used
+/// set: unchanged names are reserved first, then generated names in input
+/// order, each disambiguated if it is already taken. The result is injective,
+/// so the collected catalog never registers one name twice and a requested
+/// tool cannot route to the wrong server.
+fn allocate_registered_tool_names(entries: &[(String, String)]) -> Vec<String> {
+    let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (server, bare) in entries {
+        let servers = owners.entry(bare.as_str()).or_default();
+        if !servers.contains(&server.as_str()) {
+            servers.push(server.as_str());
+        }
+    }
+
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut names: Vec<Option<String>> = vec![None; entries.len()];
+    // Reserve every name that keeps its bare form first, so a generated name
+    // can never displace one.
+    for (index, (_, bare)) in entries.iter().enumerate() {
+        let shared = owners.get(bare.as_str()).is_some_and(|s| s.len() > 1);
+        if !shared && used.insert(bare.clone()) {
+            names[index] = Some(bare.clone());
+        }
+    }
+    for (index, (server, bare)) in entries.iter().enumerate() {
+        if names[index].is_some() {
+            continue;
+        }
+        let candidate = McpTool::namespaced_name(server, bare).to_string();
+        names[index] = Some(allocate_registered_name(candidate, &mut used));
+    }
+    names
+        .into_iter()
+        .map(|name| name.expect("every entry is allocated"))
+        .collect()
+}
+
+/// Reduce `name` to the character set every supported provider accepts and
+/// make it unique within `used`, reserving the result.
+fn allocate_registered_name(name: String, used: &mut std::collections::HashSet<String>) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = truncate_registered_name(&sanitized, MAX_REGISTERED_TOOL_NAME);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for suffix in 2..u32::MAX {
+        let tail = format!("_{suffix}");
+        let head = truncate_registered_name(&base, MAX_REGISTERED_TOOL_NAME - tail.len());
+        let candidate = format!("{head}{tail}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("a unique registered tool name is always reachable")
+}
+
+/// Truncate on a character boundary; the sanitizer already removed every
+/// non-ASCII character, but keep this total for any future relaxation.
+fn truncate_registered_name(name: &str, limit: usize) -> String {
+    if name.len() <= limit {
+        return name.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
 }

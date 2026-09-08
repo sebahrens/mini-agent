@@ -194,7 +194,9 @@ fn main() {
             write_response(
                 &mut stdout,
                 &format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"probe\",\"description\":\"report fixture process inputs\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}"
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"{tool_name}\",\"description\":\"report fixture process inputs\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}",
+                    tool_name = env::var("MCP_FIXTURE_TOOL_NAME")
+                        .unwrap_or_else(|_| "probe".to_string())
                 ),
             );
         } else if compact.contains("\"method\":\"tools/call\"") {
@@ -203,11 +205,25 @@ fn main() {
             }
             let id = request_id(&compact);
             let payload = escape(&tool_payload());
+            let result = match mode.as_str() {
+                "structured-only" => {
+                    "{\"content\":[],\"structuredContent\":{\"answer\":42},\"isError\":false}"
+                        .to_string()
+                }
+                "structured-mixed" => format!(
+                    "{{\"content\":[{{\"type\":\"text\",\"text\":\"{payload}\"}}],\"structuredContent\":{{\"answer\":42}},\"isError\":false}}"
+                ),
+                "structured-error" => {
+                    "{\"content\":[],\"structuredContent\":{\"reason\":\"quota exhausted\"},\"isError\":true}"
+                        .to_string()
+                }
+                _ => format!(
+                    "{{\"content\":[{{\"type\":\"text\",\"text\":\"{payload}\"}}],\"isError\":false}}"
+                ),
+            };
             write_response(
                 &mut stdout,
-                &format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{payload}\"}}],\"isError\":false}}}}"
-                ),
+                &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"),
             );
         }
     }
@@ -301,21 +317,38 @@ impl FixtureBuild {
         mode: &str,
         lease: &Path,
     ) -> McpServerConfig {
+        self.config_named(command, args, mode, lease, None)
+    }
+
+    /// Same as `config`, but lets a server advertise a tool name other than
+    /// `probe` so registered-name collisions can be exercised end to end.
+    fn config_named(
+        &self,
+        command: String,
+        args: Vec<String>,
+        mode: &str,
+        lease: &Path,
+        tool_name: Option<&str>,
+    ) -> McpServerConfig {
+        let mut env = HashMap::from([
+            ("MCP_FIXTURE_MODE".to_string(), mode.to_string()),
+            (
+                "MCP_FIXTURE_LEASE_FILE".to_string(),
+                lease.display().to_string(),
+            ),
+            (
+                "MCP_FIXTURE_CONFIGURED".to_string(),
+                "configured exactly".to_string(),
+            ),
+        ]);
+        if let Some(tool_name) = tool_name {
+            env.insert("MCP_FIXTURE_TOOL_NAME".to_string(), tool_name.to_string());
+        }
         McpServerConfig::Command {
             command,
             args,
             cwd: None,
-            env: HashMap::from([
-                ("MCP_FIXTURE_MODE".to_string(), mode.to_string()),
-                (
-                    "MCP_FIXTURE_LEASE_FILE".to_string(),
-                    lease.display().to_string(),
-                ),
-                (
-                    "MCP_FIXTURE_CONFIGURED".to_string(),
-                    "configured exactly".to_string(),
-                ),
-            ]),
+            env,
             inherit_env: Vec::new(),
             sandbox: None,
             network: McpStdioNetwork::Inherit,
@@ -1246,4 +1279,155 @@ async fn mcp_distinct_tool_names_keep_bare_names() {
     shutdown(manager).await;
     assert_process_reaped(pid).await;
     fixture.cleanup();
+}
+
+// ── Registered-name collisions and structured results ──────────────────
+
+/// Allow every fixture server's tool under its bare permission key.
+fn permission_for_named_tools(entries: &[(&str, &str)]) -> Arc<Mutex<PermissionChecker>> {
+    let permission = PermissionConfig {
+        default: Some(Action::Deny),
+        mcp_tool: Some(ToolPerm::Granular(
+            entries
+                .iter()
+                .map(|(server, tool)| (format!("mcp_tool:{server}:{tool}"), Action::Allow))
+                .collect(),
+        )),
+        ..PermissionConfig::default()
+    };
+    Arc::new(Mutex::new(
+        PermissionChecker::new(
+            &PermissionConfigs::from(permission),
+            SecurityMode::Standard,
+            None,
+            Some(vec!["standard".to_string()]),
+        )
+        .expect("valid permission test configuration"),
+    ))
+}
+
+#[tokio::test]
+async fn mcp_generated_names_cannot_collide_with_an_unchanged_name() {
+    let fixture = FixtureBuild::compile();
+    let mut leases = Vec::new();
+    let mut handles = Vec::new();
+    for (server, tool) in [
+        ("alpha", "probe"),
+        ("beta", "probe"),
+        ("gamma", "alpha__probe"),
+    ] {
+        let lease = fixture.lease(&format!("collide-{server}"));
+        let handle = McpClientHandle::connect(
+            CompactString::new(server),
+            &fixture.config_named(
+                fixture.executable.display().to_string(),
+                vec![server.to_string()],
+                "normal",
+                &lease,
+                Some(tool),
+            ),
+        )
+        .await
+        .unwrap();
+        leases.push(lease);
+        handles.push(handle);
+    }
+    let mut manager = McpClientManager::from_handles(handles);
+    let permission = permission_for_named_tools(&[
+        ("alpha", "probe"),
+        ("beta", "probe"),
+        ("gamma", "alpha__probe"),
+    ]);
+    let mut tools = manager.collect_tools(Some(permission), None).await;
+
+    let names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
+    let unique: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "registered names must be unique: {names:?}"
+    );
+
+    // Every call must still reach the server it was collected from.
+    for index in 0..tools.len() {
+        let expected = tools[index].server_name.to_string();
+        let output = tools[index]
+            .call("{}".to_string())
+            .await
+            .unwrap_or_else(|error| panic!("{expected} must be callable: {error}"));
+        let payload = parse_fixture_output(&output);
+        assert_eq!(payload["args"][0], expected, "names: {names:?}");
+    }
+
+    let mut pids = Vec::new();
+    for lease in &leases {
+        pids.push(wait_for_pid(lease).await);
+    }
+    shutdown(manager).await;
+    for pid in pids {
+        assert_process_reaped(pid).await;
+    }
+    fixture.cleanup();
+}
+
+async fn structured_fixture_output(mode: &str) -> Result<String, rig::tool::ToolError> {
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease(&format!("structured-{mode}"));
+    let handle = McpClientHandle::connect(
+        CompactString::new("fixture"),
+        &fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            mode,
+            &lease,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut manager = McpClientManager::from_handles(vec![handle]);
+    let mut tools = manager
+        .collect_tools(Some(permission_for(Action::Allow)), None)
+        .await;
+    let result = tools[0].call("{}".to_string()).await;
+    let pid = wait_for_pid(&lease).await;
+    shutdown(manager).await;
+    assert_process_reaped(pid).await;
+    fixture.cleanup();
+    result
+}
+
+#[tokio::test]
+async fn mcp_structured_only_result_reaches_the_model() {
+    let output = structured_fixture_output("structured-only")
+        .await
+        .expect("a successful structured-only result");
+    assert!(
+        output.contains("42"),
+        "structuredContent must not be dropped: {output:?}"
+    );
+    assert!(output.contains("answer"), "{output:?}");
+}
+
+#[tokio::test]
+async fn mcp_mixed_result_keeps_text_and_structured_content_once() {
+    let output = structured_fixture_output("structured-mixed")
+        .await
+        .expect("a successful mixed result");
+    assert!(output.contains("configured exactly"), "{output:?}");
+    assert_eq!(
+        output.matches("\"answer\"").count(),
+        1,
+        "structured content must appear exactly once: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_structured_error_explains_the_failure() {
+    let error = structured_fixture_output("structured-error")
+        .await
+        .expect_err("isError must still fail the call");
+    assert!(
+        error.to_string().contains("quota exhausted"),
+        "a structured-only error must still explain itself: {error}"
+    );
 }
