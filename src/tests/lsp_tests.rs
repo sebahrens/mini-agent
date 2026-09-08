@@ -571,11 +571,22 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
         )],
     );
 
-    // This is the same checked atomic replacement primitive used by EditTool.
-    let approved_parent = crate::fs::stable_path_metadata(root.path()).await.unwrap();
-    crate::fs::atomic_write_resolved_checked(&file, "new contents", approved_parent)
+    // Exercise EditTool's current content-checked publication path. The LSP
+    // waiter below must follow the replacement file, not its previous identity.
+    crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
+    crate::agent::tools::edit::EditTool::new(None, None)
+        .call(crate::agent::tools::EditArgs {
+            path: file.to_string_lossy().into_owned(),
+            block: Some(
+                "<<<<<<< SEARCH\nold contents\n=======\nnew contents\n>>>>>>> REPLACE".into(),
+            ),
+            replace_all: false,
+            file_crc: None,
+            edits: None,
+        })
         .await
         .unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new contents");
     manager.notify_changed(&file).await;
 
     let query_manager = manager.clone();

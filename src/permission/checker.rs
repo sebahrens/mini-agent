@@ -838,27 +838,6 @@ impl PermissionChecker {
         self.doom_loop_check(tool, expanded, action)
     }
 
-    /// Whether `path` is eligible for the narrow PlanWrite exception.
-    ///
-    /// Callers that mutate the filesystem use this to retain stable path
-    /// identity across permission handling. Explicit permission rules still
-    /// decide the final result in [`Self::check_path`].
-    pub(crate) fn plan_write_authorization(
-        &self,
-        tool: &str,
-        path: &str,
-    ) -> Option<PlanWriteAuthorization> {
-        (self.mode == SecurityMode::PlanWrite
-            && matches!(tool, "write" | "edit" | "js/write_file")
-            && self.plan_write_path_decision(path) == PlanWritePathDecision::Authorized)
-            .then(|| PlanWriteAuthorization {
-                root: self
-                    .plan_write_root
-                    .clone()
-                    .expect("authorized root exists"),
-            })
-    }
-
     fn plan_write_path_decision(&self, path: &str) -> PlanWritePathDecision {
         if !is_plan_file(path) {
             return PlanWritePathDecision::NotPlanFile;

@@ -595,21 +595,19 @@ mod tests {
             sandbox.shell_capability().unwrap().executable(),
             original_shell.canonicalize().unwrap()
         );
-        let checker = permission
+        let mut checker = permission
             .as_ref()
             .unwrap()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(
-            checker
-                .plan_write_authorization("write", &original_plan.to_string_lossy())
-                .is_some()
-        );
-        assert!(
-            checker
-                .plan_write_authorization("write", &replacement_plan.to_string_lossy())
-                .is_none()
-        );
+        assert!(matches!(
+            checker.check_path("write", &original_plan.to_string_lossy()),
+            crate::permission::checker::CheckResult::Allowed,
+        ));
+        assert!(matches!(
+            checker.check_path("write", &replacement_plan.to_string_lossy()),
+            crate::permission::checker::CheckResult::Denied(_),
+        ));
         drop(checker);
 
         drop((sandbox, workspace, permission));

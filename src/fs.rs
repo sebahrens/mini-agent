@@ -1047,24 +1047,6 @@ pub(crate) async fn atomic_write_resolved(
     .await
 }
 
-/// Variant used when a permission-gated caller captured the approved parent
-/// before waiting for user input. The opened directory descriptor must still
-/// identify that exact directory or the write fails.
-pub(crate) async fn atomic_write_resolved_checked(
-    path: impl AsRef<Path>,
-    contents: impl AsRef<[u8]>,
-    approved_parent: CheckedMetadata,
-) -> std::io::Result<()> {
-    atomic_write_resolved_inner(
-        path.as_ref(),
-        contents.as_ref(),
-        Some(approved_parent),
-        None,
-        AtomicWriteCancellation::default(),
-    )
-    .await
-}
-
 /// Replace an approved absolute path only while it still holds exactly the
 /// bytes the replacement was computed from.
 pub(crate) async fn atomic_write_resolved_expecting(
