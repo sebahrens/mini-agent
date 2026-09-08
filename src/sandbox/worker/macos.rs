@@ -2703,8 +2703,12 @@ mod one_time_image {
                 // APFS supplies an atomic copy-on-write snapshot with its own inode. Hashing both
                 // pinned descriptors below retains the original byte-for-byte proof without the
                 // full executable rewrite and durable data flush on every worker generation.
+                // Measured at ~30 ms of a ~835 ms fresh worker, and deliberately
+                // not memoized across launches: the publisher's contract is to
+                // independently hash both pinned descriptors on every
+                // publication (docs/specs/phase-6-brokered-js-runtime.md).
                 let source_digest_started = std::time::Instant::now();
-                let source_sha256 = source_digest(&mut source_file, &source_opened)?;
+                let source_sha256 = hash_file(&mut source_file)?;
                 timing.source_digest_us = super::elapsed_micros(source_digest_started);
                 fault(PreparationFaultStage::Copied, &image_path)?;
                 publication.image()?.sync_all()?;
@@ -3596,55 +3600,6 @@ mod one_time_image {
                     ),
                 )),
             },
-        }
-    }
-
-    /// Digest of the worker source, memoized against its exact identity.
-    ///
-    /// The source is the installed executable and does not change between
-    /// launches, but hashing it dominated a measurable share of every fresh
-    /// worker. The cache key pins device, inode, size and both timestamps, and
-    /// the caller still revalidates the descriptor's metadata before and after
-    /// the copy, so a replaced or mutated source recomputes rather than
-    /// inheriting another file's proof.
-    fn source_digest(
-        file: &mut std::fs::File,
-        metadata: &std::fs::Metadata,
-    ) -> io::Result<[u8; 32]> {
-        let key = SourceDigestKey::of(metadata);
-        static CACHE: std::sync::Mutex<Option<(SourceDigestKey, [u8; 32])>> =
-            std::sync::Mutex::new(None);
-        if let Some((cached_key, digest)) = *CACHE.lock().unwrap_or_else(|error| error.into_inner())
-            && cached_key == key
-        {
-            return Ok(digest);
-        }
-        let digest = hash_file(file)?;
-        *CACHE.lock().unwrap_or_else(|error| error.into_inner()) = Some((key, digest));
-        Ok(digest)
-    }
-
-    /// The exact source identity a memoized digest belongs to.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    struct SourceDigestKey {
-        device: u64,
-        inode: u64,
-        len: u64,
-        modified: (i64, i64),
-        changed: (i64, i64),
-    }
-
-    impl SourceDigestKey {
-        fn of(metadata: &std::fs::Metadata) -> Self {
-            use std::os::unix::fs::MetadataExt;
-
-            Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                len: metadata.len(),
-                modified: (metadata.mtime(), metadata.mtime_nsec()),
-                changed: (metadata.ctime(), metadata.ctime_nsec()),
-            }
         }
     }
 

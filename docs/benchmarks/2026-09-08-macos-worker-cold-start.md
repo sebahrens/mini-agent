@@ -32,7 +32,7 @@ with its usual 10 warmups and 100 samples.
 | One-time image preparation | ~385 ms | 46% |
 | — sealed image byte proof (SHA-256 of the clone) | ~367 ms | 44% |
 | — `clonefile` snapshot | ~0.6 ms | <0.1% |
-| — source digest (memoized; ~30 ms on the first launch) | ~0.005 ms | <0.1% |
+| — source digest | ~30 ms | 3.6% |
 | Publication sweep | ~0.3 ms | <0.1% |
 | Seatbelt profile rendering | ~0.008 ms | <0.1% |
 | Guardian spawn | ~1.3 ms | 0.2% |
@@ -44,18 +44,20 @@ Seatbelt until it authenticates Ready. Everything the review suspected might
 dominate — the publication sweep, the image snapshot itself, profile rendering,
 the guardian launch — is collectively under 1%.
 
-## What was optimized
+## What was considered and rejected
 
-The source digest is now memoized against the source's exact identity (device,
-inode, size, and both timestamps). The worker source is the installed executable
-and does not change between launches, so it was being re-hashed on every fresh
-worker; the caller still revalidates the descriptor's metadata before and after
-the copy, so a replaced or mutated source recomputes rather than inheriting
-another file's proof. This removes ~30 ms per launch after the first.
+Memoizing the source digest against the source's exact identity (device, inode,
+size and both timestamps) removes ~30 ms per launch after the first, and the
+caller already revalidates the descriptor's metadata before and after the copy.
+It was implemented, measured, and then reverted: the publisher's normative
+contract is to *independently* hash both pinned descriptors on every
+publication, and a 3.6% saving does not justify deviating from it without
+review.
 
-The image digest is bound by materializing the clone's copy-on-write extents,
-not by syscall count or SHA throughput: raising the read buffer from 64 KiB to
-1 MiB changed nothing measurable, so the smaller buffer was kept.
+Raising the image proof's read buffer from 64 KiB to 1 MiB changed nothing
+measurable. That phase is bound by materializing the clone's copy-on-write
+extents, not by syscall count or SHA throughput, so the smaller buffer was
+kept.
 
 ## Decision
 
