@@ -718,37 +718,89 @@ async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
     }
 }
 
+fn rewrite_preserving_length_and_mtime(path: &Path) {
+    let before = crate::fs::checked_path_metadata(path).unwrap();
+    fs::write(path, "x".repeat(before.len() as usize)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    let after = crate::fs::checked_path_metadata(path).unwrap();
+    crate::fs::ensure_same_file(path, &before, &after).unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+}
+
 #[tokio::test]
-async fn lsp_process_delayed_publication_rejects_replaced_source_identity() {
+async fn lsp_process_delayed_publication_rejects_changed_source() {
     let fixture = FixtureBuild::compile("delayed-identity");
     let mut results = Vec::new();
-    for relative in [false, true] {
-        for delayed_version in [1, 2] {
-            let workspace = fixture
-                .workspace(&format!("workspace-{relative}-{delayed_version}"))
-                .canonicalize()
-                .unwrap();
-            let source = workspace.join("document.probe");
-            let uri = file_uri(&source).unwrap();
-            let ready = workspace.join("ready");
-            let release = workspace.join("release");
-            let mut server = fixture.config("diagnostics", &workspace.join("lease"));
-            for (name, value) in [
-                ("LSP_FIXTURE_DELAY_VERSION", delayed_version.to_string()),
-                ("LSP_FIXTURE_READY_FILE", ready.display().to_string()),
-                ("LSP_FIXTURE_RELEASE_FILE", release.display().to_string()),
-            ] {
-                server.env.insert(name.into(), value);
-            }
-            let manager = LspManager::new(
-                &LspConfig {
-                    enabled: true,
-                    servers: HashMap::from([("fixture".into(), server)]),
-                },
-                workspace.clone(),
-            );
-            for version in 1..=delayed_version {
-                fs::write(&source, format!("original version {version}")).unwrap();
+    for replace in [false, true] {
+        for relative in [false, true] {
+            for delayed_version in [1, 2] {
+                let workspace = fixture
+                    .workspace(&format!("workspace-{replace}-{relative}-{delayed_version}"))
+                    .canonicalize()
+                    .unwrap();
+                let source = workspace.join("document.probe");
+                let uri = file_uri(&source).unwrap();
+                let ready = workspace.join("ready");
+                let release = workspace.join("release");
+                let mut server = fixture.config("diagnostics", &workspace.join("lease"));
+                for (name, value) in [
+                    ("LSP_FIXTURE_DELAY_VERSION", delayed_version.to_string()),
+                    ("LSP_FIXTURE_READY_FILE", ready.display().to_string()),
+                    ("LSP_FIXTURE_RELEASE_FILE", release.display().to_string()),
+                ] {
+                    server.env.insert(name.into(), value);
+                }
+                let manager = LspManager::new(
+                    &LspConfig {
+                        enabled: true,
+                        servers: HashMap::from([("fixture".into(), server)]),
+                    },
+                    workspace.clone(),
+                );
+                for version in 1..=delayed_version {
+                    fs::write(&source, format!("original version {version}")).unwrap();
+                    let baseline = if relative {
+                        manager
+                            .notify_changed_relative(Path::new("document.probe"))
+                            .await
+                    } else {
+                        manager.notify_changed(&source).await
+                    };
+                    assert!(baseline.is_some());
+                    if version < delayed_version {
+                        assert!(
+                            manager
+                                .diagnostics_block_for_edit(&source, baseline)
+                                .await
+                                .is_some()
+                        );
+                    }
+                }
+                wait_for_file(&ready).await;
+                let before = manager.diagnostic_cache_entry_metrics(&uri);
+                if replace {
+                    fs::rename(&source, workspace.join("original.probe")).unwrap();
+                    fs::write(&source, "replacement").unwrap();
+                } else {
+                    rewrite_preserving_length_and_mtime(&source);
+                }
+                fs::write(&release, "release").unwrap();
+                // A second document is a protocol barrier: its accepted diagnostic
+                // proves the reader has processed the preceding delayed reply.
+                let marker = workspace.join("marker.probe");
+                fs::write(&marker, "marker").unwrap();
+                let baseline = manager.notify_changed(&marker).await;
+                let barrier = manager.diagnostics_block_for_edit(&marker, baseline).await;
+                let after = manager.diagnostic_cache_entry_metrics(&uri);
+                let stale = manager
+                    .diagnostics_block_since(&source, Duration::ZERO, None)
+                    .await;
                 let baseline = if relative {
                     manager
                         .notify_changed_relative(Path::new("document.probe"))
@@ -756,55 +808,25 @@ async fn lsp_process_delayed_publication_rejects_replaced_source_identity() {
                 } else {
                     manager.notify_changed(&source).await
                 };
-                assert!(baseline.is_some());
-                if version < delayed_version {
-                    assert!(
-                        manager
-                            .diagnostics_block_for_edit(&source, baseline)
-                            .await
-                            .is_some()
-                    );
-                }
+                let refreshed = manager.diagnostics_block_for_edit(&source, baseline).await;
+                results.push((
+                    replace,
+                    relative,
+                    delayed_version,
+                    before,
+                    after,
+                    barrier,
+                    stale,
+                    refreshed,
+                ));
+                manager.shutdown().await;
+                drop(manager);
             }
-            wait_for_file(&ready).await;
-            let before = manager.diagnostic_cache_entry_metrics(&uri);
-            fs::rename(&source, workspace.join("original.probe")).unwrap();
-            fs::write(&source, "replacement").unwrap();
-            fs::write(&release, "release").unwrap();
-            // A second document is a protocol barrier: its accepted diagnostic
-            // proves the reader has processed the preceding delayed reply.
-            let marker = workspace.join("marker.probe");
-            fs::write(&marker, "marker").unwrap();
-            let baseline = manager.notify_changed(&marker).await;
-            let barrier = manager.diagnostics_block_for_edit(&marker, baseline).await;
-            let after = manager.diagnostic_cache_entry_metrics(&uri);
-            let stale = manager
-                .diagnostics_block_since(&source, Duration::ZERO, None)
-                .await;
-            let baseline = if relative {
-                manager
-                    .notify_changed_relative(Path::new("document.probe"))
-                    .await
-            } else {
-                manager.notify_changed(&source).await
-            };
-            let refreshed = manager.diagnostics_block_for_edit(&source, baseline).await;
-            results.push((
-                relative,
-                delayed_version,
-                before,
-                after,
-                barrier,
-                stale,
-                refreshed,
-            ));
-            manager.shutdown().await;
-            drop(manager);
         }
     }
     fixture.cleanup();
-    for (relative, version, before, after, barrier, stale, refreshed) in results {
-        let case = format!("relative={relative}, delayed_version={version}");
+    for (replace, relative, version, before, after, barrier, stale, refreshed) in results {
+        let case = format!("replace={replace}, relative={relative}, delayed_version={version}");
         assert!(barrier.is_some(), "{case}: protocol barrier failed");
         assert_eq!(
             before, after,
@@ -899,6 +921,7 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     let query = LspTool::new(manager.clone(), None, None);
     crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
     let mut outputs = Vec::new();
+    let mut stale_results = Vec::new();
     for relative in [false, true] {
         let name = format!("tool-{relative}.probe");
         let path = if relative {
@@ -927,10 +950,39 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             })
             .await,
         ));
-        outputs.push((3, query.call(LspArgs { path: Some(path) }).await));
+        outputs.push((
+            3,
+            query
+                .call(LspArgs {
+                    path: Some(path.clone()),
+                })
+                .await,
+        ));
+        let source = workspace.join(&path);
+        let uri = file_uri(&source).unwrap();
+        let binding = manager.bind_diagnostic_uri(&uri).await.unwrap();
+        rewrite_preserving_length_and_mtime(&source);
+        stale_results.push((
+            manager
+                .diagnostics_block_since(&source, Duration::ZERO, None)
+                .await,
+            manager.snapshot_bound_diagnostics(&binding, 20).await,
+            query.call(LspArgs { path: None }).await,
+        ));
     }
     manager.shutdown().await;
     fixture.cleanup();
+    for (single, bound, aggregate) in stale_results {
+        assert!(
+            single.is_none(),
+            "stale cached single-file diagnostics survived rewrite"
+        );
+        assert!(
+            bound.is_none(),
+            "stale diagnostics survived rewrite during permission wait"
+        );
+        assert_eq!(aggregate.unwrap(), "No diagnostics.");
+    }
     for (version, result) in outputs {
         let output = result.expect("file tool must succeed");
         assert!(
@@ -970,6 +1022,14 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
     assert!(
         client.sync_document(&source, original).await.is_none(),
         "a file replaced after reading must not advance synchronization"
+    );
+    let original = crate::extras::lsp::client::read_stable_document(&source)
+        .await
+        .unwrap();
+    rewrite_preserving_length_and_mtime(&source);
+    assert!(
+        client.sync_document(&source, original).await.is_none(),
+        "a file rewritten after reading must not advance synchronization"
     );
     client.sync_file(&source).await;
     let first = wait_for_file(&sync_log).await;

@@ -667,16 +667,18 @@ impl ContentDigest {
         let mut buffer = [0u8; 64 * 1024];
         let mut seen: u64 = 0;
         loop {
-            let read = match file.read(&mut buffer) {
+            let remaining = self.len.saturating_sub(seen);
+            let limit = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
+            let read = match file.read(&mut buffer[..limit]) {
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
-            seen = seen.saturating_add(read as u64);
-            if seen > self.len {
+            if read as u64 > remaining {
                 return Ok(false);
             }
+            seen += read as u64;
             hasher.update(&buffer[..read]);
         }
         if seen != self.len {
@@ -690,10 +692,59 @@ impl ContentDigest {
     /// bytes. The descriptor is read from its start without disturbing the
     /// caller's cursor.
     pub(crate) fn matches_file(&self, file: &std::fs::File) -> std::io::Result<bool> {
-        let mut handle = file.try_clone()?;
-        std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(0))?;
-        self.matches_reader(&mut handle)
+        #[cfg(unix)]
+        {
+            struct PositionedReader<'a> {
+                file: &'a std::fs::File,
+                offset: u64,
+            }
+            impl std::io::Read for PositionedReader<'_> {
+                fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                    let read = std::os::unix::fs::FileExt::read_at(self.file, buffer, self.offset)?;
+                    self.offset += read as u64;
+                    Ok(read)
+                }
+            }
+            self.matches_reader(&mut PositionedReader { file, offset: 0 })
+        }
+        #[cfg(windows)]
+        {
+            // Windows seek_read changes the shared cursor too. Reopen the
+            // object by handle to obtain an independent file position.
+            self.matches_reader(&mut reopen_for_content_read(file)?)
+        }
+        #[cfg(not(any(unix, windows)))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "independent file reads are unavailable on this platform",
+        ))
     }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn reopen_for_content_read(file: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+    };
+    // SAFETY: the borrowed handle remains live, and ReOpenFile returns a new
+    // owned handle to the same object, without resolving its mutable pathname.
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile transferred this unique handle to us.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 /// The bytes a replacement was computed from are no longer the bytes on disk.
@@ -2443,6 +2494,68 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn content_digest_file_checks_preserve_shared_cursors() {
+        use std::io::{Seek, SeekFrom};
+        let temp = TestDirectory::new("digest-cursor");
+        let path = temp.path().join("document");
+        let content = vec![b'a'; 128 * 1024];
+        std::fs::write(&path, &content).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(7)).unwrap();
+        let digest = ContentDigest::of(&content);
+        assert!(digest.matches_file(&file).unwrap());
+        assert_eq!(file.stream_position().unwrap(), 7);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let file = file.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        assert!(digest.matches_file(&file).unwrap());
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(file.stream_position().unwrap(), 7);
+    }
+
+    #[test]
+    fn content_digest_reader_stops_at_one_sentinel_byte() {
+        struct InterruptedOnce<R> {
+            inner: R,
+            interrupted: bool,
+        }
+        impl<R: std::io::Read> std::io::Read for InterruptedOnce<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupted) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.inner.read(buffer)
+            }
+        }
+        for len in [0, 1, 65_535, 65_536, 65_537] {
+            let digest = ContentDigest::of(&vec![b'a'; len]);
+            for extra in [0, 1, 65_536] {
+                let mut reader = InterruptedOnce {
+                    inner: std::io::Cursor::new(vec![b'a'; len + extra]),
+                    interrupted: true,
+                };
+                assert_eq!(digest.matches_reader(&mut reader).unwrap(), extra == 0);
+                assert_eq!(reader.inner.position(), (len + extra.min(1)) as u64);
+            }
+            let mut short = std::io::Cursor::new(vec![b'a'; len.saturating_sub(1)]);
+            assert_eq!(digest.matches_reader(&mut short).unwrap(), len == 0);
+            let mut changed = std::io::Cursor::new(vec![b'b'; len]);
+            assert_eq!(digest.matches_reader(&mut changed).unwrap(), len == 0);
         }
     }
 

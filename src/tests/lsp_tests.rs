@@ -542,9 +542,22 @@ async fn versionless_initial_publish_and_clear_are_accepted_within_unchanged_epo
             "initial versionless diagnostic",
         )],
     ));
-    assert!(manager.all_diagnostics_block().is_some());
+    let query = LspTool::new(manager.clone(), None, None);
+    assert!(
+        query
+            .call(LspArgs { path: None })
+            .await
+            .unwrap()
+            .contains("initial versionless diagnostic")
+    );
     assert!(manager.publish_synced_diagnostics_for_test(&uri, "rust", None, Vec::new()));
-    assert!(manager.all_diagnostics_block().is_none());
+    assert_eq!(
+        LspTool::new(manager.clone(), None, None)
+            .call(LspArgs { path: None })
+            .await
+            .unwrap(),
+        "No diagnostics."
+    );
 }
 
 #[tokio::test]
@@ -643,23 +656,92 @@ async fn atomic_edit_waits_for_publish_bound_to_replacement_identity() {
         manager.publish_synced_diagnostics_for_test(&uri, "guarded", None, Vec::new()),
         "an exact version anchor permits a later versionless clear in the unchanged epoch"
     );
-    assert!(manager.all_diagnostics_block().is_none());
+    assert_eq!(
+        LspTool::new(manager.clone(), None, None)
+            .call(LspArgs { path: None })
+            .await
+            .unwrap(),
+        "No diagnostics."
+    );
 }
 
-#[test]
-fn clean_project_reports_nothing() {
-    let manager = LspManager::new(
-        &LspConfig::default(),
-        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(Path::new("/tmp")).unwrap()),
+#[tokio::test]
+async fn clean_project_reports_nothing() {
+    let root = TempRoot::new("clean-project");
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    let query = LspTool::new(manager.clone(), None, None);
+    assert_eq!(
+        query.call(LspArgs { path: None }).await.unwrap(),
+        "No diagnostics."
     );
-    assert!(manager.all_diagnostics_block().is_none());
-    manager.inject_diagnostics(
-        "file:///tmp/x.rs",
+    let source = root.path().join("x.rs");
+    std::fs::write(&source, "document").unwrap();
+    let uri = crate::extras::lsp::client::file_uri(&source.canonicalize().unwrap()).unwrap();
+    manager.publish_diagnostics_for_test(
+        &uri,
         "rust",
         vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, "boom")],
     );
-    let block = manager.all_diagnostics_block().unwrap();
+    let block = query.call(LspArgs { path: None }).await.unwrap();
     assert!(block.contains("x.rs:1:1 error: boom"), "{block}");
+}
+
+#[test]
+fn publication_during_content_validation_discards_the_old_bound_snapshot() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = TempRoot::new("publication-during-validation");
+        let source = root.path().join("document.rs");
+        std::fs::write(&source, "document").unwrap();
+        let uri = crate::extras::lsp::client::file_uri(&source.canonicalize().unwrap()).unwrap();
+        let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+        manager.set_synced_document_for_test(&uri, 1, true);
+        let publish = |message| {
+            manager.publish_synced_diagnostics_for_test(
+                &uri,
+                "rust",
+                Some(1),
+                vec![diag(lsp_types::DiagnosticSeverity::ERROR, 0, 0, message)],
+            )
+        };
+        assert!(publish("old diagnostic"));
+        let binding = manager.bind_diagnostic_uri(&uri).await.unwrap();
+        // Occupy the only blocking worker so the content check is queued.
+        // Dropping release_tx also unblocks it if an assertion fails.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut snapshot = Box::pin(manager.snapshot_bound_diagnostics(&binding, 20));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(snapshot.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(publish("new diagnostic"));
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(
+            snapshot.await.is_none(),
+            "a new publication must invalidate the checked snapshot"
+        );
+        let fresh = manager
+            .snapshot_bound_diagnostics(&binding, 20)
+            .await
+            .unwrap();
+        let output = manager
+            .all_diagnostics_block_for_snapshots(&[fresh])
+            .unwrap();
+        assert!(output.contains("new diagnostic"));
+        assert!(!output.contains("old diagnostic"));
+    });
 }
 
 // ── tool permission boundary ────────────────────────────────────────────
@@ -1155,6 +1237,7 @@ async fn aggregate_binding_swap_restore_keeps_permission_and_result_on_cached_in
     );
     let snapshot = manager
         .snapshot_bound_diagnostics(&binding, crate::extras::lsp::MAX_DIAG_LINES)
+        .await
         .unwrap();
     drop(binding);
     assert!(
@@ -1249,6 +1332,7 @@ async fn aggregate_snapshot_caps_high_cardinality_high_volume_diagnostics_before
     let binding = manager.bind_diagnostic_uri(&first_uri).await.unwrap();
     let snapshot = manager
         .snapshot_bound_diagnostics(&binding, crate::extras::lsp::MAX_DIAG_LINES)
+        .await
         .unwrap();
     assert_eq!(snapshot.retained_line_count(), 20);
     assert!(snapshot.is_truncated());

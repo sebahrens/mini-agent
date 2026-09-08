@@ -25,6 +25,7 @@ use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 pub(crate) struct Document {
     text: String,
     identity: crate::fs::CheckedMetadata,
+    content: crate::fs::ContentDigest,
 }
 
 pub(crate) async fn read_stable_document(path: &Path) -> std::io::Result<Document> {
@@ -35,7 +36,27 @@ pub(crate) async fn read_stable_document(path: &Path) -> std::io::Result<Documen
 pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Document> {
     let identity = crate::fs::checked_tokio_file_metadata(&file).await?;
     let text = read_document_text(file).await?;
-    Ok(Document { text, identity })
+    let content = crate::fs::ContentDigest::of(text.as_bytes());
+    Ok(Document {
+        text,
+        identity,
+        content,
+    })
+}
+
+/// Hash only the retained readable object, off the async executor and without
+/// holding the synchronized-document or diagnostic-cache mutex.
+pub(crate) async fn content_matches(
+    identity: &crate::fs::CheckedMetadata,
+    content: Option<crate::fs::ContentDigest>,
+) -> bool {
+    let Some(content) = content else {
+        return true;
+    }; // Raw test fixtures only.
+    let identity = identity.clone();
+    tokio::task::spawn_blocking(move || content.matches_file(identity.handle()).unwrap_or(false))
+        .await
+        .unwrap_or(false)
 }
 
 /// Bound reads on the authorized handle itself, including a file that grows
@@ -230,15 +251,17 @@ fn bind_workspace_handle(
 }
 
 /// Diagnostics for one file, as last published by one server.
+#[derive(Clone)]
 pub struct FileDiags {
     pub server: String,
     /// Bumped on every `publishDiagnostics` for this file — lets callers
     /// wait for the publish that follows their `didChange`.
     pub version: u64,
     pub diagnostics: Vec<lsp_types::Diagnostic>,
-    /// File identity at publication time. Aggregate and explicit reads drop
-    /// the entry if the path is later replaced or becomes a symlink.
+    /// Identity and text digest from synchronization. Reads reject replaced
+    /// files, symlinks and same-inode content changes.
     pub identity: Option<crate::fs::CheckedMetadata>,
+    pub content: Option<crate::fs::ContentDigest>,
     /// Conservative retained-memory accounting used by the global cache cap.
     pub cached_bytes: usize,
 }
@@ -259,6 +282,19 @@ pub(crate) struct SyncedDocument {
     /// an epoch, or after an exact versioned publish anchors that epoch.
     pub(crate) allow_versionless: bool,
     pub(crate) identity: crate::fs::CheckedMetadata,
+    pub(crate) content: crate::fs::ContentDigest,
+}
+
+impl SyncedDocument {
+    /// Whether this reply anchors the epoch; None rejects its version.
+    fn publication_anchor(&self, version: Option<&Value>) -> Option<bool> {
+        match version {
+            Some(version) if !version.is_null() => {
+                (version.as_i64()? == self.version).then_some(true)
+            }
+            _ => self.allow_versionless.then_some(false),
+        }
+    }
 }
 
 pub struct LspClient {
@@ -456,12 +492,15 @@ impl LspClient {
                                         };
                                         let mut params = params.clone();
                                         params["uri"] = Value::String(uri);
-                                        if store_diagnostics(
-                                            &diags,
-                                            &server_name,
-                                            &params,
-                                            Some(&open),
-                                        ) {
+                                        let diags = diags.clone();
+                                        let open = open.clone();
+                                        let server = server_name.clone();
+                                        if tokio::task::spawn_blocking(move || {
+                                            store_diagnostics(&diags, &server, &params, Some(&open))
+                                        })
+                                        .await
+                                        .unwrap_or(false)
+                                        {
                                             diag_notify.notify_waiters();
                                         }
                                     }
@@ -676,7 +715,15 @@ impl LspClient {
         let relative = parent_path.strip_prefix(self.workspace.root()).ok()?;
         let wire_uri = file_uri(&self.server_root.join(relative))?;
         let uri = file_uri(&parent_path)?;
-        let Document { text, identity } = document;
+        let Document {
+            text,
+            identity,
+            content,
+        } = document;
+        if !content_matches(&identity, Some(content)).await {
+            return None;
+        }
+        self.workspace.validate().ok()?;
         let current = crate::fs::checked_path_metadata(&parent_path).ok()?;
         crate::fs::ensure_same_file(&parent_path, &identity, &current).ok()?;
         let uri_str = uri.clone();
@@ -696,6 +743,7 @@ impl LspClient {
                     document.version += 1;
                     document.allow_versionless = false;
                     document.identity = identity;
+                    document.content = content;
                     Sync::Change(document.version)
                 }
                 None => {
@@ -705,6 +753,7 @@ impl LspClient {
                             version: 1,
                             allow_versionless: true,
                             identity,
+                            content,
                         },
                     );
                     Sync::Open
@@ -1086,35 +1135,56 @@ pub(crate) fn store_diagnostics(
         return false;
     }
 
+    // Release the version lock during bounded disk I/O. Recheck the epoch
+    // under the lock before commit so a concurrent sync cannot be overwritten.
+    let checked_sync = if let Some(versions) = synced_versions {
+        let Some(synced) = versions.lock().unwrap().get(&uri).cloned() else {
+            return false;
+        };
+        if synced.publication_anchor(params.get("version")).is_none()
+            || crate::fs::ensure_same_file(&canonical, &synced.identity, &identity).is_err()
+            || !synced
+                .content
+                .matches_file(synced.identity.handle())
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        Some(synced)
+    } else {
+        None
+    };
+    let content = checked_sync.as_ref().map(|synced| synced.content);
     let mut synced_guard = synced_versions.map(|versions| versions.lock().unwrap());
     let exact_version_anchor = if let Some(synced_versions) = synced_guard.as_mut() {
         let Some(synced) = synced_versions.get_mut(&uri) else {
             return false;
         };
-        if crate::fs::ensure_same_file(&canonical, &synced.identity, &identity).is_err() {
+        if checked_sync
+            .as_ref()
+            .is_none_or(|checked| checked.version != synced.version)
+        {
             return false;
         }
         // Retain the synchronized identity, sharing its handle with the cache.
         // A later pathname replacement cannot relabel the server's old text.
         identity = synced.identity.clone();
-        match params.get("version") {
-            Some(version) if !version.is_null() => {
-                let Some(published_version) = version.as_i64() else {
-                    return false;
-                };
-                if published_version != synced.version {
-                    return false;
-                }
-                true
-            }
-            None | Some(_) if synced.allow_versionless => false,
-            None | Some(_) => return false,
-        }
+        let Some(anchor) = synced.publication_anchor(params.get("version")) else {
+            return false;
+        };
+        anchor
     } else {
         false
     };
 
-    let stored = commit_diagnostics(diags, uri.clone(), server, diagnostics, Some(identity));
+    let stored = commit_diagnostics(
+        diags,
+        uri.clone(),
+        server,
+        diagnostics,
+        Some(identity),
+        content,
+    );
     if stored
         && exact_version_anchor
         && let Some(synced_versions) = synced_guard.as_mut()
@@ -1131,6 +1201,7 @@ pub(crate) fn commit_diagnostics(
     server: &str,
     diagnostics: Vec<lsp_types::Diagnostic>,
     identity: Option<crate::fs::CheckedMetadata>,
+    content: Option<crate::fs::ContentDigest>,
 ) -> bool {
     let diagnostics = sanitize_diagnostics(diagnostics);
     let cached_bytes = retained_diagnostic_bytes(&uri, server, &diagnostics);
@@ -1169,6 +1240,7 @@ pub(crate) fn commit_diagnostics(
         entry.version = entry.version.saturating_add(1);
         entry.diagnostics.clear();
         entry.identity = identity;
+        entry.content = content;
         entry.cached_bytes = tombstone_bytes;
         return true;
     }
@@ -1177,6 +1249,7 @@ pub(crate) fn commit_diagnostics(
         version: 0,
         diagnostics: Vec::new(),
         identity: None,
+        content: None,
         cached_bytes: 0,
     });
     entry.server.clear();
@@ -1184,6 +1257,7 @@ pub(crate) fn commit_diagnostics(
     entry.version = entry.version.saturating_add(1);
     entry.diagnostics = diagnostics;
     entry.identity = identity;
+    entry.content = content;
     entry.cached_bytes = cached_bytes;
     true
 }
@@ -1265,7 +1339,14 @@ pub(crate) fn store_diagnostics_for_test(
                     return None;
                 }
             }
-            Some(commit_diagnostics(diags, uri, server, diagnostics, None))
+            Some(commit_diagnostics(
+                diags,
+                uri,
+                server,
+                diagnostics,
+                None,
+                None,
+            ))
         }
         DiagnosticStoreOutcome::Ignored => Some(false),
         DiagnosticStoreOutcome::LimitExceeded => None,

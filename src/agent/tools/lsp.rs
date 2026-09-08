@@ -154,6 +154,7 @@ impl Tool for LspTool {
                         && let Some(snapshot) = self
                             .manager
                             .snapshot_bound_diagnostics(&binding, remaining_lines)
+                            .await
                     {
                         remaining_lines =
                             remaining_lines.saturating_sub(snapshot.retained_line_count());

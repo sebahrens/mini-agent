@@ -2076,6 +2076,15 @@ is rejected if the source has been replaced since synchronization, including
 when its protocol version matches. Accepted cache entries share the synchronized
 identity, so a replacement racing cache insertion also invalidates the result.
 
+Each synchronized document also records a SHA-256 digest of the exact text read.
+Synchronization, incoming replies, and cached diagnostic reads validate that
+content through the retained readable handle. This rejects in-place rewrites,
+even when length and modification time are unchanged. Validation runs on blocking
+workers without holding the document or cache mutex, using a 64 KiB buffer and
+reading at most the synchronized length plus one byte (at most 4 MiB + 1).
+Project-wide queries validate each file after its permission check. This adds
+bounded file reads per validation; the content is not retained a second time.
+
 On Unix, the language server uses its inherited workspace descriptor in
 `rootUri` and document URIs. The parent translates those child-local URIs to
 canonical workspace paths before cache lookup and version checks; servers that

@@ -415,12 +415,18 @@ impl LspManager {
             }
         }
         self.inner.workspace.validate().ok()?;
-        let store = self.inner.diags.lock().unwrap();
-        let file = store.get(&uri)?;
-        if !diagnostic_identity_is_current(&uri, file) {
-            return None;
-        }
-        format_file_diags(&file.server, &file.diagnostics)
+        let file = self.inner.diags.lock().unwrap().get(&uri)?.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            if !diagnostic_identity_is_current(&uri, &file) {
+                return None;
+            }
+            format_file_diags(&file.server, &file.diagnostics)
+        })
+        .await
+        .ok()
+        .flatten();
+        self.inner.workspace.validate().ok()?;
+        output
     }
 
     /// Compact diagnostics block for one file. Errors and warnings only,
@@ -462,12 +468,6 @@ impl LspManager {
     ) -> Option<String> {
         self.diagnostics_block_relative(relative, DIAG_WAIT, baseline)
             .await
-    }
-
-    /// All files that currently have diagnostics, formatted for the
-    /// `lsp_diagnostics` tool. `None` when everything is clean.
-    pub fn all_diagnostics_block(&self) -> Option<String> {
-        self.all_diagnostics_block_inner()
     }
 
     /// Sorted cache candidates that contain at least one error or warning.
@@ -531,13 +531,33 @@ impl LspManager {
     /// Copy diagnostics only when the cache still names the exact object held
     /// by `binding`. The returned snapshot is independent of the file handle,
     /// so the caller can release it before authorizing the next candidate.
-    pub fn snapshot_bound_diagnostics(
+    pub async fn snapshot_bound_diagnostics(
         &self,
         binding: &BoundDiagnosticPath,
         remaining_lines: usize,
     ) -> Option<DiagnosticSnapshot> {
+        let (version, content) = {
+            let store = self.inner.diags.lock().unwrap();
+            let cached = store.get(&binding.uri)?;
+            if crate::fs::ensure_same_file(
+                &binding.path,
+                &binding.identity,
+                cached.identity.as_ref()?,
+            )
+            .is_err()
+            {
+                return None;
+            }
+            (cached.version, cached.content)
+        };
+        if !client::content_matches(&binding.identity, content).await {
+            return None;
+        }
         let store = self.inner.diags.lock().unwrap();
         let cached = store.get(&binding.uri)?;
+        if cached.version != version {
+            return None;
+        }
         let cache_identity = cached.identity.as_ref()?;
         if crate::fs::ensure_same_file(&binding.path, &binding.identity, cache_identity).is_err() {
             return None;
@@ -578,43 +598,6 @@ impl LspManager {
             if snapshot.truncated {
                 out.push_str("\n  … (truncated)");
                 return Some(out);
-            }
-        }
-        if out.is_empty() { None } else { Some(out) }
-    }
-
-    fn all_diagnostics_block_inner(&self) -> Option<String> {
-        let store = self.inner.diags.lock().unwrap();
-        let mut out = String::new();
-        let mut lines = 0usize;
-        let mut entries: Vec<_> = store.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (uri, file) in entries {
-            if !diagnostic_identity_is_current(uri, file) {
-                continue;
-            }
-            let interesting: Vec<_> = file
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity <= Some(DiagnosticSeverity::WARNING))
-                .collect();
-            if interesting.is_empty() {
-                continue;
-            }
-            let display = client::file_path(uri)
-                .map(|path| {
-                    path.strip_prefix(self.inner.workspace.root())
-                        .map(|relative| relative.display().to_string())
-                        .unwrap_or_else(|_| path.display().to_string())
-                })
-                .unwrap_or_else(|| uri.clone());
-            for d in interesting {
-                if lines >= MAX_DIAG_LINES {
-                    out.push_str("  … (truncated)\n");
-                    return Some(out);
-                }
-                out.push_str(&format_diag_line(&display, d));
-                lines += 1;
             }
         }
         if out.is_empty() { None } else { Some(out) }
@@ -707,8 +690,13 @@ impl LspManager {
             client::SyncedDocument {
                 version,
                 allow_versionless,
-                identity: crate::fs::checked_path_metadata(&client::file_path(uri).unwrap())
-                    .unwrap(),
+                identity: crate::fs::checked_file_metadata(
+                    &std::fs::File::open(client::file_path(uri).unwrap()).unwrap(),
+                )
+                .unwrap(),
+                content: crate::fs::ContentDigest::of(
+                    &std::fs::read(client::file_path(uri).unwrap()).unwrap(),
+                ),
             },
         );
     }
@@ -791,6 +779,7 @@ impl LspManager {
             server,
             diagnostics,
             identity,
+            None,
         )
     }
 }
@@ -811,6 +800,9 @@ fn diagnostic_identity_is_current(uri: &str, file: &client::FileDiags) -> bool {
         return false;
     }
     crate::fs::ensure_same_file(&path, approved, &current).is_ok()
+        && file
+            .content
+            .is_none_or(|content| content.matches_file(approved.handle()).unwrap_or(false))
 }
 
 /// "LSP diagnostics (server):" header + one line per error/warning, capped.
