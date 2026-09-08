@@ -1,0 +1,188 @@
+{
+  "reviewer": "adversarial",
+  "review_date": "2026-09-08",
+  "baseline": "6021ba1cee1725d52930e17d239b305d6ed9ad66",
+  "epic": "mini-agent-wldr",
+  "status": "in_progress",
+  "findings": [
+    {
+      "id": "mini-agent-wldr.1",
+      "title": "Guarded file replacement overwrites concurrent in-place user edits",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/paths.rs:225-278 (WorkspaceBinding::replace_relative_atomic_with_hook); src/fs.rs:867 (ensure_same_file); src/agent/tools/edit.rs:876-982 and write.rs:239-262",
+      "evidence": [
+        "The replacement guard compares inode identity only. After the agent reads an open file, an editor or background job can truncate/write the SAME inode. Publication still succeeds and replaces the newer contents with output computed from the old contents. Both relative edit and guarded write(overwrite=true) use this boundary."
+      ],
+      "required_change": "Carry a content/version snapshot from the read into publication and reject stale content, not just pathname/inode replacement. Revalidate the exchanged-out file before deleting it and restore it on mismatch; retain existing symlink and identity protections. Cover the absolute-path edit/write publication paths too, where only the approved parent currently crosses the await boundary.",
+      "verification": "Reproduction patch docs/reviews/2026-09-08-probes-core.patch, test release_review_probe_guarded_replacement_preserves_concurrent_in_place_edit fails on 6021ba1: stale replacement returns Ok and deletes concurrent user change. Add deterministic tests for a same-inode write after read and during publication for relative/absolute edit and guarded overwrite; latest user contents must survive and caller must be told to reread. Run cargo test paths and edit/overwrite tests."
+    },
+    {
+      "id": "mini-agent-wldr.2",
+      "title": "Distilling to a user-selected file changes its existing parent directory permissions",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/js/skills/distill.rs:911-925; src/fs/private.rs:42-78,177-184",
+      "evidence": [
+        "--distill-learned-skill-out /shared/project/draft.json calls ensure_private_directory on the existing destination parent, then private_atomic_create_sync repeats it. On Unix this unconditionally chmods /shared/project to 0700, removing group/other access. It happens even if the destination already exists and export fails."
+      ],
+      "required_change": "Separate private application-state directory creation from user-selected export destinations. Preserve permissions/ACLs of existing output parents, keep the new draft file private and create-only, and preserve no-follow/atomic guarantees. Audit analogous explicit export-path callers without weakening app-private storage defaults.",
+      "verification": "release_review_probe_distill_preserves_destination_directory_mode in docs/reviews/2026-09-08-probes-core.patch fails: expected 0755, observed 0700. Test 0755 and 0770 existing parents on successful export and AlreadyExists, default private output directory, symlink rejection and file 0600. Run cargo test --features skills distill."
+    },
+    {
+      "id": "mini-agent-wldr.3",
+      "title": "Edit tool has no input/output file size bound and can exhaust the parent",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/agent/tools/edit.rs:15-24,922-924,970-982; src/agent/builder.rs:581-605",
+      "evidence": [
+        "Read and write receive max_text_file_size (default 1 MiB), but EditTool does not. It reads the entire regular file into an unbounded Vec before even validating the edit mode. A tiny edit call against a multi-GB log/generated file allocates the full contents in the unsandboxed parent, followed by matching and output copies; replace_all can additionally expand output far beyond the file cap."
+      ],
+      "required_change": "Thread the configured text-file budget into EditTool in all agent constructors. Check metadata and perform a bounded read that also catches file growth; validate requested replacement sizes and aggregate final output size before allocating/publishing. Reject invalid edit argument modes before reading large files. Preserve valid bounded file behavior.",
+      "verification": "release_review_probe_edit_obeys_default_file_size_limit on 6021ba1 edits a 2 MiB file successfully despite the default 1 MiB cap. Add limit-1/limit/limit+1 tests, custom limits, growth-after-stat and replace_all expansion; rejected edits must leave bytes unchanged. Run cargo test edit plus feature-isolated tests."
+    },
+    {
+      "id": "mini-agent-wldr.4",
+      "title": "One unsafe saved-session entry prevents lookup of unrelated healthy sessions",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/session/storage.rs:166-184,239-251,283-288 (find_sessions_by_prefix/find_session_by_name/find_recent_sessions)",
+      "evidence": [
+        "Directory enumeration propagates read_private_string errors with ?. A single broken symlink, unsafe file, or entry disappearing during iteration aborts the whole search, even when the requested valid session was loaded. Session selection/resume can become unavailable until the user manually repairs an unrelated entry."
+      ],
+      "required_change": "Keep exact-ID loading fail-closed, but isolate per-entry errors in multi-session discovery: skip unsafe/unreadable/raced-away entries with a bounded diagnostic and continue collecting healthy matches. Apply the requested limit to successfully decoded sessions rather than candidates so bad recent files cannot hide older valid sessions.",
+      "verification": "release_review_probe_one_bad_session_does_not_hide_healthy_sessions saves one valid session and unrelated broken.json symlink; exact-prefix discovery returns Err. Add tests for prefix/name/recent/workspace queries with bad entry before/after healthy ones, invalid JSON and concurrent deletion; never follow or mutate the unsafe entry."
+    },
+    {
+      "id": "mini-agent-wldr.5",
+      "title": "A language server that stops reading stdin hangs read/edit/write tools",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/lsp/client.rs:464-479,498-503,531-605,646-658; src/extras/lsp/mod.rs notify_changed paths; src/agent/tools/edit.rs:1020-1025",
+      "evidence": [
+        "write_owned_frame waits for the shared stdin mutex and writes/flushes a complete frame with no deadline. The response timeout in request starts only AFTER the write. Document synchronization notifications have no response timeout at all. A server that initializes successfully then stops reading fills its pipe; syncing an ordinary 1 MiB document blocks the tool and its shared/exclusive tool lane indefinitely."
+      ],
+      "required_change": "Use a deadline covering writer-lock acquisition plus frame write/flush and response wait. Apply an explicit bounded notification deadline too. Treat a timed-out partial frame as a terminal transport failure using the existing TransportWriteGuard, reap the server, and let file tools report their completed mutation with bounded diagnostics.",
+      "verification": "release_review_probe_lsp_stalled_writer_is_bounded in docs/reviews/2026-09-08-probes-integrations.patch: fixture initializes then stops reading; 1 MiB sync_text requires the external 500ms cancellation to return. That short timeout is a probe, not a proposed production limit. Add virtual-time or configurable-deadline tests for blocked writer and queued writer, require bounded return/child reaping, and verify subsequent file tools continue. Run cargo test --features lsp lsp_process."
+    },
+    {
+      "id": "mini-agent-wldr.6",
+      "title": "MCP collision renaming can create duplicate registered tool names",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/mcp/mod.rs:326-363 (namespace_duplicate_tool_names); src/agent/builder.rs:727-739",
+      "evidence": [
+        "Only duplicate BARE names are counted. Servers alpha/probe and beta/probe rename to alpha__probe and beta__probe, while gamma's originally unique alpha__probe stays unchanged. The collected catalog now contains alpha__probe twice. This reintroduces ambiguous model schemas and downstream tool replacement, so a requested tool can route to the wrong server."
+      ],
+      "required_change": "Allocate final registered names against one complete used-name set, including unchanged names and every generated name; handle same-server duplicate definitions too. Use an injective escape/suffix policy and enforce provider-compatible name/length restrictions. Keep actual wire names and permission identities separate and stable.",
+      "verification": "release_review_probe_mcp_generated_names_cannot_collide in docs/reviews/2026-09-08-probes-integrations.patch starts three real stdio fixtures and returns [alpha__probe,beta__probe,alpha__probe]. Regression should assert uniqueness plus calls reach all three intended servers with distinct permissions. Cover separator collisions (server a__b/tool c vs a/tool b__c) and repeated definitions."
+    },
+    {
+      "id": "mini-agent-wldr.7",
+      "title": "MCP structured-only tool results are silently returned as empty output",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/mcp/tool.rs:263-285 (successful content rendering)",
+      "evidence": [
+        "The success path iterates result.content and ignores result.structured_content entirely. A successful result with content:[] and structuredContent:{answer:42} becomes only empty MCP delimiters. The model loses the result and may repeat a side-effecting call or invent an answer."
+      ],
+      "required_change": "Preserve structuredContent in model-visible output with the existing size/spill limits and untrusted-content delimiters. Define deterministic behavior when both text content and structuredContent exist so data is available without unbounded duplication. Also make unsupported content kinds explicit instead of presenting an unexplained empty success.",
+      "verification": "release_review_probe_mcp_preserves_structured_only_result in docs/reviews/2026-09-08-probes-integrations.patch calls a real fixture returning answer:42; current output is '[mcp output begins]\\n> \\n[mcp output ends]'. Add structured-only, mixed, large structured result and isError tests through McpTool::call; no repeated execution should be needed to obtain the value."
+    },
+    {
+      "id": "mini-agent-wldr.8",
+      "title": "Streaming a code fence repeatedly reparses the whole fence quadratically",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/ui/feed.rs:694-707,857-940 (find_stable_boundary and agent_completed_lines)",
+      "evidence": [
+        "Every newly completed code line scans and reparses from the fence start because no stable boundary is published inside a fence. A deterministic 1,000-line, 19,008-byte fenced response sends 9,517,500 bytes through the markdown parser (~501x source size). Long generated code, logs, lists and paragraphs stall the UI as the response grows; the mixed-paragraph benchmark does not cover this path."
+      ],
+      "required_change": "Maintain incremental fence/list rendering state or render bounded live tails with completed rows retained until finalization. Avoid cloning the full stable row prefix on every chunk as part of the performance fix. Preserve exact finalized Markdown behavior and width-change invalidation.",
+      "verification": "release_review_probe_long_fence_parsing_is_linear in docs/reviews/2026-09-08-probes-integrations.patch measures parser work, not noisy wall time; fails at 9,517,500 parsed bytes for 19,008 source bytes. Add 1k/2k/4k-line scaling tests for fenced code and long lists/paragraphs, and measure total layout work/allocation as well as parser bytes; require near-linear work and equivalent final output."
+    },
+    {
+      "id": "mini-agent-wldr.9",
+      "title": "Streaming Markdown mistakes a shorter code fence for a closing delimiter",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/ui/feed.rs:716-748 (find_stable_boundary fence tracking)",
+      "evidence": [
+        "The boundary scanner tracks only fence character, not opening delimiter length or closing-line validity. After a four-backtick opening, an embedded triple-backtick code line is treated as a close. A following blank line caches an unsafe stable boundary, so '# literal header' is rendered as a heading while streaming even though it remains literal code; finalization visibly changes the content."
+      ],
+      "required_change": "Match the actual Markdown fence rules: retain opening character/length and indentation, require a valid closing line of sufficient length and no non-whitespace suffix, and keep invalid shorter delimiters inside the fence. Share parser state where possible instead of duplicating an incomplete grammar.",
+      "verification": "release_review_probe_long_fence_delimiter_streaming_matches_final_render in docs/reviews/2026-09-08-probes-integrations.patch proves streamed rows lose the literal '#' while finalized rows retain it. Add chunk-boundary tests for 3/4/5 delimiters, tildes, trailing text, indentation and embedded blank lines; compare rendered text and style before/after finalization."
+    },
+    {
+      "id": "mini-agent-wldr.10",
+      "title": "Nightly evaluation drops the first persona metric and never runs the library axis",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": ".github/workflows/harness-eval.yml:30-45; scripts/tests/test_harness_eval_ci.py:32-49; src/tests/harness_eval_tests.rs persona_regression_eval",
+      "evidence": [
+        "The current baseline's Nightly harness evaluation run 34199175478 failed although all fixture/persona tests passed. With --nocapture --test-threads=1 libtest prefixes the first persona JSON record with 'test ... ... '. grep '^PERSONA_EVAL ' extracts only eight of nine records, so -eq 9 fails. The learned-skill library-axis step and metrics upload are skipped. Current Python policy tests merely assert the broken grep/count strings are present."
+      ],
+      "required_change": "Emit metrics to dedicated JSONL artifacts or parse a known record prefix independent of libtest's progress text, validate JSON/schema/counts, and test the actual extractor on representative prefixed output. Preserve tool/test failure propagation and archive diagnostics on failures. Keep the library-axis step exercised after deterministic/persona metrics validate.",
+      "verification": "Source: https://github.com/sebahrens/mini-agent/actions/runs/34199175478 at 6021ba1. Log shows first record 'test tests::harness_eval_tests::persona_regression_eval ... PERSONA_EVAL {agent_type:rust-maintainer,...}', then eight standalone PERSONA_EVAL records and exit 1. Reproduce exact workflow command/extractor locally, assert all nine persona IDs are parsed, then dispatch the nightly workflow and verify three non-empty artifacts including both none/library arms."
+    },
+    {
+      "id": "mini-agent-wldr.11",
+      "title": "A bounded read can allocate an entire arbitrarily long source line",
+      "priority": "P1",
+      "confidence": 0.95,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/agent/tools/read.rs:164-195,225-238",
+      "evidence": [
+        "Explicit offset/limit allows a file larger than max_text_file_size to pass the initial gate. read_until(newline, &mut raw_line) then grows a Vec until newline/EOF without a byte bound; only afterwards is the excerpt size checked. A 1-line request against a multi-GB minified file can OOM the parent before returning its otherwise helpful size-limit error. Skipped lines before the requested offset allocate the same way."
+      ],
+      "required_change": "Read lines incrementally with a bounded buffer. For selected lines, fail as soon as the byte budget is exceeded; skip/hash earlier or unselected long lines in chunks without retaining them. Preserve UTF-8 validation and hashedit whole-file CRC semantics with bounded memory. Define and test behavior for files growing during a read.",
+      "verification": "Code-confirmed on 6021ba1: explicit limit bypasses metadata rejection; tokio AsyncBufReadExt::read_until receives an unbounded Vec at read.rs:193; the first cap check is read.rs:231. Use a chunked/counting reader or allocation instrumentation with a single line far larger than the cap, requesting limit=1 and then offset past the line. Assert bounded peak retained memory and no allocation proportional to source line size; cover CRLF and incremental UTF-8/CRC. Run cargo test read."
+    },
+    {
+      "id": "mini-agent-wldr.12",
+      "title": "Default provider streams have no connection or inactivity deadline",
+      "priority": "P1",
+      "confidence": 0.95,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/provider.rs:1568-1600 (build_http_client); src/agent/runner.rs:3240 and retry::retry_stream_chat; src/extras/advisor/mod.rs:338-347",
+      "evidence": [
+        "Provider clients set a total timeout only when an optional custom-provider timeout_secs is present. The locked reqwest 0.13.4 defaults connect_timeout, read_timeout and timeout to None. Main/headless/advisor loops await the provider stream without an independent inactivity deadline. A peer that accepts the request and stalls before headers or between SSE events can keep a turn alive indefinitely; retry logic is never entered because no error arrives."
+      ],
+      "required_change": "Introduce explicit configurable provider connect and stream-inactivity bounds with documented defaults, applied to built-in and custom providers. Keep long healthy streams alive by resetting the inactivity deadline on valid progress. Route deadline failures through bounded retry/cancellation and preserve already executed tool history and usage; make headless termination actionable.",
+      "verification": "Code-confirmed against the locked dependency: reqwest-0.13.4/src/async_impl/client.rs:299,313-314 defaults all three to None; build_http_client only sets timeout at provider.rs:1597 under custom Some(secs); production stream consumers have no idle select. Add hermetic servers that accept then stall before headers and after one SSE event, a slow healthy stream, custom override tests, and main/headless/advisor deadline recovery tests. Assert bounded retries and no duplicated effects."
+    }
+  ],
+  "residual_risks": [
+    "This is a review checkpoint, not a claim that the release is fully audited or bug-free.",
+    "Deep worker/broker/sandbox containment, permission/hook interleavings, skill admission/lifecycle and platform packaging runtime reviews remain to be completed under the epic.",
+    "Linux/Windows runtime behavior has not been independently exercised locally; current main CI is green.",
+    "Performance test failure in the restricted initial run was not reproduced in the unrestricted full suite; no separate performance-regression finding was inferred from that timing sample."
+  ],
+  "testing_gaps": [
+    "Nine targeted regressions are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
+    "Read long-line allocation and provider-inactivity findings are code-confirmed; implementation beads require instrumented/hermetic regressions.",
+    "Nightly workflow policy tests assert command strings, not correctness of record extraction."
+  ]
+}

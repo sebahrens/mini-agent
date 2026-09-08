@@ -1,0 +1,124 @@
+--- a/src/tests/feed_tests.rs
++++ b/src/tests/feed_tests.rs
+@@ -886,3 +886,31 @@
+     assert!(!feed.is_streaming(0));
+     assert!(!feed.is_streaming(7));
+ }
++
++#[test]
++fn release_review_probe_long_fence_parsing_is_linear() {
++    let mut feed = Feed::new();
++    feed.push_streaming_block(BlockStyle::Agent);
++    feed.append_to_last("```rust\n");
++    let mut total = 8;
++    for _ in 0..1000 {
++        let line = "let value = 12345;\n";
++        total += line.len();
++        feed.append_to_last(line);
++        let _ = feed.lines(100);
++    }
++    assert!(feed.markdown_bytes_parsed() < total * 10,
++        "{} bytes parsed for {} source bytes", feed.markdown_bytes_parsed(), total);
++}
++#[test]
++fn release_review_probe_long_fence_delimiter_streaming_matches_final_render() {
++    let mut feed = Feed::new();
++    feed.push_streaming_block(BlockStyle::Agent);
++    feed.append_to_last("````text\nliteral\n```\n\n");
++    let _ = feed.lines(100);
++    feed.append_to_last("# literal header\n");
++    let streamed: Vec<_> = feed.lines(100).iter().map(|line| line.text.to_string()).collect();
++    feed.finalize_last();
++    let finalized: Vec<_> = feed.lines(100).iter().map(|line| line.text.to_string()).collect();
++    assert_eq!(streamed, finalized);
++}
+--- a/src/tests/mcp_stdio_tests.rs
++++ b/src/tests/mcp_stdio_tests.rs
+@@ -194,7 +194,8 @@
+             write_response(
+                 &mut stdout,
+                 &format!(
+-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"probe\",\"description\":\"report fixture process inputs\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}"
++                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"{}\",\"description\":\"report fixture process inputs\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}",
++                    if mode == "named" { env::args().nth(1).unwrap() } else { "probe".to_string() }
+                 ),
+             );
+         } else if compact.contains("\"method\":\"tools/call\"") {
+@@ -202,6 +203,11 @@
+                 continue;
+             }
+             let id = request_id(&compact);
++
++            if mode == "structured-only" {
++                write_response(&mut stdout, &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[],\"structuredContent\":{{\"answer\":42}}}}}}"));
++                continue;
++            }
+             let payload = escape(&tool_payload());
+             write_response(
+                 &mut stdout,
+@@ -1247,3 +1253,35 @@
+     assert_process_reaped(pid).await;
+     fixture.cleanup();
+ }
++
++#[tokio::test]
++async fn release_review_probe_mcp_generated_names_cannot_collide() {
++    let fixture = FixtureBuild::compile();
++    let mut handles = Vec::new();
++    for (server, name) in [("alpha", "probe"), ("beta", "probe"), ("gamma", "alpha__probe")] {
++        let lease = fixture.lease(server);
++        handles.push(McpClientHandle::connect(CompactString::new(server),
++            &fixture.config(fixture.executable.display().to_string(), vec![name.into()], "named", &lease)).await.unwrap());
++    }
++    let manager = McpClientManager::from_handles(handles);
++    let tools = manager.collect_tools(None, None).await;
++    let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
++    let unique: std::collections::HashSet<_> = names.iter().collect();
++    let unique_count = unique.len();
++    shutdown(manager).await;
++    fixture.cleanup();
++    assert_eq!(unique_count, names.len(), "duplicate registered names: {names:?}");
++}
++#[tokio::test]
++async fn release_review_probe_mcp_preserves_structured_only_result() {
++    let fixture = FixtureBuild::compile();
++    let lease = fixture.lease("structured");
++    let handle = McpClientHandle::connect(CompactString::new("fixture"),
++        &fixture.config(fixture.executable.display().to_string(), vec![], "structured-only", &lease)).await.unwrap();
++    let manager = McpClientManager::from_handles(vec![handle]);
++    let tools = manager.collect_tools(Some(permission_for(Action::Allow)), None).await;
++    let output = tools[0].call("{}".into()).await.unwrap();
++    shutdown(manager).await;
++    fixture.cleanup();
++    assert!(output.contains("42"), "structured result lost: {output:?}");
++}
+--- a/src/tests/lsp_process_tests.rs
++++ b/src/tests/lsp_process_tests.rs
+@@ -186,6 +186,7 @@
+                 &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"capabilities\":{{}}}}}}"),
+             );
+         } else if body.contains("\"method\":\"initialized\"") {
++            if mode == "review-stop-reading" { loop { thread::sleep(Duration::from_secs(60)); } }
+             if restart_first {
+                 return;
+             }
+@@ -756,3 +757,19 @@
+     drop(manager);
+     fixture.cleanup();
+ }
++
++#[tokio::test]
++async fn release_review_probe_lsp_stalled_writer_is_bounded() {
++    let fixture = FixtureBuild::compile("review-stalled-writer");
++    let workspace = fixture.workspace("workspace");
++    let lease = fixture.path("stalled.lease");
++    let cfg = fixture.config("review-stop-reading", &lease);
++    let client = spawn_client(&cfg, &workspace, Duration::from_secs(2)).await.unwrap();
++    let pid = wait_for_pid(&lease).await;
++    let result = tokio::time::timeout(Duration::from_millis(500),
++        client.sync_text(&workspace.join("file.probe"), "x".repeat(1024 * 1024))).await;
++    client.shutdown().await;
++    assert_process_reaped(pid).await;
++    fixture.cleanup();
++    assert!(result.is_ok(), "stalled LSP stdin held document synchronization until external cancellation");
++}

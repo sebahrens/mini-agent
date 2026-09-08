@@ -1,0 +1,91 @@
+--- a/src/extras/js/skills/distill.rs
++++ b/src/extras/js/skills/distill.rs
+@@ -1425,3 +1425,20 @@
+         assert!(path.parent().unwrap().ends_with("distilled"));
+     }
+ }
++
++#[cfg(all(test, unix))]
++mod release_review_probes {
++    use super::*;
++    use std::os::unix::fs::PermissionsExt;
++    #[test]
++    fn release_review_probe_distill_preserves_destination_directory_mode() {
++        let root = std::env::temp_dir().join(format!("review-distill-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir(&root).unwrap();
++        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
++        let (package, _) = scaffold("return 1;", "review-session", "review-call").unwrap();
++        write_package(&root.join("draft.json"), &package).unwrap();
++        let actual = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
++        std::fs::remove_dir_all(&root).unwrap();
++        assert_eq!(actual, 0o755, "export must preserve the operator's existing directory permissions");
++    }
++}
+--- a/src/paths.rs
++++ b/src/paths.rs
+@@ -3294,3 +3294,24 @@
+         std::fs::remove_dir_all(outside).unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod release_review_probes {
++    use super::*;
++    #[test]
++    fn release_review_probe_guarded_replacement_preserves_concurrent_in_place_edit() {
++        let root = std::env::temp_dir().join(format!("review-stale-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir(&root).unwrap();
++        let root = std::fs::canonicalize(root).unwrap();
++        let path = root.join("file.txt");
++        std::fs::write(&path, "old contents").unwrap();
++        let binding = WorkspaceBinding::capture(&root).unwrap();
++        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
++        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
++        std::fs::write(&path, "concurrent user change").unwrap();
++        let result = binding.replace_relative_atomic(Path::new("file.txt"), b"agent edit based on old contents", &expected);
++        let actual = std::fs::read_to_string(&path).unwrap();
++        std::fs::remove_dir_all(&root).unwrap();
++        assert!(result.is_err(), "stale replacement succeeded and persisted {actual:?}");
++    }
++}
+--- a/src/agent/tools/edit.rs
++++ b/src/agent/tools/edit.rs
+@@ -1205,3 +1205,21 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod release_review_probes {
++    use super::*;
++    #[tokio::test]
++    async fn release_review_probe_edit_obeys_default_file_size_limit() {
++        let root = std::env::temp_dir().join(format!("review-edit-size-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir(&root).unwrap();
++        let path = root.join("large.txt");
++        std::fs::write(&path, format!("needle\n{}", "x".repeat(2 * 1024 * 1024))).unwrap();
++        let tool = EditTool::new(None, None).with_workspace(root.clone());
++        let result = tool.call(EditArgs { path: "large.txt".into(), replace_all: false,
++            block: Some("<<<<<<< SEARCH\nneedle\n=======\nreplacement\n>>>>>>> REPLACE".into()),
++            file_crc: None, edits: None }).await;
++        std::fs::remove_dir_all(&root).unwrap();
++        assert!(result.is_err(), "edit bypassed default 1 MiB file limit: {result:?}");
++    }
++}
+--- a/src/tests/session_storage_tests.rs
++++ b/src/tests/session_storage_tests.rs
+@@ -1145,3 +1145,14 @@
+     );
+     drop(env);
+ }
++
++#[cfg(unix)]
++#[test]
++fn release_review_probe_one_bad_session_does_not_hide_healthy_sessions() {
++    let env = setup_test_env();
++    let s = Session::new("openai", "gpt-4", 128000, "");
++    save_session(&s).unwrap();
++    std::os::unix::fs::symlink(env.dir.join("missing"), env.dir.join("sessions/broken.json")).unwrap();
++    let result = find_sessions_by_prefix(&s.id);
++    assert!(result.is_ok(), "an unrelated unsafe file blocks healthy session lookup: {result:?}");
++}
