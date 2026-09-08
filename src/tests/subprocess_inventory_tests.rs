@@ -910,12 +910,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-PROJECT-AUTOMATION",
     ),
     (
-        "src/extras/js/engine.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/extras/js/host.rs",
         "if is_followable_redirect(response.status()) {",
         1,
@@ -3353,12 +3347,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(\"/bin/kill\")",
         1,
         "TEST-ONLY",
-    ),
-    (
-        "src/extras/js/engine.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
     ),
     (
         "src/extras/js/host.rs",

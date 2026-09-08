@@ -67,110 +67,6 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
-#[cfg(all(feature = "skills", test))]
-#[derive(Clone, Default)]
-pub(crate) struct SkillCapabilityGate {
-    stack: std::sync::Arc<std::sync::Mutex<Vec<crate::extras::js::skills::CapabilityManifest>>>,
-    registered: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, crate::extras::js::skills::CapabilityManifest>,
-        >,
-    >,
-    context: crate::extras::js::skills::capability::CapabilityContext,
-}
-
-#[cfg(all(feature = "skills", test))]
-impl SkillCapabilityGate {
-    pub(crate) fn register(
-        &self,
-        id: String,
-        manifest: crate::extras::js::skills::CapabilityManifest,
-    ) {
-        self.registered
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(id, manifest);
-    }
-
-    pub(crate) fn push_registered(&self, id: &str) -> rquickjs::Result<()> {
-        let manifest = self
-            .registered
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(id)
-            .cloned()
-            .ok_or_else(|| {
-                rquickjs::Error::new_from_js_message(
-                    "skill capability",
-                    "selected skill",
-                    "unknown selected skill identity",
-                )
-            })?;
-        self.stack
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(manifest);
-        Ok(())
-    }
-
-    pub(crate) fn pop_registered(&self) {
-        let _ = self
-            .stack
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pop();
-    }
-
-    pub(crate) fn enter(
-        &self,
-        manifest: crate::extras::js::skills::CapabilityManifest,
-    ) -> SkillCapabilityGuard {
-        self.stack
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(manifest);
-        SkillCapabilityGuard { gate: self.clone() }
-    }
-
-    fn authorize(
-        &self,
-        capability: crate::extras::js::skills::HostCapability,
-    ) -> rquickjs::Result<()> {
-        let stack = self.stack.lock().unwrap_or_else(|error| error.into_inner());
-        if stack.iter().any(|manifest| !manifest.allows(capability)) {
-            return Err(rquickjs::Error::new_from_js_message(
-                "skill capability",
-                capability.as_token(),
-                "selected skill did not declare this host capability",
-            ));
-        }
-        self.context.authorize(capability, true).map_err(|error| {
-            rquickjs::Error::new_from_js_message(
-                "skill capability policy",
-                capability.as_token(),
-                error.to_string(),
-            )
-        })
-    }
-}
-
-#[cfg(all(feature = "skills", test))]
-pub(crate) struct SkillCapabilityGuard {
-    gate: SkillCapabilityGate,
-}
-
-#[cfg(all(feature = "skills", test))]
-impl Drop for SkillCapabilityGuard {
-    fn drop(&mut self) {
-        let _ = self
-            .gate
-            .stack
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .pop();
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileAccess {
     Read,
@@ -2554,28 +2450,6 @@ pub(crate) fn make_write_file(
     }
 }
 
-#[cfg(all(feature = "sandbox", test))]
-fn make_fetch(
-    permission_bridge: PermissionBridge,
-    runtime: tokio::runtime::Handle,
-    policy: FetchPolicy,
-) -> impl for<'js> Fn(String, Opt<Object<'js>>) -> rquickjs::Result<FetchResult> {
-    let service = Arc::new(FetchEffectService::new(
-        permission_bridge.clone(),
-        runtime.clone(),
-        policy,
-        FETCH_TOTAL_TIMEOUT,
-    ));
-    move |url: String, options: Opt<Object<'_>>| {
-        let request = FetchRequest::from_options(options.0.as_ref()).map_err(fetch_host_error)?;
-        runtime
-            .block_on(service.execute(url, request, PermCancellation::new()))
-            .map_err(fetch_host_error)
-    }
-}
-
-/// Parent-side network service with an outer wall-clock deadline in addition
-/// to DNS, connect, read, redirect, header, and body bounds.
 #[cfg(feature = "sandbox")]
 pub(crate) struct FetchEffectService {
     executor: Arc<FetchExecutor>,
@@ -2895,8 +2769,6 @@ pub(crate) fn register_proposal_global(
 pub(crate) const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
-#[cfg(test)]
-const CONSOLE_MAX_BYTES_PER_STEP: usize = 256 * 1024;
 
 /// Parent-side structured process service. Permission identity and execution
 /// consume the same program/argument vector; no shell-like joining occurs.
@@ -4783,100 +4655,6 @@ fn make_spawn_with_timeout(
             .block_on(service.execute(&cmd, &args, PermCancellation::new()))
             .map_err(|error| service_host_error("js/spawn", error))
     }
-}
-
-#[cfg(test)]
-pub(crate) fn register_host_globals(
-    ctx: &Context,
-    sandbox: Sandbox,
-    permission_bridge: PermissionBridge,
-    runtime: tokio::runtime::Handle,
-    allow_config: AllowConfig,
-    #[cfg(feature = "skills")] skill_gate: SkillCapabilityGate,
-) -> rquickjs::Result<()> {
-    ctx.with(|ctx| {
-        let globals = ctx.globals();
-
-        let read_file = make_read_file(
-            permission_bridge.clone(),
-            runtime.clone(),
-            allow_config.clone(),
-        );
-        #[cfg(feature = "skills")]
-        let read_file = {
-            let gate = skill_gate.clone();
-            move |path: String| {
-                gate.authorize(crate::extras::js::skills::HostCapability::ReadFile)?;
-                read_file(path)
-            }
-        };
-        globals.set("read_file", Func::from(read_file))?;
-        let write_file = make_write_file(
-            permission_bridge.clone(),
-            runtime.clone(),
-            allow_config.clone(),
-        );
-        #[cfg(feature = "skills")]
-        let write_file = {
-            let gate = skill_gate.clone();
-            move |path: String, content: String| {
-                gate.authorize(crate::extras::js::skills::HostCapability::WriteFile)?;
-                write_file(path, content)
-            }
-        };
-        globals.set("write_file", Func::from(write_file))?;
-        #[cfg(feature = "sandbox")]
-        {
-            let fetch = make_fetch(
-                permission_bridge.clone(),
-                runtime.clone(),
-                allow_config.fetch,
-            );
-            #[cfg(feature = "skills")]
-            let fetch = {
-                let gate = skill_gate.clone();
-                move |url: String, options: Opt<Object<'_>>| {
-                    gate.authorize(crate::extras::js::skills::HostCapability::Fetch)?;
-                    fetch(url, options)
-                }
-            };
-            globals.set("fetch", Func::from(fetch))?;
-        }
-        let spawn = make_spawn(sandbox, permission_bridge, runtime);
-        #[cfg(feature = "skills")]
-        let spawn = {
-            let gate = skill_gate.clone();
-            move |command: String, arguments: Vec<String>| {
-                gate.authorize(crate::extras::js::skills::HostCapability::Spawn)?;
-                spawn(command, arguments)
-            }
-        };
-        globals.set("spawn", Func::from(spawn))?;
-
-        let console = Object::new(ctx.clone())?;
-        let console_bytes_remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
-            CONSOLE_MAX_BYTES_PER_STEP,
-        ));
-        console.set(
-            "log",
-            Func::from(move |msg: Value| {
-                let text = format!("{msg:?}");
-                let len = text.len();
-                let remaining = console_bytes_remaining
-                    .fetch_update(
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                        |r| r.checked_sub(len),
-                    )
-                    .unwrap_or(0);
-                if remaining > 0 {
-                    eprintln!("[js] {text}");
-                }
-            }),
-        )?;
-        globals.set("console", console)?;
-        Ok(())
-    })
 }
 
 #[cfg(test)]
@@ -8053,29 +7831,6 @@ mod tests {
         assert!(
             !ambient_target.exists(),
             "relative native/JS writes escaped to process CWD"
-        );
-    }
-
-    #[tokio::test]
-    async fn register_host_globals_returns_error_under_memory_pressure() {
-        let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
-        let ctx = Context::full(&runtime).expect("create QuickJS context");
-        runtime.set_memory_limit(1);
-
-        let permission_owner = PermissionBridgeOwner::new(None, None, STEP_TIMEOUT);
-        let result = register_host_globals(
-            &ctx,
-            Sandbox::new(false, "bwrap"),
-            permission_owner.bridge(),
-            tokio::runtime::Handle::current(),
-            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
-            #[cfg(feature = "skills")]
-            SkillCapabilityGate::default(),
-        );
-
-        assert!(
-            result.is_err(),
-            "host-global registration should report allocation failure"
         );
     }
 

@@ -138,45 +138,6 @@ pub(crate) fn private_skill_source(skill: &SkillArtifact) -> &str {
     &skill.source
 }
 
-/// Compatibility wrapper for the test-only Phase 3 in-process engine. Production registration
-/// and verification use the Phase 6 realm loader and [`private_skill_source`].
-#[cfg(test)]
-pub(crate) fn legacy_private_skill_source(skill: &SkillArtifact) -> String {
-    let published = skill
-        .exports
-        .iter()
-        .map(|export| {
-            let key =
-                serde_json::to_string(&export.name).unwrap_or_else(|_| "\"invalid\"".to_string());
-            format!(
-                "{key}: (typeof {name} === 'function' ? {name} : undefined)",
-                name = export.name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let host = |capability: HostCapability, name: &str| {
-        if skill.capability.allows(capability) {
-            format!("globalThis.{name}")
-        } else {
-            "undefined".to_string()
-        }
-    };
-    let read_file = host(HostCapability::ReadFile, "read_file");
-    let write_file = host(HostCapability::WriteFile, "write_file");
-    let spawn = host(HostCapability::Spawn, "spawn");
-    let fetch = host(HostCapability::Fetch, "fetch");
-    let safe_global = format!(
-        "Object.freeze({{read_file:{read_file},write_file:{write_file},spawn:{spawn},fetch:{fetch}}})"
-    );
-    format!(
-        "(function(read_file,write_file,spawn,fetch,globalThis,self,window,global,Function,Promise,__zs_Object){{\n\
-         'use strict';\n{}\n;return __zs_Object.freeze({{{published}}});\n\
-         }})({read_file},{write_file},{spawn},{fetch},{safe_global},{safe_global},{safe_global},{safe_global},undefined,Promise,Object)",
-        skill.source,
-    )
-}
-
 /// Domain separator binding identities to this scheme, so a hash computed here can never
 /// collide with a hash of the same bytes computed for another purpose.
 const IDENTITY_DOMAIN: &[u8] = b"mini-agent/skill-identity";

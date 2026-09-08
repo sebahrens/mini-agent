@@ -1,7 +1,7 @@
 //! SQLite persistence foundation for immutable learned-JS skill revisions.
 //!
 //! This module manages versioned database schema, identity-validating reads, and
-//! transactional migrations. The database is never held by JsTool/JsRequest or the
+//! transactional migrations. The database is never held by JsTool/worker request or the
 //! QuickJS thread; it is purely for durable storage and offline indexing.
 //!
 //! Database path: `<AppPaths.local_data_dir>/skills/skills.db`

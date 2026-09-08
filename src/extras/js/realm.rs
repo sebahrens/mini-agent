@@ -1352,10 +1352,6 @@ pub(super) fn skill_effect_exception(
         CapabilityError::EffectFailed(code) => effect_error_code_token(*code),
         CapabilityError::InvalidArguments => "invalid_target",
         CapabilityError::DispatchDenied => "denied",
-        // `CapabilityError::Denied` only exists in test builds; it belongs to the
-        // ambient `CapabilityContext` stack, which production never enters.
-        #[cfg(test)]
-        CapabilityError::Denied(_) => "capability_denied",
         CapabilityError::Revoked
         | CapabilityError::InvalidInvocation
         | CapabilityError::InvalidAttribution

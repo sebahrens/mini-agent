@@ -132,11 +132,6 @@ impl PermissionBridge {
         bridge
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_shutdown(&self) -> bool {
-        self.shutdown.is_cancelled()
-    }
-
     pub(crate) async fn cancelled(&self) {
         tokio::select! {
             _ = self.shutdown.cancelled() => {}
@@ -147,15 +142,6 @@ impl PermissionBridge {
 
     pub(crate) fn check(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
         self.check_sync(PermissionCheckKind::Input, tool, key)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn check_bound_path(
-        &self,
-        tool: &str,
-        key: &str,
-    ) -> Result<(), PermissionBridgeError> {
-        self.check_sync(PermissionCheckKind::BoundPath, tool, key)
     }
 
     fn check_sync(

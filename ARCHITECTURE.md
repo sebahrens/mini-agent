@@ -191,7 +191,6 @@ src/extras/js/
 ├── worker.rs         # internal worker bootstrap and fresh runtimes
 ├── realm.rs          # private skill/model realms and verification loader
 ├── host.rs           # parent effect services; historical test globals
-├── engine.rs         # test-only historical evaluator
 └── skills/           # identity, storage, retrieval, admission, lifecycle
 
 src/sandbox/worker/

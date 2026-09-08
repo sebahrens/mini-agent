@@ -97,7 +97,6 @@ mutable copy of canonical source that could drift from the final artifact.
 | `src/extras/js/skills/store.rs` | EXTENDED | Proposal/report/suite/approval schema and lifecycle primitives |
 | `src/extras/js/host.rs`, `skills/proposal.rs` | EXTENDED | Parent proposal effect service, bounds, durable queue handoff |
 | `src/extras/js/worker.rs` | EXTENDED | Register the model-only wire global; verifier and stored-skill modes omit it |
-| `src/extras/js/engine.rs` | TEST-ONLY | Historical proposal-global regression harness |
 
 The delivered Phase 4 implementation keeps proposal persistence on a dedicated bounded parent-side
 admission worker, not the historical QuickJS thread. Phase 6 preserves that parent-owned

@@ -17,34 +17,12 @@ pub struct SkillExecutionAttribution {
     pub manifest: CapabilityManifest,
 }
 
-// Test-only, with [`CapabilityContext`]: the production narrowing path is
-// [`InvocationCapabilityRuntime`], whose denials are typed
-// `CapabilityError::{Revoked, InvalidInvocation, DispatchDenied}` instead.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityDenied {
-    pub skill_id: String,
-    pub export_name: String,
-    pub operation: HostCapability,
-    pub reason: CapabilityDenialReason,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityDenialReason {
-    Undeclared,
-    SessionDenied,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum CapabilityError {
     #[error("skill attribution is missing an immutable full ID or export")]
     InvalidAttribution,
     #[error("invalid immutable capability manifest: {0}")]
     InvalidManifest(#[from] IdentityError),
-    #[error("skill capability denied")]
-    #[cfg(test)]
-    Denied(CapabilityDenied),
     #[error("invocation authorization is missing or invalid")]
     InvalidInvocation,
     #[error("invocation capability has been revoked")]
@@ -604,126 +582,6 @@ fn encode_effect_result(result: EffectResult) -> Result<String, CapabilityError>
     serde_json::to_string(&value).map_err(|_| CapabilityError::DispatchDenied)
 }
 
-/// Cloneable execution context shared by the JS wrappers and host globals for
-/// one dedicated JS thread. Nested scopes intersect manifests.
-///
-/// Test-only. Production narrowing is [`InvocationCapabilityRuntime`], which binds
-/// one parent-created invocation grant per call; this older ambient stack is reached
-/// only through the `cfg(test)` `SkillCapabilityGate` in `host.rs`.
-#[cfg(test)]
-#[derive(Clone, Default)]
-pub struct CapabilityContext {
-    stack: Arc<Mutex<Vec<SkillExecutionAttribution>>>,
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for CapabilityContext {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let depth = self.stack.lock().map(|stack| stack.len()).unwrap_or(0);
-        formatter
-            .debug_struct("CapabilityContext")
-            .field("depth", &depth)
-            .finish()
-    }
-}
-
-#[cfg(test)]
-impl CapabilityContext {
-    pub fn enter(
-        &self,
-        attribution: SkillExecutionAttribution,
-    ) -> Result<CapabilityGuard, CapabilityError> {
-        self.push(attribution)?;
-        Ok(CapabilityGuard {
-            context: self.clone(),
-            active: true,
-        })
-    }
-
-    pub(crate) fn push(
-        &self,
-        attribution: SkillExecutionAttribution,
-    ) -> Result<(), CapabilityError> {
-        validate_attribution(&attribution)?;
-        self.stack
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?
-            .push(attribution);
-        Ok(())
-    }
-
-    pub(crate) fn pop(&self) -> Result<(), CapabilityError> {
-        self.stack
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?
-            .pop()
-            .map(|_| ())
-            .ok_or(CapabilityError::InvalidAttribution)
-    }
-
-    /// Model-authored code outside a skill wrapper has no skill constraint and
-    /// is governed solely by normal session permissions.
-    pub fn authorize(
-        &self,
-        operation: HostCapability,
-        session_allowed: bool,
-    ) -> Result<(), CapabilityError> {
-        let stack = self
-            .stack
-            .lock()
-            .map_err(|_| CapabilityError::InvalidAttribution)?;
-        let current = stack.last();
-        let Some(current) = current else {
-            return if session_allowed {
-                Ok(())
-            } else {
-                Err(CapabilityError::Denied(CapabilityDenied {
-                    skill_id: String::new(),
-                    export_name: String::new(),
-                    operation,
-                    reason: CapabilityDenialReason::SessionDenied,
-                }))
-            };
-        };
-        if !session_allowed {
-            return self.deny(CapabilityDenied {
-                skill_id: current.skill_id.clone(),
-                export_name: current.export_name.clone(),
-                operation,
-                reason: CapabilityDenialReason::SessionDenied,
-            });
-        }
-        // Every nested frame must allow the operation; callees cannot borrow
-        // authority from either callers or the ambient session.
-        if stack
-            .iter()
-            .all(|attribution| attribution.manifest.allows(operation))
-        {
-            Ok(())
-        } else {
-            let denied_attribution = stack
-                .iter()
-                .rev()
-                .find(|attribution| !attribution.manifest.allows(operation))
-                .unwrap_or(current);
-            self.deny(CapabilityDenied {
-                skill_id: denied_attribution.skill_id.clone(),
-                export_name: denied_attribution.export_name.clone(),
-                operation,
-                reason: CapabilityDenialReason::Undeclared,
-            })
-        }
-    }
-
-    fn deny(&self, denial: CapabilityDenied) -> Result<(), CapabilityError> {
-        Err(CapabilityError::Denied(denial))
-    }
-
-    pub fn current(&self) -> Option<SkillExecutionAttribution> {
-        self.stack.lock().ok()?.last().cloned()
-    }
-}
-
 fn validate_attribution(attribution: &SkillExecutionAttribution) -> Result<(), CapabilityError> {
     if attribution.skill_id.len() != 64
         || !attribution
@@ -736,22 +594,6 @@ fn validate_attribution(attribution: &SkillExecutionAttribution) -> Result<(), C
     }
     attribution.manifest.validate()?;
     Ok(())
-}
-
-#[cfg(test)]
-pub struct CapabilityGuard {
-    context: CapabilityContext,
-    active: bool,
-}
-
-#[cfg(test)]
-impl Drop for CapabilityGuard {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.context.pop();
-            self.active = false;
-        }
-    }
 }
 
 #[cfg(test)]

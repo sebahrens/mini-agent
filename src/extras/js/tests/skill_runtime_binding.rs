@@ -498,7 +498,7 @@ async fn production_runner_emits_parent_bound_invocation_evidence() {
     use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
 
     let selected = artifact(
-        "function observed() { return 42; }",
+        "async function observed(_cap, value) { await Promise.resolve(); return value + 1; }",
         &["observed"],
         CapabilityManifest::pure(),
     );
@@ -510,7 +510,7 @@ async fn production_runner_emits_parent_bound_invocation_evidence() {
 
     assert_eq!(
         tool.call(JsArgs {
-            code: "observed()".to_string(),
+            code: "await observed(41)".to_string(),
         })
         .await
         .unwrap(),
@@ -544,7 +544,33 @@ async fn production_runner_emits_parent_bound_invocation_evidence() {
             .iter()
             .find(|event| event.kind == SkillEventKind::Invoked)
             .and_then(|event| event.argument_shape.as_deref()),
-        Some(r#"{"argc":0,"types":[]}"#)
+        Some(r#"{"argc":1,"types":["number"]}"#)
+    );
+
+    assert_eq!(
+        tool.call(JsArgs {
+            code: "1 + 1".into()
+        })
+        .await
+        .unwrap(),
+        "2"
+    );
+    let unused = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("selected-but-unused telemetry batch");
+    assert_eq!(
+        unused
+            .events()
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![SkillEventKind::Selected, SkillEventKind::Injected],
+    );
+    assert!(
+        unused
+            .events()
+            .iter()
+            .all(|event| event.skill_id == selected.id && event.evidence_complete)
     );
 }
 

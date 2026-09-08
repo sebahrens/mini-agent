@@ -258,8 +258,8 @@ tracker issues may cite.
 
 Phase 1–5 behavior remains implemented under `src/extras/js/`, with the portable Agent Skills
 catalog in `src/extras/skills/`. Phase 6 moved production and verification QuickJS ownership into
-the contained same-executable worker in `worker.rs`/`realm.rs`; `engine.rs` is retained only for
-historical regression tests. `tool.rs`, `supervisor.rs`, `broker.rs`, and `audit.rs` remain in the
+the contained same-executable worker in `worker.rs`/`realm.rs`. The historical in-process engine
+and ambient capability stack have been removed; runtime regressions exercise real worker paths. `tool.rs`, `supervisor.rs`, `broker.rs`, and `audit.rs` remain in the
 trusted parent and own invocation policy, transport, effects, and durable audit. Phase 5 is
 delivered. Phase 6 has dedicated cross-platform containment gates, but the committed
 `docs/benchmarks/results/js-worker-baseline.json` still declares

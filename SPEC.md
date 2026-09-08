@@ -63,8 +63,9 @@ contained worker:
 - stable typed outcomes; and
 - only closed diagnostic class/code plus validated source-free location metadata.
 
-`src/extras/js/engine.rs` is test-only. Production QuickJS ownership is in `worker.rs` and
-`realm.rs`; no QuickJS type exists in the parent `JsTool` or supervisor.
+QuickJS ownership is in `worker.rs` and `realm.rs`; no QuickJS type exists in the parent
+`JsTool` or supervisor. Runtime regressions exercise these worker paths; the historical
+in-process evaluator has been removed.
 
 ## Phase 2 — parent effect narrowing and general commands
 

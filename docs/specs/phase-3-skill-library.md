@@ -103,8 +103,7 @@ is a sibling feature so its resources are never mistaken for verified JS globals
 | `src/extras/skills/import.rs` | IMPLEMENTED | Agent Skills directory/ZIP validation and content-addressed installation |
 | `src/extras/skills/index.rs` | IMPLEMENTED | Progressive metadata discovery for instruction skills |
 | `src/extras/js/mod.rs` | IMPLEMENTED | Declares the feature-gated skill modules |
-| `src/extras/js/types.rs` | IMPLEMENTED | Carries the resolved skill bundle; Phase 6 supersedes runtime ownership |
-| `src/extras/js/engine.rs` | TEST-ONLY | Historical evaluator retained for regression coverage; never a production fallback |
+| `src/extras/js/types.rs` | IMPLEMENTED | Parent-local limits, cancellation, permission, and effect result types |
 | `src/extras/js/worker.rs`, `realm.rs` | IMPLEMENTED | Production private-realm loading, fresh runtime/context ownership, and hidden capability ABI |
 | `src/extras/js/tool.rs`, `supervisor.rs` | IMPLEMENTED | Snapshot the current bundle and dispatch it to the contained worker |
 | `src/agent/runner.rs` | EXISTS | Retrieve from the user prompt before the first model call |

@@ -53,7 +53,7 @@ Production files live at the repository root:
 
 | Concern | Location |
 |---------|----------|
-| Historical Phase 1 runtime lifecycle and JS thread | `src/extras/js/engine.rs` (`#[cfg(test)]`; superseded ownership, regression behavior retained) |
+| Runtime behavior regression coverage | `src/extras/js/tests/worker_runtime.rs` (real worker; historical in-process evaluator removed) |
 | `JsTool` implementation | `src/extras/js/tool.rs` |
 | Parent effect services and secure file operations | `src/extras/js/host.rs` |
 | Request/response and permission-bridge types | `src/extras/js/types.rs`, `src/extras/js/protocol.rs` |
@@ -71,7 +71,7 @@ The exact Rust representation may evolve without changing this contract, but the
 fixed:
 
 - requests own source text, cancellation, a one-shot reply, and any frozen turn bundle;
-- responses contain one bounded `JsOutcome`;
+- responses contain one bounded `StepResult` with a closed `StepOutcome`;
 - permission requests carry a JS-facing operation, exact key/path, deadline, cancellation, and a
   reply channel;
 - process results contain bounded stdout/stderr, exit status, and truncation/timeout metadata; and
