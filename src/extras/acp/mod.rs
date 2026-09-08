@@ -126,79 +126,93 @@ impl SessionHistory {
                 > MAX_ACP_HISTORY_BYTES
     }
 
-    async fn compact_with<F, Fut>(&mut self, summarize: F) -> anyhow::Result<()>
+    /// Reduce history to its retention bounds, carrying successful summaries
+    /// between passes. Cancellation drops the pending summary and returns None;
+    /// only completed passes may have changed history at that point.
+    async fn compact_with<F, Fut>(&mut self, control: &TurnControl, mut summarize: F) -> Option<()>
     where
-        F: FnOnce(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
+        F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
         Fut: Future<Output = anyhow::Result<(String, usize)>>,
     {
         const SUMMARY_ALLOWANCE: usize = 16 * 1024;
-        if !self.needs_compaction() {
-            return Ok(());
+        if control.is_cancelled() {
+            return None;
         }
 
-        let mut selected_turns = 0usize;
-        let mut selected_bytes = 0usize;
-        while selected_turns < self.turns.len()
-            && (self.turns.len().saturating_sub(selected_turns) > MAX_ACP_HISTORY_TURNS
-                || self
-                    .serialized_bytes
-                    .saturating_sub(selected_bytes)
-                    .saturating_add(SUMMARY_ALLOWANCE)
-                    > MAX_ACP_HISTORY_BYTES)
-        {
-            selected_bytes =
-                selected_bytes.saturating_add(self.turns[selected_turns].serialized_bytes);
-            selected_turns += 1;
-        }
-
-        let mut cumulative_messages = Vec::with_capacity(selected_turns);
-        let mut serialized = Vec::new();
-        for turn in self.turns.iter().take(selected_turns) {
-            for message in &turn.messages {
-                let content = serde_json::to_string(message)
-                    .unwrap_or_else(|_| "[unserializable ACP message]".to_string());
-                let role = match message {
-                    Message::User { .. } => crate::session::MessageRole::User,
-                    Message::Assistant { .. } => crate::session::MessageRole::Assistant,
-                    Message::System { .. } => crate::session::MessageRole::System,
-                };
-                serialized.push(crate::session::SessionMessage {
-                    role,
-                    estimated_tokens: crate::session::Session::estimate_tokens(&content),
-                    content: content.into(),
-                    tool_call_id: None,
-                    tool: None,
-                });
+        // A provider may summarize only a leading prefix within its request
+        // budget. Each successful pass removes at least one complete turn;
+        // zero progress and failures take the bounded emergency path instead.
+        while self.needs_compaction() {
+            let mut selected_turns = 0usize;
+            let mut selected_bytes = 0usize;
+            while selected_turns < self.turns.len()
+                && (self.turns.len().saturating_sub(selected_turns) > MAX_ACP_HISTORY_TURNS
+                    || self
+                        .serialized_bytes
+                        .saturating_sub(selected_bytes)
+                        .saturating_add(SUMMARY_ALLOWANCE)
+                        > MAX_ACP_HISTORY_BYTES)
+            {
+                selected_bytes =
+                    selected_bytes.saturating_add(self.turns[selected_turns].serialized_bytes);
+                selected_turns += 1;
             }
-            cumulative_messages.push(serialized.len());
-        }
 
-        let (summary, messages_included) = match summarize(serialized, self.summary.clone()).await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::warn!(%error, "ACP history summarization failed; evicting oldest complete turns");
+            let mut cumulative_messages = Vec::with_capacity(selected_turns);
+            let mut serialized = Vec::new();
+            for turn in self.turns.iter().take(selected_turns) {
+                for message in &turn.messages {
+                    let content = serde_json::to_string(message)
+                        .unwrap_or_else(|_| "[unserializable ACP message]".to_string());
+                    let role = match message {
+                        Message::User { .. } => crate::session::MessageRole::User,
+                        Message::Assistant { .. } => crate::session::MessageRole::Assistant,
+                        Message::System { .. } => crate::session::MessageRole::System,
+                    };
+                    serialized.push(crate::session::SessionMessage {
+                        role,
+                        estimated_tokens: crate::session::Session::estimate_tokens(&content),
+                        content: content.into(),
+                        tool_call_id: None,
+                        tool: None,
+                    });
+                }
+                cumulative_messages.push(serialized.len());
+            }
+
+            let summarized = tokio::select! {
+                biased;
+                _ = control.cancelled() => return None,
+                result = summarize(serialized, self.summary.clone()) => result,
+            };
+            let (summary, messages_included) = match summarized {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, "ACP history summarization failed; evicting oldest complete turns");
+                    self.emergency_compact();
+                    return Some(());
+                }
+            };
+            let turns_included = cumulative_messages
+                .iter()
+                .take_while(|count| **count <= messages_included)
+                .count();
+            if turns_included == 0 {
+                tracing::warn!(
+                    "ACP history summary did not cover a complete turn; evicting oldest complete turns"
+                );
                 self.emergency_compact();
-                return Ok(());
+                return Some(());
             }
-        };
-        let turns_included = cumulative_messages
-            .iter()
-            .take_while(|count| **count <= messages_included)
-            .count();
-        if turns_included == 0 {
-            tracing::warn!(
-                "ACP history summary did not cover a complete turn; evicting oldest complete turns"
-            );
-            self.emergency_compact();
-            return Ok(());
-        }
-        for _ in 0..turns_included {
-            if let Some(turn) = self.turns.pop_front() {
-                self.serialized_bytes = self.serialized_bytes.saturating_sub(turn.serialized_bytes);
+            for _ in 0..turns_included {
+                if let Some(turn) = self.turns.pop_front() {
+                    self.serialized_bytes =
+                        self.serialized_bytes.saturating_sub(turn.serialized_bytes);
+                }
             }
+            self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
         }
-        self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
-        Ok(())
+        Some(())
     }
 
     fn emergency_compact(&mut self) {
@@ -1451,7 +1465,7 @@ async fn run_prompt(
         let compaction_model = &model_str;
         let compaction_retry = &state.cfg.retry;
         let compacted = history
-            .compact_with(move |messages, previous_summary| async move {
+            .compact_with(&control, move |messages, previous_summary| async move {
                 compaction_client
                     .compress_messages(
                         compaction_model,
@@ -1465,14 +1479,9 @@ async fn run_prompt(
                     .await
             })
             .await;
-        if let Err(error) = compacted {
-            return respond_prompt_failure(
-                session_id,
-                responder,
-                cx,
-                registration,
-                format!("ACP history compaction failed: {error}"),
-            );
+        if compacted.is_none() {
+            let _ = respond_terminal(registration, responder, StopReason::Cancelled);
+            return Ok(());
         }
     }
     let prior_history =
@@ -1888,6 +1897,8 @@ async fn respond_cancelled_after_runner(
 
 #[cfg(test)]
 mod history_tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use rig::agent::AgentBuilder;
     use rig::completion::message::{ToolResultContent, UserContent};
@@ -2154,7 +2165,7 @@ mod history_tests {
         }
         assert!(by_count.needs_compaction());
         by_count
-            .compact_with(|messages, _| async move {
+            .compact_with(&TurnControl::new(), |messages, _| async move {
                 let count = messages.len();
                 Ok(("origin user-0 assistant-0".to_string(), count))
             })
@@ -2175,7 +2186,7 @@ mod history_tests {
             vec![Message::assistant("oversized")],
         );
         by_bytes
-            .compact_with(|messages, _| async move {
+            .compact_with(&TurnControl::new(), |messages, _| async move {
                 let count = messages.len();
                 Ok(("oversized origin retained".to_string(), count))
             })
@@ -2189,6 +2200,144 @@ mod history_tests {
     }
 
     #[tokio::test]
+    async fn partial_summaries_finish_compaction_and_carry_forward_prior_evidence() {
+        for byte_limited in [false, true] {
+            let mut history = SessionHistory::default();
+            let turn_count = if byte_limited {
+                4
+            } else {
+                MAX_ACP_HISTORY_TURNS + 3
+            };
+            for index in 0..turn_count {
+                let prompt = if byte_limited {
+                    format!("user-{index} {}", "x".repeat(MAX_ACP_HISTORY_BYTES / 2))
+                } else {
+                    format!("user-{index}")
+                };
+                history.commit_completed_turn(
+                    &prompt,
+                    vec![Message::assistant(format!("assistant-{index}"))],
+                );
+            }
+            let retained = history.snapshot_with_tool_result_retention(0)[6..].to_vec();
+            let mut prior_summaries = Vec::new();
+            history
+                .compact_with(&TurnControl::new(), |messages, previous| {
+                    let index = prior_summaries.len();
+                    assert!(messages[0].content.contains(&format!("user-{index}")));
+                    prior_summaries.push(previous);
+                    async move { Ok((format!("covered through turn {index}"), 2)) }
+                })
+                .await
+                .expect("compaction is not cancelled");
+            assert!(!history.needs_compaction());
+            assert_eq!(
+                prior_summaries,
+                vec![
+                    None,
+                    Some("covered through turn 0".into()),
+                    Some("covered through turn 1".into())
+                ]
+            );
+            let snapshot = history.snapshot_with_tool_result_retention(0);
+            assert_eq!(
+                snapshot[0],
+                Message::assistant("[Recap of earlier ACP turns]\ncovered through turn 2")
+            );
+            assert_eq!(snapshot[1..], retained);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_summary_preserves_history_and_releases_its_lock() {
+        struct PendingSummary(Arc<AtomicBool>);
+        impl Drop for PendingSummary {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        for completed_first in [false, true] {
+            let history = Arc::new(Mutex::new(SessionHistory::default()));
+            {
+                let mut history = history.lock().await;
+                for index in 0..=MAX_ACP_HISTORY_TURNS + usize::from(completed_first) {
+                    history.commit_completed_turn(
+                        &format!("user-{index}"),
+                        vec![Message::assistant("answer")],
+                    );
+                }
+            }
+            let mut expected = history.lock().await.snapshot_with_tool_result_retention(0);
+            if completed_first {
+                expected.drain(..2);
+                expected.insert(
+                    0,
+                    Message::assistant("[Recap of earlier ACP turns]\nfirst pass recap"),
+                );
+            }
+            let control = TurnControl::new();
+            let entered = Notify::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let compact = async {
+                let mut history = history.lock().await;
+                let mut first = true;
+                history
+                    .compact_with(&control, |_, _| {
+                        let complete_this_pass = completed_first && std::mem::take(&mut first);
+                        let dropped = dropped.clone();
+                        let entered = &entered;
+                        async move {
+                            if complete_this_pass {
+                                return Ok(("first pass recap".into(), 2));
+                            }
+                            let _pending = PendingSummary(dropped);
+                            entered.notify_one();
+                            std::future::pending::<anyhow::Result<(String, usize)>>().await
+                        }
+                    })
+                    .await
+            };
+            let cancel = async {
+                entered.notified().await;
+                assert!(control.cancel());
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(compact, cancel)
+            })
+            .await
+            .expect("cancellation must finish without waiting for the summarizer");
+            assert!(result.is_none());
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "the pending provider future must be dropped"
+            );
+            let mut history = history
+                .try_lock()
+                .expect("cancelled compaction releases the session lock");
+            assert_eq!(history.snapshot_with_tool_result_retention(0), expected);
+            assert!(
+                history
+                    .compact_with(
+                        &control,
+                        |_, _| -> std::future::Ready<anyhow::Result<(String, usize)>> {
+                            panic!("an already-cancelled turn must not start a summary")
+                        }
+                    )
+                    .await
+                    .is_none()
+            );
+            history
+                .compact_with(&TurnControl::new(), |messages, _| async move {
+                    Ok(("recovered recap".into(), messages.len()))
+                })
+                .await
+                .expect("a later turn can compact the unchanged history");
+            assert!(!history.needs_compaction());
+        }
+    }
+
+    #[tokio::test]
     async fn failed_or_incomplete_summary_cannot_wedge_acp_history() {
         for incomplete in [false, true] {
             let mut history = SessionHistory::default();
@@ -2198,7 +2347,7 @@ mod history_tests {
             );
             assert!(history.needs_compaction());
             let result = history
-                .compact_with(|_, _| async move {
+                .compact_with(&TurnControl::new(), |_, _| async move {
                     if incomplete {
                         Ok(("did not cover a turn".to_string(), 0))
                     } else {
@@ -2206,7 +2355,7 @@ mod history_tests {
                     }
                 })
                 .await;
-            assert!(result.is_ok());
+            assert!(result.is_some());
             assert!(!history.needs_compaction());
             assert_eq!(
                 history.snapshot(),
@@ -2216,19 +2365,6 @@ mod history_tests {
                 ))]
             );
         }
-    }
-
-    #[test]
-    fn initialize_truthfully_does_not_advertise_load_session() {
-        assert!(!acp_capabilities().load_session);
-    }
-
-    #[test]
-    fn initialize_advertises_close_session() {
-        assert!(
-            acp_capabilities().session_capabilities.close.is_some(),
-            "session/close must be advertised so clients can release capacity"
-        );
     }
 }
 
@@ -2300,11 +2436,6 @@ mod protocol_tests {
         ) -> Result<(), agent_client_protocol::Error> {
             connect_agent(self.0, client).await
         }
-    }
-
-    #[test]
-    fn initialize_always_advertises_the_implemented_v1_protocol() {
-        assert_eq!(acp_protocol_version(), ProtocolVersion::V1);
     }
 
     #[cfg(feature = "hooks")]
@@ -2578,7 +2709,16 @@ mod protocol_tests {
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
+                assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
                 assert!(!initialized.agent_capabilities.load_session);
+                assert!(
+                    initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .close
+                        .is_some(),
+                    "clients must be told that session/close is supported"
+                );
 
                 let first = cx
                     .send_request(NewSessionRequest::new(cwd.clone()))

@@ -136,6 +136,14 @@ traffic, so a client without the key is rejected immediately.
 
 The machine-readable summary lives in [`docs/acp-registry.json`](acp-registry.json).
 
+ACP history is kept in memory for the lifetime of the session. Before a new
+model turn, history exceeding 128 complete turns or 2 MiB is summarized from
+the oldest turns until it fits those limits. If a provider summarizes only a
+prefix, the next pass carries that recap forward. A failed summary or one that
+covers no complete turn triggers bounded eviction with an explicit recap notice.
+Cancellation interrupts a pending summary; completed passes remain committed,
+and the unsummarized history remains available to a later prompt.
+
 ## Permission bridge
 
 When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow always / Deny) is forwarded back to the agent.
