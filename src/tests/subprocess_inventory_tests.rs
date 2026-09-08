@@ -1368,21 +1368,9 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/mod.rs",
-        "let mut command = std::process::Command::new(\"lazygit\");",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/mod.rs",
         "std::process::Command::new(\"git\")",
         1,
         "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/ui/mod.rs",
-        "std::process::Command::new(shell)",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
     ),
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
@@ -3101,11 +3089,7 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
         "let mut cmd = Command::new(seatbelt);",
         &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
     ),
-    (
-        "src/ui/mod.rs",
-        ".output()",
-        &["TC-EXPLICIT-USER-SHELL", "TC-INTERNAL-GIT"],
-    ),
+    ("src/ui/mod.rs", ".output()", &["TC-INTERNAL-GIT"]),
 ];
 
 const ALLOWED_CURRENT_CLASSES: &[&str] = &[
@@ -3612,21 +3596,9 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/mod.rs",
-        "let mut command = std::process::Command::new(\"lazygit\");",
-        1,
-        "TC-SUPPORT-UTILITY",
-    ),
-    (
-        "src/ui/mod.rs",
         "std::process::Command::new(\"git\")",
         1,
         "TC-INTERNAL-GIT",
-    ),
-    (
-        "src/ui/mod.rs",
-        "std::process::Command::new(shell)",
-        1,
-        "TC-EXPLICIT-USER-SHELL",
     ),
 ];
 
@@ -3674,11 +3646,7 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
         "let mut cmd = Command::new(seatbelt);",
         &["TC-PROJECT-AUTOMATION", "TC-MCP-STDIO", "TC-MODEL-ACTION"],
     ),
-    (
-        "src/ui/mod.rs",
-        ".output()",
-        &["TC-EXPLICIT-USER-SHELL", "TC-INTERNAL-GIT"],
-    ),
+    ("src/ui/mod.rs", ".output()", &["TC-INTERNAL-GIT"]),
 ];
 
 /// Files whose non-disposition launch expressions all have one owner.
@@ -4278,7 +4246,7 @@ fn subprocess_inventory_rejects_site_specific_relabels_in_mixed_files() {
             ".output()",
             1,
             "TC-SUPPORT-UTILITY",
-            "the explicit shell output occurrence in the mixed UI family",
+            "the internal Git output occurrence in the UI module",
         ),
         (
             "src/ui/mod.rs",

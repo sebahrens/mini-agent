@@ -23,7 +23,6 @@ mod skill_admission_schema;
 #[cfg(feature = "skills")]
 mod skill_canary_routing;
 #[cfg(feature = "skills")]
-#[cfg(feature = "skills")]
 mod skill_embedder;
 #[cfg(feature = "skills")]
 mod skill_event_attribution;

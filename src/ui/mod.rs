@@ -521,18 +521,6 @@ pub(crate) fn rebind_worktree_workspace(
     Ok(())
 }
 
-pub(crate) fn run_shell_in_workspace(
-    shell: &str,
-    command: &str,
-    workspace: &std::path::Path,
-) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(shell)
-        .arg("-c")
-        .arg(command)
-        .current_dir(workspace)
-        .output_guarded()
-}
-
 pub(crate) fn git_stash_in_workspace(
     workspace: &std::path::Path,
 ) -> std::io::Result<std::process::Output> {
@@ -540,12 +528,6 @@ pub(crate) fn git_stash_in_workspace(
         .arg("stash")
         .current_dir(workspace)
         .output_guarded()
-}
-
-pub(crate) fn lazygit_in_workspace(workspace: &std::path::Path) -> std::process::Command {
-    let mut command = std::process::Command::new("lazygit");
-    command.current_dir(workspace);
-    command
 }
 
 /// Result of a background agent prebuild.

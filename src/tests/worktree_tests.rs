@@ -381,15 +381,63 @@ mod tests {
                 String::from_utf8_lossy(&shell_cwd.stdout).trim(),
                 canonical_worktree.display().to_string()
             );
-            let bang_cwd =
-                crate::ui::run_shell_in_workspace("sh", "pwd", workspace.root()).unwrap();
+            let bang_cwd = sandbox
+                .run_explicit_shell("!pwd", crate::sandbox::DEFAULT_COMMAND_LIMITS, None)
+                .await
+                .unwrap();
+            assert!(bang_cwd.succeeded());
             assert_eq!(
-                String::from_utf8_lossy(&bang_cwd.stdout).trim(),
+                bang_cwd.rendered_output().trim(),
                 canonical_worktree.display().to_string()
             );
+            assert_eq!(bang_cwd.audit.cwd, canonical_worktree);
+
+            // Exercise the runners used by lazygit's probe and interactive launch.
+            // A command's stale cwd must not override the rebound workspace.
+            let mut probe = tokio::process::Command::new("sh");
+            probe.args(["-c", "pwd"]).current_dir(repo.path());
+            let probe_cwd = sandbox
+                .output_support_command(probe, crate::sandbox::DEFAULT_COMMAND_LIMITS)
+                .await
+                .unwrap();
+            assert_eq!(probe_cwd.status, crate::sandbox::CommandStatus::Completed);
+            assert!(probe_cwd.exit_status.unwrap().success());
+            assert_eq!(
+                String::from_utf8_lossy(&probe_cwd.stdout).trim(),
+                canonical_worktree.display().to_string()
+            );
+
+            let mut utility = tokio::process::Command::new("sh");
+            utility
+                .args(["-c", "pwd > support-cwd.txt"])
+                .current_dir(repo.path());
+            let utility_status = sandbox
+                .status_support_command(
+                    utility,
+                    crate::sandbox::SupportCommandLimits {
+                        timeout: std::time::Duration::from_secs(5),
+                    },
+                    crate::sandbox::SupportCommandAudit::new(
+                        "worktree-test",
+                        "user-trusted-bypass",
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                utility_status.status,
+                crate::sandbox::CommandStatus::Completed
+            );
+            assert!(utility_status.exit_status.unwrap().success());
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("support-cwd.txt"))
+                    .unwrap()
+                    .trim(),
+                canonical_worktree.display().to_string()
+            );
+            assert!(!repo.path().join("support-cwd.txt").exists());
+            std::fs::remove_file(worktree.join("support-cwd.txt")).unwrap();
         }
-        let lazygit = crate::ui::lazygit_in_workspace(&worktree);
-        assert_eq!(lazygit.get_current_dir(), Some(worktree.as_path()));
         #[cfg(feature = "hooks")]
         assert_eq!(
             crate::extras::hooks::best_effort_ctx().cwd,

@@ -205,13 +205,13 @@ The audit currently resolves as follows:
 |---|---|
 | `TC-MODEL-ACTION` | `src/sandbox.rs` opaque-shell/zerobox/Seatbelt/bwrap constructors and terminal `cmd.spawn()`; Bash and JS callers are named in the normative table. Shared direct-exec wrapper constructors are occurrence-owned separately. |
 | `TC-BROKER-JS-WORKER` | Production bubblewrap constructor and terminal launches in `src/sandbox/worker/linux.rs`; inline adversarial child launches remain exact `TEST-ONLY` fingerprints. |
-| `TC-EXPLICIT-USER-SHELL` | Delegating calls in `src/startup.rs` and `src/ui/app.rs::run_bang_command`; shared construction, capture, audit, and rendering live in `src/sandbox.rs`. The explicit-workspace regression helper in `src/ui/mod.rs` is occurrence-owned separately. |
-| `TC-LOOP-VALIDATION` | Shared bounded runner in `src/extras/loop/validation.rs`; headless and interactive call sites contain no raw process constructor. |
+| `TC-EXPLICIT-USER-SHELL` | Delegating calls in `src/startup.rs` and `src/ui/app.rs::run_bang_command`; shared construction, capture, audit, and rendering live in `src/sandbox.rs`. |
+| `TC-LOOP-VALIDATION` | Shared bounded runner in `src/extras/validation.rs`; headless and interactive call sites contain no raw process constructor. |
 | `TC-PROJECT-AUTOMATION` | Direct program plus the project-automation occurrences of zerobox/Seatbelt/bwrap constructors in `src/sandbox.rs`; terminal spawn in `src/extras/hooks/subprocess.rs`. |
 | `TC-MCP-STDIO` | Tokio process import/type and RMCP terminal spawn in `src/extras/mcp/client.rs`. |
 | `TC-LSP-SERVICE` | Tokio child/stdin types, constructor, and terminal spawn in `src/extras/lsp/client.rs`. |
 | `TC-INTERNAL-GIT` | The Tokio constructor/import in `src/extras/git_worktree/mod.rs`, the shared bounded runner used by the background session-status refresh, and the explicit-workspace stash helper in `src/ui/mod.rs`. |
-| `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, the explicit-workspace lazygit helper in `src/ui/mod.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, and the fixed macOS version probe in `src/sandbox/worker/macos.rs`. Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. Windows command-interpreter site: the `cmd /c start` opener fallback in `src/ui/renderer.rs`. |
+| `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, and the fixed macOS version probe in `src/sandbox/worker/macos.rs`. Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. Windows command-interpreter site: the `cmd /c start` opener fallback in `src/ui/renderer.rs`. |
 | `TC-INTERNAL-VERIFICATION` | Fixed embedded-policy Bash constructor/status in `src/extras/loop/mod.rs`; fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |
 | `TC-LIFECYCLE-HELPER` | Shared bounded captured-process terminal and in-process Unix process-group signalling in `src/sandbox.rs`. Caller trust remains the caller's class; this helper grants no authority itself. |
 | `TEST-ONLY` | Inline Bash-tool and loop-validation process-existence helpers, plus the unconfined protocol-pipe worker fixture in `src/sandbox/worker.rs`. |
