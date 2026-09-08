@@ -59,6 +59,31 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
     )
 }
 
+#[cfg(feature = "mcp")]
+pub(crate) async fn collect_mcp_tools(
+    manager: &McpClientManager,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    timeouts: crate::extras::mcp::McpToolTimeouts,
+) -> Vec<crate::extras::mcp::tool::McpTool> {
+    let mut tools = manager
+        .collect_tools_with_timeouts(permission, ask_tx, timeouts)
+        .await;
+    tools.retain(|tool| {
+        let name = rig::tool::ToolDyn::name(tool);
+        if is_reserved_builtin_tool_name(&name) {
+            manager.push_tool_notice(format!(
+                "MCP tool '{name}' from server '{}' omitted: name reserved by a built-in tool",
+                tool.server_name
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    tools
+}
+
 fn canonical_tool_name(name: &str) -> &str {
     if name == "bash" { "shell" } else { name }
 }
@@ -725,17 +750,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             }
             let timeouts =
                 crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
-            let mcp_tools = manager
-                .collect_tools_with_timeouts(permission.clone(), ask_tx.clone(), timeouts)
-                .await;
+            let mcp_tools =
+                collect_mcp_tools(manager, permission.clone(), ask_tx.clone(), timeouts).await;
             for t in mcp_tools {
-                if is_reserved_builtin_tool_name(&rig::tool::ToolDyn::name(&t)) {
-                    tracing::warn!(
-                        "MCP tool skipped because its name is reserved by a built-in tool"
-                    );
-                } else {
-                    all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
-                }
+                all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
             }
         }
 

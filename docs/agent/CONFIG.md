@@ -1437,6 +1437,9 @@ Model-visible tool names use at most 64 ASCII letters, digits, underscores, or
 hyphens. Valid unique names stay unchanged; duplicate or incompatible names get
 a normalized server prefix and, when needed, a numeric suffix. Operator notices
 list the aliases. MCP requests and permission keys retain the original tool name.
+Tools whose registered names collide with built-in tools are omitted with a
+notice naming the tool and server. Connection and catalog notices appear in the
+TUI after agent construction or rebuilding, and on stderr in headless runs.
 
 The server must reserve stdout for MCP protocol messages and write diagnostics
 to stderr. Every server must complete the MCP initialization handshake within

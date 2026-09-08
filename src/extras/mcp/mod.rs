@@ -90,7 +90,7 @@ impl McpClientManager {
         }
     }
 
-    fn push_tool_notice(&self, notice: String) {
+    pub(crate) fn push_tool_notice(&self, notice: String) {
         // Info lands in the log file, never on stderr, so the TUI stays clean.
         tracing::info!("{notice}");
         self.tool_notices

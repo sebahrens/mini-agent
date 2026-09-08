@@ -651,6 +651,15 @@ impl<'a> App<'a> {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
+            // Every adoption/rebuild path returns here, including a prompt that
+            // awaited prebuild and deferred events that immediately continue.
+            #[cfg(feature = "mcp")]
+            if let Some(manager) = self.ui.mcp_manager.as_mut() {
+                for notice in manager.take_notices() {
+                    self.renderer
+                        .write_line(&sanitize_output(&notice), C_ERROR)?;
+                }
+            }
             if let Some(event) = self.deferred_user_events.pop_front() {
                 match self.handle_user_event(event).await? {
                     ControlFlow::Break(()) => break,
@@ -680,7 +689,7 @@ impl<'a> App<'a> {
                     }
                 }
                 Some(prebuilt) = async { self.prebuild_rx.as_mut()?.recv().await }, if self.run.agent.is_none() => {
-                    self.take_prebuild(prebuilt, true)?;
+                    self.take_prebuild(prebuilt);
                     self.refresh()?;
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
@@ -709,7 +718,7 @@ impl<'a> App<'a> {
                         && self.run.agent.is_none()
                         && let Ok(payload) = rx.try_recv()
                     {
-                        self.take_prebuild(payload, false)?;
+                        self.take_prebuild(payload);
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -2395,25 +2404,18 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    fn take_prebuild(&mut self, prebuilt: PrebuildPayload, notify: bool) -> io::Result<()> {
+    fn take_prebuild(&mut self, prebuilt: PrebuildPayload) {
         #[cfg(feature = "mcp")]
         {
             let (built_agent, built_mcp) = prebuilt;
             self.run.agent = Some(built_agent);
             self.ui.mcp_manager = built_mcp;
-            if notify && let Some(m) = self.ui.mcp_manager.as_mut() {
-                for notice in m.take_notices() {
-                    self.renderer.write_line(&notice, C_ERROR)?;
-                }
-            }
         }
         #[cfg(not(feature = "mcp"))]
         {
-            let _ = notify;
             self.run.agent = Some(prebuilt);
         }
         self.prebuild_rx = None;
-        Ok(())
     }
 
     #[cfg(feature = "mcp")]

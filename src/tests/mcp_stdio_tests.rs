@@ -1308,6 +1308,75 @@ async fn mcp_registered_aliases_preserve_wire_names_and_permission_keys() {
 
 // ── Registered-name collisions and structured results ──────────────────
 
+#[tokio::test]
+async fn builder_omissions_reach_the_headless_notice_sink_after_collection() {
+    let fixture = FixtureBuild::compile();
+    let mut leases = Vec::new();
+    let mut handles = Vec::new();
+    for (server, tool) in [("reserved", "read"), ("safe", "probe")] {
+        let lease = fixture.lease(server);
+        handles.push(
+            McpClientHandle::connect(
+                CompactString::new(server),
+                &fixture.config_named(
+                    fixture.executable.display().to_string(),
+                    Vec::new(),
+                    "normal",
+                    &lease,
+                    Some(tool),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        leases.push(lease);
+    }
+    let mut manager = McpClientManager::from_handles(handles);
+    manager.notices.push("connection notice".into());
+    let mut shown = Vec::new();
+    crate::startup::report_headless_mcp_notices(Some(&mut manager), |notice| {
+        shown.push(notice.to_string())
+    });
+    assert_eq!(shown, ["connection notice"]);
+
+    let tools = crate::agent::builder::collect_mcp_tools(
+        &manager,
+        Some(permission_for_named_tools(&[("safe", "probe")])),
+        None,
+        McpToolTimeouts::default(),
+    )
+    .await;
+    assert_eq!(
+        tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+        ["probe"]
+    );
+    manager.push_tool_notice("\u{1b}[31mlate catalog notice\u{1b}[0m".into());
+    crate::startup::report_headless_mcp_notices(Some(&mut manager), |notice| {
+        shown.push(notice.to_string())
+    });
+    assert_eq!(
+        shown,
+        [
+            "connection notice",
+            "MCP tool 'read' from server 'reserved' omitted: name reserved by a built-in tool",
+            "late catalog notice",
+        ]
+    );
+    crate::startup::report_headless_mcp_notices(Some(&mut manager), |_| panic!("notice repeated"));
+    crate::startup::report_headless_mcp_notices(None, |_| {
+        panic!("absent manager emitted a notice")
+    });
+    let mut pids = Vec::new();
+    for lease in &leases {
+        pids.push(wait_for_pid(lease).await);
+    }
+    shutdown(manager).await;
+    for pid in pids {
+        assert_process_reaped(pid).await;
+    }
+    fixture.cleanup();
+}
+
 /// Allow every fixture server's tool under its bare permission key.
 fn permission_for_named_tools(entries: &[(&str, &str)]) -> Arc<Mutex<PermissionChecker>> {
     let permission = PermissionConfig {

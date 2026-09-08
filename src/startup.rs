@@ -275,12 +275,23 @@ pub(crate) async fn connect_headless_mcp(
     if servers.is_empty() {
         return None;
     }
-    let manager =
+    let mut manager =
         crate::extras::mcp::McpClientManager::connect_all_in_binding(servers, workspace).await;
-    for notice in &manager.notices {
-        eprintln!("{}", notice);
-    }
+    report_headless_mcp_notices(Some(&mut manager), |notice| eprintln!("{notice}"));
     Some(manager)
+}
+
+/// Drain both connection and later catalog notices to the headless diagnostic sink.
+#[cfg(feature = "mcp")]
+pub(crate) fn report_headless_mcp_notices(
+    manager: Option<&mut crate::extras::mcp::McpClientManager>,
+    mut report: impl FnMut(&str),
+) {
+    if let Some(manager) = manager {
+        for notice in manager.take_notices() {
+            report(&crate::ui::events::sanitize_output(&notice));
+        }
+    }
 }
 
 // ── Startup state ────────────────────────────────────────────────────────
@@ -1450,7 +1461,7 @@ impl Startup {
             let read_tracker = self.session.read_tracker.clone();
             let todo_store = self.session.todos.clone();
             #[cfg(feature = "mcp")]
-            let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
+            let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
                 None
             } else {
                 connect_headless_mcp(&self.cfg, &self.workspace).await
@@ -1482,6 +1493,8 @@ impl Startup {
                 mcp_manager.as_ref(),
             )
             .await;
+            #[cfg(feature = "mcp")]
+            report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
             #[cfg(feature = "advisor")]
             {
                 let mut msgs = self.session.messages.clone();
@@ -1600,7 +1613,7 @@ impl Startup {
         let read_tracker = self.session.read_tracker.clone();
         let todo_store = self.session.todos.clone();
         #[cfg(feature = "mcp")]
-        let mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
+        let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
             None
         } else {
             connect_headless_mcp(&self.cfg, &self.workspace).await
@@ -1631,6 +1644,8 @@ impl Startup {
             mcp_manager.as_ref(),
         )
         .await;
+        #[cfg(feature = "mcp")]
+        report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
         let result = crate::extras::r#loop::headless::run_headless_loop(
             agent,
             &self.cli,
