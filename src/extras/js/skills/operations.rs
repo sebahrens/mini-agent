@@ -275,23 +275,29 @@ fn estimate_round_trips_saved(direct_successes: u64, declared_effect_methods: u6
 /// query work roughly eightfold. Grouping once and joining the results per
 /// revision keeps the exact source-kind/source-id and production matching, the
 /// distinct-turn semantics, and the absent-baseline `n/a` behavior.
-fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> {
-    let mut statement = store.connection().prepare(
-        "WITH qualified AS (
+/// The statistics query, named so the plan regression can `EXPLAIN` exactly
+/// what production runs.
+const SKILL_STATS_SQL: &str = "WITH lost_turns AS (
+             -- Grouped once rather than probed per outcome: no index covers
+             -- (event_kind, turn_id) without a skill_id, so a correlated
+             -- subquery here would scan every event for every outcome.
+             SELECT DISTINCT turn_id, production
+               FROM skill_events
+              WHERE event_kind = 'observability_lost'
+         ),
+         qualified AS (
              SELECT outcome.evidence_id, outcome.turn_id, outcome.verify_passed,
                     outcome.source_kind, outcome.source_id, outcome.production
                FROM skill_task_outcomes AS outcome
+               LEFT JOIN lost_turns
+                 ON lost_turns.turn_id = outcome.turn_id
+                AND lost_turns.production = outcome.production
               WHERE outcome.source_kind NOT IN ('no_verify_command', 'gate_skipped')
                 -- A turn whose telemetry was lost or rejected is unknown, not
                 -- a verified no-skill run: exclude it from utility and from the
                 -- baseline comparison alike.
                 AND outcome.evidence_complete = 1
-                AND NOT EXISTS (
-                    SELECT 1 FROM skill_events AS lost
-                     WHERE lost.turn_id = outcome.turn_id
-                       AND lost.event_kind = 'observability_lost'
-                       AND lost.production = outcome.production
-                )
+                AND lost_turns.turn_id IS NULL
          ),
          linked AS (
              SELECT link.skill_id, qualified.turn_id, qualified.verify_passed,
@@ -361,8 +367,10 @@ fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> 
            LEFT JOIN baseline_counts ON baseline_counts.skill_id = revision.id
            LEFT JOIN last_invoked ON last_invoked.skill_id = revision.id
           WHERE revision.identity_version = 2
-          ORDER BY COALESCE(stats.invoked_count, 0) DESC, revision.id",
-    )?;
+          ORDER BY COALESCE(stats.invoked_count, 0) DESC, revision.id";
+
+fn load_skill_stats(store: &SkillStore) -> anyhow::Result<Vec<SkillUsageStats>> {
+    let mut statement = store.connection().prepare(SKILL_STATS_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -2053,10 +2061,55 @@ mod tests {
         (best, rows)
     }
 
+    /// The regression this pins is structural, not temporal.
+    ///
+    /// The previous shape ran a correlated subquery per retained revision that
+    /// *scanned* every task outcome, with a further source-scope search inside
+    /// it; doubling the corpus multiplied query work roughly eightfold. Wall
+    /// clock cannot express that on a shared runner, so the plan is asserted
+    /// instead: no correlated subquery may scan a table. A correlated subquery
+    /// that probes an index (the links anti-join) stays allowed, because it is
+    /// O(log n) per row rather than a rescan.
+    #[test]
+    fn the_statistics_plan_has_no_scanning_correlated_subquery() {
+        let (root, paths, _) = fixture();
+        let store = SkillStore::open_at(&paths).unwrap();
+        let mut statement = store
+            .connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {SKILL_STATS_SQL}"))
+            .unwrap();
+        // (id, parent, detail) describes the plan tree; children of a node are
+        // the rows whose parent is that node's id.
+        let nodes: Vec<(i64, i64, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(3)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        let mut offenders = Vec::new();
+        for (id, _, detail) in &nodes {
+            if !detail.contains("CORRELATED") {
+                continue;
+            }
+            for (_, parent, child) in &nodes {
+                if parent == id && child.starts_with("SCAN") {
+                    offenders.push(format!("{detail} -> {child}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a correlated subquery rescans a table for every row: {offenders:#?}\nplan: {:#?}",
+            nodes.iter().map(|node| &node.2).collect::<Vec<_>>()
+        );
+        drop(statement);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn usage_stats_do_not_rescan_every_baseline_for_every_revision() {
-        let (small, _) = stats_latency_for(20, false);
-        let (large, rows) = stats_latency_for(80, false);
+        let (_, rows) = stats_latency_for(80, false);
 
         // With one oracle scope per skill, each revision's comparison group is
         // its own baseline turn.
@@ -2068,18 +2121,6 @@ mod tests {
             assert_eq!(row.baseline_passes, 0);
             assert_eq!(row.gym_tasks, 0);
         }
-
-        // The previous shape scanned every baseline and every observed task for
-        // every revision, so doubling both sets multiplied its work by roughly
-        // seven. Quadrupling here must stay near the corpus growth itself; the
-        // bound is loose enough to survive a noisy runner.
-        let floor = std::time::Duration::from_micros(200);
-        let small = small.max(floor);
-        assert!(
-            large <= small * 8,
-            "stats query work grew faster than the corpus: 20 revisions {small:?}, \
-             80 revisions {large:?}"
-        );
     }
 
     #[test]
