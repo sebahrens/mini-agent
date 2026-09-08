@@ -63,7 +63,7 @@ fn write_response(stdout: &mut impl Write, response: &str) {
     stdout.flush().unwrap();
 }
 
-fn tool_payload() -> String {
+fn tool_payload(request: &str) -> String {
     let args = env::args()
         .skip(1)
         .map(|arg| format!("\"{}\"", escape(&arg)))
@@ -75,7 +75,7 @@ fn tool_payload() -> String {
     let cwd = env::current_dir().unwrap();
     let executable = env::current_exe().unwrap();
     format!(
-        "{{\"args\":[{args}],\"configured_env\":\"{}\",\"inherited_home\":{},\"inherited_env\":{inherited_env},\"cwd\":\"{}\",\"executable\":\"{}\",\"pid\":{}}}",
+        "{{\"request\":{request},\"args\":[{args}],\"configured_env\":\"{}\",\"inherited_home\":{},\"inherited_env\":{inherited_env},\"cwd\":\"{}\",\"executable\":\"{}\",\"pid\":{}}}",
         escape(&configured),
         inherited_home
             .as_deref()
@@ -195,8 +195,8 @@ fn main() {
                 &mut stdout,
                 &format!(
                     "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"{tool_name}\",\"description\":\"report fixture process inputs\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}",
-                    tool_name = env::var("MCP_FIXTURE_TOOL_NAME")
-                        .unwrap_or_else(|_| "probe".to_string())
+                    tool_name = escape(&env::var("MCP_FIXTURE_TOOL_NAME")
+                        .unwrap_or_else(|_| "probe".to_string()))
                 ),
             );
         } else if compact.contains("\"method\":\"tools/call\"") {
@@ -204,7 +204,7 @@ fn main() {
                 continue;
             }
             let id = request_id(&compact);
-            let payload = escape(&tool_payload());
+            let payload = escape(&tool_payload(&line));
             let result = match mode.as_str() {
                 "structured-only" => {
                     "{\"content\":[],\"structuredContent\":{\"answer\":42},\"isError\":false}"
@@ -1254,30 +1254,55 @@ async fn mcp_duplicate_tool_names_are_namespaced_per_server() {
 }
 
 #[tokio::test]
-async fn mcp_distinct_tool_names_keep_bare_names() {
+async fn mcp_registered_aliases_preserve_wire_names_and_permission_keys() {
     let fixture = FixtureBuild::compile();
-    let lease = fixture.lease("single");
-    let handle = McpClientHandle::connect(
-        CompactString::new("only"),
-        &fixture.config(
-            fixture.executable.display().to_string(),
-            Vec::new(),
-            "normal",
-            &lease,
-        ),
-    )
-    .await
-    .unwrap();
-    let mut manager = McpClientManager::from_handles(vec![handle]);
-    let tools = manager
-        .collect_tools(Some(permission_for(Action::Allow)), None)
-        .await;
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name(), "probe");
-    assert!(manager.take_notices().is_empty());
-    let pid = wait_for_pid(&lease).await;
-    shutdown(manager).await;
-    assert_process_reaped(pid).await;
+    let long_name = "t".repeat(80);
+    for (index, (wire_name, expected_alias)) in [
+        ("probe", "probe".to_string()),
+        ("search.docs", "only__search_docs".to_string()),
+        ("検索", "only____".to_string()),
+        ("say\"hi", "only__say_hi".to_string()),
+        (long_name.as_str(), format!("only__{}", "t".repeat(58))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lease = fixture.lease(&format!("unique-{index}"));
+        let handle = McpClientHandle::connect(
+            CompactString::new("only"),
+            &fixture.config_named(
+                fixture.executable.display().to_string(),
+                Vec::new(),
+                "normal",
+                &lease,
+                Some(wire_name),
+            ),
+        )
+        .await
+        .unwrap();
+        let mut manager = McpClientManager::from_handles(vec![handle]);
+        // Only the original identity is authorized: alias-based permission checks fail.
+        let permission = permission_for_named_tools(&[("only", wire_name)]);
+        let tools = manager
+            .collect_tools_with_timeouts(Some(permission), None, McpToolTimeouts::default())
+            .await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), expected_alias);
+        assert_eq!(tools[0].definition.name, wire_name);
+        let output = tools[0].call("{}".to_string()).await.unwrap();
+        let payload = parse_fixture_output(&output);
+        assert_eq!(payload["request"]["params"]["name"], wire_name);
+        let notices = manager.take_notices();
+        if expected_alias == wire_name {
+            assert!(notices.is_empty());
+        } else {
+            assert_eq!(notices.len(), 1);
+            assert!(notices[0].contains(&expected_alias));
+        }
+        let pid = wait_for_pid(&lease).await;
+        shutdown(manager).await;
+        assert_process_reaped(pid).await;
+    }
     fixture.cleanup();
 }
 
@@ -1357,6 +1382,10 @@ async fn mcp_generated_names_cannot_collide_with_an_unchanged_name() {
             .unwrap_or_else(|error| panic!("{expected} must be callable: {error}"));
         let payload = parse_fixture_output(&output);
         assert_eq!(payload["args"][0], expected, "names: {names:?}");
+        assert_eq!(
+            payload["request"]["params"]["name"],
+            tool.definition.name.as_ref()
+        );
     }
 
     let mut pids = Vec::new();

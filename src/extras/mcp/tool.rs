@@ -49,7 +49,7 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    /// Deterministic name used when two servers expose the same tool name.
+    /// Candidate alias for a duplicate or provider-incompatible tool name.
     pub fn namespaced_name(server_name: &str, tool_name: &str) -> CompactString {
         CompactString::new(format!("{server_name}__{tool_name}"))
     }

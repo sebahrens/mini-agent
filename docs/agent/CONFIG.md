@@ -1433,6 +1433,11 @@ unsupported requested backend denies launch. `network` is `inherit` by default;
 otherwise also denies launch. Server launch trust, service sandbox/network
 authority, and permission to call each exposed MCP tool are independent.
 
+Model-visible tool names use at most 64 ASCII letters, digits, underscores, or
+hyphens. Valid unique names stay unchanged; duplicate or incompatible names get
+a normalized server prefix and, when needed, a numeric suffix. Operator notices
+list the aliases. MCP requests and permission keys retain the original tool name.
+
 The server must reserve stdout for MCP protocol messages and write diagnostics
 to stderr. Every server must complete the MCP initialization handshake within
 10 seconds; for URL servers that budget also covers the TCP/TLS connect and,

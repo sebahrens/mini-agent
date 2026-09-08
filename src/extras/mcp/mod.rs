@@ -205,10 +205,12 @@ impl McpClientManager {
     /// and timeouts become notices (see [`Self::take_notices`]) rather than
     /// `warn` logs, which would write to stderr under the alt-screen TUI.
     ///
-    /// Tool names must be unique across the whole tool set; a duplicate would
-    /// silently replace its predecessor downstream. When two servers expose the
-    /// same name, every colliding tool is registered as `<server>__<tool>` and
-    /// a notice lists the renames. The permission key keeps the bare name.
+    /// Tool names must be valid provider identifiers and unique across the
+    /// whole tool set; a duplicate would silently replace its predecessor
+    /// downstream. When two servers expose the
+    /// same name, every colliding tool is registered as `<server>__<tool>`.
+    /// Invalid bare names also receive a sanitized namespace; a notice lists
+    /// the renames. The permission key keeps the bare name.
     pub async fn collect_tools_with_timeouts(
         &self,
         permission: Option<PermCheck>,
@@ -351,7 +353,7 @@ impl McpClientManager {
         if renamed.is_empty() {
             return;
         }
-        let mut notice = String::from("MCP tool name collision; registered as ");
+        let mut notice = String::from("MCP tool names adjusted; registered as ");
         notice.push_str(&renamed.join(", "));
         notice.push_str(" (permission keys keep the bare tool name)");
         self.push_tool_notice(notice);
@@ -416,7 +418,8 @@ const MAX_REGISTERED_TOOL_NAME: usize = 64;
 /// A bare name exposed by more than one server is namespaced as
 /// `<server>__<tool>`, but that generated name can equal another server's
 /// unchanged name, or another generated name (`a__b` + tool `c` collides with
-/// server `a` + tool `b__c`). Names are therefore allocated against one used
+/// server `a` + tool `b__c`). Bare names outside the provider identifier rules
+/// also receive a sanitized namespace. Names are allocated against one used
 /// set: unchanged names are reserved first, then generated names in input
 /// order, each disambiguated if it is already taken. The result is injective,
 /// so the collected catalog never registers one name twice and a requested
@@ -436,7 +439,12 @@ fn allocate_registered_tool_names(entries: &[(String, String)]) -> Vec<String> {
     // can never displace one.
     for (index, (_, bare)) in entries.iter().enumerate() {
         let shared = owners.get(bare.as_str()).is_some_and(|s| s.len() > 1);
-        if !shared && used.insert(bare.clone()) {
+        let valid = !bare.is_empty()
+            && bare.len() <= MAX_REGISTERED_TOOL_NAME
+            && bare
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !shared && valid && used.insert(bare.clone()) {
             names[index] = Some(bare.clone());
         }
     }
@@ -618,8 +626,9 @@ mod tests {
 
     #[test]
     fn unique_bare_names_are_registered_unchanged() {
-        let names = allocate(&[("alpha", "one"), ("beta", "two")]);
-        assert_eq!(names, vec!["one".to_string(), "two".to_string()]);
+        let boundary = "t".repeat(MAX_REGISTERED_TOOL_NAME);
+        let names = allocate(&[("alpha", "one"), ("beta", "two"), ("gamma", &boundary)]);
+        assert_eq!(names, vec!["one".to_string(), "two".to_string(), boundary]);
     }
 
     #[test]
@@ -661,12 +670,19 @@ mod tests {
     fn registered_names_stay_within_provider_limits() {
         let long_server = "s".repeat(50);
         let long_tool = "t".repeat(50);
+        let unique_long_tool = "u".repeat(100);
         let names = allocate(&[
             (long_server.as_str(), long_tool.as_str()),
             ("other", long_tool.as_str()),
+            ("single", unique_long_tool.as_str()),
+            ("punctuation", "search.docs"),
+            ("unicode", "検索"),
+            ("empty", ""),
+            ("whitespace", "two words"),
         ]);
         assert_unique(&names);
         for name in &names {
+            assert!(!name.is_empty());
             assert!(name.len() <= MAX_REGISTERED_TOOL_NAME, "{name}");
             assert!(
                 name.chars()
@@ -677,13 +693,21 @@ mod tests {
     }
 
     #[test]
-    fn allocation_is_deterministic_for_the_same_catalog() {
+    fn normalization_reserves_valid_names_and_disambiguates_aliases() {
         let entries = [
-            ("alpha", "probe"),
-            ("beta", "probe"),
-            ("gamma", "alpha__probe"),
-            ("alpha", "probe"),
+            ("alpha", "search.docs"),
+            ("alpha", "search/docs"),
+            ("beta", "alpha__search_docs"),
+            ("gamma", "alpha__search_docs_2"),
         ];
-        assert_eq!(allocate(&entries), allocate(&entries));
+        assert_eq!(
+            allocate(&entries),
+            [
+                "alpha__search_docs_3",
+                "alpha__search_docs_4",
+                "alpha__search_docs",
+                "alpha__search_docs_2"
+            ]
+        );
     }
 }
