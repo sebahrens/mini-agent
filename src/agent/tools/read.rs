@@ -12,6 +12,86 @@ use crate::config::types::EditSystem;
 
 const DEFAULT_MAX_TEXT_SIZE: u64 = 1024 * 1024;
 
+/// Feed one already-validated slice of line content to the whole-file CRC and,
+/// when the line is inside the requested window, to the retained excerpt.
+fn absorb(
+    chunk: &[u8],
+    hashedit: bool,
+    file_crc: &mut Crc32,
+    selected: bool,
+    retained: &mut Vec<u8>,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    if hashedit {
+        file_crc.update(chunk);
+    }
+    if selected {
+        retained.extend_from_slice(chunk);
+    }
+}
+
+fn not_utf8(path: &str) -> ToolError {
+    ToolError::Msg(format!(
+        "Cannot read '{path}' as text because it is not valid UTF-8. Use the shell tool with `strings`, `xxd`, or another binary-aware command to inspect it."
+    ))
+}
+
+fn excerpt_cap_exceeded(cap: u64) -> ToolError {
+    ToolError::Msg(format!(
+        "Requested text window exceeds the {cap} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long or non-text lines, use the shell tool with `head`, `cut`, or `strings`."
+    ))
+}
+
+/// Incremental UTF-8 validation across chunk boundaries. Only the bytes of a
+/// possibly incomplete trailing sequence are retained, so validation costs no
+/// memory proportional to the line or the file.
+#[derive(Default)]
+struct Utf8Stream {
+    pending: [u8; 4],
+    pending_len: usize,
+}
+
+impl Utf8Stream {
+    fn push(&mut self, mut bytes: &[u8]) -> bool {
+        while self.pending_len > 0 {
+            if bytes.is_empty() {
+                return true;
+            }
+            if self.pending_len == self.pending.len() {
+                return false;
+            }
+            self.pending[self.pending_len] = bytes[0];
+            self.pending_len += 1;
+            bytes = &bytes[1..];
+            match std::str::from_utf8(&self.pending[..self.pending_len]) {
+                Ok(_) => self.pending_len = 0,
+                Err(error) if error.error_len().is_none() => {}
+                Err(_) => return false,
+            }
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(_) => true,
+            Err(error) if error.error_len().is_some() => false,
+            Err(error) => {
+                let tail = &bytes[error.valid_up_to()..];
+                if tail.len() > self.pending.len() {
+                    return false;
+                }
+                self.pending[..tail.len()].copy_from_slice(tail);
+                self.pending_len = tail.len();
+                true
+            }
+        }
+    }
+
+    /// Whether the stream ended on a complete sequence.
+    fn finish(&self) -> bool {
+        self.pending_len == 0
+    }
+}
+
 pub struct ReadTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
@@ -178,71 +258,129 @@ impl Tool for ReadTool {
         let es = edit_system();
         let oversized = file_size > self.max_text_file_size;
         let scan_to_eof = !oversized || es == EditSystem::Hashedit;
+        let hashedit = es == EditSystem::Hashedit;
         let requested_end = offset.saturating_add(limit);
         let mut reader = BufReader::new(file);
-        let mut raw_line = Vec::new();
-        let mut excerpt_lines = Vec::with_capacity(limit.min(256));
+        let mut excerpt_lines: Vec<String> = Vec::with_capacity(limit.min(256));
         let mut excerpt_bytes = 0_u64;
         let mut total_lines = 0_usize;
         let mut has_more_lines = false;
         let mut file_crc = Crc32::new();
         let mut served_content_crc = Crc32::new();
+        let mut utf8 = Utf8Stream::default();
+        // Lines are consumed in bounded chunks: an unselected or oversized line
+        // is scanned without ever being retained, so a single arbitrarily long
+        // line cannot allocate proportionally to its length in the parent.
+        // Scanning is also bounded by the size observed when the file was
+        // opened, so a file growing under the read cannot extend it without end.
+        let mut scan_budget = file_size;
+        let mut grew_during_read = false;
 
-        loop {
-            raw_line.clear();
-            let bytes_read = reader.read_until(b'\n', &mut raw_line).await?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            std::str::from_utf8(&raw_line).map_err(|_| {
-                ToolError::Msg(format!(
-                    "Cannot read '{}' as text because it is not valid UTF-8. Use the shell tool with `strings`, `xxd`, or another binary-aware command to inspect it.",
-                    path
-                ))
-            })?;
-
-            if es == EditSystem::Hashedit {
-                if raw_line.ends_with(b"\r\n") {
-                    file_crc.update(&raw_line[..raw_line.len() - 2]);
-                    file_crc.update(b"\n");
-                } else {
-                    file_crc.update(&raw_line);
-                }
-            }
-
-            let mut content_end = raw_line.len();
-            if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
-                content_end -= 1;
-                if raw_line.get(content_end.saturating_sub(1)) == Some(&b'\r') {
-                    content_end -= 1;
-                }
-            }
-            let line = std::str::from_utf8(&raw_line[..content_end])
-                .expect("the complete line was already validated as UTF-8");
+        'lines: loop {
             let line_index = total_lines;
-            total_lines += 1;
+            let selected = line_index >= offset && line_index < requested_end;
+            let separator_bytes = u64::from(!excerpt_lines.is_empty());
+            let mut retained: Vec<u8> = Vec::new();
+            let mut held_cr = false;
+            let mut saw_bytes = false;
+            let mut terminated = false;
 
-            if line_index >= offset && line_index < requested_end {
-                let separator_bytes = u64::from(!excerpt_lines.is_empty());
-                let next_excerpt_bytes = excerpt_bytes
+            loop {
+                if scan_budget == 0 {
+                    if !reader.fill_buf().await?.is_empty() {
+                        grew_during_read = true;
+                    }
+                    break;
+                }
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    break;
+                }
+                let visible = available.len().min(scan_budget as usize);
+                let available = &available[..visible];
+                let (body, consumed, ends_line) =
+                    match available.iter().position(|byte| *byte == b'\n') {
+                        Some(position) => (&available[..position], position + 1, true),
+                        None => (available, available.len(), false),
+                    };
+                if !utf8.push(body) {
+                    return Err(not_utf8(&path));
+                }
+                // A carriage return at the end of a chunk is held back until the
+                // next byte decides whether it belongs to a CRLF terminator.
+                if !body.is_empty() {
+                    let mut chunk = body;
+                    if held_cr {
+                        absorb(b"\r", hashedit, &mut file_crc, selected, &mut retained);
+                        held_cr = false;
+                    }
+                    if chunk.last() == Some(&b'\r') {
+                        held_cr = true;
+                        chunk = &chunk[..chunk.len() - 1];
+                    }
+                    absorb(chunk, hashedit, &mut file_crc, selected, &mut retained);
+                }
+                reader.consume(consumed);
+                scan_budget = scan_budget.saturating_sub(consumed as u64);
+                saw_bytes = true;
+                if selected
+                    && excerpt_bytes
+                        .saturating_add(separator_bytes)
+                        .saturating_add(retained.len() as u64)
+                        > self.max_text_file_size
+                {
+                    return Err(excerpt_cap_exceeded(self.max_text_file_size));
+                }
+                if ends_line {
+                    terminated = true;
+                    break;
+                }
+            }
+
+            if !saw_bytes {
+                break 'lines;
+            }
+            if terminated {
+                // A carriage return immediately before the newline is part of
+                // the terminator and belongs to neither the CRC nor the excerpt.
+                held_cr = false;
+                if hashedit {
+                    file_crc.update(b"\n");
+                }
+            } else if held_cr {
+                absorb(b"\r", hashedit, &mut file_crc, selected, &mut retained);
+            }
+
+            // A multi-byte sequence never spans a newline, so an incomplete
+            // sequence at the end of a line is invalid rather than pending.
+            if !utf8.finish() {
+                return Err(not_utf8(&path));
+            }
+
+            total_lines += 1;
+            if selected {
+                let line = String::from_utf8(retained)
+                    .expect("line bytes were validated as UTF-8 while streaming");
+                excerpt_bytes = excerpt_bytes
                     .saturating_add(separator_bytes)
                     .saturating_add(line.len() as u64);
-                if next_excerpt_bytes > self.max_text_file_size {
-                    return Err(ToolError::Msg(format!(
-                        "Requested text window exceeds the {} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long or non-text lines, use the shell tool with `head`, `cut`, or `strings`.",
-                        self.max_text_file_size
-                    )));
-                }
-                excerpt_bytes = next_excerpt_bytes;
-                excerpt_lines.push(line.to_string());
                 served_content_crc.update(&(line.len() as u64).to_le_bytes());
                 served_content_crc.update(line.as_bytes());
+                excerpt_lines.push(line);
             }
 
             if !scan_to_eof && total_lines > requested_end {
                 has_more_lines = true;
-                break;
+                break 'lines;
+            }
+        }
+
+        if grew_during_read {
+            has_more_lines = true;
+            if hashedit {
+                return Err(ToolError::Msg(format!(
+                    "'{path}' grew while it was being read, so the whole-file CRC would not describe the file on disk. Read it again to obtain a current CRC."
+                )));
             }
         }
 

@@ -516,3 +516,163 @@ async fn edit_of_canonical_target_invalidates_read_through_symlink_alias() {
 
     let _ = tokio::fs::remove_dir_all(directory).await;
 }
+
+// ── Bounded line reading ───────────────────────────────────────────────
+
+fn read_temp_root(label: &str) -> std::path::PathBuf {
+    let root =
+        std::env::temp_dir().join(format!("mini-agent-read-{label}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::canonicalize(&root).unwrap()
+}
+
+fn bounded_read_tool(root: &std::path::Path, cap: u64) -> ReadTool {
+    ReadTool::new_with_tracker(None, None, Some(cap), 100, ReadTracker::new(false))
+        .with_workspace(root.to_path_buf())
+}
+
+fn read_args(path: &str, offset: Option<usize>, limit: Option<usize>) -> ReadArgs {
+    ReadArgs {
+        path: path.into(),
+        offset,
+        limit,
+    }
+}
+
+#[tokio::test]
+async fn a_single_line_far_larger_than_the_cap_is_rejected_not_buffered() {
+    let root = read_temp_root("huge-line");
+    let cap = 64 * 1024;
+    // One line two orders of magnitude past the output cap.
+    std::fs::write(
+        root.join("huge.txt"),
+        format!("{}\nsecond\n", "x".repeat(8 * 1024 * 1024)),
+    )
+    .unwrap();
+
+    let tool = bounded_read_tool(&root, cap);
+    let error = tool
+        .call(read_args("huge.txt", Some(1), Some(1)))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("read output cap"),
+        "the byte budget must stop the line, not the excerpt check afterwards: {error}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_line_past_the_requested_window_is_skipped_without_being_retained() {
+    let root = read_temp_root("skip-huge-line");
+    let cap = 64 * 1024;
+    std::fs::write(
+        root.join("huge.txt"),
+        format!("{}\nsecond line\n", "x".repeat(8 * 1024 * 1024)),
+    )
+    .unwrap();
+
+    let tool = bounded_read_tool(&root, cap);
+    let output = tool
+        .call(read_args("huge.txt", Some(2), Some(1)))
+        .await
+        .unwrap();
+    assert!(output.contains("second line"), "{output}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn crlf_terminators_survive_chunked_reading() {
+    let root = read_temp_root("crlf-chunks");
+    // Long enough that lines and their terminators straddle read chunks.
+    let long = "a".repeat(20_000);
+    std::fs::write(
+        root.join("crlf.txt"),
+        format!("{long}\r\nsecond\r\ntrailing\r"),
+    )
+    .unwrap();
+
+    let tool = bounded_read_tool(&root, 1024 * 1024);
+    let output = tool.call(read_args("crlf.txt", None, None)).await.unwrap();
+    assert!(output.contains("3 lines total"), "{output}");
+    assert!(output.contains("second"), "{output}");
+    // A carriage return without a following newline is ordinary content.
+    assert!(output.contains("trailing\r"), "{output:?}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn multibyte_characters_split_across_chunks_stay_valid() {
+    let root = read_temp_root("utf8-chunks");
+    // Each character is three bytes, so sequences straddle the reader's chunks.
+    let line = "\u{4f60}\u{597d}".repeat(20_000);
+    std::fs::write(root.join("utf8.txt"), format!("{line}\n")).unwrap();
+
+    let tool = bounded_read_tool(&root, 4 * 1024 * 1024);
+    let output = tool.call(read_args("utf8.txt", None, None)).await.unwrap();
+    assert!(output.contains("1 lines total"), "{output}");
+    assert!(
+        output.contains("\u{4f60}\u{597d}\u{4f60}"),
+        "chunked UTF-8 was corrupted"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_utf8_late_in_a_long_line_is_still_rejected() {
+    let root = read_temp_root("utf8-invalid");
+    let mut bytes = vec![b'a'; 40_000];
+    bytes.push(0xFF);
+    bytes.push(b'\n');
+    std::fs::write(root.join("binary.txt"), bytes).unwrap();
+
+    let tool = bounded_read_tool(&root, 1024 * 1024);
+    let error = tool
+        .call(read_args("binary.txt", None, None))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not valid UTF-8"), "{error}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_truncated_multibyte_sequence_at_eof_is_rejected() {
+    let root = read_temp_root("utf8-truncated");
+    let mut bytes = "ok\n".as_bytes().to_vec();
+    // Leading byte of a three-byte sequence with no continuation bytes.
+    bytes.push(0xE4);
+    std::fs::write(root.join("truncated.txt"), bytes).unwrap();
+
+    let tool = bounded_read_tool(&root, 1024 * 1024);
+    let error = tool
+        .call(read_args("truncated.txt", None, None))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not valid UTF-8"), "{error}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn an_explicit_window_still_reads_a_file_above_the_cap() {
+    let root = read_temp_root("explicit-window");
+    let cap = 16 * 1024;
+    let body = (0..4_000)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(body.len() as u64 > cap);
+    std::fs::write(root.join("big.txt"), body).unwrap();
+
+    let tool = bounded_read_tool(&root, cap);
+    let output = tool
+        .call(read_args("big.txt", Some(10), Some(2)))
+        .await
+        .unwrap();
+    assert!(output.contains("line 9"), "{output}");
+    assert!(output.contains("line 10"), "{output}");
+    assert!(!output.contains("line 12"), "{output}");
+    std::fs::remove_dir_all(root).unwrap();
+}
