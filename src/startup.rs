@@ -1515,7 +1515,17 @@ impl Startup {
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
             }
-            let (response, usage, interactions) = response_result?;
+            // A write, edit or command may already have run before a terminal
+            // provider or budget failure. Persist that progress and the
+            // incurred usage before propagating the failure, so a resumed
+            // session has a durable record of what happened instead of
+            // repeating the effects.
+            let crate::agent::runner::HeadlessTurn {
+                response,
+                usage,
+                interactions,
+                failure,
+            } = response_result;
             let rendered_json = if json_output {
                 let files_changed = crate::print::files_changed_since(
                     self.workspace.root(),
@@ -1538,6 +1548,7 @@ impl Startup {
             } else {
                 None
             };
+            let mut persistence_failure = None;
             if !self.cli.no_session {
                 let mut session = self.session;
                 // Prompt, then tool calls/results in provider order, then the
@@ -1546,15 +1557,32 @@ impl Startup {
                 crate::print::persist_headless_turn(&mut session, &msg, &response, &interactions);
                 let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
                 session.charge_usage_delta(usage.into(), anthropic_native);
-                session::storage::save_session(&session)?;
-                let _ =
-                    session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
-                        content: msg,
-                        timestamp: session.updated_at.clone(),
-                    });
+                if let Err(error) = session::storage::save_session(&session) {
+                    persistence_failure = Some(error);
+                } else {
+                    let _ = session::chat_history::append_entry(
+                        &session::chat_history::ChatHistoryEntry {
+                            content: msg,
+                            timestamp: session.updated_at.clone(),
+                        },
+                    );
+                }
             }
             if let Some(json) = rendered_json {
                 println!("{json}");
+            }
+            // The turn's own failure wins: a partial persistence failure is
+            // reported too, but neither is ever presented as success.
+            if let Some(failure) = failure {
+                if let Some(error) = persistence_failure {
+                    return Err(failure.context(format!(
+                        "the partial turn could not be persisted either: {error}"
+                    )));
+                }
+                return Err(failure);
+            }
+            if let Some(error) = persistence_failure {
+                return Err(error);
             }
         }
 

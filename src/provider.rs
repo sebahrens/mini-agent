@@ -1158,7 +1158,7 @@ impl AnyAgent {
         // `--loop` iteration/active state; see `runner::run_print`. `None`
         // for plain `-p` one-shot runs.
         #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-    ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+    ) -> runner::HeadlessTurn
     where
         H: Into<std::sync::Arc<[Message]>>,
     {

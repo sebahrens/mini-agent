@@ -1613,3 +1613,87 @@ async fn persona_regression_eval() {
         );
     }
 }
+
+// ── Partial headless turns survive a terminal failure ──────────────────
+
+/// A run that completes a real file write and then fails must still hand the
+/// caller the completed tool records and the usage those turns incurred, so a
+/// resumed session has a durable record of effects that already happened.
+#[tokio::test]
+async fn a_failed_headless_turn_retains_completed_tool_records_and_usage() {
+    let directory = EvalDirectory::new();
+    let model = MockCompletionModel::from_stream_turns(vec![
+        tool_turn(
+            "partial-write",
+            "write",
+            serde_json::json!({ "path": "effect.txt", "content": "written\n" }),
+        ),
+        // The provider then fails non-retryably after the effect happened.
+        vec![MockStreamEvent::Error(
+            rig::test_utils::MockError::provider("invalid_request_error: bad request"),
+        )],
+    ]);
+    let write =
+        Box::new(WriteTool::new(None, None, None).with_workspace(directory.path().to_path_buf()))
+            as Box<dyn ToolDyn>;
+    let agent = AgentBuilder::new(model)
+        .tools(vec![write])
+        .default_max_turns(4)
+        .build();
+
+    let turn = crate::agent::runner::run_print_with_verification(
+        &agent,
+        "write the file",
+        true,
+        false,
+        &RetryConfig::default(),
+        None,
+        Vec::<Message>::new(),
+        None,
+        #[cfg(feature = "hooks")]
+        None,
+    )
+    .await;
+
+    assert!(
+        turn.failure.is_some(),
+        "a non-retryable provider failure must not become a successful turn"
+    );
+    assert!(
+        directory.path().join("effect.txt").is_file(),
+        "the scripted write must have reached the workspace"
+    );
+    assert_eq!(
+        count_tool_calls(&turn.interactions),
+        1,
+        "the completed tool call must survive the failure: {:?}",
+        turn.interactions
+    );
+    assert!(
+        turn.usage.input_tokens > 0,
+        "usage observed before the failure must survive it"
+    );
+
+    // The retained records persist and reload exactly like a successful turn.
+    let mut session = crate::session::Session::new("openai", "gpt-4", 128_000, "");
+    crate::print::persist_headless_turn(
+        &mut session,
+        "write the file",
+        &turn.response,
+        &turn.interactions,
+    );
+    assert!(
+        session
+            .messages
+            .iter()
+            .any(|message| message.role == crate::session::MessageRole::ToolResult),
+        "the failed turn's tool record must be persisted"
+    );
+    assert!(
+        session
+            .messages
+            .iter()
+            .any(|message| message.content.contains("write the file")),
+        "the prompt must be persisted with the failed turn"
+    );
+}

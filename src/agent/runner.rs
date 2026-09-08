@@ -3098,7 +3098,7 @@ pub(crate) async fn run_print_with_verification<M, H>(
     history: H,
     completion_verification: Option<CompletionVerification>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+) -> HeadlessTurn
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -3155,6 +3155,47 @@ where
         loop_info,
     )
     .await
+    .into_result()
+}
+
+/// The result of one headless turn, including the progress made before a
+/// terminal failure.
+///
+/// A write, edit or command can complete and a later provider failure can end
+/// the turn. Returning only the error would leave the saved session without the
+/// prompt, the completed tool records or the incurred usage, so a resumed
+/// session has no durable record of effects that already happened and may
+/// repeat them.
+pub(crate) struct HeadlessTurn {
+    pub(crate) response: String,
+    pub(crate) usage: rig::completion::Usage,
+    pub(crate) interactions: Vec<Message>,
+    /// `Some` when the turn ended in failure. The progress above still
+    /// describes what actually ran.
+    pub(crate) failure: Option<anyhow::Error>,
+}
+
+impl HeadlessTurn {
+    /// A failure that happened before any progress was made.
+    fn failed_before_start(error: anyhow::Error) -> Self {
+        Self {
+            response: String::new(),
+            usage: rig::completion::Usage::default(),
+            interactions: Vec::new(),
+            failure: Some(error),
+        }
+    }
+
+    /// Convert to the plain result the non-headless callers expect, discarding
+    /// partial progress on failure.
+    pub(crate) fn into_result(
+        self,
+    ) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)> {
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok((self.response, self.usage, self.interactions)),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3169,14 +3210,16 @@ async fn run_print_with_stream_policy_and_verification<M>(
     stream_policy: RunnerStreamPolicy,
     completion_verification: Option<CompletionVerification>,
     #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
-) -> anyhow::Result<(String, rig::completion::Usage, Vec<Message>)>
+) -> HeadlessTurn
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     let max_turns = agent.default_max_turns.unwrap_or(1);
     if max_turns == 0 {
-        anyhow::bail!("Agent exhausted its maximum turn budget (0) before starting.");
+        return HeadlessTurn::failed_before_start(anyhow::anyhow!(
+            "Agent exhausted its maximum turn budget (0) before starting."
+        ));
     }
 
     let mut first_attempt_history = Some(history.to_vec());
@@ -3194,7 +3237,11 @@ where
         }
     })
     .await
-    .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())))?;
+    .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())));
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => return HeadlessTurn::failed_before_start(error),
+    };
     let mut stream = stream_policy.apply(stream);
 
     let retry_history = history;
@@ -3226,6 +3273,20 @@ where
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
     let mut next_instruction: Option<String> = None;
+    // Every terminal failure below returns through this, so the completed tool
+    // records and observed usage of the failed turn survive for persistence.
+    macro_rules! fail_turn {
+        ($($arg:tt)*) => {{
+            tool_calls.finalize_unresolved(&mut interactions);
+            committed_interactions.append(&mut interactions);
+            return HeadlessTurn {
+                response: full_response,
+                usage: usage_ledger.total,
+                interactions: committed_interactions,
+                failure: Some(anyhow::anyhow!($($arg)*)),
+            };
+        }};
+    }
     #[cfg(feature = "hooks")]
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
@@ -3271,13 +3332,13 @@ where
                 )) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
                         tool_calls.finalize_unresolved(&mut interactions);
-                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                        fail_turn!(token_budget_exhaustion_message(used, budget));
                     }
                     let name = &tool_call.function.name;
                     workspace_may_have_changed |= tool_may_mutate_workspace(name);
                     if let Err(error) = tool_calls.record(&internal_call_id, &tool_call) {
                         tool_calls.finalize_unresolved(&mut interactions);
-                        return Err(anyhow::anyhow!(error));
+                        fail_turn!(error);
                     }
                     completion_had_tool_call = true;
                     if pure_stdout {
@@ -3291,7 +3352,7 @@ where
                 Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
                         tool_calls.finalize_unresolved(&mut interactions);
-                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                        fail_turn!(token_budget_exhaustion_message(used, budget));
                     }
                 }
                 Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
@@ -3300,7 +3361,7 @@ where
                 })) => {
                     if let Some((used, budget)) = exhausted_budget_after_completion {
                         tool_calls.finalize_unresolved(&mut interactions);
-                        anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                        fail_turn!(token_budget_exhaustion_message(used, budget));
                     }
                     let Some((name, output)) = append_attributed_tool_result(
                         &mut tool_calls,
@@ -3341,7 +3402,7 @@ where
                     {
                         if completion_had_tool_call {
                             tool_calls.finalize_unresolved(&mut interactions);
-                            anyhow::bail!(token_budget_exhaustion_message(used, budget));
+                            fail_turn!(token_budget_exhaustion_message(used, budget));
                         }
                         exhausted_budget_after_completion = Some((used, budget));
                     }
@@ -3356,7 +3417,7 @@ where
                         &res.output,
                     );
                     if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
-                        anyhow::bail!(UNRESOLVED_TOOL_CALLS_ERROR);
+                        fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
                     }
                     if full_response.len() == response_len_at_stream_start {
                         empty_response_count += 1;
@@ -3364,9 +3425,7 @@ where
                             tracing::warn!(
                                 "agent: {MAX_EMPTY_RESPONSES} consecutive empty responses, aborting"
                             );
-                            anyhow::bail!(
-                                "Agent returned empty response too many times, aborting."
-                            );
+                            fail_turn!("Agent returned empty response too many times, aborting.");
                         }
                         tracing::warn!(
                             "agent: empty terminal response ({empty_response_count}/{MAX_EMPTY_RESPONSES}), asking the model to continue"
@@ -3400,7 +3459,7 @@ where
                                 continue_turn = true;
                                 break;
                             } else {
-                                anyhow::bail!(
+                                fail_turn!(
                                     "Verification failed after {verification_attempt} attempts.\n{diagnostic}"
                                 );
                             }
@@ -3454,9 +3513,7 @@ where
                     }
                     // Propagate an exhausted or non-retryable stream failure
                     // instead of returning `Ok` with a truncated response.
-                    return Err(anyhow::anyhow!(retry::with_context_length_hint(
-                        &e.to_string()
-                    )));
+                    fail_turn!(retry::with_context_length_hint(&e.to_string()));
                 }
             }
         }
@@ -3464,22 +3521,25 @@ where
         tool_calls.finalize_unresolved(&mut interactions);
 
         if !terminal_response_seen && !retrying_interrupted_completion {
-            charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
-                .map_err(anyhow::Error::new)?;
+            if let Err(error) =
+                charge_nonterminal_eof(&mut turns_used, turns_at_stream_start, max_turns)
+            {
+                fail_turn!(error);
+            }
             continue_turn = true;
         }
 
         if continue_turn {
             let remaining_turns = max_turns.saturating_sub(turns_used);
             if remaining_turns == 0 {
-                anyhow::bail!(
+                fail_turn!(
                     "Agent exhausted its maximum turn budget ({max_turns}) before completing."
                 );
             }
             if let Some((used, budget)) =
                 exhausted_token_budget(usage_ledger.total, turn_token_budget)
             {
-                anyhow::bail!(
+                fail_turn!(
                     "Agent exhausted its cumulative token budget ({used}/{budget}) before \
                      completing. Compact the session or raise turn_token_budget before retrying."
                 );
@@ -3516,7 +3576,12 @@ where
 
     println!();
     committed_interactions.append(&mut interactions);
-    Ok((full_response, usage_ledger.total, committed_interactions))
+    HeadlessTurn {
+        response: full_response,
+        usage: usage_ledger.total,
+        interactions: committed_interactions,
+        failure: None,
+    }
 }
 
 fn format_tool_args_summary(args_json: &serde_json::Value) -> String {
@@ -4957,6 +5022,7 @@ mod tests {
             None,
         )
         .await
+        .into_result()
         .expect("headless verification retry should recover");
 
         assert_eq!(response, "candidatefixed");
