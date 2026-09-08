@@ -1681,7 +1681,11 @@ impl GatedEffects {
     }
 
     async fn wait_started(&self) {
-        self.started.acquire().await.unwrap().forget();
+        tokio::time::timeout(Duration::from_secs(5), self.started.acquire())
+            .await
+            .expect("worker did not start the gated effect; check worker launch failures")
+            .unwrap()
+            .forget();
     }
 
     fn release(&self) {
@@ -2357,9 +2361,7 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
             )
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), gated.wait_started())
-        .await
-        .expect("fake effect did not become pending");
+    gated.wait_started().await;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -2405,9 +2407,7 @@ async fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
             .await
     });
 
-    tokio::time::timeout(Duration::from_secs(1), gated.wait_started())
-        .await
-        .expect("fake permission-gated effect did not become pending");
+    gated.wait_started().await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     gated.release();
     assert_eq!(

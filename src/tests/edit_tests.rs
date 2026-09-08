@@ -273,6 +273,56 @@ async fn test_sim_multi_match_returns_error() {
 }
 
 #[tokio::test]
+async fn test_sim_repetitive_file_has_bounded_ambiguity_diagnostics() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("bounded_ambiguity.txt");
+    let original = "x".repeat(128 * 1024);
+    std::fs::write(tmp.path(), &original).unwrap();
+    let message = sim_edit(&tmp, "x", "replacement")
+        .await
+        .expect_err("repeated exact matches must be rejected");
+    assert!(message.contains("matched 131072 times"), "{message}");
+    assert!(
+        message.contains("131062 additional matches omitted"),
+        "{message}"
+    );
+    assert!(
+        message.len() < 2048,
+        "diagnostic has {} bytes",
+        message.len()
+    );
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
+async fn test_sim_overlapping_exact_matches_are_ambiguous() {
+    select_edit_system(EditSystem::Similarity);
+    for (original, search) in [("ababa\n", "aba"), ("ééé\n", "éé")] {
+        let tmp = TempFile::new("overlapping_exact.txt");
+        std::fs::write(tmp.path(), original).unwrap();
+        let message = sim_edit(&tmp, search, "replacement")
+            .await
+            .expect_err("overlapping occurrences must not count as a unique match");
+        assert!(message.contains("matched 2 times"), "{message}");
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn test_sim_overlapping_normalized_matches_are_ambiguous() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("overlapping_normalized.txt");
+    let original = "a \na \na \n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let message = sim_edit(&tmp, "a\na", "replacement")
+        .await
+        .expect_err("overlapping normalized matches must be rejected");
+    assert!(message.contains("matched more than once"), "{message}");
+    assert!(message.contains("lines 1 and 2"), "{message}");
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), original);
+}
+
+#[tokio::test]
 async fn test_sim_replace_all_replaces_every_exact_occurrence() {
     select_edit_system(EditSystem::Similarity);
     let tmp = TempFile::new("replace_all.txt");
@@ -297,6 +347,13 @@ async fn test_sim_replace_all_replaces_every_exact_occurrence() {
     assert!(result.contains("Applied 2 edit(s)"), "{result}");
     assert!(result.contains("1| goodbye one"), "{result}");
     assert!(result.contains("3| goodbye two"), "{result}");
+
+    // replace_all follows left-to-right, non-overlapping replacement semantics.
+    std::fs::write(tmp.path(), "ababa ababa\n").unwrap();
+    tool.call(block_args(tmp.path(), "aba", "x", true))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "xba xba\n");
 }
 
 #[tokio::test]

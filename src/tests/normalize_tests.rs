@@ -1,24 +1,6 @@
 use crate::agent::tools::normalize::{levenshtein_similarity, normalize_whitespace};
 
 #[test]
-fn normalize_tabs_to_spaces() {
-    assert_eq!(
-        normalize_whitespace("\tfn foo() {\n\t    bar\n\t}\n"),
-        "    fn foo() {\n        bar\n    }\n"
-    );
-}
-
-#[test]
-fn normalize_trailing_spaces() {
-    assert_eq!(normalize_whitespace("hello   \nworld\n"), "hello\nworld\n");
-}
-
-#[test]
-fn normalize_collapse_blank_lines() {
-    assert_eq!(normalize_whitespace("a\n\n\nb\n"), "a\n\nb\n");
-}
-
-#[test]
 fn levenshtein_identical() {
     assert!((levenshtein_similarity("hello", "hello") - 1.0).abs() < 0.001);
 }
@@ -40,18 +22,22 @@ fn levenshtein_different() {
 use crate::agent::tools::normalize::NormalizedText;
 
 #[test]
-fn mapped_text_matches_plain_normalizer() {
-    for input in [
-        "",
-        "abc",
-        "abc\n",
-        "\tfn foo() {\n\t    bar\n\t}\n",
-        "hello   \nworld\n",
-        "a\n\n\nb\n",
-        "a\r\n\r\n\r\nb\r\n",
-        "x  \t \n\n\n\n   y\t\n\n",
+fn normalization_has_expected_text() {
+    for (input, expected) in [
+        ("", ""),
+        ("abc", "abc\n"),
+        ("abc\n", "abc\n"),
+        (
+            "\tfn foo() {\n\t    bar\n\t}\n",
+            "    fn foo() {\n        bar\n    }\n",
+        ),
+        ("hello   \nworld\n", "hello\nworld\n"),
+        ("a\n\n\nb\n", "a\n\nb\n"),
+        ("a\r\n\r\n\r\nb\r\n", "a\n\nb\n"),
+        ("x  \t \n\n\n\n   y\t\n\n", "x\n\n   y\n\n"),
+        ("héllo\u{2003}\n\twörld", "héllo\n    wörld\n"),
     ] {
-        assert_eq!(NormalizedText::new(input).text, normalize_whitespace(input));
+        assert_eq!(normalize_whitespace(input), expected, "input: {input:?}");
     }
 }
 

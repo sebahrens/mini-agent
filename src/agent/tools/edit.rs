@@ -225,10 +225,8 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     if search_norm.is_empty() {
         return MatchResult::NotFound;
     }
-    let mut normalized_matches = content_norm
-        .text
-        .match_indices(&search_norm)
-        .map(|(norm_pos, _)| content_norm.source_range(norm_pos, search_norm.len()));
+    let mut normalized_matches = overlapping_match_indices(&content_norm.text, &search_norm)
+        .map(|norm_pos| content_norm.source_range(norm_pos, search_norm.len()));
     let first_normalized = normalized_matches.next();
     if let (Some((first, _)), Some((second, _))) = (first_normalized, normalized_matches.next()) {
         return MatchResult::AmbiguousNormalized(
@@ -317,8 +315,46 @@ fn find_best_match(content: &str, search: &str) -> MatchResult {
     }
 }
 
-fn count_exact_matches(content: &str, search: &str) -> usize {
-    content.match_indices(search).count()
+/// Include overlapping occurrences when deciding whether a SEARCH is unique.
+/// A prefix table keeps repeated-prefix inputs linear in file + search length.
+/// UTF-8 matches start on character boundaries because both inputs are strings.
+fn overlapping_match_indices<'a>(
+    content: &'a str,
+    search: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    let needle = search.as_bytes();
+    let mut prefixes = vec![0; needle.len()];
+    let mut matched = 0;
+    for index in 1..needle.len() {
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefixes[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefixes[index] = matched;
+    }
+
+    let mut bytes = content.bytes().enumerate();
+    matched = 0;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
+        }
+        for (index, byte) in bytes.by_ref() {
+            while matched > 0 && byte != needle[matched] {
+                matched = prefixes[matched - 1];
+            }
+            if byte == needle[matched] {
+                matched += 1;
+            }
+            if matched == needle.len() {
+                matched = prefixes[matched - 1];
+                return Some(index + 1 - needle.len());
+            }
+        }
+        None
+    })
 }
 
 fn dominant_line_ending(content: &str) -> &'static str {
@@ -386,7 +422,7 @@ async fn handle_similarity(
         let replace = with_line_ending(&blk.replace, line_ending);
         match find_best_match(content, &search) {
             MatchResult::Exact(pos) => {
-                let count = count_exact_matches(content, &search);
+                let count = overlapping_match_indices(content, &search).count();
                 if replace_all {
                     resolved.extend(content.match_indices(&search).map(|(byte_start, _)| {
                         ResolvedSim {
@@ -397,12 +433,15 @@ async fn handle_similarity(
                         }
                     }));
                 } else if count > 1 {
+                    const MAX_MATCH_PREVIEWS: usize = 10;
                     let line_starts: Vec<usize> = std::iter::once(0)
                         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
                         .collect();
 
                     let mut match_info = Vec::new();
-                    for byte_idx in content.match_indices(&search).map(|(i, _)| i) {
+                    for byte_idx in
+                        overlapping_match_indices(content, &search).take(MAX_MATCH_PREVIEWS)
+                    {
                         let line_num = match line_starts.binary_search(&byte_idx) {
                             Ok(i) => i + 1,
                             Err(i) => i,
@@ -414,6 +453,12 @@ async fn handle_similarity(
                             .unwrap_or(content.len());
                         let text: String = content[ls..le].chars().take(100).collect();
                         match_info.push(format!("  Line {}: {}", line_num, text));
+                    }
+                    if count > MAX_MATCH_PREVIEWS {
+                        match_info.push(format!(
+                            "  … {} additional matches omitted …",
+                            count - MAX_MATCH_PREVIEWS
+                        ));
                     }
 
                     return Err(ToolError::Msg(format!(
@@ -1101,8 +1146,35 @@ impl Tool for EditTool {
 }
 
 #[cfg(test)]
-mod match_excerpt_tests {
-    use super::{bounded_match_excerpt, resulting_excerpts};
+mod matching_tests {
+    use super::{bounded_match_excerpt, overlapping_match_indices, resulting_excerpts};
+
+    #[test]
+    fn overlapping_matches_agree_with_every_character_boundary() {
+        let mut strings = vec![String::new()];
+        let mut level = strings.clone();
+        for _ in 0..4 {
+            level = level
+                .iter()
+                .flat_map(|prefix| ['a', 'b', 'é'].map(|ch| format!("{prefix}{ch}")))
+                .collect();
+            strings.extend(level.iter().cloned());
+        }
+        for content in &strings {
+            for search in strings.iter().filter(|search| !search.is_empty()) {
+                let expected: Vec<_> = content
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .filter(|&index| content[index..].starts_with(search))
+                    .collect();
+                assert_eq!(
+                    overlapping_match_indices(content, search).collect::<Vec<_>>(),
+                    expected,
+                    "content={content:?}, search={search:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn non_exact_match_excerpt_is_bounded_on_character_boundaries() {

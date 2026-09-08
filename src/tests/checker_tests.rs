@@ -1305,15 +1305,6 @@ fn yolo_unknown_bash_is_allowed() {
     ));
 }
 
-#[test]
-fn yolo_allows_todo_write() {
-    let mut checker = make_checker(SecurityMode::Yolo);
-    assert!(matches!(
-        checker.check("todo_write", ""),
-        CheckResult::Allowed
-    ));
-}
-
 // --- MCP allow-all via checker ---
 
 #[cfg(feature = "mcp")]
@@ -1367,39 +1358,20 @@ fn allow_all_mcp_does_not_affect_non_mcp_tools() {
 // --- todo_write convenience allowance ---
 
 #[test]
-fn todo_write_always_allowed_in_restrictive() {
-    let mut checker = make_checker(SecurityMode::Restrictive);
-    assert!(matches!(
-        checker.check("todo_write", ""),
-        CheckResult::Allowed
-    ));
-}
-
-#[test]
-fn todo_write_always_allowed_in_readonly() {
-    let mut checker = make_checker(SecurityMode::ReadOnly);
-    assert!(matches!(
-        checker.check("todo_write", ""),
-        CheckResult::Allowed
-    ));
-}
-
-#[test]
-fn todo_write_always_allowed_in_guarded() {
-    let mut checker = make_checker(SecurityMode::Guarded);
-    assert!(matches!(
-        checker.check("todo_write", ""),
-        CheckResult::Allowed
-    ));
-}
-
-#[test]
-fn todo_write_always_allowed_in_yolo() {
-    let mut checker = make_checker(SecurityMode::Yolo);
-    assert!(matches!(
-        checker.check("todo_write", ""),
-        CheckResult::Allowed
-    ));
+fn todo_write_allowed_by_default_in_every_security_mode() {
+    for mode in [
+        SecurityMode::Standard,
+        SecurityMode::Restrictive,
+        SecurityMode::ReadOnly,
+        SecurityMode::Guarded,
+        SecurityMode::Yolo,
+    ] {
+        let mut checker = make_checker(mode);
+        assert!(
+            matches!(checker.check("todo_write", ""), CheckResult::Allowed),
+            "todo_write default in {mode:?}"
+        );
+    }
 }
 
 #[test]

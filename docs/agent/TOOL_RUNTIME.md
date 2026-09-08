@@ -55,6 +55,12 @@ column from the actual range and report an offset past EOF directly instead of
 showing an inverted range. When edit's bounded fuzzy search is too expensive,
 the error says that no closest-match suggestion was computed.
 
+SEARCH/REPLACE edits require a unique match, including occurrences that overlap
+in the original or whitespace-normalized text. For example, `aba` is ambiguous
+in `ababa`; add context to select the intended occurrence. With `replace_all`,
+exact replacements proceed left to right over non-overlapping occurrences.
+Exact-match ambiguity errors report the total count and at most ten previews.
+
 Recursive `grep` and `find_files` traversal, plus `list_dir` directory reads,
 run on the bounded blocking pool rather than occupying an async runtime worker.
 Ignore rules use a metadata-invalidated, per-workspace parent-chain cache and a
