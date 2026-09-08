@@ -23,7 +23,14 @@ Each run emits one machine-readable JSON line and a human summary. The same JSON
 model identity/revision/dimensions, OS/CPU/RAM, sample counts, cold and warm embedding latency,
 dense/FTS/fusion and total-search percentiles, build/rebuild/removal costs, concurrent-reader
 latency, observed RSS, relevance checks, and the 5 ms p99 verdict. CI validates fields and
-invariants at 2,000 revisions but deliberately does not apply a host-sensitive latency gate.
+invariants at 2,000 revisions but deliberately does not apply host-sensitive search or build
+latency gates. The smoke audit asserts operation counts from the actual search paths: hybrid
+queries use HNSW without exact full scans, and disabled channels perform no ANN, exact-vector,
+or SQLite work. It checks this on both exact and ANN snapshots, retaining recall, ordering,
+visibility and zero-result checks in the existing audit. Counts are scoped to each test index; they
+are not process-global counters. The JSON records `search_work` and marks the performance
+`gate.enforced` only for the dedicated 100,000-revision audit. Timings remain reported in smoke
+runs, even when the observed performance verdict fails.
 
 The deterministic backend's recall and self-query figures measure only HNSW fidelity to its exact
 oracle. They are not semantic-relevance measurements: self-queries are exact-string matches and

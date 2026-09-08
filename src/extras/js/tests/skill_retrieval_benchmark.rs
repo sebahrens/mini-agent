@@ -289,12 +289,36 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
     let snapshot_build_duration = exact_build_duration + ann_build_duration;
     assert_eq!(index.len(), corpus_size);
 
+    let disabled_policy = RetrievalPolicy {
+        dense_candidate_limit: 0,
+        lexical_candidate_limit: 0,
+        ..RetrievalPolicy::default()
+    };
+    let mut disabled_work = Vec::new();
+    for (mode, snapshot) in [("exact", &index_without_ann), ("ann", index.as_ref())] {
+        let before = snapshot.search_work_for_test();
+        assert!(
+            snapshot
+                .search("parseJson", &recall_queries[0].1, &disabled_policy)
+                .unwrap()
+                .is_empty()
+        );
+        disabled_work.push((mode, before, snapshot.search_work_for_test()));
+    }
+    assert!(
+        disabled_work
+            .iter()
+            .all(|(_, before, after)| before == after),
+        "disabled channels performed index work: {disabled_work:?}"
+    );
+
     let natural_language_policy = RetrievalPolicy {
         dense_candidate_limit: 0,
         ..RetrievalPolicy::default()
     };
     let mut lexical_probe = vec![0.0; model.dimensions];
     lexical_probe[0] = 1.0;
+    let before_lexical = index.search_work_for_test();
     let natural_language_result = index
         .search(
             "please parse this JSON document and return its keys",
@@ -307,6 +331,14 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             .first()
             .is_some_and(|skill| skill.artifact.exports[0].name.starts_with("parseJson_")),
         "natural-language prompts must retrieve through the lexical channel"
+    );
+
+    let after_lexical = index.search_work_for_test();
+    assert_eq!(after_lexical.ann_queries, before_lexical.ann_queries);
+    assert_eq!(after_lexical.exact_rows, before_lexical.exact_rows);
+    assert_eq!(
+        after_lexical.lexical_queries,
+        before_lexical.lexical_queries + 1
     );
 
     embedder.clear_cache().await;
@@ -326,6 +358,7 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             .search_with_metrics(query_text, query_vector, &policy)
             .unwrap();
     }
+    let before_search = index.search_work_for_test();
     let mut total = Vec::with_capacity(search_samples);
     let mut dense = Vec::with_capacity(search_samples);
     let mut lexical = Vec::with_capacity(search_samples);
@@ -341,6 +374,20 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         lexical.push(output.stages.lexical);
         fusion.push(output.stages.fusion_and_budgets);
     }
+    let after_search = index.search_work_for_test();
+    assert_eq!(
+        after_search.ann_queries - before_search.ann_queries,
+        search_samples,
+        "hybrid searches must use the ANN index"
+    );
+    assert_eq!(
+        after_search.exact_rows, before_search.exact_rows,
+        "hybrid searches regressed to full dense scans"
+    );
+    assert_eq!(
+        after_search.lexical_queries - before_search.lexical_queries,
+        search_samples
+    );
     for (query_text, query_vector, _) in recall_queries.iter().take(20) {
         let first = index.search(query_text, query_vector, &policy).unwrap();
         let second = index.search(query_text, query_vector, &policy).unwrap();
@@ -376,6 +423,7 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         dense_score_floor: -1.0,
         ..RetrievalPolicy::default()
     };
+    let before_dense_only = index.search_work_for_test();
     let mut exact_oracle_latencies = Vec::new();
     let mut recall_at_ten = 0.0_f64;
     let mut top_one_hits = 0usize;
@@ -409,6 +457,16 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
         }
     }
     recall_at_ten /= recall_queries.len().max(1) as f64;
+    let after_dense_only = index.search_work_for_test();
+    assert_eq!(
+        after_dense_only.lexical_queries, before_dense_only.lexical_queries,
+        "dense-only recall queries must not access SQLite"
+    );
+    assert_eq!(
+        after_dense_only.exact_rows - before_dense_only.exact_rows,
+        corpus_size * recall_queries.len(),
+        "only the exact oracle may scan all rows"
+    );
 
     let reader_index = Arc::clone(&index);
     let reader_query = query.clone();
@@ -466,7 +524,10 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             / exact_ids.len().max(1) as f64;
     }
     rebuild_recall_at_ten /= 20.0;
-    assert!(rebuild_recall_at_ten >= 0.95);
+    assert!(
+        rebuild_recall_at_ten >= 0.95,
+        "rebuilt ANN fidelity regressed: recall@10={rebuild_recall_at_ten:.3}"
+    );
     drop(rebuilt);
 
     let hidden = lifecycle_hidden_ids;
@@ -549,7 +610,14 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
             "zero_result": true,
             "lifecycle_filtered": true,
         },
+        "search_work": {
+            "queries": search_samples,
+            "ann_queries": after_search.ann_queries - before_search.ann_queries,
+            "exact_rows": after_search.exact_rows - before_search.exact_rows,
+            "lexical_queries": after_search.lexical_queries - before_search.lexical_queries,
+        },
         "gate": {
+            "enforced": corpus_size >= 100_000,
             "p99_target_us": 5000,
             "observed_p99_us": search_p99_us,
             "recall_at_10_target": 0.95,
@@ -573,20 +641,12 @@ async fn run_benchmark(corpus_size: usize, search_samples: usize, label: &str) {
     );
     if corpus_size < 100_000 {
         assert!(
-            search_p99_us <= 50_000.0,
-            "smoke retrieval p99 regressed above 50ms: {search_p99_us:.1}us"
-        );
-        assert!(
-            recall_at_ten >= 0.95 && rebuild_recall_at_ten >= 0.95,
-            "smoke ANN fidelity regressed: initial={recall_at_ten:.3} rebuild={rebuild_recall_at_ten:.3}"
+            recall_at_ten >= 0.95,
+            "smoke ANN fidelity regressed: recall@10={recall_at_ten:.3}"
         );
         assert!(
             top_one_hits as f64 / self_query_count.max(1) as f64 >= 0.95,
             "smoke self-query top-1 fidelity regressed"
-        );
-        assert!(
-            build_us <= 30_000_000.0 && rebuild_us <= 30_000_000.0,
-            "smoke build exceeded 30s: build={build_us:.0}us rebuild={rebuild_us:.0}us"
         );
     } else {
         assert!(

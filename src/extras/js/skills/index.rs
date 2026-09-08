@@ -3,6 +3,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +82,23 @@ pub struct SearchStageDurations {
 pub struct SearchOutput {
     pub skills: Vec<ScoredSkill>,
     pub stages: SearchStageDurations,
+}
+
+/// Operation evidence for tests; scoped to one immutable snapshot and its clones.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchWork {
+    pub ann_queries: usize,
+    pub exact_rows: usize,
+    pub lexical_queries: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SearchWorkCounters {
+    ann_queries: AtomicUsize,
+    exact_rows: AtomicUsize,
+    lexical_queries: AtomicUsize,
 }
 
 pub trait SkillIndex: Send + Sync {
@@ -161,6 +180,8 @@ pub struct ImmutableSkillIndex {
     lexical: Option<Arc<Mutex<Connection>>>,
     by_id: Arc<HashMap<String, usize>>,
     hidden: Arc<HashSet<usize>>,
+    #[cfg(test)]
+    search_work: Arc<SearchWorkCounters>,
 }
 
 impl ImmutableSkillIndex {
@@ -175,6 +196,8 @@ impl ImmutableSkillIndex {
             lexical: None,
             by_id: Arc::new(HashMap::new()),
             hidden: Arc::new(HashSet::new()),
+            #[cfg(test)]
+            search_work: Arc::default(),
         }
     }
 
@@ -271,7 +294,21 @@ impl ImmutableSkillIndex {
             lexical,
             by_id: Arc::new(by_id),
             hidden: Arc::new(HashSet::new()),
+            #[cfg(test)]
+            search_work: Arc::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_work_for_test(&self) -> SearchWork {
+        SearchWork {
+            ann_queries: self.search_work.ann_queries.load(AtomicOrdering::Relaxed),
+            exact_rows: self.search_work.exact_rows.load(AtomicOrdering::Relaxed),
+            lexical_queries: self
+                .search_work
+                .lexical_queries
+                .load(AtomicOrdering::Relaxed),
+        }
     }
 
     pub(crate) fn ann_recommended(&self) -> bool {
@@ -289,6 +326,8 @@ impl ImmutableSkillIndex {
             lexical: self.lexical.as_ref().map(Arc::clone),
             by_id: Arc::clone(&self.by_id),
             hidden: Arc::clone(&self.hidden),
+            #[cfg(test)]
+            search_work: Arc::default(),
         }
     }
 
@@ -325,6 +364,8 @@ impl ImmutableSkillIndex {
             lexical: self.lexical.as_ref().map(Arc::clone),
             by_id: Arc::clone(&self.by_id),
             hidden: Arc::new(masked),
+            #[cfg(test)]
+            search_work: Arc::default(),
         }
     }
 
@@ -398,6 +439,9 @@ impl ImmutableSkillIndex {
         policy: &RetrievalPolicy,
         pure_only: bool,
     ) -> Vec<(usize, f32)> {
+        if policy.dense_candidate_limit == 0 {
+            return Vec::new();
+        }
         let Some(ann) = &self.ann else {
             return self.exact_dense_candidates(query, policy, pure_only);
         };
@@ -414,6 +458,10 @@ impl ImmutableSkillIndex {
             .saturating_mul(overfetch)
             .max(ANN_MIN_CANDIDATES)
             .min(self.entries.len());
+        #[cfg(test)]
+        self.search_work
+            .ann_queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let mut candidates = ann
             .search(query, candidate_count, ANN_SEARCH_EF.max(candidate_count))
             .into_iter()
@@ -455,6 +503,10 @@ impl ImmutableSkillIndex {
         if limit == 0 {
             return Vec::new();
         }
+        #[cfg(test)]
+        self.search_work
+            .exact_rows
+            .fetch_add(self.entries.len(), AtomicOrdering::Relaxed);
         let scores = dense_scores(
             &self.embeddings,
             self.entries.len(),
@@ -498,9 +550,16 @@ impl ImmutableSkillIndex {
         policy: &RetrievalPolicy,
         pure_only: bool,
     ) -> Result<Vec<(usize, f32)>, SkillIndexError> {
+        if policy.lexical_candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
         let Some(lexical) = &self.lexical else {
             return Ok(Vec::new());
         };
+        #[cfg(test)]
+        self.search_work
+            .lexical_queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let connection = lexical
             .lock()
             .map_err(|_| SkillIndexError::LexicalPoisoned)?;
