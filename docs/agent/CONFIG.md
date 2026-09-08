@@ -2103,8 +2103,11 @@ starts. The writer lock covers content revalidation, version advancement and
 frame publication, so concurrent callers cannot send `didChange` ahead of
 `didOpen` or consume a version for bytes that changed while queued. One transport
 deadline covers the queue and publication; timeout or cancellation stops the
-server rather than retaining partially synchronized state. Versioned diagnostic
-support is advertised.
+server rather than retaining partially synchronized state. Failure is latched
+before the writer lock is released, so queued syncs, requests and server replies
+are rejected even while the process is still being reaped. The manager treats a
+closing client as unavailable and waits for cleanup before its restart policy
+runs. Versioned diagnostic support is advertised.
 Versionless initial publishes and clears (including an explicit JSON
 `version: null`) remain accepted while the sync epoch is unchanged; after an
 edit they fail closed until an exact versioned publish anchors the new epoch.

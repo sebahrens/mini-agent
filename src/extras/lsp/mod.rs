@@ -246,7 +246,7 @@ impl LspManager {
             return None;
         }
         if let Some(cached) = clients.get(name)
-            && !cached.is_stopped()
+            && cached.is_usable()
         {
             return Some(cached.clone());
         }
@@ -601,6 +601,11 @@ impl LspManager {
             }
         }
         if out.is_empty() { None } else { Some(out) }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn client_for_test(&self, path: &Path) -> Option<Arc<LspClient>> {
+        self.client_for(path).await
     }
 
     #[cfg(test)]

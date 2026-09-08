@@ -209,7 +209,7 @@ The audit currently resolves as follows:
 | `TC-LOOP-VALIDATION` | Shared bounded runner in `src/extras/validation.rs`; headless and interactive call sites contain no raw process constructor. |
 | `TC-PROJECT-AUTOMATION` | Direct program plus the project-automation occurrences of zerobox/Seatbelt/bwrap constructors in `src/sandbox.rs`; terminal spawn in `src/extras/hooks/subprocess.rs`. |
 | `TC-MCP-STDIO` | Tokio process import/type and RMCP terminal spawn in `src/extras/mcp/client.rs`. |
-| `TC-LSP-SERVICE` | Tokio child/stdin types, constructor, and terminal spawn in `src/extras/lsp/client.rs`. |
+| `TC-LSP-SERVICE` | Tokio child/stdin types (including the transport guard's owned stdin lock and writer accessor), constructor, and terminal spawn in `src/extras/lsp/client.rs`. |
 | `TC-INTERNAL-GIT` | The Tokio constructor/import in `src/extras/git_worktree/mod.rs`, the shared bounded runner used by the background session-status refresh, and the explicit-workspace stash helper in `src/ui/mod.rs`. |
 | `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, and the fixed macOS version probe in `src/sandbox/worker/macos.rs`. Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. Windows command-interpreter site: the `cmd /c start` opener fallback in `src/ui/renderer.rs`. |
 | `TC-INTERNAL-VERIFICATION` | Fixed embedded-policy Bash constructor/status in `src/extras/loop/mod.rs`; fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |

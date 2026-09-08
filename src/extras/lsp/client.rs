@@ -145,45 +145,6 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// stdin pipe. Without this bound, synchronizing an ordinary document blocks
 /// the calling file tool — and its shared or exclusive tool lane — forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Deadline for a notification, which has no response to wait for and so had no
-/// bound of its own.
-const NOTIFY_TIMEOUT: Duration = WRITE_TIMEOUT;
-
-/// Test override for the transport write deadline, in milliseconds. Zero keeps
-/// the production value.
-#[cfg(test)]
-static WRITE_TIMEOUT_MS_FOR_TEST: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn set_write_timeout_for_test(value: Option<Duration>) {
-    WRITE_TIMEOUT_MS_FOR_TEST.store(
-        value.map(|value| value.as_millis() as u64).unwrap_or(0),
-        Ordering::Relaxed,
-    );
-}
-
-fn write_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let millis = WRITE_TIMEOUT_MS_FOR_TEST.load(Ordering::Relaxed);
-        if millis > 0 {
-            return Duration::from_millis(millis);
-        }
-    }
-    WRITE_TIMEOUT
-}
-
-fn notify_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let millis = WRITE_TIMEOUT_MS_FOR_TEST.load(Ordering::Relaxed);
-        if millis > 0 {
-            return Duration::from_millis(millis);
-        }
-    }
-    NOTIFY_TIMEOUT
-}
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -304,12 +265,54 @@ struct SyncProbe {
     release: oneshot::Receiver<()>,
 }
 
+#[cfg(test)]
+type ShutdownProbe = Arc<Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>;
+
+struct TransportState {
+    closing: AtomicBool,
+    shutdown_tx: mpsc::UnboundedSender<()>,
+    #[cfg(test)]
+    timeout_ms: std::sync::atomic::AtomicU64,
+}
+
+impl TransportState {
+    fn new(shutdown_tx: mpsc::UnboundedSender<()>) -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            shutdown_tx,
+            #[cfg(test)]
+            timeout_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn close(&self) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            let _ = self.shutdown_tx.send(());
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn write_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let millis = self.timeout_ms.load(Ordering::Relaxed);
+            if millis > 0 {
+                return Duration::from_millis(millis);
+            }
+        }
+        WRITE_TIMEOUT
+    }
+}
+
 pub struct LspClient {
     name: String,
     stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
-    shutdown_tx: mpsc::UnboundedSender<()>,
+    transport: Arc<TransportState>,
     stopped: Arc<AtomicBool>,
     stopped_notify: Arc<Notify>,
     diags: DiagStore,
@@ -319,6 +322,8 @@ pub struct LspClient {
     open: Arc<Mutex<HashMap<String, SyncedDocument>>>,
     #[cfg(test)]
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
+    #[cfg(test)]
+    shutdown_probe: ShutdownProbe,
 }
 
 impl LspClient {
@@ -421,9 +426,12 @@ impl LspClient {
             Arc::new(Mutex::new(HashMap::new()));
         let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        let transport = Arc::new(TransportState::new(shutdown_tx));
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_notify = Arc::new(Notify::new());
         let open = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(test)]
+        let shutdown_probe = Arc::new(Mutex::new(None));
 
         // Reader task: routes responses to pending requests, stores
         // diagnostics, and answers server→client requests with null so a
@@ -438,7 +446,7 @@ impl LspClient {
             let parent_workspace_uri = file_uri(workspace.root())?;
             let workspace = workspace.clone();
             let server_root = server_root.clone();
-            let shutdown_tx = shutdown_tx.clone();
+            let transport = transport.clone();
             tokio::spawn(async move {
                 let mut stdout = rpc::FrameReader::new(stdout);
                 loop {
@@ -464,9 +472,9 @@ impl LspClient {
                             let body = serde_json::to_vec(&reply).unwrap_or_default();
                             if !write_owned_frame_with_deadline(
                                 &stdin,
-                                &shutdown_tx,
+                                &transport,
                                 &body,
-                                write_timeout(),
+                                transport.write_timeout(),
                             )
                             .await
                             {
@@ -518,7 +526,7 @@ impl LspClient {
                                         tracing::debug!(
                                             "lsp[{server_name}]: diagnostic storage limit exceeded"
                                         );
-                                        let _ = shutdown_tx.send(());
+                                        transport.close();
                                         break;
                                     }
                                 }
@@ -533,9 +541,9 @@ impl LspClient {
                         _ => {}
                     }
                 }
-                // Server died: fail every outstanding request.
+                // Mark the transport unavailable before waking failed requests.
+                transport.close();
                 pending.lock().unwrap().clear();
-                let _ = shutdown_tx.send(());
             })
         };
 
@@ -544,7 +552,7 @@ impl LspClient {
         // prevents a configured child from consuming unbounded pipe traffic.
         let stderr_task = {
             let server_name = name.to_string();
-            let shutdown_tx = shutdown_tx.clone();
+            let transport = transport.clone();
             tokio::spawn(async move {
                 let mut stderr = stderr;
                 let mut observed = 0usize;
@@ -556,7 +564,7 @@ impl LspClient {
                             observed = observed.saturating_add(read);
                             if observed > STDERR_LIMIT {
                                 tracing::debug!("lsp[{server_name}]: stderr byte limit exceeded");
-                                let _ = shutdown_tx.send(());
+                                transport.close();
                                 break;
                             }
                         }
@@ -573,8 +581,11 @@ impl LspClient {
             SupervisedProtocol {
                 reader_task,
                 stderr_task,
+                transport: transport.clone(),
                 stopped: stopped.clone(),
                 stopped_notify: stopped_notify.clone(),
+                #[cfg(test)]
+                shutdown_probe: shutdown_probe.clone(),
             },
         ));
 
@@ -583,7 +594,7 @@ impl LspClient {
             stdin,
             next_id: AtomicI64::new(1),
             pending,
-            shutdown_tx,
+            transport: transport.clone(),
             stopped,
             stopped_notify,
             diags,
@@ -592,6 +603,8 @@ impl LspClient {
             open,
             #[cfg(test)]
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            shutdown_probe,
         });
 
         let init_params = json!({
@@ -652,9 +665,9 @@ impl LspClient {
         let started = tokio::time::Instant::now();
         if !write_owned_frame_with_deadline(
             &self.stdin,
-            &self.shutdown_tx,
+            &self.transport,
             &body,
-            timeout.min(write_timeout()),
+            timeout.min(self.transport.write_timeout()),
         )
         .await
         {
@@ -685,13 +698,17 @@ impl LspClient {
         if let Ok(body) = serde_json::to_vec(&msg) {
             return write_owned_frame_with_deadline(
                 &self.stdin,
-                &self.shutdown_tx,
+                &self.transport,
                 &body,
-                notify_timeout(),
+                self.transport.write_timeout(),
             )
             .await;
         }
         false
+    }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        !self.transport.is_closing()
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
@@ -699,7 +716,7 @@ impl LspClient {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.transport.close();
         if self.is_stopped() {
             return;
         }
@@ -716,6 +733,22 @@ impl LspClient {
             return;
         };
         let _ = self.sync_document(path, document).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_shutdown_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.shutdown_probe.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_timeout_for_test(&self, value: Option<Duration>) {
+        self.transport.timeout_ms.store(
+            value.map(|value| value.as_millis() as u64).unwrap_or(0),
+            Ordering::Relaxed,
+        );
     }
 
     #[cfg(test)]
@@ -747,20 +780,20 @@ impl LspClient {
             let _ = probe.queued.send(());
             (probe.advanced, probe.release)
         });
-        let mut write = TransportWriteGuard {
-            shutdown_tx: self.shutdown_tx.clone(),
-            complete: false,
-        };
+        let mut write = TransportWriteGuard::new(&self.transport);
         // One deadline includes the queue, validation and frame publication.
         // The stdin lock keeps document versions in the order sent on the wire.
-        let outcome = tokio::time::timeout(notify_timeout(), async {
-            let mut stdin = self.stdin.lock().await;
-            if self.is_stopped() {
+        let outcome = tokio::time::timeout(self.transport.write_timeout(), async {
+            write.stdin = Some(self.stdin.lock().await);
+            if self.transport.is_closing() {
                 return Ok(None);
             }
             let Some((uri, wire_uri)) = self.document_uris(path, &document).await else {
                 return Ok(None);
             };
+            if self.transport.is_closing() {
+                return Ok(None);
+            }
             let Document {
                 text,
                 identity,
@@ -835,12 +868,18 @@ impl LspClient {
                 "jsonrpc": "2.0", "method": method, "params": params,
             }))
             .map_err(std::io::Error::other)?;
-            rpc::write_frame(&mut *stdin, &body).await?;
+            if self.transport.is_closing() {
+                return Ok(None);
+            }
+            rpc::write_frame(write.writer(), &body).await?;
             Ok::<_, std::io::Error>(Some(baseline))
         })
         .await;
-        write.complete = matches!(outcome, Ok(Ok(_)));
-        if !write.complete {
+        let completed = matches!(outcome, Ok(Ok(_)));
+        write.complete = completed;
+        // Drop latches failure before the owned writer lock is released.
+        drop(write);
+        if !completed {
             // Cancellation also arms this cleanup through the write guard.
             // Never retain a client whose advanced version lacks a full frame.
             self.shutdown().await;
@@ -868,7 +907,7 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
+        self.transport.close();
     }
 }
 
@@ -896,50 +935,69 @@ impl Drop for PendingRequest {
     }
 }
 
-struct TransportWriteGuard {
-    shutdown_tx: mpsc::UnboundedSender<()>,
+struct TransportWriteGuard<'a> {
+    transport: &'a TransportState,
+    stdin: Option<tokio::sync::MutexGuard<'a, tokio::process::ChildStdin>>,
     complete: bool,
 }
 
-impl Drop for TransportWriteGuard {
-    fn drop(&mut self) {
-        if !self.complete {
-            let _ = self.shutdown_tx.send(());
+impl<'a> TransportWriteGuard<'a> {
+    fn new(transport: &'a TransportState) -> Self {
+        Self {
+            transport,
+            stdin: None,
+            complete: false,
         }
+    }
+
+    fn writer(&mut self) -> &mut tokio::process::ChildStdin {
+        self.stdin
+            .as_deref_mut()
+            .expect("transport writer acquired")
     }
 }
 
-/// Write one frame under `deadline`, which covers waiting for the shared writer
-/// lock as well as the write and flush.
-///
-/// A frame that could not be written in full leaves the transport in an
-/// undefined state, so a timeout is a terminal transport failure: the guard
-/// reaps the server rather than letting later requests desynchronize.
+impl Drop for TransportWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.transport.close();
+        }
+        // Field destruction releases stdin only after the latch is visible.
+    }
+}
+
+/// One deadline covers waiting for stdin and writing/flushing a frame. The
+/// guard owns stdin, so failure or cancellation closes the transport before
+/// any queued writer can acquire it, even while process cleanup is pending.
 async fn write_owned_frame_with_deadline(
     stdin: &Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
-    shutdown_tx: &mpsc::UnboundedSender<()>,
+    transport: &TransportState,
     body: &[u8],
     deadline: Duration,
 ) -> bool {
-    let mut write = TransportWriteGuard {
-        shutdown_tx: shutdown_tx.clone(),
-        complete: false,
-    };
+    let mut write = TransportWriteGuard::new(transport);
     let written = tokio::time::timeout(deadline, async {
-        let mut stdin = stdin.lock().await;
-        rpc::write_frame(&mut *stdin, body).await
+        write.stdin = Some(stdin.lock().await);
+        if transport.is_closing() {
+            return Ok(false);
+        }
+        rpc::write_frame(write.writer(), body).await?;
+        Ok::<_, std::io::Error>(true)
     })
     .await;
-    write.complete = matches!(written, Ok(Ok(())));
-    write.complete
+    write.complete = matches!(written, Ok(Ok(_)));
+    matches!(written, Ok(Ok(true)))
 }
 
 /// Protocol tasks drained, and stop signals raised, once the server exits.
 struct SupervisedProtocol {
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    transport: Arc<TransportState>,
     stopped: Arc<AtomicBool>,
     stopped_notify: Arc<Notify>,
+    #[cfg(test)]
+    shutdown_probe: ShutdownProbe,
 }
 
 async fn supervise_child(
@@ -952,8 +1010,11 @@ async fn supervise_child(
     let SupervisedProtocol {
         mut reader_task,
         mut stderr_task,
+        transport,
         stopped,
         stopped_notify,
+        #[cfg(test)]
+        shutdown_probe,
     } = protocol;
     // Poll the direct child as well as protocol tasks. A crashed server can
     // leave a descendant holding inherited stdio open; waiting only for EOF
@@ -974,6 +1035,14 @@ async fn supervise_child(
             }
         }
     }
+    #[cfg(test)]
+    let probe = shutdown_probe.lock().unwrap().take();
+    #[cfg(test)]
+    if let Some((entered, release)) = probe {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
+    transport.close();
     terminate_and_reap(&name, &mut child, process_group).await;
     for task in [&mut reader_task, &mut stderr_task] {
         if tokio::time::timeout(TASK_DRAIN_TIMEOUT, &mut *task)

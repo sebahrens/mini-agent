@@ -1127,6 +1127,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-LSP-SERVICE",
     ),
+    (
+        "src/extras/lsp/client.rs",
+        "stdin: Option<tokio::sync::MutexGuard<'a, tokio::process::ChildStdin>>,",
+        1,
+        "TC-LSP-SERVICE",
+    ),
+    (
+        "src/extras/lsp/client.rs",
+        "fn writer(&mut self) -> &mut tokio::process::ChildStdin {",
+        1,
+        "TC-LSP-SERVICE",
+    ),
     ("src/extras/mcp/client.rs", ".spawn()", 1, "TC-MCP-STDIO"),
     (
         "src/extras/mcp/client.rs",

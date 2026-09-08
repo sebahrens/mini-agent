@@ -1104,39 +1104,159 @@ async fn lsp_process_concurrent_sync_preserves_document_version_order() {
     }
 }
 
-#[tokio::test]
-async fn lsp_process_cancelled_document_sync_reaps_server_before_reuse() {
+#[tokio::test(flavor = "current_thread")]
+async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping() {
     let fixture = FixtureBuild::compile("cancelled-sync");
-    let workspace = fixture.workspace("workspace");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
     let source = workspace.join("document.probe");
     fs::write(&source, "document").unwrap();
     let lease = fixture.path("lease");
-    let client = spawn_client(
-        &fixture.config("normal", &lease),
-        &workspace,
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
+    let request_seen = fixture.path("request.seen");
+    let mut cfg = fixture.config("normal", &lease);
+    cfg.env.insert(
+        "LSP_FIXTURE_REQUEST_FILE".into(),
+        request_seen.display().to_string(),
+    );
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true,
+            servers: HashMap::from([("fixture".into(), cfg)]),
+        },
+        workspace.clone(),
+    );
+    let client = manager.client_for_test(&source).await.unwrap();
     let pid = wait_for_pid(&lease).await;
+    let (stopping, release_shutdown) = client.pause_shutdown_for_test();
     let (_, advanced, _release) = client.pause_next_sync_for_test();
     let caller = client.clone();
     let path = source.clone();
     let sync = tokio::spawn(async move { caller.sync_file(&path).await });
     advanced.await.unwrap();
+    let (queued, queued_advanced, release_queued) = client.pause_next_sync_for_test();
+    let caller = client.clone();
+    let queued_path = source.clone();
+    let queued_call = tokio::spawn(async move {
+        let document = crate::extras::lsp::client::read_stable_document(&queued_path)
+            .await
+            .unwrap();
+        caller.sync_document(&queued_path, document).await
+    });
+    queued.await.unwrap();
     sync.abort();
     assert!(sync.await.unwrap_err().is_cancelled());
-    // Do not explicitly shut down until cancellation itself has reaped it.
-    assert_process_reaped(pid).await;
+    stopping.await.unwrap();
+    assert!(
+        process_is_alive(pid) && !client.is_stopped(),
+        "cleanup pause must precede reaping"
+    );
+    let advanced_during_shutdown = queued_advanced.await.is_ok();
+    let _ = release_queued.send(());
+    let reused = queued_call.await.unwrap();
+    let _ = client.request_for_test(Duration::from_millis(100)).await;
+    let request_sent = request_seen.exists();
+    let pending = client.pending_len_for_test();
+    let mut retry = Box::pin(manager.client_for_test(&source));
+    let retry_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(retry.as_mut(), cx))
+    })
+    .await;
+    let waited_for_cleanup = retry_poll.is_pending();
+    release_shutdown.send(()).unwrap();
     client.shutdown().await;
-    let document = crate::extras::lsp::client::read_stable_document(&source)
-        .await
-        .unwrap();
-    let reused = client.sync_document(&source, document).await;
+    let retried = match retry_poll {
+        std::task::Poll::Pending => retry.as_mut().await,
+        std::task::Poll::Ready(client) => client,
+    };
+    drop(retry);
+    assert_process_reaped(pid).await;
+    manager.shutdown().await;
+    let cooled_down = retried.is_none();
+    drop(retried);
+    drop(client);
+    drop(manager);
     fixture.cleanup();
+    assert!(
+        waited_for_cleanup,
+        "manager returned a closing client before cleanup"
+    );
+    assert!(
+        cooled_down,
+        "restart must observe the existing failure cooldown"
+    );
+    assert!(
+        !advanced_during_shutdown,
+        "queued sync advanced state before failed transport was reaped"
+    );
     assert!(
         reused.is_none(),
         "partially synchronized client remained reusable"
+    );
+    assert!(
+        !request_sent,
+        "a request was written after transport failure"
+    );
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn lsp_process_transport_deadlines_are_independent_between_clients() {
+    let fixture = FixtureBuild::compile("independent-deadlines");
+    let workspace = fixture.workspace("workspace");
+    let source = workspace.join("document.probe");
+    fs::write(&source, "document").unwrap();
+    let fast_client = spawn_client(
+        &fixture.config("normal", &fixture.path("fast.lease")),
+        &workspace,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let slow_client = spawn_client(
+        &fixture.config("normal", &fixture.path("slow.lease")),
+        &workspace,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    fast_client.set_write_timeout_for_test(Some(Duration::from_secs(1)));
+    slow_client.set_write_timeout_for_test(Some(Duration::from_secs(30)));
+    let (_, fast_advanced, _release_fast) = fast_client.pause_next_sync_for_test();
+    let (_, slow_advanced, release_slow) = slow_client.pause_next_sync_for_test();
+    let fast_document = crate::extras::lsp::client::read_stable_document(&source)
+        .await
+        .unwrap();
+    let slow_document = crate::extras::lsp::client::read_stable_document(&source)
+        .await
+        .unwrap();
+    let caller = fast_client.clone();
+    let path = source.clone();
+    let mut fast = tokio::spawn(async move { caller.sync_document(&path, fast_document).await });
+    let caller = slow_client.clone();
+    let slow = tokio::spawn(async move { caller.sync_document(&source, slow_document).await });
+    fast_advanced.await.unwrap();
+    slow_advanced.await.unwrap();
+    let fast_expired = matches!(
+        tokio::time::timeout(Duration::from_secs(5), &mut fast).await,
+        Ok(Ok(None))
+    );
+    if !fast.is_finished() {
+        fast.abort();
+        let _ = fast.await;
+    }
+    fast_client.set_write_timeout_for_test(None);
+    fast_client.shutdown().await;
+    let slow_was_waiting = !slow.is_finished();
+    let _ = release_slow.send(());
+    let slow_result = slow.await.unwrap();
+    slow_client.shutdown().await;
+    fixture.cleanup();
+    assert!(
+        fast_expired,
+        "the other client's override replaced the short deadline"
+    );
+    assert!(
+        slow_was_waiting && slow_result.is_some(),
+        "one client's expiry affected the other client"
     );
 }
 
@@ -1346,25 +1466,6 @@ async fn lsp_process_manager_restarts_stopped_server() {
     fixture.cleanup();
 }
 
-/// Restores the production transport write deadline when the test ends.
-#[cfg(unix)]
-struct WriteDeadlineOverride;
-
-#[cfg(unix)]
-impl WriteDeadlineOverride {
-    fn set(value: Duration) -> Self {
-        crate::extras::lsp::client::set_write_timeout_for_test(Some(value));
-        Self
-    }
-}
-
-#[cfg(unix)]
-impl Drop for WriteDeadlineOverride {
-    fn drop(&mut self) {
-        crate::extras::lsp::client::set_write_timeout_for_test(None);
-    }
-}
-
 /// A child whose stdin pipe fills is a deterministic Unix fixture: the parent's
 /// write blocks once the pipe buffer is full and the child stops reading.
 /// Windows anonymous pipes buffer a document of this size without blocking, so
@@ -1386,7 +1487,7 @@ async fn lsp_process_stalled_writer_is_bounded_and_reaped() {
         .expect("fixture must initialize before it stops reading");
     let parent_pid = wait_for_pid(&lease).await;
 
-    let _deadline = WriteDeadlineOverride::set(Duration::from_millis(300));
+    client.set_write_timeout_for_test(Some(Duration::from_millis(300)));
     let started = Instant::now();
     // Without a write deadline this never returns: the frame write blocks on a
     // full pipe and the response timer only starts afterwards.
@@ -1442,7 +1543,7 @@ async fn lsp_process_queued_writer_is_bounded_for_every_caller() {
         .expect("fixture must initialize before it stops reading");
     let parent_pid = wait_for_pid(&lease).await;
 
-    let _deadline = WriteDeadlineOverride::set(Duration::from_millis(300));
+    client.set_write_timeout_for_test(Some(Duration::from_millis(300)));
     let blocked = client.clone();
     let queued = client.clone();
     let first_path = first.clone();
