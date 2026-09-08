@@ -1999,6 +1999,13 @@ async fn write_parent(
         .await?
         .map_err(|_| WorkerError::Transport)?;
     validate_generation(connection.generation, tagged.generation)?;
+    #[cfg(test)]
+    if let Err(error) = &tagged.result {
+        eprintln!(
+            "JS_TEST_WORKER_IO direction=write class={}",
+            test_frame_failure_class(error)
+        );
+    }
     tagged.result.map_err(map_frame_error)?;
     #[cfg(test)]
     connection.process.notify_parent_write_for_test();
@@ -2067,6 +2074,11 @@ async fn read_worker(
             None => Ok(frame),
         },
         Err(error) => {
+            #[cfg(test)]
+            eprintln!(
+                "JS_TEST_WORKER_IO direction=read class={}",
+                test_frame_failure_class(&error)
+            );
             let error = map_frame_error(error);
             if error == WorkerError::Transport {
                 match exit_status {
@@ -2102,6 +2114,11 @@ fn reconciliation_poll_delay(now: Instant, deadline: Instant) -> Duration {
 }
 
 fn classify_worker_exit(status: ExitStatus) -> WorkerError {
+    #[cfg(test)]
+    eprintln!(
+        "JS_TEST_WORKER_EXIT class={}",
+        test_worker_exit_class(status)
+    );
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -2111,6 +2128,51 @@ fn classify_worker_exit(status: ExitStatus) -> WorkerError {
         }
     }
     WorkerError::Transport
+}
+
+// These breadcrumbs are for libtest/CI failures only. Never retain worker stderr
+// or format arbitrary frame data, OS errors, or worker-selected exit numbers.
+#[cfg(test)]
+pub(crate) fn test_frame_failure_class(error: &FrameError) -> &'static str {
+    match error {
+        FrameError::Io(std::io::ErrorKind::BrokenPipe) => "broken_pipe",
+        FrameError::Io(std::io::ErrorKind::UnexpectedEof) => "unexpected_eof",
+        FrameError::Io(std::io::ErrorKind::ConnectionReset) => "connection_reset",
+        FrameError::Io(std::io::ErrorKind::Interrupted) => "interrupted",
+        FrameError::Io(_) => "other_io",
+        FrameError::TruncatedHeader { .. } => "truncated_header",
+        FrameError::TruncatedBody { .. } => "truncated_body",
+        FrameError::ZeroLength => "zero_length",
+        FrameError::FrameTooLarge { .. } => "oversized_frame",
+        FrameError::InvalidJson => "invalid_json",
+        FrameError::Serialization => "serialization",
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_worker_exit_class(status: ExitStatus) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return match signal {
+                libc::SIGABRT => "signal_abort",
+                libc::SIGKILL => "signal_kill",
+                libc::SIGSEGV => "signal_segv",
+                libc::SIGBUS => "signal_bus",
+                libc::SIGXCPU => "native_cpu_limit",
+                _ => "other_signal",
+            };
+        }
+        if status.code() == Some(128 + libc::SIGXCPU) {
+            return "native_cpu_limit";
+        }
+    }
+    match status.code() {
+        Some(0) => "success",
+        Some(1) => "failure",
+        _ => "other_exit",
+    }
 }
 
 struct TaggedIo<T> {

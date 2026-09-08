@@ -3248,6 +3248,88 @@ async fn worker_supervisor_transport_rejects_stale_generation_before_protocol_st
 }
 
 #[test]
+fn worker_test_failure_diagnostics_use_closed_classes() {
+    use crate::extras::js::protocol::FrameError;
+    use crate::extras::js::supervisor::{test_frame_failure_class, test_worker_exit_class};
+    use std::io::ErrorKind;
+    use std::process::ExitStatus;
+
+    for (error, expected) in [
+        (FrameError::Io(ErrorKind::BrokenPipe), "broken_pipe"),
+        (FrameError::Io(ErrorKind::UnexpectedEof), "unexpected_eof"),
+        (
+            FrameError::Io(ErrorKind::ConnectionReset),
+            "connection_reset",
+        ),
+        (FrameError::Io(ErrorKind::Interrupted), "interrupted"),
+        (FrameError::Io(ErrorKind::PermissionDenied), "other_io"),
+        (
+            FrameError::TruncatedHeader { read: usize::MAX },
+            "truncated_header",
+        ),
+        (
+            FrameError::TruncatedBody {
+                read: usize::MAX,
+                expected: usize::MAX,
+            },
+            "truncated_body",
+        ),
+        (FrameError::ZeroLength, "zero_length"),
+        (
+            FrameError::FrameTooLarge {
+                length: usize::MAX,
+                maximum: usize::MAX,
+            },
+            "oversized_frame",
+        ),
+        (FrameError::InvalidJson, "invalid_json"),
+        (FrameError::Serialization, "serialization"),
+    ] {
+        assert_eq!(test_frame_failure_class(&error), expected);
+    }
+    // Unrecognized worker-selected exit values must not be formatted into logs.
+    for (code, expected) in [
+        (0, "success"),
+        (1, "failure"),
+        (2, "other_exit"),
+        (255, "other_exit"),
+    ] {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code)
+        };
+        assert_eq!(test_worker_exit_class(status), expected);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        for (signal, expected) in [
+            (libc::SIGABRT, "signal_abort"),
+            (libc::SIGKILL, "signal_kill"),
+            (libc::SIGSEGV, "signal_segv"),
+            (libc::SIGBUS, "signal_bus"),
+            (libc::SIGXCPU, "native_cpu_limit"),
+            (libc::SIGTERM, "other_signal"),
+        ] {
+            assert_eq!(
+                test_worker_exit_class(ExitStatus::from_raw(signal)),
+                expected
+            );
+        }
+        assert_eq!(
+            test_worker_exit_class(ExitStatus::from_raw((128 + libc::SIGXCPU) << 8)),
+            "native_cpu_limit"
+        );
+    }
+}
+
+#[test]
 fn worker_exit_reconciliation_never_sleeps_past_its_deadline() {
     assert_eq!(
         crate::extras::js::supervisor::reconciliation_poll_delay_for_test(Duration::from_millis(

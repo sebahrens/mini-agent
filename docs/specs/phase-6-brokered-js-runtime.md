@@ -73,6 +73,17 @@ Out of scope are compromise of the parent, containment backend, operating system
 availability after a host-wide resource failure. Phase 6 does not claim that JavaScript realms
 contain native compromise or that a permission-approved external effect is reversible.
 
+## Test failure diagnostics
+
+The libtest supervisor emits fixed `JS_TEST_WORKER_EXIT` and `JS_TEST_WORKER_IO`
+class labels when a native worker exits or its protocol pipe fails. These labels
+separate common native signals, ordinary exit, EOF, and framing failures without
+retaining worker stderr or formatting exit numbers, frame sizes, or arbitrary
+error text. They are compiled only for tests. Production error categories and
+containment decisions remain unchanged. Libtest worker launches bypass the
+production sealed-image and guardian path; their transport failures do not by
+themselves implicate production image publication.
+
 ## Worker lifecycle
 
 The parent lazily keeps at most one interactive worker process live at a time. It launches the

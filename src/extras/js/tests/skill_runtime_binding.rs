@@ -67,13 +67,11 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
 
 async fn call_pure_skill_with_transport_retry(artifact: &SkillArtifact, code: &str) -> String {
     const MAX_ATTEMPTS: usize = 3;
-    // A retry with no delay is barely a retry: the three attempts used to run
-    // inside ~150 ms, so a transient condition with any duration — a previous
-    // worker still being reaped, its publication lease not yet released — failed
-    // all three. A fresh macOS worker takes on the order of a second to reach
-    // authenticated Ready (docs/benchmarks/2026-09-08-macos-worker-cold-start.md),
-    // so the backoff is scaled to that. This widens no accepted outcome: the
-    // final attempt still panics.
+    // Bounded mitigation for the unresolved native transport flake (mini-agent-enx3).
+    // This reexecutes the libtest worker: production image publication and guardian
+    // startup are not involved. Fixed exit/I/O classes from the supervisor help
+    // distinguish the next CI failure without exposing source or worker stderr.
+    // A fresh supervisor isolates each retry; the final attempt still panics.
     let mut backoff = std::time::Duration::from_millis(250);
     for attempt in 1..=MAX_ATTEMPTS {
         let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(artifact, 0)]));
