@@ -1,7 +1,5 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
-
-use super::DEFAULT_PLAN_FILENAME;
 
 pub fn plan_exists(plan_file: &Path) -> bool {
     plan_file.exists()
@@ -25,11 +23,15 @@ pub async fn handle_startup(plan_file: &Path) -> anyhow::Result<bool> {
     if !plan_exists(plan_file) {
         return Ok(false);
     }
+    // Unattended runs resume by default without consuming input from a pipe.
+    if !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
     eprint!(
         "{} already exists. Restart from existing plan? [Y/n] ",
-        DEFAULT_PLAN_FILENAME
+        plan_file.display()
     );
-    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     let plan_file_owned = plan_file.to_path_buf();
     let input = tokio::task::spawn_blocking(move || {
         let mut input = String::new();

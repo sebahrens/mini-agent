@@ -102,9 +102,11 @@ fn test_iteration_label_with_max() {
 
 #[test]
 fn test_build_prompt_contains_key_parts() {
+    let plan_path = unique_plan_path("custom plan.md");
+    std::fs::write(&plan_path, "- Fix the parser").unwrap();
     let mut ls = LoopState::new(
         "implement feature X".to_string(),
-        PathBuf::from(DEFAULT_PLAN_FILENAME),
+        plan_path.clone(),
         Some(5),
         Some("cargo test".to_string()),
     );
@@ -116,10 +118,17 @@ fn test_build_prompt_contains_key_parts() {
 
     assert!(prompt.contains("implement feature X"));
     assert!(prompt.contains("Iteration 2/5"));
-    assert!(prompt.contains(DEFAULT_PLAN_FILENAME));
+    assert!(prompt.contains(&format!(
+        "Current plan ({}):\n- Fix the parser",
+        plan_path.display()
+    )));
+    assert!(prompt.contains(&format!("Keep {} up to date", plan_path.display())));
+    assert!(prompt.contains(&format!("document them in {}.", plan_path.display())));
+    assert!(!prompt.contains(DEFAULT_PLAN_FILENAME));
     assert!(prompt.contains("fixed parser bug"));
     assert!(prompt.contains("all tests passed"));
     assert!(prompt.contains("Choose ONE task from the plan"));
+    std::fs::remove_file(plan_path).unwrap();
 }
 
 #[test]

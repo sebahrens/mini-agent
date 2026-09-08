@@ -227,6 +227,12 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 
 ## Loop (feature-gated)
 
+`--loop-plan <path>` selects the plan used for both reading progress and the
+model's update instructions (default: `LOOP_PLAN.md`). When that file exists,
+startup asks whether to resume if stdin is a terminal; unattended runs resume
+automatically without reading stdin. To start fresh unattended, remove the plan
+before launching or select a new path.
+
 The optional `--loop-run <command>` validator uses the selected process sandbox
 and the same captured shell contract as the model-visible shell tool (`-c` for
 Bash/sh or `-Command` for PowerShell/pwsh). Headless and interactive loops share

@@ -87,8 +87,8 @@ impl LoopState {
             plan_contents,
             summary,
             run_output,
-            DEFAULT_PLAN_FILENAME,
-            DEFAULT_PLAN_FILENAME,
+            self.plan_file.display(),
+            self.plan_file.display(),
         )
     }
 
