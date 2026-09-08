@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_owner_releases_all_owned_workers_on_teardown() {
+    async fn workspace_cache_retains_services_until_owner_teardown() {
         struct DropProbe(Arc<AtomicUsize>);
         impl Drop for DropProbe {
             fn drop(&mut self) {

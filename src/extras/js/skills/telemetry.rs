@@ -695,29 +695,27 @@ impl TelemetryDispatcher {
     // spawn_session_scoped_with_coordinator; do not un-gate this for production use.
     #[cfg(test)]
     pub fn spawn(paths: &crate::paths::AppPaths) -> Result<Self, DispatchError> {
-        Self::spawn_inner(paths, None, crate::agent::runner::current_work_guard())
+        Self::spawn_inner(paths, None)
     }
 
     pub(crate) fn spawn_session_scoped_with_coordinator(
         paths: &crate::paths::AppPaths,
         coordinator: std::sync::Arc<super::coordinator::IndexCoordinator>,
     ) -> Result<Self, DispatchError> {
-        Self::spawn_inner(paths, Some(coordinator), None)
+        Self::spawn_inner(paths, Some(coordinator))
     }
 
     fn spawn_inner(
         paths: &crate::paths::AppPaths,
         coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
-        work_guard: Option<crate::agent::runner::AgentWorkGuard>,
     ) -> Result<Self, DispatchError> {
         let store = SkillStore::open_at(paths)?;
-        Self::spawn_with_store(store, coordinator, work_guard)
+        Self::spawn_with_store(store, coordinator)
     }
 
     fn spawn_with_store(
         mut store: SkillStore,
         coordinator: Option<std::sync::Arc<super::coordinator::IndexCoordinator>>,
-        work_guard: Option<crate::agent::runner::AgentWorkGuard>,
     ) -> Result<Self, DispatchError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
@@ -729,7 +727,6 @@ impl TelemetryDispatcher {
         let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
-                let _work_guard = work_guard;
                 while let Ok(command) = rx.recv() {
                     let TelemetryCommand::Events(batch) = command else {
                         if let TelemetryCommand::TaskOutcome(outcome) = command
@@ -791,7 +788,7 @@ impl TelemetryDispatcher {
             .connection()
             .busy_timeout(busy_timeout)
             .map_err(super::store::StoreError::from)?;
-        Self::spawn_with_store(store, None, None)
+        Self::spawn_with_store(store, None)
     }
 
     pub fn try_dispatch(&self, batch: EventBatch) -> Result<(), DispatchError> {

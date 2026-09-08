@@ -841,11 +841,6 @@ where
     }
 }
 
-#[cfg(feature = "skills")]
-pub(crate) fn current_work_guard() -> Option<AgentWorkGuard> {
-    AGENT_WORK_SCOPE.try_with(|scope| scope.register()).ok()
-}
-
 pub(crate) fn spawn_blocking_scoped_on<F, R>(
     runtime: &tokio::runtime::Handle,
     operation: F,

@@ -102,7 +102,7 @@ impl HumanReviewer for Approver {
 }
 
 #[tokio::test]
-async fn turn_scope_joins_real_admission_and_telemetry_workers() {
+async fn session_workers_allow_turn_settlement_and_join_during_teardown() {
     let (root, paths) = paths();
     let store = SkillStore::open_at(&paths).expect("admission store");
     let evaluator = AdmissionEvaluator::new(
@@ -111,24 +111,37 @@ async fn turn_scope_joins_real_admission_and_telemetry_workers() {
         "scope-worker",
     )
     .expect("evaluator");
+    let (coordinator, _) = crate::extras::js::skills::turn::shared_coordinator(
+        &paths,
+        std::sync::Arc::new(Embedder::new().unwrap()),
+    )
+    .unwrap();
     let work_scope = crate::agent::runner::AgentWorkScope::new();
     let (admission, telemetry) = work_scope
         .run(async {
             (
-                AdmissionWorker::start(evaluator).expect("admission worker"),
-                TelemetryDispatcher::spawn(&paths).expect("telemetry worker"),
+                AdmissionWorker::start_session_scoped(evaluator).expect("admission worker"),
+                TelemetryDispatcher::spawn_session_scoped_with_coordinator(&paths, coordinator)
+                    .expect("telemetry worker"),
             )
         })
         .await;
     assert_eq!(
         work_scope.active_children(),
-        2,
-        "both production worker threads must register with the turn scope"
+        0,
+        "live session workers must not pin an individual turn"
     );
+    tokio::time::timeout(Duration::from_secs(1), work_scope.wait_idle())
+        .await
+        .expect("the turn must settle while its session workers remain alive");
 
     work_scope.cancellation_handle().cancel();
-    drop(admission);
-    drop(telemetry);
+    work_scope
+        .run(async {
+            drop(admission);
+            drop(telemetry);
+        })
+        .await;
     tokio::time::timeout(Duration::from_secs(1), work_scope.wait_idle())
         .await
         .expect("cancelled turn must fully join admission and telemetry workers");
@@ -177,7 +190,8 @@ async fn auto_admission_end_to_end_proposal_to_non_retrievable_canary() {
         "e2e-worker",
     )
     .unwrap();
-    let admission_worker = AdmissionWorker::start(evaluator).expect("admission worker");
+    let admission_worker =
+        AdmissionWorker::start_session_scoped(evaluator).expect("admission worker");
     let inspector = SkillStore::open_at(&paths).expect("inspector");
     let deadline = Instant::now() + Duration::from_secs(2);
     let report_id = loop {
