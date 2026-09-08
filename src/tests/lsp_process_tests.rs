@@ -324,7 +324,9 @@ impl FixtureBuild {
         }
     }
 
-    fn cleanup(self) {
+    // Callers must first drop clients and managers: their workspace bindings
+    // intentionally prevent directory deletion on Windows, even after reaping.
+    async fn cleanup(self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match fs::remove_dir_all(&self.root) {
@@ -335,9 +337,10 @@ impl FixtureBuild {
                         && matches!(error.raw_os_error(), Some(32 | 33))
                         && Instant::now() < deadline =>
                 {
-                    // Windows can retain a reaped child's executable handle for
-                    // a short interval after process termination.
-                    std::thread::sleep(Duration::from_millis(20));
+                    // Process exit can precede protocol-task drain. Yield so
+                    // those tasks can release workspace/executable handles on
+                    // the current-thread runtime used by these tests.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(error) => {
                     panic!(
@@ -524,7 +527,8 @@ async fn lsp_process_launch_uses_canonical_root_and_delegated_environment() {
 
     client.shutdown().await;
     assert_process_reaped(parent_pid).await;
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -544,7 +548,7 @@ async fn lsp_process_initialization_failures_are_bounded_and_reaped() {
         assert!(client.is_none(), "{mode} server unexpectedly initialized");
         assert_process_reaped(wait_for_pid(&lease).await).await;
     }
-    fixture.cleanup();
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -569,7 +573,17 @@ async fn lsp_process_cancelled_initialization_reaps_descendants() {
     assert_process_reaped(parent_pid).await;
     assert_process_reaped(descendant_pid).await;
 
-    fixture.cleanup();
+    // A process can be gone while a protocol task still owns its directory
+    // binding. Keep that case deterministic on Windows: this current-thread
+    // runtime cannot release the extra binding until cleanup yields to it.
+    #[cfg(windows)]
+    let release_binding = {
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        tokio::spawn(async move { drop(binding) })
+    };
+    fixture.cleanup().await;
+    #[cfg(windows)]
+    release_binding.await.unwrap();
 }
 
 #[tokio::test]
@@ -602,7 +616,8 @@ async fn lsp_process_pending_request_cancellation_removes_entry() {
 
     client.shutdown().await;
     assert_process_reaped(parent_pid).await;
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -680,7 +695,7 @@ async fn lsp_process_publications_reach_parent_cache_before_diagnostic_wait() {
         }
         manager.shutdown().await;
     }
-    fixture.cleanup();
+    fixture.cleanup().await;
     for (
         relative,
         canonical_reply,
@@ -824,7 +839,7 @@ async fn lsp_process_delayed_publication_rejects_changed_source() {
             }
         }
     }
-    fixture.cleanup();
+    fixture.cleanup().await;
     for (replace, relative, version, before, after, barrier, stale, refreshed) in results {
         let case = format!("replace={replace}, relative={relative}, delayed_version={version}");
         assert!(barrier.is_some(), "{case}: protocol barrier failed");
@@ -879,7 +894,7 @@ async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
     let log = fs::read_to_string(&sync_log).unwrap();
     manager.shutdown().await;
     drop(manager);
-    fixture.cleanup();
+    fixture.cleanup().await;
     assert!(accepted[..cap].iter().all(|accepted| *accepted));
     assert!(
         !accepted[cap],
@@ -971,7 +986,11 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
         ));
     }
     manager.shutdown().await;
-    fixture.cleanup();
+    drop(write);
+    drop(edit);
+    drop(query);
+    drop(manager);
+    fixture.cleanup().await;
     for (single, bound, aggregate) in stale_results {
         assert!(
             single.is_none(),
@@ -1071,7 +1090,7 @@ async fn lsp_process_concurrent_sync_preserves_document_version_order() {
             log,
         ));
     }
-    fixture.cleanup();
+    fixture.cleanup().await;
     for (rewrite_queued, advanced_early, first_result, second_result, recovery, log) in results {
         assert!(first_result.is_some());
         assert_eq!(
@@ -1174,7 +1193,7 @@ async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping
     drop(retried);
     drop(client);
     drop(manager);
-    fixture.cleanup();
+    fixture.cleanup().await;
     assert!(
         waited_for_cleanup,
         "manager returned a closing client before cleanup"
@@ -1249,7 +1268,9 @@ async fn lsp_process_transport_deadlines_are_independent_between_clients() {
     let _ = release_slow.send(());
     let slow_result = slow.await.unwrap();
     slow_client.shutdown().await;
-    fixture.cleanup();
+    drop(fast_client);
+    drop(slow_client);
+    fixture.cleanup().await;
     assert!(
         fast_expired,
         "the other client's override replaced the short deadline"
@@ -1313,7 +1334,8 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
 
     client.shutdown().await;
     assert_process_reaped(parent_pid).await;
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1338,7 +1360,8 @@ async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
     client.sync_file(&source).await;
     assert!(client.is_stopped());
     assert_process_reaped(parent_pid).await;
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1366,7 +1389,7 @@ async fn lsp_process_shutdown_and_drop_reap_descendants() {
         assert_process_reaped(parent_pid).await;
         assert_process_reaped(descendant_pid).await;
     }
-    fixture.cleanup();
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1400,7 +1423,7 @@ async fn lsp_process_requested_boundary_failure_starts_no_child() {
         "unenforced network denial started a child"
     );
 
-    fixture.cleanup();
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -1463,7 +1486,7 @@ async fn lsp_process_manager_restarts_stopped_server() {
     // The manager deliberately retains a stable workspace directory handle.
     // Release it before asserting Windows can remove the fixture tree.
     drop(manager);
-    fixture.cleanup();
+    fixture.cleanup().await;
 }
 
 /// A child whose stdin pipe fills is a deterministic Unix fixture: the parent's
@@ -1522,7 +1545,8 @@ async fn lsp_process_stalled_writer_is_bounded_and_reaped() {
     // The tool that issued the sync keeps working afterwards.
     fs::write(&source, "recovered").unwrap();
     assert_eq!(fs::read_to_string(&source).unwrap(), "recovered");
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
 
 /// See `lsp_process_stalled_writer_is_bounded_and_reaped` for why the
@@ -1563,5 +1587,6 @@ async fn lsp_process_queued_writer_is_bounded_for_every_caller() {
     );
 
     assert_process_reaped(parent_pid).await;
-    fixture.cleanup();
+    drop(client);
+    fixture.cleanup().await;
 }
