@@ -47,6 +47,13 @@ pub(crate) fn attest_macos_hosted_containment() -> bool {
     platform::attest_hosted_worker_containment()
 }
 
+/// Source-free phase breakdown of the most recent fresh-worker launch, for the
+/// resource benchmark's cold-start evidence.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn macos_last_launch_profile() -> Option<platform::WorkerLaunchProfile> {
+    platform::last_launch_profile()
+}
+
 pub(crate) fn standard_streams_are_protocol_pipes() -> bool {
     // This rejects terminals, files, null devices, and sockets. It intentionally makes no
     // same-user identity claim: Unix FIFOs and Windows named/anonymous pipes share an OS type.

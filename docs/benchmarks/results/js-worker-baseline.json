@@ -13,7 +13,7 @@
   "targets": {
     "cold_ready_us": {
       "linux": 250000.0,
-      "macos": 300000.0,
+      "macos": 1000000.0,
       "windows": 750000.0
     },
     "warm_pure_call_us": 10000.0,

@@ -18,6 +18,54 @@ use super::{
 #[path = "macos/stale_sweep.rs"]
 mod stale_sweep;
 
+/// Elapsed time of each fresh-worker launch phase, in microseconds.
+///
+/// Source-free by construction: durations only, never paths, identities or
+/// digests. The release review measured cold Ready and cancel-and-recover far
+/// above their informational targets without knowing which phase dominated, so
+/// the launcher records the breakdown for the resource benchmark to report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerLaunchProfile {
+    pub(crate) publication_sweep_us: u64,
+    pub(crate) image_preparation_us: u64,
+    pub(crate) source_digest_us: u64,
+    pub(crate) image_digest_us: u64,
+    pub(crate) image_clone_us: u64,
+    pub(crate) profile_render_us: u64,
+    pub(crate) guardian_spawn_us: u64,
+}
+
+static LAST_LAUNCH_PROFILE: std::sync::Mutex<Option<WorkerLaunchProfile>> =
+    std::sync::Mutex::new(None);
+
+fn record_launch_profile(profile: WorkerLaunchProfile) {
+    *LAST_LAUNCH_PROFILE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(profile);
+}
+
+/// The phase breakdown of the most recent fresh-worker launch, if one ran.
+pub(crate) fn last_launch_profile() -> Option<WorkerLaunchProfile> {
+    *LAST_LAUNCH_PROFILE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Phase timings collected while one image is prepared.
+#[derive(Debug, Clone, Copy, Default)]
+struct ImagePreparationTiming {
+    source_digest_us: u64,
+    image_digest_us: u64,
+    clone_us: u64,
+}
+
+static LAST_IMAGE_TIMING: std::sync::Mutex<Option<ImagePreparationTiming>> =
+    std::sync::Mutex::new(None);
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 const BACKEND: WorkerBackend = WorkerBackend::Seatbelt;
 const ASSURANCE: WorkerContainmentAssurance = WorkerContainmentAssurance::DeprecatedBestEffort;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -511,7 +559,9 @@ fn launch_executable_unchecked_with_probe(
     worker_args: &[&str],
     probe: Option<&HostedProbePaths>,
 ) -> Result<WorkerProcess, WorkerLaunchError> {
+    let mut launch_profile = WorkerLaunchProfile::default();
     let root = publication_root()?;
+    let sweep_started = Instant::now();
     retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
         stale_sweep::sweep_production_publications(&root)
     })
@@ -519,6 +569,8 @@ fn launch_executable_unchecked_with_probe(
         backend: BACKEND,
         source,
     })?;
+    launch_profile.publication_sweep_us = elapsed_micros(sweep_started);
+    let image_started = Instant::now();
     let image =
         one_time_image::OneTimeWorkerImage::prepare_from(&executable, &root).map_err(|source| {
             WorkerLaunchError::Io {
@@ -526,10 +578,23 @@ fn launch_executable_unchecked_with_probe(
                 source,
             }
         })?;
+    launch_profile.image_preparation_us = elapsed_micros(image_started);
+    if let Some(timing) = LAST_IMAGE_TIMING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        launch_profile.source_digest_us = timing.source_digest_us;
+        launch_profile.image_digest_us = timing.image_digest_us;
+        launch_profile.image_clone_us = timing.clone_us;
+    }
+    let render_started = Instant::now();
     let profile = seatbelt_profile(image.image_path()).map_err(|source| WorkerLaunchError::Io {
         backend: BACKEND,
         source,
     })?;
+    launch_profile.profile_render_us = elapsed_micros(render_started);
+    let spawn_started = Instant::now();
 
     let (heartbeat_parent, heartbeat_guardian) =
         UnixStream::pair().map_err(|source| WorkerLaunchError::Io {
@@ -569,6 +634,8 @@ fn launch_executable_unchecked_with_probe(
         backend: BACKEND,
         source,
     })?;
+    launch_profile.guardian_spawn_us = elapsed_micros(spawn_started);
+    record_launch_profile(launch_profile);
     let input = child
         .stdin
         .take()
@@ -2621,19 +2688,24 @@ mod one_time_image {
                 &directory_opened,
                 lease,
             )?;
+            let mut timing = super::ImagePreparationTiming::default();
             let result = (|| {
+                let clone_started = std::time::Instant::now();
                 let image = clone_or_copy_and_open_file_at(
                     &source_file,
                     &directory,
                     OsStr::new(ONE_TIME_IMAGE_NAME),
                 )?;
+                timing.clone_us = super::elapsed_micros(clone_started);
                 publication.adopt_created_image(image)?;
                 fault(PreparationFaultStage::Created, &image_path)?;
                 ensure_no_extended_acl(publication.image()?, "writable one-time worker image")?;
                 // APFS supplies an atomic copy-on-write snapshot with its own inode. Hashing both
                 // pinned descriptors below retains the original byte-for-byte proof without the
                 // full executable rewrite and durable data flush on every worker generation.
-                let source_sha256 = hash_file(&mut source_file)?;
+                let source_digest_started = std::time::Instant::now();
+                let source_sha256 = source_digest(&mut source_file, &source_opened)?;
+                timing.source_digest_us = super::elapsed_micros(source_digest_started);
                 fault(PreparationFaultStage::Copied, &image_path)?;
                 publication.image()?.sync_all()?;
                 fault(PreparationFaultStage::Synced, &image_path)?;
@@ -2678,7 +2750,9 @@ mod one_time_image {
                     ));
                 }
                 ensure_no_extended_acl(publication.image()?, "sealed one-time worker image")?;
+                let image_digest_started = std::time::Instant::now();
                 let image_sha256 = hash_file(publication.image_mut()?)?;
+                timing.image_digest_us = super::elapsed_micros(image_digest_started);
                 fault(PreparationFaultStage::Hashed, &image_path)?;
                 if source_sha256 != image_sha256 || source_opened.len() != image_opened.len() {
                     return Err(permission_denied(
@@ -2725,6 +2799,9 @@ mod one_time_image {
                     retired: false,
                 })
             })();
+            *super::LAST_IMAGE_TIMING
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(timing);
 
             match result {
                 Ok(image) => Ok(image),
@@ -3522,9 +3599,62 @@ mod one_time_image {
         }
     }
 
+    /// Digest of the worker source, memoized against its exact identity.
+    ///
+    /// The source is the installed executable and does not change between
+    /// launches, but hashing it dominated a measurable share of every fresh
+    /// worker. The cache key pins device, inode, size and both timestamps, and
+    /// the caller still revalidates the descriptor's metadata before and after
+    /// the copy, so a replaced or mutated source recomputes rather than
+    /// inheriting another file's proof.
+    fn source_digest(
+        file: &mut std::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> io::Result<[u8; 32]> {
+        let key = SourceDigestKey::of(metadata);
+        static CACHE: std::sync::Mutex<Option<(SourceDigestKey, [u8; 32])>> =
+            std::sync::Mutex::new(None);
+        if let Some((cached_key, digest)) = *CACHE.lock().unwrap_or_else(|error| error.into_inner())
+            && cached_key == key
+        {
+            return Ok(digest);
+        }
+        let digest = hash_file(file)?;
+        *CACHE.lock().unwrap_or_else(|error| error.into_inner()) = Some((key, digest));
+        Ok(digest)
+    }
+
+    /// The exact source identity a memoized digest belongs to.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct SourceDigestKey {
+        device: u64,
+        inode: u64,
+        len: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+
+    impl SourceDigestKey {
+        fn of(metadata: &std::fs::Metadata) -> Self {
+            use std::os::unix::fs::MetadataExt;
+
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                len: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            }
+        }
+    }
+
     fn hash_file(file: &mut std::fs::File) -> io::Result<[u8; 32]> {
         file.seek(std::io::SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
+        // Measured on macOS 26 (docs/benchmarks/2026-09-08-macos-worker-cold-start.md):
+        // this proof is bound by materializing the freshly cloned image's
+        // copy-on-write extents, not by syscall count or SHA throughput, so a
+        // larger buffer changes nothing.
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;
