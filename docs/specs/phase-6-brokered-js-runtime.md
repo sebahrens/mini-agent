@@ -108,6 +108,12 @@ to the unanswered prompt and tells the model not to retry without a new user dec
 expose the permission target or user-interface payload. Platform process limits are defense in
 depth and do not replace these runtime limits.
 
+A worker interrupt during verification source initialization retains the closed
+`ResourceLimit/Initialization/SkillSource` diagnostic even when the realm loader returns a
+generic initialization error. The supervisor retires that resource-terminal worker generation.
+Tests use a shorter worker interrupt budget than the parent watchdog and require the worker's
+diagnostic; a parent timeout or transport failure does not prove source interruption.
+
 The worker handles exactly one invocation at a time. Parent cancellation, timeout, transport
 failure, or shutdown kills and reaps the entire containment/process group; no unsolicited cancel
 frame is sent. A later call may start a new worker, but the failed request is never replayed

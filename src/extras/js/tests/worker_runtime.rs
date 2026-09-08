@@ -2917,7 +2917,7 @@ fn verification_with_embedded_test(script: &str) -> VerifyArtifact {
             name: "answer".into(),
             signature: "answer()".into(),
         }],
-        vec!["true".into()],
+        vec![script.into()],
         crate::extras::js::skills::CapabilityManifest::pure(),
     )
     .unwrap();
@@ -2926,16 +2926,18 @@ fn verification_with_embedded_test(script: &str) -> VerifyArtifact {
         artifact_id: "supervisor-resource-artifact".into(),
         source: "exports.answer = () => true".into(),
         exports: vec!["answer".into()],
-        tests: vec!["true".into()],
+        tests: vec![script.into()],
     };
     VerifyArtifact {
         artifact,
+        #[cfg(feature = "skills")]
         cases: vec![VerificationCase {
             case_id: "embedded-resource".into(),
             script: script.into(),
-            #[cfg(feature = "skills")]
             kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
         }],
+        #[cfg(not(feature = "skills"))]
+        cases: vec![],
     }
 }
 #[tokio::test]
@@ -3012,38 +3014,48 @@ fn worker_supervisor_transport_run_and_verify_reuse_one_serialized_connection() 
 
 #[test]
 fn worker_supervisor_real_verification_resource_terminal_recycles_generation() {
-    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
-        TestWorkerLauncher::internal_worker_process_with_limits(50, 10_000),
-        Duration::from_secs(2),
-    );
-    let result = supervisor
-        .verify_blocking(verification_with_embedded_test("while (true) {}"))
-        .unwrap();
-    assert!(!result.passed);
-    assert!(
-        result.cases.iter().any(|case| {
-            case.diagnostic
-                .as_ref()
-                .is_some_and(|diagnostic| diagnostic.class == DiagnosticClass::ResourceLimit)
-        }),
-        "unexpected verification result: {result:?}"
-    );
+    for (request, role) in [
+        (
+            verification_with_source("while (true) {} function answer() { return true; }"),
+            ScriptRole::SkillSource,
+        ),
+        (
+            verification_with_embedded_test("while (true) {}"),
+            ScriptRole::EmbeddedTest,
+        ),
+    ] {
+        let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+            TestWorkerLauncher::internal_worker_process_with_limits(50, 10_000),
+            Duration::from_secs(2),
+        );
+        let result = supervisor.verify_blocking(request).unwrap();
+        assert!(!result.passed);
+        assert!(
+            result.cases.iter().any(|case| {
+                case.diagnostic.as_ref().is_some_and(|diagnostic| {
+                    diagnostic.class == DiagnosticClass::ResourceLimit
+                        && diagnostic.script_role == role
+                })
+            }),
+            "unexpected verification result: {result:?}"
+        );
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
-    let next = runtime
-        .block_on(supervisor.execute(
-            RunStep::new("42".into()),
-            RecordingEffects::default(),
-            PermCancellation::new(),
-        ))
-        .unwrap();
-    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
-    assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
-    runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
+        let next = runtime
+            .block_on(supervisor.execute(
+                RunStep::new("42".into()),
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            ))
+            .unwrap();
+        assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+        assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
+        runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+    }
 }
 
 #[tokio::test]

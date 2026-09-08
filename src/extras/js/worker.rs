@@ -3789,20 +3789,28 @@ fn execute_isolated_skill_verification_case(
     ) {
         Ok(loaded) => loaded,
         Err(error) => {
-            let class = match error {
-                super::realm::RealmError::Identity
-                | super::realm::RealmError::InvalidExport
-                | super::realm::RealmError::DuplicateExport
-                | super::realm::RealmError::ExportCollision
-                | super::realm::RealmError::MissingExport
-                | super::realm::RealmError::PendingInitializationJobs => DiagnosticClass::Contract,
-                super::realm::RealmError::Initialization
-                | super::realm::RealmError::PrivateLibraryCompilation
-                | super::realm::RealmError::PrivateLibraryBytecodeLoad
-                | super::realm::RealmError::PrivateLibraryModuleEvaluation
-                | super::realm::RealmError::PrivateLibraryExportLookup
-                | super::realm::RealmError::PrivateLibraryFactoryExecution
-                | super::realm::RealmError::WrapperInstallation => DiagnosticClass::Exception,
+            // Realm errors are deliberately closed, so preserve the worker-owned
+            // interrupt flag before translating the loader's error category.
+            let class = if interrupted.load(Ordering::Relaxed) {
+                DiagnosticClass::ResourceLimit
+            } else {
+                match error {
+                    super::realm::RealmError::Identity
+                    | super::realm::RealmError::InvalidExport
+                    | super::realm::RealmError::DuplicateExport
+                    | super::realm::RealmError::ExportCollision
+                    | super::realm::RealmError::MissingExport
+                    | super::realm::RealmError::PendingInitializationJobs => {
+                        DiagnosticClass::Contract
+                    }
+                    super::realm::RealmError::Initialization
+                    | super::realm::RealmError::PrivateLibraryCompilation
+                    | super::realm::RealmError::PrivateLibraryBytecodeLoad
+                    | super::realm::RealmError::PrivateLibraryModuleEvaluation
+                    | super::realm::RealmError::PrivateLibraryExportLookup
+                    | super::realm::RealmError::PrivateLibraryFactoryExecution
+                    | super::realm::RealmError::WrapperInstallation => DiagnosticClass::Exception,
+                }
             };
             return VerificationCaseResult {
                 case_id: case.case_id.clone(),

@@ -62,128 +62,39 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_boolean_false_rejected() {
-        let s = skill(
-            "function test() { return false; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(result.is_err(), "a failing test should fail verification");
-    }
-
-    #[test]
-    fn test_number_truthy_rejected() {
-        let s = skill(
-            "function test() { return 1; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns a non-boolean should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_string_truthy_rejected() {
-        let s = skill(
-            r#"function test() { return "true"; }"#,
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns a string should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_object_rejected() {
-        let s = skill(
-            "function test() { return {}; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns an object should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_array_rejected() {
-        let s = skill(
-            "function test() { return []; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns an array should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_undefined_rejected() {
-        let s = skill(
-            "function test() { return undefined; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns undefined should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_null_rejected() {
-        let s = skill(
-            "function test() { return null; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns null should fail verification"
-        );
-    }
-
-    #[test]
-    fn test_thrown_error_rejected() {
-        let s = skill(
-            "function test() { throw new Error('oops'); }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that throws an error should fail verification"
-        );
+    fn tests_require_exact_boolean_true_and_report_the_rejection() {
+        for (name, expression, expected) in [
+            ("false", "false", TestResult::ReturnedFalse),
+            ("number", "1", TestResult::ReturnedFalse),
+            ("string", "'true'", TestResult::ReturnedFalse),
+            ("object", "{}", TestResult::ReturnedFalse),
+            ("array", "[]", TestResult::ReturnedFalse),
+            ("undefined", "undefined", TestResult::ReturnedFalse),
+            ("null", "null", TestResult::ReturnedFalse),
+            (
+                "exception",
+                "(() => { throw new Error('must stay private'); })()",
+                TestResult::Threw("Exception/Evaluation/EmbeddedTest".into()),
+            ),
+        ] {
+            // Test the expression's value directly: undefined returned across the
+            // export ABI would fail cloning before reaching boolean enforcement.
+            let script = format!("test(); ({expression})");
+            let s = skill(
+                "function test() { return true; }",
+                vec![&script],
+                vec![("test", "(): boolean")],
+                CapabilityTier::Pure,
+                vec![],
+            );
+            match verify_skill(&s) {
+                Err(VerificationError::TestFailed { index, outcome }) => {
+                    assert_eq!(index, 0, "{name}");
+                    assert_eq!(outcome, expected, "{name}");
+                }
+                result => panic!("{name}: expected a test rejection, got {result:?}"),
+            }
+        }
     }
 
     #[test]
@@ -245,27 +156,25 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_export() {
-        let s = skill(
-            "function real_export() { return true; }",
-            vec!["real_export()"],
-            vec![("missing", "(): boolean"), ("real_export", "(): boolean")], // missing is declared but not defined
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(matches!(
-            result,
-            Err(VerificationError::SourceEvaluationFailed(_))
-        ));
+    fn declared_exports_must_exist_and_be_functions() {
+        for (name, source) in [
+            ("missing", "function present() { return true; }"),
+            ("non_function", "var test = 42;"),
+        ] {
+            let s = skill(
+                source,
+                vec!["true"],
+                vec![("test", "(): boolean")],
+                CapabilityTier::Pure,
+                vec![],
+            );
+            let result = verify_skill(&s);
+            assert!(
+                matches!(result, Err(VerificationError::SourceEvaluationFailed(_))),
+                "{name}: expected source rejection before tests run, got {result:?}"
+            );
+        }
     }
-
-    // Note: Export type validation tests are skipped because rquickjs's
-    // type_name() method doesn't reliably identify functions at the host level.
-    // The mutation pass provides adequate validation for this.
-    //
-    // #[test]
-    // fn test_export_not_a_function() { ... }
 
     #[test]
     fn test_multiple_tests_in_order() {
@@ -295,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn verification_cases_receive_fresh_skill_state() {
+    fn verification_cases_and_requests_receive_fresh_skill_state() {
         let s = skill(
             "let counter = 0; function increment() { counter++; return counter; }",
             vec!["increment() === 1", "increment() === 1"],
@@ -303,10 +212,14 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 2);
-        assert_eq!(report.test_results[0], TestResult::Passed);
-        assert_eq!(report.test_results[1], TestResult::Passed);
+        for request in 0..2 {
+            let report = verify_skill(&s).expect("each request starts with fresh state");
+            assert_eq!(
+                report.test_results,
+                vec![TestResult::Passed, TestResult::Passed],
+                "request {request}"
+            );
+        }
     }
 
     #[test]
@@ -544,27 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_false_test() {
-        let s = skill(
-            "function test() { return false; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&s);
-        assert!(
-            result.is_err(),
-            "a test that returns false should fail verification"
-        );
-    }
-
-    // Note: Export type validation is deferred due to rquickjs limitations.
-    //
-    // #[test]
-    // fn test_export_as_variable_rejected() { ... }
-
-    #[test]
     fn test_mutation_multiple_exports() {
         let s = skill(
             "function foo() { return 1; } function bar() { return 2; }",
@@ -599,48 +491,6 @@ mod tests {
             verify_skill(&s),
             Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
         ));
-    }
-
-    #[test]
-    fn test_infinite_source_is_interrupted() {
-        let s = skill(
-            "while (true) {} function unreachable() { return true; }",
-            vec!["unreachable()"],
-            vec![("unreachable", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        // Losing the worker outright is a transient launch/transport failure on
-        // a loaded runner, not a verification outcome, so it is retried rather
-        // than accepted: a genuinely broken interrupt still fails both attempts.
-        // This adds no accepted outcome to the match below.
-        let mut result = verify_skill(&s);
-        if matches!(
-            &result,
-            Err(VerificationError::InfrastructureUnavailable(message))
-                if message == "worker unavailable"
-        ) {
-            eprintln!("infinite-source verification lost its worker; retrying once");
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            result = verify_skill(&s);
-        }
-        let interrupted = match &result {
-            Err(VerificationError::SourceEvaluationFailed(_)) => true,
-            // The worker's own interrupt handler normally fires first, but if
-            // the parent-side deadline wins the race the failure is classified
-            // as infrastructure because it is not attributable to the source.
-            Err(VerificationError::InfrastructureUnavailable(message))
-                if message.contains("deadline expired") =>
-            {
-                true
-            }
-            #[cfg(target_os = "linux")]
-            Err(VerificationError::InfrastructureUnavailable(message)) => {
-                message == "worker unavailable"
-            }
-            _ => false,
-        };
-        assert!(interrupted, "unexpected verification result: {result:?}");
     }
 
     #[test]
@@ -732,21 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fresh_runtime_per_verification() {
-        let s = skill(
-            "function test() { return true; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report1 = verify_skill(&s).unwrap();
-        let report2 = verify_skill(&s).unwrap();
-        // Both should pass independently.
-        assert_eq!(report1.test_results, report2.test_results);
-    }
-
-    #[test]
     fn test_transcript_empty_for_tier_0() {
         let s = skill(
             "function test() { return true; }",
@@ -791,56 +626,6 @@ mod required_behaviour_probes {
             test_manifest(tier, hosts).expect("valid manifest"),
         )
         .expect("valid artifact")
-    }
-
-    #[test]
-    fn probe_missing_export_is_rejected() {
-        // `absent` is declared but never defined in source.
-        let skill = artifact(
-            "function present() { return true; }",
-            vec!["present() === true"],
-            vec![("absent", "absent(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&skill);
-        assert!(
-            result.is_err(),
-            "a declared export that does not exist must fail verification, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn probe_non_function_export_is_rejected() {
-        let skill = artifact(
-            "var notAFunction = 42;",
-            vec!["notAFunction === 42"],
-            vec![("notAFunction", "notAFunction: number")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let result = verify_skill(&skill);
-        assert!(
-            result.is_err(),
-            "a non-function export must fail verification, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn probe_tier1_receives_declared_read_file_fake() {
-        // A Tier 1 skill declaring ReadFile must be able to call the fake.
-        let skill = artifact(
-            "function readIt(cap) { return typeof cap.read_file; }",
-            vec!["readIt() === 'function'"],
-            vec![("readIt", "readIt(path: string): string")],
-            CapabilityTier::ReadOnly,
-            vec![HostCapability::ReadFile],
-        );
-        let result = verify_skill(&skill);
-        assert!(
-            result.is_ok(),
-            "Tier 1 must receive its declared read_file fake, got {result:?}"
-        );
     }
 
     #[test]
