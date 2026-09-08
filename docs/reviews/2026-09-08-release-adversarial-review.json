@@ -172,6 +172,48 @@
       ],
       "required_change": "Introduce explicit configurable provider connect and stream-inactivity bounds with documented defaults, applied to built-in and custom providers. Keep long healthy streams alive by resetting the inactivity deadline on valid progress. Route deadline failures through bounded retry/cancellation and preserve already executed tool history and usage; make headless termination actionable.",
       "verification": "Code-confirmed against the locked dependency: reqwest-0.13.4/src/async_impl/client.rs:299,313-314 defaults all three to None; build_http_client only sets timeout at provider.rs:1597 under custom Some(secs); production stream consumers have no idle select. Add hermetic servers that accept then stall before headers and after one SSE event, a slow healthy stream, custom override tests, and main/headless/advisor deadline recovery tests. Assert bounded retries and no duplicated effects."
+    },
+    {
+      "title": "Concurrent hook decisions overwrite another call's required approval",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/permission/checker.rs:113-118,358-374,576-606; src/extras/hooks/decorator.rs:98-138; src/agent/tools/concurrency.rs",
+      "evidence": [
+        "PermissionChecker keeps only one pending_forced_ask and one pending_one_shot_allow for the entire checker. Scoped tokens prevent another invocation consuming a decision, but a second hook overwrites the first decision before its tool checks permissions. Two concurrent read calls using the production concurrency wrapper and a barrier before check_perm, each with a PreToolUse ask verdict, produced one denied call and one successful call in noninteractive Standard mode. Both must deny without an approval channel."
+      ],
+      "required_change": "Store hook decisions per invocation token or within the invocation task-local scope, without overwriting other in-flight calls. Ensure cancellation, early return and completion remove only that invocation's state. Preserve deny-rule precedence and single-use semantics; keep read-tool concurrency.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-hooks.patch and run cargo test --features hooks,skills release_review_probe_parallel_read_hooks_keep_both_ask_decisions -- --nocapture. Currently one call succeeds. Require both calls to deny without ask_tx and both to request independent approval with an interactive channel. Add mixed ask/allow/defer, same/different tool names, opposite scheduling orders and cancellation tests; assert no cross-call decision loss or reuse.",
+      "id": "mini-agent-wldr.13"
+    },
+    {
+      "title": "Hook approval decisions are ignored when tools use different permission keys or no inner check",
+      "priority": "P1",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/hooks/decorator.rs:98-138; src/permission/checker.rs:576-606,622-666; src/git/tool.rs:120,478,599; src/extras/js/skills/search_tool.rs:42-73; src/extras/advisor/mod.rs:105,150",
+      "evidence": [
+        "HookedTool records ask/allow against the public ToolDyn name and assumes an inner permission check will consume it. Git checks git/status etc. while its public name is git; MCP checks mcp_tool while its public name is the discovered tool name. SkillsSearchTool and AdvisorTool have no inner check, and todo_write returns Allowed before reading the pending decision. A wrapped fixture using git -> git/status succeeded after an ask verdict without ask_tx; a wrapped tool with no inner permission check also succeeded. The two probes exercise the real decorator/checker contract with fixture tools, not real Git/advisor operations."
+      ],
+      "required_change": "Enforce hook approval decisions for every wrapped invocation, using an explicit contract between decorator and permission checks that supports operation-specific keys and tools without inner checks. An ask must never silently fall through: prompt once before execution or fail closed if approval is unavailable. Honor allow for the intended invocation while preserving explicit deny rules, path scopes and operation-specific policy; do not solve this by indiscriminate tool-name widening.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-hooks.patch and run cargo test --features hooks,skills release_review_probe_hook_ask_covers -- --nocapture. Both probes currently return success where denial is required. Add production integration coverage for Git status and commit, namespaced MCP tools, todo_write and a tool without an inner check. Cover interactive/headless/missing checker paths, allow/ask/deny, rewritten input and explicit deny precedence. Assert a denied ask executes no side effects.",
+      "id": "mini-agent-wldr.14"
+    },
+    {
+      "title": "Post-tool hooks receive original arguments after a pre-hook input rewrite",
+      "priority": "P2",
+      "confidence": 0.99,
+      "owner": "downstream-resolver",
+      "autofix_class": "manual",
+      "locations": "src/extras/hooks/decorator.rs:72-73,123-138,148-163",
+      "evidence": [
+        "PreToolUse updated_input is serialized and passed to the inner tool, but both PostToolUse and PostToolUseFailure receive the original parsed tool_input. A real hook subprocess rewriting path from original-target to actual-target made the tool return actual-target while the post-hook JSON still reported original-target. Post hooks that audit or validate the affected file/command therefore inspect a different operation from the one executed."
+      ],
+      "required_change": "Retain the effective serialized/parsed arguments actually passed to the inner tool and send those to both success and failure post hooks. If original input is needed for provenance, expose it separately with documented semantics. Keep chained pre-hook rewrites and non-rewritten calls consistent.",
+      "verification": "Apply docs/reviews/2026-09-08-probes-hooks.patch and run cargo test --features hooks,skills release_review_probe_post_hook_observes_executed_rewritten_input -- --nocapture. Currently the post envelope contains original-target. Require actual-target and add failure-path and multiple-rewrite tests that compare the captured inner-tool arguments with post-hook input; verify unchanged input when no rewrite occurs.",
+      "id": "mini-agent-wldr.15"
     }
   ],
   "residual_risks": [
@@ -181,7 +223,7 @@
     "Performance test failure in the restricted initial run was not reproduced in the unrestricted full suite; no separate performance-regression finding was inferred from that timing sample."
   ],
   "testing_gaps": [
-    "Nine targeted regressions are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
+    "Thirteen targeted regressions covering twelve findings are preserved as opt-in patches, outside the ordinary passing suite. They assert desired behavior and currently fail.",
     "Read long-line allocation and provider-inactivity findings are code-confirmed; implementation beads require instrumented/hermetic regressions.",
     "Nightly workflow policy tests assert command strings, not correctness of record extraction."
   ]

@@ -2,7 +2,7 @@
 
 Review checkpoint at `6021ba1cee1725d52930e17d239b305d6ed9ad66` (v1.8.0). Tracking epic: **mini-agent-wldr**, in progress. No production fixes are included in this checkpoint.
 
-Twelve atomic findings are filed: **7 P1, 5 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
+Fifteen atomic findings are filed: **9 P1, 6 P2**. Each bead records the affected code, concrete failure, required change and verification criteria. The complete machine-readable findings are in [the review JSON](2026-09-08-release-adversarial-review.json).
 
 | Bead | Priority | Finding | Evidence |
 |---|---|---|---|
@@ -18,6 +18,9 @@ Twelve atomic findings are filed: **7 P1, 5 P2**. Each bead records the affected
 | mini-agent-wldr.10 | P1 | Nightly evaluation drops the first persona metric and never runs the library axis | Current nightly CI log |
 | mini-agent-wldr.11 | P1 | A bounded read can allocate an entire arbitrarily long source line | Code and locked dependency trace |
 | mini-agent-wldr.12 | P1 | Default provider streams have no connection or inactivity deadline | Code and locked dependency trace |
+| mini-agent-wldr.13 | P1 | Concurrent hook decisions overwrite another call's required approval | Failing targeted regression |
+| mini-agent-wldr.14 | P1 | Hook approval decisions are ignored when tools use different permission keys or no inner check | Failing targeted regression |
+| mini-agent-wldr.15 | P2 | Post-tool hooks receive original arguments after a pre-hook input rewrite | Failing targeted regression |
 
 ## Verification evidence
 
@@ -29,15 +32,18 @@ Twelve atomic findings are filed: **7 P1, 5 P2**. Each bead records the affected
 - [Main CI 34190987872](https://github.com/sebahrens/mini-agent/actions/runs/34190987872): success at the reviewed SHA.
 - [Nightly evaluation 34199175478](https://github.com/sebahrens/mini-agent/actions/runs/34199175478): failure at the reviewed SHA. Its first persona metric shares libtest's progress line, so the anchored extractor finds eight of nine records. The library-axis step is skipped (finding .10).
 
-## Reproducing the nine experimental findings
+## Reproducing the experimental findings
 
 The temporary tests were removed after execution. Their exact patches are preserved for an isolated checkout at the reviewed SHA; they deliberately fail until the findings are fixed:
 
 ```sh
 git apply docs/reviews/2026-09-08-probes-core.patch
 git apply docs/reviews/2026-09-08-probes-integrations.patch
-cargo test --features skills,lsp release_review_probe -- --nocapture
+git apply docs/reviews/2026-09-08-probes-hooks.patch
+cargo test --features skills,lsp,hooks release_review_probe -- --nocapture
 ```
+
+The hooks patch covers .13–.15 with four probes; `cargo test --features hooks,skills release_review_probe -- --nocapture` reproduced all four failures. Its permission probes use fixture tools against the production decorator/checker and, for concurrency, the production scheduling wrapper. The input-rewrite probe captures an actual post-hook subprocess envelope.
 
 The core patch covers .1–.4. The integration patch covers .5–.9 and adds modes to the existing repository-owned MCP/LSP fixture programs. Each test cleans up its temporary data or child process before asserting, except the session test whose existing RAII fixture cleans up on unwind. The patches contain regression probes, not implementations of the proposed fixes.
 
@@ -53,9 +59,13 @@ Observed failures:
 - A 19,008-byte, 1,000-line code fence caused **9,517,500 bytes** of Markdown parsing.
 - A four-backtick fence containing a triple-backtick line rendered a literal heading differently during streaming and after finalization.
 
+- Concurrent read calls with two hook ask verdicts produced one denied call and one successful call without an approval channel.
+- Hook ask verdicts fell through for a Git-shaped permission key and for a tool without an inner permission check.
+- A pre-hook changed the executed path to `actual-target`, while the post-hook envelope still identified `original-target`.
+
 ## Scope and limits
 
-Completed in this checkpoint: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, and current CI failure analysis. The prior closed reviews were treated as leads, not proof of current behavior.
+Completed in this checkpoint: current-state inventory, canonical Phase 6 invariant read, baseline gates, targeted file-publication/session-discovery/MCP/LSP/streaming/distiller attacks, current CI failure analysis, and targeted hook concurrency/verdict/input-rewrite attacks. Broker cancellation, grant revalidation and runtime-limit ordering received an initial read with no additional confirmed finding; broader containment coverage remains pending. The prior closed reviews were treated as leads, not proof of current behavior.
 
 This checkpoint does **not** establish completion of the full release review. Deep containment and broker/protocol validation, permission and hook interleavings, learned-skill admission/lifecycle and broader platform release behavior remain under the active epic. No claim is made that all possible bugs have been found. Findings .11 and .12 are code-confirmed rather than dynamically reproduced; their beads require bounded-memory and stalled-provider regression tests.
 

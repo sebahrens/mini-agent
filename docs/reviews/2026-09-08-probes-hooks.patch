@@ -1,0 +1,132 @@
+--- a/src/tests/hooks/decorator_tests.rs
++++ b/src/tests/hooks/decorator_tests.rs
+@@ -437,3 +437,129 @@
+     assert_eq!(wrapped.len(), 1);
+     assert_eq!(wrapped[0].name(), "echo_tool");
+ }
++
++struct ReviewPermissionTool {
++    name: &'static str,
++    permission_key: &'static str,
++    permission: Option<crate::permission::checker::PermCheck>,
++    barrier: Option<Arc<tokio::sync::Barrier>>,
++}
++impl ToolDyn for ReviewPermissionTool {
++    fn name(&self) -> String {
++        self.name.into()
++    }
++    fn description(&self) -> String {
++        String::new()
++    }
++    fn parameters(&self) -> serde_json::Value {
++        serde_json::json!({})
++    }
++    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
++        Box::pin(async move {
++            if let Some(barrier) = &self.barrier {
++                barrier.wait().await;
++            }
++            crate::agent::tools::check_perm(&self.permission, &None, self.permission_key, &args)
++                .await
++                .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
++            Ok(args)
++        })
++    }
++}
++#[tokio::test]
++async fn release_review_probe_parallel_read_hooks_keep_both_ask_decisions() {
++    let dispatcher = dispatcher_with(
++        "PreToolUse",
++        vec![handler(r#"echo '{"permissionDecision":"ask"}'"#)],
++    );
++    let perm = permission();
++    let barrier = Arc::new(tokio::sync::Barrier::new(2));
++    let tools: Vec<Box<dyn ToolDyn>> = (0..2)
++        .map(|_| {
++            Box::new(ReviewPermissionTool {
++                name: "read",
++                permission_key: "read",
++                permission: perm.clone(),
++                barrier: Some(barrier.clone()),
++            }) as Box<dyn ToolDyn>
++        })
++        .collect();
++    let wrapped = crate::agent::tools::concurrency::bind(wrap_all(tools, dispatcher, perm));
++    let (a, b) = tokio::join!(
++        wrapped[0].call("first".into()),
++        wrapped[1].call("second".into())
++    );
++    assert!(
++        a.is_err() && b.is_err(),
++        "both hook asks must fail closed without ask_tx: a={a:?}, b={b:?}"
++    );
++}
++#[tokio::test]
++async fn release_review_probe_hook_ask_covers_structured_git_permission_key() {
++    let dispatcher = dispatcher_with(
++        "PreToolUse",
++        vec![handler(r#"echo '{"permissionDecision":"ask"}'"#)],
++    );
++    let perm = permission();
++    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(ReviewPermissionTool {
++        name: "git",
++        permission_key: "git/status",
++        permission: perm.clone(),
++        barrier: None,
++    })];
++    let wrapped = wrap_all(tools, dispatcher, perm);
++    let result = wrapped[0].call("status".into()).await;
++    assert!(
++        result.is_err(),
++        "git hook ask ignored because its inner check uses git/status: {result:?}"
++    );
++}
++#[tokio::test]
++async fn release_review_probe_hook_ask_covers_tools_without_inner_permission_check() {
++    let dispatcher = dispatcher_with(
++        "PreToolUse",
++        vec![handler(r#"echo '{"permissionDecision":"ask"}'"#)],
++    );
++    let wrapped = wrap_all(vec![Box::new(EchoTool)], dispatcher, permission());
++    let result = wrapped[0].call("executed".into()).await;
++    assert!(
++        result.is_err(),
++        "hook ask silently fell through: {result:?}"
++    );
++}
++#[tokio::test]
++async fn release_review_probe_post_hook_observes_executed_rewritten_input() {
++    let path =
++        std::env::temp_dir().join(format!("review-post-input-{}.json", uuid::Uuid::new_v4()));
++    let mut config: HooksConfig = HashMap::new();
++    config.insert(
++        "PreToolUse".into(),
++        vec![HookGroup {
++            matcher: None,
++            hooks: vec![handler(
++                r#"echo '{"updatedInput":{"path":"actual-target"}}'"#,
++            )],
++        }],
++    );
++    config.insert(
++        "PostToolUse".into(),
++        vec![HookGroup {
++            matcher: None,
++            hooks: vec![handler(&format!("cat > '{}'", path.display()))],
++        }],
++    );
++    let dispatcher = Arc::new(HookDispatcher::from_config(&config).unwrap());
++    let wrapped = wrap_all(vec![Box::new(EchoTool)], dispatcher, permission());
++    let result = wrapped[0]
++        .call(r#"{"path":"original-target"}"#.into())
++        .await
++        .unwrap();
++    assert!(result.contains("actual-target"));
++    let envelope: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert_eq!(
++        envelope["tool_input"]["path"], "actual-target",
++        "post hook received input the tool did not execute"
++    );
++}
