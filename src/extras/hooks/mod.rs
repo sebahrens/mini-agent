@@ -184,9 +184,10 @@ pub(crate) fn reset_dispatcher() {
 pub(crate) fn wrap_from_global(
     tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     permission: Option<crate::permission::checker::PermCheck>,
+    ask_tx: Option<crate::permission::ask::AskSender>,
 ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
     match get_dispatcher() {
-        Some(dispatcher) => decorator::wrap_all(tools, dispatcher, permission),
+        Some(dispatcher) => decorator::wrap_all(tools, dispatcher, permission, ask_tx),
         None => tools,
     }
 }

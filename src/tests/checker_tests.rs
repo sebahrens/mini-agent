@@ -2351,3 +2351,83 @@ fn set_prompt_mode_never_raises_above_user_mode() {
     assert!(checker.set_prompt_mode(SecurityMode::Standard));
     assert_eq!(checker.mode(), SecurityMode::Standard);
 }
+
+// ── Hook decisions are owned per invocation ────────────────────────────
+
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn two_in_flight_hook_decisions_do_not_overwrite_each_other() {
+    use crate::permission::checker::scope_hook_permission;
+
+    let checker = std::sync::Arc::new(std::sync::Mutex::new(make_checker(SecurityMode::Yolo)));
+    // Two concurrent wrapped calls each record their own verdict before either
+    // reaches its permission check.
+    checker
+        .lock()
+        .unwrap()
+        .force_ask_once_scoped("bash".to_string(), 11);
+    checker
+        .lock()
+        .unwrap()
+        .force_ask_once_scoped("bash".to_string(), 12);
+
+    let first =
+        scope_hook_permission(11, async { checker.lock().unwrap().check("bash", "first") }).await;
+    let second = scope_hook_permission(12, async {
+        checker.lock().unwrap().check("bash", "second")
+    })
+    .await;
+
+    assert!(matches!(first, CheckResult::Ask), "{first:?}");
+    assert!(matches!(second, CheckResult::Ask), "{second:?}");
+}
+
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn an_allow_decision_cannot_be_consumed_by_another_invocation() {
+    use crate::permission::checker::scope_hook_permission;
+
+    let checker = std::sync::Arc::new(std::sync::Mutex::new(make_checker(
+        SecurityMode::Restrictive,
+    )));
+    checker
+        .lock()
+        .unwrap()
+        .allow_once_scoped("bash".to_string(), 21);
+
+    // A different invocation must not consume the allow recorded for token 21.
+    let other =
+        scope_hook_permission(22, async { checker.lock().unwrap().check("bash", "other") }).await;
+    assert!(matches!(other, CheckResult::Ask), "{other:?}");
+
+    let owner =
+        scope_hook_permission(21, async { checker.lock().unwrap().check("bash", "owner") }).await;
+    assert!(matches!(owner, CheckResult::Allowed), "{owner:?}");
+}
+
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn clearing_one_invocation_leaves_another_decision_intact() {
+    use crate::permission::checker::scope_hook_permission;
+
+    let checker = std::sync::Arc::new(std::sync::Mutex::new(make_checker(
+        SecurityMode::Restrictive,
+    )));
+    checker
+        .lock()
+        .unwrap()
+        .allow_once_scoped("bash".to_string(), 31);
+    checker
+        .lock()
+        .unwrap()
+        .allow_once_scoped("bash".to_string(), 32);
+    checker.lock().unwrap().clear_hook_one_shot(31);
+    assert!(!checker.lock().unwrap().hook_decision_is_pending(31));
+    assert!(checker.lock().unwrap().hook_decision_is_pending(32));
+
+    let survivor = scope_hook_permission(32, async {
+        checker.lock().unwrap().check("bash", "survivor")
+    })
+    .await;
+    assert!(matches!(survivor, CheckResult::Allowed), "{survivor:?}");
+}

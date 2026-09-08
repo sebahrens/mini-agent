@@ -295,7 +295,11 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     let tools = tools::memoize::definitions(tools);
 
     #[cfg(feature = "hooks")]
-    let tools = crate::extras::hooks::wrap_from_global(tools, authorization.permission.clone());
+    let tools = crate::extras::hooks::wrap_from_global(
+        tools,
+        authorization.permission.clone(),
+        authorization.ask_tx.clone(),
+    );
 
     let tools = tools::concurrency::bind(tools);
 

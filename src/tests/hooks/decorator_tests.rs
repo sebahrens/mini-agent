@@ -198,7 +198,7 @@ fn permission_restrictive() -> Option<crate::permission::checker::PermCheck> {
 async fn deny_blocks_the_call_with_guard_rail_message() {
     let dispatcher = dispatcher_with("PreToolUse", vec![handler("exit 2")]);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0].call("{}".to_string()).await;
     let err = result.expect_err("expected the call to be blocked");
@@ -212,7 +212,7 @@ async fn deny_blocks_the_call_with_guard_rail_message() {
 async fn broken_pre_tool_hook_fails_closed() {
     let dispatcher = dispatcher_with("PreToolUse", vec![handler("exit 7")]);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let error = wrapped[0]
         .call("{}".to_string())
@@ -225,7 +225,7 @@ async fn broken_pre_tool_hook_fails_closed() {
 async fn no_matching_hook_passes_through_to_inner_tool() {
     let dispatcher = dispatcher_with("PreToolUse", vec![]);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0].call(r#"{"a":1}"#.to_string()).await.unwrap();
     assert_eq!(result, r#"{"a":1}"#);
@@ -241,7 +241,7 @@ async fn post_tool_use_failure_observes_but_cannot_change_the_outcome() {
     let cmd = format!("touch {}", marker.display());
     let dispatcher = dispatcher_with("PostToolUseFailure", vec![handler(&cmd)]);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(AlwaysFailsTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0].call("{}".to_string()).await;
     let err = result.expect_err("inner tool always fails");
@@ -266,7 +266,7 @@ async fn pre_tool_use_updated_input_is_applied_before_the_inner_call() {
         )],
     );
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0]
         .call(r#"{"command":"original"}"#.to_string())
@@ -309,7 +309,7 @@ async fn pre_tool_use_rewrite_cannot_bypass_a_permission_deny_rule() {
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(JsonCommandPermCheckingTool {
         permission: perm.clone(),
     })];
-    let wrapped = wrap_all(tools, dispatcher, perm);
+    let wrapped = wrap_all(tools, dispatcher, perm, None);
 
     let result = wrapped[0]
         .call(r#"{"command":"echo harmless"}"#.to_string())
@@ -328,7 +328,7 @@ async fn post_tool_use_result_rewrite_is_ignored() {
         vec![handler(r#"echo '{"result":"injected content"}'"#)],
     );
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0]
         .call(r#"{"secret":"abc"}"#.to_string())
@@ -344,7 +344,7 @@ async fn post_tool_use_can_redact_exact_literals_without_injecting_content() {
         vec![handler(r#"echo '{"redactions":["abc"]}'"#)],
     );
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0]
         .call(r#"{"secret":"abc","public":"ok"}"#.to_string())
@@ -357,7 +357,7 @@ async fn post_tool_use_can_redact_exact_literals_without_injecting_content() {
 async fn post_tool_use_no_decision_leaves_result_unchanged() {
     let dispatcher = dispatcher_with("PostToolUse", vec![handler("true")]);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
     let result = wrapped[0].call(r#"{"a":1}"#.to_string()).await.unwrap();
     assert_eq!(result, r#"{"a":1}"#);
@@ -377,7 +377,7 @@ async fn ask_verdict_escalates_to_deny_when_no_ask_tx_is_available() {
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(PermCheckingTool {
         permission: perm.clone(),
     })];
-    let wrapped = wrap_all(tools, dispatcher, perm);
+    let wrapped = wrap_all(tools, dispatcher, perm, None);
 
     let result = wrapped[0].call("ls -la".to_string()).await;
     let err = result.expect_err("ask with no ask_tx must escalate to deny");
@@ -404,7 +404,7 @@ async fn allow_verdict_suppresses_the_prompt_for_the_inner_tools_own_check() {
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(PermCheckingTool {
         permission: perm.clone(),
     })];
-    let wrapped = wrap_all(tools, dispatcher, perm);
+    let wrapped = wrap_all(tools, dispatcher, perm, None);
 
     let result = wrapped[0].call("ls -la".to_string()).await;
     assert_eq!(result.unwrap(), "ls -la");
@@ -418,7 +418,7 @@ async fn unused_hook_allow_is_cleared_when_the_owning_call_finishes() {
     );
     let perm = permission_restrictive();
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, perm.clone());
+    let wrapped = wrap_all(tools, dispatcher, perm.clone(), None);
 
     wrapped[0].call("first".into()).await.unwrap();
     let later = perm
@@ -433,7 +433,291 @@ async fn unused_hook_allow_is_cleared_when_the_owning_call_finishes() {
 fn wrap_all_returns_original_tools_when_dispatcher_is_empty() {
     let dispatcher = Arc::new(HookDispatcher::from_config(&HashMap::new()).unwrap());
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, permission());
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
     assert_eq!(wrapped.len(), 1);
     assert_eq!(wrapped[0].name(), "echo_tool");
+}
+
+// ── Hook decisions are per invocation and always enforced ──────────────
+
+/// A wrapped tool with no permission check at all, like the skills search and
+/// advisor tools. Records whether the inner call ran.
+struct SideEffectTool {
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ToolDyn for SideEffectTool {
+    fn name(&self) -> String {
+        "side_effect_tool".to_string()
+    }
+
+    fn description(&self) -> String {
+        String::new()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        let ran = self.ran.clone();
+        Box::pin(async move {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(args)
+        })
+    }
+}
+
+/// Mirrors the Git tool: the public name is `git` while the inner permission
+/// check uses an operation-specific key.
+struct OperationKeyTool {
+    permission: Option<crate::permission::checker::PermCheck>,
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ToolDyn for OperationKeyTool {
+    fn name(&self) -> String {
+        "git".to_string()
+    }
+
+    fn description(&self) -> String {
+        String::new()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        let ran = self.ran.clone();
+        Box::pin(async move {
+            crate::agent::tools::check_perm(&self.permission, &None, "git/status", &args)
+                .await
+                .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(args)
+        })
+    }
+}
+
+fn ask_dispatcher() -> Arc<HookDispatcher> {
+    dispatcher_with(
+        "PreToolUse",
+        vec![handler(r#"echo '{"permissionDecision":"ask"}'"#)],
+    )
+}
+
+#[tokio::test]
+async fn an_ask_verdict_denies_a_tool_that_has_no_inner_permission_check() {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(SideEffectTool { ran: ran.clone() })];
+    let wrapped = wrap_all(tools, ask_dispatcher(), permission(), None);
+
+    let error = wrapped[0]
+        .call("{}".to_string())
+        .await
+        .expect_err("an ask verdict must never fall through");
+    assert!(error.to_string().contains("non-interactive"), "{error}");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "a denied ask must execute no side effects"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_verdict_denies_a_tool_that_checks_a_different_permission_key() {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let perm = permission();
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(OperationKeyTool {
+        permission: perm.clone(),
+        ran: ran.clone(),
+    })];
+    let wrapped = wrap_all(tools, ask_dispatcher(), perm, None);
+
+    let error = wrapped[0]
+        .call("{}".to_string())
+        .await
+        .expect_err("git/status must not escape the ask verdict for git");
+    assert!(error.to_string().contains("non-interactive"), "{error}");
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn an_allow_verdict_is_honored_for_an_operation_specific_key() {
+    let dispatcher = dispatcher_with(
+        "PreToolUse",
+        vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
+    );
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let perm = permission_restrictive();
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(OperationKeyTool {
+        permission: perm.clone(),
+        ran: ran.clone(),
+    })];
+    let wrapped = wrap_all(tools, dispatcher, perm, None);
+
+    wrapped[0]
+        .call("{}".to_string())
+        .await
+        .expect("allow must reach the operation-specific check");
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn an_ask_verdict_denies_todo_write_before_it_short_circuits() {
+    struct TodoTool {
+        permission: Option<crate::permission::checker::PermCheck>,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolDyn for TodoTool {
+        fn name(&self) -> String {
+            "todo_write".to_string()
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            let ran = self.ran.clone();
+            Box::pin(async move {
+                crate::agent::tools::check_perm(&self.permission, &None, "todo_write", &args)
+                    .await
+                    .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(args)
+            })
+        }
+    }
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let perm = permission();
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(TodoTool {
+        permission: perm.clone(),
+        ran: ran.clone(),
+    })];
+    let wrapped = wrap_all(tools, ask_dispatcher(), perm, None);
+
+    let error = wrapped[0]
+        .call("{}".to_string())
+        .await
+        .expect_err("todo_write must not short-circuit a hook ask");
+    assert!(error.to_string().contains("non-interactive"), "{error}");
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Waits until both concurrent invocations have recorded their hook verdict
+/// before either reaches its permission check, which is exactly the window in
+/// which a single shared decision slot loses one of them.
+struct BarrieredPermCheckingTool {
+    permission: Option<crate::permission::checker::PermCheck>,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+impl ToolDyn for BarrieredPermCheckingTool {
+    fn name(&self) -> String {
+        "bash".to_string()
+    }
+
+    fn description(&self) -> String {
+        String::new()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        Box::pin(async move {
+            self.barrier.wait().await;
+            crate::agent::tools::check_perm(&self.permission, &None, "bash", &args)
+                .await
+                .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+            Ok(args)
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_ask_verdicts_deny_every_call() {
+    let perm = permission();
+    let dispatcher = ask_dispatcher();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let tools: Vec<Box<dyn ToolDyn>> = vec![
+        Box::new(BarrieredPermCheckingTool {
+            permission: perm.clone(),
+            barrier: barrier.clone(),
+        }),
+        Box::new(BarrieredPermCheckingTool {
+            permission: perm.clone(),
+            barrier: barrier.clone(),
+        }),
+    ];
+    let wrapped = wrap_all(tools, dispatcher, perm, None);
+
+    let (first, second) = tokio::join!(
+        wrapped[0].call("first".to_string()),
+        wrapped[1].call("second".to_string())
+    );
+
+    for result in [first, second] {
+        let error = result.expect_err("both concurrent asks must deny without an ask channel");
+        assert!(error.to_string().contains("non-interactive"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn a_post_hook_observes_the_arguments_that_actually_ran() {
+    let marker = std::env::temp_dir().join(format!(
+        "mini-agent-hooks-post-input-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let mut config: HashMap<String, Vec<HookGroup>> = HashMap::new();
+    config.insert(
+        "PreToolUse".to_string(),
+        vec![HookGroup {
+            matcher: None,
+            hooks: vec![handler(
+                r#"echo '{"updatedInput":{"path":"actual-target"}}'"#,
+            )],
+        }],
+    );
+    config.insert(
+        "PostToolUse".to_string(),
+        vec![HookGroup {
+            matcher: None,
+            hooks: vec![handler(&format!("cat > {}", marker.display()))],
+        }],
+    );
+    let dispatcher = Arc::new(HookDispatcher::from_config(&config).unwrap());
+    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
+    let wrapped = wrap_all(tools, dispatcher, permission(), None);
+
+    let result = wrapped[0]
+        .call(r#"{"path":"original-target"}"#.to_string())
+        .await
+        .unwrap();
+    assert_eq!(result, r#"{"path":"actual-target"}"#);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PostToolUse hook did not run");
+    let envelope = std::fs::read_to_string(&marker).unwrap();
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        envelope.contains("actual-target"),
+        "post hook must see the executed arguments: {envelope}"
+    );
+    assert!(
+        !envelope.contains("original-target"),
+        "post hook must not see the superseded arguments: {envelope}"
+    );
 }

@@ -107,15 +107,29 @@ pub struct PermissionChecker {
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
     cached_resolved_cwd: Option<PathBuf>,
-    /// One-shot: the next `check`/`check_path` call for this tool is forced
-    /// to `Ask`, consumed immediately after. Set by a hook `ask` verdict.
+    /// One-shot hook decisions, keyed by the invocation token the decorator
+    /// created for a single wrapped call. Concurrent calls each own their own
+    /// entry, so one hook verdict can never overwrite another call's.
     #[cfg(feature = "hooks")]
-    pending_forced_ask: Option<(String, u64)>,
-    /// One-shot: the next `check`/`check_path` call for this tool suppresses
-    /// the prompt (`Allowed`), consumed immediately after. Set by a hook
-    /// `allow` verdict. Never bypasses a deny rule (checked first).
-    #[cfg(feature = "hooks")]
-    pending_one_shot_allow: Option<(String, u64)>,
+    hook_decisions: std::collections::HashMap<u64, HookOneShot>,
+}
+
+/// A hook verdict recorded for exactly one wrapped tool invocation.
+#[cfg(feature = "hooks")]
+#[derive(Debug, Clone)]
+struct HookOneShot {
+    /// The public tool name the verdict was issued for; kept for diagnostics.
+    tool: String,
+    outcome: HookOneShotOutcome,
+}
+
+#[cfg(feature = "hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOneShotOutcome {
+    /// The inner check must prompt regardless of mode.
+    Ask,
+    /// The inner check must not prompt again for this invocation.
+    Allow,
 }
 
 impl PermissionChecker {
@@ -342,9 +356,7 @@ impl PermissionChecker {
             allow_all_mcp_calls: false,
             cached_resolved_cwd,
             #[cfg(feature = "hooks")]
-            pending_forced_ask: None,
-            #[cfg(feature = "hooks")]
-            pending_one_shot_allow: None,
+            hook_decisions: std::collections::HashMap::new(),
         };
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_permission_mode(mode);
@@ -356,12 +368,18 @@ impl PermissionChecker {
     /// hook `ask` verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
     pub fn force_ask_once_scoped(&mut self, tool: String, token: u64) {
-        self.pending_forced_ask = Some((canonical_permission_tool(&tool).to_string(), token));
+        self.hook_decisions.insert(
+            token,
+            HookOneShot {
+                tool,
+                outcome: HookOneShotOutcome::Ask,
+            },
+        );
     }
 
     #[cfg(all(feature = "hooks", test))]
     pub fn force_ask_once(&mut self, tool: String) {
-        self.pending_forced_ask = Some((canonical_permission_tool(&tool).to_string(), u64::MAX));
+        self.force_ask_once_scoped(tool, u64::MAX);
     }
 
     /// Suppresses the interactive prompt for the next `check`/`check_path`
@@ -369,31 +387,47 @@ impl PermissionChecker {
     /// verdict; never overrides a deny rule (checked first).
     #[cfg(feature = "hooks")]
     pub fn allow_once_scoped(&mut self, tool: String, token: u64) {
-        self.pending_one_shot_allow = Some((canonical_permission_tool(&tool).to_string(), token));
+        self.hook_decisions.insert(
+            token,
+            HookOneShot {
+                tool,
+                outcome: HookOneShotOutcome::Allow,
+            },
+        );
     }
 
     #[cfg(all(feature = "hooks", test))]
     pub fn allow_once(&mut self, tool: String) {
-        self.pending_one_shot_allow =
-            Some((canonical_permission_tool(&tool).to_string(), u64::MAX));
+        self.allow_once_scoped(tool, u64::MAX);
     }
 
+    /// Drop the decision owned by one invocation. Cancellation, an early
+    /// return and ordinary completion all release only that invocation's
+    /// state, never another in-flight call's.
     #[cfg(feature = "hooks")]
     pub fn clear_hook_one_shot(&mut self, token: u64) {
-        if self
-            .pending_forced_ask
-            .as_ref()
-            .is_some_and(|(_, pending)| *pending == token)
-        {
-            self.pending_forced_ask = None;
+        self.hook_decisions.remove(&token);
+    }
+
+    /// Whether a hook verdict for `token` is still unconsumed. Used by the
+    /// decorator's tests to prove single-use semantics.
+    #[cfg(all(feature = "hooks", test))]
+    pub(crate) fn hook_decision_is_pending(&self, token: u64) -> bool {
+        self.hook_decisions.contains_key(&token)
+    }
+
+    /// Evaluate deny rules for a hook-driven approval without granting
+    /// anything. A hook `ask` verdict must be enforced before the tool runs,
+    /// but it must never override an explicit deny rule.
+    #[cfg(feature = "hooks")]
+    pub(crate) fn hook_ask_decision(&mut self, tool: &str, input: &str) -> CheckResult {
+        let tool = canonical_permission_tool(tool);
+        let mut deny_inputs: SmallVec<[&str; 4]> = SmallVec::new();
+        deny_inputs.push(input);
+        if self.matches_deny_rule(tool, &deny_inputs) {
+            return CheckResult::Denied("Blocked by deny rule".to_string());
         }
-        if self
-            .pending_one_shot_allow
-            .as_ref()
-            .is_some_and(|(_, pending)| *pending == token)
-        {
-            self.pending_one_shot_allow = None;
-        }
+        CheckResult::Ask
     }
 
     fn apply_rules(&self) -> bool {
@@ -577,27 +611,20 @@ impl PermissionChecker {
         let token = HOOK_PERMISSION_TOKEN
             .try_with(|token| *token)
             .unwrap_or(u64::MAX);
-        if self
-            .pending_forced_ask
-            .as_ref()
-            .is_some_and(|(pending_tool, pending_token)| {
-                pending_tool == tool && *pending_token == token
-            })
-        {
-            self.pending_forced_ask = None;
-            return Some(CheckResult::Ask);
-        }
-        if self
-            .pending_one_shot_allow
-            .as_ref()
-            .is_some_and(|(pending_tool, pending_token)| {
-                pending_tool == tool && *pending_token == token
-            })
-        {
-            self.pending_one_shot_allow = None;
-            return Some(CheckResult::Allowed);
-        }
-        None
+        // The token identifies exactly one wrapped invocation, so the decision
+        // is matched by invocation rather than by permission key: a wrapped
+        // tool may check an operation-specific key (`git/status`) or a shared
+        // one (`mcp_tool`) that never equals its public name.
+        let decision = self.hook_decisions.remove(&token)?;
+        tracing::debug!(
+            "hook one-shot consumed: recorded={}, permission_key={}",
+            decision.tool,
+            tool
+        );
+        Some(match decision.outcome {
+            HookOneShotOutcome::Ask => CheckResult::Ask,
+            HookOneShotOutcome::Allow => CheckResult::Allowed,
+        })
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
@@ -659,12 +686,12 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &deny_inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
-        if tool == "todo_write" {
-            return CheckResult::Allowed;
-        }
         #[cfg(feature = "hooks")]
         if let Some(result) = self.take_pending_one_shot(tool) {
             return result;
+        }
+        if tool == "todo_write" {
+            return CheckResult::Allowed;
         }
         if self.allow_all_mcp_calls && tool == "mcp_tool" {
             return CheckResult::Allowed;

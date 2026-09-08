@@ -4,6 +4,7 @@ use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 
 use crate::agent::tools::ToolError as LocalToolError;
+use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 
 use super::dispatcher::HookDispatcher;
@@ -18,6 +19,7 @@ pub(crate) struct HookedTool {
     inner: Box<dyn ToolDyn>,
     dispatcher: Arc<HookDispatcher>,
     permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
 }
 
 impl HookedTool {
@@ -94,16 +96,38 @@ impl ToolDyn for HookedTool {
                         format!("Blocked by guard rail: {reason}"),
                     ))));
                 }
-                // Forces the inner tool's own permission check to prompt
-                // regardless of mode; that check already escalates to deny
-                // in non-interactive contexts (no `ask_tx`), giving the
-                // spec's fail-closed behavior for free.
+                // An `ask` must be enforced before the tool runs. Wrapped
+                // tools check operation-specific keys (`git/status`), shared
+                // keys (`mcp_tool`) or nothing at all, so relying on an inner
+                // check to consume a forced ask lets the verdict fall through
+                // and the side effect happen. Prompt once here, or fail closed
+                // when no approval channel exists.
                 Verdict::Ask => {
-                    if let Some(perm) = &self.permission {
-                        perm.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .force_ask_once_scoped(tool_name.clone(), permission_token);
-                        scoped_permission = true;
+                    if self.permission.is_some() {
+                        if let Err(error) = crate::agent::tools::request_hook_approval(
+                            &self.permission,
+                            &self.ask_tx,
+                            &tool_name,
+                            &args,
+                        )
+                        .await
+                        {
+                            if let Some(perm) = &self.permission {
+                                perm.lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .record_blocked(&tool_name, &args);
+                            }
+                            return Err(ToolError::ToolCallError(Box::new(error)));
+                        }
+                        // Approved for this invocation: the inner check must
+                        // not prompt a second time for the same call. This
+                        // never bypasses a deny rule, which is checked first.
+                        if let Some(perm) = &self.permission {
+                            perm.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .allow_once_scoped(tool_name.clone(), permission_token);
+                            scoped_permission = true;
+                        }
                     }
                 }
                 // Suppresses the inner tool's own permission prompt for only
@@ -127,6 +151,13 @@ impl ToolDyn for HookedTool {
                 Some(rewritten) => serde_json::to_string(rewritten).unwrap_or(args),
                 None => args,
             };
+            // Post hooks audit the operation that actually ran, so they receive
+            // the effective arguments after any pre-hook rewrite rather than
+            // the arguments the model originally proposed.
+            let executed_input: serde_json::Value = match &pre.updated_input {
+                Some(rewritten) => rewritten.clone(),
+                None => tool_input,
+            };
 
             let result = if scoped_permission {
                 crate::permission::checker::scope_hook_permission(
@@ -147,7 +178,7 @@ impl ToolDyn for HookedTool {
                 Ok(response) => {
                     let decision = self
                         .dispatcher
-                        .dispatch_post_tool_use(&ctx, &tool_name, tool_input, response)
+                        .dispatch_post_tool_use(&ctx, &tool_name, executed_input, response)
                         .await;
                     if let Decision::Rewrite { content } = decision {
                         return Ok(content);
@@ -158,7 +189,7 @@ impl ToolDyn for HookedTool {
                         .dispatch_post_tool_use_failure(
                             &ctx,
                             &tool_name,
-                            tool_input,
+                            executed_input,
                             &e.to_string(),
                         )
                         .await;
@@ -177,6 +208,7 @@ pub(crate) fn wrap_all(
     tools: Vec<Box<dyn ToolDyn>>,
     dispatcher: Arc<HookDispatcher>,
     permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
 ) -> Vec<Box<dyn ToolDyn>> {
     if dispatcher.is_empty() {
         return tools;
@@ -188,6 +220,7 @@ pub(crate) fn wrap_all(
                 inner,
                 dispatcher: dispatcher.clone(),
                 permission: permission.clone(),
+                ask_tx: ask_tx.clone(),
             }) as Box<dyn ToolDyn>
         })
         .collect()

@@ -781,7 +781,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let all_tools = tools::memoize::definitions(all_tools);
 
         #[cfg(feature = "hooks")]
-        let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
+        let all_tools =
+            crate::extras::hooks::wrap_from_global(all_tools, permission.clone(), ask_tx.clone());
 
         let all_tools = tools::concurrency::bind(all_tools);
 

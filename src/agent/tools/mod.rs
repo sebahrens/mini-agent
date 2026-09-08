@@ -410,6 +410,41 @@ async fn handle_ask_inner(
     }
 }
 
+/// Approval for a hook `ask` verdict, obtained before the wrapped tool runs.
+///
+/// A wrapped tool may check a different permission key than its public name
+/// (`git/status`, `mcp_tool`) or perform no permission check at all, so the
+/// hook decorator cannot rely on an inner check to enforce an `ask`. This
+/// prompts once for the invocation, keeps explicit deny rules ahead of the
+/// verdict, and fails closed when no approval channel exists.
+#[cfg(feature = "hooks")]
+pub(crate) async fn request_hook_approval(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    tool: &str,
+    input: &str,
+) -> Result<(), ToolError> {
+    let Some(perm) = permission else {
+        return Ok(());
+    };
+    let result = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.hook_ask_decision(tool, input)
+    };
+    match result {
+        CheckResult::Allowed | CheckResult::AllowedWithCoaching(_) => Ok(()),
+        CheckResult::Denied(reason) => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        CheckResult::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, tool, input, None, Vec::new(), tool).await
+        }
+    }
+}
+
 pub async fn check_perm(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
