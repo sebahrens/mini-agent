@@ -87,6 +87,7 @@ const HOSTED_DESCRIPTOR_BOUND: &str = "MINI_AGENT_MACOS_DESCRIPTOR_BOUND";
 const HOSTED_PASS_RECORD: &str = "MACOS_CONTAINMENT_MATRIX_V1=passed";
 const HOSTED_SENTINEL_CONTENT: &[u8] = b"macos-containment-sentinel-v1";
 const GUARDIAN_NORMAL_RELEASE: u8 = 0xa5;
+const GUARDIAN_WORKER_REAPED: u8 = 0x5a;
 // Only majors that passed the exact non-libtest production-binary matrix are enabled. Ready alone
 // is never availability evidence. macOS 26 passed on 26.5.2; other majors remain fail closed.
 const VALIDATED_MACOS_MAJORS: &[u32] = &[26];
@@ -246,6 +247,67 @@ fn guardian_heartbeat_released_normally(heartbeat: &mut impl Read) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+fn finish_guardian_monitor(
+    heartbeat: &mut impl Write,
+    monitor: std::thread::JoinHandle<()>,
+) -> io::Result<()> {
+    // The parent cannot release this monitor after guardian reap: joining it
+    // here would deadlock. Report the contained worker's reap on the private
+    // duplex heartbeat so the parent can acknowledge before reaping us.
+    // If the parent died, the monitor owns cleanup and whole-group termination;
+    // a failed notification must not let this thread exit ahead of that work.
+    let _ = heartbeat.write_all(&[GUARDIAN_WORKER_REAPED]);
+    monitor
+        .join()
+        .map_err(|_| io::Error::other("macOS guardian monitor panicked"))
+}
+
+#[allow(unsafe_code)]
+fn release_reaped_guardian(heartbeat: &mut Option<UnixStream>) -> io::Result<()> {
+    let Some(stream) = heartbeat.as_mut() else {
+        return Ok(());
+    };
+    let mut byte = [0_u8; 1];
+    // SAFETY: stream owns a live socket and byte is writable for exactly one
+    // byte. MSG_DONTWAIT keeps try_wait nonblocking without changing fd flags.
+    let received = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if received < 0 {
+        let error = io::Error::last_os_error();
+        return match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(()),
+            io::ErrorKind::ConnectionReset => {
+                heartbeat.take();
+                Ok(())
+            }
+            _ => Err(error),
+        };
+    }
+    if received == 1 {
+        if byte[0] != GUARDIAN_WORKER_REAPED {
+            return Err(io::Error::other("macOS guardian reap record was invalid"));
+        }
+        if let Err(error) = stream.write_all(&[GUARDIAN_NORMAL_RELEASE])
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            )
+        {
+            return Err(error);
+        }
+    }
+    // EOF means the guardian exited without a notification (for example a
+    // bootstrap failure). Its exact exit status still comes from child.wait.
+    heartbeat.take();
+    Ok(())
 }
 
 fn cleanup_abandoned_workspace_sentinel(workspace: &Path, sentinel: &Path) -> io::Result<()> {
@@ -1193,7 +1255,8 @@ fn run_guardian() -> io::Result<ExitStatus> {
     let descriptor_bound = finalize_guardian_process().inspect_err(|_error| {
         eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=worker_limits");
     })?;
-    std::thread::Builder::new()
+    let mut heartbeat_notification = heartbeat.try_clone()?;
+    let monitor = std::thread::Builder::new()
         .name("macos-worker-parent-death".into())
         .spawn(move || {
             let mut heartbeat = heartbeat;
@@ -1235,12 +1298,14 @@ fn run_guardian() -> io::Result<ExitStatus> {
             worker.env(key, value);
         }
     }
-    worker
+    let status = worker
         .spawn()
         .inspect_err(|_error| {
             eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=worker_spawn");
         })?
-        .wait()
+        .wait()?;
+    finish_guardian_monitor(&mut heartbeat_notification, monitor)?;
+    Ok(status)
 }
 
 fn required_probe_environment(key: &'static str) -> io::Result<(&'static str, std::ffi::OsString)> {
@@ -2018,9 +2083,6 @@ impl WorkerChild {
             image.retire_after_reap()?;
             self.image.take();
         }
-        if let Some(mut heartbeat) = self.heartbeat.take() {
-            let _ = heartbeat.write_all(&[GUARDIAN_NORMAL_RELEASE]);
-        }
         Ok(())
     }
 
@@ -2030,6 +2092,7 @@ impl WorkerChild {
     }
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        release_reaped_guardian(&mut self.heartbeat)?;
         self.child.try_wait()
     }
 }
@@ -4634,15 +4697,84 @@ mod tests {
     }
 
     #[test]
-    fn guardian_heartbeat_distinguishes_normal_release_from_parent_loss() {
-        let (mut parent, mut guardian) = UnixStream::pair().unwrap();
-        parent.write_all(&[GUARDIAN_NORMAL_RELEASE]).unwrap();
-        drop(parent);
-        assert!(guardian_heartbeat_released_normally(&mut guardian));
+    fn guardian_completion_waits_for_monitor_on_normal_release_and_parent_loss() {
+        use std::sync::mpsc;
 
+        for parent_survives in [true, false] {
+            let (parent, mut guardian) = UnixStream::pair().unwrap();
+            let mut parent = Some(parent);
+            let mut notification = guardian.try_clone().unwrap();
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let (cleanup_tx, cleanup_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let monitor = std::thread::spawn(move || {
+                observed_tx
+                    .send(guardian_heartbeat_released_normally(&mut guardian))
+                    .unwrap();
+                // Hold the monitor after heartbeat resolution, reproducing a
+                // slow cleanup even though the contained worker already exited.
+                let _ = cleanup_rx.recv();
+            });
+            let finisher = std::thread::spawn(move || {
+                done_tx
+                    .send(finish_guardian_monitor(&mut notification, monitor))
+                    .unwrap();
+            });
+            if parent_survives {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while parent.is_some() && Instant::now() < deadline {
+                    release_reaped_guardian(&mut parent).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    parent.is_none(),
+                    "guardian reap notification was not acknowledged"
+                );
+            } else {
+                parent.take();
+            }
+            let observed = observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let early_exit = done_rx.recv_timeout(Duration::from_millis(50));
+            // Always release/join before asserting, including the negative
+            // control where the guardian incorrectly returns before cleanup.
+            cleanup_tx.send(()).unwrap();
+            finisher.join().unwrap();
+            assert_eq!(observed, parent_survives);
+            assert!(matches!(early_exit, Err(mpsc::RecvTimeoutError::Timeout)));
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn guardian_reap_poll_is_nonblocking_and_rejects_invalid_records() {
         let (parent, mut guardian) = UnixStream::pair().unwrap();
-        drop(parent);
-        assert!(!guardian_heartbeat_released_normally(&mut guardian));
+        let mut parent = Some(parent);
+        release_reaped_guardian(&mut parent).unwrap();
+        assert!(
+            parent.is_some(),
+            "a live worker must retain parent-death monitoring"
+        );
+        guardian.write_all(&[0xff]).unwrap();
+        assert!(release_reaped_guardian(&mut parent).is_err());
+        assert!(
+            parent.is_some(),
+            "invalid records must not authorize release"
+        );
+        drop(guardian);
+        release_reaped_guardian(&mut parent).unwrap();
+        assert!(parent.is_none());
+
+        // The guardian can be killed between notifying and receiving the
+        // acknowledgement. A closed heartbeat must still allow exact reap.
+        let (parent, mut guardian) = UnixStream::pair().unwrap();
+        let mut parent = Some(parent);
+        guardian.write_all(&[GUARDIAN_WORKER_REAPED]).unwrap();
+        drop(guardian);
+        release_reaped_guardian(&mut parent).unwrap();
+        assert!(parent.is_none());
     }
 
     #[test]

@@ -733,8 +733,13 @@ resolution by `unlinkat`; hostile same-UID peers are outside the approved scoped
 Protocol v2 authenticates `WorkerReady` with a per-launch challenge. `WorkerChild` owns the exact
 publication and lease, then unlinks and fsyncs the descriptor-proven image after that acknowledgement
 and before sequence 2. Teardown removes the lease and directory. A trusted-current-binary guardian
-owns the dedicated process group; parent-heartbeat EOF kills the group. The pre-exec boundary clears
-the environment and installs the guardian heartbeat. Immediately after the trusted guardian exec,
+owns the dedicated process group; parent-heartbeat EOF kills the group. After reaping its contained
+worker, the guardian sends a private one-byte reap notification; the parent's nonblocking process poll
+acknowledges normal monitor release. The guardian joins that monitor before exiting, so worker
+EOF cannot race past parent-death sentinel cleanup and whole-group termination. Exact guardian
+reap still precedes publication retirement. The worker never inherits this duplex heartbeat.
+The pre-exec boundary clears the environment and installs the guardian heartbeat. Immediately after
+the trusted guardian exec,
 before it starts a thread or launches the untrusted worker, the guardian closes every inherited
 descriptor except protocol streams and the heartbeat and installs a 40 GiB virtual-address-space
 ceiling, 35-second CPU, 64-descriptor, zero-core, and 1 MiB file-size limits. Darwin maps roughly

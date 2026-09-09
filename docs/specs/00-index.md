@@ -194,6 +194,14 @@ record the ordering, regression coverage, and modest observed timing change.
 The native production-binary containment matrix passes; this local measurement
 does not complete the pending cross-platform benchmark manifest.
 
+`mini-agent-l07k` fixes a guardian exit race in the same production lifecycle.
+The guardian now joins its heartbeat monitor; a private worker-reaped notification
+and parent acknowledgement release normal shutdown before exact guardian reap.
+Parent-death sentinel cleanup remains mandatory. A 300 ms monitor delay reproduced
+the original CI failure; the fixed production matrix passes that delay and the
+ordinary native check. The lifecycle regression replaces the heartbeat-only test
+and fails when monitor joining is removed. The owning contract remains Phase 6.
+
 ## Feature relationships
 
 Cargo features are not phase-completion claims:
