@@ -89,6 +89,7 @@ pub enum QuarantineDecision {
     Hold(&'static str),
 }
 
+#[cfg(test)]
 pub fn evaluate(policy: &QuarantinePolicy, evidence: &QuarantineEvidence) -> QuarantineDecision {
     evaluate_with_attribution(policy, evidence, None)
 }

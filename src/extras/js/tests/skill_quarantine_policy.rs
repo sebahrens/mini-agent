@@ -127,13 +127,6 @@ fn a_pending_generation_holds_a_behavioral_decision_but_not_a_safety_one() {
 }
 
 #[test]
-fn skill_quarantine_concurrency_retries_produce_identical_snapshot() {
-    let policy = QuarantinePolicy::conservative("v1");
-    let value = evidence(QuarantineReason::CapabilityPolicyFault);
-    assert_eq!(evaluate(&policy, &value), evaluate(&policy, &value));
-}
-
-#[test]
 fn automatic_quarantine_commits_and_excludes_the_revision_from_new_leases() {
     use std::sync::Arc;
 
@@ -192,7 +185,7 @@ fn automatic_quarantine_commits_and_excludes_the_revision_from_new_leases() {
         row_version_current: true,
         generation_current: true,
     };
-    QuarantineExecutor::new(&coordinator)
+    let (first, _) = QuarantineExecutor::new(&coordinator)
         .apply(
             &policy,
             &evidence,
@@ -202,9 +195,24 @@ fn automatic_quarantine_commits_and_excludes_the_revision_from_new_leases() {
             10,
         )
         .unwrap();
+    assert!(!first.replayed);
+    let (repeated, _) = QuarantineExecutor::new(&coordinator)
+        .apply(
+            &policy,
+            &evidence,
+            crate::extras::js::skills::lifecycle::LifecycleStatus::Active,
+            1,
+            generation as i64,
+            11,
+        )
+        .unwrap();
+    assert!(repeated.replayed);
+    assert_eq!(repeated.transition_id, first.transition_id);
+    assert_eq!(repeated.row_version, first.row_version);
+    assert_eq!(repeated.desired_generation, first.desired_generation);
     assert!(!coordinator.lease().unwrap().contains_id(&skill.id));
-    let status: String = SkillStore::open_at(&paths)
-        .unwrap()
+    let stored = SkillStore::open_at(&paths).unwrap();
+    let status: String = stored
         .conn()
         .query_row(
             "SELECT status FROM skill_revisions WHERE id = ?",
@@ -213,6 +221,49 @@ fn automatic_quarantine_commits_and_excludes_the_revision_from_new_leases() {
         )
         .unwrap();
     assert_eq!(status, "quarantined");
+    let (evidence_count, transition_count): (i64, i64) = stored
+        .conn()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM skill_evidence WHERE skill_id = ?1),
+                    (SELECT COUNT(*) FROM skill_transitions WHERE skill_id = ?1)",
+            [&skill.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((evidence_count, transition_count), (1, 1));
+    let (payload, created_at): (String, i64) = stored
+        .conn()
+        .query_row(
+            "SELECT payload_json, created_at FROM skill_evidence WHERE skill_id = ?",
+            [&skill.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(created_at, 10, "retry must preserve the original evidence");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+        serde_json::json!({
+            "schema_version": 1,
+            "policy": {
+                "version": "phase5-quarantine-test",
+                "min_behavioral_invocations": 20,
+                "min_behavioral_failures": 5
+            },
+            "evidence": {
+                "skill_id": skill.id,
+                "reason": "capability_policy_fault",
+                "qualified_invocations": 1,
+                "direct_failures": 1,
+                "evidence_complete": true,
+                "authenticated_feedback": false,
+                "feedback_marked_severe": false,
+                "row_version_current": true,
+                "generation_current": true
+            },
+            "decision": "quarantine"
+        })
+    );
+    drop(stored);
     let _ = std::fs::remove_dir_all(root);
 }
 

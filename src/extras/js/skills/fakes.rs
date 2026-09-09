@@ -199,6 +199,7 @@ pub struct FakeTranscript {
 
 impl FakeTranscript {
     /// Whether this transcript is empty (no operations).
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.reads.is_empty()
             && self.writes.is_empty()
@@ -350,14 +351,6 @@ pub struct FakeHostGlobals {
 }
 
 impl FakeHostGlobals {
-    /// Create a new set of fake hosts for the given capability manifest.
-    ///
-    /// Tier 0 skills get no fakes (the builder will not register globals).
-    /// Tier 1/2 skills get only the operations they declared.
-    pub fn new(manifest: CapabilityManifest) -> Self {
-        Self::with_transcript_budget(manifest, VerificationTranscriptBudget::new())
-    }
-
     pub(crate) fn with_transcript_budget(
         manifest: CapabilityManifest,
         transcript_budget: VerificationTranscriptBudget,
@@ -367,11 +360,6 @@ impl FakeHostGlobals {
             transcript_budget,
             manifest,
         }
-    }
-
-    /// Whether `capability` is declared in the manifest.
-    pub fn allows(&self, capability: HostCapability) -> bool {
-        self.manifest.allows(capability)
     }
 
     /// Read the immutable transcript. Embedded tests cannot inspect this.
