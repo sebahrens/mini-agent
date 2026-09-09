@@ -18,6 +18,7 @@ use super::manifest::parse_skill_markdown;
 // and then dropped. Import refuses to install one above this bound.
 const MAX_SKILL_MD_BYTES: u64 = super::MAX_SKILL_INSTRUCTION_BYTES;
 const MAX_RESOURCES: usize = 4096;
+const MAX_ACTIVE_POINTER_BYTES: u64 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceMetadata {
@@ -28,6 +29,8 @@ pub struct ResourceMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error(transparent)]
+    StableRead(#[from] super::ImportError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -65,6 +68,7 @@ pub struct AgentSkillCatalog {
 #[allow(dead_code)]
 struct CatalogSignature {
     entries: Vec<CatalogSignatureEntry>,
+    unavailable_packages: Vec<PathBuf>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -113,7 +117,9 @@ impl AgentSkillCatalog {
             let mut names = fs::read_dir(&self.root)?.collect::<Result<Vec<_>, _>>()?;
             names.sort_by_key(|entry| entry.file_name());
             for name_entry in names {
-                if !name_entry.file_type()?.is_dir() {
+                if signature.unavailable_packages.contains(&name_entry.path())
+                    || !name_entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
                     continue;
                 }
                 // Installed packages are independent trust domains. A corrupt package is
@@ -166,7 +172,10 @@ fn signature_entry(path: PathBuf) -> Result<CatalogSignatureEntry, CatalogError>
     };
     let pointer_digest = (path.file_name().is_some_and(|name| name == "ACTIVE")
         && metadata.is_file())
-    .then(|| fs::read(&path).map(|bytes| sha256_hex(&bytes)))
+    .then(|| {
+        super::import::read_stable_file(&path, MAX_ACTIVE_POINTER_BYTES, false)
+            .map(|bytes| sha256_hex(&bytes))
+    })
     .transpose()?;
     Ok(CatalogSignatureEntry {
         path,
@@ -178,25 +187,43 @@ fn signature_entry(path: PathBuf) -> Result<CatalogSignatureEntry, CatalogError>
 }
 
 fn catalog_signature(root: &Path) -> Result<CatalogSignature, CatalogError> {
-    if !root.exists() {
-        return Ok(CatalogSignature {
-            entries: Vec::new(),
-        });
-    }
-    let mut entries = vec![signature_entry(root.to_path_buf())?];
+    let root_entry = match signature_entry(root.to_path_buf()) {
+        Ok(entry) => entry,
+        Err(CatalogError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CatalogSignature {
+                entries: Vec::new(),
+                unavailable_packages: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut entries = vec![root_entry];
+    let mut unavailable_packages = Vec::new();
     let mut names = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     names.sort_by_key(|entry| entry.file_name());
     for name in names {
-        entries.push(signature_entry(name.path())?);
-        if name.file_type()?.is_dir() {
-            let mut children = fs::read_dir(name.path())?.collect::<Result<Vec<_>, _>>()?;
-            children.sort_by_key(|entry| entry.file_name());
-            for child in children {
-                entries.push(signature_entry(child.path())?);
+        let package_entries = (|| -> Result<Vec<CatalogSignatureEntry>, CatalogError> {
+            let mut entries = vec![signature_entry(name.path())?];
+            if name.file_type()?.is_dir() {
+                let mut children = fs::read_dir(name.path())?.collect::<Result<Vec<_>, _>>()?;
+                children.sort_by_key(|entry| entry.file_name());
+                for child in children {
+                    entries.push(signature_entry(child.path())?);
+                }
             }
+            Ok(entries)
+        })();
+        match package_entries {
+            Ok(package_entries) => entries.extend(package_entries),
+            // Retry the package signature on every refresh check. Recording its unavailable
+            // state prevents unnecessary index rebuilds while still detecting repairs.
+            Err(_) => unavailable_packages.push(name.path()),
         }
     }
-    Ok(CatalogSignature { entries })
+    Ok(CatalogSignature {
+        entries,
+        unavailable_packages,
+    })
 }
 
 fn scan_record(
@@ -254,10 +281,19 @@ fn scan_record(
 
 fn select_active_digest(name_root: &Path) -> Result<Option<String>, CatalogError> {
     let pointer = name_root.join("ACTIVE");
-    if pointer.is_file() {
-        let digest = fs::read_to_string(pointer)?.trim().to_string();
-        validate_digest(&digest)?;
-        return Ok(Some(digest));
+    match fs::symlink_metadata(&pointer) {
+        Ok(_) => {
+            // An explicit but invalid pointer must never fall through to legacy selection.
+            let bytes = super::import::read_stable_file(&pointer, MAX_ACTIVE_POINTER_BYTES, false)?;
+            let digest = std::str::from_utf8(&bytes)
+                .map_err(|_| CatalogError::InvalidDigest)?
+                .trim()
+                .to_string();
+            validate_digest(&digest)?;
+            return Ok(Some(digest));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut digests = fs::read_dir(name_root)?
         .filter_map(Result::ok)

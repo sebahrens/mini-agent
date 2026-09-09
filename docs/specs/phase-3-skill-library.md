@@ -205,6 +205,13 @@ zip-slip/symlink/reparse protections are defined in `platform-paths.md`. The imp
 without executing any resource. The experimental `allowed-tools` field is retained as metadata but
 does not grant permission or capability.
 
+Catalog refresh isolates package-local signature failures, preserving valid siblings. Subsequent
+refresh checks retry those failed signatures and detect repairs. `ACTIVE` must be a regular,
+non-linked file of at most 128 bytes, read through the importer's stable bounded-file primitive.
+Only a missing pointer permits the legacy single-digest fallback; invalid explicit pointers omit
+that package. The corruption regression covers invalid, unreadable, non-file, oversized, and
+linked pointers, fresh startup, retained siblings, and repair.
+
 Catalog generation belongs to the immutable index and the frozen turn. Search results retain
 immutable records without a duplicate generation field. The active-version switch regression
 checks that a retained selection still loads its original instructions after a new index is published.

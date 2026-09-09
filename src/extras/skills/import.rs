@@ -742,7 +742,7 @@ fn portable_relative(root: &Path, path: &Path) -> Result<String, ImportError> {
     Ok(relative)
 }
 
-fn read_stable_file(
+pub(super) fn read_stable_file(
     path: &Path,
     limit: u64,
     reject_hard_links: bool,

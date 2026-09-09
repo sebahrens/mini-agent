@@ -246,38 +246,112 @@ fn agent_skill_loader_rejects_same_size_resource_mutation_after_selection() {
 
 #[test]
 fn agent_skill_catalog_omits_corrupt_package_without_hiding_valid_sibling() {
-    let temp = TempPaths::new();
-    let source = write_skill(&temp, "v1");
-    let imported = import_agent_skill(&source, &temp.paths).unwrap();
-    let corrupt = temp
-        .paths
-        .data_dir
-        .join("agent-skills")
-        .join("corrupt-skill");
-    fs::create_dir_all(&corrupt).unwrap();
-    fs::write(corrupt.join("ACTIVE"), "not-a-digest\n").unwrap();
-
-    let embedder = Embedder::new().unwrap();
-    let mut catalog = AgentSkillCatalog::new(&temp.paths);
-    catalog
-        .activate("review-code", &imported.identity.digest)
-        .unwrap();
-    let index = catalog.refresh(&embedder).unwrap();
-    let query = embedder
-        .embed_documents(&["review rust".to_string()])
-        .unwrap()
-        .remove(0);
-    let selected = index
-        .search(
-            &query,
-            &AgentSkillSearchPolicy {
-                score_floor: -1.0,
-                ..AgentSkillSearchPolicy::default()
-            },
+    for damage in [
+        "invalid",
+        #[cfg(unix)]
+        "unreadable",
+        "directory",
+        "oversized",
+        #[cfg(unix)]
+        "symlink",
+        #[cfg(unix)]
+        "dangling-symlink",
+    ] {
+        let temp = TempPaths::new();
+        let source = write_skill(&temp, "v1");
+        import_agent_skill(&source, &temp.paths).unwrap();
+        let other_source = temp.root.join("corrupt-skill");
+        fs::create_dir_all(&other_source).unwrap();
+        fs::write(
+            other_source.join("SKILL.md"),
+            "---\nname: corrupt-skill\ndescription: review code\n---\n# Other skill\n",
         )
         .unwrap();
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].record.digest, imported.identity.digest);
+        let other = import_agent_skill(&other_source, &temp.paths).unwrap();
+        let pointer = other.install_path.parent().unwrap().join("ACTIVE");
+        let embedder = Embedder::new().unwrap();
+        let mut catalog = AgentSkillCatalog::new(&temp.paths);
+        let names = |index: &crate::extras::skills::index::AgentSkillIndex| {
+            let mut names = index
+                .search_lexical("review", &AgentSkillSearchPolicy::default())
+                .unwrap()
+                .into_iter()
+                .map(|skill| skill.record.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&catalog.refresh(&embedder).unwrap()),
+            ["corrupt-skill", "review-code"]
+        );
+        fs::remove_file(&pointer).unwrap();
+        match damage {
+            "invalid" => fs::write(&pointer, "not-a-digest\n").unwrap(),
+            "directory" => fs::create_dir(&pointer).unwrap(),
+            "oversized" => fs::write(
+                &pointer,
+                format!("{}{}", other.identity.digest, " ".repeat(1024)),
+            )
+            .unwrap(),
+            #[cfg(unix)]
+            "unreadable" => {
+                use std::os::unix::fs::PermissionsExt;
+                fs::write(&pointer, format!("{}\n", other.identity.digest)).unwrap();
+                fs::set_permissions(&pointer, fs::Permissions::from_mode(0o000)).unwrap();
+                if fs::read(&pointer).is_ok() {
+                    eprintln!(
+                        "skipping unreadable-pointer case: this account bypasses file permissions"
+                    );
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            "symlink" | "dangling-symlink" => {
+                let target = temp.root.join("external-active");
+                if damage == "symlink" {
+                    fs::write(&target, format!("{}\n", other.identity.digest)).unwrap();
+                }
+                std::os::unix::fs::symlink(&target, &pointer).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let changed = catalog
+            .refresh_if_changed(&embedder)
+            .unwrap_or_else(|error| panic!("{damage}: {error}"))
+            .expect("pointer damage must refresh the catalog");
+        assert_eq!(names(&changed), ["review-code"], "{damage}");
+        assert!(
+            catalog.refresh_if_changed(&embedder).unwrap().is_none(),
+            "{damage}"
+        );
+
+        // A fresh catalog must isolate the same failure, and a repaired package must reappear.
+        let mut fresh_catalog = AgentSkillCatalog::new(&temp.paths);
+        assert_eq!(
+            names(&fresh_catalog.refresh(&embedder).unwrap()),
+            ["review-code"],
+            "{damage}"
+        );
+        if damage == "directory" {
+            fs::remove_dir(&pointer).unwrap();
+        } else {
+            fs::remove_file(&pointer).unwrap();
+        }
+        catalog
+            .activate("corrupt-skill", &other.identity.digest)
+            .unwrap();
+        let repaired = catalog
+            .refresh_if_changed(&embedder)
+            .unwrap()
+            .expect("repair must refresh");
+        assert_eq!(
+            names(&repaired),
+            ["corrupt-skill", "review-code"],
+            "{damage}"
+        );
+        assert!(catalog.refresh_if_changed(&embedder).unwrap().is_none());
+    }
 }
 
 /// The version an import installs is the version the catalog serves.
@@ -340,6 +414,21 @@ fn agent_skill_catalog_refuses_to_guess_between_digests_without_a_pointer() {
     let temp = TempPaths::new();
     let source = write_skill(&temp, "v1");
     let first = import_agent_skill(&source, &temp.paths).unwrap();
+    let name_root = temp.paths.data_dir.join("agent-skills").join("review-code");
+    fs::remove_file(name_root.join("ACTIVE")).unwrap();
+    let embedder = Embedder::new().unwrap();
+    let mut catalog = AgentSkillCatalog::new(&temp.paths);
+    let legacy = catalog
+        .refresh(&embedder)
+        .unwrap()
+        .search_lexical("review", &AgentSkillSearchPolicy::default())
+        .unwrap();
+    assert_eq!(
+        legacy.len(),
+        1,
+        "one digest without a pointer remains loadable"
+    );
+    assert_eq!(legacy[0].record.digest, first.identity.digest);
     fs::write(
         source.join("SKILL.md"),
         b"---\nname: review-code\ndescription: Reviews Rust code for correctness v2.\n---\n\n# V2\n",
@@ -348,13 +437,10 @@ fn agent_skill_catalog_refuses_to_guess_between_digests_without_a_pointer() {
     let second = import_agent_skill(&source, &temp.paths).unwrap();
     assert_ne!(first.identity.digest, second.identity.digest);
 
-    let name_root = temp.paths.data_dir.join("agent-skills").join("review-code");
     fs::remove_file(name_root.join("ACTIVE")).unwrap();
     assert!(name_root.join(&first.identity.digest).is_dir());
     assert!(name_root.join(&second.identity.digest).is_dir());
 
-    let embedder = Embedder::new().unwrap();
-    let mut catalog = AgentSkillCatalog::new(&temp.paths);
     let query = embedder
         .embed_documents(&["review rust".to_string()])
         .unwrap()
