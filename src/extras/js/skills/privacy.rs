@@ -11,15 +11,17 @@ static PRIVATE_KEY_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Bare or quoted credential assignments. Quoted values include whitespace,
-/// punctuation, and escaped quotes; an unfinished quote consumes the remainder
-/// of the input. The scheme prefix also covers `Authorization: Bearer <token>`.
+/// punctuation, backslash escapes, and YAML's doubled single quotes; an
+/// unfinished quote consumes the remainder of the input. Backslashes before
+/// doubled quotes are included so they cannot hide the pair from the matcher.
+/// The scheme prefix also covers `Authorization: Bearer <token>`.
 static LABELED_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"(?i)(?P<prefix>["']?\b(?:api[_-]?key|apikey|access[_-]?token|"#,
         r#"refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|"#,
         r#"token|password|passwd|secret|authorization)\b["']?\s*[:=]\s*)"#,
         r#"(?P<value>"(?:\\(?s:.|$)|[^"\\])*(?:"|$)|"#,
-        r#"'(?:\\(?s:.|$)|[^'\\])*(?:'|$)|"#,
+        r#"'(?:\\*''|\\(?s:.|$)|[^'\\])*(?:'|$)|"#,
         r#"(?:bearer\s+|basic\s+|token\s+)?[^"',;\s}\[\]]+)"#,
     ))
     .expect("static labeled credential regex")

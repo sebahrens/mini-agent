@@ -215,6 +215,8 @@ fn feedback_redaction_removes_unconfigured_credential_shapes() {
             "before password='first second' after",
             "before password='[REDACTED]' after",
         ),
+        ("password: 'first'''", "password: '[REDACTED]'"),
+        ("password: '' after", "password: '[REDACTED]' after"),
         ("password=\"unfinished phrase", "password=\"[REDACTED]\""),
         ("password='unfinished phrase", "password='[REDACTED]'"),
         (r#"password="unfinished\"#, "password=\"[REDACTED]\""),
@@ -222,6 +224,22 @@ fn feedback_redaction_removes_unconfigured_credential_shapes() {
         ("token=one; status=ok", "token=[REDACTED]; status=ok"),
     ] {
         assert_eq!(redactor.redact(input), expected);
+    }
+    // YAML treats backslashes literally in single-quoted scalars. A run of
+    // either parity must not consume half of a doubled-quote escape.
+    for backslashes in 0..=4 {
+        for ending in ["' after", ""] {
+            let input = format!(
+                "before password: 'first{}''second; tail{ending}",
+                "\\".repeat(backslashes)
+            );
+            let suffix = if ending.is_empty() { "" } else { " after" };
+            assert_eq!(
+                redactor.redact(&input),
+                format!("before password: '[REDACTED]'{suffix}"),
+                "{input}"
+            );
+        }
     }
     for (limit, expected) in [(0, ""), (1, ""), (2, "é"), (3, "é")] {
         assert_eq!(
@@ -237,7 +255,7 @@ fn stored_feedback_text_never_retains_an_unconfigured_credential() {
     let actor = owner(&skill.id);
     let mut command = negative_command(&skill.id, &invocation, "text-leak");
     command.reason_text = Some(
-        r#"wrong output; repro used {"password":"feedback first; feedback-tail-canary"} and Authorization: Bearer abcdefghijklmnop012345"#.into(),
+        r#"wrong output; repro used {"password":"feedback first; feedback-tail-canary"} and password: 'first''YAML-PAST-QUOTE-CANARY' and Authorization: Bearer abcdefghijklmnop012345"#.into(),
     );
     let id = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
         .submit(&actor, &command, 2)
@@ -253,6 +271,7 @@ fn stored_feedback_text_never_retains_an_unconfigured_credential() {
     assert!(!stored.contains("abcdefghijklmnop012345"), "{stored}");
     assert!(!stored.contains("feedback first"), "{stored}");
     assert!(!stored.contains("feedback-tail-canary"), "{stored}");
+    assert!(!stored.contains("YAML-PAST-QUOTE-CANARY"), "{stored}");
     assert!(stored.contains("wrong output"), "{stored}");
 }
 
