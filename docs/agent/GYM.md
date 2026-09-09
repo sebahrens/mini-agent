@@ -15,7 +15,7 @@ into production evidence.
 - Linux or macOS. `scripts/gym/setup.sh` exits 2 on any other host, and the runner shells out to
   `/bin/sh` and `git worktree`.
 - `cargo` and `rustc` matching `rust-toolchain.toml` (setup compares the exact version), `git` 2.40
-  or newer, Python 3.11 or newer, and `jq`.
+  or newer (checked independently of vendor build suffixes), Python 3.11 or newer, and `jq`.
 - `bd` (beads) only for `scripts/gym/mine_tasks.py`; the miner falls back to an exported
   `.beads/issues.jsonl` or an explicit `--beads-json` file when `bd` is missing or fails.
 - A workspace outside `/private/tmp`. Setup refuses that prefix because it is the Seatbelt test
@@ -29,8 +29,11 @@ scripts/gym/setup.sh [repository]
 
 The optional first argument is the repository to build and evaluate; it defaults to the current
 directory. The gym root defaults to `<repository>/.gym` and is overridden with
-`MINI_AGENT_GYM_ROOT`. Episode worktrees and per-episode AppPaths trees are created under that
-root, so ignore it in Git or point `MINI_AGENT_GYM_ROOT` outside the repository.
+`MINI_AGENT_GYM_ROOT`. Relative roots are resolved against the invocation directory. Setup resolves
+all existing symlink ancestors, including above multiple missing directories, before refusing roots
+under `/tmp` or `/private/tmp` and before creating any directories. Episode worktrees and per-episode
+AppPaths trees are created under that root, so ignore it in Git or point `MINI_AGENT_GYM_ROOT` outside
+the repository.
 
 Setup checks the prerequisites, creates `<gym root>/worktrees` and `<gym root>/runs`, then runs:
 

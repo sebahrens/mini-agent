@@ -5,24 +5,19 @@ step=initialization
 trap 'printf "gym setup failed during %s\n" "$step" >&2' ERR
 
 step=workspace_location
+command -v python3 >/dev/null
 # Resolve before deciding: `$(pwd)`, `$1` and MINI_AGENT_GYM_ROOT can all reach
 # the temp root through a symlink (macOS `/tmp` -> `/private/tmp`), and the
 # unresolved spelling walks straight past a literal prefix test. Resolves the
 # deepest existing ancestor so a gym root that does not exist yet still gets a
 # real path.
 resolve_path() {
-  target=$1
-  if [ -d "$target" ]; then
-    (cd "$target" && pwd -P)
-    return
-  fi
-  parent=$(dirname "$target")
-  if [ -d "$parent" ]; then
-    parent=$(cd "$parent" && pwd -P)
-    printf '%s/%s\n' "${parent%/}" "$(basename "$target")"
-  else
-    printf '%s\n' "$target"
-  fi
+  python3 - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+print(Path(sys.argv[1]).resolve())
+PY
 }
 
 repo=${1:-$(pwd)}
@@ -49,7 +44,6 @@ done
 step=prerequisites
 command -v cargo >/dev/null
 command -v rustc >/dev/null
-command -v python3 >/dev/null
 command -v git >/dev/null
 command -v jq >/dev/null
 python3 - "$repo" <<'PY'
@@ -65,10 +59,13 @@ required = re.search(r'channel\s*=\s*"([^"]+)"', (repo / "rust-toolchain.toml").
 actual = subprocess.check_output(["rustc", "--version"], text=True).split()[1]
 if actual != required:
     raise SystemExit(f"rustc {actual} does not match rust-toolchain.toml {required}")
-git_version = subprocess.check_output(["git", "version"], text=True).strip().split()[-1]
-parts = tuple(int(part) for part in re.findall(r"\d+", git_version)[:2])
+git_version = subprocess.check_output(["git", "version"], text=True).strip()
+match = re.match(r"git version (\d+)\.(\d+)(?:[.\s]|$)", git_version)
+if match is None:
+    raise SystemExit(f"cannot parse {git_version!r}; required 2.40 or newer")
+parts = tuple(int(part) for part in match.groups())
 if parts < (2, 40):
-    raise SystemExit(f"git {git_version} is older than required 2.40")
+    raise SystemExit(f"{git_version} is older than required 2.40")
 PY
 
 step=isolated_directories

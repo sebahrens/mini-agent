@@ -1486,12 +1486,19 @@ CARGO_STUB = """#!/bin/sh
 set -u
 printf '%s\\n' "$*" >> "$CARGO_LOG"
 if [ "${1:-}" = install ]; then
-  mkdir -p "$MINI_AGENT_GYM_ROOT/bin"
-  cat > "$MINI_AGENT_GYM_ROOT/bin/mini-agent" <<'INNER'
+  shift
+  install_root=
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --root ]; then shift; install_root=$1; fi
+    shift
+  done
+  test -n "$install_root" || exit 2
+  mkdir -p "$install_root/bin"
+  cat > "$install_root/bin/mini-agent" <<'INNER'
 #!/bin/sh
 echo "usage: mini-agent [--install-learned-skill-seeds] [--import-learned-skill <path>]"
 INNER
-  chmod 755 "$MINI_AGENT_GYM_ROOT/bin/mini-agent"
+  chmod 755 "$install_root/bin/mini-agent"
 fi
 exit 0
 """
@@ -1552,8 +1559,12 @@ class GymEntrypointTests(unittest.TestCase):
         with scratch_outside_tmp() as directory:
             root = Path(directory)
             repo, gym_root, env = make_setup_host(root)
+            # Resolve a nested relative destination before setup changes cwd;
+            # Cargo must install into the same root the directory step created.
+            env["MINI_AGENT_GYM_ROOT"] = "nested/gym"
+            gym_root = root / "nested/gym"
             completed = subprocess.run(
-                ["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env
+                ["bash", str(SETUP), str(repo)], cwd=root, capture_output=True, text=True, env=env
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             invocations = (root / "cargo.log").read_text(encoding="utf-8").splitlines()
@@ -1579,7 +1590,7 @@ class GymEntrypointTests(unittest.TestCase):
             code = "import sys; sys.version_info=(3,10,0); exec(compile(sys.stdin.read(), '<setup>', 'exec'))"
             python_stub.write_text("#!/bin/sh\nshift\nexec " + shlex.join([sys.executable, "-c", code]) + ' "$@"\n')
             python_stub.chmod(0o755)
-            rejected = subprocess.run(["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env)
+            rejected = subprocess.run(["bash", str(SETUP), str(repo)], cwd=root, capture_output=True, text=True, env=env)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("Python 3.11 or newer is required", rejected.stderr)
             self.assertEqual((root / "cargo.log").read_text().splitlines(), invocations)
@@ -1601,18 +1612,40 @@ class GymEntrypointTests(unittest.TestCase):
             repo.rmdir()
 
     def test_setup_refuses_a_gym_root_in_the_temp_root(self) -> None:
-        with scratch_outside_tmp() as directory:
+        with scratch_outside_tmp() as directory, tempfile.TemporaryDirectory(prefix="gym-guard-", dir="/tmp") as temporary:
             root = Path(directory)
             repo, _, env = make_setup_host(root)
-            refused = Path(f"/tmp/mini-agent-gym-guard-{os.getpid()}")
-            env["MINI_AGENT_GYM_ROOT"] = str(refused)
-            completed = subprocess.run(
-                ["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env
-            )
-            self.assertEqual(completed.returncode, 2, completed.stderr)
-            self.assertIn("system temp root", completed.stderr)
-            self.assertFalse(Path(env["CARGO_LOG"]).exists(), "the guard must run before cargo")
-            self.assertFalse(refused.exists(), "the refused gym root must not be created")
+            alias = root / "alias"
+            alias.symlink_to(Path(temporary), target_is_directory=True)
+            for case, refused in [("direct", Path(temporary) / "direct"), ("symlink", alias / "missing" / "nested"),
+                                  ("relative", Path("alias/relative/nested"))]:
+                with self.subTest(case=case):
+                    env["MINI_AGENT_GYM_ROOT"] = str(refused)
+                    completed = subprocess.run(
+                        ["bash", str(SETUP), str(repo)], cwd=root, capture_output=True, text=True, env=env
+                    )
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertIn("system temp root", completed.stderr)
+                    self.assertFalse(Path(env["CARGO_LOG"]).exists(), "the guard must run before cargo")
+                    self.assertFalse((root / refused).exists(), "the refused gym root must not be created")
+
+    def test_setup_requires_supported_git_versions_with_vendor_suffixes(self) -> None:
+        cases = [("git version 2.39.5 (Apple Git-155)", False), ("git version 2.39.9", False),
+                 ("git version unknown build-155", False), ("git version 2.40.0", True),
+                 ("git version 2.40.1 (Apple Git-155)", True), ("git version 2.40.1.windows.1", True)]
+        for version, supported in cases:
+            with self.subTest(version=version), scratch_outside_tmp() as directory:
+                root = Path(directory)
+                repo, _, env = make_setup_host(root)
+                stub = root / "bin/git"
+                stub.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(version) + "\n")
+                stub.chmod(0o755)
+                completed = subprocess.run(["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env)
+                self.assertEqual(completed.returncode == 0, supported, completed.stderr)
+                self.assertEqual(Path(env["CARGO_LOG"]).exists(), supported)
+                if not supported:
+                    self.assertIn(version, completed.stderr)
+                    self.assertIn("required 2.40", completed.stderr)
 
 
 if __name__ == "__main__":
