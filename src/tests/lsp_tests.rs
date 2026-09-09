@@ -744,6 +744,89 @@ fn publication_during_content_validation_discards_the_old_bound_snapshot() {
     });
 }
 
+#[tokio::test]
+async fn cancelled_lsp_validation_remains_owned_until_disk_work_finishes() {
+    use futures::FutureExt;
+
+    let root = TempRoot::new("cancelled-validation");
+    let source = root.path().join("document.rs");
+    std::fs::write(&source, "document").unwrap();
+    let source = source.canonicalize().unwrap();
+    let uri = crate::extras::lsp::client::file_uri(&source).unwrap();
+    let manager = LspManager::new(&LspConfig::default(), root.path().to_path_buf());
+    manager.set_synced_document_for_test(&uri, 1, true);
+    assert!(manager.publish_synced_diagnostics_for_test(
+        &uri,
+        "rust",
+        Some(1),
+        vec![diag(
+            lsp_types::DiagnosticSeverity::ERROR,
+            0,
+            0,
+            "retained diagnostic"
+        )],
+    ));
+    let binding = manager.bind_diagnostic_uri(&uri).await.unwrap();
+
+    // Edit feedback and aggregate queries validate content through different
+    // entry points. Both must retain their disk work when the tool is dropped.
+    for aggregate in [false, true] {
+        let (scope, started, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        {
+            let work = scope.run(async {
+                if aggregate {
+                    assert!(
+                        manager
+                            .snapshot_bound_diagnostics(&binding, 20)
+                            .await
+                            .is_some()
+                    );
+                } else {
+                    assert!(
+                        manager
+                            .diagnostics_block_since(&source, Duration::ZERO, Some(0))
+                            .await
+                            .is_some()
+                    );
+                }
+            });
+            tokio::pin!(work);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    _ = &mut work => panic!("aggregate={aggregate}: validation bypassed the scoped disk worker"),
+                    _ = async {
+                        loop {
+                            if started.try_recv().is_ok() { break; }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    } => {},
+                }
+            }).await.expect("LSP validation must register with the active work scope");
+            scope.cancellation_handle().cancel();
+        }
+        assert!(
+            scope.wait_idle().now_or_never().is_none(),
+            "aggregate={aggregate}: cancelled validation is still running"
+        );
+        release.release();
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(scope.active_children(), 0);
+    }
+    let snapshot = manager
+        .snapshot_bound_diagnostics(&binding, 20)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .all_diagnostics_block_for_snapshots(&[snapshot])
+            .unwrap()
+            .contains("retained diagnostic")
+    );
+}
+
 // ── tool permission boundary ────────────────────────────────────────────
 
 #[tokio::test]

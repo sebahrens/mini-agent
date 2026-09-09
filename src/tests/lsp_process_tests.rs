@@ -1248,6 +1248,77 @@ async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping
 }
 
 #[tokio::test]
+async fn lsp_process_shutdown_drains_publication_before_manager_replacement() {
+    let fixture = FixtureBuild::compile("publication-shutdown");
+    let workspace = fixture.workspace("workspace").canonicalize().unwrap();
+    let source = workspace.join("document.probe");
+    fs::write(&source, "document").unwrap();
+    let lease = fixture.path("lease");
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true,
+            servers: HashMap::from([("fixture".into(), fixture.config("diagnostics", &lease))]),
+        },
+        workspace,
+    );
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let client = scope.run(manager.client_for_test(&source)).await.unwrap();
+    let pid = wait_for_pid(&lease).await;
+    let (entered, release) = client.pause_diagnostic_for_test(1);
+    assert!(scope.run(manager.notify_changed(&source)).await.is_some());
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    // A persistent server's publication must not keep an otherwise finished
+    // agent turn alive. Its client supervisor owns the remaining disk work.
+    tokio::time::timeout(Duration::from_secs(2), scope.wait_idle())
+        .await
+        .unwrap();
+
+    let mut shutdown = Box::pin(client.shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut shutdown)
+            .await
+            .is_err(),
+        "reader drain timeout must not detach a running diagnostic publication"
+    );
+    assert_process_reaped(pid).await;
+    assert!(!client.is_stopped(), "native publication is still running");
+    let mut replacement = Box::pin(manager.client_for_test(&source));
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(replacement.as_mut(), cx).is_pending(),
+            "manager replacement must wait for the old publication"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), &mut replacement)
+            .await
+            .unwrap()
+            .is_none(),
+        "restart must honor the existing cooldown"
+    );
+    assert!(client.is_stopped());
+    assert!(
+        manager.diagnostic_candidate_uris().is_empty(),
+        "old publication must finish before replacement clears the cache"
+    );
+    drop(replacement);
+    drop(shutdown);
+    manager.shutdown().await;
+    drop(client);
+    drop(manager);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn lsp_process_transport_deadlines_are_independent_between_clients() {
     let fixture = FixtureBuild::compile("independent-deadlines");
     let workspace = fixture.workspace("workspace");
@@ -1527,95 +1598,55 @@ async fn lsp_process_manager_restarts_stopped_server() {
 /// and flush for every request and notification on all platforms.
 #[cfg(unix)]
 #[tokio::test]
-async fn lsp_process_stalled_writer_is_bounded_and_reaped() {
-    let fixture = FixtureBuild::compile("stalled-writer");
+async fn lsp_process_stalled_and_queued_writers_are_bounded_and_reaped() {
+    let fixture = FixtureBuild::compile("stalled-and-queued-writers");
     let workspace = fixture.workspace("workspace");
-    let source = workspace.join("document.probe");
-    // Large enough to fill the child's stdin pipe once it stops reading.
-    fs::write(&source, vec![b'x'; 1024 * 1024]).unwrap();
+    let first = workspace.join("first.probe");
+    let second = workspace.join("second.probe");
+    // The first frame fills stdin; the second caller waits for its writer lock.
+    fs::write(&first, vec![b'x'; 1024 * 1024]).unwrap();
+    fs::write(&second, vec![b'y'; 1024 * 1024]).unwrap();
     let lease = fixture.path("stalled.lease");
     let cfg = fixture.config("stop-reading", &lease);
     let client = spawn_client(&cfg, &workspace, Duration::from_secs(5))
         .await
         .expect("fixture must initialize before it stops reading");
     let parent_pid = wait_for_pid(&lease).await;
+    let first_document = crate::extras::lsp::client::read_stable_document(&first)
+        .await
+        .unwrap();
+    let second_document = crate::extras::lsp::client::read_stable_document(&second)
+        .await
+        .unwrap();
 
     client.set_write_timeout_for_test(Some(Duration::from_millis(300)));
     let started = Instant::now();
-    // Without a write deadline this never returns: the frame write blocks on a
-    // full pipe and the response timer only starts afterwards.
-    tokio::time::timeout(Duration::from_secs(10), client.sync_file(&source))
-        .await
-        .expect("a stalled writer must not block the calling tool");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            client.sync_document(&first, first_document),
+            client.sync_document(&second, second_document)
+        )
+    })
+    .await
+    .expect("the blocked and queued callers must both finish within the deadline");
+    assert_eq!(
+        outcome,
+        (None, None),
+        "neither document reached a complete frame"
+    );
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
-        "the write deadline must bound the call, took {elapsed:?}"
+        "the write deadline must bound every caller, took {elapsed:?}"
     );
     assert!(
         elapsed >= Duration::from_millis(200),
-        "the write must actually have blocked on the full pipe, took {elapsed:?}"
+        "the first write must actually block on the full pipe, took {elapsed:?}"
     );
 
-    // A partially written frame is a terminal transport failure: the server is
-    // reaped rather than left desynchronized.
-    assert!(
-        client.is_stopped() || {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !client.is_stopped() {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .is_ok()
-        }
-    );
-    assert_process_reaped(parent_pid).await;
-
-    // The tool that issued the sync keeps working afterwards.
-    fs::write(&source, "recovered").unwrap();
-    assert_eq!(fs::read_to_string(&source).unwrap(), "recovered");
-    drop(client);
-    fixture.cleanup().await;
-}
-
-/// See `lsp_process_stalled_writer_is_bounded_and_reaped` for why the
-/// full-pipe fixture is Unix-only.
-#[cfg(unix)]
-#[tokio::test]
-async fn lsp_process_queued_writer_is_bounded_for_every_caller() {
-    let fixture = FixtureBuild::compile("queued-writer");
-    let workspace = fixture.workspace("workspace");
-    let first = workspace.join("first.probe");
-    let second = workspace.join("second.probe");
-    fs::write(&first, vec![b'x'; 1024 * 1024]).unwrap();
-    fs::write(&second, vec![b'y'; 1024 * 1024]).unwrap();
-    let lease = fixture.path("queued.lease");
-    let cfg = fixture.config("stop-reading", &lease);
-    let client = spawn_client(&cfg, &workspace, Duration::from_secs(5))
-        .await
-        .expect("fixture must initialize before it stops reading");
-    let parent_pid = wait_for_pid(&lease).await;
-
-    client.set_write_timeout_for_test(Some(Duration::from_millis(300)));
-    let blocked = client.clone();
-    let queued = client.clone();
-    let first_path = first.clone();
-    let second_path = second.clone();
-    // The second caller waits for the shared writer lock; its deadline must
-    // cover that wait, not only the write it never gets to start.
-    let outcome = tokio::time::timeout(Duration::from_secs(10), async move {
-        tokio::join!(
-            blocked.sync_file(&first_path),
-            queued.sync_file(&second_path)
-        )
-    })
-    .await;
-    assert!(
-        outcome.is_ok(),
-        "a queued writer must be bounded by the same deadline"
-    );
-
+    // A partially written frame is terminal. Synchronization returns only
+    // after shutdown, so callers cannot reuse a desynchronized server.
+    assert!(client.is_stopped());
     assert_process_reaped(parent_pid).await;
     drop(client);
     fixture.cleanup().await;

@@ -416,7 +416,7 @@ impl LspManager {
         }
         self.inner.workspace.validate().ok()?;
         let file = self.inner.diags.lock().unwrap().get(&uri)?.clone();
-        let output = tokio::task::spawn_blocking(move || {
+        let output = crate::agent::runner::spawn_blocking_scoped(move || {
             if !diagnostic_identity_is_current(&uri, &file) {
                 return None;
             }

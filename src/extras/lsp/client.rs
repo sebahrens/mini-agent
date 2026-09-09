@@ -54,9 +54,11 @@ pub(crate) async fn content_matches(
         return true;
     }; // Raw test fixtures only.
     let identity = identity.clone();
-    tokio::task::spawn_blocking(move || content.matches_file(identity.handle()).unwrap_or(false))
-        .await
-        .unwrap_or(false)
+    crate::agent::runner::spawn_blocking_scoped(move || {
+        content.matches_file(identity.handle()).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Bound reads on the authorized handle itself, including a file that grows
@@ -268,6 +270,13 @@ struct SyncProbe {
 #[cfg(test)]
 type ShutdownProbe = Arc<Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>;
 
+#[cfg(test)]
+struct DiagnosticProbe {
+    version: i64,
+    entered: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 struct TransportState {
     closing: AtomicBool,
     shutdown_tx: mpsc::UnboundedSender<()>,
@@ -324,6 +333,8 @@ pub struct LspClient {
     sync_probes: Mutex<std::collections::VecDeque<SyncProbe>>,
     #[cfg(test)]
     shutdown_probe: ShutdownProbe,
+    #[cfg(test)]
+    diagnostic_probe: Arc<Mutex<Option<DiagnosticProbe>>>,
 }
 
 impl LspClient {
@@ -430,8 +441,14 @@ impl LspClient {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_notify = Arc::new(Notify::new());
         let open = Arc::new(Mutex::new(HashMap::new()));
+        // The reader is sequential, but its blocking publication can survive
+        // reader cancellation. The supervisor retains this barrier until all
+        // cache access and captured file handles have been released.
+        let diagnostic_work = Arc::new(tokio::sync::Mutex::new(()));
         #[cfg(test)]
         let shutdown_probe = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let diagnostic_probe: Arc<Mutex<Option<DiagnosticProbe>>> = Arc::new(Mutex::new(None));
 
         // Reader task: routes responses to pending requests, stores
         // diagnostics, and answers server→client requests with null so a
@@ -447,6 +464,9 @@ impl LspClient {
             let workspace = workspace.clone();
             let server_root = server_root.clone();
             let transport = transport.clone();
+            let diagnostic_work = diagnostic_work.clone();
+            #[cfg(test)]
+            let diagnostic_probe = diagnostic_probe.clone();
             tokio::spawn(async move {
                 let mut stdout = rpc::FrameReader::new(stdout);
                 loop {
@@ -512,8 +532,30 @@ impl LspClient {
                                         let diags = diags.clone();
                                         let open = open.clone();
                                         let server = server_name.clone();
-                                        if tokio::task::spawn_blocking(move || {
+                                        let work = diagnostic_work.clone().lock_owned().await;
+                                        #[cfg(test)]
+                                        let probe = {
+                                            let mut probe = diagnostic_probe.lock().unwrap();
+                                            if probe.as_ref().is_some_and(|probe| {
+                                                params.get("version").and_then(Value::as_i64)
+                                                    == Some(probe.version)
+                                            }) {
+                                                probe.take()
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        let publish = move || {
+                                            #[cfg(test)]
+                                            if let Some(probe) = probe {
+                                                let _ = probe.entered.send(());
+                                                let _ = probe.release.recv();
+                                            }
                                             store_diagnostics(&diags, &server, &params, Some(&open))
+                                        };
+                                        if tokio::task::spawn_blocking(move || {
+                                            let _work = work;
+                                            publish()
                                         })
                                         .await
                                         .unwrap_or(false)
@@ -581,6 +623,7 @@ impl LspClient {
             SupervisedProtocol {
                 reader_task,
                 stderr_task,
+                diagnostic_work,
                 transport: transport.clone(),
                 stopped: stopped.clone(),
                 stopped_notify: stopped_notify.clone(),
@@ -605,6 +648,8 @@ impl LspClient {
             sync_probes: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
             shutdown_probe,
+            #[cfg(test)]
+            diagnostic_probe,
         });
 
         let init_params = json!({
@@ -741,6 +786,21 @@ impl LspClient {
         let (release_tx, release_rx) = oneshot::channel();
         *self.shutdown_probe.lock().unwrap() = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_diagnostic_for_test(
+        &self,
+        version: i64,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, received) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        *self.diagnostic_probe.lock().unwrap() = Some(DiagnosticProbe {
+            version,
+            entered,
+            release: gate,
+        });
+        (received, release)
     }
 
     #[cfg(test)]
@@ -993,6 +1053,7 @@ async fn write_owned_frame_with_deadline(
 struct SupervisedProtocol {
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    diagnostic_work: Arc<tokio::sync::Mutex<()>>,
     transport: Arc<TransportState>,
     stopped: Arc<AtomicBool>,
     stopped_notify: Arc<Notify>,
@@ -1010,6 +1071,7 @@ async fn supervise_child(
     let SupervisedProtocol {
         mut reader_task,
         mut stderr_task,
+        diagnostic_work,
         transport,
         stopped,
         stopped_notify,
@@ -1050,8 +1112,14 @@ async fn supervise_child(
             .is_err()
         {
             task.abort();
+            // An abort request alone does not establish that the reader has
+            // stopped submitting blocking work or released its handles.
+            let _ = task.await;
         }
     }
+    // Native disk work cannot be aborted with its async reader. Keep shutdown
+    // and manager replacement pending until the final publication is done.
+    let _diagnostic_work = diagnostic_work.lock().await;
     stopped.store(true, Ordering::Release);
     stopped_notify.notify_waiters();
 }

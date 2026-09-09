@@ -107,6 +107,15 @@ it is checked for inventory drift but is not a production trust class. `NON-PROC
 lexical match that is a thread/task spawn, HTTP/tool status accessor, type reference, comment, or
 the no-effect skill verifier's in-memory fake `spawn`; it never authorizes an OS process.
 
+### LSP disk-work ownership
+
+Content validation requested by edit feedback and diagnostic queries registers with the active
+agent work scope. Cancelling the calling tool leaves its retained-handle disk work owned until
+the turn settles. Background diagnostic publication instead belongs to the persistent LSP
+client: its blocking worker holds a client-owned barrier across publication and handle release.
+Shutdown joins aborted protocol tasks and drains that barrier before marking the client stopped.
+Manager replacement consequently clears the old cache only after its last publisher finishes.
+
 ### Selected-workspace rebinding
 
 The process-global current directory is only an initialization fallback. Startup captures one
