@@ -1653,6 +1653,7 @@ pub(crate) fn normalize_windows_clipboard_newlines(text: &str) -> String {
     normalized
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn normalize_internal_clipboard_newlines(text: String) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }

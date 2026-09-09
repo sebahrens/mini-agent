@@ -9,40 +9,29 @@ use crate::ui::renderer::{
 };
 
 #[test]
-fn base64_encode_empty() {
-    assert_eq!(base64_encode(b""), "");
+fn base64_encode_exact_vectors_cover_padding_and_binary_alphabet() {
+    for (input, expected) in [
+        (b"".as_slice(), ""),
+        (b"f".as_slice(), "Zg=="),
+        (b"fo".as_slice(), "Zm8="),
+        (b"foo".as_slice(), "Zm9v"),
+        (b"foob".as_slice(), "Zm9vYg=="),
+        (b"fooba".as_slice(), "Zm9vYmE="),
+        (b"foobar".as_slice(), "Zm9vYmFy"),
+        (b"\x00\x80\xff".as_slice(), "AID/"),
+        (b"\xfb\xef\xbe".as_slice(), "++++"),
+        (b"\xff\xff\xff".as_slice(), "////"),
+    ] {
+        assert_eq!(base64_encode(input), expected, "input: {input:?}");
+    }
 }
 
 #[test]
-fn base64_encode_single_byte() {
-    assert_eq!(base64_encode(b"f"), "Zg==");
-}
-
-#[test]
-fn base64_encode_two_bytes() {
-    assert_eq!(base64_encode(b"fo"), "Zm8=");
-}
-
-#[test]
-fn base64_encode_three_bytes() {
-    assert_eq!(base64_encode(b"foo"), "Zm9v");
-}
-
-#[test]
-fn base64_encode_known_values() {
-    assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
-    assert_eq!(base64_encode(b"Hi!"), "SGkh");
-    assert_eq!(base64_encode(b"ab"), "YWI=");
-    assert_eq!(base64_encode(b"abc"), "YWJj");
-    assert_eq!(base64_encode(b"Man"), "TWFu");
-}
-
-#[test]
-fn base64_encode_long_input() {
-    let input = "The quick brown fox jumps over the lazy dog. ".repeat(10);
-    let encoded = base64_encode(input.as_bytes());
-    assert!(encoded.len() > input.len());
-    assert!(encoded.ends_with('=') || !encoded.contains('='));
+fn base64_encode_long_input_preserves_every_block_without_line_wrapping() {
+    let mut input = b"abc".repeat(256);
+    input.push(b'd');
+    let expected = "YWJj".repeat(256) + "ZA==";
+    assert_eq!(base64_encode(&input), expected);
 }
 
 #[test]

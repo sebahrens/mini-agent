@@ -10,8 +10,7 @@
 use std::io;
 use std::process::{Child, ExitStatus, Output};
 #[cfg(windows)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 #[cfg(feature = "mcp")]
@@ -46,8 +45,8 @@ pub(crate) fn creation_guard() -> io::Result<CreationGuard> {
     }
 }
 
+#[cfg(windows)]
 pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuard> {
-    #[cfg(windows)]
     loop {
         match PROCESS_CREATION_LOCK.try_lock() {
             Ok(guard) => return Ok(CreationGuard { _inner: guard }),
@@ -70,15 +69,11 @@ pub(crate) fn creation_guard_until(deadline: Instant) -> io::Result<CreationGuar
             }
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = deadline;
-        Ok(CreationGuard {})
-    }
 }
 
 pub(crate) trait StdCommandCreationExt {
     fn spawn_guarded(&mut self) -> io::Result<Child>;
+    #[cfg(windows)]
     fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<Child>;
     fn status_guarded(&mut self) -> io::Result<ExitStatus>;
     fn output_guarded(&mut self) -> io::Result<Output>;
@@ -90,6 +85,7 @@ impl StdCommandCreationExt for std::process::Command {
         std::process::Command::spawn(self)
     }
 
+    #[cfg(windows)]
     fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<Child> {
         let _guard = creation_guard_until(deadline)?;
         if Instant::now() >= deadline {
