@@ -15,6 +15,9 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+mod artifact_cleanup;
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, OnceLock};

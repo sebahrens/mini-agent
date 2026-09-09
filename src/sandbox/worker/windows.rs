@@ -2497,12 +2497,14 @@ mod feasibility {
         }
     }
 
+    #[cfg(test)]
     struct DisposableArtifact {
         executable: PathBuf,
         directory: PathBuf,
         destination_expected: InstallLocation,
         probe: ProbeKind,
         cleaned: bool,
+        cleanup_deadline: Option<Instant>,
     }
 
     #[cfg(test)]
@@ -2584,8 +2586,8 @@ mod feasibility {
         probe: ProbeKind,
     }
 
+    #[cfg(test)]
     impl DisposableArtifact {
-        #[cfg(test)]
         fn copy_into(
             source: &Path,
             source_lock: WinHandle,
@@ -2639,6 +2641,7 @@ mod feasibility {
                 destination_expected,
                 probe,
                 cleaned: false,
+                cleanup_deadline: None,
             })
         }
 
@@ -2646,10 +2649,14 @@ mod feasibility {
             if self.cleaned {
                 return Ok(());
             }
-            std::fs::remove_file(&self.executable).map_err(|error| {
-                GateError(format!("remove disposable LPAC executable: {error}"))
-            })?;
-            std::fs::remove_dir(&self.directory)
+            let deadline = *self
+                .cleanup_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+            crate::sandbox::worker::artifact_cleanup::remove_file(&self.executable, deadline)
+                .map_err(|error| {
+                    GateError(format!("remove disposable LPAC executable: {error}"))
+                })?;
+            crate::sandbox::worker::artifact_cleanup::remove_dir(&self.directory, deadline)
                 .map_err(|error| GateError(format!("remove disposable LPAC directory: {error}")))?;
             self.cleaned = true;
             Ok(())
@@ -2660,6 +2667,7 @@ mod feasibility {
         }
     }
 
+    #[cfg(test)]
     impl Drop for DisposableArtifact {
         fn drop(&mut self) {
             if !self.cleaned {

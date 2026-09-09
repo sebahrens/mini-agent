@@ -815,6 +815,14 @@ an inheritable canary omitted from `HANDLE_LIST`, and access denial for a parent
 sentinel before emitting its fixed readiness frame. Profile and disposable-artifact cleanup errors
 are part of the gate result rather than silently treated as success.
 
+The test-only `src/sandbox/worker/artifact_cleanup.rs` retries Windows sharing and lock violations
+for private disposable-artifact deletion after the probe's worker has exited. One two-second
+deadline covers file and directory cleanup and the final `Drop` attempt. Other errors fail
+immediately, and persistent contention still fails the gate; cleanup never changes permissions
+or recursively removes unexpected contents. Already-removed paths are accepted so a partial
+cleanup can resume. Portable tests cover retry classification, the expired deadline, and partial
+progress; a native Windows fixture holds a handle that denies delete sharing until it is released.
+
 Windows handle inheritance is process-global state. The LPAC launcher and every production
 standard-library, Tokio, or reviewed third-party process terminal in mini-agent use one crate-wide
 creation lock. LPAC acquires it before the first handle is made inheritable and releases it only
