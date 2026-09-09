@@ -34,6 +34,31 @@ const MAX_RETRY_BACKOFF_SECONDS: i64 = 300;
 const MAX_AUTH_AGE_SECONDS: i64 = 300;
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// Reject an awaiting proposal without depending on evaluation infrastructure.
+/// The local-owner capability and optimistic transaction guard this action;
+/// approved proposals are never interpreted as a replay of an approval.
+pub(crate) fn reject_proposal(
+    store: &mut SkillStore,
+    admin: Option<&AdminIdentity>,
+    proposal_id: &str,
+    now: i64,
+) -> Result<String, AdmissionError> {
+    admin.ok_or(StoreError::Unauthorized)?;
+    let proposal = store
+        .get_proposal(proposal_id)?
+        .ok_or_else(|| AdmissionError::NotFound(proposal_id.to_string()))?;
+    if proposal.status != ProposalStatus::AwaitingApproval {
+        return Err(AdmissionError::NotAwaitingApproval);
+    }
+    AdmissionStore::new(store).deny(
+        &proposal.proposal_id,
+        proposal.row_version,
+        "local_owner_rejected",
+        now,
+    )?;
+    Ok(proposal.skill_id)
+}
+
 pub(crate) struct AdmissionEvaluator {
     store: SkillStore,
     /// Shared with retrieval and the telemetry coordinator: one compatible

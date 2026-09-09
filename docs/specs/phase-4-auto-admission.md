@@ -55,6 +55,12 @@ proposal deferred for infrastructure failure or an exhausted claim budget, or a 
 `held_out_suite_required` proposal. Importing the same package also requeues recoverable proposals
 after restoring its matching baseline.
 
+Explicit reevaluation and rejection are authenticated database-only operations. They do not
+initialize an embedding backend or execute the verifier, so missing embedding credentials or an
+unavailable worker cannot block them. Rejection accepts only `awaiting_approval` proposals and
+never replays an earlier approval; explicit approval retains its idempotent replay contract and
+configured embedding/verification gates.
+
 The evaluator:
 
 1. recomputes and validates the full artifact identity under its owning identity version;

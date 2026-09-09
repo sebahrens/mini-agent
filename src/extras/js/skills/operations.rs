@@ -718,7 +718,7 @@ fn run_library_operation(
         LibraryOperation::Activate(id) => activate_skill(id, paths, embedding),
         LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
         LibraryOperation::Retire(id) => retire_skill(id, paths, embedding),
-        LibraryOperation::Reevaluate(id) => reevaluate_skill(id, paths, embedding),
+        LibraryOperation::Reevaluate(id) => reevaluate_skill(id, paths),
         LibraryOperation::ListSuites => {
             let store = SkillStore::open_at(paths)?;
             suite_listing_report(&store)?.emit();
@@ -754,27 +754,22 @@ fn suite_listing_report(store: &SkillStore) -> anyhow::Result<OperatorReport> {
 /// unavailable or its attempt budget ran out. All three are recoverable, but
 /// the only shipped route was re-importing the byte-identical package, which an
 /// operator cannot do at all for a proposal the model authored.
-fn reevaluate_skill(
-    skill_id: &str,
-    paths: &AppPaths,
-    embedding: Option<&EmbeddingConfig>,
-) -> anyhow::Result<()> {
-    let store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+fn reevaluate_skill(skill_id: &str, paths: &AppPaths) -> anyhow::Result<()> {
+    let mut store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let proposal = store
         .get_proposal(skill_id)?
         .context("learned-skill proposal not found")?;
     let status = proposal_status(proposal.status);
     let reason = proposal.reason_code.clone();
-    drop(store);
 
     let admin = AdminIdentity::authenticated("local-owner")?;
-    let mut evaluator = AdmissionEvaluator::new(
-        SkillStore::open_at(paths)?,
-        std::sync::Arc::new(Embedder::from_config(embedding)?),
-        format!("local-reevaluate-{}", uuid::Uuid::new_v4()),
-    )?;
-    evaluator
-        .request_reevaluation(&proposal.proposal_id, &admin, current_timestamp()?)
+    store
+        .request_blocked_reevaluation(
+            Some(&admin),
+            &proposal.proposal_id,
+            proposal.row_version,
+            current_timestamp()?,
+        )
         .with_context(|| {
             format!(
                 "learned-skill re-evaluation requires a proposal parked as verified with \
@@ -1342,19 +1337,12 @@ fn sleep_until_due(
 }
 
 struct LocalOwnerReviewer {
-    approve: bool,
     now: i64,
 }
 
 impl HumanReviewer for LocalOwnerReviewer {
     fn review(&self, _packet: &super::admission::ReviewPacket) -> ReviewDecision {
-        if self.approve {
-            ReviewDecision::Approve(AuthenticatedHumanDecision::local_owner(self.now))
-        } else {
-            ReviewDecision::Deny {
-                reason_code: "local_owner_rejected".to_string(),
-            }
-        }
+        ReviewDecision::Approve(AuthenticatedHumanDecision::local_owner(self.now))
     }
 }
 
@@ -1365,13 +1353,29 @@ fn review_proposal(
     embedding: Option<&EmbeddingConfig>,
 ) -> anyhow::Result<()> {
     let now = current_timestamp().context("failed to resolve review timestamp")?;
+    if !approve {
+        let mut store = SkillStore::open_at(paths)?;
+        let admin = AdminIdentity::authenticated("local-owner")?;
+        let skill_id =
+            super::admission::reject_proposal(&mut store, Some(&admin), proposal_id, now)
+                .context("learned-skill rejection failed")?;
+        let status = store
+            .revision_status(&skill_id)?
+            .context("rejected revision disappeared")?;
+        OperatorReport::new("reject")
+            .with("id", skill_id)
+            .with("status", status)
+            .with("idempotent", false)
+            .emit();
+        return Ok(());
+    }
     let mut evaluator = AdmissionEvaluator::new(
         SkillStore::open_at(paths)?,
         std::sync::Arc::new(Embedder::from_config(embedding)?),
         format!("local-review-{}", uuid::Uuid::new_v4()),
     )?;
     let outcome = evaluator
-        .review_and_admit(proposal_id, &LocalOwnerReviewer { approve, now }, now)
+        .review_and_admit(proposal_id, &LocalOwnerReviewer { now }, now)
         .context("learned-skill review failed")?;
     match outcome {
         ReviewOutcome::Canary(result) => {
@@ -1389,19 +1393,7 @@ fn review_proposal(
             let status = live_revision_status(paths, &result.skill_id)?;
             approve_report(&result, generation, &status).emit();
         }
-        ReviewOutcome::Denied => {
-            let skill_id = SkillStore::open_at(paths)?
-                .get_proposal(proposal_id)?
-                .map(|record| record.skill_id)
-                .unwrap_or_else(|| proposal_id.to_string());
-            let status = live_revision_status(paths, &skill_id)?;
-            OperatorReport::new("reject")
-                .with("id", skill_id)
-                .with("status", status)
-                .with("idempotent", false)
-                .emit();
-        }
-        ReviewOutcome::Cancelled | ReviewOutcome::TimedOut => {
+        ReviewOutcome::Denied | ReviewOutcome::Cancelled | ReviewOutcome::TimedOut => {
             anyhow::bail!("local-owner learned-skill review did not complete")
         }
     }
@@ -1850,6 +1842,40 @@ mod tests {
     use super::*;
     use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
     use crate::paths::{PathEnvironment, PathPlatform};
+
+    fn unavailable_embedding_config() -> EmbeddingConfig {
+        let key = format!(
+            "MINI_AGENT_MISSING_EMBEDDING_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        assert!(std::env::var_os(&key).is_none());
+        let config = EmbeddingConfig {
+            backend: crate::config::EmbeddingBackendKind::External,
+            api_key_env: Some(key.into()),
+            ..EmbeddingConfig::default()
+        };
+        assert!(
+            Embedder::from_config(Some(&config)).is_err(),
+            "fixture must prevent embedding initialization"
+        );
+        config
+    }
+
+    fn assert_rejection_preserves_approved_state(paths: &AppPaths, skill_id: &str) {
+        let store = SkillStore::open_at(paths).unwrap();
+        let proposal = store.get_proposal(skill_id).unwrap().unwrap();
+        let revision = store.revision_status(skill_id).unwrap();
+        let generation = store.desired_generation().unwrap();
+        drop(store);
+        assert!(
+            review_proposal(skill_id, false, paths, None).is_err(),
+            "rejection must not replay approval for an approved proposal"
+        );
+        let store = SkillStore::open_at(paths).unwrap();
+        assert_eq!(store.get_proposal(skill_id).unwrap().unwrap(), proposal);
+        assert_eq!(store.revision_status(skill_id).unwrap(), revision);
+        assert_eq!(store.desired_generation().unwrap(), generation);
+    }
 
     fn fixture() -> (std::path::PathBuf, AppPaths, SkillArtifact) {
         let root = std::env::temp_dir().join(format!(
@@ -3106,7 +3132,22 @@ mod tests {
         assert!(line.ends_with(&format!("\t{}\t{}", listed.created_at, listed.updated_at)));
         drop(store);
 
-        review_proposal(&skill_id, false, &paths, None).unwrap();
+        let unavailable = unavailable_embedding_config();
+        assert!(
+            review_proposal(&skill_id, true, &paths, Some(&unavailable)).is_err(),
+            "approval must still honor the configured embedding backend"
+        );
+        assert_eq!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .get_proposal(&skill_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::AwaitingApproval
+        );
+        review_proposal(&skill_id, false, &paths, Some(&unavailable))
+            .expect("human rejection must not require embedding credentials");
         let store = SkillStore::open_at(&paths).unwrap();
         assert!(
             load_proposal_queue(&store)
@@ -3497,13 +3538,14 @@ mod tests {
         assert_eq!(before.status, ProposalStatus::Deferred);
         drop(store);
 
+        let unavailable = unavailable_embedding_config();
         run(
             None,
             false,
             None,
             Some(LibraryOperation::Reevaluate(&queued.proposal_id)),
             &paths,
-            None,
+            Some(&unavailable),
         )
         .expect("a parked proposal must be requeueable");
 
@@ -3515,6 +3557,23 @@ mod tests {
             "re-evaluation must return the proposal to the queue"
         );
         assert_eq!(after.reason_code, None);
+        assert_eq!(after.attempt_count, 0);
+        assert!(
+            run(
+                None,
+                false,
+                None,
+                Some(LibraryOperation::Reevaluate(&queued.proposal_id)),
+                &paths,
+                Some(&unavailable)
+            )
+            .is_err(),
+            "an already pending row is not parked"
+        );
+        assert_eq!(
+            store.get_proposal(&queued.proposal_id).unwrap().unwrap(),
+            after
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3851,6 +3910,9 @@ mod tests {
                 .as_deref(),
             Some("canary")
         );
+        assert_rejection_preserves_approved_state(&paths, &skill_id);
+        review_proposal(&skill_id, true, &paths, None)
+            .expect("explicit approval replay remains idempotent");
         activate_skill(&skill_id, &paths, None).unwrap();
         let store = SkillStore::open_at(&paths).unwrap();
         assert_eq!(
@@ -3859,6 +3921,7 @@ mod tests {
         );
         assert!(store.is_retrievable(&skill_id).unwrap());
         drop(store);
+        assert_rejection_preserves_approved_state(&paths, &skill_id);
         activate_skill(&skill_id, &paths, None).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

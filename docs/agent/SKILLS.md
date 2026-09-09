@@ -145,6 +145,10 @@ same fields as one JSON object per line instead. The two tabular listings,
 See [COMMANDS.md](COMMANDS.md#learned-skill-and-agent-skill-cli-flags) for the one-line flag
 reference.
 
+`--reevaluate-learned-skill` and `--reject-learned-skill` only update the authenticated local
+store; they work without embedding credentials or a running verifier. Rejection requires a
+proposal awaiting approval. An already approved proposal remains intact and the command fails.
+
 A directory import reads 1–32 sorted regular `.json` files and ignores symlinks. Each file is
 bounded to 256 KiB and contains exactly a `proposal` in the `propose_skill` wire shape plus a
 non-empty `held_out_suites` array — the full format is in

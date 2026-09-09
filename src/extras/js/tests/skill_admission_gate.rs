@@ -728,6 +728,26 @@ fn skill_admission_concurrency_duplicate_approval_is_idempotent() {
 fn skill_admission_review_deny_cancel_and_timeout_never_create_canary() {
     let (root, _paths, mut denied, denied_artifact) = evaluator(true);
     denied.evaluate_next(20).unwrap().unwrap();
+    assert!(matches!(
+        crate::extras::js::skills::admission::reject_proposal(
+            denied.store_mut(),
+            None,
+            &denied_artifact.id,
+            21,
+        ),
+        Err(AdmissionError::Store(
+            crate::extras::js::skills::store::StoreError::Unauthorized
+        ))
+    ));
+    assert_eq!(
+        denied
+            .store()
+            .get_proposal(&denied_artifact.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ProposalStatus::AwaitingApproval
+    );
     assert_eq!(
         denied
             .review_and_admit(&denied_artifact.id, &Denier, 21)

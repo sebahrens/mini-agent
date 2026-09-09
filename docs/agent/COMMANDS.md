@@ -343,7 +343,7 @@ reference — package format, held-out suites, feedback semantics, stats columns
 | `--learned-skill-proposal <SHA256>` | Print one proposal's admission outcome, including the `reason_code` and `report_id` of a rejected or deferred decision, then exit. Unlike the listing, this also finds terminal proposals. |
 | `--learned-skill-stats` | Print the per-revision usage table (TSV) and exit. See [Reading `--learned-skill-stats`](SKILLS.md#reading---learned-skill-stats) before drawing conclusions from the `success` column. |
 | `--approve-learned-skill <SHA256>` | Approve an evaluated proposal into the non-retrievable canary state. Requires `awaiting_approval`. |
-| `--reject-learned-skill <SHA256>` | Reject an evaluated proposal as the authenticated local owner. |
+| `--reject-learned-skill <SHA256>` | Reject a proposal awaiting approval as the authenticated local owner. Requires no embedding credentials or verifier; approved proposals are ineligible. |
 | `--activate-learned-skill <SHA256>` | Activate an approved **lineage-root** skill after its held-out baseline. Deliberately refuses a replacement. |
 | `--promote-learned-skill <SHA256>` | Promote an approved replacement canary over its active or quarantined predecessor, superseding it and preserving lineage. |
 | `--retire-learned-skill <SHA256>` | Administratively disable an `active` revision, preserving the revision and its lineage. |
