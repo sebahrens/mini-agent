@@ -652,10 +652,6 @@ impl ContentDigest {
         }
     }
 
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
     /// Whether `file` still holds exactly the snapshotted bytes.
     ///
     /// Reading is bounded by the snapshot length plus one byte, so a file that

@@ -256,17 +256,6 @@ pub(crate) fn bind_configured_shell(
 }
 
 /// Build a permission policy and approval channel for interactive startup.
-pub(crate) fn build_interactive_permission(
-    cfg: &crate::config::Config,
-    authority: ResolvedExecutionAuthority,
-) -> anyhow::Result<(
-    Option<checker::PermCheck>,
-    Option<ask::AskSender>,
-    Option<ask::AskReceiver>,
-)> {
-    build_interactive_permission_at(cfg, authority, None)
-}
-
 pub(crate) fn build_interactive_permission_at(
     cfg: &crate::config::Config,
     authority: ResolvedExecutionAuthority,
@@ -488,7 +477,7 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
 #[cfg(test)]
 mod execution_authority_tests {
     use super::{
-        SandboxResolution, SecurityMode, bind_configured_shell, build_interactive_permission,
+        SandboxResolution, SecurityMode, bind_configured_shell, build_interactive_permission_at,
         build_noninteractive_permission, resolve_configured_execution_authority,
         resolve_execution_authority,
     };
@@ -779,7 +768,7 @@ mod execution_authority_tests {
                     assert_eq!(authority.sandbox, sandbox, "{}", case.name);
 
                     let (interactive, interactive_ask, interactive_receiver) =
-                        build_interactive_permission(&case.cfg, authority).unwrap();
+                        build_interactive_permission_at(&case.cfg, authority, None).unwrap();
                     assert_eq!(
                         interactive.is_some(),
                         case.permission_checks_enabled,
@@ -804,10 +793,14 @@ mod execution_authority_tests {
                     assert_eq!(
                         noninteractive.is_some(),
                         case.permission_checks_enabled,
-                        "{} ACP checker",
+                        "{} noninteractive checker",
                         case.name
                     );
-                    assert!(noninteractive_ask.is_none(), "{} ACP Ask", case.name);
+                    assert!(
+                        noninteractive_ask.is_none(),
+                        "{} noninteractive Ask",
+                        case.name
+                    );
                 }
                 Err(message) => assert_eq!(
                     result.expect_err(case.name).to_string(),

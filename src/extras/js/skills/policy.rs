@@ -126,6 +126,7 @@ pub struct PromotionPolicy {
 }
 
 impl PromotionPolicy {
+    #[cfg(test)]
     pub fn conservative(version: impl Into<String>, window_start: i64, window_end: i64) -> Self {
         Self {
             version: version.into(),

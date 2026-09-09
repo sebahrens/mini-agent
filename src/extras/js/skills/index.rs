@@ -331,10 +331,12 @@ impl ImmutableSkillIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len().saturating_sub(self.hidden.len())
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

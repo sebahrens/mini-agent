@@ -415,6 +415,7 @@ impl<'de> Deserialize<'de> for CapabilityManifest {
 
 impl CapabilityManifest {
     /// A Tier 0 manifest declaring nothing.
+    #[cfg(test)]
     pub fn pure() -> Self {
         Self {
             tier: CapabilityTier::Pure,

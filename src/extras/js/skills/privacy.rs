@@ -132,6 +132,7 @@ impl Redactor {
         truncate_utf8(&value, self.max_bytes)
     }
 
+    #[cfg(test)]
     pub fn contains_configured_secret(&self, value: &str) -> bool {
         self.exact_secrets
             .iter()

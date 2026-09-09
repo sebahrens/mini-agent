@@ -140,10 +140,6 @@ impl GitRunner {
         })
     }
 
-    pub(crate) fn executable(&self) -> Option<&Path> {
-        (!self.program.as_os_str().is_empty()).then_some(self.program.as_path())
-    }
-
     pub(crate) fn verify_contained(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -826,11 +822,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unavailable_runner_executable_is_none() {
-        let runner = GitRunner::unavailable()
-            .expect("unavailable() must succeed in a normal test environment");
-        assert!(runner.executable().is_none());
+    #[tokio::test]
+    async fn unavailable_runner_rejects_internal_and_contained_execution() {
+        let runner = GitRunner::unavailable().unwrap();
+        let root = std::env::current_dir().unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&root).unwrap();
+        let internal = runner.run(&root, "status", ["status"], limits()).await;
+        let contained = runner
+            .run_contained(
+                &workspace,
+                &Sandbox::new(false, "git"),
+                "status",
+                ["status"],
+                limits(),
+                false,
+            )
+            .await;
+        for result in [internal, contained] {
+            assert_eq!(
+                result.err().as_deref(),
+                Some("Git executable is unavailable or unsupported")
+            );
+        }
     }
 
     #[test]
