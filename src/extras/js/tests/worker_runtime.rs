@@ -3609,8 +3609,11 @@ fn worker_exit_reconciliation_never_sleeps_past_its_deadline() {
 }
 
 #[tokio::test]
-async fn worker_supervisor_transport_bounds_stderr_without_blocking_worker() {
-    let supervisor = scripted_supervisor(256 * 1024);
+async fn worker_supervisor_transport_drains_large_stderr_without_blocking_worker() {
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        TestWorkerLauncher::scripted_internal_worker(256 * 1024),
+        Duration::from_secs(5),
+    );
     let result = supervisor
         .execute(
             RunStep::new("success".into()),
@@ -3620,10 +3623,7 @@ async fn worker_supervisor_transport_bounds_stderr_without_blocking_worker() {
         .await
         .unwrap();
     assert_eq!(result.outcome, StepOutcome::Value("success".into()));
-    let stats = supervisor.stderr_stats_for_test().await.unwrap();
-    assert_eq!(stats.retained_bytes, 0);
-    assert!(stats.observed_bytes <= 4096);
-    assert!(stats.truncated);
+    supervisor.shutdown_for_test().await.unwrap();
 }
 
 #[test]

@@ -101,6 +101,7 @@ pub enum AgentEvent {
 
 impl AgentEvent {
     /// A terminal failure with no completed work to retain.
+    #[cfg(feature = "hooks")]
     pub fn error(message: impl Into<CompactString>) -> Self {
         Self::Error {
             message: message.into(),

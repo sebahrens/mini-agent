@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::sandbox::worker::TestWorkerLauncher;
+use std::sync::atomic::AtomicUsize;
 
 async fn requested_connection(code: &str) -> WorkerConnection {
     let cancellation = PermCancellation::new();
@@ -170,5 +171,45 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
         assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
         assert_eq!(supervisor.generation_for_test().await, Some(2));
         supervisor.shutdown_for_test().await.unwrap();
+    }
+}
+
+#[test]
+fn stderr_drain_retries_interruptions_and_stops_on_eof_or_error() {
+    use std::collections::VecDeque;
+    use std::io::{self, ErrorKind};
+
+    struct ScriptedReader(VecDeque<Result<usize, ErrorKind>>);
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert!(!buffer.is_empty() && buffer.len() <= 4096);
+            let available = self
+                .0
+                .pop_front()
+                .expect("drain read past its terminal event")?;
+            let count = available.min(buffer.len());
+            if available > count {
+                self.0.push_front(Ok(available - count));
+            }
+            buffer[..count].fill(b'x');
+            Ok(count)
+        }
+    }
+
+    for terminal in [Ok(0), Err(ErrorKind::BrokenPipe)] {
+        let mut reader = ScriptedReader(VecDeque::from([
+            Err(ErrorKind::Interrupted),
+            Ok(17),
+            Err(ErrorKind::Interrupted),
+            Ok(4096),
+            terminal,
+            Ok(1),
+        ]));
+        discard_worker_stderr(&mut reader);
+        assert_eq!(
+            reader.0,
+            VecDeque::from([Ok(1)]),
+            "drain must consume through the terminal event, retrying interruptions"
+        );
     }
 }

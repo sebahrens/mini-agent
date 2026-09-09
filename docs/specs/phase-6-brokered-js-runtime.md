@@ -164,9 +164,15 @@ data, while a bounded stderr pipe carries only sanitized diagnostics and never s
 arguments, file or response contents, environment values, or secrets.
 
 `src/extras/js/supervisor.rs` owns the parent-side serialized transport lease shared by run and
-verification requests. The shared state retains only process, protocol, generation, and bounded
-stderr-drain data; per-invocation effect authority remains method-local. Dropping or cancelling an
-in-flight lease invalidates that worker connection, so the next independent request launches a
+verification requests. The shared state retains only process, protocol, generation, and
+stderr-drain ownership; per-invocation effect authority remains method-local. The drain
+discards stderr continuously through a fixed 4096-byte buffer, without accumulating or reporting
+its contents or recording per-read counters. Interrupted reads are retried; EOF and other read
+errors end the drain. An injected-reader regression covers interrupted reads before and between
+successful reads, plus EOF and terminal-error behavior. A real-worker regression writes 256 KiB
+before its protocol handshake and verifies successful execution and shutdown.
+
+Dropping or cancelling an in-flight lease invalidates that worker connection, so the next independent request launches a
 new generation. One 30-second watchdog starts before lease acquisition and covers startup, IPC,
 execution, and pending parent effects. The synchronous platform launch runs outside the async
 lease task; cancellation or the watchdog can therefore win during launch, and any process returned

@@ -13,6 +13,7 @@ use crate::provider::AnyAgent;
 use crate::sandbox::Sandbox;
 use crate::session::Session;
 
+#[cfg(any(feature = "hooks", all(test, unix)))]
 fn hook_loop_active(iteration: u32, max_iterations: Option<u32>) -> bool {
     max_iterations.is_none_or(|max| iteration < max)
 }

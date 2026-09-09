@@ -7,7 +7,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -26,7 +26,6 @@ use super::types::{PermCancellation, STEP_TIMEOUT};
 use crate::sandbox::worker::ProductionWorkerLauncher;
 use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 
-const MAX_STDERR_OBSERVED_BYTES: usize = 4 * 1024;
 /// Polling interval for detecting worker process exit. Raised from 10ms to 250ms to reduce
 /// per-frame IPC overhead: thousands of unnecessary wakeups and syscalls during long effects are
 /// now avoided. Worst-case worker-death detection latency is therefore 250ms.
@@ -245,8 +244,6 @@ impl RetirementTicket {
 }
 
 struct BoundedStderrDrain {
-    observed: Arc<AtomicUsize>,
-    truncated: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -495,6 +492,7 @@ impl JsWorkerSupervisor {
         self.0.idle_retirement.notified().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         request: RunStep,
@@ -508,7 +506,7 @@ impl JsWorkerSupervisor {
     /// Execute using the parent-created identity that also binds the invocation broker.
     ///
     /// The identity remains method-local and is never retained once the invocation finishes.
-    // Test-only: production always supplies a deadline via execute_bound_with_deadline.
+    // Production uses the deadline-bound plain-JS or skill-bundle entry point.
     #[cfg(test)]
     pub(crate) async fn execute_bound(
         &self,
@@ -521,6 +519,7 @@ impl JsWorkerSupervisor {
             .await
     }
 
+    #[cfg(any(test, not(feature = "skills")))]
     pub(crate) async fn execute_bound_with_deadline(
         &self,
         invocation: InvocationId,
@@ -559,6 +558,7 @@ impl JsWorkerSupervisor {
         .await
     }
 
+    #[cfg(any(test, not(feature = "skills")))]
     async fn execute_inner(
         &self,
         request: RunStep,
@@ -885,17 +885,6 @@ impl JsWorkerSupervisor {
             0 => None,
             generation => Some(generation),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn stderr_stats_for_test(&self) -> Option<StderrStats> {
-        let state = self.0.transport.lock().await;
-        let drain = &state.idle.as_ref()?.stderr_drain;
-        Some(StderrStats {
-            observed_bytes: drain.observed.load(Ordering::Acquire),
-            retained_bytes: 0,
-            truncated: drain.truncated.load(Ordering::Acquire),
-        })
     }
 
     #[cfg(test)]
@@ -1311,6 +1300,7 @@ impl Drop for EffectCancellation {
 }
 
 enum InvocationRequest {
+    #[cfg(any(test, not(feature = "skills")))]
     Run(RunStep),
     #[cfg(feature = "skills")]
     RunWithSkills(
@@ -1327,6 +1317,7 @@ fn prepare_worker_skill_cache_request(
     cached_ids: &[String],
 ) -> Option<(String, Vec<String>)> {
     let (step, bundle) = match request {
+        #[cfg(test)]
         InvocationRequest::Run(step) => (step, None),
         InvocationRequest::RunWithSkills(step, bundle) => (step, Some(bundle)),
         InvocationRequest::Verify(_) => return None,
@@ -1810,6 +1801,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
         None
     };
     let parent_message = match request {
+        #[cfg(any(test, not(feature = "skills")))]
         InvocationRequest::Run(request) => ParentFrame::RunStep(request),
         #[cfg(feature = "skills")]
         InvocationRequest::RunWithSkills(request, _) => ParentFrame::RunStep(request),
@@ -2307,32 +2299,29 @@ fn start_stderr_drain(process: &WorkerProcess) -> Result<BoundedStderrDrain, Wor
         .stderr
         .try_clone()
         .map_err(|_| WorkerError::Transport)?;
-    let observed = Arc::new(AtomicUsize::new(0));
-    let truncated = Arc::new(AtomicBool::new(false));
-    let thread_observed = observed.clone();
-    let thread_truncated = truncated.clone();
     let thread = std::thread::Builder::new()
         .name("mini-agent-js-worker-stderr".into())
         .spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(count) = stderr.read(&mut buffer) {
-                if count == 0 {
-                    break;
-                }
-                let previous = thread_observed.load(Ordering::Relaxed);
-                let total = previous.saturating_add(count);
-                thread_observed.store(total.min(MAX_STDERR_OBSERVED_BYTES), Ordering::Relaxed);
-                if total > MAX_STDERR_OBSERVED_BYTES {
-                    thread_truncated.store(true, Ordering::Relaxed);
-                }
-            }
+            discard_worker_stderr(&mut stderr);
         })
         .map_err(|_| WorkerError::Transport)?;
     Ok(BoundedStderrDrain {
-        observed,
-        truncated,
         thread: Some(thread),
     })
+}
+
+fn discard_worker_stderr(stderr: &mut impl Read) {
+    // Discard continuously in fixed-size storage so even a noisy worker
+    // cannot block on a full pipe. No stderr bytes enter parent diagnostics.
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn map_launch_error(error: WorkerLaunchError) -> WorkerError {
@@ -2389,13 +2378,6 @@ async fn await_controlled<F: Future>(
         }
         output = future => Ok(output),
     }
-}
-
-#[cfg(test)]
-pub(crate) struct StderrStats {
-    pub(crate) observed_bytes: usize,
-    pub(crate) retained_bytes: usize,
-    pub(crate) truncated: bool,
 }
 
 #[cfg(test)]
