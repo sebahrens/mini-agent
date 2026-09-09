@@ -18,6 +18,9 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[cfg(not(windows))]
+const MAX_EDITOR_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(not(windows))]
 struct EditorTemp {
     path: std::path::PathBuf,
     directory: std::path::PathBuf,
@@ -26,6 +29,9 @@ struct EditorTemp {
 #[cfg(not(windows))]
 impl EditorTemp {
     fn create(contents: &[u8]) -> std::io::Result<Self> {
+        if contents.len() as u64 > MAX_EDITOR_BYTES {
+            return Err(editor_draft_too_large());
+        }
         let directory =
             std::env::temp_dir().join(format!("zerostack-editor-{}", uuid::Uuid::new_v4()));
         crate::fs::ensure_private_directory(&directory)?;
@@ -36,6 +42,35 @@ impl EditorTemp {
         }
         Ok(Self { path, directory })
     }
+
+    fn read_contents(&self) -> std::io::Result<String> {
+        let not_regular = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "edited draft must be a regular file, not a symlink or special file",
+            )
+        };
+        if !std::fs::symlink_metadata(&self.path)?.is_file() {
+            return Err(not_regular());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A regular file may be replaced between metadata and open.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = options.open(&self.path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(not_regular());
+        }
+        if metadata.len() > MAX_EDITOR_BYTES {
+            return Err(editor_draft_too_large());
+        }
+        read_editor_text(file)
+    }
 }
 
 #[cfg(not(windows))]
@@ -44,6 +79,27 @@ impl Drop for EditorTemp {
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_dir(&self.directory);
     }
+}
+
+#[cfg(not(windows))]
+fn editor_draft_too_large() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("editor draft exceeds the {MAX_EDITOR_BYTES}-byte limit"),
+    )
+}
+
+/// Bound bytes consumed even when the file grows after its metadata check.
+#[cfg(not(windows))]
+fn read_editor_text(reader: impl std::io::Read) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take(MAX_EDITOR_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_EDITOR_BYTES {
+        return Err(editor_draft_too_large());
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 const MAX_KILL_RING: usize = 30;
@@ -302,17 +358,28 @@ impl InputEditor {
             .arg(&tmp.path)
             .status_guarded();
 
-        if let Ok(content) = std::fs::read_to_string(&tmp.path)
+        let contents = tmp
+            .read_contents()
+            .context("could not read edited draft; original input retained");
+        if let Ok(content) = &contents
             && content != self.buffer.as_str()
         {
             self.load_text(content.trim_end());
         }
-        let exit_status = result.context("could not launch the configured editor")?;
-        anyhow::ensure!(
-            exit_status.success(),
-            "configured editor exited with {exit_status}"
-        );
-        Ok(())
+        let command = result
+            .context("could not launch the configured editor")
+            .and_then(|exit_status| {
+                anyhow::ensure!(
+                    exit_status.success(),
+                    "configured editor exited with {exit_status}"
+                );
+                Ok(())
+            });
+        match (command, contents) {
+            (Err(error), Err(read_error)) => Err(error.context(format!("{read_error:#}"))),
+            (Err(error), _) => Err(error),
+            (Ok(()), contents) => contents.map(|_| ()),
+        }
     }
 
     pub fn handle_paste(&mut self, data: String) {
@@ -862,32 +929,99 @@ mod editor_temp_tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn editor_exit_status_preserves_drafts_and_keeps_edits_on_failure() {
-        for (command, expected, error_code) in [
-            ("true", "original draft  \n", None),
+    fn editor_results_preserve_drafts_and_report_launch_exit_and_read_failures() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("true", "original draft  \n", &[]),
             (
                 "/nonexistent-mini-agent-editor",
                 "original draft  \n",
-                Some("127"),
+                &["127"],
             ),
-            ("sh -c 'exit 7' sh", "original draft  \n", Some("7")),
+            ("sh -c 'exit 7' sh", "original draft  \n", &["7"]),
             (
                 "sh -c 'printf edited > \"$1\"; exit 9' sh",
                 "edited",
-                Some("9"),
+                &["9"],
             ),
-            ("sh -c 'printf edited > \"$1\"' sh", "edited", None),
-        ] {
+            ("sh -c 'printf edited > \"$1\"' sh", "edited", &[]),
+            (
+                "sh -c 'printf replaced > \"$1.new\"; mv \"$1.new\" \"$1\"' sh",
+                "replaced",
+                &[],
+            ),
+            (
+                "sh -c 'rm \"$1\"' sh",
+                "original draft  \n",
+                &["could not read edited draft", "original input retained"],
+            ),
+            (
+                "sh -c 'rm \"$1\"; exit 7' sh",
+                "original draft  \n",
+                &["could not read edited draft", "exited with", "7"],
+            ),
+            (
+                "sh -c 'printf \"\\377\" > \"$1\"' sh",
+                "original draft  \n",
+                &["could not read edited draft", "utf-8"],
+            ),
+            (
+                "sh -c 'rm \"$1\"; mkfifo \"$1\"' sh",
+                "original draft  \n",
+                &["regular file"],
+            ),
+            (
+                "sh -c 'rm \"$1\"; ln -s /etc/hosts \"$1\"' sh",
+                "original draft  \n",
+                &["regular file"],
+            ),
+            (
+                "sh -c 'dd if=/dev/zero of=\"$1\" bs=1 count=0 seek=4194305 2>/dev/null' sh",
+                "original draft  \n",
+                &["4194304-byte limit"],
+            ),
+        ];
+        for &(command, expected, errors) in cases {
             let mut input = super::InputEditor::new();
             input.load_text("original draft  \n");
             input.set_editor(command.to_string());
             let result = input.edit_buffer();
             assert_eq!(input.buffer.as_str(), expected, "{command}");
-            match error_code {
-                Some(code) => assert!(result.unwrap_err().to_string().contains(code), "{command}"),
-                None => result.unwrap(),
+            if errors.is_empty() {
+                result.unwrap();
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                for expected in errors {
+                    assert!(error.contains(expected), "{command}: {error}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn editor_byte_limits_bound_reads_and_reject_oversized_input() {
+        use super::{MAX_EDITOR_BYTES, read_editor_text};
+        use std::io::Cursor;
+
+        for length in [0, MAX_EDITOR_BYTES, MAX_EDITOR_BYTES + 4096] {
+            let mut reader = Cursor::new(vec![b'x'; length as usize]);
+            let result = read_editor_text(&mut reader);
+            if length <= MAX_EDITOR_BYTES {
+                assert_eq!(result.unwrap().len() as u64, length);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+            // The content reader must cap consumption independently of the
+            // file's earlier metadata: files can grow after that check.
+            assert_eq!(reader.position(), length.min(MAX_EDITOR_BYTES + 1));
+        }
+
+        let mut input = super::InputEditor::new();
+        let original = "x".repeat(MAX_EDITOR_BYTES as usize + 1);
+        input.load_text(&original);
+        input.set_editor("sh -c 'printf changed > \"$1\"' sh".into());
+        let error = input.edit_buffer().unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+        assert_eq!(input.buffer.as_str(), original);
     }
 
     #[test]

@@ -2722,6 +2722,8 @@ impl<'a> App<'a> {
 
     fn rebind_event_thread(&mut self) {
         self.pause_event_thread();
+        // Terminal resumption clears the screen even when the draft is unchanged.
+        self.renderer.invalidate();
         self.running = Arc::new(AtomicBool::new(true));
         // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(
