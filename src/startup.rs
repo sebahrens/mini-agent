@@ -1331,6 +1331,8 @@ impl Startup {
     }
 
     /// Phase 4: mode dispatch — print, loop, or interactive.
+    /// Box the mode futures so their large states are not embedded in every
+    /// startup frame, including early exits such as `--print-config`.
     pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_workspace(self.workspace.root());
@@ -1346,7 +1348,7 @@ impl Startup {
             if let Some(task) = self.session_start_task.take() {
                 let _ = task.await;
             }
-            self.dispatch_print().await
+            Box::pin(self.dispatch_print()).await
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
@@ -1354,10 +1356,10 @@ impl Startup {
                 if let Some(task) = self.session_start_task.take() {
                     let _ = task.await;
                 }
-                return self.dispatch_loop().await;
+                return Box::pin(self.dispatch_loop()).await;
             }
 
-            self.dispatch_interactive().await
+            Box::pin(self.dispatch_interactive()).await
         }
     }
 

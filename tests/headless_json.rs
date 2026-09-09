@@ -20,7 +20,11 @@ impl TempRoot {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mini-agent"));
+        self.command_for(env!("CARGO_BIN_EXE_mini-agent"))
+    }
+
+    fn command_for(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(program);
         command
             .current_dir(&self.0)
             .stdin(std::process::Stdio::null());
@@ -297,6 +301,86 @@ fn loop_resumes_existing_plan_without_reading_piped_stdin() {
     assert!(stderr.contains("max iterations (0) reached"), "{stderr}");
     assert!(!stderr.contains("Restart from existing plan?"), "{stderr}");
     assert_eq!(std::fs::read_to_string(plan).unwrap(), contents);
+}
+
+#[test]
+fn startup_commands_run_with_the_windows_default_stack_budget() {
+    for (args, expected) in [
+        (&["--print-config"][..], "config"),
+        (
+            &[
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-session",
+                "-p",
+                "!echo stack-budget",
+            ][..],
+            "stack-budget",
+        ),
+        (
+            &[
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-session",
+                "--no-tools",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "-p",
+                "hello",
+            ][..],
+            "finished",
+        ),
+    ] {
+        let root = TempRoot::new();
+        let server = (expected == "finished").then(|| root.local_provider("completed"));
+        #[cfg(not(unix))]
+        let mut command = root.command();
+        #[cfg(unix)]
+        let mut command = {
+            // Apply the limit after exec, from a fresh process main thread.
+            // macOS rejects lowering it in a pre_exec callback forked from
+            // libtest's secondary thread. Positional arguments keep paths literal.
+            let mut command = root.command_for("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "ulimit -s 1024 || exit 125\nexec \"$@\"",
+                    "stack-probe",
+                ])
+                .arg(env!("CARGO_BIN_EXE_mini-agent"));
+            command
+        };
+        command
+            .env("OPENROUTER_API_KEY", "headless-stack-test-key")
+            .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args(args);
+        let output = bounded_output(command);
+        if let Some(server) = server {
+            assert!(
+                server.join().unwrap().is_ok(),
+                "local provider: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+        if args == ["--print-config"] {
+            assert!(
+                stdout.contains(root.0.to_str().unwrap()),
+                "missing isolated root: {stdout}"
+            );
+        }
+        assert!(!root.0.join(".zerostack").exists());
+    }
 }
 
 #[test]

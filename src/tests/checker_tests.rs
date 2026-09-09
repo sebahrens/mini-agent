@@ -285,11 +285,96 @@ fn hook_approval_never_overrides_a_deny_rule() {
 
 #[cfg(feature = "hooks")]
 #[test]
-fn allow_once_suppresses_the_prompt_for_the_next_call() {
-    let mut checker = make_checker(SecurityMode::Restrictive);
-    checker.allow_once("bash".to_string());
-    let result = checker.check("bash", "ls -la");
-    assert!(matches!(result, CheckResult::Allowed));
+fn hook_allow_preserves_effective_policy_across_check_surfaces() {
+    let ordinary = workspace_path("hook-policy.txt");
+    let plan = workspace_path("PLAN-hook-policy.md");
+    for mode in [
+        SecurityMode::Restrictive,
+        SecurityMode::ReadOnly,
+        SecurityMode::PlanWrite,
+    ] {
+        for (surface, tool, input, permitted_in_plan) in [
+            ("tool", "shell", "echo harmless", false),
+            ("path", "write", ordinary.as_str(), false),
+            ("bound", "js/write_file", ordinary.as_str(), false),
+            ("path", "write", plan.as_str(), true),
+            ("bound", "js/write_file", plan.as_str(), true),
+            ("path", "read", ordinary.as_str(), true),
+            ("bound", "js/read_file", ordinary.as_str(), true),
+        ] {
+            for granted in [false, true] {
+                let mut checker = make_checker(mode);
+                if granted {
+                    checker.allow_once(tool.into());
+                }
+                let actual = match surface {
+                    "tool" => checker.check(tool, input),
+                    "path" => checker.check_path(tool, input),
+                    "bound" => checker.check_bound_path(tool, input),
+                    _ => unreachable!(),
+                };
+                let denied = match mode {
+                    SecurityMode::ReadOnly => !matches!(tool, "read" | "js/read_file"),
+                    SecurityMode::PlanWrite => !permitted_in_plan,
+                    _ => false,
+                };
+                if denied {
+                    assert!(
+                        matches!(actual, CheckResult::Denied(_)),
+                        "{mode:?} {surface} {tool} granted={granted}: {actual:?}"
+                    );
+                } else if mode == SecurityMode::Restrictive && !granted {
+                    assert_eq!(actual, CheckResult::Ask, "{surface} {tool}");
+                } else {
+                    assert_eq!(
+                        actual,
+                        CheckResult::Allowed,
+                        "{mode:?} {surface} {tool} granted={granted}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn hook_allow_cannot_bypass_doom_loop_denial() {
+    let path = workspace_path("hook-repeat.txt");
+    for surface in ["tool", "path", "bound"] {
+        let config = PermissionConfig {
+            doom_loop: Some(Action::Deny),
+            ..Default::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &config.into(),
+            SecurityMode::Restrictive,
+            Some(test_workspace()),
+            default_modes(),
+        )
+        .unwrap();
+        for repetition in 1..=3 {
+            checker.allow_once("read".into());
+            let result = match surface {
+                "tool" => checker.check("read", &path),
+                "path" => checker.check_path("read", &path),
+                "bound" => checker.check_bound_path("read", &path),
+                _ => unreachable!(),
+            };
+            if repetition < 3 {
+                assert_eq!(
+                    result,
+                    CheckResult::Allowed,
+                    "{surface} repetition {repetition}"
+                );
+            } else {
+                assert!(
+                    matches!(result, CheckResult::Denied(ref reason) if reason.contains("Doom loop")),
+                    "{surface}: {result:?}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(feature = "hooks")]

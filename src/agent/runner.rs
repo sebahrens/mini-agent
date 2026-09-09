@@ -3185,7 +3185,9 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     H: Into<Arc<[Message]>>,
 {
-    run_print_with_stream_policy_and_verification(
+    // This large streaming state must not be copied into the enclosing
+    // provider and cancellation futures on small native main-thread stacks.
+    Box::pin(run_print_with_stream_policy_and_verification(
         agent,
         prompt,
         pure_stdout,
@@ -3197,7 +3199,7 @@ where
         completion_verification,
         #[cfg(feature = "hooks")]
         loop_info,
-    )
+    ))
     .await
 }
 

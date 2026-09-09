@@ -1162,7 +1162,9 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
-        crate::print::run_headless_turn(async {
+        // Keep the turn on the heap before layering cancellation and task-local
+        // scopes around it, so those scopes do not copy its state onto the stack.
+        crate::print::run_headless_turn(Box::pin(async {
             let history = history.into();
             #[cfg(feature = "skills")]
             let _turn_guard = if self.skills.is_some() {
@@ -1280,7 +1282,7 @@ impl AnyAgent {
                     .await
                 }
             }
-        })
+        }))
         .await
     }
 

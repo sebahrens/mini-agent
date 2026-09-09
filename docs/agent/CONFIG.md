@@ -702,8 +702,10 @@ may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it
 under `--yolo`. `ask` forces an interactive confirmation regardless of
 permission mode, and escalates to deny in non-interactive contexts (`-p`,
 `--loop`) where no confirmation is possible. `allow` suppresses the
-interactive prompt for that one call only — it can never override a deny
-from a rule, security mode, managed policy, or another hook. `PreToolUse` may
+interactive prompt for that one call only, after the permission and
+repeated-call checks. It can suppress an `ask`, but never override a deny from
+a rule, security mode, configured doom-loop safeguard, managed policy, or
+another hook. `PreToolUse` may
 also set `"updatedInput"` to rewrite the tool's arguments before it runs.
 When a hook requests approval, the confirmation shows those effective
 arguments. Approval applies to that invocation only; any unused grant is

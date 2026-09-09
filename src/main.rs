@@ -63,7 +63,11 @@ fn main() -> anyhow::Result<ExitCode> {
     }
 
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
-    runtime.block_on(run()).map(|()| ExitCode::SUCCESS)
+    // Runtime adapters otherwise copy the entire startup future into their
+    // own stack frames before polling it.
+    runtime
+        .block_on(Box::pin(run()))
+        .map(|()| ExitCode::SUCCESS)
 }
 
 fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {

@@ -573,8 +573,8 @@ impl PermissionChecker {
         }
     }
 
-    /// Consumes a pending one-shot hook approval for `tool`. Called after
-    /// the deny-rule check in `check`/`check_path` so it cannot bypass a deny.
+    /// Consumes a pending one-shot hook approval for `tool`. Callers apply it
+    /// only to an Ask result after effective policy and doom-loop checks.
     #[cfg(feature = "hooks")]
     fn take_pending_one_shot(&mut self, tool: &str) -> Option<CheckResult> {
         let token = HOOK_PERMISSION_TOKEN
@@ -653,9 +653,7 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
-        if let Some(result) = self.take_pending_one_shot(tool) {
-            return result;
-        }
+        let hook_approved = self.take_pending_one_shot(tool).is_some();
         if tool == "todo_write" {
             return CheckResult::Allowed;
         }
@@ -692,7 +690,13 @@ impl PermissionChecker {
         }
 
         let action = self.resolve_check_action(tool, &matched);
-        self.doom_loop_check(tool, identity, action)
+        let result = self.doom_loop_check(tool, identity, action);
+        // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
+        #[cfg(feature = "hooks")]
+        if hook_approved && result == CheckResult::Ask {
+            return CheckResult::Allowed;
+        }
+        result
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
@@ -778,9 +782,7 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by external directory deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
-        if let Some(result) = self.take_pending_one_shot(tool) {
-            return result;
-        }
+        let hook_approved = self.take_pending_one_shot(tool).is_some();
         if inputs
             .iter()
             .any(|input| self.is_session_allowed(tool, input))
@@ -801,7 +803,13 @@ impl PermissionChecker {
 
         let action =
             self.resolve_path_action(tool, &matched, abs_path, external, external_action, false);
-        self.doom_loop_check(tool, expanded, action)
+        let result = self.doom_loop_check(tool, expanded, action);
+        // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
+        #[cfg(feature = "hooks")]
+        if hook_approved && result == CheckResult::Ask {
+            return CheckResult::Allowed;
+        }
+        result
     }
 
     fn plan_write_path_decision(&self, path: &str) -> PlanWritePathDecision {
@@ -861,9 +869,7 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
-        if let Some(result) = self.take_pending_one_shot(tool) {
-            return result;
-        }
+        let hook_approved = self.take_pending_one_shot(tool).is_some();
         if self.is_session_allowed(tool, &logical) || self.is_session_allowed(tool, &relative) {
             return CheckResult::Allowed;
         }
@@ -880,7 +886,13 @@ impl PermissionChecker {
         }
 
         let action = self.resolve_path_action(tool, &matched, &logical, false, None, true);
-        self.doom_loop_check(tool, &logical, action)
+        let result = self.doom_loop_check(tool, &logical, action);
+        // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
+        #[cfg(feature = "hooks")]
+        if hook_approved && result == CheckResult::Ask {
+            return CheckResult::Allowed;
+        }
+        result
     }
 
     /// Check whether any deny rule matches the given inputs. Deny rules are

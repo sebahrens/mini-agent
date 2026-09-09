@@ -441,26 +441,37 @@ async fn ask_verdict_escalates_to_deny_when_no_ask_tx_is_available() {
 }
 
 #[tokio::test]
-async fn allow_verdict_suppresses_the_prompt_for_the_inner_tools_own_check() {
-    // Restrictive would otherwise Ask (and fail, with no ask_tx) for bash;
-    // allow must suppress that specifically for the inner tool's own
-    // check_perm call driven by this dispatch. (One-shot *consumption* of
-    // the underlying PermissionChecker entry is covered directly by
-    // checker_tests.rs; a hook that matches every PreToolUse call
-    // legitimately re-arms it on every subsequent call, so that isn't
-    // observable through the decorator.)
-    let dispatcher = dispatcher_with(
-        "PreToolUse",
-        vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
-    );
-    let perm = permission_restrictive();
-    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(PermCheckingTool {
-        permission: perm.clone(),
-    })];
-    let wrapped = wrap_all(tools, dispatcher, perm, None);
-
-    let result = wrapped[0].call("ls -la".to_string()).await;
-    assert_eq!(result.unwrap(), "ls -la");
+async fn allow_verdict_suppresses_prompts_but_preserves_mode_denials() {
+    for mode in [
+        SecurityMode::Restrictive,
+        SecurityMode::ReadOnly,
+        SecurityMode::PlanWrite,
+    ] {
+        let dispatcher = dispatcher_with(
+            "PreToolUse",
+            vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
+        );
+        let perm = permission();
+        perm.as_ref().unwrap().lock().unwrap().set_mode(mode);
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(JsonCommandPermCheckingTool {
+            permission: perm.clone(),
+        })];
+        let wrapped = wrap_all(tools, dispatcher, perm, None);
+        let result = wrapped[0]
+            .call(r#"{"command":"echo harmless"}"#.into())
+            .await;
+        if mode == SecurityMode::Restrictive {
+            assert_eq!(result.unwrap(), r#"{"command":"echo harmless"}"#);
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Permission denied"),
+                "{mode:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
