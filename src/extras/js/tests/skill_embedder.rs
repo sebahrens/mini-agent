@@ -1,13 +1,5 @@
-//! Comprehensive test suite for the embedding system.
-//!
-//! Tests verify:
-//! - Batching and document handling
-//! - Deterministic embeddings and document rendering
-//! - Finite normalization properties
-//! - Cache behavior (hits, evictions, bounds)
-//! - Error handling and edge cases
-//!
-//! Admission, cancellation, backend-failure, and cache-policy tests live with `Embedder`.
+//! Public embedding and document contracts. Admission, backend failures, and
+//! cache-policy tests live with `Embedder`; session tests count shared initialization.
 
 #[cfg(test)]
 mod tests {
@@ -16,240 +8,112 @@ mod tests {
     };
 
     #[test]
-    fn test_deterministic_backend_finite_output() {
+    fn deterministic_vectors_are_finite_normalized_and_independent_of_batch_position() {
         let backend = DeterministicBackend::new();
-        let docs = vec!["test".to_string()];
-        let embeddings = backend.embed_documents(&docs).unwrap();
-        for v in embeddings[0].iter() {
-            assert!(v.is_finite(), "embedding contains non-finite value: {}", v);
+        let embedder = Embedder::new().unwrap();
+        let documents = ["hello world", "goodbye world", "λ雪"].map(str::to_string);
+        let vectors = backend.embed_documents(&documents).unwrap();
+        assert_eq!(vectors.len(), documents.len());
+        assert_eq!(backend.embed_documents(&documents).unwrap(), vectors);
+        assert_eq!(embedder.embed_documents(&documents).unwrap(), vectors);
+        for (document, vector) in documents.iter().zip(&vectors) {
+            assert_eq!(vector.len(), 384);
+            assert!(vector.iter().all(|value| value.is_finite()));
+            let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
+            assert_eq!(backend.embed_query(document).unwrap(), *vector);
+            assert_eq!(
+                backend
+                    .embed_documents(std::slice::from_ref(document))
+                    .unwrap(),
+                vec![vector.clone()]
+            );
+        }
+        assert_ne!(vectors[0], vectors[1]);
+        assert_ne!(vectors[1], vectors[2]);
+    }
+
+    #[tokio::test]
+    async fn empty_batches_succeed_but_empty_documents_and_queries_are_rejected() {
+        let backend = DeterministicBackend::new();
+        let embedder = Embedder::new().unwrap();
+        assert!(backend.embed_documents(&[]).unwrap().is_empty());
+        assert!(embedder.embed_documents(&[]).unwrap().is_empty());
+        for blank in ["", " \t\n"] {
+            assert_eq!(
+                backend.embed_documents(&[blank.into()]),
+                Err(EmbeddingError::EmptyDocument)
+            );
+            assert_eq!(
+                embedder.embed_documents(&[blank.into()]),
+                Err(EmbeddingError::EmptyDocument)
+            );
+            assert_eq!(backend.embed_query(blank), Err(EmbeddingError::EmptyQuery));
+            assert_eq!(
+                embedder.embed_query_cached(blank).await,
+                Err(EmbeddingError::EmptyQuery)
+            );
         }
     }
 
     #[test]
-    fn test_deterministic_backend_unit_norm() {
+    fn default_embedder_preserves_the_deterministic_backend_identity() {
         let backend = DeterministicBackend::new();
-        let docs = vec!["hello world".to_string()];
-        let embeddings = backend.embed_documents(&docs).unwrap();
-        let vec = &embeddings[0];
-
-        let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-5,
-            "vector not unit-normalized: norm={}, expected ~1.0",
-            norm
-        );
-    }
-
-    #[test]
-    fn test_deterministic_query_unit_norm() {
-        let backend = DeterministicBackend::new();
-        let query = backend.embed_query("test query").unwrap();
-
-        let norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-5,
-            "query vector not unit-normalized: norm={}",
-            norm
-        );
-    }
-
-    #[test]
-    fn test_deterministic_backend_consistent_hashing() {
-        let backend = DeterministicBackend::new();
-        let doc = "same text";
-
-        let emb1 = backend.embed_documents(&[doc.to_string()]).unwrap()[0].clone();
-        let emb2 = backend.embed_documents(&[doc.to_string()]).unwrap()[0].clone();
-
-        assert_eq!(
-            emb1, emb2,
-            "deterministic backend produced different embeddings"
-        );
-    }
-
-    #[test]
-    fn deterministic_embedding_depends_only_on_text_not_batch_position() {
-        let backend = DeterministicBackend::new();
-        let text = "same text".to_string();
-        let batch = backend
-            .embed_documents(&["other".to_string(), text.clone()])
-            .unwrap();
-        let alone = backend
-            .embed_documents(std::slice::from_ref(&text))
-            .unwrap();
-        let query = backend.embed_query(&text).unwrap();
-
-        assert_eq!(batch[1], alone[0]);
-        assert_eq!(alone[0], query);
-    }
-
-    #[test]
-    fn test_deterministic_backend_different_text_different_embedding() {
-        let backend = DeterministicBackend::new();
-        let doc1 = "hello";
-        let doc2 = "world";
-
-        let emb1 = backend.embed_documents(&[doc1.to_string()]).unwrap()[0].clone();
-        let emb2 = backend.embed_documents(&[doc2.to_string()]).unwrap()[0].clone();
-
-        assert_ne!(
-            emb1, emb2,
-            "different text should produce different embeddings"
-        );
-    }
-
-    #[test]
-    fn test_deterministic_backend_correct_dimensions() {
-        let backend = DeterministicBackend::new();
-        let docs = vec!["test".to_string()];
-        let embeddings = backend.embed_documents(&docs).unwrap();
-
-        assert_eq!(
-            embeddings[0].len(),
-            384,
-            "embedding dimensions should be 384 for BAAI/bge-small-en-v1.5"
-        );
-    }
-
-    #[test]
-    fn test_empty_document_rejected() {
-        let backend = DeterministicBackend::new();
-        assert_eq!(
-            backend.embed_documents(&["  ".to_string()]),
-            Err(EmbeddingError::EmptyDocument)
-        );
-    }
-
-    #[test]
-    fn test_empty_query_rejected() {
-        let backend = DeterministicBackend::new();
-        assert_eq!(backend.embed_query("   "), Err(EmbeddingError::EmptyQuery));
-    }
-
-    #[test]
-    fn test_empty_batch_accepted() {
-        let backend = DeterministicBackend::new();
-        let embeddings = backend.embed_documents(&[]).unwrap();
-        assert_eq!(embeddings.len(), 0);
-    }
-
-    #[test]
-    fn test_backend_metadata() {
-        let backend = DeterministicBackend::new();
-        // The offline hash backend must advertise its own identity. Stored vectors
-        // are keyed by (model_id, model_revision), so claiming to be BGE here would
-        // let hash vectors be treated as interchangeable with real BGE vectors.
         assert_eq!(backend.model_id(), "deterministic-hash");
         assert_eq!(backend.model_revision(), "deterministic-v2");
         assert_eq!(backend.dimensions(), 384);
         assert!(backend.normalized());
-    }
-
-    #[tokio::test]
-    async fn test_embedder_single_initialization() {
-        let embedder = Embedder::new().unwrap();
-        let meta1 = embedder.model_metadata();
-        let meta2 = embedder.model_metadata();
-
-        // Metadata should be identical and shared
-        assert_eq!(meta1.model_id, meta2.model_id);
-        assert_eq!(meta1.model_revision, meta2.model_revision);
-        assert_eq!(meta1.dimensions, meta2.dimensions);
+        let embedder = Embedder::default();
+        let metadata = embedder.model_metadata();
+        assert_eq!(metadata.model_id, backend.model_id());
+        assert_eq!(metadata.model_revision, backend.model_revision());
+        assert_eq!(metadata.dimensions, backend.dimensions());
+        assert_eq!(metadata.normalized, backend.normalized());
     }
 
     #[test]
-    fn test_skill_document_renders_correctly() {
-        let doc = SkillDocument::new("Parse JSON with error handling".to_string())
-            .with_export(
-                "parseJSON".to_string(),
-                "(input: string): object | null".to_string(),
-            )
-            .with_tags(vec![
-                "json".to_string(),
-                "parsing".to_string(),
-                "utility".to_string(),
-            ])
-            .with_identifiers(vec!["json_parser_v2".to_string(), "parse_safe".to_string()]);
-
-        let rendered = doc.render();
-
-        // Verify all components are present
-        assert!(rendered.contains("Parse JSON with error handling"));
-        assert!(rendered.contains("Exports:"));
-        assert!(rendered.contains("parseJSON"));
-        assert!(rendered.contains("(input: string): object | null"));
-        assert!(rendered.contains("Tags:"));
-        assert!(rendered.contains("json"));
-        assert!(rendered.contains("parsing"));
-        assert!(rendered.contains("utility"));
-        assert!(rendered.contains("Identifiers:"));
-    }
-
-    #[test]
-    fn test_skill_document_identifiers_sorted_and_deduped() {
-        let doc = SkillDocument::new("Test".to_string()).with_identifiers(vec![
-            "zebra".to_string(),
-            "apple".to_string(),
-            "apple".to_string(),
-            "monkey".to_string(),
-        ]);
-
-        let rendered = doc.render();
-        // Should be sorted: apple, monkey, zebra (and duplicates removed)
-        assert!(rendered.contains("Identifiers: apple, monkey, zebra"));
-    }
-
-    #[test]
-    fn test_skill_document_identifiers_bounded_to_10() {
-        let ids: Vec<String> = (0..20).map(|i| format!("id_{:02}", i)).collect();
-        let doc = SkillDocument::new("Test".to_string()).with_identifiers(ids);
-
-        let rendered = doc.render();
-        let comma_count = rendered.matches(',').count();
-        // 10 identifiers = 9 commas
-        assert!(comma_count <= 9, "should have at most 9 commas (10 ids)");
-    }
-
-    #[test]
-    fn test_skill_document_deterministic_rendering() {
-        let doc1 = SkillDocument::new("Description".to_string())
-            .with_exports(vec![("fn1".to_string(), "sig1".to_string())])
-            .with_tags(vec!["tag1".to_string()]);
-
-        let doc2 = SkillDocument::new("Description".to_string())
-            .with_exports(vec![("fn1".to_string(), "sig1".to_string())])
-            .with_tags(vec!["tag1".to_string()]);
-
+    fn skill_document_renders_all_sections_and_omits_empty_ones() {
         assert_eq!(
-            doc1.render(),
-            doc2.render(),
-            "identical documents should render identically"
+            SkillDocument::new("Just a description".into()).render(),
+            "Just a description"
+        );
+        let document = SkillDocument::new("Parse JSON safely".into())
+            .with_exports(vec![
+                ("parseJson".into(), "(text: string): unknown | null".into()),
+                ("validJson".into(), "(text: string): boolean".into()),
+            ])
+            .with_tags(vec!["json".into(), "parsing".into(), "utility".into()])
+            .with_identifiers(vec!["parse_safe".into(), "json_parser_v2".into()]);
+        assert_eq!(
+            document.render(),
+            concat!(
+                "Parse JSON safely\n",
+                "Exports: parseJson(text: string): unknown | null; validJson(text: string): boolean\n",
+                "Tags: json, parsing, utility\n",
+                "Identifiers: json_parser_v2, parse_safe"
+            )
         );
     }
 
-    #[tokio::test]
-    async fn test_embedder_batching() {
-        let embedder = Embedder::new().unwrap();
-        let docs = vec![
-            "first document".to_string(),
-            "second document".to_string(),
-            "third document".to_string(),
-        ];
-
-        let embeddings = embedder.embed_documents(&docs).unwrap();
-        assert_eq!(embeddings.len(), 3);
-
-        for (i, emb) in embeddings.iter().enumerate() {
-            assert_eq!(emb.len(), 384, "embedding {} has wrong dimension", i);
-            let norm: f32 = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-5, "embedding {} not normalized", i);
-        }
+    #[test]
+    fn skill_document_sorts_and_deduplicates_before_limiting_identifiers() {
+        let identifiers = (0..20)
+            .rev()
+            .flat_map(|index| [format!("id_{index:02}"), format!("id_{index:02}")])
+            .collect();
+        let document = SkillDocument::new("Test".into()).with_identifiers(identifiers);
+        assert_eq!(
+            document.render(),
+            concat!(
+                "Test\nIdentifiers: id_00, id_01, id_02, id_03, id_04, ",
+                "id_05, id_06, id_07, id_08, id_09"
+            )
+        );
     }
 
     #[tokio::test]
     async fn test_cache_normalized_queries() {
         let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
 
         let query1 = "hello world";
         let query2 = "hello world  "; // Trailing spaces
@@ -314,18 +178,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embedder_default() {
-        let embedder = Embedder::default();
-        assert_eq!(embedder.model_metadata().dimensions, 384);
-    }
-
-    #[tokio::test]
     async fn test_multiple_embedders_independent_caches() {
         let embedder1 = Embedder::new().unwrap();
         let embedder2 = Embedder::new().unwrap();
-
-        embedder1.clear_cache().await;
-        embedder2.clear_cache().await;
 
         embedder1.embed_query_cached("query").await.unwrap();
         let stats1 = embedder1.cache_stats().await;
@@ -335,35 +190,6 @@ mod tests {
         assert_eq!(
             stats2.entries, 0,
             "different embedders should have separate caches"
-        );
-    }
-
-    #[test]
-    fn test_skill_document_empty_fields() {
-        let doc = SkillDocument::new("Just a description".to_string());
-        let rendered = doc.render();
-
-        // Should only have description, no other sections
-        assert_eq!(rendered, "Just a description");
-        assert!(!rendered.contains("Exports:"));
-        assert!(!rendered.contains("Tags:"));
-        assert!(!rendered.contains("Identifiers:"));
-    }
-
-    #[test]
-    fn test_skill_document_multiple_exports() {
-        let doc = SkillDocument::new("Multi-export skill".to_string()).with_exports(vec![
-            ("fn1".to_string(), "(x: number): number".to_string()),
-            ("fn2".to_string(), "(y: string): string".to_string()),
-        ]);
-
-        let rendered = doc.render();
-        assert!(rendered.contains("Exports:"));
-        assert!(rendered.contains("fn1"));
-        assert!(rendered.contains("fn2"));
-        assert!(
-            rendered.contains(";"),
-            "exports should be separated by semicolons"
         );
     }
 }

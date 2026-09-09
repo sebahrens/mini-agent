@@ -1095,15 +1095,6 @@ impl SkillDocument {
         }
     }
 
-    /// Add an export.
-    ///
-    /// Test-only: production builds documents through [`SkillDocument::with_exports`].
-    #[cfg(test)]
-    pub fn with_export(mut self, name: String, signature: String) -> Self {
-        self.exports.push((name, signature));
-        self
-    }
-
     /// Add multiple exports.
     pub fn with_exports(mut self, exports: Vec<(String, String)>) -> Self {
         self.exports = exports;
@@ -1210,83 +1201,8 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_backend_creates_embeddings() {
-        let backend = DeterministicBackend::new();
-        let docs = vec!["hello world".to_string(), "goodbye world".to_string()];
-        let embeddings = backend.embed_documents(&docs).unwrap();
-        assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0].len(), 384);
-        assert_eq!(embeddings[1].len(), 384);
-    }
-
-    #[test]
     fn deterministic_embedder_disables_semantic_retrieval() {
         assert!(!Embedder::new().unwrap().supports_semantic_retrieval());
-    }
-
-    #[test]
-    fn test_deterministic_backend_normalized() {
-        let backend = DeterministicBackend::new();
-        let docs = vec!["test document".to_string()];
-        let embeddings = backend.embed_documents(&docs).unwrap();
-        let vec = &embeddings[0];
-        let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-5,
-            "vector not normalized: norm={}",
-            norm
-        );
-    }
-
-    #[test]
-    fn test_deterministic_backend_query() {
-        let backend = DeterministicBackend::new();
-        let query = backend.embed_query("what is rust?").unwrap();
-        assert_eq!(query.len(), 384);
-        let norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_deterministic_backend_empty_rejects() {
-        let backend = DeterministicBackend::new();
-        assert_eq!(backend.embed_documents(&[]).unwrap().len(), 0);
-        assert_eq!(
-            backend.embed_documents(&["  ".to_string()]),
-            Err(EmbeddingError::EmptyDocument)
-        );
-        assert_eq!(backend.embed_query("  "), Err(EmbeddingError::EmptyQuery));
-    }
-
-    #[test]
-    fn test_deterministic_backend_consistent() {
-        let backend = DeterministicBackend::new();
-        let doc = "same text".to_string();
-        let emb1 = backend.embed_documents(std::slice::from_ref(&doc)).unwrap()[0].clone();
-        let emb2 = backend.embed_documents(&[doc]).unwrap()[0].clone();
-        assert_eq!(
-            emb1, emb2,
-            "deterministic backend not producing same embedding"
-        );
-    }
-
-    #[test]
-    fn test_model_metadata() {
-        let embedder = Embedder::new().unwrap();
-        let meta = embedder.model_metadata();
-        // The offline backend advertises its own identity, not a real model's.
-        assert_eq!(meta.model_id, "deterministic-hash");
-        assert_eq!(meta.dimensions, 384);
-        assert!(meta.normalized);
-    }
-
-    #[tokio::test]
-    async fn test_embedder_embed_documents() {
-        let embedder = Embedder::new().unwrap();
-        let docs = vec!["hello".to_string(), "world".to_string()];
-        let embeddings = embedder.embed_documents(&docs).unwrap();
-        assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0].len(), 384);
     }
 
     #[tokio::test]
@@ -1504,66 +1420,6 @@ mod tests {
         assert!(
             stats_q2.evictions >= 2,
             "q2 should have been evicted earlier"
-        );
-    }
-
-    #[test]
-    fn test_skill_document_builder() {
-        let doc = SkillDocument::new("Parse JSON safely".to_string())
-            .with_export(
-                "parseJson".to_string(),
-                "(text: string): unknown | null".to_string(),
-            )
-            .with_tags(vec!["json".to_string(), "utility".to_string()])
-            .with_identifiers(vec!["parse_json_v1".to_string()]);
-
-        let rendered = doc.render();
-        assert!(rendered.contains("Parse JSON safely"));
-        assert!(rendered.contains("Exports:"));
-        assert!(rendered.contains("parseJson"));
-        assert!(rendered.contains("Tags:"));
-        assert!(rendered.contains("json"));
-        assert!(rendered.contains("utility"));
-        assert!(rendered.contains("Identifiers:"));
-        assert!(rendered.contains("parse_json_v1"));
-    }
-
-    #[test]
-    fn test_skill_document_sorted_ids() {
-        let doc = SkillDocument::new("Test".to_string()).with_identifiers(vec![
-            "z".to_string(),
-            "a".to_string(),
-            "m".to_string(),
-        ]);
-
-        let rendered = doc.render();
-        // Should be sorted
-        assert!(rendered.contains("Identifiers: a, m, z"));
-    }
-
-    #[test]
-    fn test_skill_document_bounded_ids() {
-        let ids: Vec<String> = (0..20).map(|i| format!("id{}", i)).collect();
-        let doc = SkillDocument::new("Test".to_string()).with_identifiers(ids);
-
-        let rendered = doc.render();
-        let id_count = rendered.matches(',').count() + 1; // count commas + 1
-        assert!(id_count <= 10, "should bound identifiers to 10");
-    }
-
-    #[test]
-    fn test_embedding_error_display() {
-        assert_eq!(
-            format!("{}", EmbeddingError::EmptyDocument),
-            "empty document provided"
-        );
-        assert_eq!(
-            format!("{}", EmbeddingError::EmptyQuery),
-            "empty query provided"
-        );
-        assert_eq!(
-            format!("{}", EmbeddingError::NonFiniteValue),
-            "embedding contains non-finite value"
         );
     }
 }
