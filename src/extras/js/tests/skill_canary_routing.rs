@@ -50,6 +50,10 @@ fn skill_canary_distribution_stays_within_ten_percent() {
 
 #[test]
 fn skill_canary_routing_races_ineligible_and_root_canaries_never_replace_active() {
+    let eligible = (0..100)
+        .map(|turn| request(&format!("turn-{turn}")))
+        .find(|input| route(b"key", input).unwrap().route_kind == RouteKind::Canary)
+        .expect("fixture must select a canary before eligibility is changed");
     for status in [
         LifecycleStatus::Pending,
         LifecycleStatus::Verified,
@@ -59,15 +63,19 @@ fn skill_canary_routing_races_ineligible_and_root_canaries_never_replace_active(
         LifecycleStatus::Retired,
         LifecycleStatus::Rejected,
     ] {
-        let mut input = request("turn");
+        let mut input = eligible.clone();
         input.candidate.as_mut().unwrap().status = status;
-        assert_eq!(route(b"key", &input).unwrap().route_kind, RouteKind::Active);
+        let routed = route(b"key", &input).unwrap();
+        assert_eq!(routed.route_kind, RouteKind::Active, "{status:?}");
+        assert_eq!(routed.candidate_id, None, "{status:?}");
     }
-    let mut root = request("turn");
+    let mut root = eligible;
     let candidate = root.candidate.as_mut().unwrap();
     candidate.candidate_id = "root".into();
     candidate.lineage_root_id = "root".into();
-    assert_eq!(route(b"key", &root).unwrap().route_kind, RouteKind::Active);
+    let routed = route(b"key", &root).unwrap();
+    assert_eq!(routed.route_kind, RouteKind::Active);
+    assert_eq!(routed.candidate_id, None);
 }
 
 #[test]

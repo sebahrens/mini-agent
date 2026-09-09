@@ -2197,49 +2197,130 @@ mod tests {
 
     #[test]
     fn usage_stats_exclude_turns_whose_evidence_was_lost() {
+        use super::super::policy::{TaskOutcomeEvidence, TaskOutcomeSource};
+        use super::super::telemetry::TelemetryDispatcher;
+
         let (root, paths, artifact) = fixture();
         let mut store = SkillStore::open_at(&paths).unwrap();
         store.insert_verified(&artifact).unwrap();
-
-        // One healthy linked task, one healthy baseline, and one turn whose
-        // telemetry the parent knows was lost. The lost turn must count as
-        // neither utility nor baseline.
-        for (evidence_id, turn_id, linked, complete) in [
-            ("healthy-observed", "turn-observed", true, 1),
-            ("healthy-baseline", "turn-baseline", false, 1),
-            ("lost-baseline", "turn-lost", false, 0),
-        ] {
-            store
-                .conn_mut()
-                .execute(
-                    "INSERT INTO skill_task_outcomes (
-                         evidence_id, turn_id, verify_passed, attempt, source_kind,
-                         source_id, production, evidence_complete, created_at
-                     ) VALUES (?, ?, 1, 1, 'oracle', 'shared-oracle', 1, ?, 42)",
-                    rusqlite::params![evidence_id, turn_id, complete],
-                )
+        // The queue accepts these valid events, but SQLite rejects their
+        // transaction later. The caller cannot see that asynchronous failure.
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_selected_evidence BEFORE INSERT ON skill_events
+             WHEN NEW.turn_id IN ('worker-lost', 'late-loss')
+              AND NEW.event_kind = 'selected'
+             BEGIN SELECT RAISE(ABORT, 'injected ingestion failure'); END;
+             CREATE TRIGGER reject_task_evidence BEFORE INSERT ON skill_task_outcomes
+             WHEN NEW.turn_id = 'task-lost' AND NEW.attempt = 2
+             BEGIN SELECT RAISE(ABORT, 'injected task ingestion failure'); END;",
+            )
+            .unwrap();
+        let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();
+        let event = |turn: &str, kind| SkillEvent {
+            invocation_id: Some(stable_invocation_id(turn, "tool", &artifact.id, "run", 0)),
+            skill_id: artifact.id.clone(),
+            turn_id: turn.into(),
+            tool_call_id: Some("tool".into()),
+            kind,
+            export_name: Some("run".into()),
+            outcome: None,
+            latency_us: None,
+            retrieval_score: None,
+            retrieval_rank: None,
+            query_fingerprint: None,
+            index_generation: 0,
+            evidence_complete: true,
+            production: true,
+            argument_shape: None,
+            created_at: 2_000_000_000,
+        };
+        let outcome = |turn: &str, evidence_complete, attempt| {
+            dispatcher
+                .record_task_outcome(TaskOutcomeEvidence {
+                    turn_id: turn.into(),
+                    skill_ids: vec![artifact.id.clone()],
+                    verify_passed: true,
+                    attempt,
+                    source: TaskOutcomeSource::Oracle("shared-oracle".into()),
+                    production: true,
+                    evidence_complete,
+                    created_at: 2_000_000_001,
+                })
                 .unwrap();
-            if linked {
-                store
-                    .conn_mut()
-                    .execute(
-                        "INSERT INTO skill_task_outcome_links (evidence_id, skill_id)
-                         VALUES (?, ?)",
-                        rusqlite::params![evidence_id, artifact.id],
-                    )
-                    .unwrap();
-            }
+        };
+        for turn in ["healthy-observed", "late-loss"] {
+            dispatcher
+                .try_dispatch(EventBatch::new(vec![event(turn, SkillEventKind::Invoked)]).unwrap())
+                .unwrap();
+            outcome(turn, true, 1);
         }
-
+        // A later failed write must also invalidate the already stored pass.
+        dispatcher
+            .try_dispatch(
+                EventBatch::new(vec![event("late-loss", SkillEventKind::Selected)]).unwrap(),
+            )
+            .unwrap();
+        // Both events roll back, so there is no invocation link left to keep
+        // this turn out of the no-library baseline by itself.
+        dispatcher
+            .try_dispatch(
+                EventBatch::new(vec![
+                    event("worker-lost", SkillEventKind::Invoked),
+                    event("worker-lost", SkillEventKind::Selected),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        outcome("worker-lost", true, 1);
+        outcome("worker-lost", true, 1); // replay cannot restore completeness
+        let mut incomplete = event("worker-incomplete", SkillEventKind::Invoked);
+        incomplete.evidence_complete = false;
+        dispatcher
+            .try_dispatch(EventBatch::new(vec![incomplete]).unwrap())
+            .unwrap();
+        outcome("worker-incomplete", true, 1);
+        outcome("parent-lost", true, 1);
+        outcome("parent-lost", false, 1);
+        outcome("parent-lost", true, 1); // a late snapshot cannot heal a lost turn
+        outcome("healthy-baseline", true, 1); // unrelated later turns still qualify
+        outcome("task-lost", true, 1);
+        outcome("task-lost", true, 2); // fails after a pass was stored
+        outcome("task-lost", true, 1); // retry cannot heal the worker-side loss
+        let probe = dispatcher.shutdown_probe_for_test();
+        drop(dispatcher); // flush the FIFO before inspecting durable evidence
+        assert_eq!(probe().1, 3);
+        let mut statement = store
+            .conn()
+            .prepare("SELECT turn_id, evidence_complete FROM skill_task_outcomes ORDER BY turn_id")
+            .unwrap();
+        let completeness = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            completeness,
+            vec![
+                ("healthy-baseline".into(), true),
+                ("healthy-observed".into(), true),
+                ("late-loss".into(), false),
+                ("parent-lost".into(), false),
+                ("task-lost".into(), false),
+                ("worker-incomplete".into(), false),
+                ("worker-lost".into(), false),
+            ]
+        );
         let rows = load_skill_stats(&store).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tasks_with, 1);
-        assert_eq!(
-            rows[0].baseline_tasks, 1,
-            "a turn with lost evidence is not a verified no-skill baseline"
-        );
+        assert_eq!((rows[0].tasks_with, rows[0].passed_with), (1, 1));
+        assert_eq!((rows[0].baseline_tasks, rows[0].baseline_passes), (1, 1));
+        drop(statement);
         drop(store);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

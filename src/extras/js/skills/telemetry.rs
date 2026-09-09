@@ -738,30 +738,83 @@ impl TelemetryDispatcher {
         let join = std::thread::Builder::new()
             .name("skill-telemetry".into())
             .spawn(move || {
+                // Parent snapshots precede asynchronous SQLite writes. Retain
+                // worker-side losses for this session so later attempts and
+                // replays cannot turn missing attribution into a baseline.
+                let mut incomplete_turns = BTreeSet::new();
                 while let Ok(command) = rx.recv() {
                     let TelemetryCommand::Events(batch) = command else {
-                        if let TelemetryCommand::TaskOutcome(outcome) = command
-                            && ingest_retrying_busy(
+                        if let TelemetryCommand::TaskOutcome(mut outcome) = command {
+                            let key = (outcome.turn_id.clone(), outcome.production);
+                            outcome.evidence_complete &= !incomplete_turns.contains(&key);
+                            if !outcome.evidence_complete {
+                                incomplete_turns.insert(key.clone());
+                            }
+                            if ingest_retrying_busy(
                                 #[cfg(test)]
                                 &worker_busy_retries,
                                 &worker_shutdown,
                                 || ingest_task_outcome(&mut store, &outcome),
                             )
                             .is_err()
-                        {
-                            worker_observability_lost.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!(
-                                "skill task-outcome ingestion failed; evidence was excluded"
-                            );
+                            {
+                                incomplete_turns.insert(key);
+                                worker_observability_lost.fetch_add(1, Ordering::Relaxed);
+                                if ingest_retrying_busy(
+                                    #[cfg(test)]
+                                    &worker_busy_retries,
+                                    &worker_shutdown,
+                                    || {
+                                        invalidate_task_outcomes(
+                                            store.connection(),
+                                            &outcome.turn_id,
+                                            outcome.production,
+                                        )
+                                    },
+                                )
+                                .is_err()
+                                {
+                                    tracing::error!(
+                                        "could not invalidate earlier task outcomes after evidence loss"
+                                    );
+                                }
+                                tracing::error!(
+                                    "skill task-outcome ingestion failed; turn evidence is incomplete"
+                                );
+                            }
                         }
                         continue;
                     };
-                    match ingest_retrying_busy(
+                    let ingested = ingest_retrying_busy(
                         #[cfg(test)]
                         &worker_busy_retries,
                         &worker_shutdown,
                         || TelemetryIngestor::new(&mut store).ingest(&batch),
-                    ) {
+                    );
+                    let failed = ingested.is_err();
+                    let affected_turns = batch.events().iter()
+                        .filter(|event| {
+                            failed || !event.evidence_complete
+                                || event.kind == SkillEventKind::ObservabilityLost
+                        })
+                        .map(|event| (event.turn_id.clone(), event.production))
+                        .collect::<BTreeSet<_>>();
+                    for (turn_id, production) in affected_turns {
+                        incomplete_turns.insert((turn_id.clone(), production));
+                        if ingest_retrying_busy(
+                            #[cfg(test)]
+                            &worker_busy_retries,
+                            &worker_shutdown,
+                            || invalidate_task_outcomes(store.connection(), &turn_id, production),
+                        )
+                        .is_err()
+                        {
+                            tracing::error!(
+                                "could not invalidate earlier task outcomes after evidence loss"
+                            );
+                        }
+                    }
+                    match ingested {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
@@ -869,6 +922,9 @@ fn ingest_task_outcome(
     let tx = store
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !outcome.evidence_complete {
+        invalidate_task_outcomes(&tx, &outcome.turn_id, outcome.production)?;
+    }
     let (source_kind, source_id) = task_outcome_source_columns(&outcome.source);
     let mut attributed_skills = Vec::new();
     for skill_id in &outcome.skill_ids {
@@ -927,6 +983,19 @@ fn ingest_task_outcome(
         )?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+fn invalidate_task_outcomes(
+    connection: &rusqlite::Connection,
+    turn_id: &str,
+    production: bool,
+) -> Result<(), TelemetryError> {
+    connection.execute(
+        "UPDATE skill_task_outcomes SET evidence_complete = 0
+         WHERE turn_id = ?1 AND production = ?2 AND evidence_complete = 1",
+        params![turn_id, i64::from(production)],
+    )?;
     Ok(())
 }
 

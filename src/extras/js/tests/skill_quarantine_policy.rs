@@ -73,20 +73,29 @@ fn behavioral_and_feedback_boundaries_fail_closed() {
 #[test]
 fn incomplete_or_stale_evidence_never_transitions() {
     let policy = QuarantinePolicy::conservative("v1");
-    let mut value = evidence(QuarantineReason::IdentityMismatch);
-    value.evidence_complete = false;
-    assert!(matches!(
-        evaluate(&policy, &value),
-        QuarantineDecision::Hold("incomplete_evidence")
-    ));
-    value.evidence_complete = true;
-    // An optimistic conflict with a concurrent lifecycle write still holds:
-    // the decision must be re-applied against the revision it actually saw.
-    value.row_version_current = false;
-    assert!(matches!(
-        evaluate(&policy, &value),
-        QuarantineDecision::Hold("stale_state")
-    ));
+    for reason in [
+        QuarantineReason::IdentityMismatch,
+        QuarantineReason::CapabilityPolicyFault,
+        QuarantineReason::BehavioralFailureRate,
+    ] {
+        let mut value = evidence(reason);
+        assert!(matches!(
+            evaluate(&policy, &value),
+            QuarantineDecision::Quarantine { .. }
+        ));
+        value.evidence_complete = false;
+        assert!(matches!(
+            evaluate(&policy, &value),
+            QuarantineDecision::Hold("incomplete_evidence")
+        ));
+        value.evidence_complete = true;
+        // A concurrent lifecycle write invalidates the observed revision.
+        value.row_version_current = false;
+        assert!(matches!(
+            evaluate(&policy, &value),
+            QuarantineDecision::Hold("stale_state")
+        ));
+    }
 }
 
 #[test]

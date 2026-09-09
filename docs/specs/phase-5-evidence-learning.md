@@ -289,7 +289,11 @@ bounded channel. Phase 6 carries bounded worker-attributed events in the termina
 and validates them against the parent invocation/grant table before parent-side durable ingestion.
 Queue overflow, attribution mismatch, or SQLite failure marks the turn's evidence incomplete; the
 user-visible tool result remains valid, but the turn contributes no promotion or rate-based
-quarantine evidence.
+quarantine evidence. The asynchronous ingestion worker tracks incomplete turns independently
+of the parent's enqueue-time snapshot. A failed event write invalidates earlier task outcomes
+for that turn and marks subsequent outcomes and retries incomplete, without excluding healthy
+turns elsewhere in the session. This also keeps missing invocation links from being interpreted
+as a verified no-library baseline.
 
 The brokered effect audit is separate from skill evidence. If an approved effect may have happened
 but cannot be classified after cancellation, deadline, or transport failure, the audit records

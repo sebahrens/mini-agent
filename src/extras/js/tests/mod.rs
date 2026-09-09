@@ -15,7 +15,6 @@ mod propose_skill_host;
 #[cfg(feature = "skills")]
 mod self_learning_end_to_end;
 #[cfg(feature = "skills")]
-mod self_learning_failure_matrix;
 #[cfg(feature = "skills")]
 mod skill_admission_gate;
 #[cfg(feature = "skills")]
