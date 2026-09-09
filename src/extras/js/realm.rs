@@ -496,14 +496,14 @@ pub(crate) enum RealmError {
     WrapperInstallation,
 }
 
-/// Metadata proving which immutable artifact was installed into the model context.
+/// Owns one artifact's Rust-held realm resources from construction through request teardown.
 #[derive(Debug)]
 pub(crate) struct LoadedArtifact {
     #[cfg(test)]
     artifact_id: String,
     #[cfg(test)]
     exports: Vec<String>,
-    dispatcher_resources: Vec<Arc<Mutex<Option<DispatcherResources>>>>,
+    dispatcher_resources: Vec<DispatcherResourceOwner>,
     settlements: Option<Arc<ModelSettlementRegistry>>,
 }
 
@@ -872,6 +872,19 @@ fn load_artifact_internal(
         .as_ref()
         .map(|_| Arc::new(ModelSettlementRegistry::default()));
 
+    let mut loaded = LoadedArtifact {
+        #[cfg(test)]
+        artifact_id: artifact.id.clone(),
+        #[cfg(test)]
+        exports: artifact
+            .exports
+            .iter()
+            .map(|export| export.name.clone())
+            .collect(),
+        dispatcher_resources: Vec::new(),
+        settlements: settlements.clone(),
+    };
+
     let private_context = Context::full(runtime).map_err(|_| RealmError::Initialization)?;
     let private_skill_library = if artifact_uses_ajv(artifact) {
         Some(private_skill_library_bytecode().ok_or(RealmError::PrivateLibraryCompilation)?)
@@ -1035,30 +1048,20 @@ fn load_artifact_internal(
         return Err(RealmError::PendingInitializationJobs);
     }
 
-    let (wrappers, dispatcher_resources) = build_model_wrappers(
+    let wrappers = build_model_wrappers(
         model_context,
         artifact,
         bridges,
         capabilities,
-        settlements.clone(),
+        settlements,
         bound_exports,
+        &mut loaded.dispatcher_resources,
     )?;
     if runtime.is_job_pending() {
         return Err(RealmError::PendingInitializationJobs);
     }
     publish_model_wrappers(model_context, wrappers)?;
-    Ok(LoadedArtifact {
-        #[cfg(test)]
-        artifact_id: artifact.id.clone(),
-        #[cfg(test)]
-        exports: artifact
-            .exports
-            .iter()
-            .map(|export| export.name.clone())
-            .collect(),
-        dispatcher_resources,
-        settlements,
-    })
+    Ok(loaded)
 }
 
 fn validate_export_names(artifact: &SkillArtifact) -> Result<(), RealmError> {
@@ -1108,7 +1111,8 @@ fn build_model_wrappers(
     capabilities: Option<Arc<InvocationCapabilityRuntime>>,
     settlements: Option<Arc<ModelSettlementRegistry>>,
     bound_exports: Option<Arc<HashMap<String, BoundExportInvocation>>>,
-) -> Result<(Vec<InstalledWrapper>, Vec<DispatcherResourceOwner>), RealmError> {
+    dispatcher_resources: &mut Vec<DispatcherResourceOwner>,
+) -> Result<Vec<InstalledWrapper>, RealmError> {
     let bootstrap = load_realm_bootstrap_functions(model_context)?;
     model_context
         .with(|ctx| {
@@ -1149,7 +1153,6 @@ fn build_model_wrappers(
                 return Err(rquickjs::Error::Unknown);
             }
 
-            let mut dispatcher_resources = Vec::new();
             let wrappers = artifact
                 .exports
                 .iter()
@@ -1212,7 +1215,7 @@ fn build_model_wrappers(
                     Ok((export.name.clone(), Persistent::save(&ctx, wrapper)))
                 })
                 .collect::<rquickjs::Result<Vec<_>>>()?;
-            Ok((wrappers, dispatcher_resources))
+            Ok(wrappers)
         })
         .map_err(|_| RealmError::WrapperInstallation)
 }

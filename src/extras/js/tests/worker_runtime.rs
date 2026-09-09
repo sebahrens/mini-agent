@@ -29,6 +29,87 @@ const TEST_CREDENTIAL_CANARY: &str = "A07_CREDENTIAL_CANARY_MUST_NOT_LEAK";
 const TEST_CONFIG_CANARY: &str = "A07_CONFIG_CANARY_MUST_NOT_LEAK";
 const TEST_WORKSPACE_CANARY: &str = "A07_WORKSPACE_CANARY_MUST_NOT_LEAK";
 
+#[cfg(feature = "skills")]
+#[test]
+fn worker_supervisor_partial_realm_loading_oom_is_closed_and_recovers() {
+    use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
+    let supervisor = JsWorkerSupervisor::with_launcher_for_test(
+        TestWorkerLauncher::internal_worker_process_with_limits(10_000, 10_000),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Locate the boundary where source allocation succeeds but later wrapper allocations can
+    // fail. Searching the whole budget avoids assuming a platform-specific bootstrap footprint.
+    let (mut low, mut high) = (0, crate::extras::js::types::MEMORY_LIMIT);
+    let mut saw_success = false;
+    let mut saw_resource_failure = false;
+    while low <= high {
+        let count = low + (high - low) / 2;
+        let exports: Vec<_> = (0..crate::extras::js::protocol::MAX_SKILL_EXPORTS_PER_ARTIFACT)
+            .map(|i| SkillExport {
+                name: format!("answer{i}"),
+                signature: "()".into(),
+            })
+            .collect();
+        let mut source = format!("const buffer=new ArrayBuffer({count});");
+        for export in &exports {
+            source.push_str(&format!("function {}() {{ return true; }}", export.name));
+        }
+        let artifact = SkillArtifact::new(
+            source,
+            "partial-publication pressure".into(),
+            vec![],
+            exports,
+            vec!["true".into()],
+            CapabilityManifest::pure(),
+        )
+        .unwrap();
+        let request = VerifyArtifact {
+            artifact,
+            cases: vec![VerificationCase {
+                case_id: "load".into(),
+                script: "true".into(),
+                kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
+            }],
+        };
+        let result = supervisor
+            .verify_blocking(request)
+            .unwrap_or_else(|error| panic!("heap allocation {count}: {error:?}"));
+        if result.passed {
+            saw_success = true;
+            low = count + 1;
+        } else {
+            saw_resource_failure = true;
+            let diagnostic = result.cases[0]
+                .diagnostic
+                .as_ref()
+                .expect("closed resource diagnostic");
+            assert_eq!(
+                diagnostic.class,
+                DiagnosticClass::ResourceLimit,
+                "heap allocation {count}"
+            );
+            assert_eq!(runtime.block_on(supervisor.generation_for_test()), None);
+            high = count - 1;
+        }
+    }
+    assert!(
+        saw_success && saw_resource_failure,
+        "search must straddle the heap boundary"
+    );
+    let next = runtime
+        .block_on(supervisor.execute(
+            RunStep::new("42".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        ))
+        .unwrap();
+    assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+    runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_production_supervisor_rejects_nonproduction_test_image() {

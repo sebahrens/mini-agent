@@ -104,6 +104,9 @@ earlier reports that could have accepted a candidate continuing after caught OOM
 The artifact owner also releases pending Rust-held promise callbacks during teardown;
 uncatchable interrupts may skip the wrapper's JavaScript cleanup, and those callbacks
 must not keep an opaque reference cycle alive when QuickJS frees the runtime.
+This cleanup owner is established before wrapper construction and publication, so
+allocation failure after publishing only some exports also releases every Rust-held
+handle before the failed request's runtime is dropped.
 
 The parent lazily keeps at most one interactive worker process live at a time. It launches the
 current executable in an internal mode before Clap, Tokio, configuration, path discovery, logging,
