@@ -119,8 +119,11 @@ a task is reported on stderr with the reason (no matching commit, unresolvable b
 green at base, oracle not green at the fix, or no bounded text delta).
 
 Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim and binary
-blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes,
-renames are recorded as a delete plus an add (`--no-renames`), deletions become `deleted_files`, and
+blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes:
+Git reports their size before content is captured, and the subsequent read independently enforces
+the same limit and a 30-second deadline. A failed or oversized required blob skips the whole file;
+truncated prefixes are never used as oracle text. Exact-limit and empty blobs are accepted.
+Renames are recorded as a delete plus an add (`--no-renames`), deletions become `deleted_files`, and
 any path with a dot-prefixed component (`.github/workflows/...` included) is skipped. Validation
 runs each oracle with `/bin/sh -c` under the same curated environment and gym-owned AppPaths as
 training, never a login shell and never the operator's environment.
@@ -166,7 +169,8 @@ For each task and each arm the runner:
 
 Agent, library-install, and command-oracle output in both training and task mining is drained
 concurrently by [process_capture.py](../../scripts/gym/process_capture.py), retaining only the last
-2,000 bytes of each stream. Git data queries retain their complete output. Timeout diagnostics use
+2,000 bytes of each stream. Git blobs use its capped complete-stdout mode; other Git data queries
+retain their complete output. Timeout diagnostics use
 those same tails. The exit deadline still applies if a process closes its output pipes early.
 Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
 groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.

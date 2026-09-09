@@ -596,6 +596,91 @@ class GymMinerTests(unittest.TestCase):
                 else:
                     self.assertIn("oracle timed out after 1s", diagnostic.getvalue())
 
+    def test_miner_blob_limits_bound_memory_and_preserve_complete_text(self) -> None:
+        limit = MINE.MAX_BLOB_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory))
+            before_files = {
+                "exact.txt": b"a" * limit,
+                "new_too_large.txt": b"small",
+                "old_too_large.txt": b"b" * (limit + 1),
+                "large_deleted.txt": b"d" * (4 * 1024 * 1024),
+                "large_modified.txt": b"e" * (4 * 1024 * 1024),
+                "at_limit_deleted.txt": b"g" * limit,
+                "empty_old.txt": b"",
+                "line\nname.txt": b"old",
+            }
+            after_files = {
+                "exact.txt": b"z" * limit,
+                "new_too_large.txt": b"x" * (limit + 1),
+                "old_too_large.txt": b"small",
+                "large_modified.txt": b"tiny",
+                "large_added.txt": b"a" * (4 * 1024 * 1024),
+                "at_limit_added.txt": b"+" * limit,
+                "empty_new.txt": b"",
+                "empty_old.txt": b"x",
+                "line\nname.txt": b"new",
+            }
+            for name, data in before_files.items():
+                (repo / name).write_bytes(data)
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "before")
+            parent = git(repo, "rev-parse", "HEAD").strip()
+            for name in before_files.keys() - after_files.keys():
+                (repo / name).unlink()
+            for name, data in after_files.items():
+                (repo / name).write_bytes(data)
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "after")
+            commit = git(repo, "rev-parse", "HEAD").strip()
+            tracemalloc.start()
+            try:
+                before, after, deleted = MINE.changed_text_files(repo, parent, commit)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 4 * 1024 * 1024, "oversized Git blobs were captured before rejection")
+            self.assertEqual(before, {
+                "exact.txt": "a" * limit,
+                "at_limit_deleted.txt": "g" * limit,
+                "empty_old.txt": "",
+                "line\nname.txt": "old",
+            })
+            self.assertEqual(after, {
+                "exact.txt": "z" * limit,
+                "at_limit_added.txt": "+" * limit,
+                "empty_new.txt": "",
+                "empty_old.txt": "x",
+                "line\nname.txt": "new",
+            })
+            self.assertEqual(deleted, ["at_limit_deleted.txt"])
+
+    def test_miner_blob_read_rejects_ref_growth_after_size_query(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory))
+            small = git(repo, "rev-parse", "HEAD").strip()
+            (repo / "value.txt").write_bytes(b"x" * (4 * 1024 * 1024))
+            git(repo, "commit", "-qam", "large")
+            large = git(repo, "rev-parse", "HEAD").strip()
+            git(repo, "update-ref", "refs/heads/probe", small)
+            original_run = MINE.run
+
+            def replace_after_size(*args, **kwargs):
+                result = original_run(*args, **kwargs)
+                self.assertEqual(args[0], ["git", "cat-file", "-s", "probe:value.txt"])
+                git(repo, "update-ref", "refs/heads/probe", large)
+                return result
+
+            with mock.patch.object(MINE, "run", side_effect=replace_after_size):
+                tracemalloc.start()
+                try:
+                    data = MINE.read_blob(repo, "probe:value.txt")
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+            self.assertIsNone(data, "a capped prefix must never become oracle text")
+            self.assertLess(peak, 1024 * 1024)
+
     def test_miner_preserves_crlf_and_reports_deletions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

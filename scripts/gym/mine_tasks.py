@@ -22,6 +22,7 @@ else:
 
 SCHEMA_VERSION = 1
 MAX_BLOB_BYTES = 256_000
+GIT_BLOB_TIMEOUT_SECS = 30
 ORACLE_TIMEOUT_SECS = 300
 DEFAULT_BUDGETS = {"max_provider_turns": 12, "max_tool_calls": 24, "max_total_tokens": 16000}
 # Only these variables reach a mined oracle run, matching the training runner.
@@ -85,6 +86,24 @@ def isolated_env(root: Path) -> dict[str, str]:
     return env
 
 
+def read_blob(repo: Path, specification: str) -> bytes | None:
+    # Avoid materializing oversized objects even in Git. The capture limit
+    # also covers a ref or replacement changing after this size query.
+    size = run(["git", "cat-file", "-s", specification], repo, check=False)
+    if size.returncode or not size.stdout.strip().isdigit() or int(size.stdout) > MAX_BLOB_BYTES:
+        return None
+    try:
+        result = run_bounded(
+            ["git", "cat-file", "blob", specification], repo, dict(os.environ),
+            GIT_BLOB_TIMEOUT_SECS, stdout_limit=MAX_BLOB_BYTES,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode or len(result.stdout) > MAX_BLOB_BYTES:
+        return None
+    return result.stdout
+
+
 def changed_text_files(repo: Path, parent: str, commit: str) -> tuple[dict[str, str], dict[str, str], list[str]]:
     """Return (initial files, expected files, deleted files) for one commit.
 
@@ -106,13 +125,14 @@ def changed_text_files(repo: Path, parent: str, commit: str) -> tuple[dict[str, 
             continue
         if not name or not usable_path(name):
             continue
-        old = run(["git", "show", f"{parent}:{name}"], repo, check=False)
-        new = run(["git", "show", f"{commit}:{name}"], repo, check=False)
-        if len(old.stdout) > MAX_BLOB_BYTES or len(new.stdout) > MAX_BLOB_BYTES:
+        added, removed = status.startswith("A"), status.startswith("D")
+        old = None if added else read_blob(repo, f"{parent}:{name}")
+        new = None if removed else read_blob(repo, f"{commit}:{name}")
+        if (not added and old is None) or (not removed and new is None):
             continue
         try:
-            old_text = old.stdout.decode("utf-8") if old.returncode == 0 else None
-            new_text = new.stdout.decode("utf-8") if new.returncode == 0 else None
+            old_text = old.decode("utf-8") if old is not None else None
+            new_text = new.decode("utf-8") if new is not None else None
         except UnicodeDecodeError:
             continue
         if status.startswith("D"):

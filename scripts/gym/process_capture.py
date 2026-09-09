@@ -1,7 +1,7 @@
 """Bounded diagnostic output capture shared by the Gym trainer and task miner.
 
-Results contain diagnostic byte tails. Git blob and metadata queries that need
-complete stdout must use the miner's Git readers.
+Results normally contain diagnostic byte tails. A stdout limit selects complete
+capture with an overflow sentinel for callers such as the miner's Git blob reader.
 """
 
 from __future__ import annotations
@@ -16,8 +16,14 @@ OUTPUT_TAIL_BYTES = 2000
 PROCESS_REAP_TIMEOUT_SECS = 5
 
 
-def run_bounded(argv: list[str], cwd: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[bytes]:
-    """Drain both pipes while retaining only diagnostic tails on Gym's POSIX hosts."""
+def run_bounded(
+    argv: list[str], cwd: Path, env: dict[str, str], timeout: int, *, stdout_limit: int | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture diagnostic tails, or complete stdout up to a caller's limit.
+
+    Limited stdout retains one overflow byte and terminates the child on
+    overflow. Callers must reject that result instead of accepting a prefix.
+    """
     tails = [bytearray(), bytearray()]
     with selectors.DefaultSelector() as selector:
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -36,8 +42,15 @@ def run_bounded(argv: list[str], cwd: Path, env: dict[str, str], timeout: int) -
                     except (BlockingIOError, InterruptedError):
                         continue
                     if chunk:
-                        key.data.extend(chunk)
-                        del key.data[:-OUTPUT_TAIL_BYTES]
+                        if stdout_limit is not None and key.data is tails[0]:
+                            key.data.extend(chunk[:stdout_limit + 1 - len(key.data)])
+                            if len(key.data) > stdout_limit:
+                                process.kill()
+                                returncode = process.wait(timeout=PROCESS_REAP_TIMEOUT_SECS)
+                                return subprocess.CompletedProcess(argv, returncode, bytes(tails[0]), bytes(tails[1]))
+                        else:
+                            key.data.extend(chunk)
+                            del key.data[:-OUTPUT_TAIL_BYTES]
                     else:
                         selector.unregister(key.fileobj)
                         key.fileobj.close()
