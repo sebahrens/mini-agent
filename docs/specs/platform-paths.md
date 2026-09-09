@@ -270,6 +270,9 @@ atomic-write intermediates disable inherited broad access and use a protected DA
 current user and `SYSTEM` access while excluding `Everyone` and ordinary `Users`. Unix mode-bit
 calls are not treated as Windows protection. Existing owned real paths may be repaired through an
 opened handle; symbolic links, reparse points, wrong file types, and non-owned paths fail closed.
+New Windows private objects explicitly name the current user as owner, including MCP OAuth
+directories and lock files, so a token whose default owner is Administrators still satisfies
+the current-user ownership check.
 
 For MCP OAuth, `canonical-server-identity` is the versioned, length-prefixed tuple of the exact
 UTF-8 config map key, normalized absolute HTTP(S) URL, and explicit OAuth client ID (or empty).

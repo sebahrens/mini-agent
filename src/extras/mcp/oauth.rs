@@ -821,7 +821,7 @@ mod windows_private {
         fn private() -> std::io::Result<Self> {
             let current_user = current_user_sid_string()?;
             let sddl = wide(OsStr::new(&format!(
-                "D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
+                "O:{current_user}D:P(A;;FA;;;SY)(A;;FA;;;{current_user})"
             )));
             let mut descriptor = null_mut();
             let result = unsafe {
@@ -931,6 +931,35 @@ mod windows_private {
             let _ = unsafe { LocalFree(string_sid.cast()) };
             string
         })
+    }
+
+    #[test]
+    fn mcp_oauth_storage_security_creation_descriptor_sets_current_owner() {
+        // A token's default owner can be Administrators. Creation must name
+        // the same current user that apply_private_dacl later validates.
+        let descriptor = SecurityDescriptor::private().unwrap();
+        let mut owner = null_mut();
+        let mut defaulted = 0;
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Security::GetSecurityDescriptorOwner(
+                    descriptor.0,
+                    &mut owner,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert!(
+            !owner.is_null(),
+            "creation must not inherit the token default owner"
+        );
+        assert_eq!(defaulted, 0);
+        with_current_user_sid(|current| {
+            assert_ne!(unsafe { EqualSid(owner, current) }, 0);
+            Ok(())
+        })
+        .unwrap();
     }
 
     fn ensure_current_owner(handle: Handle) -> std::io::Result<()> {
