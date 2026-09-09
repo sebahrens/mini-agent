@@ -26,11 +26,16 @@ commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.
 
-Interactive teardown runs after both normal exit and event-loop errors. It closes
-the input receiver before joining the event thread, cancels the main runner and
-side questions, and waits for their owned work before closing shared services.
-Terminal handoff uses the same input-stop path, so a full event queue cannot
-prevent an editor or synchronous prompt from taking over stdin.
+Interactive teardown runs after both normal exit and event-loop errors. It stops
+and joins the input reader, cancels the main runner and side questions, and waits
+for their owned work before closing shared services. Reader shutdown drains queued
+events into the UI's deferred queue while joining, so a saturated sender can finish
+without closing the shared event channel. Terminal handoffs (including lazygit)
+use that same path and restart only the reader; background completions retain
+their destination and queued events retain their order. Ctrl-G keeps the reader
+paused for the whole editor session and restores it even when the editor fails.
+Editor launch and nonzero-exit failures are displayed after terminal restoration;
+unchanged drafts and edits from a failed editor are retained.
 `src/ui/prebuild.rs` owns background agent construction and its work scope. It
 lets cancelled MCP initialization finish process cleanup, explicitly closes MCP
 managers in rejected or queued prebuild results, and waits for scoped children.

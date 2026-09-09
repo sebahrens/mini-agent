@@ -1399,7 +1399,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/ui/input/mod.rs", ".status();", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/ui/input/mod.rs",
-        "let _ = std::process::Command::new(\"sh\")",
+        "let result = std::process::Command::new(\"sh\")",
         1,
         "TC-SUPPORT-UTILITY",
     ),

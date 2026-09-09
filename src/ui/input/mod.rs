@@ -277,6 +277,16 @@ impl InputEditor {
 
     #[cfg(not(windows))]
     fn open_in_editor_unix(&mut self, terminal_guard: &mut TerminalGuard) -> anyhow::Result<()> {
+        terminal_guard.suspend()?;
+        let result = self.edit_buffer();
+        terminal_guard.resume()?;
+        result
+    }
+
+    #[cfg(not(windows))]
+    fn edit_buffer(&mut self) -> anyhow::Result<()> {
+        use anyhow::Context;
+
         let editor = self
             .editor
             .clone()
@@ -285,21 +295,24 @@ impl InputEditor {
 
         let tmp = EditorTemp::create(self.buffer.as_bytes())?;
 
-        terminal_guard.suspend()?;
-
-        let _ = std::process::Command::new("sh")
+        let result = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{} \"$1\"", editor))
             .arg("sh")
             .arg(&tmp.path)
             .status_guarded();
 
-        let resume_result = terminal_guard.resume();
-
-        if let Ok(content) = std::fs::read_to_string(&tmp.path) {
+        if let Ok(content) = std::fs::read_to_string(&tmp.path)
+            && content != self.buffer.as_str()
+        {
             self.load_text(content.trim_end());
         }
-        Ok(resume_result?)
+        let exit_status = result.context("could not launch the configured editor")?;
+        anyhow::ensure!(
+            exit_status.success(),
+            "configured editor exited with {exit_status}"
+        );
+        Ok(())
     }
 
     pub fn handle_paste(&mut self, data: String) {
@@ -847,6 +860,35 @@ impl InputEditor {
 mod editor_temp_tests {
     use super::EditorTemp;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn editor_exit_status_preserves_drafts_and_keeps_edits_on_failure() {
+        for (command, expected, error_code) in [
+            ("true", "original draft  \n", None),
+            (
+                "/nonexistent-mini-agent-editor",
+                "original draft  \n",
+                Some("127"),
+            ),
+            ("sh -c 'exit 7' sh", "original draft  \n", Some("7")),
+            (
+                "sh -c 'printf edited > \"$1\"; exit 9' sh",
+                "edited",
+                Some("9"),
+            ),
+            ("sh -c 'printf edited > \"$1\"' sh", "edited", None),
+        ] {
+            let mut input = super::InputEditor::new();
+            input.load_text("original draft  \n");
+            input.set_editor(command.to_string());
+            let result = input.edit_buffer();
+            assert_eq!(input.buffer.as_str(), expected, "{command}");
+            match error_code {
+                Some(code) => assert!(result.unwrap_err().to_string().contains(code), "{command}"),
+                None => result.unwrap(),
+            }
+        }
+    }
 
     #[test]
     fn editor_temp_is_private_and_removed_on_drop() {

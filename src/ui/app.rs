@@ -1234,8 +1234,19 @@ impl<'a> App<'a> {
         }
 
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.pause_event_thread();
+            let result = self.input.open_in_editor(&mut self.terminal_guard);
             self.rebind_event_thread();
-            self.input.open_in_editor(&mut self.terminal_guard)?;
+            if let Err(error) = result {
+                if error
+                    .downcast_ref::<crate::ui::terminal::TerminalLifecycleError>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                self.renderer
+                    .write_line(&format!("editor failed: {error:#}"), C_ERROR)?;
+            }
             return Ok(());
         }
 
@@ -2701,21 +2712,18 @@ impl<'a> App<'a> {
     /// consumer (editor, pager, y/N prompt) is the only tty reader. Pair with
     /// `rebind_event_thread` once the terminal is resumed.
     fn pause_event_thread(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        // A blocked input sender cannot observe the flag until its send wakes.
-        // Rebinding replaces this receiver after the synchronous tty consumer.
-        self.user_rx.close();
-        if let Some(h) = self.event_handle.take() {
-            let _ = h.join();
-        }
+        pause_input_reader(
+            &self.running,
+            &mut self.event_handle,
+            &mut self.user_rx,
+            &mut self.deferred_user_events,
+        );
     }
 
     fn rebind_event_thread(&mut self) {
         self.pause_event_thread();
         self.running = Arc::new(AtomicBool::new(true));
-        let (new_tx, new_rx) = mpsc::channel(64);
-        self.user_tx = new_tx;
-        self.user_rx = new_rx;
+        // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(
             self.user_tx.clone(),
             self.running.clone(),
@@ -2791,10 +2799,7 @@ impl<'a> App<'a> {
             )?;
             return Ok(());
         }
-        if let Some(h) = self.event_handle.take() {
-            self.running.store(false, Ordering::Relaxed);
-            let _ = h.join();
-        }
+        self.pause_event_thread();
         self.terminal_guard.suspend()?;
         let mut command = tokio::process::Command::new("lazygit");
         command.current_dir(self.ui.workspace.root());
@@ -3476,6 +3481,28 @@ mod mid_turn_pressure_tests {
     }
 }
 
+/// Release a saturated input sender without closing the shared completion
+/// channel. Preserve drained events in their original order for the next UI
+/// iteration. Once stopped, the reader can finish at most its current event.
+fn pause_input_reader(
+    running: &AtomicBool,
+    handle: &mut Option<std::thread::JoinHandle<()>>,
+    receiver: &mut mpsc::Receiver<UserEvent>,
+    deferred: &mut std::collections::VecDeque<UserEvent>,
+) {
+    running.store(false, Ordering::Relaxed);
+    if let Some(thread) = handle.take() {
+        while !thread.is_finished() {
+            if let Ok(event) = receiver.try_recv() {
+                deferred.push_back(event);
+            }
+            // Yield to the reader even if background producers refill the queue.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = thread.join();
+    }
+}
+
 /// Slash commands that read the tty synchronously while the terminal is
 /// suspended: `/tutor` runs a pager, `/init` (without `force`) asks y/N on
 /// stdin. The event thread must be paused around them.
@@ -3501,5 +3528,99 @@ mod slash_tty_tests {
         assert!(!slash_command_needs_tty("/undo"));
         assert!(!slash_command_needs_tty("/memory editor"));
         assert!(!slash_command_needs_tty(""));
+    }
+}
+
+#[cfg(test)]
+mod input_reader_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn saturated_reader_stop_preserves_order_and_background_senders() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let background = sender.clone();
+        #[cfg(feature = "loop")]
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        #[cfg(feature = "loop")]
+        let mut run = AgentRunState::default();
+        let mut deferred = std::collections::VecDeque::from([UserEvent::Paste("earlier".into())]);
+        // Exercise a second reader on the same event channel after a handoff.
+        for round in 0..2 {
+            #[cfg(feature = "loop")]
+            let operation = crate::extras::r#loop::validation::start(
+                &crate::sandbox::Sandbox::new(false, "bwrap"),
+                "echo validated",
+            );
+            #[cfg(feature = "loop")]
+            let operation_id = run.begin_validation(operation.cancellation());
+            sender
+                .blocking_send(UserEvent::Paste(format!("queued-{round}")))
+                .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let reader_sender = sender.clone();
+            let reader_running = running.clone();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut handle = Some(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                reader_sender
+                    .blocking_send(UserEvent::Paste(format!("reader-{round}")))
+                    .unwrap();
+                assert!(!reader_running.load(Ordering::Relaxed));
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            pause_input_reader(&running, &mut handle, &mut receiver, &mut deferred);
+            assert!(handle.is_none());
+            assert!(!receiver.is_closed());
+            while let Ok(event) = receiver.try_recv() {
+                deferred.push_back(event);
+            }
+            // A completion producer captured before the handoff is still live.
+            #[cfg(feature = "loop")]
+            let completion = {
+                let result = runtime.block_on(operation.wait());
+                assert!(result.succeeded());
+                UserEvent::LoopValidationDone(crate::event::LoopValidationEvent {
+                    operation_id,
+                    response: "completed".into(),
+                    summary: format!("completion-{round}"),
+                    result,
+                })
+            };
+            #[cfg(not(feature = "loop"))]
+            let completion = UserEvent::LinkOpenFailed(format!("completion-{round}"));
+            background.blocking_send(completion).unwrap();
+            let completion = receiver.blocking_recv().unwrap();
+            #[cfg(feature = "loop")]
+            if let UserEvent::LoopValidationDone(event) = &completion {
+                assert!(run.complete_validation(event.operation_id));
+                assert!(!run.validation_active());
+            }
+            deferred.push_back(completion);
+            pause_input_reader(&running, &mut handle, &mut receiver, &mut deferred);
+        }
+        let actual: Vec<_> = deferred
+            .into_iter()
+            .map(|event| match event {
+                UserEvent::Paste(text) | UserEvent::LinkOpenFailed(text) => text,
+                #[cfg(feature = "loop")]
+                UserEvent::LoopValidationDone(event) => event.summary,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "earlier",
+                "queued-0",
+                "reader-0",
+                "completion-0",
+                "queued-1",
+                "reader-1",
+                "completion-1"
+            ]
+        );
     }
 }
