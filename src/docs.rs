@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 
+#[cfg(not(windows))]
 use crate::process_creation::StdCommandCreationExt;
 
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/docs");

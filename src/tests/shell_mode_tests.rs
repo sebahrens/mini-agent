@@ -1,12 +1,16 @@
 use std::io::Write;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use crate::sandbox::{
-    CommandCancellation, CommandLimits, CommandOutputLimit, CommandStatus, ExplicitShellBoundary,
-    Sandbox, SupportCommandAudit, SupportCommandLimits,
+    CommandCancellation, CommandOutputLimit, SupportCommandAudit, SupportCommandLimits,
 };
-use tokio::time::{Duration, sleep, timeout};
+use crate::sandbox::{CommandLimits, CommandStatus, ExplicitShellBoundary, Sandbox};
+#[cfg(unix)]
+use tokio::time::timeout;
+use tokio::time::{Duration, sleep};
 
 const SHORT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_millis(300),

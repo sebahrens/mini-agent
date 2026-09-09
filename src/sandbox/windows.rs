@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, FILETIME,
     GENERIC_ALL, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree, TRUE, WAIT_ABANDONED_0,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
 use windows_sys::Win32::Security::Authorization::{

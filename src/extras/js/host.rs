@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 use regex::{Regex, RegexBuilder};
 #[cfg(all(feature = "sandbox", test))]
 use rquickjs::prelude::Opt;
+#[cfg(all(test, any(feature = "skills", feature = "sandbox")))]
+use rquickjs::{Context, prelude::Func};
 #[cfg(test)]
-use rquickjs::{Context, Ctx, IntoJs, Object, Value, prelude::Func};
+use rquickjs::{Ctx, IntoJs, Object, Value};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use unicode_normalization::UnicodeNormalization;
@@ -1831,15 +1833,6 @@ fn timeout_error(tool: &'static str) -> rquickjs::Error {
 }
 
 #[cfg(test)]
-fn file_error(
-    tool: &'static str,
-    kind: &'static str,
-    message: impl Into<String>,
-) -> rquickjs::Error {
-    rquickjs::Error::new_from_js_message(kind, tool, message.into())
-}
-
-#[cfg(test)]
 async fn timeout_host_call<T>(
     tool: &'static str,
     duration: Duration,
@@ -2928,7 +2921,7 @@ impl PreparedSpawnEffect {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn capture(
         program: &str,
         arguments: Vec<String>,

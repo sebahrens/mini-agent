@@ -15,7 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-use crate::process_creation::{StdCommandCreationExt, TokioCommandCreationExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process_creation::StdCommandCreationExt;
+use crate::process_creation::TokioCommandCreationExt;
 
 #[cfg(feature = "js")]
 pub(crate) mod worker;

@@ -729,13 +729,6 @@ pub(crate) fn source_hint_for_workspace(
 mod tests {
     use super::*;
 
-    fn embedded_prompt(name: &str) -> String {
-        crate::context::load_embedded_files(&EMBEDDED, "md")
-            .into_iter()
-            .find_map(|(candidate, prompt)| (candidate == name).then_some(prompt))
-            .unwrap_or_else(|| panic!("missing embedded specialist {name}"))
-    }
-
     #[test]
     fn real_project_trust_binding_controls_persona_override_round_trip() {
         let root = std::env::temp_dir()

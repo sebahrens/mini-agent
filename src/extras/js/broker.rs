@@ -211,7 +211,7 @@ impl ExecutablePreparationControl {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn new_for_test(deadline: Instant) -> Self {
         Self::new(deadline)
     }

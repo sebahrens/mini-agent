@@ -393,7 +393,7 @@ mod feasibility {
     use super::{WinHandle, WorkerChild, close_unowned_handle};
     use crate::process_creation::CreationGuard;
     use crate::sandbox::worker::{
-        INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerBackend, WorkerProcess,
+        INTERNAL_WORKER_MARKER, INTERNAL_WORKER_MARKER_VALUE, WorkerProcess,
     };
     use std::ffi::{OsStr, OsString, c_void};
     use std::fmt;

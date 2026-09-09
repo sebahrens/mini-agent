@@ -13,7 +13,6 @@ use crate::session::{
 use crate::ui::state::{AgentRunState, PendingMainTurn};
 use crate::ui::utils::suggest_pattern;
 use crate::ui::{mark_main_turn_started, persist_session_if_settled, rollback_pending_main_turn};
-use std::env;
 use std::path::Path;
 
 struct TestEnv {
@@ -753,7 +752,7 @@ fn session_storage_permissions_ignore_permissive_umask() {
     const SESSION_ID: &str = "session-storage-permission-umask";
 
     if let Some(state_dir) = std::env::var_os(CHILD_STATE_DIR) {
-        unsafe { env::set_var("ZS_STATE_DIR", &state_dir) };
+        unsafe { std::env::set_var("ZS_STATE_DIR", &state_dir) };
         let mut session = Session::new("openai", "gpt-4", 128000, "");
         session.id = SESSION_ID.into();
         save_session(&session).unwrap();

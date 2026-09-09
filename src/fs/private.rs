@@ -49,7 +49,7 @@ pub(crate) fn ensure_directory(path: &Path) -> std::io::Result<()> {
 /// narrow the permissions or ACLs of a directory that already exists. Missing
 /// components are still created privately, and the no-follow/ownership checks
 /// are unchanged.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "skills"))]
 pub(crate) fn ensure_export_directory(path: &Path) -> std::io::Result<()> {
     ensure_directory_inner(path, false)
 }
@@ -202,7 +202,7 @@ pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// The file itself keeps 0600 and the atomic no-follow publication; only the
 /// treatment of an already existing parent differs from `atomic_create`.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "skills"))]
 pub(crate) fn atomic_create_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_create_with_parent_policy(path, bytes, false)
 }
@@ -289,10 +289,10 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(windows)]
-pub(crate) use windows::{
-    atomic_create, atomic_create_export, atomic_write, ensure_directory, ensure_export_directory,
-    open_existing,
-};
+pub(crate) use windows::{atomic_create, atomic_write, ensure_directory, open_existing};
+
+#[cfg(all(windows, feature = "skills"))]
+pub(crate) use windows::{atomic_create_export, ensure_export_directory};
 
 #[cfg(all(test, windows))]
 pub(crate) use windows::dacl_sddl;
@@ -302,12 +302,12 @@ pub(crate) fn ensure_directory(_path: &Path) -> std::io::Result<()> {
     Err(unsupported())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), feature = "skills"))]
 pub(crate) fn ensure_export_directory(_path: &Path) -> std::io::Result<()> {
     Err(unsupported())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), feature = "skills"))]
 pub(crate) fn atomic_create_export(_path: &Path, _bytes: &[u8]) -> std::io::Result<()> {
     Err(unsupported())
 }
@@ -739,6 +739,7 @@ mod windows {
 
     /// See the Unix `ensure_export_directory`: an operator's existing output
     /// directory keeps its ACL, while missing components are created private.
+    #[cfg(feature = "skills")]
     pub(crate) fn ensure_export_directory(path: &Path) -> std::io::Result<()> {
         ensure_directory_inner(path, false)
     }
@@ -913,6 +914,7 @@ mod windows {
         atomic_write_mode(path, bytes, true)
     }
 
+    #[cfg(feature = "skills")]
     pub(crate) fn atomic_create_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         // The Windows publication path creates the file with a private
         // descriptor and never rewrites an existing parent's ACL, so the export

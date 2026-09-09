@@ -844,6 +844,7 @@ pub(crate) struct AtomicWritePublicationProbe {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AtomicWriteProbePoint {
+    #[cfg(windows)]
     BeforeTempCreation,
     BeforeDecision,
     AfterDecision,
@@ -890,7 +891,7 @@ impl AtomicWriteCancellation {
         self.0.cancel_requested.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn probe_before_temp_creation(&self) {
         if let Some(probe) = &self.0.publication_probe
             && probe.point == AtomicWriteProbePoint::BeforeTempCreation
@@ -939,7 +940,7 @@ impl AtomicWriteCancellation {
         result
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn with_temp_creation_probe_for_test() -> (Self, AtomicWritePublicationProbe) {
         let probe = AtomicWritePublicationProbe {
             reached: Arc::new(std::sync::Barrier::new(2)),

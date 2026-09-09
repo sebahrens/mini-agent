@@ -7,6 +7,7 @@ pub use cursor::{
 };
 pub use pickers::Picker;
 
+#[cfg(not(windows))]
 use crate::process_creation::StdCommandCreationExt;
 use crate::ui::pickers::file::FilePicker;
 use crate::ui::pickers::list::ListPicker;
