@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -111,27 +112,31 @@ def read_blob(repo: Path, specification: str) -> bytes | None:
 def changed_text_files(repo: Path, parent: str, commit: str) -> tuple[dict[str, str], dict[str, str], list[str]]:
     """Return (initial files, expected files, deleted files) for one commit.
 
-    Blobs are captured as bytes and decoded strictly, so line endings survive
-    verbatim and binary content is skipped instead of raising. Renames are
-    reported as delete+add so both sides can be reproduced.
+    Only regular-file entries become text overlays; symlink targets are not
+    file contents. Blobs are decoded strictly, preserving line endings.
+    Renames are reported as delete+add so both sides can be reproduced.
     """
     listing = run(
-        ["git", "diff", "-z", "--name-status", "--no-renames", "--diff-filter=AMD", parent, commit], repo
+        ["git", "diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--diff-filter=AMD", parent, commit], repo
     ).stdout.split(b"\0")
     before: dict[str, str] = {}
     after: dict[str, str] = {}
     deleted: list[str] = []
-    for status_bytes, name_bytes in zip(listing[0::2], listing[1::2]):
+    regular_or_absent = {b"000000", b"100644", b"100755"}
+    for header, name_bytes in zip(listing[0::2], listing[1::2]):
+        old_mode, new_mode, old_oid, new_oid, _status = header.split()
+        old_mode = old_mode.removeprefix(b":")
+        if old_mode not in regular_or_absent or new_mode not in regular_or_absent:
+            continue
         try:
-            status = status_bytes.decode("utf-8")
             name = name_bytes.decode("utf-8")
         except UnicodeDecodeError:
             continue
         if not name or not usable_path(name):
             continue
-        added, removed = status.startswith("A"), status.startswith("D")
-        old = None if added else read_blob(repo, f"{parent}:{name}")
-        new = None if removed else read_blob(repo, f"{commit}:{name}")
+        added, removed = old_mode == b"000000", new_mode == b"000000"
+        old = None if added else read_blob(repo, old_oid.decode("ascii"))
+        new = None if removed else read_blob(repo, new_oid.decode("ascii"))
         if (not added and old is None) or (not removed and new is None):
             continue
         try:
@@ -139,7 +144,7 @@ def changed_text_files(repo: Path, parent: str, commit: str) -> tuple[dict[str, 
             new_text = new.decode("utf-8") if new is not None else None
         except UnicodeDecodeError:
             continue
-        if status.startswith("D"):
+        if removed:
             if old_text is None:
                 continue
             before[name] = old_text
@@ -227,7 +232,9 @@ def load_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]]:
     a mined task file would not be reproducible. Sorting by id here is the only
     ordering guarantee `mine()` relies on.
     """
-    return sorted(collect_beads(repo, beads_json), key=lambda bead: str(bead.get("id", "")))
+    closed = (bead for bead in collect_beads(repo, beads_json)
+              if str(bead.get("status", "closed")) == "closed")
+    return sorted(closed, key=lambda bead: str(bead.get("id", "")))
 
 
 def collect_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]]:
@@ -254,7 +261,7 @@ def collect_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]
         if not fallback.is_file():
             raise SystemExit(f"gym mine: no bead source available; {fallback} does not exist")
         print(f"gym mine: falling back to {fallback}", file=sys.stderr)
-        return [bead for bead in beads_from_file(fallback) if str(bead.get("status", "closed")) == "closed"]
+        return beads_from_file(fallback)
     if isinstance(parsed, dict):
         parsed = parsed.get("issues") or parsed.get("results") or []
     if not isinstance(parsed, list):
@@ -302,9 +309,10 @@ def resolve_commit(repo: Path, bead_id: str, entry: dict[str, object], main_ref:
         if parsed.returncode:
             return "", f"fix_commit {explicit!r} is not a commit in this repository"
         return out(parsed).strip(), ""
-    # The oldest match reachable from the integration branch is the fix itself;
-    # later mentions are follow-ups and --all would admit abandoned branches.
-    log = run(["git", "log", main_ref, "--format=%H", "--reverse", f"--grep={bead_id}"], repo, check=False)
+    # Match the whole literal ID: .1 must not select .10 or treat '.' as a
+    # wildcard. Later exact mentions are follow-ups; --all admits abandoned branches.
+    pattern = rf"(^|[^[:alnum:]_.-]){re.escape(bead_id)}([^[:alnum:]_.-]|$)"
+    log = run(["git", "log", main_ref, "--format=%H", "--reverse", "--extended-regexp", f"--grep={pattern}"], repo, check=False)
     if log.returncode:
         return "", f"git log {main_ref} failed: {tail_text(log.stderr)}"
     commits = out(log).split()
@@ -355,7 +363,7 @@ def mine(
                 continue
         initial, expected, deleted = changed_text_files(repo, parent, commit)
         if not expected:
-            skipped.append(f"{bead_id}: no bounded UTF-8 text files changed between {parent[:12]} and {commit[:12]}")
+            skipped.append(f"{bead_id}: no bounded regular UTF-8 text files changed between {parent[:12]} and {commit[:12]}")
             continue
         tasks.append(
             {

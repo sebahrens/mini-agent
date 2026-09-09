@@ -844,7 +844,7 @@ class GymMinerTests(unittest.TestCase):
             self.assertIsNone(data, "a capped prefix must never become oracle text")
             self.assertLess(peak, 1024 * 1024)
 
-    def test_miner_preserves_crlf_and_reports_deletions(self) -> None:
+    def test_miner_text_delta_preserves_base_types_modes_and_line_endings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
@@ -852,6 +852,14 @@ class GymMinerTests(unittest.TestCase):
             (repo / "value.txt").write_bytes(b"broken\r\n" * 512)
             (repo / "gone.txt").write_text("bye\n", encoding="utf-8")
             (repo / "binary.bin").write_bytes(b"\x00\xff\xfe")
+            (repo / "modified-link").symlink_to("value.txt")
+            (repo / "deleted-link").symlink_to("value.txt")
+            (repo / "link-to-file").symlink_to("value.txt")
+            (repo / "file-to-link").write_text("ordinary file\n")
+            (repo / "executable").write_text("old\n")
+            (repo / "executable").chmod(0o755)
+            (repo / "mode-only").write_text("same\n")
+            (repo / "mode-only").chmod(0o644)
             nested = repo / ".github" / "workflows"
             nested.mkdir(parents=True)
             (nested / "ci.yml").write_text("on: push\n", encoding="utf-8")
@@ -861,6 +869,16 @@ class GymMinerTests(unittest.TestCase):
             (repo / "value.txt").write_bytes(b"fixed\r\n" * 512)
             (repo / "gone.txt").unlink()
             (repo / "binary.bin").write_bytes(b"\x00\xff\xfd")
+            (repo / "modified-link").unlink()
+            (repo / "modified-link").symlink_to("elsewhere")
+            (repo / "deleted-link").unlink()
+            (repo / "added-link").symlink_to("value.txt")
+            (repo / "link-to-file").unlink()
+            (repo / "link-to-file").write_text("now a file\n")
+            (repo / "file-to-link").unlink()
+            (repo / "file-to-link").symlink_to("value.txt")
+            (repo / "executable").write_text("new\n")
+            (repo / "mode-only").chmod(0o755)
             (nested / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
             git(repo, "add", "-A")
             git(repo, "commit", "-qm", "fix mini-agent-test")
@@ -874,6 +892,24 @@ class GymMinerTests(unittest.TestCase):
             self.assertNotIn("gone.txt", after)
             self.assertNotIn("binary.bin", after)
             self.assertNotIn(".github/workflows/ci.yml", after)
+            for name in ["modified-link", "deleted-link", "added-link", "link-to-file", "file-to-link"]:
+                self.assertNotIn(name, before)
+                self.assertNotIn(name, after)
+                self.assertNotIn(name, deleted)
+            self.assertEqual(before["executable"], "old\n")
+            self.assertEqual(after["executable"], "new\n")
+            self.assertEqual((before["mode-only"], after["mode-only"]), ("same\n", "same\n"))
+            workspace = root / "reconstructed"
+            TRAIN_MODULE.prepare_workspace(repo, {"base_commit": parent, "initial_files": before,
+                                                 "deleted_files": deleted}, workspace, False)
+            self.assertEqual(git(workspace, "status", "--porcelain"), "", "mined overlays must preserve the validated base")
+            self.assertEqual(os.readlink(workspace / "modified-link"), "value.txt")
+            self.assertTrue((workspace / "deleted-link").is_symlink())
+            self.assertTrue((workspace / "link-to-file").is_symlink())
+            self.assertFalse((workspace / "added-link").is_symlink())
+            self.assertEqual((workspace / "file-to-link").read_text(), "ordinary file\n")
+            self.assertTrue((workspace / "executable").stat().st_mode & 0o111)
+            self.assertFalse((workspace / "mode-only").stat().st_mode & 0o111)
 
     def test_miner_validates_fail_to_pass_under_an_isolated_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -888,63 +924,76 @@ class GymMinerTests(unittest.TestCase):
             self.assertTrue(MINE.oracle_at(repo, commit, "test -n \"$MINI_AGENT_GYM\" && test -d \"$ZS_CONFIG_DIR\""))
             self.assertFalse(MINE.oracle_at(repo, commit, "test -n \"${GYM_MUST_NOT_LEAK:-}\""))
 
-    def test_commit_association_prefers_the_oldest_match_on_main(self) -> None:
+    def test_commit_association_prefers_the_oldest_exact_id_on_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
+            bead_id = "mini-agent-test.1"
+            for misleading in ["mini-agent-test.10", "mini-agent-testx1", "prefix-mini-agent-test.1",
+                               "mini-agent-test.1-suffix", "mini-agent-test.1_child"]:
+                (repo / "value.txt").write_text(misleading + "\n", encoding="utf-8")
+                git(repo, "commit", "-qam", f"unrelated fix {misleading}")
             (repo / "value.txt").write_text("fixed\n", encoding="utf-8")
-            git(repo, "commit", "-qam", "fix mini-agent-test")
+            git(repo, "commit", "-qam", f"fix ({bead_id})")
             fix = git(repo, "rev-parse", "HEAD").strip()
             (repo / "value.txt").write_text("fixed again\n", encoding="utf-8")
-            git(repo, "commit", "-qam", "docs: follow-up for mini-agent-test")
+            git(repo, "commit", "-qam", f"docs: follow-up for {bead_id}")
             git(repo, "checkout", "-q", "-b", "abandoned")
             (repo / "value.txt").write_text("abandoned\n", encoding="utf-8")
-            git(repo, "commit", "-qam", "abandoned mini-agent-test")
+            git(repo, "commit", "-qam", f"abandoned {bead_id}")
             abandoned = git(repo, "rev-parse", "HEAD").strip()
             git(repo, "checkout", "-q", "main")
 
-            commit, reason = MINE.resolve_commit(repo, "mini-agent-test", {}, "main")
+            commit, reason = MINE.resolve_commit(repo, bead_id, {}, "main")
             self.assertEqual(commit, fix)
             self.assertEqual(reason, "")
-            explicit, reason = MINE.resolve_commit(repo, "mini-agent-test", {"fix_commit": abandoned}, "main")
+            explicit, reason = MINE.resolve_commit(repo, bead_id, {"fix_commit": abandoned}, "main")
             self.assertEqual(explicit, abandoned)
             missing, reason = MINE.resolve_commit(repo, "mini-agent-absent", {}, "main")
             self.assertEqual(missing, "")
             self.assertIn("no commit reachable from main", reason)
-            bad, reason = MINE.resolve_commit(repo, "mini-agent-test", {"fix_commit": "deadbeef"}, "main")
+            bad, reason = MINE.resolve_commit(repo, bead_id, {"fix_commit": "deadbeef"}, "main")
             self.assertEqual(bad, "")
             self.assertIn("not a commit", reason)
 
-    def test_beads_fall_back_to_the_exported_jsonl(self) -> None:
+    def test_bead_sources_filter_unfinished_issues_and_preserve_stable_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
-            beads = root / "beads.jsonl"
-            beads.write_text(
-                json.dumps({"id": "mini-agent-test", "title": "fix it", "status": "closed"}) + "\n",
-                encoding="utf-8",
-            )
-            loaded = MINE.load_beads(repo, beads)
-            self.assertEqual(loaded[0]["id"], "mini-agent-test")
-            self.assertIn("dolt_mode", MINE.beads_hint(repo))
+            rows = [{"id": "mini-agent-zzz", "status": "closed"}, {"id": "mini-agent-legacy"},
+                    *[{"id": f"mini-agent-{status}", "status": status} for status in ["open", "in_progress", "deferred", None]],
+                    {"id": "mini-agent-aaa", "status": "closed"}]
+            jsonl = "".join(json.dumps(row) + "\n" for row in rows)
+            (repo / ".beads").mkdir()
+            (repo / ".beads/metadata.json").write_text(json.dumps({"dolt_mode": "embedded"}))
+            (repo / ".beads/issues.jsonl").write_text(jsonl)
+            for source in ["explicit-json", "explicit-jsonl", "bd", "fallback-missing", "fallback-error", "fallback-malformed"]:
+                with self.subTest(source=source):
+                    explicit = root / "export" if source.startswith("explicit") else None
+                    if explicit is not None:
+                        explicit.write_text(json.dumps(rows) if source == "explicit-json" else jsonl)
 
-    def test_beads_are_returned_in_a_stable_id_order(self) -> None:
-        # bd list documents no ordering, so --limit would otherwise select a
-        # different subset from run to run.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            beads = root / "beads.jsonl"
-            unordered = ["mini-agent-zzz", "mini-agent-aaa", "mini-agent-mmm"]
-            beads.write_text(
-                "".join(
-                    json.dumps({"id": name, "title": name, "status": "closed"}) + "\n"
-                    for name in unordered
-                ),
-                encoding="utf-8",
-            )
-            loaded = MINE.load_beads(repo, beads)
-            self.assertEqual([bead["id"] for bead in loaded], sorted(unordered))
+                    def command(argv, *args, **kwargs):
+                        if explicit is not None:
+                            self.fail("an explicit export must not invoke bd")
+                        if argv[1] == "version":
+                            return subprocess.CompletedProcess(argv, 0, b"bd fixture\n", b"")
+                        if source == "fallback-missing":
+                            raise FileNotFoundError("bd")
+                        if source == "fallback-error":
+                            raise subprocess.CalledProcessError(2, argv, stderr=b"tracker unavailable")
+                        data = b"not json" if source == "fallback-malformed" else json.dumps(rows).encode()
+                        return subprocess.CompletedProcess(argv, 0, data, b"")
+
+                    with mock.patch.object(MINE, "run", side_effect=command), contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+                        loaded = MINE.load_beads(repo, explicit)
+                    self.assertEqual([row["id"] for row in loaded], ["mini-agent-aaa", "mini-agent-legacy", "mini-agent-zzz"])
+                    if source.startswith("fallback"):
+                        self.assertIn("falling back to", diagnostics.getvalue())
+                        if source != "fallback-malformed":
+                            self.assertIn("dolt_mode: embedded", diagnostics.getvalue())
+                    else:
+                        self.assertEqual(diagnostics.getvalue(), "")
 
     def test_mined_prompt_carries_the_description_and_acceptance_criteria(self) -> None:
         prompt = MINE.mined_prompt(
@@ -984,12 +1033,16 @@ class GymMinerTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            with beads.open("a", encoding="utf-8") as export:
+                export.write(json.dumps({"id": "mini-agent-open", "status": "open", "title": "unfinished"}) + "\n")
             for validate, command, count in [(True, "grep -qx fixed value.txt", 1), (False, "true", 1), (True, "true", 0)]:
                 with self.subTest(validate=validate, command=command):
                     output = root / "tasks.json"
                     oracle_map = root / "map.json"
                     marker = root / "oracle-ran"
-                    oracle_map.write_text(json.dumps({"mini-agent-test": "touch " + shlex.quote(str(marker)) + "; " + command}))
+                    oracle_command = "touch " + shlex.quote(str(marker)) + "; " + command
+                    oracle_map.write_text(json.dumps({"mini-agent-test": oracle_command,
+                                                     "mini-agent-open": {"command": oracle_command, "fix_commit": "HEAD"}}))
                     marker.unlink(missing_ok=True)
                     completed = subprocess.run(
                         [sys.executable, str(ROOT / "scripts/gym/mine_tasks.py"), "--repo", str(repo),

@@ -111,10 +111,15 @@ python3 scripts/gym/mine_tasks.py --oracle-map map.json --output tasks.json [--m
   [--beads-json export.jsonl] [--limit 20] [--no-validate]
 ```
 
+The live tracker, automatic JSONL fallback, and explicit JSON/JSONL exports use the same filter
+for closed issues and stable ID ordering. Open, in-progress, and deferred issues are not mined.
+Legacy export records without a `status` field retain the existing assumption of `closed`.
+
 Each `map.json` value is either an oracle command string or an object with `command` plus optional
 `fix_commit`, `base_commit`, `id`, and `library`. Without an explicit `fix_commit` the miner takes
-the **oldest** commit reachable from `--main-ref` whose message mentions the bead id, so a
-follow-up mention or an abandoned branch cannot be selected. Every bead that cannot be turned into
+the **oldest** commit reachable from `--main-ref` whose message mentions the complete literal bead
+id. For example, `.1` does not match `.10`, and dots are not wildcards. A follow-up mention or an
+abandoned branch cannot be selected. Every bead that cannot be turned into
 a task is reported on stderr with the reason (no matching commit, unresolvable base, oracle already
 green at base, oracle not green at the fix, checkout unavailable, or no bounded text delta).
 Checkout failures provide no oracle evidence: the candidate is skipped if either revision cannot
@@ -125,13 +130,17 @@ Validated tasks receive the `fail-to-pass` tag. With `--no-validate`, neither or
 receive `validation-skipped` and the CLI reports them as unvalidated. These two provenance tags
 are derived from the current mining run rather than inherited from bead labels.
 
-Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim and binary
-blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes:
+Raw Git entry modes restrict text overlays to regular files, including executable files.
+Symlinks, submodules, and file-type changes are excluded from the overlays, preserving their
+original entries in the base checkout. A symlink target is never interpreted as ordinary file
+content. Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim
+and non-UTF-8 blobs are skipped rather than raising. Both the parent and child blob are bounded at
+256000 bytes:
 Git reports their size before content is captured, and the subsequent read independently enforces
 the same limit and a 30-second deadline. A failed or oversized required blob skips the whole file;
 truncated prefixes are never used as oracle text. Exact-limit and empty blobs are accepted.
-Renames are recorded as a delete plus an add (`--no-renames`), deletions become `deleted_files`, and
-any path with a dot-prefixed component (`.github/workflows/...` included) is skipped. Validation
+Regular-file renames are recorded as a delete plus an add (`--no-renames`), deletions become
+`deleted_files`, and any path with a dot-prefixed component (`.github/workflows/...` included) is skipped. Validation
 runs each oracle with `/bin/sh -c` under the same curated environment and gym-owned AppPaths as
 training, never a login shell and never the operator's environment.
 
