@@ -183,6 +183,11 @@ def load_tasks(path: Path, default_timeout: int) -> list[dict[str, object]]:
         deleted = merged.get("deleted_files") or []
         if not isinstance(deleted, list):
             raise TaskError(f"{label}.deleted_files must be an array")
+        library = str(merged.get("library") or "seeds")
+        if library != "seeds":
+            # Imports run from a fresh neutral directory. Bind relative package
+            # paths to the invocation directory before that cwd change.
+            library = str(Path(library).absolute())
         tasks.append(
             {
                 "name": name,
@@ -194,7 +199,7 @@ def load_tasks(path: Path, default_timeout: int) -> list[dict[str, object]]:
                 "deleted_files": [relative_path(value, f"{label}.deleted_files") for value in deleted],
                 "oracle": validated_oracle(merged.get("oracle"), label),
                 "budgets": validated_budgets(merged.get("budgets"), label),
-                "library": str(merged.get("library") or "seeds"),
+                "library": library,
                 "timeout_secs": positive_int(merged.get("timeout_secs", default_timeout), f"{label}.timeout_secs"),
                 "tags": list(merged.get("tags") or []),
             }
@@ -485,7 +490,11 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
         prepare_workspace(repo, task, workspace, args.allow_empty_workspace)
         env = episode_env(root, args.provider, args.model, args.forward_env)
         if arm == "library":
-            record["active_skill_ids"] = install_library(args.binary, str(task["library"]), env)
+            try:
+                record["active_skill_ids"] = install_library(args.binary, str(task["library"]), env)
+            except sqlite3.Error as error:
+                detail = tail_text(str(error).encode("utf-8", errors="replace"))
+                raise EpisodeFailure("library_install_failed", f"library database read failed: {detail}") from error
         oracle_started = time.monotonic()
         pre_exit, pre_detail = run_oracle(oracle, workspace, env)
         oracle_ms += elapsed_ms_since(oracle_started)

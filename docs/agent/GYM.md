@@ -92,6 +92,7 @@ What the Python runner enforces at load time, before any episode runs:
 | `base_commit` | defaults to `HEAD`; a commit Git cannot materialize is a failed row, not an empty directory |
 | `initial_files`, `deleted_files` | relative paths only; `..`, absolute paths, and root-only paths such as `.` are rejected |
 | `oracle` | needs `command` or a non-empty `expected_files`; `id` defaults to a hash of the oracle |
+| `library` | defaults to `seeds`; package file/directory paths are made absolute relative to the invocation directory before import switches to its neutral directory |
 | `budgets.max_provider_turns` | **required**, integer >= 1; passed to the binary as `--max-agent-turns` |
 | `budgets.max_tool_calls`, `budgets.max_total_tokens` | optional, integer >= 1, **not enforced** (see below) |
 | `timeout_secs` | optional per-task override of `--task-timeout` |
@@ -180,6 +181,8 @@ For each task and each arm the runner:
    binary now has `--learned-skill-json`, but the runner does not use it.) Database paths are URI
    encoded, preserving literal `#`, `?`, and `%` characters and the read-only option. Every reader
    closes before its query returns or raises; missing databases are never created by a query.
+   Unreadable or incompatible database contents fail that arm with `library_install_failed` and a
+   bounded diagnostic. The failed row is recorded, cleanup runs, and later episodes continue.
 4. runs the oracle **before** the agent and records `oracle_pre_exit`. An oracle that already passes
    makes the task invalid: the row fails with `task_invalid_oracle_passes_before_agent` and the
    agent is never launched;

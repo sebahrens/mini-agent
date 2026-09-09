@@ -100,10 +100,6 @@ case "$mode" in
     echo "agent failed" >&2
     exit 3
     ;;
-  timeout)
-    sleep 30
-    exit 0
-    ;;
 esac
 printf 'fixed\\n' > fixed.txt
 exit 0
@@ -153,7 +149,7 @@ def task_document(tasks: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def run_training(root: Path, repo: Path, binary: Path, document: dict[str, object], *extra: str):
+def run_training(root: Path, repo: Path, binary: Path, document: dict[str, object], *extra: str, cwd: Path | None = None):
     tasks = root / "tasks.json"
     tasks.write_text(json.dumps(document), encoding="utf-8")
     output = root / "outcomes.jsonl"
@@ -176,6 +172,7 @@ def run_training(root: Path, repo: Path, binary: Path, document: dict[str, objec
         ],
         capture_output=True,
         text=True,
+        cwd=cwd,
         env={**os.environ, "MINI_AGENT_GYM_ROOT": str(gym_root)},
     )
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] if output.is_file() else []
@@ -851,55 +848,75 @@ class GymTrainerTests(unittest.TestCase):
                 with (run_dir / "config/config.toml").open("rb") as config:
                     self.assertEqual(tomllib.load(config), {"provider": provider, "model": model})
 
-    def test_elapsed_ms_times_the_agent_without_the_oracle(self) -> None:
-        # A one-second oracle runs twice per episode (before and after the
-        # agent). Folding that into elapsed_ms would make the number operators
-        # compare across arms mostly oracle time.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            binary, _ = make_stub(root, "success")
-            document = task_document([{"name": "fix", "tags": []}])
-            document["defaults"]["oracle"] = {
-                "command": "sleep 1; test -f fixed.txt",
-                "id": "slow-oracle",
-            }
-            completed, rows, _ = run_training(root, repo, binary, document)
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            for row in rows:
-                self.assertTrue(row["success"], row)
-                self.assertGreaterEqual(row["oracle_ms"], 1900, row)
-                self.assertLess(row["elapsed_ms"], 900, row)
-                self.assertGreaterEqual(
-                    row["total_ms"], row["elapsed_ms"] + row["oracle_ms"], row
-                )
+    def test_phase_clocks_separate_agent_oracles_and_setup_on_success_failure_and_timeout(self) -> None:
+        for arm in ("none", "library"):
+            for outcome in ("success", "failure", "timeout"):
+                with self.subTest(arm=arm, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo = make_repo(root)
+                    gym_root = root / "gym"
+                    task_path = root / "tasks.json"
+                    task_path.write_text(json.dumps(task_document([{"name": "clock", "timeout_secs": 5}])))
+                    task = TRAIN_MODULE.load_tasks(task_path, 5)[0]
+                    args = mock.Mock(binary="agent", provider=None, model=None, forward_env=[], agent_arg=[],
+                                     allow_empty_workspace=False, keep_run_dirs=False)
+                    now = 100.0
+                    oracle_calls = 0
+                    original_prepare = TRAIN_MODULE.prepare_workspace
+                    original_cleanup = TRAIN_MODULE.cleanup_episode
 
-    def test_agent_timeout_records_clock_failure_and_cleans_workspace(self) -> None:
-        # The pre-agent oracle also takes a second here, so an elapsed_ms that
-        # still spanned the whole episode would be about twice the timeout.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            binary, _ = make_stub(root, "timeout")
-            document = task_document([{"name": "slow", "tags": []}])
-            document["defaults"]["oracle"] = {
-                "command": "sleep 1; test -f fixed.txt",
-                "id": "slow-oracle",
-            }
-            completed, rows, gym_root = run_training(
-                root, repo, binary, document, "--task-timeout", "1"
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            for row in rows:
-                self.assertFalse(row["success"])
-                self.assertEqual(row["failure_reason"], "agent_timeout")
-                self.assertEqual(row["agent_exit"], 124)
-                self.assertEqual(row["timeout_secs"], 1)
-                self.assertGreaterEqual(row["elapsed_ms"], 900, row)
-                self.assertLess(row["elapsed_ms"], 1900, row)
-                self.assertGreaterEqual(row["oracle_ms"], 900, row)
-            self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
-            self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
+                    def prepare(*args, **kwargs):
+                        nonlocal now
+                        original_prepare(*args, **kwargs)
+                        now += 7
+
+                    def cleanup(*args, **kwargs):
+                        nonlocal now
+                        original_cleanup(*args, **kwargs)
+                        # Initial stale-state cleanup is outside total_ms; final cleanup is inside.
+                        now += 13
+
+                    def install(*args):
+                        nonlocal now
+                        now += 11
+                        return ["skill-root"]
+
+                    def oracle(*args):
+                        nonlocal now, oracle_calls
+                        oracle_calls += 1
+                        now += 3 if oracle_calls == 1 else 5
+                        return (1, "before") if oracle_calls == 1 else (0, "")
+
+                    def agent(argv, cwd, env, timeout):
+                        nonlocal now
+                        self.assertEqual(timeout, 5)
+                        now += 5 if outcome == "timeout" else 2
+                        if outcome == "timeout":
+                            raise subprocess.TimeoutExpired(argv, timeout, stderr=b"timeout detail")
+                        return subprocess.CompletedProcess(argv, 3 if outcome == "failure" else 0, b"", b"agent detail")
+
+                    with mock.patch.object(TRAIN_MODULE.time, "monotonic", side_effect=lambda: now), \
+                         mock.patch.object(TRAIN_MODULE, "prepare_workspace", side_effect=prepare), \
+                         mock.patch.object(TRAIN_MODULE, "cleanup_episode", side_effect=cleanup), \
+                         mock.patch.object(TRAIN_MODULE, "install_library", side_effect=install), \
+                         mock.patch.object(TRAIN_MODULE, "run_oracle", side_effect=oracle), \
+                         mock.patch.object(TRAIN_MODULE, "run", side_effect=agent):
+                        row = TRAIN_MODULE.run_episode(task, arm, args, repo, gym_root)
+                    timed_out = outcome == "timeout"
+                    self.assertEqual(row["success"], outcome == "success")
+                    self.assertEqual(row["elapsed_ms"], 5000 if timed_out else 2000)
+                    self.assertEqual(row["oracle_ms"], 3000 if timed_out else 8000)
+                    self.assertEqual(row["total_ms"], (28000 if timed_out else 30000) + (11000 if arm == "library" else 0))
+                    self.assertEqual(row["agent_exit"], {"success": 0, "failure": 3, "timeout": 124}[outcome])
+                    self.assertEqual(row["oracle_pre_exit"], 1)
+                    self.assertEqual(row["oracle_exit"], None if timed_out else 0)
+                    self.assertEqual(row["failure_reason"], {"success": None, "failure": "agent_exit_nonzero",
+                                                            "timeout": "agent_timeout"}[outcome])
+                    self.assertEqual(row["agent_stderr_tail"], "timeout detail" if timed_out else "agent detail")
+                    self.assertEqual(row["active_skill_ids"], ["skill-root"] if arm == "library" else [])
+                    self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
+                    self.assertEqual(sorted((gym_root / "runs").iterdir()), [])
+                    self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
 
     def test_agent_failure_is_a_failed_row_and_the_run_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -918,17 +935,78 @@ class GymTrainerTests(unittest.TestCase):
             self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
 
     def test_library_install_failure_only_fails_the_library_arm(self) -> None:
+        for failure in ["command", "corrupt_database", "incompatible_schema", "missing_database", "no_active_roots"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                binary, _ = make_stub(root, "install_fail" if failure == "command" else "success")
+                if failure in ("corrupt_database", "incompatible_schema", "missing_database"):
+                    payload = {
+                        "corrupt_database": "(root/'skills.db').write_bytes(b'not sqlite')",
+                        "incompatible_schema": "sqlite3.connect(root/'skills.db').close()",
+                        "missing_database": "pass",
+                    }[failure]
+                    (root / "stub_db.py").write_text(
+                        "import pathlib,sqlite3,sys\n"
+                        "root=pathlib.Path(sys.argv[2])/'skills'; root.mkdir(parents=True,exist_ok=True)\n" + payload + "\n"
+                    )
+                elif failure == "no_active_roots":
+                    helper = root / "stub_db.py"
+                    helper.write_text(helper.read_text().replace("status = 'active'", "status = 'pending'"))
+                completed, rows, gym_root = run_training(
+                    root, repo, binary, task_document([{"name": "first"}, {"name": "second"}])
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual([(row["task"], row["arm"]) for row in rows],
+                                 [(name, arm) for name in ("first", "second") for arm in ("none", "library")])
+                for row in rows:
+                    if row["arm"] == "none":
+                        self.assertTrue(row["success"], row)
+                        continue
+                    self.assertFalse(row["success"])
+                    self.assertEqual(row["failure_reason"], "library_install_failed")
+                    detail = {"command": "seed import exploded", "corrupt_database": "file is not a database",
+                              "incompatible_schema": "no such table", "missing_database": "0 skills.db files",
+                              "no_active_roots": "left no active skill revision"}[failure]
+                    self.assertIn(detail, row["failure_detail"])
+                    self.assertIsNone(row["agent_exit"])
+                self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
+                self.assertEqual(sorted((gym_root / "runs").iterdir()), [])
+                self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
+
+    def test_library_packages_resolve_from_invocation_before_neutral_import(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             repo = make_repo(root)
-            binary, _ = make_stub(root, "install_fail")
-            completed, rows, _ = run_training(root, repo, binary, task_document([{"name": "fix", "tags": []}]))
+            invocation = root / "invocation"
+            invocation.mkdir()
+            bundle = invocation / "bundle file.json"
+            bundle.write_text("expected\n")
+            package_dir = invocation / "bundle directory"
+            package_dir.mkdir()
+            (package_dir / "package.json").write_text("expected\n")
+            imports = root / "imports.log"
+            binary, _ = make_stub(root, "success")
+            binary.write_text(binary.read_text().replace("mode=success", "mode=success\n" + (
+                'if [ "${1:-}" = --import-learned-skill ]; then\n'
+                f'  printf "%s\\n" "$2" >> {shlex.quote(str(imports))}\n'
+                '  bundle="$2"; if [ -d "$bundle" ]; then bundle="$bundle/package.json"; fi\n'
+                '  grep -qx expected "$bundle" || exit 9\n'
+                'fi\n'
+            )))
+            document = task_document([
+                {"name": "relative-file", "library": bundle.name},
+                {"name": "relative-directory", "library": package_dir.name},
+                {"name": "absolute-file", "library": str(bundle)},
+            ])
+            completed, rows, gym_root = run_training(root, repo, binary, document, cwd=invocation)
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertTrue(rows[0]["success"], rows[0])
-            self.assertFalse(rows[1]["success"])
-            self.assertEqual(rows[1]["failure_reason"], "library_install_failed")
-            self.assertIn("seed import exploded", rows[1]["failure_detail"])
-            self.assertIsNone(rows[1]["agent_exit"])
+            self.assertEqual(len(rows), 6)
+            for row in rows:
+                self.assertTrue(row["success"], row)
+                self.assertEqual(row["active_skill_ids"], ["skill-root"] if row["arm"] == "library" else [])
+            self.assertEqual(imports.read_text().splitlines(), [str(bundle), str(package_dir), str(bundle)])
+            self.assertEqual(sorted((gym_root / "runs").iterdir()), [])
 
     def test_failed_checkouts_require_opt_in_and_a_fresh_empty_fallback(self) -> None:
         for failure in ["missing_revision", "checkout_hook", "locked_hook"]:
