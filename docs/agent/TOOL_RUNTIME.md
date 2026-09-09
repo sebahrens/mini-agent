@@ -29,11 +29,22 @@ shutdown.
 Interactive teardown runs after both normal exit and event-loop errors. It closes
 the input receiver before joining the event thread, cancels the main runner and
 side questions, and waits for their owned work before closing shared services.
+Terminal handoff uses the same input-stop path, so a full event queue cannot
+prevent an editor or synchronous prompt from taking over stdin.
 `src/ui/prebuild.rs` owns background agent construction and its work scope. It
 lets cancelled MCP initialization finish process cleanup, explicitly closes MCP
 managers in rejected or queued prebuild results, and waits for scoped children.
+The result receiver stays with that owner. A memory refresh retires the stale
+prebuild before constructing a replacement; a retirement failure stops the new
+turn. Receiving a result preserves its owner until retirement.
 Retirement has a five-second bound per owner; a timeout is reported in the log
 and remaining cleanup still runs.
+
+Terminal `Done` and `Error` events precede the runner's final cleanup. The UI
+waits for its lifecycle channel to close before starting compaction, loop
+validation, or another turn. Successful response data is committed before that
+wait, and normal settlement preserves the cached agent. A timeout retains the
+channel and abort handle so error teardown can still cancel and settle the work.
 
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher

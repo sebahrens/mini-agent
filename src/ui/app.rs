@@ -457,8 +457,7 @@ pub(crate) struct App<'a> {
     deferred_user_events: std::collections::VecDeque<UserEvent>,
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
-    prebuild_rx: Option<mpsc::Receiver<PrebuildPayload>>,
-    prebuild_task: Option<super::prebuild::AgentPrebuild>,
+    prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
 }
 
@@ -708,7 +707,7 @@ impl<'a> App<'a> {
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
 
-        let (prebuild_task, prebuild_rx) = if auto_trigger_msg.is_none() && run.agent.is_none() {
+        let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
             let session_model = ui.session.model.to_string();
             let tool_output_session_id = ui.session.id.to_string();
@@ -728,59 +727,58 @@ impl<'a> App<'a> {
             let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
             let prebuild_scope = crate::agent::runner::AgentWorkScope::new();
-            let (task, receiver) =
-                super::prebuild::AgentPrebuild::start(prebuild_scope, async move {
-                    #[cfg(feature = "mcp")]
-                    let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
-                        None
-                    } else if let Some(ref servers) = cfg_clone.mcp_servers {
-                        if !servers.is_empty() {
-                            Some(
-                                McpClientManager::connect_all_in_binding(servers, &workspace_clone)
-                                    .await,
-                            )
-                        } else {
-                            None
-                        }
+            let prebuild = super::prebuild::AgentPrebuild::start(prebuild_scope, async move {
+                #[cfg(feature = "mcp")]
+                let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
+                    None
+                } else if let Some(ref servers) = cfg_clone.mcp_servers {
+                    if !servers.is_empty() {
+                        Some(
+                            McpClientManager::connect_all_in_binding(servers, &workspace_clone)
+                                .await,
+                        )
                     } else {
                         None
-                    };
-
-                    let a = crate::ui::state::AgentBuildCtx {
-                        cli: &cli_clone,
-                        cfg: &cfg_clone,
-                        context: &context_clone,
-                        workspace: &workspace_clone,
-                        client: &client_clone,
-                        permission: &permission_clone,
-                        ask_tx: &ask_tx_clone,
-                        sandbox: &sandbox_clone,
-                        read_tracker: &read_tracker_clone,
-                        todo_store: &todo_store_clone,
-                        tool_output_session_id: &tool_output_session_id,
-                        tool_result_spills: &tool_result_spills,
-                        #[cfg(feature = "js")]
-                        js_session_state: &js_session_state,
-                        #[cfg(feature = "skills")]
-                        skill_services: &skill_services_clone,
-                        #[cfg(feature = "mcp")]
-                        mcp_manager: mcp.as_ref(),
                     }
-                    .rebuild_agent(&session_model, reasoning_enabled)
-                    .await;
+                } else {
+                    None
+                };
 
+                let a = crate::ui::state::AgentBuildCtx {
+                    cli: &cli_clone,
+                    cfg: &cfg_clone,
+                    context: &context_clone,
+                    workspace: &workspace_clone,
+                    client: &client_clone,
+                    permission: &permission_clone,
+                    ask_tx: &ask_tx_clone,
+                    sandbox: &sandbox_clone,
+                    read_tracker: &read_tracker_clone,
+                    todo_store: &todo_store_clone,
+                    tool_output_session_id: &tool_output_session_id,
+                    tool_result_spills: &tool_result_spills,
+                    #[cfg(feature = "js")]
+                    js_session_state: &js_session_state,
+                    #[cfg(feature = "skills")]
+                    skill_services: &skill_services_clone,
                     #[cfg(feature = "mcp")]
-                    {
-                        (a, mcp)
-                    }
-                    #[cfg(not(feature = "mcp"))]
-                    {
-                        a
-                    }
-                });
-            (Some(task), Some(receiver))
+                    mcp_manager: mcp.as_ref(),
+                }
+                .rebuild_agent(&session_model, reasoning_enabled)
+                .await;
+
+                #[cfg(feature = "mcp")]
+                {
+                    (a, mcp)
+                }
+                #[cfg(not(feature = "mcp"))]
+                {
+                    a
+                }
+            });
+            Some(prebuild)
         } else {
-            (None, None)
+            None
         };
 
         #[cfg(feature = "hooks")]
@@ -818,8 +816,7 @@ impl<'a> App<'a> {
             deferred_user_events: std::collections::VecDeque::new(),
             running,
             event_handle,
-            prebuild_rx,
-            prebuild_task,
+            prebuild,
             terminal_guard,
         };
         app.request_git_status_refresh();
@@ -892,7 +889,7 @@ impl<'a> App<'a> {
                         ControlFlow::Continue(()) => {}
                     }
                 }
-                Some(prebuilt) = async { self.prebuild_rx.as_mut()?.recv().await }, if self.run.agent.is_none() => {
+                Some(prebuilt) = async { self.prebuild.as_mut()?.recv().await }, if self.run.agent.is_none() => {
                     self.take_prebuild(prebuilt);
                     self.refresh()?;
                 }
@@ -918,9 +915,9 @@ impl<'a> App<'a> {
                     self.renderer.tick_spinner()?;
                 }
                 else => {
-                    if let Some(rx) = self.prebuild_rx.as_mut()
+                    if let Some(rx) = self.prebuild.as_mut()
                         && self.run.agent.is_none()
-                        && let Ok(payload) = rx.try_recv()
+                        && let Some(payload) = rx.try_recv()
                     {
                         self.take_prebuild(payload);
                     }
@@ -949,9 +946,7 @@ impl<'a> App<'a> {
     }
 
     pub(crate) async fn teardown(mut self) {
-        self.running.store(false, Ordering::Relaxed);
-
-        self.user_rx.close();
+        self.pause_event_thread();
 
         // Retire owned work before closing the services it can still use.
         const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -967,17 +962,12 @@ impl<'a> App<'a> {
         if let Err(error) = self.run.retire(TEARDOWN_TIMEOUT).await {
             tracing::warn!(%error, "TUI main-run cleanup failed");
         }
-        if let Some(prebuild) = self.prebuild_task.take()
-            && let Err(error) = prebuild
-                .retire(self.prebuild_rx.take(), TEARDOWN_TIMEOUT)
-                .await
+        if let Some(prebuild) = self.prebuild.take()
+            && let Err(error) = prebuild.retire(TEARDOWN_TIMEOUT).await
         {
             tracing::warn!(%error, "TUI prebuild cleanup failed");
         }
 
-        if let Some(h) = self.event_handle {
-            let _ = h.join();
-        }
         #[cfg(feature = "lsp")]
         crate::extras::lsp::shutdown_live_managers().await;
         #[cfg(feature = "mcp")]
@@ -1387,7 +1377,7 @@ impl<'a> App<'a> {
                         .write_line(&format!("> {}", safe_line), Color::Green)?;
                 }
                 self.renderer.write_line("", Color::White)?;
-                self.start_main_run(&text).await;
+                self.start_main_run(&text).await?;
             }
         }
 
@@ -1525,7 +1515,9 @@ impl<'a> App<'a> {
                 }
                 self.ui.sandbox.kill_active();
                 self.run.is_running = false;
-                self.run.agent_rx = None;
+                if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
+                    tracing::warn!(%error, "TUI completed-run cleanup failed");
+                }
                 self.run.compaction_decision_tx = None;
                 self.run.agent_line_started = false;
                 self.run.response_buf.clear();
@@ -1686,7 +1678,7 @@ impl<'a> App<'a> {
                         .write_line(&format!("> {}", sanitize_output(line)), Color::Green)?;
                 }
                 self.renderer.write_line("", Color::White)?;
-                self.start_main_run(&next).await;
+                self.start_main_run(&next).await?;
             }
         }
 
@@ -1810,7 +1802,7 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    async fn start_main_run(&mut self, text: &str) {
+    async fn start_main_run(&mut self, text: &str) -> anyhow::Result<()> {
         // Preflight: if the pending payload is irreducibly too large, reject
         // locally before any provider I/O or session mutation.
         let text_tokens = crate::session::Session::estimate_tokens(text);
@@ -1850,7 +1842,7 @@ impl<'a> App<'a> {
                 ),
                 C_ERROR,
             );
-            return;
+            return Ok(());
         }
         start_main_run(
             text,
@@ -1858,21 +1850,21 @@ impl<'a> App<'a> {
             &mut self.run,
             &mut self.ui,
             &self.slash,
-            &mut self.prebuild_rx,
+            &mut self.prebuild,
         )
-        .await;
+        .await
     }
 
-    async fn start_internal_main_run(&mut self, text: &str) {
+    async fn start_internal_main_run(&mut self, text: &str) -> anyhow::Result<()> {
         start_main_run(
             text,
             false,
             &mut self.run,
             &mut self.ui,
             &self.slash,
-            &mut self.prebuild_rx,
+            &mut self.prebuild,
         )
-        .await;
+        .await
     }
 
     async fn ensure_agent(&mut self) {
@@ -1911,7 +1903,7 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
         self.run.agent = None;
-        self.start_main_run(&msg).await;
+        self.start_main_run(&msg).await?;
         Ok(())
     }
 
@@ -2386,7 +2378,7 @@ impl<'a> App<'a> {
                     .unwrap_or("")
                     .to_string();
                 self.chain.dot_prompt_restore = self.ui.context.one_shot_restore.take();
-                self.start_internal_main_run(&msg).await;
+                self.start_internal_main_run(&msg).await?;
             }
             #[cfg(feature = "memory")]
             Err(e) if e.to_string().starts_with("DEFER_EDITOR:") => {
@@ -2651,7 +2643,6 @@ impl<'a> App<'a> {
         {
             self.run.agent = Some(prebuilt);
         }
-        self.prebuild_rx = None;
     }
 
     #[cfg(feature = "mcp")]
@@ -2710,8 +2701,11 @@ impl<'a> App<'a> {
     /// consumer (editor, pager, y/N prompt) is the only tty reader. Pair with
     /// `rebind_event_thread` once the terminal is resumed.
     fn pause_event_thread(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // A blocked input sender cannot observe the flag until its send wakes.
+        // Rebinding replaces this receiver after the synchronous tty consumer.
+        self.user_rx.close();
         if let Some(h) = self.event_handle.take() {
-            self.running.store(false, Ordering::Relaxed);
             let _ = h.join();
         }
     }
@@ -3116,10 +3110,8 @@ impl<'a> App<'a> {
             retire_scoped_task(task, scope, "side-question", RETIRE_TIMEOUT).await?;
         }
         self.btw_inflight = 0;
-        if let Some(prebuild) = self.prebuild_task.take() {
-            prebuild
-                .retire(self.prebuild_rx.take(), RETIRE_TIMEOUT)
-                .await?;
+        if let Some(prebuild) = self.prebuild.take() {
+            prebuild.retire(RETIRE_TIMEOUT).await?;
         }
         #[cfg(feature = "mcp")]
         if let Some(manager) = self.ui.mcp_manager.take() {

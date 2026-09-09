@@ -389,11 +389,20 @@ impl AgentRunState {
         if let Some(abort) = self.main_abort.take() {
             abort.abort();
         }
-        if let Some(mut events) = self.agent_rx.take() {
+        self.settle(timeout).await
+    }
+
+    /// A terminal payload precedes owned-work cleanup. Keep the channel and
+    /// abort handle on timeout so error teardown can still retire that work.
+    pub(crate) async fn settle(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
+        if let Some(events) = self.agent_rx.as_mut() {
             tokio::time::timeout(timeout, async { while events.recv().await.is_some() {} })
                 .await
-                .map_err(|_| anyhow::anyhow!("timed out retiring the active agent workspace"))?;
+                .map_err(|_| anyhow::anyhow!("timed out settling the active agent workspace"))?;
         }
+        self.agent_rx = None;
+        self.main_abort = None;
+        self.compaction_decision_tx = None;
         Ok(())
     }
 }
@@ -512,6 +521,163 @@ mod validation_generation_tests {
 
 #[cfg(test)]
 mod retirement_tests {
+    #[tokio::test]
+    async fn terminal_settlement_preserves_post_response_work_and_timeout_ownership() {
+        use crate::agent::runner::{AgentRunCleanupGuard, AgentWorkScope, spawn_blocking_scoped};
+        use crate::event::AgentEvent;
+        use std::time::Duration;
+        use tokio::sync::{mpsc, oneshot};
+
+        for fail in [false, true] {
+            let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
+            let task_scope = scope.clone();
+            let (events_tx, events_rx) = mpsc::channel(1);
+            let (continue_tx, continue_rx) = oneshot::channel();
+            let (bookkeeping_tx, bookkeeping_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let cleanup = AgentRunCleanupGuard::new(task_scope.clone(), events_tx.clone());
+                task_scope
+                    .run(async move {
+                        let _child = spawn_blocking_scoped(|| ());
+                        let terminal = if fail {
+                            AgentEvent::error_with("fixture failure", Vec::new())
+                        } else {
+                            AgentEvent::Done {
+                                response: "completed".into(),
+                                interactions: Vec::new(),
+                            }
+                        };
+                        events_tx.send(terminal).await.unwrap();
+                        continue_rx.await.unwrap();
+                        bookkeeping_tx.send(()).unwrap();
+                    })
+                    .await;
+                cleanup.settle().await;
+            });
+            tokio::task::spawn_blocking(move || {
+                started.recv_timeout(Duration::from_secs(2)).unwrap()
+            })
+            .await
+            .unwrap();
+            let mut run = super::AgentRunState {
+                agent: Some(crate::ui::prebuild::test_agent()),
+                agent_rx: Some(events_rx),
+                main_abort: Some(task.abort_handle()),
+                ..super::AgentRunState::default()
+            };
+            let terminal = run.agent_rx.as_mut().unwrap().recv().await.unwrap();
+            assert_eq!(matches!(terminal, AgentEvent::Error { .. }), fail);
+            let error = run.settle(Duration::from_millis(20)).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "timed out settling the active agent workspace"
+            );
+            assert!(
+                !task.is_finished(),
+                "settlement must not abort post-response bookkeeping"
+            );
+            assert!(
+                run.agent_rx.is_some(),
+                "timeout must preserve the cleanup barrier"
+            );
+            assert!(
+                run.main_abort.is_some(),
+                "timeout must retain cancellation authority"
+            );
+            continue_tx.send(()).unwrap();
+            bookkeeping_rx
+                .await
+                .expect("post-response bookkeeping must complete");
+            let mut settlement = tokio::spawn(async move {
+                use clap::Parser;
+                let workspace = std::sync::Arc::new(
+                    crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap())
+                        .unwrap(),
+                );
+                let cli =
+                    crate::cli::Cli::parse_from(["mini-agent", "--no-session", "--no-sandbox"]);
+                let cfg = crate::config::Config::default();
+                let mut session =
+                    crate::session::Session::new("openrouter", "test-model", 128_000, "");
+                let mut context = crate::context::ContextFiles {
+                    workspace_root: workspace.root().to_path_buf(),
+                    agents: None,
+                    prompts: Default::default(),
+                    current_prompt: None,
+                    current_prompt_name: None,
+                    agent_definitions: Default::default(),
+                    current_agent_name: None,
+                    current_agent_explicit: false,
+                    themes: Default::default(),
+                    current_theme_name: None,
+                    extra_files: Vec::new(),
+                    extra_file_contents: Default::default(),
+                    one_shot_restore: None,
+                    chain_declined: Vec::new(),
+                    #[cfg(feature = "memory")]
+                    memory: None,
+                    #[cfg(feature = "archmd")]
+                    architecture: None,
+                };
+                let client = crate::provider::AnyClient::OpenRouter(
+                    rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+                );
+                let mut ui = super::UiContext::new(
+                    &cli,
+                    &cfg,
+                    &mut session,
+                    &mut context,
+                    workspace,
+                    client,
+                    None,
+                    None,
+                    crate::sandbox::Sandbox::new(false, "none"),
+                    None,
+                );
+                let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+                let slash = super::SlashState {
+                    show_reasoning: false,
+                    reasoning_enabled: false,
+                    todo_tools_enabled: false,
+                };
+                let mut chain = super::ChainState::default();
+                #[cfg(feature = "loop")]
+                let (validation_tx, _validation_rx) = mpsc::channel(1);
+                crate::ui::event_handler::handle_agent_event(
+                    terminal,
+                    &mut renderer,
+                    &mut run,
+                    &mut ui,
+                    &slash,
+                    &mut chain,
+                    #[cfg(feature = "loop")]
+                    &validation_tx,
+                )
+                .await
+                .unwrap();
+                if !fail {
+                    assert_eq!(ui.session.messages.last().unwrap().content, "completed");
+                }
+                assert!(
+                    run.agent.is_some(),
+                    "normal settlement preserves the cached agent"
+                );
+                assert!(run.agent_rx.is_none());
+                assert!(run.main_abort.is_none());
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut settlement)
+                    .await
+                    .is_err(),
+                "terminal delivery does not release owned work"
+            );
+            release.release();
+            settlement.await.unwrap();
+            task.await.unwrap();
+            assert_eq!(scope.active_children(), 0);
+        }
+    }
+
     #[tokio::test]
     async fn main_run_retirement_waits_for_lifecycle_channel_after_abort() {
         use crate::agent::runner::{AgentRunCleanupGuard, AgentWorkScope, spawn_blocking_scoped};

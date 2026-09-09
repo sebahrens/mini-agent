@@ -1121,7 +1121,7 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
         let scope = crate::agent::runner::AgentWorkScope::new();
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
         let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
-        let (prebuild, receiver) = AgentPrebuild::start(scope.clone(), async move {
+        let prebuild = AgentPrebuild::start(scope.clone(), async move {
             let manager = McpClientManager::connect_all_in_binding(&servers, &workspace).await;
             if delivery == "rejected" {
                 connected_tx.send(()).unwrap();
@@ -1129,7 +1129,7 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
             }
             (test_agent(), Some(manager))
         });
-        let mut receiver = Some(receiver);
+        let mut prebuild = Some(prebuild);
         let mut pids = Vec::new();
         for lease in leases
             .iter()
@@ -1139,16 +1139,16 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
         }
         if delivery == "queued" {
             tokio::time::timeout(Duration::from_secs(2), async {
-                while receiver.as_ref().unwrap().is_empty() {
+                while !prebuild.as_ref().unwrap().has_queued_result() {
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("connected result must reach the prebuild queue");
         } else if delivery == "rejected" {
-            // A memory refresh can discard the receiver independently of quit.
+            // Dropping the owner cancels a pending publication as well.
             connected_rx.await.unwrap();
-            drop(receiver.take());
+            drop(prebuild.take());
             publish_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while process_is_alive(pids[0]) {
@@ -1160,10 +1160,9 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
         } else {
             assert!(!leases[9].exists(), "last connection must still be queued");
         }
-        prebuild
-            .retire(receiver, Duration::from_secs(3))
-            .await
-            .unwrap();
+        if let Some(prebuild) = prebuild {
+            prebuild.retire(Duration::from_secs(3)).await.unwrap();
+        }
         for pid in pids {
             assert!(
                 !process_is_alive(pid),
@@ -1175,6 +1174,150 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
         }
         assert_eq!(scope.active_children(), 0);
     }
+    fixture.cleanup();
+}
+
+#[cfg(feature = "memory")]
+#[tokio::test]
+async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
+    use crate::agent::runner::{AgentWorkScope, spawn_blocking_scoped};
+    use crate::ui::prebuild::{AgentPrebuild, test_agent};
+    use crate::ui::state::{AgentRunState, SlashState, UiContext};
+    use clap::Parser;
+
+    // Persistent memory uses process roots. Isolate this production entry-point
+    // test in a child, without replacing roots used by other tests or the user.
+    if std::env::var_os("ZS_TEST_MEMORY_PREFLIGHT").is_none() {
+        let fixture = FixtureBuild::compile();
+        let root = fixture.root.canonicalize().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "tests::mcp_stdio_tests::memory_refresh_retires_queued_prebuild_before_starting_turn", "--nocapture"])
+            .current_dir(&root).env("ZS_TEST_MEMORY_PREFLIGHT", "1");
+        for name in [
+            "CONFIG",
+            "DATA",
+            "LOCAL_DATA",
+            "STATE",
+            "CACHE",
+            "CREDENTIALS",
+        ] {
+            child.env(format!("ZS_{name}_DIR"), root.join(name));
+        }
+        let output = child.output().unwrap();
+        fixture.cleanup();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let fixture = FixtureBuild::compile();
+    let lease = fixture.lease("memory-prebuild");
+    let servers = HashMap::from([(
+        "memory-prebuild".to_string(),
+        fixture.config(
+            fixture.executable.display().to_string(),
+            Vec::new(),
+            "normal",
+            &lease,
+        ),
+    )]);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
+    let build_workspace = workspace.clone();
+    let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
+    let prebuild = AgentPrebuild::start(scope.clone(), async move {
+        let manager = McpClientManager::connect_all_in_binding(&servers, &build_workspace).await;
+        let _child = spawn_blocking_scoped(|| ());
+        (test_agent(), Some(manager))
+    });
+    tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2)).unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !prebuild.has_queued_result() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = wait_for_pid(&lease).await;
+    let mut start = tokio::spawn(async move {
+        let cli = crate::cli::Cli::parse_from([
+            "mini-agent",
+            "--no-session",
+            "--no-sandbox",
+            "--tools",
+            "todo_read",
+        ]);
+        let cfg = Config {
+            mcp_servers: Some(HashMap::new()),
+            ..Config::default()
+        };
+        let mut session = crate::session::Session::new("openrouter", "test-model", 128_000, "");
+        let mut context = crate::context::load_for_workspace(true, Some(workspace.root()));
+        assert!(context.memory.is_none());
+        context.memory = Some("stale prebuild memory".to_string());
+        let client = rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .base_url("http://127.0.0.1:9")
+            .build()
+            .unwrap();
+        let sandbox =
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+        let mut ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            crate::provider::AnyClient::OpenRouter(client),
+            None,
+            None,
+            sandbox,
+            None,
+        );
+        let mut run = AgentRunState::default();
+        let slash = SlashState {
+            show_reasoning: false,
+            reasoning_enabled: false,
+            todo_tools_enabled: false,
+        };
+        let mut prebuild = Some(prebuild);
+        crate::ui::start_main_run("hello", false, &mut run, &mut ui, &slash, &mut prebuild)
+            .await
+            .unwrap();
+        assert!(prebuild.is_none());
+        assert!(ui.context.memory.is_none());
+        assert!(
+            ui.mcp_manager.is_none(),
+            "stale manager must never be adopted"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "old MCP server must be reaped before the new turn starts"
+        );
+        assert!(run.is_running);
+        run.retire(Duration::from_secs(2)).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !scope.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("memory refresh must invalidate the queued prebuild");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut start)
+            .await
+            .is_err(),
+        "the replacement turn must wait for old prebuild work"
+    );
+    release.release();
+    start.await.unwrap();
+    assert_eq!(scope.active_children(), 0);
     fixture.cleanup();
 }
 

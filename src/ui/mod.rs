@@ -542,33 +542,31 @@ pub(crate) type PrebuildPayload = AnyAgent;
 pub(crate) async fn resolve_prebuild<'a>(
     agent: &'a mut Option<AnyAgent>,
     mcp_manager: &'a mut Option<McpClientManager>,
-    prebuild_rx: &'a mut Option<mpsc::Receiver<PrebuildPayload>>,
+    prebuild: &'a mut Option<prebuild::AgentPrebuild>,
 ) {
     if agent.is_some() {
         return;
     }
-    if let Some(rx) = prebuild_rx.as_mut() {
-        if let Some((a, mcp)) = rx.recv().await {
-            *agent = Some(a);
-            *mcp_manager = mcp;
-        }
-        *prebuild_rx = None;
+    if let Some(prebuild) = prebuild.as_mut()
+        && let Some((a, mcp)) = prebuild.recv().await
+    {
+        *agent = Some(a);
+        *mcp_manager = mcp;
     }
 }
 
 #[cfg(not(feature = "mcp"))]
 pub(crate) async fn resolve_prebuild<'a>(
     agent: &'a mut Option<AnyAgent>,
-    prebuild_rx: &'a mut Option<mpsc::Receiver<PrebuildPayload>>,
+    prebuild: &'a mut Option<prebuild::AgentPrebuild>,
 ) {
     if agent.is_some() {
         return;
     }
-    if let Some(rx) = prebuild_rx.as_mut() {
-        if let Some(a) = rx.recv().await {
-            *agent = Some(a);
-        }
-        *prebuild_rx = None;
+    if let Some(prebuild) = prebuild.as_mut()
+        && let Some(a) = prebuild.recv().await
+    {
+        *agent = Some(a);
     }
 }
 
@@ -582,23 +580,23 @@ pub(crate) async fn start_main_run(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     slash: &SlashState,
-    prebuild_rx: &mut Option<mpsc::Receiver<PrebuildPayload>>,
-) {
+    prebuild: &mut Option<prebuild::AgentPrebuild>,
+) -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut pending_turn = PendingMainTurn::capture(ui.session, text);
     #[cfg(feature = "memory")]
     if ui.context.refresh_memory_if_changed().await {
-        // Any completed/racing prebuild contains the old system preamble.
-        // Dropping the receiver also prevents a late stale result from being
-        // installed after the fresh agent is built below.
+        // A queued result still owns services; retire it before rebuilding.
         run.agent = None;
-        *prebuild_rx = None;
+        if let Some(stale) = prebuild.take() {
+            stale.retire(Duration::from_secs(5)).await?;
+        }
     }
     // Wait for the background prebuild if it hasn't completed yet.
     #[cfg(feature = "mcp")]
-    resolve_prebuild(&mut run.agent, &mut ui.mcp_manager, prebuild_rx).await;
+    resolve_prebuild(&mut run.agent, &mut ui.mcp_manager, prebuild).await;
     #[cfg(not(feature = "mcp"))]
-    resolve_prebuild(&mut run.agent, prebuild_rx).await;
+    resolve_prebuild(&mut run.agent, prebuild).await;
 
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
     run.request_tool_results_cleared = ui
@@ -644,6 +642,7 @@ pub(crate) async fn start_main_run(
     } else {
         mark_main_turn_started(ui.session, run, pending_turn);
     }
+    Ok(())
 }
 
 pub(crate) fn mark_main_turn_started(

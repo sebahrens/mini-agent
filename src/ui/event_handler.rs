@@ -293,13 +293,13 @@ pub async fn handle_agent_event(
             if let Some(ss) = ui.status_signals.as_ref() {
                 ss.send_stop();
             }
-            run.agent_rx = None;
             run.compaction_decision_tx = None;
             run.agent_line_started = false;
             finalize_response_segment(renderer, run)?;
             crate::ui::preserve_pending_main_turn_progress(run, ui.session);
             run.response_buf.clear();
             run.response_start_block = None;
+            run.settle(std::time::Duration::from_secs(5)).await?;
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let safe = sanitize_output(&e);
             renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
@@ -404,6 +404,7 @@ async fn handle_agent_done(
     // startup, or worktree-return presentation fails afterward.
     commit_turn_response(ui.session, &response, &interactions);
     ui.session.reanchor_calibration_to_current_messages();
+    run.settle(std::time::Duration::from_secs(5)).await?;
 
     finalize_response_segment(renderer, run)?;
     if run.response_buf.is_empty() && !run.agent_line_started {
@@ -458,8 +459,6 @@ async fn handle_agent_done(
     if let Some(ss) = ui.status_signals.as_ref() {
         ss.send_stop();
     }
-    run.agent_rx = None;
-    run.compaction_decision_tx = None;
 
     #[cfg(feature = "loop")]
     if let Some(ls) = chain.loop_state.as_mut()
