@@ -206,7 +206,8 @@ syntactically proven task/thread or local associated `spawn` calls are excluded;
 unrecognized terminals fail closed. The learned-skill reevaluation branch
 `matches!(status.as_str(), "verified" | "awaiting_approval")` compares a database status string;
 its exact source expression and full macro-context digest are classified `NON-PROCESS`.
-Spawn/status helpers hold the Windows creation mutex only through
+The `CommandWrap` creation adapter compiles with its LSP caller; MCP uses the separate RMCP
+creation adapter. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
 explicit stdio and reusable-builder semantics remain exact; that synchronous helper can therefore
 hold the mutex through output completion. Raw terminals in async functions, after `.await`, or in

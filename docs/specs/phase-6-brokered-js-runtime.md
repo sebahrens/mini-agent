@@ -205,6 +205,9 @@ waiting or active. A whole `VerifyArtifact` already dispatched to the worker rem
 the dispatcher admits waiting interactive calls before dequeuing the next verification. A request
 cancelled before dequeue never reaches the worker. Queue overflow or closure fails closed as a
 retryable admission-infrastructure failure and cannot produce an admission success.
+The parent scheduler, its blocking cancellation wakeups, and its submission APIs compile with
+`skills` or in transport tests. Plain-JS production builds omit that unused scheduling surface;
+the worker wire protocol and verification-result validation remain intact in every JS build.
 
 All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
 snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,

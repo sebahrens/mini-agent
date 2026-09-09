@@ -8,16 +8,19 @@ use std::io::{Read, Write};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
+#[cfg(any(test, feature = "skills"))]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "skills"))]
+use super::protocol::VerifyArtifact;
 use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
     FrameError, InvocationId, JsErrorCode, JsExceptionClass, ParentFrame, ParentProtocol,
     ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
-    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame,
-    write_frame,
+    VerificationResult, WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -40,6 +43,7 @@ const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// long enough for bounded process-tree teardown and durable unknown-outcome reconciliation, but
 /// never extends an abandoned caller indefinitely.
 const EFFECT_CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(test, feature = "skills"))]
 const VERIFICATION_QUEUE_CAPACITY: usize = 16;
 const MAX_PROCESS_AGE: Duration = Duration::from_secs(15 * 60);
 const MAX_PROCESS_INVOCATIONS: u64 = 256;
@@ -107,16 +111,20 @@ pub(crate) enum WorkerError {
     #[error("JavaScript worker supervisor identity space is exhausted")]
     IdentityExhausted,
     #[error("blocking JavaScript verification cannot run inside a Tokio runtime")]
+    #[cfg(any(test, feature = "skills"))]
     BlockingVerifyInAsyncRuntime,
     #[error("JavaScript verification attempted an external effect")]
     UnexpectedVerificationEffect,
     #[error("JavaScript verification queue is at capacity")]
+    #[cfg(any(test, feature = "skills"))]
     VerificationQueueFull,
     #[error("JavaScript verification queue is unavailable")]
+    #[cfg(any(test, feature = "skills"))]
     VerificationQueueClosed,
 }
 
 impl WorkerError {
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) fn is_retryable_admission_infrastructure(self) -> bool {
         matches!(
             self,
@@ -138,7 +146,9 @@ struct SupervisorInner {
     active_generation: AtomicU64,
     accepts_test_preamble: bool,
     watchdog: Duration,
+    #[cfg(any(test, feature = "skills"))]
     priority: Arc<InvocationPriority>,
+    #[cfg(any(test, feature = "skills"))]
     verification_scheduler: OnceLock<Result<VerificationScheduler, WorkerError>>,
     reuse_policy: WorkerReusePolicy,
     #[cfg(test)]
@@ -248,30 +258,37 @@ struct BoundedStderrDrain {
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "skills"))]
 struct InvocationPriority {
     state: Mutex<InvocationPriorityState>,
     changed: Condvar,
+    #[cfg(test)]
     observed: tokio::sync::Notify,
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "skills"))]
 struct InvocationPriorityState {
     interactive_waiters: usize,
     interactive_active: usize,
     verification_running: bool,
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct VerificationScheduler {
     sender: Mutex<Option<mpsc::SyncSender<VerificationJob>>>,
     queue: Arc<VerificationQueueObservation>,
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "skills"))]
 struct VerificationQueueObservation {
     depth: Mutex<usize>,
+    #[cfg(test)]
     changed: tokio::sync::Notify,
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct VerificationJob {
     request: VerifyArtifact,
     cancellation: PermCancellation,
@@ -280,17 +297,20 @@ struct VerificationJob {
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "skills"))]
 struct VerificationReply {
     result: Mutex<Option<Result<VerificationResult, WorkerError>>>,
     changed: Condvar,
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct VerificationReplySender {
     reply: Arc<VerificationReply>,
     armed: bool,
 }
 // END AUTHORITY-FREE SUPERVISOR STATE
 
+#[cfg(any(test, feature = "skills"))]
 impl VerificationReply {
     fn complete(&self, result: Result<VerificationResult, WorkerError>) {
         let mut slot = self
@@ -338,6 +358,7 @@ impl VerificationReply {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl VerificationReplySender {
     fn new(reply: Arc<VerificationReply>) -> Self {
         Self { reply, armed: true }
@@ -349,6 +370,7 @@ impl VerificationReplySender {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl Drop for VerificationReplySender {
     fn drop(&mut self) {
         if self.armed {
@@ -448,7 +470,9 @@ impl JsWorkerSupervisor {
             active_generation: AtomicU64::new(0),
             accepts_test_preamble,
             watchdog,
+            #[cfg(any(test, feature = "skills"))]
             priority: Arc::new(InvocationPriority::default()),
+            #[cfg(any(test, feature = "skills"))]
             verification_scheduler: OnceLock::new(),
             reuse_policy,
             #[cfg(test)]
@@ -600,6 +624,7 @@ impl JsWorkerSupervisor {
         }
     }
 
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) fn verify_blocking(
         &self,
         request: VerifyArtifact,
@@ -607,6 +632,7 @@ impl JsWorkerSupervisor {
         self.verify_blocking_cancellable(request, PermCancellation::new())
     }
 
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) fn verify_blocking_cancellable(
         &self,
         request: VerifyArtifact,
@@ -623,6 +649,7 @@ impl JsWorkerSupervisor {
             .submit(request, cancellation, deadline)
     }
 
+    #[cfg(any(test, feature = "skills"))]
     fn verification_scheduler(&self) -> Result<&VerificationScheduler, WorkerError> {
         self.0
             .verification_scheduler
@@ -644,8 +671,10 @@ impl JsWorkerSupervisor {
         // If a deadline is provided from the caller (e.g., from JsTool::call), use that absolute
         // deadline. Otherwise, create a fresh deadline from the watchdog duration.
         let deadline = deadline_override.unwrap_or_else(|| Instant::now() + self.0.watchdog);
+        #[cfg(any(test, feature = "skills"))]
         let waiter = self.0.priority.register_interactive();
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        #[cfg(any(test, feature = "skills"))]
         let _active_interactive = waiter.activate();
         self.invoke_with_state(
             &mut state,
@@ -658,6 +687,7 @@ impl JsWorkerSupervisor {
         .await
     }
 
+    #[cfg(any(test, feature = "skills"))]
     async fn invoke_scheduled_verification(
         &self,
         request: VerifyArtifact,
@@ -919,12 +949,14 @@ impl JsWorkerSupervisor {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl InvocationPriority {
     fn register_interactive(self: &Arc<Self>) -> InteractiveWaiter {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.interactive_waiters = state.interactive_waiters.saturating_add(1);
         drop(state);
         self.changed.notify_all();
+        #[cfg(test)]
         self.observed.notify_waiters();
         InteractiveWaiter {
             priority: Arc::clone(self),
@@ -997,11 +1029,13 @@ impl InvocationPriority {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct InteractiveWaiter {
     priority: Arc<InvocationPriority>,
     waiting: bool,
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl InteractiveWaiter {
     fn activate(mut self) -> ActiveInteractive {
         let mut state = self
@@ -1014,6 +1048,7 @@ impl InteractiveWaiter {
         self.waiting = false;
         drop(state);
         self.priority.changed.notify_all();
+        #[cfg(test)]
         self.priority.observed.notify_waiters();
         ActiveInteractive {
             priority: Arc::clone(&self.priority),
@@ -1021,6 +1056,7 @@ impl InteractiveWaiter {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl Drop for InteractiveWaiter {
     fn drop(&mut self) {
         if !self.waiting {
@@ -1034,14 +1070,17 @@ impl Drop for InteractiveWaiter {
         state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
         drop(state);
         self.priority.changed.notify_all();
+        #[cfg(test)]
         self.priority.observed.notify_waiters();
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct ActiveInteractive {
     priority: Arc<InvocationPriority>,
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl Drop for ActiveInteractive {
     fn drop(&mut self) {
         let mut state = self
@@ -1052,14 +1091,17 @@ impl Drop for ActiveInteractive {
         state.interactive_active = state.interactive_active.saturating_sub(1);
         drop(state);
         self.priority.changed.notify_all();
+        #[cfg(test)]
         self.priority.observed.notify_waiters();
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct VerificationLease {
     priority: Arc<InvocationPriority>,
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl Drop for VerificationLease {
     fn drop(&mut self) {
         let mut state = self
@@ -1070,10 +1112,12 @@ impl Drop for VerificationLease {
         state.verification_running = false;
         drop(state);
         self.priority.changed.notify_all();
+        #[cfg(test)]
         self.priority.observed.notify_waiters();
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl VerificationScheduler {
     fn start(supervisor: Weak<SupervisorInner>) -> Result<Self, WorkerError> {
         let (sender, receiver) = mpsc::sync_channel(VERIFICATION_QUEUE_CAPACITY);
@@ -1123,6 +1167,7 @@ impl VerificationScheduler {
             Ok(()) => {
                 *depth = depth.saturating_add(1);
                 drop(depth);
+                #[cfg(test)]
                 self.queue.changed.notify_waiters();
             }
             Err(mpsc::TrySendError::Full(_)) => {
@@ -1166,6 +1211,7 @@ impl VerificationScheduler {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 fn run_verification_scheduler(
     supervisor: Weak<SupervisorInner>,
     receiver: mpsc::Receiver<VerificationJob>,
@@ -1217,6 +1263,7 @@ fn run_verification_scheduler(
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 fn verification_dequeued(queue: &VerificationQueueObservation) {
     let mut depth = queue
         .depth
@@ -1224,6 +1271,7 @@ fn verification_dequeued(queue: &VerificationQueueObservation) {
         .unwrap_or_else(|error| error.into_inner());
     *depth = depth.saturating_sub(1);
     drop(depth);
+    #[cfg(test)]
     queue.changed.notify_waiters();
 }
 
@@ -1307,6 +1355,7 @@ enum InvocationRequest {
         RunStep,
         Arc<crate::extras::js::skills::turn::TurnSkillBundle>,
     ),
+    #[cfg(any(test, feature = "skills"))]
     Verify(VerifyArtifact),
 }
 
@@ -1576,8 +1625,10 @@ fn retire_idle_generation(
     let _ = did_retire;
 }
 
+#[cfg(any(test, feature = "skills"))]
 struct RejectEffects;
 
+#[cfg(any(test, feature = "skills"))]
 impl InvocationEffectHandler for RejectEffects {
     fn handle_effect(
         &mut self,
@@ -1786,6 +1837,9 @@ async fn run_invocation<H: InvocationEffectHandler>(
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<InvocationTerminal, WorkerError> {
+    #[cfg(not(any(test, feature = "skills")))]
+    let expected_verification_cases: Option<Vec<String>> = None;
+    #[cfg(any(test, feature = "skills"))]
     let expected_verification_cases = if let InvocationRequest::Verify(request) = &request {
         let cases = request.cases.iter().map(|case| case.case_id.clone());
         #[cfg(not(feature = "skills"))]
@@ -1805,6 +1859,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
         InvocationRequest::Run(request) => ParentFrame::RunStep(request),
         #[cfg(feature = "skills")]
         InvocationRequest::RunWithSkills(request, _) => ParentFrame::RunStep(request),
+        #[cfg(any(test, feature = "skills"))]
         InvocationRequest::Verify(request) => ParentFrame::VerifyArtifact(request),
     };
     let frame = WireFrame::invocation(

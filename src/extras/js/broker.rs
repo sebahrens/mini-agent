@@ -152,13 +152,13 @@ fn executable_preparation_slots() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "skills"))]
 pub(crate) struct SaturatedExecutablePreparationSlots {
     _exclusive: tokio::sync::OwnedMutexGuard<()>,
     _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "skills"))]
 pub(crate) async fn saturate_executable_preparation_slots_for_test()
 -> SaturatedExecutablePreparationSlots {
     static EXCLUSIVE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
@@ -424,7 +424,7 @@ impl SpawnExecutableIdentity {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "skills"))]
     pub(crate) fn with_content_sha256_for_test(mut self, content_sha256: String) -> Self {
         self.content_sha256 = content_sha256;
         self
@@ -655,12 +655,12 @@ impl InvocationGrant {
         &self.grant_id
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "skills"))]
     pub(crate) fn expires_at_for_test(&self) -> Instant {
         self.expires_at
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "skills"))]
     pub(crate) fn allowed_for_test(&self) -> &BTreeSet<HostCapability> {
         &self.allowed
     }

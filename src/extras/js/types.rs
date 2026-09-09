@@ -1,8 +1,11 @@
+#[cfg(any(test, feature = "skills"))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::Arc;
+#[cfg(any(test, feature = "skills"))]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -157,7 +160,9 @@ struct PermCancellationState {
     permission_prompt_timed_out: AtomicBool,
     pending_permission_prompts: AtomicU64,
     notify: tokio::sync::Notify,
+    #[cfg(any(test, feature = "skills"))]
     next_blocking_wake: AtomicU64,
+    #[cfg(any(test, feature = "skills"))]
     blocking_wakes: Mutex<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -166,6 +171,7 @@ pub(crate) struct PermissionPromptGuard {
     registered: bool,
 }
 
+#[cfg(any(test, feature = "skills"))]
 pub(crate) struct PermCancellationWake {
     state: Arc<PermCancellationState>,
     id: Option<u64>,
@@ -187,16 +193,19 @@ impl PermCancellation {
     pub fn cancel(&self) {
         if !self.state.cancelled.swap(true, Ordering::AcqRel) {
             self.state.notify.notify_waiters();
-            let wakes = self
-                .state
-                .blocking_wakes
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            for wake in wakes {
-                wake();
+            #[cfg(any(test, feature = "skills"))]
+            {
+                let wakes = self
+                    .state
+                    .blocking_wakes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for wake in wakes {
+                    wake();
+                }
             }
         }
     }
@@ -251,6 +260,7 @@ impl PermCancellation {
             || self.permission_prompt_pending()
     }
 
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) fn register_blocking_wake(
         &self,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -291,6 +301,7 @@ impl Drop for PermissionPromptGuard {
     }
 }
 
+#[cfg(any(test, feature = "skills"))]
 impl Drop for PermCancellationWake {
     fn drop(&mut self) {
         let Some(id) = self.id.take() else {
