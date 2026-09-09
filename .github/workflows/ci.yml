@@ -824,6 +824,22 @@ jobs:
           cargo test --locked --no-default-features --features js
           windows_production_ -- --nocapture --test-threads=1
 
+      - name: Test native Windows artifact cleanup under sharing contention
+        shell: pwsh
+        run: |
+          $native = 'sandbox::worker::artifact_cleanup::native_sharing_holder_must_release_before_artifact_cleanup_succeeds'
+          $listing = cargo test --locked --no-default-features --features js $native -- --exact --list 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $listing | Write-Output
+            exit $LASTEXITCODE
+          }
+          $found = @($listing | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -eq "${native}: test" })
+          if ($found.Count -ne 1) {
+            throw 'Expected exactly one native Windows artifact cleanup regression'
+          }
+          cargo test --locked --no-default-features --features js sandbox::worker::artifact_cleanup:: -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test process-creation lock panic recovery under contention
         run: >-
           cargo test --locked --no-default-features --features js

@@ -52,6 +52,49 @@ use super::{C_PERM, apply_current_prompt_mode};
 const TURN_TRACE_MAX: usize = 64;
 const BTW_MAX_INFLIGHT: usize = 4;
 
+#[cfg(feature = "git-worktree")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreePromptChoice {
+    Proceed,
+    Abort,
+}
+
+#[cfg(feature = "git-worktree")]
+async fn read_worktree_choice(
+    user_rx: &mut mpsc::Receiver<UserEvent>,
+    deferred: &mut std::collections::VecDeque<UserEvent>,
+    proceed_key: char,
+) -> WorktreePromptChoice {
+    while let Some(event) = user_rx.recv().await {
+        let UserEvent::Key(key) = event else {
+            // Background completions and other input still belong to the main loop.
+            deferred.push_back(event);
+            continue;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))
+        {
+            return WorktreePromptChoice::Abort;
+        }
+        if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('a' | 'A') | KeyCode::Enter | KeyCode::Esc => {
+                return WorktreePromptChoice::Abort;
+            }
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&proceed_key) => {
+                return WorktreePromptChoice::Proceed;
+            }
+            _ => {}
+        }
+    }
+    WorktreePromptChoice::Abort
+}
+
 #[derive(Debug)]
 struct GitStatusRefresh {
     working_dir: PathBuf,
@@ -150,6 +193,174 @@ mod ctrl_h_tests {
             KeyCode::Backspace,
             KeyModifiers::NONE
         )));
+    }
+}
+
+#[cfg(all(test, feature = "git-worktree"))]
+mod worktree_choice_tests {
+    use super::*;
+    use crossterm::event::KeyEventKind;
+    use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn explicit_choices_and_interrupts_apply_to_both_prompts() {
+        for proceed_key in ['c', 'l'] {
+            let proceed = KeyEvent::new(KeyCode::Char(proceed_key), KeyModifiers::NONE);
+            let mut cases = vec![
+                (proceed, WorktreePromptChoice::Proceed),
+                (
+                    KeyEvent::new(
+                        KeyCode::Char(proceed_key.to_ascii_uppercase()),
+                        KeyModifiers::SHIFT,
+                    ),
+                    WorktreePromptChoice::Proceed,
+                ),
+            ];
+            for code in [
+                KeyCode::Char('a'),
+                KeyCode::Char('A'),
+                KeyCode::Enter,
+                KeyCode::Esc,
+            ] {
+                cases.push((
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    WorktreePromptChoice::Abort,
+                ));
+            }
+            for c in ['c', 'C', 'd', 'D'] {
+                for modifiers in [
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ] {
+                    cases.push((
+                        KeyEvent::new(KeyCode::Char(c), modifiers),
+                        WorktreePromptChoice::Abort,
+                    ));
+                }
+            }
+            for (key, expected) in cases {
+                let (tx, mut rx) = mpsc::channel(2);
+                tx.send(UserEvent::Key(key)).await.unwrap();
+                // An opposite choice makes incorrectly ignoring the first key observable.
+                let opposite = if expected == WorktreePromptChoice::Abort {
+                    proceed
+                } else {
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+                };
+                tx.send(UserEvent::Key(opposite)).await.unwrap();
+                drop(tx);
+                let mut deferred = VecDeque::new();
+                assert_eq!(
+                    read_worktree_choice(&mut rx, &mut deferred, proceed_key).await,
+                    expected,
+                    "{proceed_key}: {key:?}"
+                );
+                assert!(deferred.is_empty());
+                assert!(matches!(rx.try_recv(), Ok(UserEvent::Key(k)) if k == opposite));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_modified_and_nonpress_keys_do_not_choose_an_action() {
+        for proceed_key in ['c', 'l'] {
+            let cases = [
+                KeyEvent::new(KeyCode::Char(proceed_key), KeyModifiers::ALT),
+                KeyEvent::new(KeyCode::Char(proceed_key), KeyModifiers::SUPER),
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                KeyEvent::new_with_kind(
+                    KeyCode::Char(proceed_key),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ),
+                KeyEvent::new_with_kind(
+                    KeyCode::Char(proceed_key),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat,
+                ),
+            ];
+            for key in cases {
+                // Both outcomes expose an accidental abort as well as an accidental proceed.
+                for (expected, followup) in [
+                    (WorktreePromptChoice::Abort, KeyCode::Esc),
+                    (WorktreePromptChoice::Proceed, KeyCode::Char(proceed_key)),
+                ] {
+                    let (tx, mut rx) = mpsc::channel(2);
+                    tx.send(UserEvent::Key(key)).await.unwrap();
+                    tx.send(UserEvent::Key(KeyEvent::new(followup, KeyModifiers::NONE)))
+                        .await
+                        .unwrap();
+                    drop(tx);
+                    let mut deferred = VecDeque::new();
+                    assert_eq!(
+                        read_worktree_choice(&mut rx, &mut deferred, proceed_key).await,
+                        expected,
+                        "{proceed_key}: {key:?}"
+                    );
+                    assert!(deferred.is_empty());
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Disconnected)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn background_events_keep_fifo_order_through_choice_or_eof() {
+        for proceed_key in ['c', 'l'] {
+            for choose in [false, true] {
+                let (tx, mut rx) = mpsc::channel(5);
+                let mut deferred = VecDeque::from([UserEvent::Paste("earlier".into())]);
+                tx.send(UserEvent::Resize).await.unwrap();
+                tx.send(UserEvent::LinkOpenFailed("opener failed".into()))
+                    .await
+                    .unwrap();
+                tx.send(UserEvent::Paste("during prompt".into()))
+                    .await
+                    .unwrap();
+                if choose {
+                    tx.send(UserEvent::Key(KeyEvent::new(
+                        KeyCode::Char(proceed_key),
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                    tx.send(UserEvent::ScrollDown).await.unwrap();
+                }
+                drop(tx);
+                assert_eq!(
+                    read_worktree_choice(&mut rx, &mut deferred, proceed_key).await,
+                    if choose {
+                        WorktreePromptChoice::Proceed
+                    } else {
+                        WorktreePromptChoice::Abort
+                    }
+                );
+                assert!(
+                    matches!(deferred.pop_front(), Some(UserEvent::Paste(s)) if s == "earlier")
+                );
+                assert!(matches!(deferred.pop_front(), Some(UserEvent::Resize)));
+                assert!(
+                    matches!(deferred.pop_front(), Some(UserEvent::LinkOpenFailed(s)) if s == "opener failed")
+                );
+                assert!(
+                    matches!(deferred.pop_front(), Some(UserEvent::Paste(s)) if s == "during prompt")
+                );
+                assert!(deferred.is_empty());
+                if choose {
+                    assert!(matches!(rx.try_recv(), Ok(UserEvent::ScrollDown)));
+                }
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Disconnected)
+                ));
+            }
+        }
     }
 }
 
@@ -2690,22 +2901,10 @@ impl<'a> App<'a> {
             if let Some(ss) = self.ui.status_signals.as_ref() {
                 ss.send_git_conflict();
             }
-            let action = loop {
-                tokio::select! {
-                    Some(ev) = self.user_rx.recv() => {
-                        if let UserEvent::Key(key) = ev {
-                            match key.code {
-                                KeyCode::Char('c') | KeyCode::Char('C') => break 'c',
-                                KeyCode::Char('a') | KeyCode::Char('A') => break 'a',
-                                KeyCode::Enter | KeyCode::Esc => break 'a',
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            };
+            let action =
+                read_worktree_choice(&mut self.user_rx, &mut self.deferred_user_events, 'c').await;
             match action {
-                'c' => {
+                WorktreePromptChoice::Proceed => {
                     if let Err(e) =
                         crate::extras::git_worktree::worktree_auto_commit_all(&info.worktree_path)
                             .await
@@ -2745,13 +2944,12 @@ impl<'a> App<'a> {
                         }
                     }
                 }
-                'a' => {
+                WorktreePromptChoice::Abort => {
                     let _ = self
                         .renderer
                         .write_line("merge aborted, worktree left untouched", C_AGENT);
                     proceed = false;
                 }
-                _ => unreachable!(),
             }
         }
         if !proceed {
@@ -2805,23 +3003,12 @@ impl<'a> App<'a> {
                     .renderer
                     .write_line("[a]bort  [l]eave for manual resolution", C_PERM);
 
-                let action = loop {
-                    tokio::select! {
-                        Some(ev) = self.user_rx.recv() => {
-                            if let UserEvent::Key(key) = ev {
-                                match key.code {
-                                    KeyCode::Char('a') | KeyCode::Char('A') => break 'a',
-                                    KeyCode::Char('l') | KeyCode::Char('L') => break 'l',
-                                    KeyCode::Enter | KeyCode::Esc => break 'a',
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                };
+                let action =
+                    read_worktree_choice(&mut self.user_rx, &mut self.deferred_user_events, 'l')
+                        .await;
 
                 match action {
-                    'a' => {
+                    WorktreePromptChoice::Abort => {
                         if let Err(error) =
                             crate::extras::git_worktree::cancel_merge(&mut state).await
                         {
@@ -2848,7 +3035,7 @@ impl<'a> App<'a> {
                             C_AGENT,
                         );
                     }
-                    'l' => {
+                    WorktreePromptChoice::Proceed => {
                         super::rebind_worktree_workspace(
                             self.ui.session,
                             self.ui.context,
@@ -2869,7 +3056,6 @@ impl<'a> App<'a> {
                             C_AGENT,
                         );
                     }
-                    _ => unreachable!(),
                 }
             }
             crate::extras::git_worktree::MergeOutcome::Error(e) => {

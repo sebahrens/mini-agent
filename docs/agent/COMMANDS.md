@@ -225,6 +225,11 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 | `/wt-merge [branch]` | Merge the worktree branch back into the target branch. |
 | `/wt-exit` | Exit the worktree and return to the main repo. |
 
+During a merge, a dirty worktree requires an explicit `c` to commit all changes;
+a conflict offers `l` to leave it for manual resolution. Uppercase action keys
+also work. `a`, Enter, Escape, Ctrl-C, or Ctrl-D selects abort. Closing the input
+channel also aborts. Background events are queued for processing after the prompt.
+
 ## Loop (feature-gated)
 
 `--loop-plan <path>` selects the plan used for both reading progress and the
