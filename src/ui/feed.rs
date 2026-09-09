@@ -201,20 +201,12 @@ impl FeedLines {
         self.len
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     pub fn get(&self, index: usize) -> Option<&LineEntry> {
         if index >= self.len {
             return None;
         }
         let segment = self.starts.partition_point(|start| *start <= index) - 1;
         self.segments[segment].get(index - self.starts[segment])
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &LineEntry> {
-        self.segments.iter().flat_map(|segment| segment.iter())
     }
 
     pub(crate) fn with_segment(&self, segment: Arc<Vec<LineEntry>>) -> Self {

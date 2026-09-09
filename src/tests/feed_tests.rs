@@ -1,6 +1,24 @@
-use crate::ui::feed::{BlockStyle, Feed};
+use crate::ui::feed::{BlockStyle, Feed, FeedLines};
+use crate::ui::renderer::LineEntry;
 use crossterm::style::Color;
 use std::sync::Arc;
+
+// Traverse the lookup used by the viewport, including segment boundaries.
+fn indexed_rows(lines: &FeedLines) -> impl Iterator<Item = &LineEntry> {
+    (0..lines.len()).map(|index| &lines[index])
+}
+
+#[track_caller]
+fn assert_same_rows(actual: &FeedLines, expected: &FeedLines) {
+    assert_eq!(actual.len(), expected.len(), "visual row count");
+    for index in 0..actual.len() {
+        assert_eq!(actual[index].text, expected[index].text, "row {index} text");
+        assert_eq!(
+            actual[index].color, expected[index].color,
+            "row {index} color"
+        );
+    }
+}
 
 #[test]
 fn block_style_color_mapping() {
@@ -32,7 +50,7 @@ fn lines_wrap_narrow_width() {
     feed.push_line(BlockStyle::Plain, "hello world");
     let lines = feed.lines(5);
     assert!(lines.len() > 1);
-    for line in lines.iter() {
+    for line in indexed_rows(&lines) {
         assert!(line.text.chars().count() <= 5 || line.text == "hello" || line.text == "world");
     }
 }
@@ -51,14 +69,13 @@ fn agent_block_gets_prefix_and_markdown() {
     let mut feed = Feed::new();
     feed.push_block(BlockStyle::Agent, "hello **world**");
     let lines = feed.lines(80);
-    assert!(!lines.is_empty());
+    assert!(lines.len() > 0);
     assert!(
         lines[0].text.starts_with("< "),
         "first agent line should start with '< ', got {:?}",
         lines[0].text
     );
-    let joined: String = lines
-        .iter()
+    let joined: String = indexed_rows(&lines)
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("");
@@ -79,7 +96,7 @@ fn agent_empty_block_no_lines() {
     let mut feed = Feed::new();
     feed.push_block(BlockStyle::Agent, "");
     let lines = feed.lines(80);
-    assert!(lines.is_empty());
+    assert_eq!(lines.len(), 0);
 }
 
 #[test]
@@ -440,8 +457,7 @@ fn replace_last_invalidates_cached_layout() {
     // Same length, different content: the cached layout must not leak through.
     feed.replace_last(BlockStyle::Agent, "bbbb **new**");
     let lines = feed.lines(80);
-    let joined: String = lines
-        .iter()
+    let joined: String = indexed_rows(&lines)
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("");
@@ -564,17 +580,7 @@ fn streaming_correctness_with_stable_boundary_enabled() {
     fresh_feed.push_block(BlockStyle::Agent, full_text);
     let fresh_lines = fresh_feed.lines(80);
 
-    // The incremental and fresh parses should produce identical output.
-    assert_eq!(
-        incremental_lines.len(),
-        fresh_lines.len(),
-        "incremental vs fresh: line count should match"
-    );
-
-    for (i, (inc, fresh)) in incremental_lines.iter().zip(fresh_lines.iter()).enumerate() {
-        assert_eq!(inc.text, fresh.text, "line {} text should match", i);
-        assert_eq!(inc.color, fresh.color, "line {} color should match", i);
-    }
+    assert_same_rows(&incremental_lines, &fresh_lines);
 }
 
 #[test]
@@ -593,11 +599,7 @@ fn streaming_reference_definition_reparses_earlier_references() {
     );
     let reparsed = fresh.lines(80);
 
-    assert_eq!(incremental.len(), reparsed.len());
-    for (actual, expected) in incremental.iter().zip(reparsed.iter()) {
-        assert_eq!(actual.text, expected.text);
-        assert_eq!(actual.color, expected.color);
-    }
+    assert_same_rows(&incremental, &reparsed);
 }
 
 #[test]
@@ -613,60 +615,7 @@ fn streaming_indented_code_continues_across_blank_line() {
     fresh.push_block(BlockStyle::Agent, "Intro.\n\n    alpha\n\n    beta\n");
     let reparsed = fresh.lines(80);
 
-    assert_eq!(incremental.len(), reparsed.len());
-    for (actual, expected) in incremental.iter().zip(reparsed.iter()) {
-        assert_eq!(actual.text, expected.text);
-        assert_eq!(actual.color, expected.color);
-    }
-}
-
-#[test]
-fn streaming_fence_with_blank_line_produces_correct_output() {
-    // Test correctness: a fence containing a blank line, streamed line by line.
-    // This is the critical test that would fail if find_stable_boundary used
-    // naive "\n\n" search, since the blank line inside the fence is not a
-    // top-level block boundary.
-    let mut feed = Feed::new();
-    feed.push_streaming_block(BlockStyle::Agent);
-
-    // Append intro, then open a fence.
-    assert!(feed.append_to_last("Here is code:\n\n"));
-    assert!(feed.append_to_last("```rust\n"));
-    assert!(feed.append_to_last("fn a() {}\n"));
-    // Blank line inside the fence: not a top-level boundary.
-    assert!(feed.append_to_last("\n"));
-    assert!(feed.append_to_last("fn b() {}\n"));
-    assert!(feed.append_to_last("```\n"));
-
-    // Get the incremental parse result.
-    let incremental_lines = feed.lines(80);
-
-    // Parse from scratch for comparison.
-    feed.finalize_last();
-    let fresh_lines = feed.lines(80);
-
-    // The incremental and fresh parses must produce identical output.
-    assert_eq!(
-        incremental_lines.len(),
-        fresh_lines.len(),
-        "fence with blank line: line count mismatch"
-    );
-
-    let incremental_text: String = incremental_lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let fresh_text: String = fresh_lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_eq!(
-        incremental_text, fresh_text,
-        "fence with blank line: full content mismatch"
-    );
+    assert_same_rows(&incremental, &reparsed);
 }
 
 #[test]
@@ -688,22 +637,7 @@ fn streaming_loose_list_produces_correct_output() {
     feed.finalize_last();
     let fresh_parse_lines = feed.lines(80);
 
-    // Verify they match.
-    let incremental_text: String = incremental_lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let fresh_text: String = fresh_parse_lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_eq!(
-        incremental_text, fresh_text,
-        "loose list: incremental vs fresh content should match"
-    );
+    assert_same_rows(&incremental_lines, &fresh_parse_lines);
 }
 
 #[test]
@@ -727,18 +661,11 @@ fn streaming_setext_heading_produces_correct_output() {
     let fresh_parse_lines = feed.lines(80);
 
     // The text should be the same between the two approaches.
-    let intermediate_text: String = intermediate_lines
-        .iter()
+    let intermediate_text: String = indexed_rows(&intermediate_lines)
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let final_text: String = final_lines
-        .iter()
-        .map(|l| l.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let fresh_text: String = fresh_parse_lines
-        .iter()
+    let fresh_text: String = indexed_rows(&fresh_parse_lines)
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
@@ -751,10 +678,7 @@ fn streaming_setext_heading_produces_correct_output() {
 
     // After the underline, it becomes a setext heading in the final parse.
     // The final text after adding the underline should match the fresh parse.
-    assert_eq!(
-        final_text, fresh_text,
-        "setext heading: incremental vs fresh result"
-    );
+    assert_same_rows(&final_lines, &fresh_parse_lines);
 
     // The final result should also contain the heading text.
     assert!(fresh_text.contains("This is a heading"));
@@ -794,17 +718,7 @@ fn finalized_streaming_block_equals_from_scratch_parse() {
     fresh_feed.push_block(BlockStyle::Agent, &full_text);
     let fresh_lines = fresh_feed.lines(80);
 
-    // They should match.
-    assert_eq!(
-        incremental_lines.len(),
-        fresh_lines.len(),
-        "incremental vs fresh: line count mismatch"
-    );
-
-    for (i, (inc, fresh)) in incremental_lines.iter().zip(fresh_lines.iter()).enumerate() {
-        assert_eq!(inc.text, fresh.text, "line {} text mismatch", i);
-        assert_eq!(inc.color, fresh.color, "line {} color mismatch", i);
-    }
+    assert_same_rows(&incremental_lines, &fresh_lines);
 }
 
 // --- indexed streaming: foreign blocks pushed mid-stream must survive ---
@@ -854,7 +768,7 @@ fn streaming_block_finalized_in_place_keeps_foreign_blocks_and_tokens() {
     // Finalized text is parsed as markdown (bold markers consumed), and the
     // foreign block still renders after it.
     let lines = feed.lines(80);
-    let joined: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+    let joined: Vec<&str> = indexed_rows(&lines).map(|l| l.text.as_str()).collect();
     assert!(
         joined.iter().any(|t| t.contains("first bold")),
         "{joined:?}"
@@ -975,7 +889,8 @@ fn streaming_a_long_paragraph_does_not_grow_quadratically() {
 
 /// Stream `text` one line at a time and compare the result with a from-scratch
 /// parse of the same text.
-fn assert_streamed_matches_fresh(text: &str) {
+#[track_caller]
+fn assert_streamed_matches_fresh(text: &str) -> Arc<FeedLines> {
     let mut feed = Feed::new();
     feed.push_streaming_block(BlockStyle::Agent);
     for line in text.split_inclusive('\n') {
@@ -988,20 +903,8 @@ fn assert_streamed_matches_fresh(text: &str) {
     fresh.push_block(BlockStyle::Agent, text);
     let reparsed = fresh.lines(80);
 
-    assert_eq!(
-        streamed.len(),
-        reparsed.len(),
-        "line count mismatch for {text:?}:\nstreamed={:?}\nfresh={:?}",
-        streamed.iter().map(|line| &line.text).collect::<Vec<_>>(),
-        reparsed.iter().map(|line| &line.text).collect::<Vec<_>>()
-    );
-    for (index, (actual, expected)) in streamed.iter().zip(reparsed.iter()).enumerate() {
-        assert_eq!(actual.text, expected.text, "line {index} text for {text:?}");
-        assert_eq!(
-            actual.color, expected.color,
-            "line {index} color for {text:?}"
-        );
-    }
+    assert_same_rows(&streamed, &reparsed);
+    streamed
 }
 
 #[test]
@@ -1051,5 +954,15 @@ fn an_unterminated_fence_round_trips_while_streaming() {
 
 #[test]
 fn a_blank_line_inside_a_fence_round_trips() {
-    assert_streamed_matches_fresh("```\nalpha\n\nbeta\n```\n\nafter\n");
+    let lines = assert_streamed_matches_fresh("```\nalpha\n\nbeta\n```\n\nafter\n");
+    // Both layouts share the boundary detector, so also pin the semantics:
+    // a blank keeps the fence open, while the closing delimiter restores prose.
+    let beta = indexed_rows(&lines)
+        .find(|line| line.text == "beta")
+        .unwrap();
+    assert_eq!(beta.color, Color::DarkYellow);
+    let after = indexed_rows(&lines)
+        .find(|line| line.text == "after")
+        .unwrap();
+    assert_eq!(after.color, Color::White);
 }
