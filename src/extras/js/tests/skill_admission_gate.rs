@@ -403,79 +403,103 @@ fn candidate_failures_remain_deterministic_rejections() {
 
 #[test]
 fn exhausted_evaluation_attempts_are_deferred_with_a_reason_code_and_stay_recoverable() {
-    let (root, _paths, mut evaluator, artifact) = evaluator(true);
+    for prior_report in [false, true] {
+        let (root, _paths, mut evaluator, artifact) = evaluator(true);
 
-    // Every claim increments `attempt_count`, including reclaims of a crashed
-    // worker's expired lease. After the last one the row can never be claimed
-    // again.
-    let mut now = 100;
-    for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
-        let lease = evaluator
-            .store_mut()
-            .claim_due_proposal("crashed-worker", now, 1)
-            .expect("claim")
-            .expect("the proposal is still claimable");
-        assert_eq!(lease.attempt, attempt);
-        now += 2;
-    }
-    let stranded = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(stranded.status, ProposalStatus::Evaluating);
-    assert_eq!(stranded.attempt_count, MAX_EVALUATION_ATTEMPTS);
-    assert!(
-        evaluator
-            .store_mut()
-            .claim_due_proposal("worker-1", now, 30)
+        let previous = if prior_report {
+            let report = evaluator.evaluate_next(20).unwrap().unwrap();
+            let admin = AdminIdentity::authenticated("refresh-admin").unwrap();
+            evaluator
+                .request_reevaluation(&artifact.id, &admin, 21)
+                .unwrap();
+            Some(report)
+        } else {
+            None
+        };
+
+        // Every claim increments `attempt_count`, including reclaims of a crashed
+        // worker's expired lease. After the last one the row can never be claimed
+        // again.
+        let mut now = 100;
+        for attempt in (if prior_report { 2 } else { 1 })..=MAX_EVALUATION_ATTEMPTS {
+            let lease = evaluator
+                .store_mut()
+                .claim_due_proposal("crashed-worker", now, 1)
+                .expect("claim")
+                .expect("the proposal is still claimable");
+            assert_eq!(lease.attempt, attempt);
+            now += 2;
+        }
+        let stranded = evaluator
+            .store()
+            .get_proposal(&artifact.id)
             .unwrap()
-            .is_none(),
-        "an exhausted row is invisible to the claim filter"
-    );
+            .unwrap();
+        assert_eq!(stranded.status, ProposalStatus::Evaluating);
+        assert_eq!(stranded.attempt_count, MAX_EVALUATION_ATTEMPTS);
+        assert!(
+            evaluator
+                .store_mut()
+                .claim_due_proposal("worker-1", now, 30)
+                .unwrap()
+                .is_none(),
+            "an exhausted row is invisible to the claim filter"
+        );
 
-    assert!(
-        evaluator.evaluate_next(now).unwrap().is_none(),
-        "there is nothing left to evaluate, only to sweep"
-    );
-    let swept = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .expect("the proposal is still queued, never rejected");
-    assert_eq!(swept.status, ProposalStatus::Deferred);
-    assert_eq!(
-        swept.reason_code.as_deref(),
-        Some("evaluation_attempts_exhausted")
-    );
-    assert_eq!(swept.lease_owner, None);
-    assert_eq!(swept.lease_expires_at, None);
-    assert_eq!(swept.report_id, None);
-    assert_eq!(
-        evaluator.store().revision_status(&artifact.id).unwrap(),
-        Some("pending".to_string())
-    );
+        assert!(
+            evaluator.evaluate_next(now).unwrap().is_none(),
+            "there is nothing left to evaluate, only to sweep"
+        );
+        let swept = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .expect("the proposal is still queued, never rejected");
+        assert_eq!(swept.status, ProposalStatus::Deferred);
+        assert_eq!(
+            swept.reason_code.as_deref(),
+            Some("evaluation_attempts_exhausted")
+        );
+        assert_eq!(swept.lease_owner, None);
+        assert_eq!(swept.lease_expires_at, None);
+        assert_eq!(swept.report_id, None);
+        assert_eq!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("pending".to_string())
+        );
 
-    // The parked row is recoverable: an authenticated reevaluation request
-    // clears the spent budget and the proposal evaluates normally.
-    let admin = AdminIdentity::authenticated("recovery-admin").unwrap();
-    evaluator
-        .request_reevaluation(&artifact.id, &admin, now + 1)
-        .expect("an exhausted deferral is reevaluable");
-    let requeued = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(requeued.status, ProposalStatus::Pending);
-    assert_eq!(requeued.attempt_count, 0);
-    assert_eq!(requeued.reason_code, None);
-    let report = evaluator
-        .evaluate_next(now + 2)
-        .unwrap()
-        .expect("the recovered proposal evaluates");
-    assert_eq!(report.outcome, "passed");
-    let _ = std::fs::remove_dir_all(root);
+        // The parked row is recoverable: an authenticated reevaluation request
+        // clears the spent budget and the proposal evaluates normally.
+        let admin = AdminIdentity::authenticated("recovery-admin").unwrap();
+        evaluator
+            .request_reevaluation(&artifact.id, &admin, now + 1)
+            .expect("an exhausted deferral is reevaluable");
+        let requeued = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued.status, ProposalStatus::Pending);
+        assert_eq!(requeued.attempt_count, 0);
+        assert_eq!(requeued.reason_code, None);
+        let report = evaluator
+            .evaluate_next(now + 2)
+            .unwrap()
+            .expect("the recovered proposal evaluates");
+        assert_eq!(report.outcome, "passed");
+        assert_eq!(report.attempt, if prior_report { 2 } else { 1 });
+        if let Some(previous) = previous {
+            assert_eq!(
+                evaluator
+                    .store()
+                    .get_evaluation_report(&previous.report_id)
+                    .unwrap()
+                    .unwrap(),
+                previous
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 struct Approver {

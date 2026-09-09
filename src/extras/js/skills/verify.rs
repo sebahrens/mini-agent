@@ -20,9 +20,9 @@ use super::held_out::ExpectedJsValue;
 use super::{CapabilityManifest, SkillArtifact};
 
 /// Version of the verification algorithm. Bumping this invalidates existing reports.
-/// Version 5 rejects caught/unwound OOM using allocator evidence; prior success reports
-/// may have accepted a candidate that continued after allocation failure.
-pub const VERIFIER_VERSION: u32 = 5;
+/// Version 6 compares held-out integer expectations across QuickJS numeric
+/// representations without rounding, coercion, or narrowing to an i32.
+pub const VERIFIER_VERSION: u32 = 6;
 
 /// Timeout for one whole worker verification request.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);

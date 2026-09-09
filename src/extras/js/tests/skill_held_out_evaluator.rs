@@ -334,6 +334,83 @@ fn skill_held_out_evaluator_missing_or_failing_suite_blocks_admission() {
 }
 
 #[test]
+fn held_out_integer_expectations_preserve_exact_numeric_values() {
+    use crate::extras::js::skills::verify::{VerificationError, verify_held_out_case};
+
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let artifact = pure_artifact();
+    let admin = AdminIdentity::authenticated("numeric-reviewer").unwrap();
+    let values = [
+        0,
+        1,
+        -1,
+        i64::from(i32::MIN),
+        i64::from(i32::MAX),
+        i64::from(i32::MIN) - 1,
+        i64::from(i32::MAX) + 1,
+        (1_i64 << 53) - 1,
+        1_i64 << 53,
+        (1_i64 << 53) + 2,
+        i64::MIN,
+        i64::MAX - 1023,
+    ];
+    let mut suite = pure_suite("");
+    suite.cases = values
+        .into_iter()
+        .map(|value| HeldOutCase {
+            expression: format!("{value}.0"),
+            expected: ExpectedJsValue::Integer(value),
+            ..suite.cases[0].clone()
+        })
+        .collect();
+    suite.import(&mut store, &admin, 10).unwrap();
+    let report = evaluate(&store, &artifact, None).expect("exact Number integers must pass");
+    assert_eq!(report.cases.len(), values.len());
+    assert!(report.cases.iter().all(|case| case.passed));
+
+    for (expression, expected) in [
+        ("1.5", 1),
+        ("-1.5", -1),
+        ("'1'", 1),
+        ("true", 1),
+        ("null", 0),
+        ("NaN", 0),
+        ("Infinity", i64::MAX),
+        ("-Infinity", i64::MIN),
+        ("9223372036854775808", i64::MAX),
+        ("9007199254740992", 9007199254740993),
+        ("-9007199254740992", -9007199254740993),
+    ] {
+        assert!(
+            matches!(
+                verify_held_out_case(
+                    &artifact,
+                    expression,
+                    &ExpectedJsValue::Integer(expected),
+                    &BTreeMap::new(),
+                    &[],
+                    &[],
+                ),
+                Err(VerificationError::HeldOutExpectedMismatch)
+            ),
+            "{expression} must not equal the integer {expected}"
+        );
+    }
+    for value in [i64::MAX, i64::MIN + 1, 9007199254740993, -9007199254740993] {
+        let mut invalid = pure_suite("");
+        invalid.cases[0].expected = ExpectedJsValue::Integer(value);
+        assert!(matches!(
+            invalid.import(&mut store, &admin, 11),
+            Err(HeldOutError::InvalidSuite(_))
+        ));
+    }
+    assert_eq!(store.held_out_suite_states().unwrap().len(), 1);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn held_out_selectors_require_scope_and_exact_export_contracts() {
     let empty = HeldOutSuiteDraft {
         selector: HeldOutSelector::default(),

@@ -305,6 +305,7 @@ fn validate_suite(suite: &HeldOutSuiteDraft) -> Result<(), HeldOutError> {
         }
         if matches!(&case.expected, ExpectedJsValue::String(value) if value.len() > MAX_EXPECTED_STRING_BYTES)
             || matches!(&case.expected, ExpectedJsValue::Float(value) if !value.is_finite())
+            || matches!(&case.expected, ExpectedJsValue::Integer(value) if (*value as f64) as i128 != i128::from(*value))
         {
             return Err(HeldOutError::InvalidSuite(
                 "held-out expected value is invalid".to_string(),

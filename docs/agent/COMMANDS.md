@@ -347,7 +347,7 @@ reference — package format, held-out suites, feedback semantics, stats columns
 | `--activate-learned-skill <SHA256>` | Activate an approved **lineage-root** skill after its held-out baseline. Deliberately refuses a replacement. |
 | `--promote-learned-skill <SHA256>` | Promote an approved replacement canary over its active or quarantined predecessor, superseding it and preserving lineage. |
 | `--retire-learned-skill <SHA256>` | Administratively disable an `active` revision, preserving the revision and its lineage. |
-| `--reevaluate-learned-skill <SHA256>` | Requeue a parked proposal: one `verified` with `held_out_suite_required`, or `deferred` after an infrastructure outage or an exhausted attempt budget. |
+| `--reevaluate-learned-skill <SHA256>` | Requeue a proposal awaiting approval to refresh its evaluation, or one parked as `verified` with `held_out_suite_required` or `deferred` after an infrastructure outage or exhausted attempt budget. |
 | `--compact-learned-skill-events` | Aggregate raw telemetry older than the 30-day retention window into daily rows, then delete it. |
 | `--purge-learned-skill <SHA256>` | Coordinated, tombstoned privacy purge of one revision and its dependent records. |
 | `--purge-learned-skill-force` | Permit that purge to delete a revision that is not in a terminal lifecycle status, or whose dependent revisions would be re-rooted. Only valid with `--purge-learned-skill`. |

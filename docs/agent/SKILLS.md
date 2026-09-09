@@ -303,7 +303,7 @@ suite hash as a claim that the whole suite ran.
 | Key | Type | Bound |
 | --- | --- | --- |
 | `expression` | string | non-empty, ≤ 4 KiB; calls the export without the capability argument |
-| `expected` | tagged value | `{"type": "boolean"\|"string"\|"integer"\|"float"\|"null", "value": …}`; a string value ≤ 64 KiB, a float must be finite, `null` carries no `value` |
+| `expected` | tagged value | `{"type": "boolean"\|"string"\|"integer"\|"float"\|"null", "value": …}`; a string value ≤ 64 KiB, an integer must fit signed 64-bit storage and be exactly representable as a JavaScript Number, a float must be finite, `null` carries no `value` |
 | `fake_files` | object of path → contents | ≤ 32 entries; path ≤ 4 KiB, contents ≤ 64 KiB each |
 | `fake_spawns` | array | ≤ 256 entries; `program` non-empty ≤ 4 KiB, ≤ 64 args, `stdout`/`stderr` ≤ 64 KiB |
 | `fake_fetches` | array | ≤ 256 entries; `url` non-empty ≤ 4 KiB, `method` is `GET` or `POST`, `body` ≤ 64 KiB |
@@ -312,12 +312,18 @@ suite hash as a claim that the whole suite ran.
 `fake_files`, `fake_spawns`, `fake_fetches` and `transcript` all default to empty and can be
 omitted for a pure skill.
 
+Integer expectations compare numeric values exactly, including integers outside the 32-bit range.
+Strings, booleans, fractions, and rounded neighboring integers do not match. For example,
+`9007199254740992` is representable, while `9007199254740993` is refused when importing the suite.
+
 ### Directory import
 
 A directory argument is read non-recursively: entries whose type is a regular file and whose
 extension is `.json` are collected, sorted by path, and imported in that order. Symlinked entries
 are not regular files and are skipped, and a symlinked import path itself is refused. The directory
-must yield 1–32 such files. Each file is read with a hard 256 KiB ceiling. Every package is parsed
+must yield 1–32 such files; scanning stops at the 33rd matching file. Package reads reject special
+files and symlinks and verify the opened file identity to detect replacement during open. Each file
+is read with a hard 256 KiB ceiling. Every package is parsed
 and validated **before** the first one is imported, so a malformed file in the set stops the run
 rather than leaving a partial library.
 
@@ -526,6 +532,11 @@ queue directly, and is the only route for a proposal that arrived through the in
 parked as `deferred`, whether by a verification infrastructure outage or by an exhausted attempt
 budget. Requeueing on its own does not supply the missing baseline, so import the matching suite
 first unless the selector is what changed.
+
+The same command refreshes a proposal in `awaiting_approval` when a verifier upgrade or a changed
+held-out corpus makes its report stale. It clears the current report binding and returns the
+revision to pending evaluation while preserving historical reports. Approval requires the new
+evaluation to pass. Approved and rejected proposals cannot be reopened this way.
 
 The other route is to **re-import the identical package with a matching held-out suite**: importing
 the same proposal alongside a `held_out_suites` entry whose selector matches the artifact stores

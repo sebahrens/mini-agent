@@ -747,13 +747,12 @@ fn suite_listing_report(store: &SkillStore) -> anyhow::Result<OperatorReport> {
     Ok(OperatorReport::new("list-suites").with("suites", suites))
 }
 
-/// Requeue a proposal that admission parked, without an identical re-import.
+/// Requeue a parked proposal or refresh an unapproved evaluation report.
 ///
 /// A proposal reaches `verified` with `held_out_suite_required` when no enabled
 /// suite matched it, and `deferred` when the verification infrastructure was
-/// unavailable or its attempt budget ran out. All three are recoverable, but
-/// the only shipped route was re-importing the byte-identical package, which an
-/// operator cannot do at all for a proposal the model authored.
+/// unavailable or its attempt budget ran out. An `awaiting_approval` report
+/// also needs reevaluation when the verifier or trusted corpus changes.
 fn reevaluate_skill(skill_id: &str, paths: &AppPaths) -> anyhow::Result<()> {
     let mut store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
     let proposal = store
@@ -772,8 +771,8 @@ fn reevaluate_skill(skill_id: &str, paths: &AppPaths) -> anyhow::Result<()> {
         )
         .with_context(|| {
             format!(
-                "learned-skill re-evaluation requires a proposal parked as verified with \
-                 held_out_suite_required or as deferred; proposal {} is {status}{}",
+                "learned-skill re-evaluation requires a proposal awaiting approval or parked as \
+                 verified with held_out_suite_required or as deferred; proposal {} is {status}{}",
                 proposal.proposal_id,
                 reason
                     .as_deref()
@@ -934,10 +933,13 @@ fn import_path(
             && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
         {
             packages.push(entry.path());
+            if packages.len() > MAX_DIRECTORY_PACKAGES {
+                anyhow::bail!("learned-skill directory must contain 1 to 32 regular JSON files");
+            }
         }
     }
     packages.sort();
-    if packages.is_empty() || packages.len() > MAX_DIRECTORY_PACKAGES {
+    if packages.is_empty() {
         anyhow::bail!("learned-skill directory must contain 1 to 32 regular JSON files");
     }
     let packages = packages
@@ -974,8 +976,38 @@ fn validate_package(package: &LearnedSkillPackage, label: &str) -> anyhow::Resul
 }
 
 fn read_package(path: &Path) -> anyhow::Result<LearnedSkillPackage> {
-    let file = std::fs::File::open(path)
+    let before = crate::fs::checked_path_metadata(path)
+        .with_context(|| format!("failed to inspect learned-skill package {}", path.display()))?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        anyhow::bail!("learned-skill package must be a regular file");
+    }
+    #[cfg(test)]
+    if let Some(action) = tests::BEFORE_PACKAGE_OPEN.with(|slot| slot.borrow_mut().take()) {
+        action();
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
         .with_context(|| format!("failed to open learned-skill package {}", path.display()))?;
+    let opened = crate::fs::checked_file_metadata(&file)?;
+    if !opened.is_file() || opened.file_type().is_symlink() {
+        anyhow::bail!("learned-skill package must be a regular file");
+    }
+    crate::fs::ensure_same_file(path, &before, &opened)?;
+    let after = crate::fs::checked_path_metadata(path)?;
+    crate::fs::ensure_same_file(path, &opened, &after)?;
     let mut bytes = Vec::new();
     file.take(MAX_PACKAGE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1842,6 +1874,12 @@ mod tests {
     use super::*;
     use crate::extras::js::skills::{CapabilityManifest, SkillArtifact, SkillExport};
     use crate::paths::{PathEnvironment, PathPlatform};
+
+    thread_local! {
+        pub(super) static BEFORE_PACKAGE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
 
     fn unavailable_embedding_config() -> EmbeddingConfig {
         let key = format!(
@@ -3191,6 +3229,73 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn package_reader_requires_regular_files_and_bounds_content() {
+        let (root, _paths, _) = fixture();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("package.json");
+        let mut payload = SEED_PACKAGES[0].1.to_string();
+        payload.extend(std::iter::repeat_n(
+            ' ',
+            MAX_PACKAGE_BYTES as usize - payload.len(),
+        ));
+        std::fs::write(&path, &payload).unwrap();
+        let package = read_package(&path).expect("the exact byte limit is accepted");
+        validate_package(&package, "test").unwrap();
+        payload.push(' ');
+        std::fs::write(&path, &payload).unwrap();
+        let error = read_package(&path).err().expect("oversized package");
+        assert!(error.to_string().contains("exceeds 256 KiB"), "{error}");
+
+        std::fs::write(&path, SEED_PACKAGES[0].1).unwrap();
+        assert!(read_package(&root).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let link = root.join("link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(
+                read_package(&link).is_err(),
+                "the read itself must reject a file swapped for a symlink"
+            );
+
+            for replacement in ["file", "symlink", "fifo"] {
+                let checked = root.join(format!("swap-{replacement}.json"));
+                std::fs::write(&checked, SEED_PACKAGES[0].1).unwrap();
+                let target = path.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    let changed = checked.clone();
+                    BEFORE_PACKAGE_OPEN.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            std::fs::remove_file(&changed).unwrap();
+                            match replacement {
+                                "file" => std::fs::write(&changed, SEED_PACKAGES[0].1).unwrap(),
+                                "symlink" => std::os::unix::fs::symlink(target, changed).unwrap(),
+                                "fifo" => {
+                                    let name =
+                                        std::ffi::CString::new(changed.as_os_str().as_bytes())
+                                            .unwrap();
+                                    // SAFETY: the path is NUL-terminated and lives through this call.
+                                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                                }
+                                _ => unreachable!(),
+                            }
+                        }));
+                    });
+                    let _ = tx.send(read_package(&checked).map(|_| ()));
+                });
+                let result = rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("package reading must not wait for a FIFO writer");
+                reader.join().unwrap();
+                assert!(result.is_err(), "accepted replacement: {replacement}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn directory_import_validates_every_package_before_mutating_the_store() {
         let (root, paths, _) = fixture();
         let import_dir = root.join("imports");
@@ -3205,6 +3310,20 @@ mod tests {
             .id;
 
         assert!(import_path(&import_dir, &paths, None).is_err());
+        assert!(
+            SkillStore::open_at(&paths)
+                .unwrap()
+                .get_proposal(&skill_id)
+                .unwrap()
+                .is_none()
+        );
+        // Directory capacity is checked before parsing any package or
+        // importing the valid first entry.
+        for index in 3..=MAX_DIRECTORY_PACKAGES + 1 {
+            std::fs::write(import_dir.join(format!("{index:02}.json")), b"{not-json").unwrap();
+        }
+        let error = import_path(&import_dir, &paths, None).unwrap_err();
+        assert!(error.to_string().contains("1 to 32 regular JSON files"));
         assert!(
             SkillStore::open_at(&paths)
                 .unwrap()
@@ -3576,6 +3695,124 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reevaluation_refreshes_stale_reports_before_approval() {
+        for change in ["verifier", "corpus"] {
+            let (root, paths, _) = fixture();
+            let package =
+                || serde_json::from_str::<LearnedSkillPackage>(SEED_PACKAGES[0].1).unwrap();
+            let imported = import_package(package(), &paths, None, "refresh").unwrap();
+            let skill_id = imported.skill_id;
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let initial = store.get_proposal(&skill_id).unwrap().unwrap();
+            if change == "verifier" {
+                let original_id = initial.report_id.as_deref().unwrap();
+                let mut old = store.get_evaluation_report(original_id).unwrap().unwrap();
+                old.verifier_version -= 1;
+                old.report_id = old.recompute_id().unwrap();
+                let tx = store.conn_mut().transaction().unwrap();
+                tx
+                    .execute(
+                        "UPDATE evaluation_reports SET verifier_version = ?, report_id = ? WHERE report_id = ?",
+                        rusqlite::params![old.verifier_version, old.report_id, original_id],
+                    )
+                    .unwrap();
+                tx.execute(
+                    "UPDATE skill_proposals SET report_id = ? WHERE proposal_id = ?",
+                    rusqlite::params![old.report_id, skill_id],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            } else {
+                let mut suite = package().held_out_suites.remove(0);
+                suite.cases[0].expression = format!("({})", suite.cases[0].expression);
+                suite
+                    .import(
+                        &mut store,
+                        &AdminIdentity::authenticated("local-owner").unwrap(),
+                        current_timestamp().unwrap(),
+                    )
+                    .unwrap();
+            }
+            let before = store.get_proposal(&skill_id).unwrap().unwrap();
+            let old_report_id = before.report_id.as_deref().unwrap();
+            assert!(review_proposal(&skill_id, true, &paths, None).is_err());
+            let old_report = store.get_evaluation_report(old_report_id).unwrap().unwrap();
+            let admin = AdminIdentity::authenticated("local-owner").unwrap();
+            for (authority, version) in [
+                (None, before.row_version),
+                (Some(&admin), before.row_version - 1),
+            ] {
+                assert!(
+                    store
+                        .request_blocked_reevaluation(
+                            authority,
+                            &skill_id,
+                            version,
+                            current_timestamp().unwrap()
+                        )
+                        .is_err()
+                );
+                assert_eq!(store.get_proposal(&skill_id).unwrap().unwrap(), before);
+            }
+            drop(store);
+
+            reevaluate_skill(&skill_id, &paths).expect("an unapproved stale report is refreshable");
+            let store = SkillStore::open_at(&paths).unwrap();
+            let pending = store.get_proposal(&skill_id).unwrap().unwrap();
+            assert_eq!(pending.status, ProposalStatus::Pending);
+            assert_eq!(pending.report_id, None);
+            assert_eq!(pending.attempt_count, before.attempt_count);
+            assert_eq!(
+                store.revision_status(&skill_id).unwrap().as_deref(),
+                Some("pending")
+            );
+            assert_eq!(store.desired_generation().unwrap(), 0);
+            assert_eq!(
+                store.get_evaluation_report(old_report_id).unwrap().unwrap(),
+                old_report
+            );
+            drop(store);
+
+            import_package(package(), &paths, None, "refresh").unwrap();
+            let store = SkillStore::open_at(&paths).unwrap();
+            let refreshed = store.get_proposal(&skill_id).unwrap().unwrap();
+            assert_eq!(refreshed.status, ProposalStatus::AwaitingApproval);
+            assert_eq!(refreshed.attempt_count, before.attempt_count + 1);
+            assert_ne!(refreshed.report_id, before.report_id);
+            drop(store);
+            if change == "verifier" {
+                // Several explicit verifier/corpus refreshes may outlive one
+                // claim budget; their durable report numbers must never rewind.
+                for expected_attempt in 3..=super::super::store::MAX_EVALUATION_ATTEMPTS + 2 {
+                    reevaluate_skill(&skill_id, &paths).unwrap();
+                    import_package(package(), &paths, None, "refresh").unwrap();
+                    let store = SkillStore::open_at(&paths).unwrap();
+                    let proposal = store.get_proposal(&skill_id).unwrap().unwrap();
+                    assert_eq!(proposal.status, ProposalStatus::AwaitingApproval);
+                    let report = store
+                        .get_evaluation_report(proposal.report_id.as_deref().unwrap())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(report.attempt, expected_attempt);
+                    let count: u32 = store
+                        .conn()
+                        .query_row(
+                            "SELECT COUNT(*) FROM evaluation_reports WHERE proposal_id = ?",
+                            [&skill_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, expected_attempt);
+                }
+            }
+            review_proposal(&skill_id, true, &paths, None).unwrap();
+            assert!(reevaluate_skill(&skill_id, &paths).is_err());
+            assert_eq!(live_revision_status(&paths, &skill_id).unwrap(), "canary");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

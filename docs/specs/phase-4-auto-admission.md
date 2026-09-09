@@ -54,6 +54,10 @@ return it to `pending`. The shipped `--reevaluate-learned-skill <SHA256>` comman
 proposal deferred for infrastructure failure or an exhausted claim budget, or a `verified` +
 `held_out_suite_required` proposal. Importing the same package also requeues recoverable proposals
 after restoring its matching baseline.
+Explicit reevaluation also accepts `awaiting_approval`, allowing the operator to refresh an
+outdated verifier report or changed suite selection before approving it. It clears the proposal's
+report binding and preserves historical reports and their attempt numbering; approved and rejected
+proposals remain ineligible. Reimport alone preserves an awaiting proposal's existing report.
 
 Explicit reevaluation and rejection are authenticated database-only operations. They do not
 initialize an embedding backend or execute the verifier, so missing embedding credentials or an
@@ -180,6 +184,10 @@ this transition directly for all three parking reasons. `--import-learned-skill`
 recoverable proposals while importing their matching baselines.
 
 Claims use persisted leases and retries so a crash cannot strand a row in `evaluating`.
+The bounded claim counter and durable report attempt number are distinct. A claim allocates its
+report number above every stored report for that proposal inside the claim transaction. Explicit
+recovery can reset an exhausted claim budget, including a final successful evaluation now awaiting
+approval, without colliding with or replacing historical reports.
 Evaluation reports bind proposal ID, artifact ID, verifier version, matched held-out suite hashes,
 predecessor ID, attempt number, and timestamps. Reason codes are stable; human-readable messages
 are supplementary, generated only from fixed templates and sanitized typed fields, and never embed
@@ -386,6 +394,11 @@ execution. Cases run under the same fresh, bounded, no-effect contract as embedd
 held-out case may supply hidden verifier-fake responses and assert the fake call transcript.
 Expected values, fixture responses, and transcripts are never included in agent input or telemetry.
 
+Held-out integer expectations must fit signed 64-bit storage and be exactly representable as a
+JavaScript Number. Verifier version 6 compares both QuickJS numeric representations by exact
+integer value; it rejects fractions, non-finite numbers, non-numeric types, and rounded neighbors.
+Invalid expected integers are a trusted-corpus validation error, not a candidate test failure.
+
 The evaluator permits at most 32 distinct matched suites and 64 total held-out cases across the
 candidate and its complete predecessor lineage. Shared suites count once. If either bound is
 exceeded, evaluation refuses the corpus before running any held-out case; it must never truncate
@@ -401,9 +414,10 @@ without parser details or hidden fixture values. Actual failed cases remain dete
 If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and
 requests reevaluation. Agent-authored embedded tests alone never satisfy this gate.
-The authenticated reevaluation transition atomically returns only that blocked proposal and its
+The authenticated reevaluation transition atomically returns only the selected proposal and its
 revision to `pending`; it cannot reset deterministic rejection or alter identity-bearing bytes. It
-also accepts the two `deferred` reason codes above. In the shipped binary this transition is
+also accepts the two `deferred` reason codes above and unapproved `awaiting_approval` proposals.
+In the shipped binary this transition is
 available through `--reevaluate-learned-skill <SHA256>`. Importing a package whose held-out
 baseline is bundled with it also imports the baseline and requeues a recoverable proposal.
 

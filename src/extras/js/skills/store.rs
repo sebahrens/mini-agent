@@ -1411,7 +1411,20 @@ impl SkillStore {
                 "proposal row version must be positive".to_string(),
             ));
         }
-        let attempt = attempt_count + 1;
+        let claim_attempt = attempt_count + 1;
+        // Explicit recovery can reset the bounded claim budget, but historical
+        // reports keep their unique (proposal_id, attempt) identity forever.
+        let last_report_attempt: u32 = tx.query_row(
+            "SELECT COALESCE(MAX(attempt), 0) FROM evaluation_reports WHERE proposal_id = ?1",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        let attempt = last_report_attempt
+            .checked_add(1)
+            .ok_or_else(|| {
+                StoreError::Constraint("evaluation report attempt overflow".to_string())
+            })?
+            .max(claim_attempt);
         let next_version = row_version + 1;
         let changed = tx.execute(
             "UPDATE skill_proposals
@@ -1424,7 +1437,7 @@ impl SkillStore {
                  (status = 'evaluating' AND lease_expires_at <= ?5)
                )",
             params![
-                attempt,
+                claim_attempt,
                 worker,
                 lease_expires_at,
                 next_version,
@@ -2412,7 +2425,8 @@ impl SkillStore {
                 "SELECT skill_id, status FROM skill_proposals
                  WHERE proposal_id = ?1 AND row_version = ?2
                    AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
-                        OR (status = 'deferred' AND reason_code IN (?3, ?4)))",
+                        OR (status = 'deferred' AND reason_code IN (?3, ?4))
+                        OR status = 'awaiting_approval')",
                 params![
                     proposal_id,
                     sql_version(expected_row_version)?,
@@ -2423,32 +2437,34 @@ impl SkillStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
-        // A row parked by `sweep_exhausted_proposals` has a spent claim budget,
-        // so it must be cleared or the reopened row is unclaimable all over
-        // again. Every other reopen keeps its count: `attempt` numbers the
-        // evaluation reports, and rewinding it would collide with the report
-        // the earlier attempt already wrote.
+        // Reset an exhausted claim budget, including an awaiting proposal whose
+        // last evaluation used the final claim. Report numbering is allocated
+        // independently by claim_due_proposal and never rewinds with this counter.
         let proposal_changed = tx.execute(
             "UPDATE skill_proposals
              SET status = 'pending',
                  attempt_count = CASE
-                     WHEN reason_code = ?6 THEN 0 ELSE attempt_count END,
+                     WHEN reason_code = ?6
+                          OR (status = 'awaiting_approval' AND attempt_count >= ?7)
+                     THEN 0 ELSE attempt_count END,
                  infrastructure_attempt_count = 0,
                  next_attempt_at = ?1, report_id = NULL,
                  reason_code = NULL, row_version = row_version + 1, updated_at = ?1
              WHERE proposal_id = ?2 AND row_version = ?3
                AND ((status = 'verified' AND reason_code = 'held_out_suite_required')
-                    OR (status = 'deferred' AND reason_code IN (?4, ?5)))",
+                    OR (status = 'deferred' AND reason_code IN (?4, ?5))
+                    OR status = 'awaiting_approval')",
             params![
                 now,
                 proposal_id,
                 sql_version(expected_row_version)?,
                 EVALUATION_INFRASTRUCTURE_DEFERRED,
                 EVALUATION_ATTEMPTS_EXHAUSTED,
-                EVALUATION_ATTEMPTS_EXHAUSTED
+                EVALUATION_ATTEMPTS_EXHAUSTED,
+                MAX_EVALUATION_ATTEMPTS
             ],
         )?;
-        let revision_changed = if status == "verified" {
+        let revision_changed = if matches!(status.as_str(), "verified" | "awaiting_approval") {
             tx.execute(
                 "UPDATE skill_revisions
                  SET status = 'pending', row_version = row_version + 1, updated_at = ?1

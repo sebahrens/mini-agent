@@ -4201,8 +4201,13 @@ fn verification_expected_matches(
             .and_then(|value| value.to_string().ok())
             .is_some_and(|actual| actual == *expected),
         VerificationExpectedValue::Integer(expected) => actual
-            .as_int()
-            .is_some_and(|actual| i64::from(actual) == *expected),
+            .as_float()
+            .or_else(|| actual.as_int().map(f64::from))
+            .is_some_and(|actual| {
+                actual.is_finite()
+                    && actual.fract() == 0.0
+                    && actual as i128 == i128::from(*expected)
+            }),
         VerificationExpectedValue::Float(expected) => actual
             .as_float()
             .or_else(|| actual.as_int().map(f64::from))
