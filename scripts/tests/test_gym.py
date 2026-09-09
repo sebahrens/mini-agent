@@ -5,6 +5,8 @@ import io
 import json
 import os
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,7 @@ from unittest import mock
 
 from scripts.gym import mine_tasks as MINE
 from scripts.gym import train as TRAIN_MODULE
+from scripts.gym import worktrees as WORKTREES
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -238,6 +241,171 @@ class GymSubprocessTests(unittest.TestCase):
                     [sys.executable, "-c", "print('recovered')"], root, dict(os.environ), 2,
                 )
                 self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
+
+
+class GymWorktreeCommandTests(unittest.TestCase):
+    def test_cleanup_unlinks_replaced_roots_and_preserves_other_worktrees(self) -> None:
+        for registered in [False, True]:
+            with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                other = root / "other"
+                git(repo, "worktree", "add", "--detach", str(other), "HEAD")
+                git(repo, "worktree", "lock", "--reason", "unrelated", str(other))
+                original = git(repo, "worktree", "list", "--porcelain")
+                workspace = root / "owned"
+                if registered:
+                    git(repo, "worktree", "add", "--detach", str(workspace), "HEAD")
+                    workspace.rename(root / "retained")
+                workspace.symlink_to(other, target_is_directory=True)
+                TRAIN_MODULE.remove_workspace(repo, workspace)
+                self.assertEqual((other / "value.txt").read_text(), "broken\n")
+                self.assertFalse(os.path.lexists(workspace))
+                self.assertEqual(git(repo, "worktree", "list", "--porcelain"), original)
+                if registered:
+                    self.assertEqual((root / "retained/value.txt").read_text(), "broken\n")
+
+    def test_filesystem_cleanup_failure_reports_data_and_preserves_registration(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("permission fixture requires an unprivileged user")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            workspace = root / "worktree"
+            git(repo, "worktree", "add", "--detach", str(workspace), "HEAD")
+            original = git(repo, "worktree", "list", "--porcelain")
+            protected = workspace / "protected"
+            protected.mkdir()
+            (protected / "file").write_text("retained")
+            protected.chmod(0o500)
+            try:
+                with self.assertRaises(WORKTREES.WorktreeError) as failed:
+                    TRAIN_MODULE.remove_workspace(repo, workspace)
+                self.assertIn("filesystem cleanup", str(failed.exception))
+                self.assertEqual((protected / "file").read_text(), "retained")
+                # A partial removal may delete the .git pointer, but the
+                # registration must remain available for cleanup retry.
+                registrations = git(repo, "worktree", "list", "--porcelain")
+                self.assertEqual([line for line in registrations.splitlines() if not line.startswith("prunable ")],
+                                 original.splitlines())
+            finally:
+                protected.chmod(0o700)
+                TRAIN_MODULE.remove_workspace(repo, workspace)
+            self.assertFalse(workspace.exists())
+            self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+
+    def test_stalled_checkout_is_setup_failure_and_bounds_output(self) -> None:
+        for caller in ["trainer", "miner"]:
+            with self.subTest(caller=caller), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                pid_file = root / "hook-pid"
+                marker = root / "oracle-ran"
+                code = (
+                    "import os,time; from pathlib import Path\n"
+                    f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                    "for _ in range(32): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
+                    "os.write(2,b'checkout-tail'); time.sleep(3)\n"
+                )
+                hook = repo / ".git/hooks/post-checkout"
+                hook.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-c", code]) + "\n")
+                hook.chmod(0o755)
+                workspace = root / "worktree"
+                tracemalloc.start()
+                try:
+                    with mock.patch.object(WORKTREES, "SETUP_TIMEOUT_SECS", 1):
+                        if caller == "trainer":
+                            task = {"base_commit": "HEAD", "initial_files": {}, "deleted_files": []}
+                            with self.assertRaises(TRAIN_MODULE.EpisodeFailure) as failed:
+                                TRAIN_MODULE.prepare_workspace(repo, task, workspace, True)
+                            self.assertEqual(failed.exception.reason, "workspace_unavailable")
+                        else:
+                            with self.assertRaises(MINE.OracleSetupError) as failed:
+                                MINE.oracle_at(repo, "HEAD", "touch " + shlex.quote(str(marker)))
+                    peak = tracemalloc.get_traced_memory()[1]
+                    self.assertIn("git worktree add timed out after 1s", str(failed.exception))
+                    self.assertIn("checkout-tail", str(failed.exception))
+                    self.assertLess(len(str(failed.exception)), 2200)
+                    self.assertLess(peak, 1024 * 1024, "checkout diagnostics retained the flood")
+                    self.assertFalse(marker.exists(), "an unavailable checkout cannot produce oracle evidence")
+                    self.assertTrue(pid_file.exists(), "the checkout hook must actually start")
+                finally:
+                    tracemalloc.stop()
+                    # Full descendant ownership remains m7bs. Explicitly terminate
+                    # this fixture's surviving hook after the Git root is killed.
+                    if pid_file.exists():
+                        try:
+                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    TRAIN_MODULE.remove_workspace(repo, workspace)
+                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+
+    def test_cleanup_failures_attempt_remaining_steps_and_reap_commands(self) -> None:
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        for caller, operation, outcome in [("trainer", "remove", "timeout"), ("trainer", "prune", "timeout"),
+                                           ("miner", "prune", "error")]:
+            with self.subTest(caller=caller, operation=operation, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                workspace = root / "worktree"
+                if caller == "trainer":
+                    git(repo, "worktree", "add", "--detach", str(workspace), "HEAD")
+                shim_dir = root / "bin"
+                shim_dir.mkdir()
+                pid_file = root / "command-pid"
+                calls = root / "calls.jsonl"
+                shim = shim_dir / "git"
+                shim.write_text(
+                    f"#!{sys.executable}\nimport os,sys,time,json\nfrom pathlib import Path\n"
+                    f"with open({str(calls)!r},'a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                    f"if sys.argv[1:3]==['worktree',{operation!r}]:\n"
+                    f" Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                    " for _ in range(32): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
+                    " os.write(2,b'cleanup-tail')\n"
+                    f" if {outcome!r}=='timeout': time.sleep(3)\n"
+                    f" sys.exit(7 if {outcome!r}=='error' else 0)\n"
+                    f"os.execv({real_git!r},[{real_git!r},*sys.argv[1:]])\n"
+                )
+                shim.chmod(0o755)
+                tracemalloc.start()
+                try:
+                    with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
+                         mock.patch.object(WORKTREES, "CLEANUP_TIMEOUT_SECS", 1):
+                        exception = WORKTREES.WorktreeError if caller == "trainer" else MINE.OracleSetupError
+                        with self.assertRaises(exception) as failed:
+                            if caller == "trainer":
+                                TRAIN_MODULE.remove_workspace(repo, workspace)
+                            else:
+                                MINE.oracle_at(repo, "HEAD", "true")
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertIn(f"git worktree {operation} " + ("timed out after 1s" if outcome == "timeout" else "exited 7"),
+                              str(failed.exception))
+                self.assertIn("cleanup-tail", str(failed.exception))
+                self.assertLess(peak, 1024 * 1024, "cleanup diagnostics retained the flood")
+                observed = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual([args[1] for args in observed], ["remove", "prune"] if caller == "trainer"
+                                 else ["add", "remove", "prune"])
+                removed = next(args[-1] for args in observed if args[1] == "remove")
+                self.assertFalse(Path(removed).exists())
+                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            workspace = repo / "leftover"
+            workspace.mkdir()
+            (workspace / "file").write_text("cleanup still required")
+            with mock.patch.dict(os.environ, {"PATH": ""}):
+                with self.assertRaises(WORKTREES.WorktreeError) as failed:
+                    TRAIN_MODULE.remove_workspace(repo, workspace)
+            self.assertIn("git worktree remove could not complete", str(failed.exception))
+            self.assertIn("git worktree prune could not complete", str(failed.exception))
+            self.assertFalse(workspace.exists(), "missing Git must not prevent filesystem cleanup")
 
 
 class GymWorkspaceTests(unittest.TestCase):

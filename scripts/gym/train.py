@@ -27,8 +27,10 @@ from pathlib import Path
 
 if __package__:
     from .process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
+    from .worktrees import WorktreeError, remove_workspace, run_worktree
 else:
     from process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
+    from worktrees import WorktreeError, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
 ARMS = ("none", "library")
@@ -329,9 +331,10 @@ def publish_workspace_file(parent_fd: int, name: str, content: str) -> None:
 
 def prepare_workspace(repo: Path, task: dict[str, object], destination: Path, allow_empty: bool) -> None:
     base = str(task["base_commit"])
-    result = subprocess.run(
-        ["git", "worktree", "add", "--detach", str(destination), base], cwd=repo, capture_output=True
-    )
+    try:
+        result = run_worktree(repo, "add", "--detach", str(destination), base)
+    except WorktreeError as error:
+        raise EpisodeFailure("workspace_unavailable", str(error)) from error
     if result.returncode:
         if not allow_empty:
             raise EpisodeFailure(
@@ -363,13 +366,6 @@ def prepare_workspace(repo: Path, task: dict[str, object], destination: Path, al
             os.close(root_fd)
     except (OSError, TaskError) as error:
         raise EpisodeFailure("workspace_unavailable", f"workspace preparation failed: {error}") from error
-
-
-def remove_workspace(repo: Path, workspace: Path) -> None:
-    # This path is Gym-owned; a checkout hook may have locked its registration.
-    subprocess.run(["git", "worktree", "remove", "--force", "--force", str(workspace)], cwd=repo, capture_output=True)
-    shutil.rmtree(workspace, ignore_errors=True)
-    subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)
 
 
 def open_regular_oracle_file(path: str, flags: int) -> int:

@@ -165,7 +165,8 @@ For each task and each arm the runner:
    `deleted_files`, and overlays `initial_files`. A worktree that cannot be created is a failed row
    with `failure_reason=workspace_unavailable`. With `--allow-empty-workspace`, any partial
    checkout and its registration are removed before creating an empty directory and applying the
-   task's initial files. If cleanup leaves the destination behind, the episode fails;
+   task's initial files. If cleanup leaves the destination behind, the episode fails. A timed-out
+   setup fails the episode even when the empty-workspace fallback is enabled;
 2. builds a fresh AppPaths tree under `<gym root>/runs/` and a curated environment (below);
 3. for the `library` arm, installs the library from a neutral directory, approves and activates only
    the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
@@ -191,15 +192,22 @@ unlink final symlinks (including dangling ones) and remove directories without f
 inside them. An overlay error produces `workspace_unavailable` and prevents the agent from
 running for that episode. Failed file publication removes its temporary file.
 
-Agent, library-install, and command-oracle output in both training and task mining is drained
+Agent, library-install, command-oracle, and worktree-command output in training and task mining is drained
 concurrently by [process_capture.py](../../scripts/gym/process_capture.py), retaining only the last
 2,000 bytes of each stream. Git blobs use its capped complete-stdout mode; other Git data queries
 retain their complete output. Timeout diagnostics use
 those same tails. The exit deadline still applies if a process closes its output pipes early.
 Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
 groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.
-Git worktree setup and cleanup commands still lack deadlines; bounded administrative execution is
-tracked separately in `mini-agent-i7r1`.
+Git worktree administration is shared through [worktrees.py](../../scripts/gym/worktrees.py).
+Checkout has a 300-second deadline; removal and pruning each have a 30-second deadline. Cleanup
+first removes the filesystem entry without following root symlinks, then removes its Git
+registration. Filesystem failures are reported and preserve the registration for a later retry;
+pruning still runs if the subsequent Git removal command times out. Administrative
+timeouts and launch failures are separate from oracle verdicts: training records a setup failure
+before launching the agent, and mining skips the candidate. A cleanup command timeout, launch
+failure, filesystem cleanup failure, or nonzero prune exit stops training with a runner error and makes mining skip the
+candidate. These command bounds do not establish complete descendant ownership.
 
 Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
 finished.

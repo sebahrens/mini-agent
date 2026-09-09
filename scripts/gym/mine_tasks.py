@@ -18,8 +18,10 @@ from pathlib import Path
 
 if __package__:
     from .process_capture import OUTPUT_TAIL_BYTES, run_bounded
+    from .worktrees import WorktreeError, remove_workspace, run_worktree
 else:
     from process_capture import OUTPUT_TAIL_BYTES, run_bounded
+    from worktrees import WorktreeError, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
 MAX_BLOB_BYTES = 256_000
@@ -163,9 +165,10 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
         root = Path(directory)
         worktree = root / "worktree"
         try:
-            added = subprocess.run(
-                ["git", "worktree", "add", "--detach", str(worktree), revision], cwd=repo, capture_output=True
-            )
+            try:
+                added = run_worktree(repo, "add", "--detach", str(worktree), revision)
+            except WorktreeError as error:
+                raise OracleSetupError(str(error)) from error
             if added.returncode:
                 raise OracleSetupError(f"worktree add {revision} failed: {tail_text(added.stderr)}")
             result = run_bounded(
@@ -178,11 +181,10 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
             print(f"gym mine: oracle timed out after {ORACLE_TIMEOUT_SECS}s at {revision[:12]}", file=sys.stderr)
             return False
         finally:
-            # A failing post-checkout hook can make add fail after registering
-            # the worktree, possibly locking it. Remove this Gym-owned checkout
-            # and its registration before deleting its temp root.
-            subprocess.run(["git", "worktree", "remove", "--force", "--force", str(worktree)], cwd=repo, capture_output=True)
-            subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)
+            try:
+                remove_workspace(repo, worktree)
+            except WorktreeError as error:
+                raise OracleSetupError(str(error)) from error
         if result.returncode:
             print(
                 f"gym mine: oracle exited {result.returncode} at {revision[:12]}: {tail_text(result.stderr)}",
