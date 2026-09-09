@@ -100,7 +100,7 @@ async fn buffered_terminal_survives_clean_exit_and_keeps_validation() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // Deliberately stall only the blocking pipe reader.
 async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
-    for action in ["release", "cancel", "expire"] {
+    for action in ["release", "delayed-release", "cancel", "deadline"] {
         let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
             TestWorkerLauncher::scripted_internal_worker(0),
             Duration::from_secs(5),
@@ -128,9 +128,8 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
             cancellation.clone(),
         );
         tokio::pin!(read);
-        // Observe reaping in the same poll that enters the drain. A separate
-        // timer can be scheduled after the 100 ms drain expires while this
-        // fixture still holds the pipe reader locked.
+        // Enter the drain before releasing the reader. The delayed case then
+        // keeps driving the caller beyond the former 100 ms grace window.
         tokio::time::timeout(
             Duration::from_secs(2),
             std::future::poll_fn(|cx| {
@@ -147,7 +146,13 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
         )
         .await
         .expect("the read loop must observe and reap the exited worker");
-        if action == "release" {
+        if action == "delayed-release" {
+            tokio::select! {
+                result = &mut read => panic!("queued reader lost its buffered terminal: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+            }
+        }
+        if matches!(action, "release" | "delayed-release") {
             drop(guard);
             assert_eq!(
                 read.await.unwrap().outcome,
@@ -157,14 +162,14 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
             if action == "cancel" {
                 cancellation.cancel();
             }
-            let result = tokio::time::timeout(Duration::from_secs(1), &mut read).await;
+            let result = tokio::time::timeout(Duration::from_secs(6), &mut read).await;
             drop(guard);
             assert_eq!(
                 result.expect("exit drain must be bounded").unwrap_err(),
                 if action == "cancel" {
                     WorkerError::Cancelled
                 } else {
-                    WorkerError::Transport
+                    WorkerError::TimedOut
                 }
             );
         }
@@ -180,6 +185,43 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
         assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
         assert_eq!(supervisor.generation_for_test().await, Some(2));
         supervisor.shutdown_for_test().await.unwrap();
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn exited_worker_drain_rejects_incomplete_frames_with_a_foreign_writer_still_open() {
+    for prefix in [&[][..], &[0, 0][..], &[0, 0, 0, 4, b'{'][..]] {
+        let mut connection = requested_connection("terminal-exit-clean").await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while connection.process.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker must exit");
+        let (reader, mut foreign_writer) = std::io::pipe().unwrap();
+        #[cfg(unix)]
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+        #[cfg(windows)]
+        let file = std::fs::File::from(std::os::windows::io::OwnedHandle::from(reader));
+        foreign_writer.write_all(prefix).unwrap();
+        connection.output_handle = Arc::new(Mutex::new(file));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_worker(
+                &mut connection,
+                false,
+                &PermCancellation::new(),
+                Instant::now() + Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("drain must stop at the end of buffered bytes without waiting for writer EOF");
+        assert_eq!(result.unwrap_err(), WorkerError::Transport);
+        // Keep the writer alive throughout the read. Its later bytes cannot
+        // complete a frame belonging to an already-exited producer.
+        foreign_writer.write_all(b"late").unwrap();
     }
 }
 

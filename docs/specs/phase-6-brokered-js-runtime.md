@@ -1019,10 +1019,17 @@ preserves complete step/verification results after a successful exit, then appli
 build, invocation, sequence, state, and closed-diagnostic validation. It never treats a dead
 worker's effect request or Ready as actionable, and abnormal/resource exits still override result
 frames. Authenticated protocol faults retain their closed classification even on abnormal exit.
-When the exit poll wins over the pending pipe read, the parent drains that same read for at most
-100 ms, bounded by cancellation and the invocation deadline. Observably exited workers cannot
-return to the idle pool. `src/extras/js/tests/worker_exit.rs` forces both exit/read orderings and
-checks protocol validation, abnormal/native CPU exits, cancellation, and the bounded drain;
+When the exit poll wins over the pending pipe read, the parent drains that same read through
+`src/extras/js/pipe.rs`. Native pipe readiness permits consuming buffered bytes without waiting
+for a foreign writer to close an empty pipe. The frame-size cap bounds decoding, and cancellation
+and the original invocation deadline bound scheduling; there is no additional scheduling grace
+window that can discard a complete buffered terminal. Dropping the read signals its blocking
+task to stop at the next readiness check. Unix uses polling; Windows peeks its exclusively owned
+anonymous pipe with bounded idle backoff. An incomplete header or body remains a transport
+failure. Observably exited workers cannot return to the idle pool.
+`src/extras/js/tests/worker_exit.rs` forces both exit/read orderings and checks protocol validation,
+abnormal/native CPU exits, delayed reader scheduling, cancellation, the invocation deadline,
+and empty or incomplete frames with a foreign writer still open (mini-agent-02cp);
 the skill identity/ABI boundary tests run without transport retries.
 
 Verification terminals must also use the current loader version, return exactly the ordered case

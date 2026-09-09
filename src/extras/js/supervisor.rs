@@ -2063,11 +2063,17 @@ async fn read_worker(
 ) -> Result<WorkerWireFrame, WorkerError> {
     let generation = connection.generation;
     let output_handle = connection.output_handle.clone();
+    let control = super::pipe::ReadControl::default();
+    let _stop_read = control.stop_on_drop();
+    let reader_control = control.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         let mut output = output_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let result = read_worker_frame(&mut *output, accepts_test_preamble);
+        let result = read_worker_frame(
+            &mut reader_control.reader(&mut output),
+            accepts_test_preamble,
+        );
         TaggedIo { generation, result }
     });
     let tagged = loop {
@@ -2079,18 +2085,14 @@ async fn read_worker(
             }
             tagged = &mut task => break tagged.map_err(|_| WorkerError::Transport)?,
             _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
-                if let Some(exit_status) = connection.process.try_wait().map_err(|_| WorkerError::Transport)? {
-                    // Exit can become observable before the blocking reader delivers a flushed
-                    // terminal frame. Drain that same read, bounded independently of invocation
-                    // time so an inherited/open pipe cannot keep a dead worker's caller waiting.
-                    let drain_deadline = deadline.min(Instant::now() + PROCESS_EXIT_RECONCILIATION_TIMEOUT);
-                    match await_controlled(&mut task, cancellation, drain_deadline).await {
-                        Ok(tagged) => break tagged.map_err(|_| WorkerError::Transport)?,
-                        Err(WorkerError::TimedOut) if Instant::now() < deadline => {
-                            return Err(classify_worker_exit(exit_status));
-                        }
-                        Err(error) => return Err(error),
-                    }
+                if connection.process.try_wait().map_err(|_| WorkerError::Transport)?.is_some() {
+                    // Preserve buffered bytes even when the reader has not been scheduled yet.
+                    // Its next empty read is EOF after exit, including with a foreign pipe holder.
+                    // The original invocation deadline still bounds scheduling and decoding.
+                    control.producer_exited();
+                    break await_controlled(&mut task, cancellation, deadline)
+                        .await?
+                        .map_err(|_| WorkerError::Transport)?;
                 }
             }
         }
