@@ -161,8 +161,14 @@ For each task and each arm the runner:
    command is given, an exact UTF-8 comparison of `oracle.expected_files` against the workspace.
    File comparisons preserve line endings, accept only regular files (including symlink targets),
    and read at most the expected character count plus one. POSIX FIFO opens are nonblocking;
-7. removes the worktree, runs `git worktree prune`, and deletes the run tree — in a `finally`, so a
-   timeout or install failure cannot leak either.
+7. removes the worktree, runs `git worktree prune`, and deletes the run tree in a `finally`, so
+   these cleanup steps also run after a timeout or install failure.
+
+Agent, library-install, and command-oracle output is drained concurrently, retaining only the last
+2,000 bytes of each stream. Timeout diagnostics use those same tails. The exit deadline still
+applies if a process closes its output pipes early.
+Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
+groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.
 
 Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
 finished.

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import tracemalloc
+import time
 import unittest
 from pathlib import Path
 
@@ -181,6 +182,68 @@ def run_training(root: Path, repo: Path, binary: Path, document: dict[str, objec
     return completed, rows, gym_root
 
 
+class GymSubprocessTests(unittest.TestCase):
+    def test_output_floods_retain_exact_tails_with_bounded_memory(self) -> None:
+        limit = 2000
+        for mode, exit_code in [("stdout", 0), ("stderr", 7), ("mixed", 0)]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                code = (
+                    "import os,sys; mode=sys.argv[1]; "
+                    "out=b'x'*65536; err=b'y'*65536\n"
+                    "for _ in range(64):\n"
+                    " if mode != 'stderr': os.write(1,out)\n"
+                    " if mode != 'stdout': os.write(2,err)\n"
+                    "if mode != 'stderr': os.write(1,b'\\xffstdout-end\\n')\n"
+                    "if mode != 'stdout': os.write(2,b'\\xfestderr-end\\n')\n"
+                    "sys.exit(int(sys.argv[2]))"
+                )
+                tracemalloc.start()
+                try:
+                    result = TRAIN_MODULE.run(
+                        [sys.executable, "-c", code, mode, str(exit_code)],
+                        Path(directory), dict(os.environ), 5,
+                    )
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(result.returncode, exit_code)
+                self.assertLess(peak, 1024 * 1024, "output capture retained the flood")
+                for actual, enabled, fill, marker in [
+                    (result.stdout, mode != "stderr", b"x", b"\xffstdout-end\n"),
+                    (result.stderr, mode != "stdout", b"y", b"\xfestderr-end\n"),
+                ]:
+                    self.assertEqual(len(actual), limit if enabled else 0)
+                    self.assertEqual(actual, fill * (limit - len(marker)) + marker if enabled else b"")
+
+    def test_timeout_retains_tails_and_reaps_child_with_open_or_closed_pipes(self) -> None:
+        for close_pipes in [False, True]:
+            with self.subTest(close_pipes=close_pipes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                code = (
+                    "import os,sys,time; from pathlib import Path; "
+                    "Path('pid').write_text(str(os.getpid())); "
+                    "os.write(1,b'x'*10000+b'OUT'); os.write(2,b'y'*10000+b'ERR')\n"
+                    "if sys.argv[1]=='close': os.close(1); os.close(2)\n"
+                    "time.sleep(30)"
+                )
+                started = time.monotonic()
+                with self.assertRaises(subprocess.TimeoutExpired) as timed_out:
+                    TRAIN_MODULE.run(
+                        [sys.executable, "-c", code, "close" if close_pipes else "open"],
+                        root, dict(os.environ), 1,
+                    )
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertEqual(timed_out.exception.timeout, 1)
+                self.assertEqual(timed_out.exception.output, b"x" * 1997 + b"OUT")
+                self.assertEqual(timed_out.exception.stderr, b"y" * 1997 + b"ERR")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int((root / "pid").read_text()), 0)
+                recovered = TRAIN_MODULE.run(
+                    [sys.executable, "-c", "print('recovered')"], root, dict(os.environ), 2,
+                )
+                self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
+
+
 class GymFileOracleTests(unittest.TestCase):
     def test_exact_file_comparison_handles_boundaries_and_invalid_content(self) -> None:
         cases = [
@@ -326,7 +389,7 @@ class GymTrainerTests(unittest.TestCase):
                     row["total_ms"], row["elapsed_ms"] + row["oracle_ms"], row
                 )
 
-    def test_agent_timeout_records_the_agent_clock_without_the_oracle(self) -> None:
+    def test_agent_timeout_records_clock_failure_and_cleans_workspace(self) -> None:
         # The pre-agent oracle also takes a second here, so an elapsed_ms that
         # still spanned the whole episode would be about twice the timeout.
         with tempfile.TemporaryDirectory() as directory:
@@ -338,15 +401,20 @@ class GymTrainerTests(unittest.TestCase):
                 "command": "sleep 1; test -f fixed.txt",
                 "id": "slow-oracle",
             }
-            completed, rows, _ = run_training(
+            completed, rows, gym_root = run_training(
                 root, repo, binary, document, "--task-timeout", "1"
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             for row in rows:
+                self.assertFalse(row["success"])
                 self.assertEqual(row["failure_reason"], "agent_timeout")
+                self.assertEqual(row["agent_exit"], 124)
+                self.assertEqual(row["timeout_secs"], 1)
                 self.assertGreaterEqual(row["elapsed_ms"], 900, row)
                 self.assertLess(row["elapsed_ms"], 1900, row)
                 self.assertGreaterEqual(row["oracle_ms"], 900, row)
+            self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
+            self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
 
     def test_agent_failure_is_a_failed_row_and_the_run_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,23 +430,6 @@ class GymTrainerTests(unittest.TestCase):
                 self.assertEqual(row["failure_reason"], "agent_exit_nonzero")
                 self.assertIn("agent failed", row["agent_stderr_tail"])
             self.assertIn("gym arm none: 0 passed, 1 failed of 1", completed.stdout)
-            self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
-
-    def test_agent_timeout_is_recorded_and_the_worktree_is_removed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            binary, _ = make_stub(root, "timeout")
-            completed, rows, gym_root = run_training(
-                root, repo, binary, task_document([{"name": "slow", "tags": []}]), "--task-timeout", "1"
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            for row in rows:
-                self.assertFalse(row["success"])
-                self.assertEqual(row["failure_reason"], "agent_timeout")
-                self.assertEqual(row["agent_exit"], 124)
-                self.assertEqual(row["timeout_secs"], 1)
-            self.assertEqual(git(repo, "worktree", "list").strip().count("\n"), 0)
             self.assertEqual(sorted((gym_root / "worktrees").iterdir()), [])
 
     def test_library_install_failure_only_fails_the_library_arm(self) -> None:
