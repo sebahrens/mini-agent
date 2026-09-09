@@ -1020,13 +1020,6 @@ fn skill_store_pending_lifecycle_missing_suite_is_verified_but_not_approvable() 
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn skill_admission_api_visibility_has_no_active_transition() {
-    let source = include_str!("../skills/admission_store.rs");
-    assert!(!source.contains("status = 'active'"));
-    assert!(!source.contains("pub fn approve_canary"));
-}
-
 struct UnavailableEmbedding;
 
 impl EmbeddingBackend for UnavailableEmbedding {

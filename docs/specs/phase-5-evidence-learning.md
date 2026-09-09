@@ -90,6 +90,11 @@ purged: explicit privacy operation, not a normal lifecycle transition
 
 Allowed transitions are implemented in one service and persisted transactionally. Direct SQL or
 raw store methods must not bypass verifier, approval, evidence, or rollback gates.
+The generic transaction primitive rejects entry into `canary` or `active`, and rejects
+`active → superseded`; those edges require their dedicated admission, activation, or replacement
+service. Production quarantine calls the primitive inside its own evidence transaction. The
+standalone generic transaction adapter exists only for tests; there is no generic coordinated
+publication wrapper.
 
 Every replacement stores `supersedes_id`. Successful promotion atomically sets the candidate to
 `active` and the predecessor to `superseded`. A lineage must be acyclic and each active revision

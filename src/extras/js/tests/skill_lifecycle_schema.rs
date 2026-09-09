@@ -198,13 +198,53 @@ fn skill_lifecycle_transitions_are_atomic_optimistic_and_idempotent() {
     let mut stale = request.clone();
     stale.idempotency_key = "transition-2".into();
     stale.from_status = LifecycleStatus::Verified;
-    stale.to_status = LifecycleStatus::Canary;
+    stale.to_status = LifecycleStatus::Quarantined;
+    stale.snapshot = snapshot(&artifact.id, 1, 1);
     assert!(matches!(
         service.transition(&stale, 4),
-        Err(LifecycleError::StaleRowVersion { .. })
-            | Err(LifecycleError::EvidenceMismatch)
-            | Err(LifecycleError::StaleGeneration { .. })
+        Err(LifecycleError::StaleRowVersion {
+            expected: 1,
+            actual: 2,
+            ..
+        })
     ));
+
+    // A current row and valid evidence cannot replace the dedicated admission,
+    // activation, or replacement services and their authorization checks.
+    for (from_status, to_status) in [
+        (LifecycleStatus::Verified, LifecycleStatus::Canary),
+        (LifecycleStatus::Canary, LifecycleStatus::Active),
+        (LifecycleStatus::Superseded, LifecycleStatus::Active),
+        (LifecycleStatus::Active, LifecycleStatus::Superseded),
+    ] {
+        let privileged = TransitionRequest {
+            idempotency_key: format!("privileged-{from_status}-{to_status}"),
+            from_status,
+            to_status,
+            expected_row_version: 2,
+            snapshot: snapshot(&artifact.id, 2, 1),
+            ..request.clone()
+        };
+        let outcome = service.transition(&privileged, 5);
+        assert!(
+            matches!(outcome, Err(LifecycleError::PrivilegedTransition)),
+            "{from_status} -> {to_status}: {outcome:?}"
+        );
+        let revision = service.revision(&artifact.id).unwrap();
+        assert_eq!(revision.status, LifecycleStatus::Verified);
+        assert_eq!(revision.row_version, 2);
+        assert_eq!(service.index_generations().unwrap(), (1, 0));
+    }
+    assert_eq!(
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_transitions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1,
+        "failed transitions must leave no audit records"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

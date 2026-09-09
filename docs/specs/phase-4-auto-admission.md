@@ -114,6 +114,9 @@ evaluator/reviewer service. Its private
 `admission_store` dependency owns the only Phase 4 canary transaction; neither `SkillStore`'s
 public surface nor a JS global exposes an active transition. Active-only visibility snapshots
 exclude pending, verified, rejected, and canary revisions by construction.
+The generic Phase 5 lifecycle transaction also refuses entry into canary, preserving the Phase 4
+approval boundary. Admission and lifecycle tests assert the resulting stored status, retrieval
+visibility, authorization requirements, and unchanged state after refused transitions.
 
 ---
 

@@ -363,7 +363,7 @@ pub enum LifecycleError {
     },
     #[error("lineage-root activation was attempted on a replacement")]
     NotLineageRoot,
-    #[error("privileged activation/supersession requires its dedicated atomic service")]
+    #[error("privileged admission/activation/supersession requires its dedicated atomic service")]
     PrivilegedTransition,
     #[error("stored evidence does not qualify this replacement for promotion: {0}")]
     PromotionHeld(String),
@@ -476,24 +476,6 @@ impl<'a> CoordinatedLifecycle<'a> {
                     snapshot,
                     created_at,
                 )?;
-                let generation = outcome.desired_generation as u64;
-                Ok((outcome, generation))
-            })
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn transition(
-        &self,
-        request: &TransitionRequest,
-        created_at: i64,
-    ) -> Result<(TransitionOutcome, PublicationReport), LifecyclePublicationError> {
-        let removed = (request.to_status != LifecycleStatus::Active)
-            .then(|| request.skill_id.clone())
-            .into_iter()
-            .collect();
-        self.coordinator
-            .coordinate_mutation(removed, |store| {
-                let outcome = LifecycleService::new(store).transition(request, created_at)?;
                 let generation = outcome.desired_generation as u64;
                 Ok((outcome, generation))
             })
@@ -662,11 +644,12 @@ impl<'a> LifecycleService<'a> {
         Ok(())
     }
 
-    /// Apply one lifecycle transition in its own `BEGIN IMMEDIATE`.
+    /// Exercise one lifecycle transition in its own `BEGIN IMMEDIATE` in tests.
     ///
     /// Callers that must write policy or evidence rows atomically with the
     /// decision own the transaction themselves and use
     /// [`register_policy_in_tx`] plus [`transition_in_tx`] instead.
+    #[cfg(test)]
     pub(crate) fn transition(
         &mut self,
         request: &TransitionRequest,
@@ -1374,9 +1357,11 @@ pub(crate) fn transition_in_tx(
     created_at: i64,
 ) -> Result<TransitionOutcome, LifecycleError> {
     validate_request(request)?;
-    if request.to_status == LifecycleStatus::Active
-        || (request.from_status == LifecycleStatus::Active
-            && request.to_status == LifecycleStatus::Superseded)
+    if matches!(
+        request.to_status,
+        LifecycleStatus::Canary | LifecycleStatus::Active
+    ) || (request.from_status == LifecycleStatus::Active
+        && request.to_status == LifecycleStatus::Superseded)
     {
         return Err(LifecycleError::PrivilegedTransition);
     }
