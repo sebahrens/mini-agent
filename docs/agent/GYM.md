@@ -177,7 +177,9 @@ For each task and each arm the runner:
    the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
    one revision ends up `active`. The runner reads `skills.db` directly with read-only SQLite to
    pick the roots and read back the active set; the active ids land in `active_skill_ids`. (The
-   binary now has `--learned-skill-json`, but the runner does not use it.)
+   binary now has `--learned-skill-json`, but the runner does not use it.) Database paths are URI
+   encoded, preserving literal `#`, `?`, and `%` characters and the read-only option. Every reader
+   closes before its query returns or raises; missing databases are never created by a query.
 4. runs the oracle **before** the agent and records `oracle_pre_exit`. An oracle that already passes
    makes the task invalid: the row fails with `task_invalid_oracle_passes_before_agent` and the
    agent is never launched;
@@ -185,8 +187,10 @@ For each task and each arm the runner:
    `--task-timeout` (default 900s);
 6. runs the oracle again: `oracle.command` through `/bin/sh -c` with a 300-second bound, or, when no
    command is given, an exact UTF-8 comparison of `oracle.expected_files` against the workspace.
-   File comparisons preserve line endings, accept only regular files (including symlink targets),
-   and read at most the expected character count plus one. POSIX FIFO opens are nonblocking;
+   File comparisons preserve line endings, accept only regular files inside the bound workspace,
+   and read at most the expected character count plus one. Links to internal outputs are supported;
+   external targets and symlinked workspace roots are refused. Resolved paths are reopened through
+   retained directory descriptors without following replacement links. POSIX FIFO opens are nonblocking;
 7. removes the worktree, runs `git worktree prune`, and deletes the run tree in a `finally`, so
    these cleanup steps also run after a timeout or install failure.
 

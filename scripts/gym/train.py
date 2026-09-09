@@ -242,7 +242,7 @@ def skills_database(env: dict[str, str]) -> Path:
 
 
 def query(database: Path, sql: str) -> list[str]:
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+    with contextlib.closing(sqlite3.connect(f"{database.absolute().as_uri()}?mode=ro", uri=True)) as db:
         return [str(row[0]) for row in db.execute(sql)]
 
 
@@ -368,9 +368,9 @@ def prepare_workspace(repo: Path, task: dict[str, object], destination: Path, al
         raise EpisodeFailure("workspace_unavailable", f"workspace preparation failed: {error}") from error
 
 
-def open_regular_oracle_file(path: str, flags: int) -> int:
-    """Open without waiting on a FIFO, then validate the descriptor we read."""
-    descriptor = os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+def open_regular_oracle_file(path: str, flags: int, *, dir_fd: int) -> int:
+    """Open a bound entry without following a replacement link or waiting on a FIFO."""
+    descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError("oracle output is not a regular file")
@@ -388,19 +388,34 @@ def run_oracle(oracle: dict[str, object], workspace: Path, env: dict[str, str]) 
         except subprocess.TimeoutExpired:
             return TIMEOUT_EXIT, f"oracle timed out after {ORACLE_TIMEOUT_SECS}s"
         return result.returncode, tail_text(result.stderr)
+    try:
+        root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return 1, "unreadable workspace"
     mismatches: list[str] = []
-    for relative, expected in dict(oracle["expected_files"]).items():  # type: ignore[arg-type]
-        target = workspace / relative
-        try:
-            with open(target, "r", encoding="utf-8", newline="", opener=open_regular_oracle_file) as handle:
-                # One extra character distinguishes an exact match from a
-                # matching prefix, without retaining an agent-sized output.
-                actual = handle.read(len(expected) + 1)
-        except (OSError, UnicodeDecodeError):
-            mismatches.append(f"unreadable: {relative}")
-            continue
-        if actual != expected:
-            mismatches.append(f"differs: {relative}")
+    try:
+        canonical_root = workspace.resolve(strict=True)
+        for relative, expected in dict(oracle["expected_files"]).items():  # type: ignore[arg-type]
+            try:
+                # Preserve links to internal outputs, but reopen the resolved path
+                # through the bound root. No subsequent component may follow a
+                # replacement symlink, including the final regular-file entry.
+                target = (workspace / relative).resolve(strict=True).relative_to(canonical_root)
+                with workspace_parent(root_fd, str(target), create=False) as (parent_fd, name):
+                    with open(name, "r", encoding="utf-8", newline="",
+                              opener=lambda path, flags: open_regular_oracle_file(path, flags, dir_fd=parent_fd)) as handle:
+                        # One extra character rejects a matching prefix without
+                        # retaining an agent-sized output.
+                        actual = handle.read(len(expected) + 1)
+            except (OSError, ValueError, RuntimeError):
+                mismatches.append(f"unreadable: {relative}")
+                continue
+            if actual != expected:
+                mismatches.append(f"differs: {relative}")
+    except (OSError, RuntimeError):
+        return 1, "unreadable workspace"
+    finally:
+        os.close(root_fd)
     return (1 if mismatches else 0), "; ".join(mismatches)
 
 

@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -530,6 +531,70 @@ class GymWorkspaceTests(unittest.TestCase):
 
 
 class GymFileOracleTests(unittest.TestCase):
+    def test_file_oracle_confines_links_and_replaced_paths_to_the_workspace(self) -> None:
+        cases = ["final_link", "ancestor_link", "root_link", "missing_root", "link_cycle", "internal_link", "internal_absolute_link",
+                 "internal_directory_link", "replace_final", "replace_before_parent", "replace_parent", "replace_root"]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                workspace = root / "workspace"
+                outside = root / "outside"
+                (workspace / "nested").mkdir(parents=True)
+                (outside / "nested").mkdir(parents=True)
+                (outside / "answer").write_text("expected")
+                (outside / "nested/answer").write_text("expected")
+                target = workspace / "nested/answer"
+                target.write_text("wrong")
+                relative = "nested/answer"
+                outcome = (1, "unreadable: nested/answer")
+                if case == "final_link":
+                    target.unlink()
+                    target.symlink_to(outside / "answer")
+                elif case == "ancestor_link":
+                    shutil.rmtree(workspace / "nested")
+                    (workspace / "nested").symlink_to(outside, target_is_directory=True)
+                elif case in ("root_link", "missing_root"):
+                    shutil.rmtree(workspace)
+                    if case == "root_link":
+                        workspace.symlink_to(outside, target_is_directory=True)
+                    outcome = (1, "unreadable workspace")
+                elif case == "link_cycle":
+                    target.unlink()
+                    target.symlink_to("answer")
+                elif case.startswith("internal"):
+                    target.write_text("expected")
+                    relative = "alias/answer" if case == "internal_directory_link" else "alias"
+                    link_target = "nested" if case == "internal_directory_link" else (
+                        target if case == "internal_absolute_link" else "nested/answer"
+                    )
+                    (workspace / "alias").symlink_to(link_target, target_is_directory=case == "internal_directory_link")
+                    outcome = (0, "")
+                elif case not in ("replace_final", "replace_before_parent"):
+                    outcome = (1, "differs: nested/answer")
+
+                original_open = os.open
+                replaced = False
+
+                def replace_before_open(path, flags, *args, **kwargs):
+                    nonlocal replaced
+                    trigger = "nested" if case == "replace_before_parent" else "answer"
+                    if case.startswith("replace_") and Path(path).name == trigger and not replaced:
+                        replaced = True
+                        victim = target if case == "replace_final" else (
+                            workspace / "nested" if case in ("replace_before_parent", "replace_parent") else workspace
+                        )
+                        victim.rename(root / "retained")
+                        replacement = outside / "answer" if case == "replace_final" else outside
+                        victim.symlink_to(replacement, target_is_directory=case != "replace_final")
+                    return original_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(os, "open", side_effect=replace_before_open):
+                    self.assertEqual(
+                        TRAIN_MODULE.run_oracle({"expected_files": {relative: "expected"}}, workspace, {}), outcome
+                    )
+                if case.startswith("replace_"):
+                    self.assertTrue(replaced, "the replacement must occur during the real oracle read")
+
     def test_exact_file_comparison_handles_boundaries_and_invalid_content(self) -> None:
         cases = [
             ("exact", "snow ☃\r\n", "snow ☃\r\n".encode(), (0, "")),
@@ -588,6 +653,39 @@ class GymFileOracleTests(unittest.TestCase):
 
 
 class GymTrainerTests(unittest.TestCase):
+    def test_database_queries_preserve_literal_paths_and_read_only_access(self) -> None:
+        for name in ["skills#probe.db", "skills?mode=rw.db", "skills%23probe.db", "space 雪.db"]:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                database = root / name
+                with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute("CREATE TABLE records (id TEXT)")
+                    connection.execute("INSERT INTO records VALUES ('expected')")
+                original_connect = sqlite3.connect
+                readers = []
+
+                def retain_reader(*args, **kwargs):
+                    reader = original_connect(*args, **kwargs)
+                    readers.append(reader)
+                    return reader
+
+                try:
+                    with mock.patch.object(sqlite3, "connect", side_effect=retain_reader):
+                        self.assertEqual(TRAIN_MODULE.query(database, "SELECT id FROM records"), ["expected"])
+                        with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                            TRAIN_MODULE.query(database, "DELETE FROM records")
+                        self.assertEqual(TRAIN_MODULE.query(database, "SELECT id FROM records"), ["expected"])
+                        with self.assertRaises(sqlite3.OperationalError):
+                            TRAIN_MODULE.query(root / ("missing-" + name), "SELECT 1")
+                    # Retain actual connections so garbage collection cannot hide a leak.
+                    for reader in readers:
+                        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+                            reader.execute("SELECT 1")
+                finally:
+                    for reader in readers:
+                        reader.close()
+                self.assertEqual(sorted(path.name for path in root.iterdir()), [name])
+
     def test_apppaths_setup_requires_a_fresh_root(self) -> None:
         for case in ["symlink", "file", "protected"]:
             if case == "protected" and os.geteuid() == 0:
@@ -682,7 +780,9 @@ class GymTrainerTests(unittest.TestCase):
 
     def test_successful_run_records_rows_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # Exercise the whole library arm with characters meaningful in a SQLite URI.
+            root = Path(directory) / "gym #?%23 space"
+            root.mkdir()
             repo = make_repo(root)
             binary, log = make_stub(root, "success")
             completed, rows, gym_root = run_training(
