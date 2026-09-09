@@ -54,6 +54,7 @@ struct SessionHistory {
 impl SessionHistory {
     const EMERGENCY_RECAP: &'static str = "Earlier ACP turns were evicted because automatic summarization was unavailable; retained recent turns remain authoritative.";
 
+    #[cfg(test)]
     fn snapshot(&self) -> Vec<Message> {
         self.snapshot_with_tool_result_retention(crate::session::DEFAULT_KEEP_RECENT_TOOL_RESULTS)
     }

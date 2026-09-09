@@ -288,6 +288,7 @@ fn render_task_brief(index: usize, brief: &TaskBrief) -> Result<String, ToolErro
 struct ResolvedSpecialization {
     prompt: String,
     result_notice: Option<String>,
+    #[cfg(any(test, feature = "hooks"))]
     source: String,
     tools: Option<Vec<crate::context::agents::AgentTool>>,
     model: Option<String>,
@@ -377,6 +378,7 @@ fn resolve_persona_runtime(
     })
 }
 
+#[cfg(any(test, feature = "hooks"))]
 fn hook_identity(
     agent_type: Option<&str>,
     specialization: Option<&ResolvedSpecialization>,
@@ -404,10 +406,12 @@ fn resolve_specialization(
         )));
     };
     let result_notice = definition.result_notice(agent_type);
+    #[cfg(any(test, feature = "hooks"))]
     let source = definition.source_description(agent_type);
     Ok(Some(ResolvedSpecialization {
         prompt: definition.prompt,
         result_notice,
+        #[cfg(any(test, feature = "hooks"))]
         source,
         tools: definition.tools,
         model: definition.model,
