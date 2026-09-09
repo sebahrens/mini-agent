@@ -286,7 +286,9 @@ only when you ask for them: lifecycle hooks (`--features hooks`), a
 second-model advisor (`--features advisor`), image/PDF message attachments
 (`--features multimodal`, or the equivalent `--features pdf` alias). PDF attachments
 are sent as raw document messages to a provider that supports them; mini-agent
-does not parse PDFs locally. See the root [README](https://github.com/sebahrens/mini-agent) for what each one
+does not parse PDFs locally. Attachments must be regular files (or symlinks to
+them), and the 20 MiB limit is enforced while reading, including if a file grows.
+See the root [README](https://github.com/sebahrens/mini-agent) for what each one
 does and how to enable it.
 
 # Conclusions
