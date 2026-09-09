@@ -284,6 +284,9 @@ operator chose the bypass. An explicitly requested unavailable sandbox still
 fails closed. Output is capped (1 MiB per stream, 1.5 MiB combined), commands
 time out after 30 seconds, and TUI `Ctrl+C`/`Ctrl+D` cancels the whole process
 tree before accepting the next command.
+In `--print` mode, `Ctrl+C` or Unix `SIGTERM` cancels the explicit shell command
+and waits for its owned process group to terminate, the direct child to be reaped,
+and the command audit to finish before exiting with a nonzero interruption error.
 
 | Example | Description |
 | ------- | ----------- |

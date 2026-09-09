@@ -1374,11 +1374,12 @@ impl Startup {
                 .strip_prefix('!')
                 .is_some_and(|command| !command.trim().is_empty())
             {
-                let run = self
-                    .sandbox
-                    .clone()
-                    .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None)
-                    .await?;
+                let run = crate::print::run_headless_command(
+                    self.sandbox
+                        .clone()
+                        .run_explicit_shell(&msg, DEFAULT_COMMAND_LIMITS, None),
+                )
+                .await?;
                 let result = run.rendered_output();
                 let rendered_json = if json_output {
                     let files_changed = crate::print::files_changed_since(

@@ -19,6 +19,47 @@ use crate::session::{
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 
+/// Wait for a headless interruption without affecting the interactive UI.
+pub(crate) async fn headless_interrupt() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => Ok(()),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+pub(crate) async fn run_headless_command<F, T>(command: F) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let result = scope
+        .run(async {
+            tokio::select! {
+                // Poll first to install signal handlers before launching work.
+                biased;
+                signal = headless_interrupt() => {
+                    signal?;
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "headless command interrupted"))
+                }
+                result = command => result,
+            }
+        })
+        .await;
+    // Dropping the command future closes its response receiver. The scoped
+    // worker then cancels, kills/reaps the group, and completes its audit.
+    scope.cancellation_handle().cancel();
+    scope.wait_idle().await;
+    result
+}
+
 /// Char-safe short preview of a session id for listings. Ids are normally
 /// 32 hex chars, but imported sessions (`/import`) may carry shorter or
 /// non-ASCII ids, where a byte slice (`&id[..8]`) would panic.
