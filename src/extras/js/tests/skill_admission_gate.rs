@@ -113,6 +113,46 @@ fn evaluator(with_suite: bool) -> (PathBuf, AppPaths, AdmissionEvaluator, SkillA
     (root, paths, evaluator, artifact)
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SuiteCorruption {
+    Tampered,
+    Malformed,
+    Invalid,
+    Unsupported,
+}
+
+fn import_corrupt_suite(store: &mut SkillStore, corruption: SuiteCorruption, now: i64) -> String {
+    use sha2::Digest;
+    let mut record = store.enabled_held_out_suites().unwrap().remove(0);
+    let mut payload: serde_json::Value = serde_json::from_str(&record.canonical_payload).unwrap();
+    match corruption {
+        SuiteCorruption::Tampered => record.cases_json = "[]".to_string(),
+        SuiteCorruption::Malformed => {
+            // Serde includes this unknown variant in its error. It is hidden
+            // suite data and must not escape through the admission error.
+            payload["cases"][0]["expected"]["type"] = serde_json::json!("hidden-corpus-secret");
+        }
+        SuiteCorruption::Invalid => payload["cases"][0]["expression"] = serde_json::json!(""),
+        SuiteCorruption::Unsupported => payload["version"] = serde_json::json!(u32::MAX),
+    }
+    if !matches!(corruption, SuiteCorruption::Tampered) {
+        record.cases_json = serde_json::to_string(&payload["cases"]).unwrap();
+    }
+    record.canonical_payload = serde_json::to_string(&payload).unwrap();
+    // Give the tampered fixture its own row without altering the original.
+    record.canonical_payload.push(' ');
+    record.content_hash =
+        crate::hex::encode_lower(sha2::Sha256::digest(record.canonical_payload.as_bytes()));
+    record.suite_id = record.content_hash.clone();
+    let admin = AdminIdentity::authenticated("suite-admin").unwrap();
+    // Deliberately bypass draft validation to model damaged or incompatible
+    // durable state while preserving the outer record's content hash.
+    store
+        .import_held_out_suite(Some(&admin), &record, now)
+        .unwrap();
+    record.suite_id
+}
+
 #[test]
 fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
     let (root, _paths, mut evaluator, artifact) = evaluator(true);
@@ -145,12 +185,20 @@ fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
 
 #[test]
 fn skill_admission_infrastructure_failures_park_and_recover_without_rejecting_identity() {
-    // All three failures belong to evaluation infrastructure, not candidate source.
-    // Exercise their shared bounded retry/recovery path with real corpus imports.
-    for (name, extra_suites, cases_per_suite) in [
-        ("scheduler cancellation", 0, 0),
-        ("suite capacity", 32, 1),
-        ("case capacity", 1, 64),
+    // Exercise the shared bounded retry/recovery path with real corpus state.
+    for (name, extra_suites, cases_per_suite, corruption) in [
+        ("scheduler cancellation", 0, 0, None),
+        ("suite capacity", 32, 1, None),
+        ("case capacity", 1, 64, None),
+        ("tampered corpus", 0, 0, Some(SuiteCorruption::Tampered)),
+        ("malformed corpus", 0, 0, Some(SuiteCorruption::Malformed)),
+        ("invalid corpus", 0, 0, Some(SuiteCorruption::Invalid)),
+        (
+            "unsupported corpus",
+            0,
+            0,
+            Some(SuiteCorruption::Unsupported),
+        ),
     ] {
         let (root, _paths, mut evaluator, artifact) = evaluator(true);
         let admin = AdminIdentity::authenticated("suite-admin").unwrap();
@@ -167,12 +215,19 @@ fn skill_admission_infrastructure_failures_park_and_recover_without_rejecting_id
                 .collect();
             excess_ids.push(draft.import(evaluator.store_mut(), &admin, 15).unwrap());
         }
+        if let Some(corruption) = corruption {
+            excess_ids.push(import_corrupt_suite(evaluator.store_mut(), corruption, 15));
+        }
         let mut now = 20;
         for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
-            if extra_suites == 0 {
+            if extra_suites == 0 && corruption.is_none() {
                 evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
             }
             let error = evaluator.evaluate_next(now).expect_err(name);
+            assert!(
+                !error.to_string().contains("hidden-corpus-secret"),
+                "hidden fixture data leaked"
+            );
             assert!(
                 matches!(error, AdmissionError::Retryable(_)),
                 "{name}: {error}"
@@ -265,34 +320,57 @@ fn skill_source_diagnostic(class: DiagnosticClass, stage: DiagnosticStage) -> Di
 }
 
 #[test]
-fn source_resource_limits_are_reported_as_verification_resource_limit() {
-    // The worker renders a source-side resource limit as `Class/Stage/Role`,
-    // which shares no substring with the outcome names the classifier used to
-    // match, so each of these was misreported as an embedded-test failure.
-    for (class, stage, expected_reason) in [
+fn candidate_failures_remain_deterministic_rejections() {
+    enum Failure {
+        Source(DiagnosticClass, DiagnosticStage),
+        HeldOutValue,
+        HeldOutTranscript,
+    }
+    // Resource failures retain their typed classification. Genuine held-out
+    // value/transcript failures must not enter the corpus-recovery path.
+    for (failure, expected_reason) in [
         (
-            DiagnosticClass::ResourceLimit,
-            DiagnosticStage::Evaluation,
+            Failure::Source(DiagnosticClass::ResourceLimit, DiagnosticStage::Evaluation),
             "verification_resource_limit",
         ),
         (
-            DiagnosticClass::Contract,
-            DiagnosticStage::JobDrain,
+            Failure::Source(DiagnosticClass::Contract, DiagnosticStage::JobDrain),
             "verification_resource_limit",
         ),
         (
-            DiagnosticClass::Exception,
-            DiagnosticStage::Evaluation,
+            Failure::Source(DiagnosticClass::Exception, DiagnosticStage::Evaluation),
             "embedded_test_failed",
         ),
+        (Failure::HeldOutValue, "held_out_failed"),
+        (Failure::HeldOutTranscript, "held_out_failed"),
     ] {
         let (root, _paths, mut evaluator, artifact) = evaluator(true);
-        evaluator.fail_next_verification_for_test(VerificationError::SourceEvaluationFailed(
-            SourceFailure::from_diagnostic(&skill_source_diagnostic(class, stage)),
-        ));
+        match failure {
+            Failure::Source(class, stage) => evaluator.fail_next_verification_for_test(
+                VerificationError::SourceEvaluationFailed(SourceFailure::from_diagnostic(
+                    &skill_source_diagnostic(class, stage),
+                )),
+            ),
+            Failure::HeldOutValue | Failure::HeldOutTranscript => {
+                let mut draft = suite();
+                if matches!(failure, Failure::HeldOutValue) {
+                    draft.cases[0].expected = ExpectedJsValue::String("different".to_string());
+                } else {
+                    draft.cases[0].transcript.reads = 1;
+                    draft.cases[0].transcript.read_paths = vec!["unexpected-read".to_string()];
+                }
+                draft
+                    .import(
+                        evaluator.store_mut(),
+                        &AdminIdentity::authenticated("suite-admin").unwrap(),
+                        15,
+                    )
+                    .expect("valid suite whose assertion the candidate fails");
+            }
+        }
         let report = evaluator
             .evaluate_next(20)
-            .expect("a source failure is a deterministic outcome")
+            .expect("candidate failure is deterministic")
             .expect("a report is produced");
         assert_eq!(report.outcome, "rejected");
         assert_eq!(report.reason_code.as_deref(), Some(expected_reason));
@@ -303,7 +381,23 @@ fn source_resource_limits_are_reported_as_verification_resource_limit() {
             .unwrap();
         assert_eq!(proposal.status, ProposalStatus::Rejected);
         assert_eq!(proposal.reason_code.as_deref(), Some(expected_reason));
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(proposal.infrastructure_attempt_count, 0);
+        assert_eq!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("rejected".to_string())
+        );
+        assert!(
+            evaluator
+                .request_reevaluation(
+                    &artifact.id,
+                    &AdminIdentity::authenticated("suite-admin").unwrap(),
+                    21
+                )
+                .is_err(),
+            "corpus recovery must not reopen a candidate that failed a regression"
+        );
+        drop(evaluator);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
 
@@ -706,12 +800,15 @@ struct SuiteChangingApprover {
     paths: AppPaths,
     now: i64,
     exceed_capacity: bool,
+    corruption: Option<SuiteCorruption>,
 }
 
 impl HumanReviewer for SuiteChangingApprover {
     fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
         let mut store = SkillStore::open_at(&self.paths).expect("second connection");
-        if self.exceed_capacity {
+        if let Some(corruption) = self.corruption {
+            import_corrupt_suite(&mut store, corruption, self.now);
+        } else if self.exceed_capacity {
             let admin = AdminIdentity::authenticated("suite-admin").unwrap();
             for index in 0..32 {
                 let mut draft = suite();
@@ -756,7 +853,14 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
     assert_eq!(approvals, 0);
     let _ = std::fs::remove_dir_all(root);
 
-    for exceed_capacity in [false, true] {
+    for (exceed_capacity, corruption) in [
+        (false, None),
+        (true, None),
+        (false, Some(SuiteCorruption::Tampered)),
+        (false, Some(SuiteCorruption::Malformed)),
+        (false, Some(SuiteCorruption::Invalid)),
+        (false, Some(SuiteCorruption::Unsupported)),
+    ] {
         let (root, paths, mut suite_evaluator, artifact) = evaluator(true);
         let report = suite_evaluator.evaluate_next(20).unwrap().unwrap();
         let error = suite_evaluator
@@ -766,11 +870,16 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
                     paths,
                     now: 21,
                     exceed_capacity,
+                    corruption,
                 },
                 21,
             )
             .expect_err("changed held-out corpus must block admission");
-        if exceed_capacity {
+        assert!(
+            !error.to_string().contains("hidden-corpus-secret"),
+            "hidden fixture data leaked"
+        );
+        if exceed_capacity || corruption.is_some() {
             assert!(
                 matches!(error, AdmissionError::Infrastructure(_)),
                 "{error}"
@@ -795,7 +904,7 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
             Some("canary".to_string())
         );
         assert_eq!(suite_evaluator.store().desired_generation().unwrap(), 0);
-        if exceed_capacity {
+        if exceed_capacity || corruption.is_some() {
             suite_evaluator
                 .store()
                 .conn()

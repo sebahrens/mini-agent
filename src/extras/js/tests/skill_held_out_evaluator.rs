@@ -1,4 +1,6 @@
-use crate::extras::js::skills::fakes::{FakeSpawnFixture, FakeSpawnResponse};
+use crate::extras::js::skills::fakes::{
+    FakeFetchFixture, FakeFetchResponse, FakeSpawnFixture, FakeSpawnResponse,
+};
 use crate::extras::js::skills::held_out::{
     ExpectedJsValue, HeldOutCase, HeldOutError, HeldOutSelector, HeldOutSuiteDraft,
     TranscriptExpectation, evaluate, select_suites,
@@ -297,6 +299,81 @@ fn held_out_selectors_require_scope_and_exact_export_contracts() {
         .unwrap();
     assert!(select_suites(&store, &pure_artifact()).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn held_out_fixture_import_requires_unique_request_keys_within_each_case() {
+    let (root, paths) = paths();
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let admin = AdminIdentity::authenticated("suite-admin").unwrap();
+    let spawn = FakeSpawnFixture {
+        program: "printf".to_string(),
+        args: vec!["value".to_string()],
+        response: FakeSpawnResponse {
+            stdout: "value".to_string(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        },
+    };
+    let fetch = FakeFetchFixture {
+        url: "https://fixture.invalid/value".to_string(),
+        method: "GET".to_string(),
+        response: FakeFetchResponse {
+            status: 200,
+            body: "value".to_string(),
+        },
+    };
+    for effect in ["spawn", "fetch"] {
+        for conflicting_response in [false, true] {
+            let mut draft = pure_suite("value");
+            draft.selector.capability_tier = Some("side_effecting".to_string());
+            if effect == "spawn" {
+                let mut duplicate = spawn.clone();
+                if conflicting_response {
+                    duplicate.response.stdout = "conflict".to_string();
+                }
+                draft.cases[0].fake_spawns = vec![spawn.clone(), duplicate];
+            } else {
+                let mut duplicate = fetch.clone();
+                if conflicting_response {
+                    duplicate.response.body = "conflict".to_string();
+                }
+                draft.cases[0].fake_fetches = vec![fetch.clone(), duplicate];
+            }
+            let result = draft.import(&mut store, &admin, 10);
+            assert!(
+                matches!(result, Err(HeldOutError::InvalidSuite(_))),
+                "duplicate {effect}, conflicting={conflicting_response}: {result:?}"
+            );
+            assert!(
+                store.enabled_held_out_suites().unwrap().is_empty(),
+                "invalid import must not persist"
+            );
+        }
+    }
+    // Program arguments and HTTP method belong to fixture identity; sharing
+    // just the program or URL is valid. Separate cases own independent fakes.
+    let mut draft = pure_suite("value");
+    draft.selector.capability_tier = Some("side_effecting".to_string());
+    let mut other_spawn = spawn.clone();
+    other_spawn.args.push("another".to_string());
+    let mut other_fetch = fetch.clone();
+    other_fetch.method = "POST".to_string();
+    draft.cases[0].fake_spawns = vec![spawn, other_spawn];
+    draft.cases[0].fake_fetches = vec![fetch, other_fetch];
+    draft.cases.push(draft.cases[0].clone());
+    let suite_id = draft
+        .import(&mut store, &admin, 11)
+        .expect("distinct keys and separate cases");
+    assert_eq!(
+        store.enabled_held_out_suites().unwrap()[0].suite_id,
+        suite_id
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]

@@ -256,17 +256,17 @@ impl AdmissionEvaluator {
                 ));
             }
             Err(HeldOutError::Store(error)) => return Err(classify_store(error)),
-            Err(HeldOutError::Json(_) | HeldOutError::TamperedSuite(_)) => {
-                return Err(deterministic(
-                    "held_out_failed",
-                    "held-out suite is invalid",
-                ));
-            }
-            Err(HeldOutError::InvalidSuite(_) | HeldOutError::UnsupportedVersion(_)) => {
-                return Err(deterministic(
-                    "held_out_failed",
-                    "held-out suite is unsupported",
-                ));
+            Err(
+                HeldOutError::Json(_)
+                | HeldOutError::TamperedSuite(_)
+                | HeldOutError::InvalidSuite(_)
+                | HeldOutError::UnsupportedVersion(_),
+            ) => {
+                // A damaged trusted corpus cannot establish candidate failure.
+                // Parser details can contain hidden fixture data.
+                return Err(EvaluationFailure::Infrastructure {
+                    error: "held-out corpus is invalid or unsupported".to_string(),
+                });
             }
         };
 
@@ -938,6 +938,12 @@ fn review_gate_verification_error(error: &VerificationError) -> AdmissionError {
 fn review_gate_held_out_error(error: HeldOutError) -> AdmissionError {
     match error {
         HeldOutError::CorpusCapacity(_) => AdmissionError::Infrastructure(error.to_string()),
+        HeldOutError::Json(_)
+        | HeldOutError::TamperedSuite(_)
+        | HeldOutError::InvalidSuite(_)
+        | HeldOutError::UnsupportedVersion(_) => {
+            AdmissionError::Infrastructure("held-out corpus is invalid or unsupported".to_string())
+        }
         HeldOutError::Infrastructure(error)
         | HeldOutError::Embedded(error)
         | HeldOutError::Inherited(error) => review_gate_verification_error(&error),

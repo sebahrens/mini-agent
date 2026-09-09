@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::fakes::{FAKES_VERSION, FakeFetchFixture, FakeSpawnFixture, FakeTranscript};
 use super::store::{AdminIdentity, HeldOutSuiteRecord, SkillStore, StoreError};
@@ -286,6 +286,21 @@ fn validate_suite(suite: &HeldOutSuiteDraft) -> Result<(), HeldOutError> {
         {
             return Err(HeldOutError::InvalidSuite(
                 "held-out fake effect fixture is invalid".to_string(),
+            ));
+        }
+        let mut spawn_keys = BTreeSet::new();
+        let mut fetch_keys = BTreeSet::new();
+        if case
+            .fake_spawns
+            .iter()
+            .any(|fixture| !spawn_keys.insert((&fixture.program, &fixture.args)))
+            || case
+                .fake_fetches
+                .iter()
+                .any(|fixture| !fetch_keys.insert((&fixture.url, &fixture.method)))
+        {
+            return Err(HeldOutError::InvalidSuite(
+                "held-out fake effect fixture contains a duplicate request key".to_string(),
             ));
         }
         if matches!(&case.expected, ExpectedJsValue::String(value) if value.len() > MAX_EXPECTED_STRING_BYTES)

@@ -354,6 +354,10 @@ Suite IDs are SHA-256 hashes of a versioned canonical payload. Human/admin-only 
 bounds and records approval. The proposal API cannot list suite inputs or expected outputs, write
 the suite database, or choose which suite runs.
 
+Within each case, spawn fixtures must have distinct `(program, args)` keys and fetch fixtures
+must have distinct `(url, method)` keys. Duplicate keys are rejected at import, even when their
+responses agree. Different cases own independent fixture maps and may reuse the same keys.
+
 Selectors use deterministic trusted fields such as capability, declared exports, and
 human-approved tags. Selection and suite IDs are recorded in the evaluation report before
 execution. Cases run under the same fresh, bounded, no-effect contract as embedded tests. A
@@ -363,12 +367,14 @@ Expected values, fixture responses, and transcripts are never included in agent 
 The evaluator permits at most 32 distinct matched suites and 64 total held-out cases across the
 candidate and its complete predecessor lineage. Shared suites count once. If either bound is
 exceeded, evaluation refuses the corpus before running any held-out case; it must never truncate
-the suite union or execute a partial suite. Every successful report covers the complete union. A corpus
-capacity failure belongs to trusted evaluation infrastructure, not candidate source. It follows
-bounded infrastructure retry and then `evaluation_infrastructure_deferred`; correcting the corpus
-and resubmitting the unchanged artifact permits reevaluation. During human approval, the same
-capacity failure reports infrastructure unavailability and leaves the reviewed proposal intact.
-Actual failed cases remain deterministic rejections.
+the suite union or execute a partial suite. Every successful report covers the complete union.
+
+Corpus capacity failures and malformed, tampered, invalid, or unsupported stored suites belong to
+trusted evaluation infrastructure, not candidate source. They follow bounded infrastructure retry
+and then `evaluation_infrastructure_deferred`; correcting the corpus and resubmitting the unchanged
+artifact permits reevaluation. During human approval, these failures report infrastructure
+unavailability and leave the reviewed proposal intact. Corruption diagnostics use a fixed message
+without parser details or hidden fixture values. Actual failed cases remain deterministic rejections.
 
 If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and
