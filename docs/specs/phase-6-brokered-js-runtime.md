@@ -183,7 +183,10 @@ pending, and any startup fault, malformed frame, crash, cancellation, deadline, 
 drop destroys the connection instead of attempting resynchronization. Cleanup closes/kills the
 backend-owned containment tree and reaps its root within a fixed bound; the platform
 `WorkerProcess` abstraction supplies direct native Unix process-group signalling or Windows Job
-teardown. Tree-termination failure remains an error even when the root has already reaped. A graceful
+teardown. Launcher lifecycle tests exercise this same bounded `terminate_and_reap` path,
+including cached-root exit and tree-termination failure; no separate unbounded worker wait API
+is retained for fixtures. Natural-exit probes poll `try_wait` and bound timeout cleanup as well.
+Tree-termination failure remains an error even when the root has already reaped. A graceful
 shutdown sends the closed `Shutdown` frame, waits within the same bound, and still performs tree
 cleanup. The next independent request always receives a new generation, so delayed output from
 an old process cannot enter its protocol stream.

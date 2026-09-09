@@ -281,11 +281,8 @@ fn wait_for_exit(process: &mut crate::sandbox::worker::WorkerProcess) -> ExitSta
             return status;
         }
         if Instant::now() >= deadline {
-            let termination = process.terminate_tree();
-            let reap = process.wait();
-            panic!(
-                "worker child exceeded the five-second test deadline (termination: {termination:?}, reap: {reap:?})"
-            );
+            let cleanup = process.terminate_and_reap(Duration::from_secs(1));
+            panic!("worker child exceeded the five-second test deadline (cleanup: {cleanup:?})");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -314,8 +311,9 @@ fn run_worker_transcript(
                     break 'startup (process, parent, preamble, ready);
                 }
                 Err(error) => {
-                    let _ = process.terminate_tree();
-                    let _ = process.wait();
+                    process
+                        .terminate_and_reap(Duration::from_secs(1))
+                        .expect("failed-startup worker should terminate and reap before retry");
                     if error.kind() == ErrorKind::UnexpectedEof && attempt < MAX_STARTUP_ATTEMPTS {
                         eprintln!(
                             "test worker exited before Ready on attempt {attempt}; retrying with a fresh worker"

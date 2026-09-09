@@ -12,7 +12,7 @@ use std::process::Child;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
 #[cfg(test)]
 use super::WindowsWorkerProcessObservation;
@@ -372,35 +372,6 @@ impl WorkerChild {
             }
             #[cfg(test)]
             WorkerChildInner::Unconfined(child) => child.try_wait(),
-        }
-    }
-
-    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
-        match &mut self.inner {
-            WorkerChildInner::Contained {
-                process, status, ..
-            } => {
-                if let Some(status) = status {
-                    return Ok(*status);
-                }
-                // SAFETY: the process handle remains directly owned for this wait. Common caller
-                // paths bound it by terminating the kill-on-close Job before waiting.
-                match unsafe { WaitForSingleObject(process.raw(), INFINITE) } {
-                    WAIT_OBJECT_0 => {
-                        let exited = process_exit_status(process)?;
-                        *status = Some(exited);
-                        Ok(exited)
-                    }
-                    windows_sys::Win32::Foundation::WAIT_FAILED => {
-                        Err(contextual_last_error("wait for JavaScript worker process"))
-                    }
-                    other => Err(io::Error::other(format!(
-                        "unexpected JavaScript worker wait result {other}"
-                    ))),
-                }
-            }
-            #[cfg(test)]
-            WorkerChildInner::Unconfined(child) => child.wait(),
         }
     }
 }
@@ -3216,7 +3187,6 @@ mod feasibility {
             input: parent_input.into_file(),
             output: parent_output.into_file(),
             stderr: parent_error.into_file(),
-            backend: WorkerBackend::WindowsLpac,
             #[cfg(test)]
             reap_observer: None,
             #[cfg(test)]

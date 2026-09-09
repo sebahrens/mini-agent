@@ -132,7 +132,6 @@ fn launch_executable(
         input: super::child_stdin_file(input),
         output: super::child_stdout_file(output),
         stderr: super::child_stderr_file(stderr),
-        backend: BACKEND,
         #[cfg(test)]
         reap_observer: None,
         #[cfg(test)]
@@ -919,8 +918,7 @@ fn run_worker_lifecycle_probes(bwrap: &Path, executable: &Path) -> io::Result<()
 
     let mut terminated = launch().map_err(|error| io::Error::other(error.to_string()))?;
     complete_hello_ready_and_run_step(&mut terminated)?;
-    terminated.terminate_tree()?;
-    let terminated_status = wait_worker_bounded(&mut terminated, Duration::from_secs(5))?;
+    let terminated_status = terminated.terminate_and_reap(Duration::from_secs(5))?;
     if terminated_status.success() {
         return Err(io::Error::other(
             "explicit worker termination produced a successful exit",
@@ -1083,8 +1081,7 @@ fn wait_worker_bounded(process: &mut WorkerProcess, timeout: Duration) -> io::Re
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let _ = process.terminate_tree();
-            let _ = process.wait();
+            process.terminate_and_reap(Duration::from_secs(1))?;
             return Err(io::Error::other("contained worker teardown timed out"));
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -1582,9 +1579,5 @@ impl WorkerChild {
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
-    }
-
-    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
     }
 }

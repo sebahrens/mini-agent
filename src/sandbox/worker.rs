@@ -204,15 +204,6 @@ pub(crate) enum WorkerLaunchError {
     MissingPipe { pipe: &'static str },
 }
 
-impl WorkerLaunchError {
-    pub(crate) const fn backend(&self) -> WorkerBackend {
-        match self {
-            Self::Unavailable { backend, .. } | Self::Io { backend, .. } => *backend,
-            Self::MissingPipe { .. } => WorkerBackend::for_current_platform(),
-        }
-    }
-}
-
 pub(crate) trait WorkerLauncher: Send + Sync {
     fn containment_status(&self) -> WorkerContainmentStatus;
     fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError>;
@@ -291,17 +282,12 @@ pub(crate) fn containment_status() -> WorkerContainmentStatus {
     ProductionWorkerLauncher.containment_status()
 }
 
-pub(crate) fn launch() -> Result<WorkerProcess, WorkerLaunchError> {
-    ProductionWorkerLauncher.launch()
-}
-
 #[derive(Debug)]
 pub(crate) struct WorkerProcess {
     process: platform::WorkerChild,
     pub(crate) input: File,
     pub(crate) output: File,
     pub(crate) stderr: File,
-    pub(crate) backend: WorkerBackend,
     #[cfg(test)]
     reap_observer: Option<Arc<AtomicUsize>>,
     #[cfg(test)]
@@ -364,13 +350,6 @@ impl WorkerProcess {
             self.process.retire_after_reap()?;
             self.notify_reaped();
         }
-        Ok(status)
-    }
-
-    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.process.wait()?;
-        self.process.retire_after_reap()?;
-        self.notify_reaped();
         Ok(status)
     }
 
@@ -699,7 +678,6 @@ impl WorkerLauncher for TestWorkerLauncher {
             input: child_stdin_file(input),
             output: child_stdout_file(output),
             stderr: child_stderr_file(stderr),
-            backend,
             reap_observer: None,
             force_tree_termination_error: false,
             authenticated_ready_observer: None,
@@ -773,9 +751,13 @@ mod tests {
         assert_eq!(backend, WorkerBackend::for_current_platform());
         assert!(reason.contains("test harness"));
 
-        let error = launch().expect_err("production must not select the test launcher");
-        assert_eq!(error.backend(), backend);
-        assert!(matches!(error, WorkerLaunchError::Unavailable { .. }));
+        let error = ProductionWorkerLauncher
+            .launch()
+            .expect_err("production must not select the test launcher");
+        assert!(matches!(
+            error,
+            WorkerLaunchError::Unavailable { backend: actual, .. } if actual == backend
+        ));
     }
 
     #[test]
@@ -964,18 +946,20 @@ mod tests {
         }
         assert!(ready, "test child did not report a cleared environment");
         assert!(process.id() > 0);
-        assert_eq!(process.backend, WorkerBackend::for_current_platform());
-        let _owned_protocol_pipes = (&process.input, &process.stderr);
         assert!(
             process
                 .try_wait()
                 .expect("try_wait should succeed")
                 .is_none()
         );
-        process
-            .terminate_tree()
-            .expect("test child should terminate");
-        let _ = process.wait().expect("test child should be reaped");
+        let reaps = Arc::new(AtomicUsize::new(0));
+        process.observe_reap_for_test(reaps.clone());
+        let exit_status = process
+            .terminate_and_reap(Duration::from_secs(5))
+            .expect("test child should terminate and reap within its deadline");
+        assert!(!exit_status.success());
+        assert_eq!(process.try_wait().unwrap(), Some(exit_status));
+        assert_eq!(reaps.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -984,9 +968,8 @@ mod tests {
             .launch()
             .expect("test launcher should start the current test executable");
         process
-            .terminate_tree()
-            .expect("test worker group should terminate");
-        process.wait().expect("test worker root should reap");
+            .terminate_and_reap(Duration::from_secs(5))
+            .expect("test worker group should terminate and its root reap");
         process.force_tree_termination_error_for_test();
 
         let error = process

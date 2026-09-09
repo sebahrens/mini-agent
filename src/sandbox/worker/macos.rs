@@ -45,6 +45,7 @@ fn record_launch_profile(profile: WorkerLaunchProfile) {
 }
 
 /// The phase breakdown of the most recent fresh-worker launch, if one ran.
+#[cfg(test)]
 pub(crate) fn last_launch_profile() -> Option<WorkerLaunchProfile> {
     *LAST_LAUNCH_PROFILE
         .lock()
@@ -663,7 +664,6 @@ impl PendingGuardian {
             input: super::child_stdin_file(input),
             output: super::child_stdout_file(output),
             stderr: super::child_stderr_file(stderr),
-            backend: BACKEND,
             #[cfg(test)]
             reap_observer: None,
             #[cfg(test)]
@@ -2031,10 +2031,6 @@ impl WorkerChild {
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
-    }
-
-    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
     }
 }
 
