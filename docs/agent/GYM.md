@@ -158,7 +158,9 @@ For each task and each arm the runner:
 5. runs `mini-agent --max-agent-turns <budget> [agent args] -p <prompt>` bounded by
    `--task-timeout` (default 900s);
 6. runs the oracle again: `oracle.command` through `/bin/sh -c` with a 300-second bound, or, when no
-   command is given, an exact comparison of `oracle.expected_files` against the workspace;
+   command is given, an exact UTF-8 comparison of `oracle.expected_files` against the workspace.
+   File comparisons preserve line endings, accept only regular files (including symlink targets),
+   and read at most the expected character count plus one. POSIX FIFO opens are nonblocking;
 7. removes the worktree, runs `git worktree prune`, and deletes the run tree — in a `finally`, so a
    timeout or install failure cannot leak either.
 

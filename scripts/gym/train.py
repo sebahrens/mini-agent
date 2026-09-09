@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -308,6 +309,18 @@ def remove_workspace(repo: Path, workspace: Path) -> None:
     subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)
 
 
+def open_regular_oracle_file(path: str, flags: int) -> int:
+    """Open without waiting on a FIFO, then validate the descriptor we read."""
+    descriptor = os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("oracle output is not a regular file")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def run_oracle(oracle: dict[str, object], workspace: Path, env: dict[str, str]) -> tuple[int, str]:
     command = oracle.get("command")
     if command:
@@ -320,8 +333,10 @@ def run_oracle(oracle: dict[str, object], workspace: Path, env: dict[str, str]) 
     for relative, expected in dict(oracle["expected_files"]).items():  # type: ignore[arg-type]
         target = workspace / relative
         try:
-            with target.open("r", encoding="utf-8", newline="") as handle:
-                actual = handle.read()
+            with open(target, "r", encoding="utf-8", newline="", opener=open_regular_oracle_file) as handle:
+                # One extra character distinguishes an exact match from a
+                # matching prefix, without retaining an agent-sized output.
+                actual = handle.read(len(expected) + 1)
         except (OSError, UnicodeDecodeError):
             mismatches.append(f"unreadable: {relative}")
             continue

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -178,6 +179,63 @@ def run_training(root: Path, repo: Path, binary: Path, document: dict[str, objec
     )
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] if output.is_file() else []
     return completed, rows, gym_root
+
+
+class GymFileOracleTests(unittest.TestCase):
+    def test_exact_file_comparison_handles_boundaries_and_invalid_content(self) -> None:
+        cases = [
+            ("exact", "snow ☃\r\n", "snow ☃\r\n".encode(), (0, "")),
+            ("empty", "", b"", (0, "")),
+            ("extra_byte", "ok", b"ok!", (1, "differs: result.txt")),
+            ("empty_extra", "", b"x", (1, "differs: result.txt")),
+            ("short", "ok", b"o", (1, "differs: result.txt")),
+            ("newline", "ok\n", b"ok\r\n", (1, "differs: result.txt")),
+            ("oversized", "ok", b"ok" + b"x" * (4 * 1024 * 1024), (1, "differs: result.txt")),
+            ("invalid_utf8", "ok", b"\xff", (1, "unreadable: result.txt")),
+            ("missing", "ok", None, (1, "unreadable: result.txt")),
+            ("directory", "ok", None, (1, "unreadable: result.txt")),
+        ]
+        for name, expected, contents, outcome in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                target = workspace / "result.txt"
+                if name == "directory":
+                    target.mkdir()
+                elif contents is not None:
+                    target.write_bytes(contents)
+                if name == "oversized":
+                    # Measure the real read, excluding fixture allocation. An
+                    # unbounded read of this 4 MiB file exceeds this generous
+                    # 1 MiB ceiling even though it correctly reports a mismatch.
+                    tracemalloc.start()
+                try:
+                    self.assertEqual(
+                        TRAIN_MODULE.run_oracle({"expected_files": {"result.txt": expected}}, workspace, {}),
+                        outcome,
+                    )
+                    if name == "oversized":
+                        self.assertLess(tracemalloc.get_traced_memory()[1], 1024 * 1024)
+                finally:
+                    if name == "oversized":
+                        tracemalloc.stop()
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFOs")
+    def test_fifo_file_oracle_returns_failure_without_waiting_for_a_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            os.mkfifo(workspace / "result.txt")
+            script = (
+                "import importlib.util,json,sys; from pathlib import Path; "
+                "spec=importlib.util.spec_from_file_location('train',sys.argv[1]); "
+                "train=importlib.util.module_from_spec(spec); spec.loader.exec_module(train); "
+                "print(json.dumps(train.run_oracle({'expected_files': {'result.txt':'ok'}},Path(sys.argv[2]),{})))"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(TRAIN), str(workspace)],
+                capture_output=True, text=True, timeout=3,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(json.loads(completed.stdout), [1, "unreadable: result.txt"])
 
 
 class GymTrainerTests(unittest.TestCase):
