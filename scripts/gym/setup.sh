@@ -58,6 +58,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 11):
+    raise SystemExit("Python 3.11 or newer is required for descriptor-relative workspace cleanup")
 repo = Path(sys.argv[1])
 required = re.search(r'channel\s*=\s*"([^"]+)"', (repo / "rust-toolchain.toml").read_text()).group(1)
 actual = subprocess.check_output(["rustc", "--version"], text=True).split()[1]

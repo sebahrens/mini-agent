@@ -11,6 +11,7 @@ and skill database never take part.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 if __package__:
@@ -93,7 +95,7 @@ def relative_path(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TaskError(f"{label} must be a non-empty relative path")
     candidate = Path(value)
-    if candidate.is_absolute() or candidate.drive or any(part in ("..", "") for part in candidate.parts):
+    if not candidate.parts or candidate.is_absolute() or candidate.drive or any(part in ("..", "") for part in candidate.parts):
         raise TaskError(f"{label} must stay inside the workspace: {value!r}")
     return value
 
@@ -279,6 +281,50 @@ def install_library(binary: str, library: str, env: dict[str, str]) -> list[str]
     return active
 
 
+@contextlib.contextmanager
+def workspace_parent(root_fd: int, relative: str, *, create: bool):
+    """Walk below the checkout without following any directory symlinks."""
+    parts = Path(relative_path(relative, "workspace overlay")).parts
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, parts[-1]
+    finally:
+        os.close(descriptor)
+
+
+def publish_workspace_file(parent_fd: int, name: str, content: str) -> None:
+    """Replace the entry, preserving regular-file mode without writing through links."""
+    mode = None
+    try:
+        previous = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISREG(previous.st_mode):
+            mode = stat.S_IMODE(previous.st_mode) & 0o777
+    except FileNotFoundError:
+        pass
+    temporary = f".gym-overlay-{uuid.uuid4().hex}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=parent_fd)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
 def prepare_workspace(repo: Path, task: dict[str, object], destination: Path, allow_empty: bool) -> None:
     base = str(task["base_commit"])
     result = subprocess.run(
@@ -291,16 +337,26 @@ def prepare_workspace(repo: Path, task: dict[str, object], destination: Path, al
                 f"git worktree add {base} failed: {tail_text(result.stderr) or tail_text(result.stdout)}",
             )
         destination.mkdir(parents=True, exist_ok=True)
-    for relative in list(task["deleted_files"]):  # type: ignore[arg-type]
-        target = destination / str(relative)
-        if target.is_dir():
-            shutil.rmtree(target)
-        elif target.exists():
-            target.unlink()
-    for relative, content in dict(task["initial_files"]).items():  # type: ignore[arg-type]
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="")
+    try:
+        root_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for relative in list(task["deleted_files"]):  # type: ignore[arg-type]
+                try:
+                    with workspace_parent(root_fd, str(relative), create=False) as (parent_fd, name):
+                        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        if stat.S_ISDIR(entry.st_mode):
+                            shutil.rmtree(name, dir_fd=parent_fd)
+                        else:
+                            os.unlink(name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            for relative, content in dict(task["initial_files"]).items():  # type: ignore[arg-type]
+                with workspace_parent(root_fd, relative, create=True) as (parent_fd, name):
+                    publish_workspace_file(parent_fd, name, content)
+        finally:
+            os.close(root_fd)
+    except (OSError, TaskError) as error:
+        raise EpisodeFailure("workspace_unavailable", f"workspace overlay failed: {error}") from error
 
 
 def remove_workspace(repo: Path, workspace: Path) -> None:

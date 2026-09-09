@@ -361,7 +361,9 @@ def mine(
             {
                 "name": bead_id,
                 "prompt": mined_prompt(bead),
-                "tags": sorted(set(bead.get("labels") or []) | {"mined", "fail-to-pass"}),
+                # Validation provenance belongs to this run, not inherited labels.
+                "tags": sorted((set(bead.get("labels") or []) - {"fail-to-pass", "validation-skipped"})
+                               | {"mined", "fail-to-pass" if validate else "validation-skipped"}),
                 "base_commit": parent,
                 "initial_files": initial,
                 "deleted_files": deleted,
@@ -420,7 +422,8 @@ def main() -> int:
     args.output.write_text(json.dumps(document(tasks), indent=2) + "\n", encoding="utf-8")
     for note in skipped:
         print(f"gym mine: skipped {note}", file=sys.stderr)
-    print(f"mined {len(tasks)} validated task(s) into {args.output}; skipped {len(skipped)}")
+    qualification = "unvalidated" if args.no_validate else "validated"
+    print(f"mined {len(tasks)} {qualification} task(s) into {args.output}; skipped {len(skipped)}")
     return 0
 
 

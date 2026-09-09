@@ -15,7 +15,7 @@ into production evidence.
 - Linux or macOS. `scripts/gym/setup.sh` exits 2 on any other host, and the runner shells out to
   `/bin/sh` and `git worktree`.
 - `cargo` and `rustc` matching `rust-toolchain.toml` (setup compares the exact version), `git` 2.40
-  or newer, `python3`, and `jq`.
+  or newer, Python 3.11 or newer, and `jq`.
 - `bd` (beads) only for `scripts/gym/mine_tasks.py`; the miner falls back to an exported
   `.beads/issues.jsonl` or an explicit `--beads-json` file when `bd` is missing or fails.
 - A workspace outside `/private/tmp`. Setup refuses that prefix because it is the Seatbelt test
@@ -87,7 +87,7 @@ What the Python runner enforces at load time, before any episode runs:
 | `name` | required, non-empty, unique across the file |
 | `prompt` | required, non-empty |
 | `base_commit` | defaults to `HEAD`; a commit Git cannot materialize is a failed row, not an empty directory |
-| `initial_files`, `deleted_files` | relative paths only; `..` and absolute paths are rejected |
+| `initial_files`, `deleted_files` | relative paths only; `..`, absolute paths, and root-only paths such as `.` are rejected |
 | `oracle` | needs `command` or a non-empty `expected_files`; `id` defaults to a hash of the oracle |
 | `budgets.max_provider_turns` | **required**, integer >= 1; passed to the binary as `--max-agent-turns` |
 | `budgets.max_tool_calls`, `budgets.max_total_tokens` | optional, integer >= 1, **not enforced** (see below) |
@@ -121,6 +121,9 @@ Checkout failures provide no oracle evidence: the candidate is skipped if either
 be checked out. Cleanup also removes a partially created worktree when a post-checkout hook fails,
 including its Git registration. Command timeouts remain reported oracle failures, allowing tasks
 that fix hangs or excessive runtime; the fix revision must complete successfully within the limit.
+Validated tasks receive the `fail-to-pass` tag. With `--no-validate`, neither oracle runs: tasks
+receive `validation-skipped` and the CLI reports them as unvalidated. These two provenance tags
+are derived from the current mining run rather than inherited from bead labels.
 
 Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim and binary
 blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes:
@@ -170,6 +173,13 @@ For each task and each arm the runner:
    and read at most the expected character count plus one. POSIX FIFO opens are nonblocking;
 7. removes the worktree, runs `git worktree prune`, and deletes the run tree in a `finally`, so
    these cleanup steps also run after a timeout or install failure.
+
+Workspace overlays traverse directories through retained descriptors and reject symlinked
+ancestors. Initial files replace the destination entry without writing through a symlink or
+hardlink; regular-file executable permissions and exact line endings are preserved. Deletions
+unlink final symlinks (including dangling ones) and remove directories without following links
+inside them. An overlay error produces `workspace_unavailable` and prevents the agent from
+running for that episode. Failed file publication removes its temporary file.
 
 Agent, library-install, and command-oracle output in both training and task mining is drained
 concurrently by [process_capture.py](../../scripts/gym/process_capture.py), retaining only the last

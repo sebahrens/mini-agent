@@ -239,6 +239,127 @@ class GymSubprocessTests(unittest.TestCase):
                 self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
 
 
+class GymWorkspaceTests(unittest.TestCase):
+    def test_overlay_rejects_symlink_ancestors_and_records_failed_rows(self) -> None:
+        for operation in ["initial_files", "deleted_files"]:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                outside = root / "outside"
+                outside.mkdir()
+                sentinel = outside / "value.txt"
+                sentinel.write_text("untouched\n")
+                (repo / "alias").symlink_to(outside, target_is_directory=True)
+                git(repo, "add", "alias")
+                git(repo, "commit", "-qm", "directory link")
+                binary, log = make_stub(root, "success")
+                entry = {"name": "escape", operation: {"alias/value.txt": "changed\n"}
+                         if operation == "initial_files" else ["alias/value.txt"]}
+                completed, rows, gym_root = run_training(root, repo, binary, task_document([entry]))
+                self.assertEqual(sentinel.read_text(), "untouched\n")
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(len(rows), 2)
+                for row in rows:
+                    self.assertFalse(row["success"])
+                    self.assertEqual(row["failure_reason"], "workspace_unavailable")
+                    self.assertIsNone(row["agent_exit"])
+                self.assertFalse(log.exists())
+                self.assertEqual(list((gym_root / "worktrees").iterdir()), [])
+                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+
+    def test_overlay_replaces_or_unlinks_final_links_without_touching_targets(self) -> None:
+        for operation in ["initial_files", "deleted_files"]:
+            for kind in ["file", "directory", "dangling", "hardlink"]:
+                with self.subTest(operation=operation, kind=kind), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo = make_repo(root)
+                    outside = root / "outside"
+                    outside.mkdir()
+                    sentinel = outside / "value.txt"
+                    sentinel.write_text("untouched\n")
+                    target = {"file": sentinel, "directory": outside, "dangling": outside / "missing"}.get(kind)
+                    if target is not None:
+                        (repo / "alias").symlink_to(target, target_is_directory=kind == "directory")
+                        git(repo, "add", "alias")
+                        git(repo, "commit", "-qm", "final link")
+                    else:
+                        # Git does not preserve hardlinks. Create one in the
+                        # real checkout hook, before the overlay is applied.
+                        hook = repo / ".git/hooks/post-checkout"
+                        hook.write_text("#!/bin/sh\nln " + shlex.quote(str(sentinel)) + " alias\n")
+                        hook.chmod(0o755)
+                    workspace = root / "worktree"
+                    task = {"base_commit": "HEAD", "initial_files": {}, "deleted_files": []}
+                    task[operation] = {"alias": "replacement\r\n"} if operation == "initial_files" else ["alias"]
+                    TRAIN_MODULE.prepare_workspace(repo, task, workspace, False)
+                    self.assertEqual(sentinel.read_text(), "untouched\n")
+                    self.assertEqual(list(outside.iterdir()), [sentinel])
+                    alias = workspace / "alias"
+                    self.assertFalse(alias.is_symlink())
+                    if operation == "initial_files":
+                        self.assertEqual(alias.read_bytes(), b"replacement\r\n")
+                    else:
+                        self.assertFalse(alias.exists())
+
+    def test_overlay_preserves_executable_mode_and_cleans_failed_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            (repo / "script").write_text("old\n")
+            (repo / "script").chmod(0o755)
+            git(repo, "add", "script")
+            git(repo, "commit", "-qm", "executable")
+            workspace = root / "worktree"
+            task = {"base_commit": "HEAD", "initial_files": {"script": "new\r\n", "nested/file": "added"},
+                    "deleted_files": ["missing/child"]}
+            TRAIN_MODULE.prepare_workspace(repo, task, workspace, False)
+            self.assertEqual((workspace / "script").read_bytes(), b"new\r\n")
+            self.assertTrue((workspace / "script").stat().st_mode & 0o111)
+            self.assertEqual((workspace / "nested/file").read_text(), "added")
+            TRAIN_MODULE.remove_workspace(repo, workspace)
+            with mock.patch.object(TRAIN_MODULE.os, "replace", side_effect=OSError("publication failed")):
+                with self.assertRaisesRegex(TRAIN_MODULE.EpisodeFailure, "publication failed"):
+                    TRAIN_MODULE.prepare_workspace(repo, task, workspace, False)
+            self.assertEqual((workspace / "script").read_text(), "old\n")
+            self.assertEqual(sorted(p.name for p in workspace.iterdir()), [".git", "script", "value.txt"])
+
+    def test_overlay_keeps_bound_parent_when_its_name_becomes_a_symlink(self) -> None:
+        for operation in ["initial_files", "deleted_files"]:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                (repo / "nested").mkdir()
+                (repo / "nested/value").write_text("old")
+                git(repo, "add", "nested")
+                git(repo, "commit", "-qm", "nested file")
+                outside = root / "outside"
+                outside.mkdir()
+                (outside / "value").write_text("untouched")
+                workspace = root / "worktree"
+                task = {"base_commit": "HEAD", "initial_files": {}, "deleted_files": []}
+                task[operation] = {"nested/value": "new"} if operation == "initial_files" else ["nested/value"]
+                original_open = os.open
+                swapped = False
+
+                def swap_after_open(path, flags, *args, **kwargs):
+                    nonlocal swapped
+                    descriptor = original_open(path, flags, *args, **kwargs)
+                    if path == "nested" and flags & os.O_DIRECTORY and not swapped:
+                        (workspace / "nested").rename(workspace / "retained")
+                        (workspace / "nested").symlink_to(outside, target_is_directory=True)
+                        swapped = True
+                    return descriptor
+
+                with mock.patch.object(TRAIN_MODULE.os, "open", side_effect=swap_after_open):
+                    TRAIN_MODULE.prepare_workspace(repo, task, workspace, False)
+                self.assertTrue(swapped, "fixture must replace the directory after it is opened")
+                self.assertEqual((outside / "value").read_text(), "untouched")
+                if operation == "initial_files":
+                    self.assertEqual((workspace / "retained/value").read_text(), "new")
+                else:
+                    self.assertFalse((workspace / "retained/value").exists())
+
+
 class GymFileOracleTests(unittest.TestCase):
     def test_exact_file_comparison_handles_boundaries_and_invalid_content(self) -> None:
         cases = [
@@ -502,26 +623,42 @@ class GymTrainerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
+            sentinel = root / "outside"
+            sentinel.write_text("untouched")
+            (repo / "discard/nested").mkdir(parents=True)
+            (repo / "discard/nested/file").write_text("delete me")
+            (repo / "discard/link").symlink_to(sentinel)
+            git(repo, "add", "discard")
+            git(repo, "commit", "-qm", "directory to delete")
             binary, _ = make_stub(root, "success")
-            document = task_document([{"name": "delete", "tags": [], "deleted_files": ["value.txt"]}])
-            document["defaults"]["oracle"] = {"command": "test ! -e value.txt && test -f fixed.txt", "id": "deleted"}
+            document = task_document([{"name": "delete", "tags": [], "deleted_files": ["value.txt", "discard"]}])
+            document["defaults"]["oracle"] = {"command": "test ! -e value.txt && test ! -e discard && test -f fixed.txt", "id": "deleted"}
             completed, rows, _ = run_training(root, repo, binary, document)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             for row in rows:
                 self.assertTrue(row["success"], row)
+            self.assertEqual(sentinel.read_text(), "untouched")
 
-    def test_invalid_budget_fails_at_load_before_any_episode(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            binary, log = make_stub(root, "success")
-            document = task_document([{"name": "fix", "tags": []}])
-            document["defaults"]["budgets"]["max_provider_turns"] = 0
-            completed, rows, _ = run_training(root, repo, binary, document)
-            self.assertEqual(completed.returncode, 2)
-            self.assertIn("max_provider_turns", completed.stderr)
-            self.assertEqual(rows, [])
-            self.assertFalse(log.exists())
+    def test_invalid_budget_or_root_file_path_fails_before_any_episode(self) -> None:
+        cases = [("budgets", 0)] + [(field, path) for field in ["initial_files", "deleted_files", "oracle"]
+                                     for path in [".", "./"]]
+        for field, value in cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                binary, log = make_stub(root, "success")
+                document = task_document([{"name": "fix", "tags": []}])
+                if field == "budgets":
+                    document["defaults"][field]["max_provider_turns"] = value
+                elif field == "oracle":
+                    document["defaults"][field] = {"expected_files": {value: "content"}}
+                else:
+                    document["defaults"][field] = {value: "content"} if field == "initial_files" else [value]
+                completed, rows, _ = run_training(root, repo, binary, document)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("max_provider_turns" if field == "budgets" else "must stay inside the workspace", completed.stderr)
+                self.assertEqual(rows, [])
+                self.assertFalse(log.exists())
 
     def test_legacy_task_arrays_are_rejected_with_a_migration_hint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -826,7 +963,7 @@ class GymMinerTests(unittest.TestCase):
         self.assertEqual(bare, "just a title")
         self.assertEqual(MINE.mined_prompt({"id": "mini-agent-test"}), "mini-agent-test")
 
-    def test_miner_emits_a_loadable_document_with_the_composed_prompt(self) -> None:
+    def test_miner_cli_records_validation_provenance_in_loadable_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
@@ -841,25 +978,41 @@ class GymMinerTests(unittest.TestCase):
                         "description": "The import left value.txt reading broken.",
                         "acceptance_criteria": "grep -qx fixed value.txt passes.",
                         "status": "closed",
+                        "labels": ["domain:example", "fail-to-pass", "validation-skipped"],
                     }
                 )
                 + "\n",
                 encoding="utf-8",
             )
-            tasks, skipped = MINE.mine(
-                repo, {"mini-agent-test": "grep -qx fixed value.txt"}, True, 10, "main", beads
-            )
-            self.assertEqual(skipped, [])
-            prompt = str(tasks[0]["prompt"])
-            self.assertIn("The import left value.txt reading broken.", prompt)
-            self.assertIn("grep -qx fixed value.txt passes.", prompt)
-            self.assertEqual(len(tasks), 1)
-            output = root / "tasks.json"
-            output.write_text(json.dumps(MINE.document(tasks)), encoding="utf-8")
-            loaded = TRAIN_MODULE.load_tasks(output, 900)
-            self.assertEqual(loaded[0]["name"], "mini-agent-test")
-            self.assertEqual(loaded[0]["initial_files"]["value.txt"], "broken\n")
-            self.assertEqual(loaded[0]["oracle"]["expected_files"]["value.txt"], "fixed\n")
+            for validate, command, count in [(True, "grep -qx fixed value.txt", 1), (False, "true", 1), (True, "true", 0)]:
+                with self.subTest(validate=validate, command=command):
+                    output = root / "tasks.json"
+                    oracle_map = root / "map.json"
+                    marker = root / "oracle-ran"
+                    oracle_map.write_text(json.dumps({"mini-agent-test": "touch " + shlex.quote(str(marker)) + "; " + command}))
+                    marker.unlink(missing_ok=True)
+                    completed = subprocess.run(
+                        [sys.executable, str(ROOT / "scripts/gym/mine_tasks.py"), "--repo", str(repo),
+                         "--beads-json", str(beads), "--oracle-map", str(oracle_map), "--output", str(output),
+                         *([] if validate else ["--no-validate"])],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(marker.exists(), validate)
+                    self.assertIn(f"mined {count} {'validated' if validate else 'unvalidated'} task(s)", completed.stdout)
+                    tasks = json.loads(output.read_text())["tasks"]
+                    self.assertEqual(len(tasks), count)
+                    if not count:
+                        self.assertIn("oracle already passes at base", completed.stderr)
+                        continue
+                    self.assertEqual(tasks[0]["tags"], ["domain:example", "fail-to-pass", "mined"] if validate
+                                     else ["domain:example", "mined", "validation-skipped"])
+                    self.assertIn("The import left value.txt reading broken.", tasks[0]["prompt"])
+                    self.assertIn("grep -qx fixed value.txt passes.", tasks[0]["prompt"])
+                    loaded = TRAIN_MODULE.load_tasks(output, 900)
+                    self.assertEqual(loaded[0]["name"], "mini-agent-test")
+                    self.assertEqual(loaded[0]["initial_files"]["value.txt"], "broken\n")
+                    self.assertEqual(loaded[0]["oracle"]["expected_files"]["value.txt"], "fixed\n")
 
 
 CARGO_STUB = """#!/bin/sh
@@ -952,6 +1105,17 @@ class GymEntrypointTests(unittest.TestCase):
             self.assertTrue((gym_root / "worktrees").is_dir())
             self.assertTrue((gym_root / "runs").is_dir())
             self.assertIn("gym host ready", completed.stdout)
+
+            # Setup must reject an interpreter without descriptor-relative
+            # rmtree before another install or containment test is launched.
+            python_stub = root / "bin/python3"
+            code = "import sys; sys.version_info=(3,10,0); exec(compile(sys.stdin.read(), '<setup>', 'exec'))"
+            python_stub.write_text("#!/bin/sh\nshift\nexec " + shlex.join([sys.executable, "-c", code]) + ' "$@"\n')
+            python_stub.chmod(0o755)
+            rejected = subprocess.run(["bash", str(SETUP), str(repo)], capture_output=True, text=True, env=env)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Python 3.11 or newer is required", rejected.stderr)
+            self.assertEqual((root / "cargo.log").read_text().splitlines(), invocations)
 
     def test_setup_refuses_a_repo_that_only_resolves_into_the_temp_root(self) -> None:
         # macOS hands out `/tmp/...`, which resolves to `/private/tmp`; Linux
