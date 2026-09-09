@@ -750,7 +750,11 @@ impl JsWorkerSupervisor {
             connection.skill_cache_turn = Some(turn_id);
             connection.skill_cache_ids = ids;
         }
-        let reusable_terminal = result.as_ref().is_ok_and(terminal_is_reusable);
+        let reusable_terminal = result.as_ref().is_ok_and(terminal_is_reusable)
+            && connection
+                .process
+                .try_wait()
+                .is_ok_and(|status| status.is_none());
         if reusable_terminal {
             authority.finish();
             connection.completed_invocations = connection.completed_invocations.saturating_add(1);
@@ -2054,7 +2058,17 @@ async fn read_worker(
             tagged = &mut task => break tagged.map_err(|_| WorkerError::Transport)?,
             _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
                 if let Some(exit_status) = connection.process.try_wait().map_err(|_| WorkerError::Transport)? {
-                    return Err(classify_worker_exit(exit_status));
+                    // Exit can become observable before the blocking reader delivers a flushed
+                    // terminal frame. Drain that same read, bounded independently of invocation
+                    // time so an inherited/open pipe cannot keep a dead worker's caller waiting.
+                    let drain_deadline = deadline.min(Instant::now() + PROCESS_EXIT_RECONCILIATION_TIMEOUT);
+                    match await_controlled(&mut task, cancellation, drain_deadline).await {
+                        Ok(tagged) => break tagged.map_err(|_| WorkerError::Transport)?,
+                        Err(WorkerError::TimedOut) if Instant::now() < deadline => {
+                            return Err(classify_worker_exit(exit_status));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
         }
@@ -2070,6 +2084,18 @@ async fn read_worker(
         // validate it instead of flattening it into a transport failure.
         Ok(frame) if matches!(frame.message, WorkerFrame::ProtocolFault(_)) => Ok(frame),
         Ok(frame) => match exit_status {
+            // A terminal result remains valid after graceful exit (for example, rejection of a
+            // corrupt skill cache). The caller still authenticates the full wire frame and checks
+            // its state/diagnostics. Never dispatch an effect or accept Ready from a dead worker.
+            Some(status)
+                if status.success()
+                    && matches!(
+                        frame.message,
+                        WorkerFrame::StepResult(_) | WorkerFrame::VerificationResult(_)
+                    ) =>
+            {
+                Ok(frame)
+            }
             Some(status) => Err(classify_worker_exit(status)),
             None => Ok(frame),
         },
@@ -2341,3 +2367,7 @@ pub(crate) struct StderrStats {
     pub(crate) retained_bytes: usize,
     pub(crate) truncated: bool,
 }
+
+#[cfg(test)]
+#[path = "tests/worker_exit.rs"]
+mod worker_exit_tests;

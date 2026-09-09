@@ -65,7 +65,7 @@ mod worker_effect_services;
 mod worker_fault_matrix;
 mod worker_protocol;
 mod worker_resource_benchmark;
-mod worker_runtime;
+pub(super) mod worker_runtime;
 
 use crate::extras::js::audit::EffectAudit;
 use crate::extras::js::host::AllowConfig;

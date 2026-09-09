@@ -956,6 +956,17 @@ worker even when no later request arrives. Normal CLI completion and error exits
 supervisor shutdown; clean shutdown retires the idle process and a later request starts a fresh
 generation.
 
+A worker may flush a terminal response and exit before the parent consumes it. The parent
+preserves complete step/verification results after a successful exit, then applies the usual
+build, invocation, sequence, state, and closed-diagnostic validation. It never treats a dead
+worker's effect request or Ready as actionable, and abnormal/resource exits still override result
+frames. Authenticated protocol faults retain their closed classification even on abnormal exit.
+When the exit poll wins over the pending pipe read, the parent drains that same read for at most
+100 ms, bounded by cancellation and the invocation deadline. Observably exited workers cannot
+return to the idle pool. `src/extras/js/tests/worker_exit.rs` forces both exit/read orderings and
+checks protocol validation, abnormal/native CPU exits, cancellation, and the bounded drain;
+the skill identity/ABI boundary tests run without transport retries.
+
 An unavailable audit prevents broker construction and therefore sends no request to a worker. An
 effect whose durable completion is `outcome_unknown` immediately erases invocation authority,
 closes that invocation in both protocol state machines, and forces process recycle without retry.

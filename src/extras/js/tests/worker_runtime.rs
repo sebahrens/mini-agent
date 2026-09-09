@@ -2870,7 +2870,7 @@ fn verification_scheduler_worker_fault_does_not_close_the_single_queue() {
     assert!(launcher.live_processes.load(Ordering::Acquire) <= 1);
 }
 
-fn verification_with_source(source: &str) -> VerifyArtifact {
+pub(in crate::extras::js) fn verification_with_source(source: &str) -> VerifyArtifact {
     #[cfg(feature = "skills")]
     let artifact = crate::extras::js::skills::SkillArtifact::new(
         source.into(),
@@ -3489,7 +3489,7 @@ fn run_scripted_supervisor_worker() -> ! {
                         output.flush().unwrap();
                         std::thread::park_timeout(Duration::from_secs(30));
                     }
-                    "protocol-fault" => {
+                    "protocol-fault" | "terminal-exit-fault" => {
                         let fault = WireFrame::invocation(
                             build.clone(),
                             invocation.clone(),
@@ -3505,6 +3505,9 @@ fn run_scripted_supervisor_worker() -> ! {
                         protocol.on_send(&fault).unwrap();
                         write_frame(&mut output, &fault).unwrap();
                         output.flush().unwrap();
+                        if step.code == "terminal-exit-fault" {
+                            std::process::exit(74);
+                        }
                         std::thread::park_timeout(Duration::from_secs(30));
                     }
                     "stale-response" => {
@@ -3533,7 +3536,10 @@ fn run_scripted_supervisor_worker() -> ! {
                 let mut sequence = request.sequence + 1;
                 let effect_count = match step.code.as_str() {
                     "two-effects" => 2,
-                    "effect-pending" | "crash-pending-effect" | "outcome-unknown" => 1,
+                    "effect-pending"
+                    | "crash-pending-effect"
+                    | "outcome-unknown"
+                    | "terminal-exit-effect" => 1,
                     _ => 0,
                 };
                 for ordinal in 0..effect_count {
@@ -3553,6 +3559,9 @@ fn run_scripted_supervisor_worker() -> ! {
                     protocol.on_send(&effect).unwrap();
                     write_frame(&mut output, &effect).unwrap();
                     output.flush().unwrap();
+                    if step.code == "terminal-exit-effect" {
+                        std::process::exit(0);
+                    }
                     if step.code == "crash-pending-effect" {
                         std::thread::sleep(Duration::from_millis(30));
                         std::process::exit(75);
@@ -3601,7 +3610,7 @@ fn run_scripted_supervisor_worker() -> ! {
                         .into(),
                     )
                 };
-                let terminal = WireFrame::invocation(
+                let mut terminal = WireFrame::invocation(
                     build.clone(),
                     invocation,
                     sequence,
@@ -3616,8 +3625,20 @@ fn run_scripted_supervisor_worker() -> ! {
                     }),
                 );
                 protocol.on_send(&terminal).unwrap();
+                if step.code == "terminal-exit-invalid-sequence" {
+                    terminal.sequence += 1;
+                }
                 write_frame(&mut output, &terminal).unwrap();
                 output.flush().unwrap();
+                match step.code.as_str() {
+                    "terminal-exit-clean" | "terminal-exit-invalid-sequence" => {
+                        std::process::exit(0);
+                    }
+                    "terminal-exit-abnormal" => std::process::exit(76),
+                    #[cfg(unix)]
+                    "terminal-exit-cpu" => exit_with_native_cpu_limit(),
+                    _ => {}
+                }
             }
             ParentFrame::VerifyArtifact(verification) => {
                 let invocation = request.invocation_id.clone().unwrap();
@@ -3684,6 +3705,9 @@ fn run_scripted_supervisor_worker() -> ! {
                 protocol.on_send(&terminal).unwrap();
                 write_frame(&mut output, &terminal).unwrap();
                 output.flush().unwrap();
+                if internal {
+                    std::process::exit(0);
+                }
             }
             ParentFrame::Shutdown => std::process::exit(0),
             ParentFrame::Hello(_)

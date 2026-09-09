@@ -30,6 +30,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         "extras::js::tests::worker_broker::worker_broker_",
         "extras::js::tests::worker_broker::js_effect_audit_",
         "extras::js::tests::worker_fault_matrix::",
+        "extras::js::supervisor::worker_exit_tests::",
         "agent::builder::js_tests::unavailable_worker_containment_",
         "print::tests::config_reports_",
     )
@@ -116,6 +117,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "worker_broker",
             "js_effect_audit",
             "worker_fault_matrix",
+            "worker_exit",
             "skill_realm_isolation",
             "capability_manifest_v2",
             "worker_verifier",
@@ -142,7 +144,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     r"(?m)^\s+(?:require_suite|Assert-Suite)\s+(.+)$",
                     discovery,
                 )
-                self.assertEqual(12, len(guard_calls))
+                self.assertEqual(len(required_categories), len(guard_calls))
                 for category in required_categories:
                     matching_calls = [
                         call
@@ -335,29 +337,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("RUST_MIN_STACK: 8388608", binding_step)
         self.assertIn("extras::js::tests::skill_runtime_binding", binding_step)
         self.assertIn("-- --test-threads=1", binding_step)
-        isolated_binding_tests = (
-            "hidden_capability_abi_mismatch_fails_before_export_source_runs",
-            "identity_mismatch_fails_before_skill_source_runs",
-            "production_and_verifier_make_identical_loader_decisions_for_differential_artifacts",
-        )
-        for test_name in isolated_binding_tests:
-            self.assertIn(
-                f"--skip extras::js::tests::skill_runtime_binding::{test_name}",
-                binding_step,
-            )
-
-        identity_step = body.split(
-            "name: Test skill runtime identity boundaries in fresh processes", 1
-        )[1].split("- name:", 1)[0]
-        self.assertIn("contains(matrix.features, 'skills')", identity_step)
-        self.assertIn("RUST_MIN_STACK: 8388608", identity_step)
-        self.assertEqual(identity_step.count("cargo test --locked"), 3)
-        for test_name in isolated_binding_tests:
-            self.assertIn(
-                f"extras::js::tests::skill_runtime_binding::{test_name}",
-                identity_step,
-            )
-        self.assertEqual(identity_step.count("-- --exact --test-threads=1"), 3)
+        # The module filter must run all binding cases in one invocation. Per-case skips or
+        # an exact filter would silently lose the identity/ABI/differential boundary coverage.
+        self.assertEqual(binding_step.count("cargo test --locked"), 1)
+        self.assertNotIn("--skip", binding_step)
+        self.assertNotIn("--exact", binding_step)
 
         isolated_step = body.split(
             "name: Test macOS agent-rebuild worker reuse in a fresh process", 1

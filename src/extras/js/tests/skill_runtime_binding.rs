@@ -3,7 +3,6 @@ use std::sync::Arc;
 use rig::tool::Tool;
 
 use super::make_test_tool;
-use crate::agent::tools::ToolError;
 use crate::extras::js::broker::saturate_executable_preparation_slots_for_test;
 use crate::extras::js::protocol::{
     EffectResult, GrantId, InvocationId, MAX_EFFECTS_PER_STEP, MAX_SKILL_EXPORTS_PER_ARTIFACT,
@@ -65,38 +64,14 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
     }))
 }
 
-async fn call_pure_skill_with_transport_retry(artifact: &SkillArtifact, code: &str) -> String {
-    const MAX_ATTEMPTS: usize = 3;
-    // Bounded mitigation for the unresolved native transport flake (mini-agent-enx3).
-    // This reexecutes the libtest worker: production image publication and guardian
-    // startup are not involved. Fixed exit/I/O classes from the supervisor help
-    // distinguish the next CI failure without exposing source or worker stderr.
-    // A fresh supervisor isolates each retry; the final attempt still panics.
-    let mut backoff = std::time::Duration::from_millis(250);
-    for attempt in 1..=MAX_ATTEMPTS {
-        let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(artifact, 0)]));
-        match tool
-            .call(JsArgs {
-                code: code.to_string(),
-            })
-            .await
-        {
-            Ok(result) => return result,
-            Err(ToolError::Msg(message))
-                if message == "JavaScript worker transport failed" && attempt < MAX_ATTEMPTS =>
-            {
-                eprintln!(
-                    "skill runtime binding test transport failed on attempt {attempt}; \
-                     retrying with a fresh supervisor after {backoff:?}"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(3);
-                continue;
-            }
-            Err(error) => panic!("skill runtime binding call failed on attempt {attempt}: {error}"),
-        }
-    }
-    unreachable!("the final transport failure returns through the error arm")
+async fn call_pure_skill(artifact: &SkillArtifact, code: &str) -> String {
+    make_test_tool()
+        .with_skill_turn_context(context(vec![resolved(artifact, 0)]))
+        .call(JsArgs {
+            code: code.to_string(),
+        })
+        .await
+        .expect("skill runtime binding call must succeed without transport retries")
 }
 
 fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
@@ -191,8 +166,7 @@ async fn production_and_verifier_make_identical_loader_decisions_for_differentia
     for (name, source, test, production_expression) in cases {
         let artifact = differential_artifact(source, test);
         let verifier_accepted = verify_skill(&artifact).is_ok();
-        let production =
-            call_pure_skill_with_transport_retry(&artifact, production_expression).await;
+        let production = call_pure_skill(&artifact, production_expression).await;
         let production_accepted = production == "true";
         assert_eq!(
             verifier_accepted, production_accepted,
@@ -580,8 +554,7 @@ async fn identity_mismatch_fails_before_skill_source_runs() {
         CapabilityManifest::pure(),
     );
     selected.source = "throw new Error('source must not execute')".to_string();
-    let result =
-        call_pure_skill_with_transport_retry(&selected, "globalThis.agentCodeRan = true").await;
+    let result = call_pure_skill(&selected, "globalThis.agentCodeRan = true").await;
 
     assert!(
         result.starts_with("JS error: internal error"),
@@ -599,7 +572,7 @@ async fn hidden_capability_abi_mismatch_fails_before_export_source_runs() {
     );
     selected.abi_version = 1;
     selected.id = selected.compute_identity();
-    let result = call_pure_skill_with_transport_retry(&selected, "1").await;
+    let result = call_pure_skill(&selected, "1").await;
 
     assert!(
         result.starts_with("JS error: internal error"),

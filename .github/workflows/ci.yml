@@ -335,18 +335,6 @@ jobs:
         run: >-
           cargo test --locked ${{ matrix.features }}
           extras::js::tests::skill_runtime_binding -- --test-threads=1
-          --skip extras::js::tests::skill_runtime_binding::hidden_capability_abi_mismatch_fails_before_export_source_runs
-          --skip extras::js::tests::skill_runtime_binding::identity_mismatch_fails_before_skill_source_runs
-          --skip extras::js::tests::skill_runtime_binding::production_and_verifier_make_identical_loader_decisions_for_differential_artifacts
-
-      - name: Test skill runtime identity boundaries in fresh processes
-        if: contains(matrix.features, 'skills')
-        env:
-          RUST_MIN_STACK: 8388608
-        run: |
-          cargo test --locked ${{ matrix.features }} extras::js::tests::skill_runtime_binding::hidden_capability_abi_mismatch_fails_before_export_source_runs -- --exact --test-threads=1
-          cargo test --locked ${{ matrix.features }} extras::js::tests::skill_runtime_binding::identity_mismatch_fails_before_skill_source_runs -- --exact --test-threads=1
-          cargo test --locked ${{ matrix.features }} extras::js::tests::skill_runtime_binding::production_and_verifier_make_identical_loader_decisions_for_differential_artifacts -- --exact --test-threads=1
 
       - name: Test macOS agent-rebuild worker reuse in a fresh process
         if: >-
@@ -494,6 +482,7 @@ jobs:
             require_suite "$listing" worker_broker '^extras::js::tests::worker_broker::worker_broker_'
             require_suite "$listing" js_effect_audit '^extras::js::tests::worker_broker::js_effect_audit_'
             require_suite "$listing" worker_fault_matrix '^extras::js::tests::worker_fault_matrix::'
+            require_suite "$listing" worker_exit '^extras::js::supervisor::worker_exit_tests::'
             require_suite "$listing" javascript_worker_status '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
           done
           require_suite "$skills_tests" skill_realm_isolation '^extras::js::tests::skill_realm_isolation::'
@@ -545,6 +534,7 @@ jobs:
             'extras::js::tests::worker_broker::worker_broker_'
             'extras::js::tests::worker_broker::js_effect_audit_'
             'extras::js::tests::worker_fault_matrix::'
+            'extras::js::supervisor::worker_exit_tests::'
             'agent::builder::js_tests::unavailable_worker_containment_'
             'print::tests::config_reports_'
           )
@@ -662,6 +652,7 @@ jobs:
             require_suite "$listing" worker_broker '^extras::js::tests::worker_broker::worker_broker_'
             require_suite "$listing" js_effect_audit '^extras::js::tests::worker_broker::js_effect_audit_'
             require_suite "$listing" worker_fault_matrix '^extras::js::tests::worker_fault_matrix::'
+            require_suite "$listing" worker_exit '^extras::js::supervisor::worker_exit_tests::'
             require_suite "$listing" javascript_worker_status '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
           done
           require_suite "$skills_tests" skill_realm_isolation '^extras::js::tests::skill_realm_isolation::'
@@ -718,6 +709,7 @@ jobs:
             'extras::js::tests::worker_broker::worker_broker_'
             'extras::js::tests::worker_broker::js_effect_audit_'
             'extras::js::tests::worker_fault_matrix::'
+            'extras::js::supervisor::worker_exit_tests::'
             'agent::builder::js_tests::unavailable_worker_containment_'
             'print::tests::config_reports_'
           )
@@ -1009,6 +1001,7 @@ jobs:
             Assert-Suite $Listing 'worker_broker' '^extras::js::tests::worker_broker::worker_broker_'
             Assert-Suite $Listing 'js_effect_audit' '^extras::js::tests::worker_broker::js_effect_audit_'
             Assert-Suite $Listing 'worker_fault_matrix' '^extras::js::tests::worker_fault_matrix::'
+            Assert-Suite $Listing 'worker_exit' '^extras::js::supervisor::worker_exit_tests::'
             Assert-Suite $Listing 'javascript_worker_status' '^(agent::builder::js_tests::unavailable_worker_containment_|print::tests::config_reports_)'
           }
           Assert-CoreSuites $tests
@@ -1431,6 +1424,7 @@ jobs:
             'extras::js::tests::worker_broker::worker_broker_',
             'extras::js::tests::worker_broker::js_effect_audit_',
             'extras::js::tests::worker_fault_matrix::',
+            'extras::js::supervisor::worker_exit_tests::',
             'agent::builder::js_tests::unavailable_worker_containment_',
             'print::tests::config_reports_'
           )
