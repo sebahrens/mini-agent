@@ -872,18 +872,45 @@ fn worker_runtime_timeout_and_pending_job_limits_reset_before_next_request() {
     assert_eq!(jobs[1].outcome, StepOutcome::Value("42".into()));
 }
 
-#[test]
-fn worker_runtime_oom_drops_poisoned_heap_and_next_request_succeeds() {
-    let results = run_steps(
-        &[
-            "const chunks=[]; while(true){ chunks.push(new ArrayBuffer(1024 * 1024)); }",
-            "40 + 2",
-        ],
-        10_000,
-        10_000,
-    );
-    assert_eq!(results[0].outcome, StepOutcome::OutOfMemory);
-    assert_eq!(results[1].outcome, StepOutcome::Value("42".into()));
+#[tokio::test]
+async fn worker_supervisor_oom_blocks_effects_and_recycles_generation() {
+    for source in [
+        "const chunks=[]; while(true){ chunks.push(new ArrayBuffer(1024 * 1024)); }",
+        "(() => { const chunks=[]; while(true){ chunks.push(new ArrayBuffer(1024 * 1024)); } })()",
+        "new ArrayBuffer(128 * 1024 * 1024)",
+        "try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} read_file('after-oom'); 42",
+        "Promise.resolve().then(() => { try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} read_file('after-job-oom'); return 42; })",
+    ] {
+        let supervisor = JsWorkerSupervisor::with_launcher_for_test(
+            TestWorkerLauncher::internal_worker_process_with_limits(10_000, 10_000),
+        );
+        let effects = RecordingEffects::default();
+        let result = supervisor
+            .execute(
+                RunStep::new(source.into()),
+                effects.clone(),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, StepOutcome::OutOfMemory, "{source}");
+        assert!(
+            effects.operations.lock().unwrap().is_empty(),
+            "effect after OOM: {source}"
+        );
+        assert_eq!(supervisor.generation_for_test().await, None);
+        let next = supervisor
+            .execute(
+                RunStep::new("42".into()),
+                RecordingEffects::default(),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.outcome, StepOutcome::Value("42".into()));
+        assert_eq!(supervisor.generation_for_test().await, Some(2));
+        supervisor.shutdown_for_test().await.unwrap();
+    }
 }
 
 #[test]
@@ -3014,7 +3041,7 @@ fn worker_supervisor_transport_run_and_verify_reuse_one_serialized_connection() 
 
 #[test]
 fn worker_supervisor_real_verification_resource_terminal_recycles_generation() {
-    for (request, role) in [
+    for (mut request, role) in [
         (
             verification_with_source("while (true) {} function answer() { return true; }"),
             ScriptRole::SkillSource,
@@ -3023,12 +3050,52 @@ fn worker_supervisor_real_verification_resource_terminal_recycles_generation() {
             verification_with_embedded_test("while (true) {}"),
             ScriptRole::EmbeddedTest,
         ),
+        (
+            verification_with_source(
+                "try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} function answer() { return true; }",
+            ),
+            ScriptRole::SkillSource,
+        ),
+        (
+            verification_with_embedded_test(
+                "try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} true",
+            ),
+            ScriptRole::EmbeddedTest,
+        ),
+        (
+            {
+                let mut request = verification_with_source("function answer() { while (true) {} }");
+                request.cases[0].script = "answer()".into();
+                request
+            },
+            ScriptRole::HeldOutTest,
+        ),
     ] {
         let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
             TestWorkerLauncher::internal_worker_process_with_limits(50, 10_000),
             Duration::from_secs(2),
         );
+        request.cases.push(VerificationCase {
+            case_id: "must-not-run-after-resource-failure".into(),
+            script: "true".into(),
+            #[cfg(feature = "skills")]
+            kind: crate::extras::js::protocol::VerificationCaseKind::Embedded,
+        });
         let result = supervisor.verify_blocking(request).unwrap();
+        let first_resource_failure = result
+            .cases
+            .iter()
+            .position(|case| {
+                case.diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| diagnostic.class == DiagnosticClass::ResourceLimit)
+            })
+            .expect("resource failure must be reported");
+        assert!(
+            result.cases[first_resource_failure..]
+                .iter()
+                .all(|case| !case.passed)
+        );
         assert!(!result.passed);
         assert!(
             result.cases.iter().any(|case| {

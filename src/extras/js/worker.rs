@@ -16,10 +16,11 @@ use rquickjs::context::EvalOptions;
 use rquickjs::prelude::Opt;
 use rquickjs::promise::PromiseState;
 use rquickjs::{
-    Context, Ctx, Error, Exception, Function, IntoJs, Module, Object, Persistent, Runtime, Value,
+    Context, Ctx, Error, Exception, Function, IntoJs, Module, Object, Persistent, Value,
     WriteOptions,
 };
 
+use super::memory::Runtime;
 use super::protocol::{
     AdvisoryAttribution, BuildIdentity, ConsoleLevel, ConsoleRecord, Diagnostic, DiagnosticClass,
     DiagnosticStage, DirectoryEntry, DirectoryEntryKind, EffectErrorCode, EffectOperation,
@@ -40,7 +41,7 @@ use super::protocol::{
 };
 use super::session::{SCRATCH_KEY_MAX_BYTES, SCRATCH_VALUE_MAX_BYTES, STRUCTURED_RESULT_MAX_BYTES};
 use super::types::{
-    DISCOVERY_PATTERN_MAX_BYTES, MEMORY_LIMIT, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
+    DISCOVERY_PATTERN_MAX_BYTES, READ_FILE_MAX_BYTES, READ_FILES_MAX_PATH_BYTES,
     READ_FILES_MAX_PATHS, STACK_LIMIT, STEP_TIMEOUT, WRITE_FILE_MAX_BYTES,
 };
 #[cfg(feature = "skills")]
@@ -342,6 +343,7 @@ fn install_model_effect_globals(
         let read_effects = effects.clone();
         let read_file = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: String| {
             validate_path(&path).map_err(|code| effect_error(&ctx, "read_file", code))?;
+            super::memory::ensure_healthy(&ctx)?;
             match read_effects(EffectOperation::ReadFile { path }) {
                 EffectResult::ReadFile { content } => Ok(content),
                 EffectResult::Error(error) => Err(effect_error(&ctx, "read_file", error.code)),
@@ -352,6 +354,7 @@ fn install_model_effect_globals(
         let read_files = Function::new(ctx.clone(), move |ctx: Ctx<'_>, paths: Vec<String>| {
             validate_read_files_paths(&paths)
                 .map_err(|code| effect_error(&ctx, "read_files", code))?;
+            super::memory::ensure_healthy(&ctx)?;
             match read_many_effects(EffectOperation::ReadFiles { paths }) {
                 EffectResult::ReadFiles { contents } => Ok(contents),
                 EffectResult::Error(error) => Err(effect_error(&ctx, "read_files", error.code)),
@@ -362,6 +365,7 @@ fn install_model_effect_globals(
         let list_dir = Function::new(ctx.clone(), move |ctx: Ctx<'_>, path: Opt<String>| {
             let path = path.0.unwrap_or_else(|| ".".to_string());
             validate_path(&path).map_err(|code| effect_error(&ctx, "list_dir", code))?;
+            super::memory::ensure_healthy(&ctx)?;
             match list_effects(EffectOperation::ListDir { path }) {
                 EffectResult::ListDir { entries, truncated } => {
                     Ok(WorkerListDirResult { entries, truncated })
@@ -378,6 +382,7 @@ fn install_model_effect_globals(
                     .map_err(|code| effect_error(&ctx, "glob", code))?;
                 let path = parse_glob_options(options.0.as_ref())
                     .map_err(|code| effect_error(&ctx, "glob", code))?;
+                super::memory::ensure_healthy(&ctx)?;
                 match glob_effects(EffectOperation::Glob { path, pattern }) {
                     EffectResult::Glob { paths, truncated } => {
                         Ok(WorkerGlobResult { paths, truncated })
@@ -395,6 +400,7 @@ fn install_model_effect_globals(
                     .map_err(|code| effect_error(&ctx, "grep", code))?;
                 let (path, options) = parse_grep_options(options.0.as_ref())
                     .map_err(|code| effect_error(&ctx, "grep", code))?;
+                super::memory::ensure_healthy(&ctx)?;
                 match grep_effects(EffectOperation::Grep {
                     path,
                     pattern,
@@ -416,6 +422,7 @@ fn install_model_effect_globals(
                 if content.len() > WRITE_FILE_MAX_BYTES {
                     return Err(effect_error(&ctx, "write_file", EffectErrorCode::TooLarge));
                 }
+                super::memory::ensure_healthy(&ctx)?;
                 match write_effects(EffectOperation::WriteFile { path, content }) {
                     EffectResult::WriteFile => Ok(()),
                     EffectResult::Error(error) => Err(effect_error(&ctx, "write_file", error.code)),
@@ -433,6 +440,7 @@ fn install_model_effect_globals(
                         return Err(effect_error(&ctx, "fetch", EffectErrorCode::InvalidTarget));
                     }
                     let (method, headers, body) = parse_fetch_options(options.0.as_ref())?;
+                    super::memory::ensure_healthy(&ctx)?;
                     match fetch_effects(EffectOperation::Fetch {
                         url,
                         method,
@@ -463,6 +471,7 @@ fn install_model_effect_globals(
                 move |ctx: Ctx<'_>, program: String, arguments: Vec<String>| {
                     validate_spawn(&program, &arguments)
                         .map_err(|code| effect_error(&ctx, "spawn", code))?;
+                    super::memory::ensure_healthy(&ctx)?;
                     match spawn_effects(EffectOperation::Spawn { program, arguments }) {
                         EffectResult::Spawn {
                             stdout,
@@ -507,6 +516,7 @@ fn install_session_state_globals(
             if json.len() > STRUCTURED_RESULT_MAX_BYTES {
                 return Err(effect_error(&ctx, "result", EffectErrorCode::TooLarge));
             }
+            super::memory::ensure_healthy(&ctx)?;
             match result_effects(EffectOperation::Result { json }) {
                 EffectResult::ResultAccepted { .. } => Ok(()),
                 EffectResult::Error(error) => Err(effect_error(&ctx, "result", error.code)),
@@ -524,6 +534,7 @@ fn install_session_state_globals(
                 if json.len() > SCRATCH_VALUE_MAX_BYTES {
                     return Err(effect_error(&ctx, "scratch_put", EffectErrorCode::TooLarge));
                 }
+                super::memory::ensure_healthy(&ctx)?;
                 match put_effects(EffectOperation::ScratchPut { key, json }) {
                     EffectResult::ScratchPut => Ok(()),
                     EffectResult::Error(error) => {
@@ -540,6 +551,7 @@ fn install_session_state_globals(
         let scratch_get_dispatch = Function::new(ctx.clone(), move |ctx: Ctx<'_>, key: String| {
             validate_scratch_key_worker(&key)
                 .map_err(|code| effect_error(&ctx, "scratch_get", code))?;
+            super::memory::ensure_healthy(&ctx)?;
             match effects(EffectOperation::ScratchGet { key }) {
                 EffectResult::ScratchGet { json } => Ok(json),
                 EffectResult::Error(error) => Err(effect_error(&ctx, "scratch_get", error.code)),
@@ -578,6 +590,7 @@ fn install_proposal_global(
         let propose_skill = Function::new(ctx.clone(), move |ctx: Ctx<'_>, draft: Object<'_>| {
             let proposal = super::skills::proposal::JsProposal::from_object(&draft)
                 .map_err(|_| effect_error(&ctx, "propose_skill", EffectErrorCode::InvalidTarget))?;
+            super::memory::ensure_healthy(&ctx)?;
             match effects(EffectOperation::ProposeSkill {
                 draft: proposal.into(),
             }) {
@@ -846,6 +859,29 @@ fn effect_error(ctx: &Ctx<'_>, tool: &'static str, code: EffectErrorCode) -> rqu
 #[cfg(test)]
 mod effect_error_tests {
     use super::*;
+
+    #[test]
+    fn effect_dispatch_rejects_caught_oom_without_waiting_for_an_interrupt() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        let effects = Rc::new(move |_| {
+            observed.set(observed.get() + 1);
+            EffectResult::ReadFile {
+                content: "ok".into(),
+            }
+        }) as ModelEffectDispatcher;
+        install_model_effect_globals(&context, effects, false, ModelEffectProfile::Full).unwrap();
+        context.with(|ctx| {
+            assert_eq!(ctx.eval::<String, _>("read_file('before')").unwrap(), "ok");
+            // Deliberately no interrupt handler: the dispatch boundary must independently refuse
+            // an effect during the instructions between allocation failure and the next poll.
+            assert!(ctx.eval::<bool, _>("try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} try { read_file('after'); } catch (_) {} true").unwrap());
+        });
+        assert_eq!(calls.get(), 1);
+        assert!(runtime.allocation_failed());
+    }
 
     #[test]
     fn read_only_profile_installs_only_the_three_read_effect_globals() {
@@ -1432,7 +1468,6 @@ fn trusted_bootstrap_source() -> String {
 
 fn compile_trusted_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
     let runtime = Runtime::new()?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + STEP_TIMEOUT;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -1506,7 +1541,6 @@ mod trusted_bootstrap_bytecode_tests {
 
     fn configure_benchmark_runtime() -> rquickjs::Result<(Runtime, Context)> {
         let runtime = Runtime::new()?;
-        runtime.set_memory_limit(MEMORY_LIMIT);
         runtime.set_max_stack_size(STACK_LIMIT);
         let deadline = Instant::now() + STEP_TIMEOUT;
         runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -1568,7 +1602,6 @@ mod trusted_bootstrap_bytecode_tests {
 
         for expected in ["{\"runtime\":1}", "{\"runtime\":2}"] {
             let runtime = Runtime::new().expect("create fresh runtime");
-            runtime.set_memory_limit(MEMORY_LIMIT);
             runtime.set_max_stack_size(STACK_LIMIT);
             let deadline = Instant::now() + STEP_TIMEOUT;
             runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -1851,6 +1884,9 @@ fn classify_thrown_exception<'js>(
     role: ScriptRole,
     diagnostics: &ExceptionDiagnostics<'_>,
 ) -> ClosedFailure {
+    if super::memory::allocation_failed(ctx) {
+        return ClosedFailure::out_of_memory(stage, role);
+    }
     let inspected = diagnostics.inspect(ctx, thrown);
     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
         ClosedFailure::timeout(stage, role)
@@ -2892,79 +2928,26 @@ fn execute_fresh_step(
     #[cfg(feature = "skills")] tool_call_id: &str,
 ) -> Result<StepOutcome, ClosedFailure> {
     let runtime = Runtime::new().map_err(|error| initialization_failure(error, role))?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
-    runtime.set_max_stack_size(STACK_LIMIT);
-    let deadline = Instant::now() + limits.timeout;
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupt_flag = interrupted.clone();
-    let terminal_interrupt = terminal_requested.clone();
-    runtime.set_interrupt_handler(Some(Box::new(move || {
-        let expired = Instant::now() >= deadline;
-        if expired {
-            interrupt_flag.store(true, Ordering::Relaxed);
-        }
-        expired || terminal_interrupt.load(Ordering::Acquire)
-    })));
+    let result = (|| {
+        runtime.set_max_stack_size(STACK_LIMIT);
+        let deadline = Instant::now() + limits.timeout;
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupt_flag = interrupted.clone();
+        let terminal_interrupt = terminal_requested.clone();
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            let expired = Instant::now() >= deadline;
+            if expired {
+                interrupt_flag.store(true, Ordering::Relaxed);
+            }
+            expired || terminal_interrupt.load(Ordering::Acquire)
+        })));
 
-    let context = Context::full(&runtime).map_err(|error| initialization_failure(error, role))?;
-    let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
-        ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
-    })?;
-    let functions = load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
-        classify_error(
-            &context,
-            error,
-            deadline,
-            &interrupted,
-            DiagnosticStage::Initialization,
-            role,
-        )
-    })?;
-    install_console(&context, console, functions.console_wrapper.clone()).map_err(|error| {
-        classify_error(
-            &context,
-            error,
-            deadline,
-            &interrupted,
-            DiagnosticStage::Initialization,
-            role,
-        )
-    })?;
-    if let Some(effects) = effects {
-        if model_effect_profile == ModelEffectProfile::Full {
-            install_session_state_globals(
-                &context,
-                effects.clone(),
-                functions.session_result_wrapper.clone(),
-                functions.scratch_put_wrapper.clone(),
-                functions.scratch_get_wrapper.clone(),
-            )
-            .map_err(|error| {
-                classify_error(
-                    &context,
-                    error,
-                    deadline,
-                    &interrupted,
-                    DiagnosticStage::Initialization,
-                    role,
-                )
-            })?;
-        }
-        install_model_effect_globals(&context, effects, spawn_available, model_effect_profile)
-            .map_err(|error| {
-                classify_error(
-                    &context,
-                    error,
-                    deadline,
-                    &interrupted,
-                    DiagnosticStage::Initialization,
-                    role,
-                )
-            })?;
-    }
-    #[cfg(feature = "skills")]
-    if let Some(proposal_effects) = proposal_effects {
-        install_proposal_global(&context, proposal_effects).map_err(|error| {
+        let context =
+            Context::full(&runtime).map_err(|error| initialization_failure(error, role))?;
+        let bytecode = trusted_bootstrap_bytecode().ok_or_else(|| {
+            ClosedFailure::error(JsErrorCode::Internal, DiagnosticStage::Initialization, role)
+        })?;
+        let functions = load_trusted_bootstrap_functions(&context, bytecode).map_err(|error| {
             classify_error(
                 &context,
                 error,
@@ -2974,88 +2957,151 @@ fn execute_fresh_step(
                 role,
             )
         })?;
-    }
-    let clone = functions.strict_clone;
-    let string_gate = functions.string_gate;
-    let exception_inspector = functions.exception_inspector;
-    let async_completion_value = functions.async_completion_value;
-    let exception_diagnostics = ExceptionDiagnostics {
-        inspector: &exception_inspector,
-        model_source: (role == ScriptRole::Model).then_some(source),
-    };
-    #[cfg(feature = "skills")]
-    let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
-    #[cfg(feature = "skills")]
-    for cached in artifacts {
-        let artifact = cached.artifact.as_ref();
-        let artifact_bindings = bindings.get(&artifact.id).cloned().ok_or_else(|| {
-            ClosedFailure::error(
-                JsErrorCode::Internal,
+        install_console(&context, console, functions.console_wrapper.clone()).map_err(|error| {
+            classify_error(
+                &context,
+                error,
+                deadline,
+                &interrupted,
                 DiagnosticStage::Initialization,
-                ScriptRole::SkillSource,
+                role,
             )
         })?;
-        let loaded = super::realm::load_artifact_with_bound_exports_bytecode(
-            &runtime,
-            &context,
-            artifact,
-            &cached.bytecode,
-            capability_runtime.clone(),
-            artifact_bindings,
-        )
-        .map_err(|_| {
-            ClosedFailure::error(
-                JsErrorCode::Internal,
-                DiagnosticStage::Initialization,
-                ScriptRole::SkillSource,
+        if let Some(effects) = effects {
+            if model_effect_profile == ModelEffectProfile::Full {
+                install_session_state_globals(
+                    &context,
+                    effects.clone(),
+                    functions.session_result_wrapper.clone(),
+                    functions.scratch_put_wrapper.clone(),
+                    functions.scratch_get_wrapper.clone(),
+                )
+                .map_err(|error| {
+                    classify_error(
+                        &context,
+                        error,
+                        deadline,
+                        &interrupted,
+                        DiagnosticStage::Initialization,
+                        role,
+                    )
+                })?;
+            }
+            install_model_effect_globals(&context, effects, spawn_available, model_effect_profile)
+                .map_err(|error| {
+                    classify_error(
+                        &context,
+                        error,
+                        deadline,
+                        &interrupted,
+                        DiagnosticStage::Initialization,
+                        role,
+                    )
+                })?;
+        }
+        #[cfg(feature = "skills")]
+        if let Some(proposal_effects) = proposal_effects {
+            install_proposal_global(&context, proposal_effects).map_err(|error| {
+                classify_error(
+                    &context,
+                    error,
+                    deadline,
+                    &interrupted,
+                    DiagnosticStage::Initialization,
+                    role,
+                )
+            })?;
+        }
+        let clone = functions.strict_clone;
+        let string_gate = functions.string_gate;
+        let exception_inspector = functions.exception_inspector;
+        let async_completion_value = functions.async_completion_value;
+        let exception_diagnostics = ExceptionDiagnostics {
+            inspector: &exception_inspector,
+            model_source: (role == ScriptRole::Model).then_some(source),
+        };
+        #[cfg(feature = "skills")]
+        let mut loaded_artifacts = Vec::with_capacity(artifacts.len());
+        #[cfg(feature = "skills")]
+        for cached in artifacts {
+            let artifact = cached.artifact.as_ref();
+            let artifact_bindings = bindings.get(&artifact.id).cloned().ok_or_else(|| {
+                ClosedFailure::error(
+                    JsErrorCode::Internal,
+                    DiagnosticStage::Initialization,
+                    ScriptRole::SkillSource,
+                )
+            })?;
+            let loaded = super::realm::load_artifact_with_bound_exports_bytecode(
+                &runtime,
+                &context,
+                artifact,
+                &cached.bytecode,
+                capability_runtime.clone(),
+                artifact_bindings,
             )
-        })?;
-        loaded_artifacts.push(loaded);
-        event_state
-            .lock()
             .map_err(|_| {
                 ClosedFailure::error(
                     JsErrorCode::Internal,
                     DiagnosticStage::Initialization,
                     ScriptRole::SkillSource,
                 )
-            })?
-            .injected(
-                artifact.id.clone(),
-                turn_id.to_string(),
-                tool_call_id.to_string(),
-            );
+            })?;
+            loaded_artifacts.push(loaded);
+            event_state
+                .lock()
+                .map_err(|_| {
+                    ClosedFailure::error(
+                        JsErrorCode::Internal,
+                        DiagnosticStage::Initialization,
+                        ScriptRole::SkillSource,
+                    )
+                })?
+                .injected(
+                    artifact.id.clone(),
+                    turn_id.to_string(),
+                    tool_call_id.to_string(),
+                );
+        }
+        let value = evaluate(
+            &context,
+            source,
+            &runtime,
+            deadline,
+            &interrupted,
+            role,
+            &exception_diagnostics,
+        )?;
+        let mut remaining_jobs = limits.max_pending_jobs;
+        drain_jobs(
+            &runtime,
+            deadline,
+            &interrupted,
+            &mut remaining_jobs,
+            role,
+            &exception_diagnostics,
+        )?;
+        settle_and_convert(
+            &runtime,
+            &context,
+            value,
+            clone,
+            string_gate,
+            async_completion_value,
+            deadline,
+            &interrupted,
+            role,
+            &exception_diagnostics,
+        )
+    })();
+    if runtime.allocation_failed() {
+        Err(ClosedFailure::out_of_memory(
+            DiagnosticStage::Evaluation,
+            role,
+        ))
+    } else {
+        result
     }
-    let value = evaluate(
-        &context,
-        source,
-        &runtime,
-        deadline,
-        &interrupted,
-        role,
-        &exception_diagnostics,
-    )?;
-    let mut remaining_jobs = limits.max_pending_jobs;
-    drain_jobs(
-        &runtime,
-        deadline,
-        &interrupted,
-        &mut remaining_jobs,
-        role,
-        &exception_diagnostics,
-    )?;
-    settle_and_convert(
-        &runtime,
-        &context,
-        value,
-        clone,
-        string_gate,
-        async_completion_value,
-        deadline,
-        &interrupted,
-        role,
-        &exception_diagnostics,
-    )
 }
 
 fn install_console(
@@ -3137,7 +3183,7 @@ fn evaluate(
     role: ScriptRole,
     exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<Persistent<Value<'static>>, ClosedFailure> {
-    context
+    let result = context
         .with(|ctx| {
             let filename = if role == ScriptRole::Model {
                 MODEL_SCRIPT_NAME
@@ -3151,17 +3197,26 @@ fn evaluate(
                 .map(|value| Persistent::save(&ctx, value))
         })
         .map_err(|error| {
-            classify_evaluation_error(
-                context,
-                runtime,
-                error,
-                deadline,
-                interrupted,
-                DiagnosticStage::Evaluation,
-                role,
-                exception_diagnostics,
-            )
-        })
+            context.with(|ctx| {
+                classify_ctx_error(
+                    &ctx,
+                    error,
+                    deadline,
+                    interrupted,
+                    DiagnosticStage::Evaluation,
+                    role,
+                    Some(exception_diagnostics),
+                )
+            })
+        });
+    if runtime.allocation_failed() {
+        Err(ClosedFailure::out_of_memory(
+            DiagnosticStage::Evaluation,
+            role,
+        ))
+    } else {
+        result
+    }
 }
 
 fn drain_jobs(
@@ -3173,6 +3228,12 @@ fn drain_jobs(
     exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<(), ClosedFailure> {
     loop {
+        if runtime.allocation_failed() {
+            return Err(ClosedFailure::out_of_memory(
+                DiagnosticStage::JobDrain,
+                role,
+            ));
+        }
         if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Err(ClosedFailure::timeout(DiagnosticStage::JobDrain, role));
         }
@@ -3191,12 +3252,12 @@ fn drain_jobs(
             Ok(true) => *remaining_jobs -= 1,
             Ok(false) => return Ok(()),
             Err(exception) => {
-                let near_heap_limit = runtime_is_near_heap_limit(runtime);
+                let allocation_failed = runtime.allocation_failed();
                 return Err(exception.0.with(|ctx| {
                     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
                         let _ = ctx.catch();
                         ClosedFailure::timeout(DiagnosticStage::JobDrain, role)
-                    } else if near_heap_limit {
+                    } else if allocation_failed {
                         let _ = ctx.catch();
                         ClosedFailure::out_of_memory(DiagnosticStage::JobDrain, role)
                     } else {
@@ -3232,7 +3293,7 @@ fn settle_and_convert(
     role: ScriptRole,
     exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<StepOutcome, ClosedFailure> {
-    let near_heap_limit = runtime_is_near_heap_limit(runtime);
+    let allocation_failed = runtime.allocation_failed();
     context.with(|ctx| {
         let mut value = value.restore(&ctx).map_err(|error| {
             classify_ctx_error(
@@ -3261,7 +3322,7 @@ fn settle_and_convert(
                         })?,
                     PromiseState::Rejected => {
                         let rejected = promise.result::<Value>();
-                        if near_heap_limit {
+                        if allocation_failed {
                             if matches!(rejected, Some(Err(Error::Exception))) {
                                 let _ = ctx.catch();
                             }
@@ -3312,7 +3373,7 @@ fn settle_and_convert(
                     }
                     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
                         ClosedFailure::timeout(DiagnosticStage::ResultConversion, role)
-                    } else if near_heap_limit {
+                    } else if allocation_failed {
                         ClosedFailure::out_of_memory(DiagnosticStage::ResultConversion, role)
                     } else {
                         ClosedFailure::error(
@@ -3479,6 +3540,12 @@ fn classify_ctx_error(
     role: ScriptRole,
     exception_diagnostics: Option<&ExceptionDiagnostics<'_>>,
 ) -> ClosedFailure {
+    if super::memory::allocation_failed(ctx) {
+        if matches!(error, Error::Exception) {
+            let _ = ctx.catch();
+        }
+        return ClosedFailure::out_of_memory(stage, role);
+    }
     if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
         if matches!(error, Error::Exception) {
             let _ = ctx.catch();
@@ -3501,49 +3568,6 @@ fn classify_ctx_error(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn classify_evaluation_error(
-    context: &Context,
-    runtime: &Runtime,
-    error: Error,
-    deadline: Instant,
-    interrupted: &AtomicBool,
-    stage: DiagnosticStage,
-    role: ScriptRole,
-    exception_diagnostics: &ExceptionDiagnostics<'_>,
-) -> ClosedFailure {
-    let near_heap_limit = runtime_is_near_heap_limit(runtime);
-    context.with(|ctx| {
-        if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
-            if matches!(error, Error::Exception) {
-                let _ = ctx.catch();
-            }
-            return ClosedFailure::timeout(stage, role);
-        }
-        if matches!(error, Error::Allocation) || near_heap_limit {
-            return ClosedFailure::out_of_memory(stage, role);
-        }
-        if !matches!(error, Error::Exception) {
-            return ClosedFailure::error(JsErrorCode::Internal, stage, role);
-        }
-        let thrown = ctx.catch();
-        classify_thrown_exception(
-            &ctx,
-            thrown,
-            deadline,
-            interrupted,
-            stage,
-            role,
-            exception_diagnostics,
-        )
-    })
-}
-
-fn runtime_is_near_heap_limit(runtime: &Runtime) -> bool {
-    let usage = runtime.memory_usage();
-    usage.malloc_size >= (MEMORY_LIMIT.saturating_sub(1024 * 1024)) as i64
-}
-
 #[cfg(feature = "skills")]
 fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> VerificationResult {
     if request.cases.is_empty()
@@ -3564,7 +3588,6 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
         Ok(runtime) => runtime,
         Err(_) => return failed_skill_verification(&request, DiagnosticClass::Internal),
     };
-    runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + limits.timeout;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -3631,6 +3654,19 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
                 .limit_call_count(&mut transcript_calls_remaining);
         } else {
             transcript_calls_remaining -= result.transcript.call_count();
+        }
+        if runtime.allocation_failed()
+            && result
+                .diagnostic
+                .as_ref()
+                .is_none_or(|d| d.class != DiagnosticClass::ResourceLimit)
+        {
+            result.passed = false;
+            result.diagnostic = Some(diagnostic(
+                DiagnosticClass::ResourceLimit,
+                DiagnosticStage::Verification,
+                verification_case_role(&case.kind),
+            ));
         }
         if result.diagnostic.as_ref().is_some_and(|diagnostic| {
             diagnostic.class == DiagnosticClass::ResourceLimit
@@ -3792,7 +3828,7 @@ fn execute_isolated_skill_verification_case(
         Err(error) => {
             // Realm errors are deliberately closed, so preserve the worker-owned
             // interrupt flag before translating the loader's error category.
-            let class = if interrupted.load(Ordering::Relaxed) {
+            let class = if runtime.allocation_failed() || interrupted.load(Ordering::Relaxed) {
                 DiagnosticClass::ResourceLimit
             } else {
                 match error {
@@ -3825,6 +3861,16 @@ fn execute_isolated_skill_verification_case(
             };
         }
     };
+    if runtime.allocation_failed() {
+        return failed_case(
+            case.case_id.clone(),
+            diagnostic(
+                DiagnosticClass::ResourceLimit,
+                DiagnosticStage::Initialization,
+                ScriptRole::SkillSource,
+            ),
+        );
+    }
     let mut remaining_jobs = max_pending_jobs;
     let mut result = match &case.kind {
         VerificationCaseKind::Embedded | VerificationCaseKind::Inherited => {
@@ -4260,7 +4306,6 @@ fn execute_verification(request: VerifyArtifact, limits: ExecutionLimits) -> Ver
         Ok(runtime) => runtime,
         Err(_) => return failed_verification(&request, DiagnosticClass::Internal),
     };
-    runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + limits.timeout;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -4389,7 +4434,7 @@ fn ensure_source_settled(
     interrupted: &AtomicBool,
     exception_diagnostics: &ExceptionDiagnostics<'_>,
 ) -> Result<(), ClosedFailure> {
-    let near_heap_limit = runtime_is_near_heap_limit(runtime);
+    let allocation_failed = runtime.allocation_failed();
     context.with(|ctx| {
         let value = value.restore(&ctx).map_err(|error| {
             classify_ctx_error(
@@ -4416,7 +4461,7 @@ fn ensure_source_settled(
             },
             PromiseState::Rejected => {
                 let rejected = promise.result::<Value>();
-                if near_heap_limit {
+                if allocation_failed {
                     if matches!(rejected, Some(Err(Error::Exception))) {
                         let _ = ctx.catch();
                     }
@@ -4481,7 +4526,7 @@ fn execute_verification_case(
             role,
             exception_diagnostics,
         )?;
-        let near_heap_limit = runtime_is_near_heap_limit(runtime);
+        let allocation_failed = runtime.allocation_failed();
         context.with(|ctx| {
             let mut value = value.restore(&ctx).map_err(|error| {
                 classify_ctx_error(
@@ -4508,7 +4553,7 @@ fn execute_verification_case(
                         })?,
                     PromiseState::Rejected => {
                         let rejected = promise.result::<Value>();
-                        if near_heap_limit {
+                        if allocation_failed {
                             if matches!(rejected, Some(Err(Error::Exception))) {
                                 let _ = ctx.catch();
                             }

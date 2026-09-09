@@ -29,7 +29,7 @@ use super::skills::capability::{
 use super::skills::{
     HostCapability, SKILL_REALM_HARDENING_JS, SkillArtifact, private_skill_source,
 };
-use super::types::{MEMORY_LIMIT, STACK_LIMIT, STEP_TIMEOUT};
+use super::types::{STACK_LIMIT, STEP_TIMEOUT};
 use super::worker::STRICT_CLONE_SOURCE;
 
 type CallAuthorization =
@@ -142,8 +142,7 @@ initialize();
 static PRIVATE_SKILL_LIBRARY_BYTECODE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
 fn compile_private_skill_library_bytecode() -> rquickjs::Result<Vec<u8>> {
-    let runtime = Runtime::new()?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
+    let runtime = crate::extras::js::memory::Runtime::new()?;
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + STEP_TIMEOUT;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -354,8 +353,7 @@ fn realm_bootstrap_source() -> String {
 }
 
 fn compile_realm_bootstrap_bytecode() -> rquickjs::Result<Vec<u8>> {
-    let runtime = Runtime::new()?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
+    let runtime = crate::extras::js::memory::Runtime::new()?;
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + STEP_TIMEOUT;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -411,17 +409,18 @@ fn load_realm_bootstrap_functions(
         .map_err(|_| RealmError::Initialization)
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ModelSettlementRegistry {
     state: Mutex<ModelSettlementState>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ModelSettlementState {
     next_id: u64,
     pending: HashMap<u64, ModelSettlement>,
 }
 
+#[derive(Debug)]
 struct ModelSettlement {
     resolve: Persistent<Function<'static>>,
     reject: Persistent<Function<'static>>,
@@ -505,6 +504,7 @@ pub(crate) struct LoadedArtifact {
     #[cfg(test)]
     exports: Vec<String>,
     dispatcher_resources: Vec<Arc<Mutex<Option<DispatcherResources>>>>,
+    settlements: Option<Arc<ModelSettlementRegistry>>,
 }
 
 impl LoadedArtifact {
@@ -521,6 +521,17 @@ impl LoadedArtifact {
 
 impl Drop for LoadedArtifact {
     fn drop(&mut self) {
+        // Uncatchable interrupts can skip the JS wrapper's abandonSettlement call. Release
+        // Rust-held promise resolvers before their context/runtime dies; QuickJS cannot see
+        // those references when collecting the cycle through the host callbacks.
+        if let Some(settlements) = &self.settlements {
+            settlements
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pending
+                .clear();
+        }
         for resources in &self.dispatcher_resources {
             if let Ok(mut resources) = resources.lock() {
                 resources.take();
@@ -571,8 +582,8 @@ pub(crate) fn compile_artifact_bytecode(
         .verify_identity()
         .map_err(|_| RealmError::Identity)?;
     validate_export_names(artifact)?;
-    let runtime = Runtime::new().map_err(|_| RealmError::Initialization)?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
+    let runtime =
+        crate::extras::js::memory::Runtime::new().map_err(|_| RealmError::Initialization)?;
     runtime.set_max_stack_size(STACK_LIMIT);
     let deadline = Instant::now() + STEP_TIMEOUT;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
@@ -971,6 +982,7 @@ fn load_artifact_internal(
                         let dispatch = Function::new(
                             ctx.clone(),
                             move |ctx: Ctx<'_>, token: u64, method: String, arguments: String| {
+                                super::memory::ensure_healthy(&ctx)?;
                                 let operation = HostCapability::from_token(&method)
                                     .ok_or(rquickjs::Error::Unknown)?;
                                 dispatch_capabilities
@@ -1028,7 +1040,7 @@ fn load_artifact_internal(
         artifact,
         bridges,
         capabilities,
-        settlements,
+        settlements.clone(),
         bound_exports,
     )?;
     if runtime.is_job_pending() {
@@ -1045,6 +1057,7 @@ fn load_artifact_internal(
             .map(|export| export.name.clone())
             .collect(),
         dispatcher_resources,
+        settlements,
     })
 }
 
@@ -1221,9 +1234,13 @@ fn build_bound_dispatcher<'js>(
     let terminal = binding.on_terminal;
     let terminal_host = {
         let terminal = terminal.clone();
-        Function::new(ctx.clone(), move |invocation_id: String, success: bool| {
-            terminal(invocation_id, success).map_err(|_| rquickjs::Error::Unknown)
-        })?
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, invocation_id: String, success: bool| {
+                super::memory::ensure_healthy(&ctx)?;
+                terminal(invocation_id, success).map_err(|_| rquickjs::Error::Unknown)
+            },
+        )?
     };
     let terminal_host = Persistent::save(ctx, terminal_host);
     let resources = Arc::new(Mutex::new(Some(DispatcherResources {
@@ -1237,6 +1254,7 @@ fn build_bound_dispatcher<'js>(
         move |ctx: Ctx<'js>,
               Rest(arguments): Rest<Value<'js>>|
               -> rquickjs::Result<Persistent<Value<'static>>> {
+            super::memory::ensure_healthy(&ctx)?;
             // Each entry asks the parent for the next exact ordinal. The returned opaque handle
             // remains one-shot; only the export binding itself is reusable.
             let call_ordinal = next_call_ordinal
@@ -1264,7 +1282,9 @@ fn build_bound_dispatcher<'js>(
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    let _ = terminal(invocation_id, false);
+                    if !super::memory::allocation_failed(&ctx) {
+                        let _ = terminal(invocation_id, false);
+                    }
                     return Err(error);
                 }
             };
@@ -1374,7 +1394,7 @@ mod tests {
 
     #[test]
     fn a_brokered_effect_failure_reaches_skill_code_with_its_closed_code() {
-        let runtime = Runtime::new().expect("runtime");
+        let runtime = crate::extras::js::memory::Runtime::new().expect("runtime");
         let context = Context::full(&runtime).expect("context");
         context.with(|ctx| {
             for (error, expected) in [
@@ -1423,7 +1443,7 @@ mod tests {
     #[test]
     fn trusted_realm_bootstrap_bytecode_loads_repeatedly_without_shared_state() {
         for _ in 0..2 {
-            let runtime = Runtime::new().unwrap();
+            let runtime = crate::extras::js::memory::Runtime::new().unwrap();
             let context = Context::full(&runtime).unwrap();
             for _ in 0..2 {
                 let functions = load_realm_bootstrap_functions(&context).unwrap();
@@ -1442,7 +1462,7 @@ mod tests {
 
     #[test]
     fn invalid_identifier_is_rejected_before_source_generation() {
-        let runtime = Runtime::new().unwrap();
+        let runtime = crate::extras::js::memory::Runtime::new().unwrap();
         let model = Context::full(&runtime).unwrap();
         let artifact = SkillArtifact::new(
             "throw new Error('must not execute')".to_string(),
@@ -1481,7 +1501,7 @@ mod tests {
         assert!(!bytecode.is_empty());
 
         for _ in 0..2 {
-            let runtime = Runtime::new().unwrap();
+            let runtime = crate::extras::js::memory::Runtime::new().unwrap();
             let context = Context::full(&runtime).unwrap();
             context
                 .with(|ctx| {

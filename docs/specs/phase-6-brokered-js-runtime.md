@@ -86,6 +86,25 @@ themselves implicate production image publication.
 
 ## Worker lifecycle
 
+`src/extras/js/memory.rs` owns each worker runtime's bounded allocator. The 64 MiB
+budget includes allocation headers and alignment padding and applies from runtime
+construction. QuickJS's separate native memory-limit precheck remains unset: it can
+reject a request before invoking the allocator. The custom allocator enforces the
+bound and records every rejected or failed allocation in a sticky Rust-owned flag.
+Freeing memory, catching an exception, and switching contexts cannot clear it.
+
+The flag interrupts further JavaScript execution and is checked before model
+effects, skill authorization, and skill effects. A successful evaluation or case
+cannot erase an allocation failure; the worker reports a closed resource terminal
+and the supervisor retires that process. Allocator evidence replaces sampling heap
+usage after exception unwinding and never depends on exception text. Verifier
+errors display `ResourceLimit` for the shared heap/stack/deadline diagnostic; the
+admission reason remains `verification_resource_limit`. Verifier version 5 invalidates
+earlier reports that could have accepted a candidate continuing after caught OOM.
+The artifact owner also releases pending Rust-held promise callbacks during teardown;
+uncatchable interrupts may skip the wrapper's JavaScript cleanup, and those callbacks
+must not keep an opaque reference cycle alive when QuickJS frees the runtime.
+
 The parent lazily keeps at most one interactive worker process live at a time. It launches the
 current executable in an internal mode before Clap, Tokio, configuration, path discovery, logging,
 hooks, MCP, providers, credentials, or the TUI initialize. The parent creates the containment unit

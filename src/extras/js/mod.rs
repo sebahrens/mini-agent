@@ -1,6 +1,7 @@
 pub(crate) mod audit;
 pub(crate) mod broker;
 pub mod host;
+pub(crate) mod memory;
 pub(crate) mod protocol;
 #[cfg(feature = "skills")]
 pub(crate) mod realm;

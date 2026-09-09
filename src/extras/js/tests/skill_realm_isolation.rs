@@ -20,6 +20,61 @@ const MAX_CLONE_BYTES: usize = 1_024;
 const MAX_EXCEPTION_MESSAGE_BYTES: usize = 252;
 const MAX_EXCEPTION_STACK_BYTES: usize = 32;
 
+#[test]
+fn skill_effect_dispatch_rejects_caught_oom_before_the_next_interrupt() {
+    let runtime = crate::extras::js::memory::Runtime::new().unwrap();
+    runtime.set_max_stack_size(STACK_LIMIT);
+    let model = Context::full(&runtime).unwrap();
+    let manifest = test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).unwrap();
+    let skill = SkillArtifact::new(
+        "function read(cap, exhaust) { if (exhaust) { try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} } return cap.read_file('file'); }".into(),
+        "Caught private-realm allocation failure".into(),
+        vec![],
+        vec![SkillExport { name: "read".into(), signature: "(boolean)".into() }],
+        vec!["true".into()],
+        manifest.clone(),
+    ).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let capabilities = InvocationCapabilityRuntime::new(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(EffectResult::ReadFile {
+            content: "ok".into(),
+        })
+    });
+    load_artifact_with_capabilities(&runtime, &model, &skill, capabilities.clone()).unwrap();
+    for (ordinal, exhaust) in [(1, false), (2, true)] {
+        let handle = capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    invocation(&format!("oom-{ordinal}")),
+                    skill.id.clone(),
+                    "read".into(),
+                    manifest.clone(),
+                    [(HostCapability::ReadFile, grant(ordinal))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        model.with(|ctx| {
+            // No interrupt handler: exercise the effect boundary independently of polling.
+            let result: rquickjs::Result<Value> =
+                call_export_with_capability(&ctx, "read", &capabilities, handle, (exhaust,));
+            if exhaust {
+                assert!(result.is_err());
+                let _ = ctx.catch();
+            } else {
+                assert_eq!(
+                    result.unwrap().as_string().unwrap().to_string().unwrap(),
+                    "ok"
+                );
+            }
+        });
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(runtime.allocation_failed());
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum CloneError {
     Rejected,

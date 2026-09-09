@@ -20,7 +20,9 @@ use super::held_out::ExpectedJsValue;
 use super::{CapabilityManifest, SkillArtifact};
 
 /// Version of the verification algorithm. Bumping this invalidates existing reports.
-pub const VERIFIER_VERSION: u32 = 4;
+/// Version 5 rejects caught/unwound OOM using allocator evidence; prior success reports
+/// may have accepted a candidate that continued after allocation failure.
+pub const VERIFIER_VERSION: u32 = 5;
 
 /// Timeout for one whole worker verification request.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,15 +32,13 @@ pub enum TestResult {
     Passed,
     ReturnedFalse,
     Threw(String),
-    Timeout,
-    OutOfMemory,
+    ResourceLimit,
     JobLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationOutcome {
     Detected,
-    Undetected,
 }
 
 #[derive(Debug, Clone)]
@@ -66,10 +66,6 @@ pub enum VerificationError {
     InfrastructureUnavailable(String),
     #[error("skill source failed to evaluate: {0}")]
     SourceEvaluationFailed(SourceFailure),
-    #[error("declared export '{export}' not found in source")]
-    ExportNotFound { export: String },
-    #[error("declared export '{export}' exists but is not a function")]
-    ExportNotAFunction { export: String },
     #[error("test at index {index} failed: {outcome:?}")]
     TestFailed { index: usize, outcome: TestResult },
     #[error("mutation pass failed for export '{export}': {reason}")]
@@ -80,8 +76,6 @@ pub enum VerificationError {
     },
     #[error("held-out expected value mismatch")]
     HeldOutExpectedMismatch,
-    #[error("invalid held-out fake fixture: {0}")]
-    FakeFixtureInvalid(String),
 }
 
 /// A source-attributable verification failure together with the closed worker
@@ -161,7 +155,7 @@ impl VerificationError {
         match self {
             Self::TestFailed { outcome, .. } => matches!(
                 outcome,
-                TestResult::Timeout | TestResult::OutOfMemory | TestResult::JobLimitExceeded
+                TestResult::ResourceLimit | TestResult::JobLimitExceeded
             ),
             Self::SourceEvaluationFailed(failure) => failure.is_resource_limit(),
             Self::MutationPassFailed { diagnostic, .. } => diagnostic
@@ -464,10 +458,10 @@ pub(crate) fn test_result(
     if let Some(error) = worker_internal_failure(diagnostic) {
         return Err(error);
     }
-    Ok(if diagnostic.stage == DiagnosticStage::JobDrain {
+    Ok(if diagnostic.class == DiagnosticClass::ResourceLimit {
+        TestResult::ResourceLimit
+    } else if diagnostic.stage == DiagnosticStage::JobDrain {
         TestResult::JobLimitExceeded
-    } else if diagnostic.class == DiagnosticClass::ResourceLimit {
-        TestResult::Timeout
     } else if diagnostic.class == DiagnosticClass::Contract {
         TestResult::ReturnedFalse
     } else {

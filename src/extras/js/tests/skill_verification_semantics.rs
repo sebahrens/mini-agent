@@ -109,6 +109,10 @@ mod tests {
                 "(() => { const chunks = []; while (true) { chunks.push(new ArrayBuffer(1024 * 1024)); } })()",
             ),
             (
+                "caught_job_heap",
+                "Promise.resolve().then(() => { try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} return true; })",
+            ),
+            (
                 "stack",
                 "(() => { function recurse() { return recurse(); } return recurse(); })()",
             ),
@@ -768,6 +772,17 @@ mod fake_integrity_probes {
             result.is_ok(),
             "fakes must maintain virtual state across calls, got {result:?}"
         );
+    }
+
+    #[test]
+    fn allocation_failure_remains_terminal_after_fake_transcript_exhaustion() {
+        let skill = artifact(
+            "function f(cap) { for (let i=0; i<300; i++) { try { cap.write_file('virtual/a.txt', 'x'); } catch (_) {} } try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} return true; }",
+            vec!["f() === true"],
+            vec![HostCapability::WriteFile],
+        );
+        let error = verify_skill(&skill).expect_err("OOM cannot become a transcript-only failure");
+        assert!(error.is_resource_limit(), "{error:?}");
     }
 
     #[test]
