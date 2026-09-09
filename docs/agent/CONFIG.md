@@ -2023,6 +2023,12 @@ The call allowance belongs to each agent request. Parallel advisor calls and
 retries within that request share it; a new request gets a fresh allowance even
 when the app reuses its cached agent.
 
+Advisor model names use the same quick-model aliases at startup and in
+`/advisor model <name>`. An alias selects its configured provider and model;
+a bare model ID selects the current main provider. That selection remains bound
+to its provider when the main agent changes models, providers, or prompts.
+An invalid provider selection leaves the current advisor model unchanged.
+
 ### Human handoff mode
 
 When enabled, the agent's advisor calls are redirected to the

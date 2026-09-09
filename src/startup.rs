@@ -947,38 +947,32 @@ impl Startup {
             let max_uses = self.cli.resolve_advisor_max_uses(&self.cfg);
             let kilobytes_limit = self.cli.resolve_advisor_kilobytes_limit(&self.cfg);
 
-            let qm = config::quick_models_map(&self.cfg);
-            let (advisor_provider, advisor_model) =
-                if let Some(q) = qm.get(advisor_model_name.as_str()) {
-                    (q.provider.to_string(), q.model.to_string())
-                } else {
-                    (self.provider.to_string(), advisor_model_name)
-                };
-
-            let advisor_client = if advisor_provider == self.provider.as_str() {
-                Some(self.client.clone())
-            } else {
-                match crate::provider::create_client(
-                    &advisor_provider,
-                    self.cli.api_key.as_deref(),
-                    &self.cfg.custom_providers_map(),
-                    self.cfg.api_keys.as_ref(),
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not create advisor client for provider '{}' ({}); \
-                             advisor disabled. Set `advisor.model` and API key in config.",
-                            advisor_provider,
-                            e
-                        );
-                        None
-                    }
+            let (advisor_provider, advisor_model) = crate::extras::advisor::resolve_model(
+                &advisor_model_name,
+                &self.provider,
+                &self.cfg,
+            );
+            let advisor_client = match crate::extras::advisor::model_client(
+                &advisor_provider,
+                &self.provider,
+                &self.client,
+                &self.cfg,
+                self.cli.api_key.as_deref(),
+            ) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not create advisor client for provider '{}' ({}); advisor model unavailable. Set `advisor.model` and API key in config.",
+                        advisor_provider,
+                        error
+                    );
+                    None
                 }
             };
 
             let mut config = crate::extras::advisor::AdvisorToolConfig {
                 client: advisor_client,
+                advisor_provider,
                 advisor_model,
                 human_handoff,
                 max_uses,

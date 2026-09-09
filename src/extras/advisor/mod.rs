@@ -38,6 +38,7 @@ pub type HandoffReceiver = tokio::sync::mpsc::Receiver<HandoffRequest>;
 #[derive(Clone)]
 pub struct AdvisorToolConfig {
     pub client: Option<AnyClient>,
+    pub advisor_provider: String,
     pub advisor_model: String,
     pub human_handoff: bool,
     pub max_uses: Option<usize>,
@@ -47,6 +48,28 @@ pub struct AdvisorToolConfig {
 }
 
 impl AdvisorToolConfig {
+    pub(crate) fn refresh_client(&mut self, provider: &str, client: AnyClient) {
+        if provider == self.advisor_provider {
+            self.client = Some(client);
+        }
+    }
+
+    pub(crate) fn select_model(
+        &mut self,
+        name: &str,
+        main_provider: &str,
+        main_client: &AnyClient,
+        cfg: &crate::config::Config,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (provider, model) = resolve_model(name, main_provider, cfg);
+        let client = model_client(&provider, main_provider, main_client, cfg, api_key)?;
+        self.advisor_provider = provider;
+        self.advisor_model = model;
+        self.client = Some(client);
+        Ok(())
+    }
+
     /// Keep the interactive receiver available even when handoff starts disabled,
     /// so a later mode change can use the same UI-owned channel.
     pub(crate) fn prepare_handoff_channel(
@@ -61,6 +84,36 @@ impl AdvisorToolConfig {
             self.handoff_tx = None;
             None
         }
+    }
+}
+
+pub(crate) fn resolve_model(
+    name: &str,
+    main_provider: &str,
+    cfg: &crate::config::Config,
+) -> (String, String) {
+    match crate::config::quick_models_map(cfg).get(name) {
+        Some(model) => (model.provider.to_string(), model.model.to_string()),
+        None => (main_provider.to_owned(), name.to_owned()),
+    }
+}
+
+pub(crate) fn model_client(
+    provider: &str,
+    main_provider: &str,
+    main_client: &AnyClient,
+    cfg: &crate::config::Config,
+    api_key: Option<&str>,
+) -> anyhow::Result<AnyClient> {
+    if provider == main_provider {
+        Ok(main_client.clone())
+    } else {
+        crate::provider::create_client(
+            provider,
+            api_key,
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
     }
 }
 
@@ -91,10 +144,10 @@ where
     Ok(f(cfg))
 }
 
-pub fn update_client(client: AnyClient) {
+pub fn update_client(provider: &str, client: AnyClient) {
     let mut guard = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref mut cfg) = *guard {
-        cfg.client = Some(client);
+        cfg.refresh_client(provider, client);
     }
 }
 
@@ -389,6 +442,143 @@ where
 mod tests {
     use super::*;
 
+    fn routing_config() -> crate::config::Config {
+        toml::from_str(
+            r#"
+            [custom_providers.main_gateway]
+            provider_type = "openai"
+            base_url = "https://main.invalid/v1"
+            api_style = "completions"
+            [custom_providers.advisor_gateway]
+            provider_type = "openai"
+            base_url = "https://advisor.invalid/v1"
+            api_style = "completions"
+            [quick_models.consult]
+            provider = "advisor_gateway"
+            model = "advisor-model"
+            [quick_models.local]
+            provider = "main_gateway"
+            model = "local-model"
+            [quick_models.broken]
+            provider = "missing-provider"
+            model = "unavailable-model"
+        "#,
+        )
+        .unwrap()
+    }
+
+    fn routing_advisor() -> AdvisorToolConfig {
+        AdvisorToolConfig {
+            client: None,
+            advisor_provider: String::new(),
+            advisor_model: String::new(),
+            human_handoff: false,
+            max_uses: Some(3),
+            handoff_tx: None,
+            enabled: true,
+            kilobytes_limit: 256,
+        }
+    }
+
+    fn client_url(client: &AnyClient) -> &str {
+        match client {
+            AnyClient::OpenAI(crate::provider::OpenAiClient::Completions(client)) => {
+                client.base_url()
+            }
+            _ => panic!("expected an OpenAI completions gateway"),
+        }
+    }
+
+    #[test]
+    fn advisor_model_selection_resolves_routes_and_preserves_selection_on_error() {
+        let config = routing_config();
+        let main = crate::provider::create_client(
+            "main_gateway",
+            Some("test-key"),
+            &config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let mut advisor = routing_advisor();
+        for (name, provider, model, url) in [
+            (
+                "consult",
+                "advisor_gateway",
+                "advisor-model",
+                "https://advisor.invalid/v1",
+            ),
+            (
+                "bare-model",
+                "main_gateway",
+                "bare-model",
+                "https://main.invalid/v1",
+            ),
+            (
+                "local",
+                "main_gateway",
+                "local-model",
+                "https://main.invalid/v1",
+            ),
+        ] {
+            advisor
+                .select_model(name, "main_gateway", &main, &config, Some("test-key"))
+                .unwrap();
+            assert_eq!(advisor.advisor_provider, provider);
+            assert_eq!(advisor.advisor_model, model);
+            assert_eq!(client_url(advisor.client.as_ref().unwrap()), url);
+            assert!(
+                advisor
+                    .select_model("broken", "main_gateway", &main, &config, Some("test-key"))
+                    .is_err()
+            );
+            assert_eq!(advisor.advisor_provider, provider);
+            assert_eq!(advisor.advisor_model, model);
+            assert_eq!(client_url(advisor.client.as_ref().unwrap()), url);
+        }
+    }
+
+    #[test]
+    fn advisor_refresh_distinguishes_custom_providers_using_the_same_protocol() {
+        let mut config = routing_config();
+        let main = crate::provider::create_client(
+            "main_gateway",
+            Some("test-key"),
+            &config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let mut advisor = routing_advisor();
+        advisor
+            .select_model("consult", "main_gateway", &main, &config, Some("test-key"))
+            .unwrap();
+        advisor.refresh_client("main_gateway", main);
+        assert_eq!(
+            client_url(advisor.client.as_ref().unwrap()),
+            "https://advisor.invalid/v1"
+        );
+        config
+            .custom_providers
+            .as_mut()
+            .unwrap()
+            .get_mut("advisor_gateway")
+            .unwrap()
+            .base_url = "https://rotated.invalid/v1".into();
+        let refreshed = crate::provider::create_client(
+            "advisor_gateway",
+            Some("rotated-key"),
+            &config.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        advisor.refresh_client("advisor_gateway", refreshed);
+        assert_eq!(
+            client_url(advisor.client.as_ref().unwrap()),
+            "https://rotated.invalid/v1"
+        );
+        assert_eq!(advisor.advisor_provider, "advisor_gateway");
+        assert_eq!(advisor.advisor_model, "advisor-model");
+    }
+
     #[tokio::test]
     async fn cached_advisor_tool_has_a_fresh_allowance_for_each_request() {
         use crate::agent::runner::AgentWorkScope;
@@ -455,6 +645,7 @@ mod tests {
     async fn interactive_handoff_can_be_enabled_after_model_only_startup() {
         let initial = AdvisorToolConfig {
             client: None,
+            advisor_provider: "provider".into(),
             advisor_model: "model".into(),
             human_handoff: false,
             max_uses: Some(3),

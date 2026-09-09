@@ -77,6 +77,10 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         write_result(ctx.renderer, format!("  model: {}", current.advisor_model));
         write_result(
             ctx.renderer,
+            format!("  provider: {}", current.advisor_provider),
+        );
+        write_result(
+            ctx.renderer,
             format!(
                 "  max uses: {}",
                 current
@@ -143,10 +147,23 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         "model" => {
             if let Some(model) = parts.get(2) {
                 let mut cfg = current;
-                cfg.advisor_model = model.to_string();
+                if let Err(error) = cfg.select_model(
+                    model,
+                    &ctx.session.provider,
+                    ctx.client,
+                    ctx.cfg,
+                    ctx.cli.api_key.as_deref(),
+                ) {
+                    write_error(
+                        ctx.renderer,
+                        format!("cannot select advisor model: {error}"),
+                    );
+                    return Ok(());
+                }
+                let selected = format!("{}/{}", cfg.advisor_provider, cfg.advisor_model);
                 advisor::init_config(cfg);
                 ctx.rebuild_agent().await;
-                write_ok(ctx.renderer, format!("advisor model: {}", model));
+                write_ok(ctx.renderer, format!("advisor model: {selected}"));
             } else {
                 write_error(ctx.renderer, "usage: /advisor model <name>");
             }
