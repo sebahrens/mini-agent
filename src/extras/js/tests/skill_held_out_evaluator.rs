@@ -99,46 +99,113 @@ fn pure_suite_with_cases(first_case: usize, count: usize) -> HeldOutSuiteDraft {
 }
 
 #[test]
-fn skill_held_out_evaluator_refuses_a_corpus_above_the_matched_case_cap() {
-    let (root, paths) = paths();
-    let mut store = SkillStore::open_at(&paths).expect("store");
-    let admin = AdminIdentity::authenticated("reviewer").expect("admin");
-    let artifact = pure_artifact();
-
-    // Two matched suites of 40 cases each: 80 cases against a 64-case cap.
-    let first_id = pure_suite_with_cases(0, 40)
-        .import(&mut store, &admin, 10)
-        .expect("import the first suite");
-    let second_id = pure_suite_with_cases(40, 40)
-        .import(&mut store, &admin, 11)
-        .expect("import the second suite");
-    assert_ne!(
-        first_id, second_id,
-        "the fixture must import two distinct suites"
-    );
-
-    let selected = select_suites(&store, &artifact).expect("selection");
-    assert_eq!(selected.len(), 2);
-    let matched_cases = selected
-        .iter()
-        .map(|suite| suite.cases.len())
-        .sum::<usize>();
-    assert_eq!(matched_cases, 80);
-
-    match evaluate(&store, &artifact, None) {
-        Err(HeldOutError::InvalidSuite(detail)) => {
-            assert!(
-                detail.contains("64-case evaluation cap"),
-                "unexpected refusal detail: {detail}"
-            );
-        }
-        other => panic!(
-            "a corpus above the case cap must be refused instead of binding \
-             suite hashes for cases that never ran, got {other:?}"
+fn skill_held_out_evaluator_enforces_complete_corpus_limits_after_inheritance() {
+    for (name, candidate_suites, ancestor_suites, cases_per_suite, shared, refusal) in [
+        ("exact suite and case caps", 32, 0, 2, false, None),
+        (
+            "candidate suite overflow",
+            33,
+            0,
+            1,
+            false,
+            Some("32-suite"),
         ),
+        (
+            "inherited suite overflow",
+            17,
+            16,
+            1,
+            false,
+            Some("32-suite"),
+        ),
+        ("shared suites count once", 32, 32, 1, true, None),
+        ("case overflow", 2, 0, 40, false, Some("64-case")),
+    ] {
+        let (root, paths) = paths();
+        let mut store = SkillStore::open_at(&paths).expect("store");
+        let admin = AdminIdentity::authenticated("reviewer").expect("admin");
+        let base = pure_artifact();
+        let artifact_with_tag = |tag: &str| {
+            SkillArtifact::new(
+                base.source.clone(),
+                base.description.clone(),
+                vec!["normalize".to_string(), tag.to_string()],
+                base.exports.clone(),
+                base.tests.clone(),
+                CapabilityManifest::pure(),
+            )
+            .expect("artifact")
+        };
+        let candidate = artifact_with_tag("candidate");
+        let predecessor = artifact_with_tag("ancestor");
+        let mut imported = Vec::new();
+        for (tag, count) in [
+            ("candidate", candidate_suites),
+            ("ancestor", ancestor_suites),
+        ] {
+            if shared && tag == "ancestor" {
+                continue;
+            }
+            for _ in 0..count {
+                let mut suite =
+                    pure_suite_with_cases(imported.len() * cases_per_suite, cases_per_suite);
+                if !shared {
+                    suite.selector.tags.push(tag.to_string());
+                }
+                imported.push(suite.import(&mut store, &admin, 10).expect("import"));
+            }
+        }
+        assert_eq!(
+            select_suites(&store, &candidate).unwrap().len(),
+            candidate_suites,
+            "{name}"
+        );
+        assert_eq!(
+            select_suites(&store, &predecessor).unwrap().len(),
+            ancestor_suites,
+            "{name}"
+        );
+        let result = evaluate(
+            &store,
+            &candidate,
+            (ancestor_suites > 0).then_some(&predecessor),
+        );
+        match (refusal, result) {
+            (Some(limit), Err(HeldOutError::InvalidSuite(detail))) => {
+                assert!(
+                    detail.contains(&format!("{limit} evaluation cap")),
+                    "{name}: {detail}"
+                );
+            }
+            (None, Ok(report)) => {
+                imported.sort();
+                assert_eq!(
+                    report.suite_hashes, imported,
+                    "{name}: every suite must run exactly once"
+                );
+                assert_eq!(
+                    report.cases.len(),
+                    imported.len() * cases_per_suite,
+                    "{name}"
+                );
+                for suite_id in imported {
+                    let indices: Vec<_> = report
+                        .cases
+                        .iter()
+                        .filter(|case| case.suite_id == suite_id)
+                        .map(|case| {
+                            assert!(case.passed, "{name}");
+                            case.case_index
+                        })
+                        .collect();
+                    assert_eq!(indices, (0..cases_per_suite).collect::<Vec<_>>(), "{name}");
+                }
+            }
+            (expected, actual) => panic!("{name}: expected refusal {expected:?}, got {actual:?}"),
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

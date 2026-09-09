@@ -385,7 +385,14 @@ pub(crate) fn evaluate(
         }
     }
     suites.sort_by(|left, right| left.id.cmp(&right.id));
-    suites.truncate(MAX_MATCHED_SUITES);
+    // Apply the bound to the deduplicated candidate/lineage union. Sampling a
+    // prefix could omit required ancestor regressions while reporting success.
+    if suites.len() > MAX_MATCHED_SUITES {
+        return Err(HeldOutError::InvalidSuite(format!(
+            "matched held-out suites exceed the {MAX_MATCHED_SUITES}-suite evaluation cap: {} suites",
+            suites.len()
+        )));
+    }
     if suites.is_empty() {
         return Err(HeldOutError::SuiteRequired);
     }
