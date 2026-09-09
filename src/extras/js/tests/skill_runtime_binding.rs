@@ -176,7 +176,7 @@ async fn production_and_verifier_make_identical_loader_decisions_for_differentia
 }
 
 #[test]
-fn cancellation_and_worker_recycle_revoke_before_effect_dispatch() {
+fn worker_lifecycle_drop_revokes_active_prepared_and_bound_authority() {
     let manifest = crate::extras::js::skills::test_manifest(
         CapabilityTier::ReadOnly,
         vec![HostCapability::ReadFile],
@@ -187,60 +187,80 @@ fn cancellation_and_worker_recycle_revoke_before_effect_dispatch() {
     let capabilities = InvocationCapabilityRuntime::new(move |_| {
         captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(EffectResult::ReadFile {
-            content: "should-not-run".into(),
+            content: "allowed".into(),
         })
     });
     let skill_id = "a".repeat(64);
-    let grant = GrantId::new(uuid::Uuid::from_bytes([7; 16])).unwrap();
-    let first = InvocationId::new("cancelled-invocation").unwrap();
-    let cancelled_handle = capabilities
-        .prepare(
-            InvocationAuthorization::new(
-                first.clone(),
-                skill_id.clone(),
-                "run".into(),
-                manifest.clone(),
-                [(HostCapability::ReadFile, grant.clone())],
+    let prepare = |name: &str, byte: u8| {
+        capabilities
+            .prepare(
+                InvocationAuthorization::new(
+                    InvocationId::new(name).unwrap(),
+                    skill_id.clone(),
+                    "run".into(),
+                    manifest.clone(),
+                    [(
+                        HostCapability::ReadFile,
+                        GrantId::new(uuid::Uuid::from_bytes([byte; 16])).unwrap(),
+                    )],
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let cancelled_token = capabilities
-        .activate_for_test(cancelled_handle, &skill_id, "run", &manifest)
-        .unwrap();
+            .unwrap()
+    };
     let lifecycle = WorkerCapabilityLifecycle::new(capabilities.clone());
-    lifecycle.cancel(&first);
-    assert_eq!(capabilities.active_count(), 0);
-    assert!(matches!(
-        capabilities.dispatch(cancelled_token, HostCapability::ReadFile, r#"["secret"]"#),
-        Err(CapabilityError::Revoked)
-    ));
-
-    let recycled_handle = capabilities
-        .prepare(
-            InvocationAuthorization::new(
-                InvocationId::new("recycled-invocation").unwrap(),
-                skill_id.clone(),
-                "run".into(),
-                manifest.clone(),
-                [(
-                    HostCapability::ReadFile,
-                    GrantId::new(uuid::Uuid::from_bytes([9; 16])).unwrap(),
-                )],
-            )
+    let active_handle = prepare("active", 7);
+    let active_token = capabilities
+        .activate_for_test(active_handle, &skill_id, "run", &manifest)
+        .unwrap();
+    assert_eq!(
+        capabilities
+            .dispatch(active_token, HostCapability::ReadFile, r#"["before-drop"]"#)
             .unwrap(),
-        )
-        .unwrap();
-    let recycled_token = capabilities
-        .activate_for_test(recycled_handle, &skill_id, "run", &manifest)
-        .unwrap();
+        r#""allowed""#
+    );
+    let queued_handle = prepare("queued", 8);
+    let bound_handle = prepare("bound", 9);
+    let stale_binding = capabilities.bind(bound_handle).unwrap();
+
     drop(lifecycle);
     assert_eq!(capabilities.active_count(), 0);
     assert!(matches!(
-        capabilities.dispatch(recycled_token, HostCapability::ReadFile, r#"["secret"]"#),
+        capabilities.dispatch(active_token, HostCapability::ReadFile, r#"["after-drop"]"#),
         Err(CapabilityError::Revoked)
     ));
-    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(
+        capabilities.claim_bound(&skill_id, "run", &manifest),
+        Err(CapabilityError::InvalidInvocation)
+    ));
+    for handle in [queued_handle, bound_handle] {
+        assert!(matches!(
+            capabilities.bind(handle),
+            Err(CapabilityError::InvalidInvocation)
+        ));
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let _fresh_lifecycle = WorkerCapabilityLifecycle::new(capabilities.clone());
+    let fresh_handle = prepare("fresh", 10);
+    let _fresh_binding = capabilities.bind(fresh_handle).unwrap();
+    // An outstanding guard from the retired runtime must not clear a new binding.
+    drop(stale_binding);
+    let fresh_token = capabilities
+        .claim_bound(&skill_id, "run", &manifest)
+        .unwrap();
+    assert_ne!(fresh_token, active_token);
+    assert_eq!(
+        capabilities
+            .dispatch(fresh_token, HostCapability::ReadFile, r#"["fresh"]"#)
+            .unwrap(),
+        r#""allowed""#
+    );
+    assert!(matches!(
+        capabilities.dispatch(active_token, HostCapability::ReadFile, r#"["stale"]"#),
+        Err(CapabilityError::Revoked)
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
 #[test]

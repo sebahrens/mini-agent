@@ -205,6 +205,10 @@ zip-slip/symlink/reparse protections are defined in `platform-paths.md`. The imp
 without executing any resource. The experimental `allowed-tools` field is retained as metadata but
 does not grant permission or capability.
 
+Catalog generation belongs to the immutable index and the frozen turn. Search results retain
+immutable records without a duplicate generation field. The active-version switch regression
+checks that a retained selection still loads its original instructions after a new index is published.
+
 Discovery follows progressive disclosure:
 
 1. Parse, validate, and pre-embed only the name/description and bounded discovery metadata.

@@ -388,25 +388,6 @@ impl InvocationCapabilityRuntime {
         }
     }
 
-    pub(crate) fn cancel(&self, invocation_id: &InvocationId) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.bound_handle.is_some_and(|handle| {
-                state.prepared.iter().any(|candidate| {
-                    candidate.handle == handle
-                        && &candidate.authorization.invocation_id == invocation_id
-                })
-            }) {
-                state.bound_handle = None;
-            }
-            state
-                .prepared
-                .retain(|candidate| &candidate.authorization.invocation_id != invocation_id);
-            state
-                .active
-                .retain(|_, candidate| &candidate.authorization.invocation_id != invocation_id);
-        }
-    }
-
     pub(crate) fn recycle(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.prepared.clear();

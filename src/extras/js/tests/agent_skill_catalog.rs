@@ -53,7 +53,7 @@ fn write_skill(temp: &TempPaths, suffix: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn agent_skill_catalog_index_and_progressive_disclosure_are_generation_consistent() {
+async fn agent_skill_catalog_preserves_imported_metadata_and_progressive_disclosure() {
     let temp = TempPaths::new();
     let source = write_skill(&temp, "v1");
     let imported = import_agent_skill(&source, &temp.paths).unwrap();
@@ -73,7 +73,6 @@ async fn agent_skill_catalog_index_and_progressive_disclosure_are_generation_con
     };
     let selected = index.search(&query, &policy).unwrap();
     assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].generation, index.generation());
     assert_eq!(selected[0].record.digest, imported.identity.digest);
     assert_eq!(
         selected[0].record.allowed_tools.as_deref(),
@@ -116,23 +115,33 @@ fn agent_skill_catalog_active_digest_switch_is_atomic_and_deterministic() {
         score_floor: -1.0,
         ..AgentSkillSearchPolicy::default()
     };
-    assert_eq!(
-        first_index.search(&query, &policy).unwrap()[0]
-            .record
-            .digest,
-        first.identity.digest
-    );
+    let retained = first_index.search(&query, &policy).unwrap().remove(0);
+    assert_eq!(retained.record.digest, first.identity.digest);
+    let first_markdown = load_skill_markdown(&retained.record).unwrap();
+    assert!(first_markdown.contains("# Review safely"));
     catalog
         .activate("review-code", &second.identity.digest)
         .unwrap();
     let second_index = catalog.refresh(&embedder).unwrap();
     assert_eq!(first_index.generation(), 1);
     assert_eq!(second_index.generation(), 2);
+    let current = second_index.search(&query, &policy).unwrap().remove(0);
+    assert_eq!(current.record.digest, second.identity.digest);
+    assert!(
+        load_skill_markdown(&current.record)
+            .unwrap()
+            .contains("# V2")
+    );
     assert_eq!(
-        second_index.search(&query, &policy).unwrap()[0]
+        load_skill_markdown(&retained.record).unwrap(),
+        first_markdown
+    );
+    assert_eq!(
+        first_index.search(&query, &policy).unwrap()[0]
             .record
             .digest,
-        second.identity.digest
+        first.identity.digest,
+        "publishing a new catalog must not change a retained index"
     );
 }
 

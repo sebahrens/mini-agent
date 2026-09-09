@@ -68,7 +68,6 @@ impl Default for AgentSkillSearchPolicy {
 #[derive(Debug, Clone)]
 pub struct ScoredAgentSkill {
     pub record: Arc<AgentSkillRecord>,
-    pub generation: u64,
     pub score: f32,
     pub rank: usize,
 }
@@ -257,7 +256,6 @@ impl AgentSkillIndex {
             instruction_bytes = next_instructions;
             selected.push(ScoredAgentSkill {
                 record,
-                generation: self.generation,
                 score,
                 rank: selected.len() + 1,
             });

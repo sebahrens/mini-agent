@@ -1104,11 +1104,6 @@ impl WorkerCapabilityLifecycle {
     pub(crate) fn new(capabilities: InvocationCapabilityRuntime) -> Self {
         Self { capabilities }
     }
-
-    #[cfg(test)]
-    pub(crate) fn cancel(&self, invocation_id: &super::protocol::InvocationId) {
-        self.capabilities.cancel(invocation_id);
-    }
 }
 
 #[cfg(feature = "skills")]

@@ -173,7 +173,9 @@ successful reads, plus EOF and terminal-error behavior. A real-worker regression
 before its protocol handshake and verifies successful execution and shutdown.
 
 Dropping or cancelling an in-flight lease invalidates that worker connection, so the next independent request launches a
-new generation. One 30-second watchdog starts before lease acquisition and covers startup, IPC,
+new generation. Worker-local lifecycle teardown revokes active, queued, and bound invocation
+authority together; its regression exercises the production drop boundary and verifies that
+stale tokens and binding guards cannot affect a fresh lifecycle. One 30-second watchdog starts before lease acquisition and covers startup, IPC,
 execution, and pending parent effects. The synchronous platform launch runs outside the async
 lease task; cancellation or the watchdog can therefore win during launch, and any process returned
 afterward is killed and reaped without becoming a generation. One supervisor-owned launch lease
