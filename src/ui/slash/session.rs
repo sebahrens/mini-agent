@@ -178,7 +178,6 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     #[cfg(feature = "advisor")]
     {
         crate::extras::advisor::update_client(&ctx.session.provider, ctx.client.clone());
-        crate::extras::advisor::set_session_messages(ctx.session.messages.clone());
     }
     render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
     write_ok(

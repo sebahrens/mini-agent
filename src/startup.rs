@@ -12,9 +12,6 @@ use crate::provider::{self, AnyClient};
 use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
 use crate::session::{self, MessageRole, Session};
 
-#[cfg(feature = "advisor")]
-use crate::session::SessionMessage;
-
 // ── Helper functions ─────────────────────────────────────────────────────
 
 /// Regenerate embedded prompts/themes, printing the actual outcome instead
@@ -1512,18 +1509,6 @@ impl Startup {
             .await;
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
-            #[cfg(feature = "advisor")]
-            {
-                let mut msgs = self.session.messages.clone();
-                msgs.push(SessionMessage {
-                    role: MessageRole::User,
-                    content: CompactString::new(&msg),
-                    estimated_tokens: Session::estimate_tokens(&msg),
-                    tool_call_id: None,
-                    tool: None,
-                });
-                crate::extras::advisor::set_session_messages(msgs);
-            }
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_start();
             }

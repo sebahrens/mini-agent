@@ -637,6 +637,8 @@ pub(crate) struct AgentWorkScope {
     active_children: AtomicUsize,
     #[cfg(feature = "advisor")]
     advisor_uses: Arc<AtomicUsize>,
+    #[cfg(feature = "advisor")]
+    advisor_messages: std::sync::Mutex<Vec<crate::session::SessionMessage>>,
     cancellation: Notify,
     idle: Notify,
     #[cfg(test)]
@@ -650,6 +652,8 @@ impl AgentWorkScope {
             active_children: AtomicUsize::new(0),
             #[cfg(feature = "advisor")]
             advisor_uses: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "advisor")]
+            advisor_messages: std::sync::Mutex::new(Vec::new()),
             cancellation: Notify::new(),
             idle: Notify::new(),
             #[cfg(test)]
@@ -675,6 +679,8 @@ impl AgentWorkScope {
                 active_children: AtomicUsize::new(0),
                 #[cfg(feature = "advisor")]
                 advisor_uses: Arc::new(AtomicUsize::new(0)),
+                #[cfg(feature = "advisor")]
+                advisor_messages: std::sync::Mutex::new(Vec::new()),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
                 blocking_gate: Some(gate),
@@ -893,6 +899,21 @@ where
 pub(crate) fn current_advisor_usage() -> Option<Arc<AtomicUsize>> {
     AGENT_WORK_SCOPE
         .try_with(|scope| Arc::clone(&scope.advisor_uses))
+        .ok()
+}
+
+#[cfg(feature = "advisor")]
+pub(crate) fn with_advisor_messages<R>(
+    f: impl FnOnce(&mut Vec<crate::session::SessionMessage>) -> R,
+) -> Option<R> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| {
+            let mut messages = scope
+                .advisor_messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            f(&mut messages)
+        })
         .ok()
 }
 

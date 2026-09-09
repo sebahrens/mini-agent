@@ -118,7 +118,6 @@ pub(crate) fn model_client(
 }
 
 static CONFIG: Mutex<Option<AdvisorToolConfig>> = Mutex::new(None);
-static SESSION_MESSAGES: Mutex<Vec<SessionMessage>> = Mutex::new(Vec::new());
 
 #[derive(Debug, thiserror::Error)]
 #[error("advisor config not initialized")]
@@ -151,8 +150,126 @@ pub fn update_client(provider: &str, client: AnyClient) {
     }
 }
 
-pub fn set_session_messages(msgs: Vec<SessionMessage>) {
-    *SESSION_MESSAGES.lock().unwrap_or_else(|e| e.into_inner()) = msgs;
+fn current_messages() -> Vec<SessionMessage> {
+    crate::agent::runner::with_advisor_messages(|messages| messages.clone()).unwrap_or_default()
+}
+
+/// Observe the accepted run history and bounded tool outputs, after result-rewriting hooks.
+pub(crate) struct AdvisorContextHook;
+
+impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for AdvisorContextHook {
+    async fn on_event(
+        &self,
+        _ctx: &rig::agent::HookContext,
+        event: rig::agent::StepEvent<'_, M>,
+    ) -> rig::agent::Flow {
+        use rig::agent::StepEvent;
+        crate::agent::runner::with_advisor_messages(|messages| match event {
+            StepEvent::CompletionCall {
+                prompt, history, ..
+            } => {
+                // Replace rather than append: retries and continuations carry their own history.
+                messages.clear();
+                for message in history.iter().chain(std::iter::once(prompt)) {
+                    append_message(messages, message);
+                }
+            }
+            StepEvent::ModelTurnFinished { content, .. } => append_assistant(messages, content),
+            StepEvent::ToolResult { result, .. } => {
+                append_context(messages, MessageRole::ToolResult, result.to_owned());
+            }
+            _ => {}
+        });
+        rig::agent::Flow::cont()
+    }
+
+    fn observes(&self, kind: rig::agent::StepEventKind) -> bool {
+        use rig::agent::StepEventKind;
+        matches!(
+            kind,
+            StepEventKind::CompletionCall
+                | StepEventKind::ModelTurnFinished
+                | StepEventKind::ToolResult
+        )
+    }
+}
+
+fn append_context(messages: &mut Vec<SessionMessage>, role: MessageRole, content: String) {
+    messages.push(SessionMessage {
+        role,
+        content: content.into(),
+        estimated_tokens: 0,
+        tool_call_id: None,
+        tool: None,
+    });
+}
+
+fn append_message(messages: &mut Vec<SessionMessage>, message: &rig::completion::Message) {
+    use rig::completion::Message;
+    use rig::message::{ToolResultContent, UserContent};
+    match message {
+        Message::System { content } => {
+            append_context(messages, MessageRole::System, content.clone())
+        }
+        Message::Assistant { content, .. } => append_assistant(messages, content),
+        Message::User { content } => {
+            for item in content.iter() {
+                match item {
+                    UserContent::Text(text) => {
+                        append_context(messages, MessageRole::User, text.text.clone())
+                    }
+                    UserContent::ToolResult(result) => {
+                        for item in result.content.iter() {
+                            let text = match item {
+                                ToolResultContent::Text(text) => text.text.as_str(),
+                                ToolResultContent::Image(_) => "[image]",
+                            };
+                            append_context(messages, MessageRole::ToolResult, text.to_owned());
+                        }
+                    }
+                    UserContent::Image(_) => {
+                        append_context(messages, MessageRole::User, "[image]".into())
+                    }
+                    UserContent::Audio(_) => {
+                        append_context(messages, MessageRole::User, "[audio]".into())
+                    }
+                    UserContent::Video(_) => {
+                        append_context(messages, MessageRole::User, "[video]".into())
+                    }
+                    UserContent::Document(_) => {
+                        append_context(messages, MessageRole::User, "[document]".into())
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn append_assistant(
+    messages: &mut Vec<SessionMessage>,
+    content: &rig::OneOrMany<rig::message::AssistantContent>,
+) {
+    use rig::message::AssistantContent;
+    for item in content.iter() {
+        match item {
+            AssistantContent::Text(text) => {
+                append_context(messages, MessageRole::Assistant, text.text.clone())
+            }
+            AssistantContent::ToolCall(call) => append_context(
+                messages,
+                MessageRole::ToolCall,
+                format!(
+                    "{} {}: {}",
+                    call.id, call.function.name, call.function.arguments
+                ),
+            ),
+            AssistantContent::Image(_) => {
+                append_context(messages, MessageRole::Assistant, "[image]".into())
+            }
+            // Provider reasoning/signatures are not part of the advisor's plain-text transcript.
+            AssistantContent::Reasoning(_) => {}
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -276,11 +393,8 @@ conversation, so focus your question on the specific decision you need help with
             };
 
             let model = client.completion_model(cfg.advisor_model.clone());
-            let messages = SESSION_MESSAGES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            run_advisor_completion(model, &args.question, &messages)
+            let messages = current_messages();
+            run_advisor_completion(model, &args.question, &messages, cfg.kilobytes_limit)
                 .await
                 .map_err(|e| ToolError::Msg(format!("Advisor call failed: {e}")))
         }
@@ -291,8 +405,8 @@ async fn run_advisor_completion(
     model: AnyModel,
     question: &str,
     messages: &[SessionMessage],
+    kilobytes_limit: u32,
 ) -> anyhow::Result<String> {
-    let kilobytes_limit = with_config(|c| c.kilobytes_limit)?;
     let conversation = format_conversation(messages, kilobytes_limit);
     let prompt = format!(
         "## Conversation\n\n{}\n\n## Assistant's question\n\n{}",
@@ -441,6 +555,307 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct ContextProbe {
+        snapshots: Arc<Mutex<Vec<(String, String)>>>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    impl Tool for ContextProbe {
+        const NAME: &'static str = "context_probe";
+        type Error = ToolError;
+        type Args = AdvisorArgs;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Capture the advisor transcript".into()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]})
+        }
+
+        async fn call(&self, args: AdvisorArgs) -> Result<String, ToolError> {
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((args.question, format_conversation(&current_messages(), 256)));
+            Ok("context captured".into())
+        }
+    }
+
+    struct EvidenceTool;
+
+    impl Tool for EvidenceTool {
+        const NAME: &'static str = "evidence";
+        type Error = ToolError;
+        type Args = AdvisorArgs;
+        type Output = String;
+
+        fn description(&self) -> String {
+            "Produce evidence for the advisor".into()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]})
+        }
+
+        async fn call(&self, _: AdvisorArgs) -> Result<String, ToolError> {
+            Ok("raw output removed by result hook".into())
+        }
+    }
+
+    struct RewriteEvidence;
+
+    impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for RewriteEvidence {
+        async fn on_event(
+            &self,
+            _: &rig::agent::HookContext,
+            event: rig::agent::StepEvent<'_, M>,
+        ) -> rig::agent::Flow {
+            if let rig::agent::StepEvent::ToolResult {
+                tool_name: EvidenceTool::NAME,
+                ..
+            } = event
+            {
+                rig::agent::Flow::rewrite_result("bounded visible evidence")
+            } else {
+                rig::agent::Flow::cont()
+            }
+        }
+    }
+
+    #[test]
+    fn advisor_context_represents_media_without_copying_payloads_or_reasoning() {
+        use rig::OneOrMany;
+        use rig::completion::Message;
+        use rig::message::{
+            AssistantContent, Audio, Document, DocumentSourceKind, Image, Reasoning,
+            ToolResultContent, UserContent, Video,
+        };
+        let data = DocumentSourceKind::Base64("private-payload".into());
+        let image = Image {
+            data: data.clone(),
+            ..Default::default()
+        };
+        let history = [
+            Message::User {
+                content: OneOrMany::many([
+                    UserContent::Image(image.clone()),
+                    UserContent::Audio(Audio {
+                        data: data.clone(),
+                        ..Default::default()
+                    }),
+                    UserContent::Video(Video {
+                        data: data.clone(),
+                        ..Default::default()
+                    }),
+                    UserContent::Document(Document {
+                        data,
+                        ..Default::default()
+                    }),
+                ])
+                .unwrap(),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::many([
+                    AssistantContent::Image(image.clone()),
+                    AssistantContent::Reasoning(Reasoning::new_with_signature(
+                        "private reasoning",
+                        Some("private signature".into()),
+                    )),
+                ])
+                .unwrap(),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::tool_result(
+                    "media-result",
+                    OneOrMany::one(ToolResultContent::Image(image)),
+                )),
+            },
+        ];
+        let mut messages = Vec::new();
+        for message in history {
+            append_message(&mut messages, &message);
+        }
+        assert_eq!(
+            format_conversation(&messages, 256),
+            "[User]: [image]\n\n[User]: [audio]\n\n[User]: [video]\n\n[User]: [document]\n\n[Assistant]: [image]\n\n[ToolResult]: [image]"
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_context_tracks_live_results_and_refreshes_without_duplicates() {
+        use futures::StreamExt;
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("checking current evidence"),
+                MockStreamEvent::tool_call(
+                    "evidence-id",
+                    EvidenceTool::NAME,
+                    serde_json::json!({"question": "read"}),
+                ),
+                MockStreamEvent::tool_call(
+                    "probe-first",
+                    ContextProbe::NAME,
+                    serde_json::json!({"question": "first"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::tool_call(
+                    "probe-second",
+                    ContextProbe::NAME,
+                    serde_json::json!({"question": "second"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = rig::agent::AgentBuilder::new(model)
+            .tool(EvidenceTool)
+            .tool(ContextProbe {
+                snapshots: Arc::clone(&snapshots),
+                barrier: None,
+            })
+            .add_hook(RewriteEvidence)
+            .add_hook(AdvisorContextHook)
+            .build();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        scope
+            .run(async {
+                let mut stream = agent
+                    .stream_chat(
+                        "active user request",
+                        vec![
+                            rig::completion::Message::system("prior system context"),
+                            rig::completion::Message::user("prior user request"),
+                            rig::completion::Message::assistant("prior assistant response"),
+                        ],
+                    )
+                    .max_turns(4)
+                    .tool_concurrency(1)
+                    .await;
+                while let Some(item) = stream.next().await {
+                    item.unwrap();
+                }
+            })
+            .await;
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        for (label, transcript) in snapshots.iter() {
+            for required in [
+                "[System]: prior system context",
+                "[User]: prior user request",
+                "[Assistant]: prior assistant response",
+                "[User]: active user request",
+                "[Assistant]: checking current evidence",
+                "[ToolCall]: evidence-id evidence:",
+                "[ToolResult]: bounded visible evidence",
+            ] {
+                assert!(
+                    transcript.contains(required),
+                    "{label} is missing {required}: {transcript}"
+                );
+                assert_eq!(
+                    transcript.matches(required).count(),
+                    1,
+                    "duplicate {required}: {transcript}"
+                );
+            }
+            assert!(!transcript.contains("raw output removed"));
+        }
+        assert!(snapshots[1].1.contains("[ToolResult]: context captured"));
+    }
+
+    #[tokio::test]
+    async fn advisor_context_is_isolated_between_concurrent_requests() {
+        use futures::StreamExt;
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent};
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let run = |label: &'static str| {
+            let probe = ContextProbe {
+                snapshots: Arc::clone(&snapshots),
+                barrier: Some(Arc::clone(&barrier)),
+            };
+            async move {
+                let model = MockCompletionModel::from_stream_turns(vec![
+                    vec![
+                        MockStreamEvent::tool_call(
+                            "probe",
+                            ContextProbe::NAME,
+                            serde_json::json!({"question": label}),
+                        ),
+                        MockStreamEvent::final_response_with_default_usage(),
+                    ],
+                    vec![
+                        MockStreamEvent::text("done"),
+                        MockStreamEvent::final_response_with_default_usage(),
+                    ],
+                ]);
+                let agent = rig::agent::AgentBuilder::new(model)
+                    .tool(probe)
+                    .add_hook(AdvisorContextHook)
+                    .build();
+                crate::agent::runner::AgentWorkScope::new()
+                    .run(async {
+                        let mut stream = agent
+                            .stream_chat(label, Vec::<rig::completion::Message>::new())
+                            .max_turns(3)
+                            .await;
+                        while let Some(item) = stream.next().await {
+                            item.unwrap();
+                        }
+                    })
+                    .await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run("request-alpha"), run("request-beta"));
+        })
+        .await
+        .expect("both requests reach the probe");
+        {
+            let snapshots = snapshots.lock().unwrap();
+            assert_eq!(snapshots.len(), 2);
+            for (label, transcript) in snapshots.iter() {
+                assert!(transcript.contains(&format!("[User]: {label}")));
+                let other = if label == "request-alpha" {
+                    "request-beta"
+                } else {
+                    "request-alpha"
+                };
+                assert!(
+                    !transcript.contains(other),
+                    "request context leaked: {transcript}"
+                );
+            }
+        }
+        crate::agent::runner::AgentWorkScope::new()
+            .run(async {
+                assert!(
+                    current_messages().is_empty(),
+                    "a new request starts without previous context"
+                );
+            })
+            .await;
+        assert!(
+            current_messages().is_empty(),
+            "unscoped calls cannot read another request"
+        );
+    }
 
     fn routing_config() -> crate::config::Config {
         toml::from_str(

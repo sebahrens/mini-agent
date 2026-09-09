@@ -836,6 +836,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         tool_output_session_id,
         tool_result_spills,
     ));
+    #[cfg(feature = "advisor")]
+    if registered_tools.contains(&"advisor") {
+        builder = builder.add_hook(crate::extras::advisor::AdvisorContextHook);
+    }
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
     }

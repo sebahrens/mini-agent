@@ -2023,6 +2023,13 @@ The call allowance belongs to each agent request. Parallel advisor calls and
 retries within that request share it; a new request gets a fresh allowance even
 when the app reuses its cached agent.
 
+The advisor receives the active request's text history, including assistant
+messages and completed tool results from the current request. It sees the same
+bounded tool output as the main model. Concurrent requests keep separate
+transcripts; each model call refreshes its snapshot from the current history.
+Images, audio, video, and documents appear as placeholders, and provider
+reasoning blocks are excluded from this text transcript.
+
 Advisor model names use the same quick-model aliases at startup and in
 `/advisor model <name>`. An alias selects its configured provider and model;
 a bare model ID selects the current main provider. That selection remains bound

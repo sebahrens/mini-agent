@@ -642,8 +642,6 @@ pub(crate) async fn start_main_run(
         record_started_main_turn(pending_turn, run, ui);
     } else {
         mark_main_turn_started(ui.session, run, pending_turn);
-        #[cfg(feature = "advisor")]
-        crate::extras::advisor::set_session_messages(ui.session.messages.clone());
     }
 }
 
@@ -658,7 +656,7 @@ pub(crate) fn mark_main_turn_started(
 
 /// Records the common bookkeeping for a main turn only after its runner has
 /// started. Startup auto-triggers and editor-submitted turns must use the same
-/// path so rollback, advisor context, and chat history cannot drift apart.
+/// path so rollback and chat history cannot drift apart.
 pub(crate) fn record_started_main_turn(
     pending_turn: PendingMainTurn,
     run: &mut AgentRunState,
@@ -672,20 +670,13 @@ pub(crate) fn record_started_main_turn(
         .as_mut()
         .expect("main turn was just recorded")
         .record_started(ui.session.updated_at.clone());
-    #[cfg(feature = "advisor")]
-    crate::extras::advisor::set_session_messages(ui.session.messages.clone());
 }
 
 pub(crate) fn rollback_pending_main_turn(
     run: &mut AgentRunState,
     session: &mut Session,
 ) -> Option<String> {
-    let prompt = run.pending_turn.take().map(|turn| turn.rollback(session));
-    #[cfg(feature = "advisor")]
-    if prompt.is_some() {
-        crate::extras::advisor::set_session_messages(session.messages.clone());
-    }
-    prompt
+    run.pending_turn.take().map(|turn| turn.rollback(session))
 }
 
 pub(crate) fn pending_main_turn_has_progress(run: &AgentRunState, session: &Session) -> bool {

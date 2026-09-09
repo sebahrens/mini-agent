@@ -124,7 +124,6 @@ impl SlashCtx<'_> {
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
-            crate::extras::advisor::set_session_messages(self.session.messages.clone());
         }
         let new_agent = self
             .agent_build_ctx()
@@ -166,7 +165,6 @@ impl SlashCtx<'_> {
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
-            crate::extras::advisor::set_session_messages(self.session.messages.clone());
         }
         Ok(())
     }
@@ -185,7 +183,6 @@ impl SlashCtx<'_> {
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(provider, self.client.clone());
-            crate::extras::advisor::set_session_messages(self.session.messages.clone());
         }
         let new_agent = self
             .agent_build_ctx()
@@ -239,7 +236,6 @@ impl SlashCtx<'_> {
             #[cfg(feature = "advisor")]
             {
                 crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
-                crate::extras::advisor::set_session_messages(self.session.messages.clone());
             }
             let new_agent = self
                 .agent_build_ctx()
@@ -321,7 +317,6 @@ pub(crate) async fn apply_prompt_model(
     #[cfg(feature = "advisor")]
     {
         crate::extras::advisor::update_client(&ui.session.provider, ui.client.clone());
-        crate::extras::advisor::set_session_messages(ui.session.messages.clone());
     }
     *agent = Some(
         ui.agent_build_ctx()
