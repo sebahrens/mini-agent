@@ -217,7 +217,11 @@ as import, capped at the 48 KiB instruction limit and 16 MiB import resource lim
 Progressive loading retains its 1 MiB resource limit and bounds each read to the selected
 manifest size before checking its digest. Growth and replacement between metadata validation
 and opening are rejected; the catalog boundary regression accepts exact limits and omits a
-package one byte above either limit while retaining valid siblings.
+package one byte above either limit while retaining valid siblings. Catalog traversal also
+reuses the importer's limits of 16 path components, 4,096 entries (including empty directories
+and `SKILL.md`), and 128 MiB total content (including the already-read instructions). The
+remaining aggregate allowance caps every resource read; over-limit trees are omitted without
+hiding valid siblings. A separate traversal matrix checks exact and exceeded boundaries.
 
 Catalog generation belongs to the immutable index and the frozen turn. Search results retain
 immutable records without a duplicate generation field. The active-version switch regression

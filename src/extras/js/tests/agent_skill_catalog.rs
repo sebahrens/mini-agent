@@ -555,3 +555,89 @@ fn agent_skill_catalog_enforces_instruction_and_resource_read_limits() {
         assert_eq!(selected[0].record.digest, small.identity.digest);
     }
 }
+
+#[test]
+fn agent_skill_catalog_scan_limits_include_empty_directories_and_instruction_bytes() {
+    for limit in ["depth", "entries", "bytes"] {
+        let temp = TempPaths::new();
+        let source = write_skill(&temp, "v1");
+        let small = import_agent_skill(&source, &temp.paths).unwrap();
+        let digest = "e".repeat(64);
+        let root = temp
+            .paths
+            .data_dir
+            .join("agent-skills")
+            .join("bounded-code")
+            .join(&digest);
+        fs::create_dir_all(&root).unwrap();
+        let markdown = "---\nname: bounded-code\ndescription: review code\n---\n# Bounded\n";
+        fs::write(root.join("SKILL.md"), markdown).unwrap();
+        fs::write(root.parent().unwrap().join("ACTIVE"), format!("{digest}\n")).unwrap();
+        let overflow_path = match limit {
+            "depth" => {
+                let mut deepest = root.clone();
+                for _ in 0..16 {
+                    deepest.push("d");
+                    fs::create_dir(&deepest).unwrap();
+                }
+                deepest.join("one-too-deep")
+            }
+            "entries" => {
+                // SKILL.md is also an entry: 4095 empty directories reach the limit.
+                for entry in 0..4095 {
+                    fs::create_dir(root.join(format!("d-{entry}"))).unwrap();
+                }
+                root.join("one-too-many")
+            }
+            "bytes" => {
+                let chunk = 16 * 1024 * 1024;
+                for entry in 0..8 {
+                    let bytes = if entry == 7 {
+                        chunk - markdown.len() as u64
+                    } else {
+                        chunk
+                    };
+                    fs::File::create(root.join(format!("asset-{entry}")))
+                        .unwrap()
+                        .set_len(bytes)
+                        .unwrap();
+                }
+                root.join("asset-7")
+            }
+            _ => unreachable!(),
+        };
+        let embedder = Embedder::new().unwrap();
+        let mut catalog = AgentSkillCatalog::new(&temp.paths);
+        let policy = AgentSkillSearchPolicy::default();
+        let at_limit = catalog
+            .refresh(&embedder)
+            .unwrap()
+            .search_lexical("review", &policy)
+            .unwrap();
+        assert_eq!(
+            at_limit.len(),
+            2,
+            "{limit}: exact boundary must be accepted"
+        );
+        if limit == "bytes" {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&overflow_path)
+                .unwrap();
+            file.set_len(file.metadata().unwrap().len() + 1).unwrap();
+        } else {
+            fs::create_dir(&overflow_path).unwrap();
+        }
+        let over_limit = catalog
+            .refresh(&embedder)
+            .unwrap()
+            .search_lexical("review", &policy)
+            .unwrap();
+        assert_eq!(
+            over_limit.len(),
+            1,
+            "{limit}: over-limit package must be omitted"
+        );
+        assert_eq!(over_limit[0].record.digest, small.identity.digest);
+    }
+}

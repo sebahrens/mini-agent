@@ -17,7 +17,6 @@ use super::manifest::parse_skill_markdown;
 // be surfaced, so it is omitted from the generation rather than ranked first
 // and then dropped. Import refuses to install one above this bound.
 const MAX_SKILL_MD_BYTES: u64 = super::MAX_SKILL_INSTRUCTION_BYTES;
-const MAX_RESOURCES: usize = 4096;
 const MAX_ACTIVE_POINTER_BYTES: u64 = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +42,7 @@ pub enum CatalogError {
     Index(#[from] super::index::AgentSkillIndexError),
     #[error("installed Agent Skill catalog contains an invalid digest path")]
     InvalidDigest,
-    #[error("Agent Skill catalog exceeds its bounded resource count")]
+    #[error("Agent Skill catalog exceeds its tree depth, entry count, or content byte limit")]
     ResourceLimit,
     #[error("active Agent Skill digest does not exist: {0}")]
     MissingActiveDigest(String),
@@ -247,7 +246,7 @@ fn scan_record(
     if name_entry.file_name().to_string_lossy() != manifest.name {
         return Ok(None);
     }
-    let resources = resources(&digest_root)?;
+    let resources = resources(&digest_root, markdown.len() as u64)?;
     let mut tags = manifest
         .metadata
         .get("tags")
@@ -336,19 +335,26 @@ fn validate_digest(digest: &str) -> Result<(), CatalogError> {
     }
 }
 
-fn resources(root: &Path) -> Result<Vec<ResourceMetadata>, CatalogError> {
+fn resources(root: &Path, instruction_bytes: u64) -> Result<Vec<ResourceMetadata>, CatalogError> {
     fn visit(
         root: &Path,
         current: &Path,
+        depth: usize,
+        entries: &mut usize,
+        bytes_left: &mut u64,
         output: &mut BTreeMap<String, ResourceMetadata>,
     ) -> Result<(), CatalogError> {
         for entry in fs::read_dir(current)? {
             let entry = entry?;
+            *entries += 1;
+            if depth + 1 > super::import::MAX_DEPTH || *entries > super::import::MAX_ENTRIES {
+                return Err(CatalogError::ResourceLimit);
+            }
             let path = entry.path();
             portable::ensure_no_link_traversal(root, &path)?;
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
-                visit(root, &path, output)?;
+                visit(root, &path, depth + 1, entries, bytes_left, output)?;
             } else if metadata.is_file() {
                 let relative = path
                     .strip_prefix(root)
@@ -356,11 +362,15 @@ fn resources(root: &Path) -> Result<Vec<ResourceMetadata>, CatalogError> {
                     .to_string_lossy()
                     .replace('\\', "/");
                 if relative != "SKILL.md" {
+                    if metadata.len() > *bytes_left {
+                        return Err(CatalogError::ResourceLimit);
+                    }
                     let bytes = super::import::read_stable_file(
                         &path,
-                        super::import::MAX_FILE_BYTES,
+                        super::import::MAX_FILE_BYTES.min(*bytes_left),
                         false,
                     )?;
+                    *bytes_left -= bytes.len() as u64;
                     output.insert(
                         relative.clone(),
                         ResourceMetadata {
@@ -371,14 +381,16 @@ fn resources(root: &Path) -> Result<Vec<ResourceMetadata>, CatalogError> {
                     );
                 }
             }
-            if output.len() > MAX_RESOURCES {
-                return Err(CatalogError::ResourceLimit);
-            }
         }
         Ok(())
     }
+    // The instruction bytes were already read and hashed, but count toward the same tree limit.
+    let mut bytes_left = super::import::MAX_EXPANDED_BYTES
+        .checked_sub(instruction_bytes)
+        .ok_or(CatalogError::ResourceLimit)?;
+    let mut entries = 0;
     let mut output = BTreeMap::new();
-    visit(root, root, &mut output)?;
+    visit(root, root, 0, &mut entries, &mut bytes_left, &mut output)?;
     Ok(output.into_values().collect())
 }
 

@@ -15,10 +15,10 @@ use crate::extras::js::skills::store::SkillStore;
 
 const TREE_IDENTITY_VERSION: &[u8] = b"mini-agent-agent-skill-tree-v1";
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
+pub(super) const MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
 pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ENTRIES: usize = 4096;
-const MAX_DEPTH: usize = 16;
+pub(super) const MAX_ENTRIES: usize = 4096;
+pub(super) const MAX_DEPTH: usize = 16;
 const MAX_COMPRESSION_RATIO: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
