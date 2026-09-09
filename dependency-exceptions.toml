@@ -2,14 +2,7 @@
 # into .cargo/audit.toml or deny.toml. CI rejects missing, orphaned, malformed,
 # overlong, and expired entries.
 version = 1
-[[exceptions]]
-kind = "advisory"
-id = "RUSTSEC-2026-0187"
-crate = "lopdf@0.41.0"
-owner = "@sebahrens"
-rationale = "rig-core 0.42 splits the agent runtime into rig-agent and removes the generic Agent, public ToolDyn dispatch, and OneOrMany APIs used throughout mini-agent; complete that migration before enabling untrusted PDF ingestion."
-created = "2026-08-25"
-expires = "2026-11-23"
+exceptions = []
 
 # Example only:
 #

@@ -284,7 +284,9 @@ runner and do not prove identical ACL visibility on every Windows host.
 Everything else above, including ACP editor integration, ships in the default build. A few extras are compiled in
 only when you ask for them: lifecycle hooks (`--features hooks`), a
 second-model advisor (`--features advisor`), image/PDF message attachments
-(`--features multimodal,pdf`). See the root [README](https://github.com/sebahrens/mini-agent) for what each one
+(`--features multimodal`, or the equivalent `--features pdf` alias). PDF attachments
+are sent as raw document messages to a provider that supports them; mini-agent
+does not parse PDFs locally. See the root [README](https://github.com/sebahrens/mini-agent) for what each one
 does and how to enable it.
 
 # Conclusions

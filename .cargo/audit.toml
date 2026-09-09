@@ -3,7 +3,7 @@
 # score remain reportable and are handled by the deny policy below.
 severity_threshold = "medium"
 informational_warnings = ["unmaintained", "unsound", "notice"]
-ignore = ["RUSTSEC-2026-0187"]
+ignore = []
 
 [database]
 fetch = true

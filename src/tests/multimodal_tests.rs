@@ -59,22 +59,6 @@ fn load_attachment_unknown_media_type() {
 }
 
 #[test]
-fn load_attachment_success_for_small_media() {
-    use std::io::Write;
-    let dir = std::env::temp_dir();
-    let path = dir.join("zerostack_test_media.png");
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(b"\x89PNG\r\n\x1a\npayload").unwrap();
-    drop(f);
-    let result = load_attachment(&path);
-    let _ = std::fs::remove_file(&path);
-    assert!(result.is_ok(), "expected Ok, got {result:?}");
-    let att = result.unwrap();
-    assert_eq!(att.size(), 15);
-    assert_eq!(att.path().to_string_lossy(), path.to_string_lossy());
-}
-
-#[test]
 fn load_attachment_rejects_extension_signature_mismatch() {
     let path = std::env::temp_dir().join(format!(
         "mini-agent-media-mismatch-{}.png",
@@ -87,61 +71,76 @@ fn load_attachment_rejects_extension_signature_mismatch() {
     assert!(error.to_string().contains("does not match"));
 }
 
-// --- MediaAttachment size and path ---
-
-#[test]
-fn media_attachment_size_matches_data_len() {
-    let att = MediaAttachment::Image {
-        path: Path::new("test.png").to_path_buf(),
-        data: vec![0u8; 42],
-        mime: "image/png".into(),
-    };
-    assert_eq!(att.size(), 42);
-}
-
-#[test]
-fn media_attachment_path_returns_stored_path() {
-    let att = MediaAttachment::Audio {
-        path: Path::new("/tmp/sound.wav").to_path_buf(),
-        data: vec![0u8; 10],
-        mime: "audio/wav".into(),
-    };
-    assert_eq!(att.path(), Path::new("/tmp/sound.wav"));
-}
-
 // --- media_to_messages tests ---
 
-#[cfg(feature = "multimodal")]
 #[test]
-fn media_to_messages_produces_user_messages() {
+fn loaded_attachments_preserve_order_types_and_bytes_in_messages() {
     use crate::agent::runner::media_to_messages;
     use rig::completion::Message;
+    use rig::message::{
+        Audio, AudioMediaType, Document, DocumentMediaType, DocumentSourceKind, Image,
+        ImageMediaType, UserContent,
+    };
 
-    let media = vec![
-        MediaAttachment::Image {
-            path: Path::new("photo.png").to_path_buf(),
-            data: vec![1, 2, 3],
-            mime: "image/png".into(),
-        },
-        MediaAttachment::Document {
-            path: Path::new("doc.pdf").to_path_buf(),
-            data: vec![4, 5, 6],
-            mime: "application/pdf".into(),
-        },
+    let fixtures: [(&str, &[u8]); 3] = [
+        ("png", b"\x89PNG\r\n\x1a\npayload"),
+        ("wav", b"RIFF\x04\x00\x00\x00WAVE"),
+        (
+            "pdf",
+            b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+        ),
     ];
+    let media: Vec<_> = fixtures
+        .iter()
+        .map(|(extension, bytes)| {
+            let path = std::env::temp_dir().join(format!(
+                "mini-agent-media-{}.{}",
+                uuid::Uuid::new_v4(),
+                extension
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            let result = load_attachment(&path);
+            std::fs::remove_file(&path).unwrap();
+            let attachment = result.unwrap();
+            assert_eq!(attachment.path(), path);
+            assert_eq!(attachment.size(), bytes.len());
+            attachment
+        })
+        .collect();
+    assert!(matches!(media[0], MediaAttachment::Image { .. }));
+    assert!(matches!(media[1], MediaAttachment::Audio { .. }));
+    assert!(matches!(media[2], MediaAttachment::Document { .. }));
 
+    let expected = [
+        UserContent::Image(Image {
+            data: DocumentSourceKind::Raw(fixtures[0].1.to_vec()),
+            media_type: Some(ImageMediaType::PNG),
+            ..Default::default()
+        }),
+        UserContent::Audio(Audio {
+            data: DocumentSourceKind::Raw(fixtures[1].1.to_vec()),
+            media_type: Some(AudioMediaType::WAV),
+            ..Default::default()
+        }),
+        UserContent::Document(Document {
+            data: DocumentSourceKind::Raw(fixtures[2].1.to_vec()),
+            media_type: Some(DocumentMediaType::PDF),
+            ..Default::default()
+        }),
+    ];
     let messages = media_to_messages(&media);
-    assert_eq!(messages.len(), 2);
-
-    for msg in &messages {
-        assert!(
-            matches!(msg, Message::User { .. }),
-            "expected User message, got {msg:?}"
+    assert_eq!(messages.len(), expected.len());
+    for (message, expected_content) in messages.into_iter().zip(expected) {
+        let Message::User { content } = message else {
+            panic!("expected User message, got {message:?}");
+        };
+        assert_eq!(
+            content.into_iter().collect::<Vec<_>>(),
+            vec![expected_content]
         );
     }
 }
 
-#[cfg(feature = "multimodal")]
 #[test]
 fn media_to_messages_empty_vec_returns_empty() {
     use crate::agent::runner::media_to_messages;

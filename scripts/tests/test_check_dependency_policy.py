@@ -24,7 +24,7 @@ class DependencyPolicyTests(unittest.TestCase):
     def test_repository_policy_is_valid_after_previous_exception_deadline(self) -> None:
         policy.validate_policy(
             REPOSITORY_ROOT,
-            today=dt.date(2026, 8, 31),
+            today=dt.date(2026, 11, 24),
         )
 
     def test_fake_denied_license_fails(self) -> None:
