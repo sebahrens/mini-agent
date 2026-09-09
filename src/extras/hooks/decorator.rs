@@ -22,6 +22,21 @@ pub(crate) struct HookedTool {
     ask_tx: Option<AskSender>,
 }
 
+/// Owns only this invocation's grant, including while its future is suspended.
+struct HookPermissionGuard<'a> {
+    permission: &'a PermCheck,
+    token: u64,
+}
+
+impl Drop for HookPermissionGuard<'_> {
+    fn drop(&mut self) {
+        self.permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear_hook_one_shot(self.token);
+    }
+}
+
 impl HookedTool {
     fn build_ctx(&self) -> HookCtx {
         let (session_id, session_path) = session_context();
@@ -80,6 +95,21 @@ impl ToolDyn for HookedTool {
                 .dispatch_pre_tool_use(&ctx, &tool_name, tool_input.clone())
                 .await;
 
+            // A PreToolUse hook may rewrite the arguments the inner tool
+            // actually runs with. Multiple rewrites are folded upstream in
+            // declared order; this applies the folded result.
+            let call_args = match &pre.updated_input {
+                Some(rewritten) => serde_json::to_string(rewritten).unwrap_or(args),
+                None => args,
+            };
+            // Post hooks audit the operation that actually ran, so they receive
+            // the effective arguments after any pre-hook rewrite rather than
+            // the arguments the model originally proposed.
+            let executed_input: serde_json::Value = match &pre.updated_input {
+                Some(rewritten) => rewritten.clone(),
+                None => tool_input,
+            };
+
             let permission_token =
                 HOOK_PERMISSION_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut scoped_permission = false;
@@ -90,7 +120,7 @@ impl ToolDyn for HookedTool {
                     if let Some(perm) = &self.permission {
                         perm.lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .record_blocked(&tool_name, &args);
+                            .record_blocked(&tool_name, &call_args);
                     }
                     return Err(ToolError::ToolCallError(Box::new(LocalToolError::Msg(
                         format!("Blocked by guard rail: {reason}"),
@@ -108,14 +138,14 @@ impl ToolDyn for HookedTool {
                             &self.permission,
                             &self.ask_tx,
                             &tool_name,
-                            &args,
+                            &call_args,
                         )
                         .await
                         {
                             if let Some(perm) = &self.permission {
                                 perm.lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .record_blocked(&tool_name, &args);
+                                    .record_blocked(&tool_name, &call_args);
                             }
                             return Err(ToolError::ToolCallError(Box::new(error)));
                         }
@@ -144,21 +174,14 @@ impl ToolDyn for HookedTool {
                 Verdict::Defer => {}
             }
 
-            // A PreToolUse hook may rewrite the arguments the inner tool
-            // actually runs with. Multiple rewrites are folded upstream in
-            // declared order; this applies the folded result.
-            let call_args = match &pre.updated_input {
-                Some(rewritten) => serde_json::to_string(rewritten).unwrap_or(args),
-                None => args,
-            };
-            // Post hooks audit the operation that actually ran, so they receive
-            // the effective arguments after any pre-hook rewrite rather than
-            // the arguments the model originally proposed.
-            let executed_input: serde_json::Value = match &pre.updated_input {
-                Some(rewritten) => rewritten.clone(),
-                None => tool_input,
-            };
-
+            let permission_guard =
+                self.permission
+                    .as_ref()
+                    .filter(|_| scoped_permission)
+                    .map(|permission| HookPermissionGuard {
+                        permission,
+                        token: permission_token,
+                    });
             let result = if scoped_permission {
                 crate::permission::checker::scope_hook_permission(
                     permission_token,
@@ -168,11 +191,7 @@ impl ToolDyn for HookedTool {
             } else {
                 self.inner.call(call_args).await
             };
-            if scoped_permission && let Some(perm) = &self.permission {
-                perm.lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clear_hook_one_shot(permission_token);
-            }
+            drop(permission_guard);
 
             match &result {
                 Ok(response) => {

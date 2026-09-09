@@ -263,27 +263,7 @@ fn record_blocked_feeds_doom_loop_detection() {
 
 #[cfg(feature = "hooks")]
 #[test]
-fn force_ask_once_forces_ask_for_the_next_call_regardless_of_mode() {
-    // Yolo would otherwise allow bash unconditionally.
-    let mut checker = make_checker(SecurityMode::Yolo);
-    checker.force_ask_once("bash".to_string());
-    let result = checker.check("bash", "ls -la");
-    assert!(matches!(result, CheckResult::Ask));
-}
-
-#[cfg(feature = "hooks")]
-#[test]
-fn force_ask_once_is_consumed_after_one_call() {
-    let mut checker = make_checker(SecurityMode::Yolo);
-    checker.force_ask_once("bash".to_string());
-    let _ = checker.check("bash", "ls -la");
-    let result = checker.check("bash", "ls -la");
-    assert!(matches!(result, CheckResult::Allowed));
-}
-
-#[cfg(feature = "hooks")]
-#[test]
-fn force_ask_once_never_overrides_a_deny_rule() {
+fn hook_approval_never_overrides_a_deny_rule() {
     let config = PermissionConfig {
         bash: Some(ToolPerm::Granular({
             let mut m = std::collections::HashMap::new();
@@ -299,8 +279,7 @@ fn force_ask_once_never_overrides_a_deny_rule() {
         default_modes(),
     )
     .expect("valid permission test configuration");
-    checker.force_ask_once("bash".to_string());
-    let result = checker.check("bash", "rm -rf important");
+    let result = checker.hook_ask_decision("bash", "rm -rf important");
     assert!(matches!(result, CheckResult::Denied(_)));
 }
 
@@ -2331,17 +2310,19 @@ fn set_prompt_mode_never_raises_above_user_mode() {
 async fn two_in_flight_hook_decisions_do_not_overwrite_each_other() {
     use crate::permission::checker::scope_hook_permission;
 
-    let checker = std::sync::Arc::new(std::sync::Mutex::new(make_checker(SecurityMode::Yolo)));
+    let checker = std::sync::Arc::new(std::sync::Mutex::new(make_checker(
+        SecurityMode::Restrictive,
+    )));
     // Two concurrent wrapped calls each record their own verdict before either
     // reaches its permission check.
     checker
         .lock()
         .unwrap()
-        .force_ask_once_scoped("bash".to_string(), 11);
+        .allow_once_scoped("bash".to_string(), 11);
     checker
         .lock()
         .unwrap()
-        .force_ask_once_scoped("bash".to_string(), 12);
+        .allow_once_scoped("bash".to_string(), 12);
 
     let first =
         scope_hook_permission(11, async { checker.lock().unwrap().check("bash", "first") }).await;
@@ -2350,8 +2331,8 @@ async fn two_in_flight_hook_decisions_do_not_overwrite_each_other() {
     })
     .await;
 
-    assert!(matches!(first, CheckResult::Ask), "{first:?}");
-    assert!(matches!(second, CheckResult::Ask), "{second:?}");
+    assert!(matches!(first, CheckResult::Allowed), "{first:?}");
+    assert!(matches!(second, CheckResult::Allowed), "{second:?}");
 }
 
 #[cfg(feature = "hooks")]

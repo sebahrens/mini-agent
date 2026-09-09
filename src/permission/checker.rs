@@ -120,16 +120,6 @@ pub struct PermissionChecker {
 struct HookOneShot {
     /// The public tool name the verdict was issued for; kept for diagnostics.
     tool: String,
-    outcome: HookOneShotOutcome,
-}
-
-#[cfg(feature = "hooks")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HookOneShotOutcome {
-    /// The inner check must prompt regardless of mode.
-    Ask,
-    /// The inner check must not prompt again for this invocation.
-    Allow,
 }
 
 impl PermissionChecker {
@@ -363,37 +353,12 @@ impl PermissionChecker {
         Ok(checker)
     }
 
-    /// Forces the next `check`/`check_path` call for `tool` to `Ask`,
-    /// regardless of permission mode. Consumed after that one call. Set by a
-    /// hook `ask` verdict; never overrides a deny rule (checked first).
-    #[cfg(feature = "hooks")]
-    pub fn force_ask_once_scoped(&mut self, tool: String, token: u64) {
-        self.hook_decisions.insert(
-            token,
-            HookOneShot {
-                tool,
-                outcome: HookOneShotOutcome::Ask,
-            },
-        );
-    }
-
-    #[cfg(all(feature = "hooks", test))]
-    pub fn force_ask_once(&mut self, tool: String) {
-        self.force_ask_once_scoped(tool, u64::MAX);
-    }
-
     /// Suppresses the interactive prompt for the next `check`/`check_path`
     /// call for `tool`. Consumed after that one call. Set by a hook `allow`
-    /// verdict; never overrides a deny rule (checked first).
+    /// verdict or explicit approval of a hook `ask`; never overrides a deny rule.
     #[cfg(feature = "hooks")]
     pub fn allow_once_scoped(&mut self, tool: String, token: u64) {
-        self.hook_decisions.insert(
-            token,
-            HookOneShot {
-                tool,
-                outcome: HookOneShotOutcome::Allow,
-            },
-        );
+        self.hook_decisions.insert(token, HookOneShot { tool });
     }
 
     #[cfg(all(feature = "hooks", test))]
@@ -414,6 +379,11 @@ impl PermissionChecker {
     #[cfg(all(feature = "hooks", test))]
     pub(crate) fn hook_decision_is_pending(&self, token: u64) -> bool {
         self.hook_decisions.contains_key(&token)
+    }
+
+    #[cfg(all(feature = "hooks", test))]
+    pub(crate) fn hook_decision_count(&self) -> usize {
+        self.hook_decisions.len()
     }
 
     /// Evaluate deny rules for a hook-driven approval without granting
@@ -603,9 +573,8 @@ impl PermissionChecker {
         }
     }
 
-    /// Consumes a hook-set one-shot forced-ask/allow entry for `tool`, if
-    /// pending. Called after the deny-rule check in `check`/`check_path` so
-    /// neither can ever bypass a deny.
+    /// Consumes a pending one-shot hook approval for `tool`. Called after
+    /// the deny-rule check in `check`/`check_path` so it cannot bypass a deny.
     #[cfg(feature = "hooks")]
     fn take_pending_one_shot(&mut self, tool: &str) -> Option<CheckResult> {
         let token = HOOK_PERMISSION_TOKEN
@@ -621,10 +590,7 @@ impl PermissionChecker {
             decision.tool,
             tool
         );
-        Some(match decision.outcome {
-            HookOneShotOutcome::Ask => CheckResult::Ask,
-            HookOneShotOutcome::Allow => CheckResult::Allowed,
-        })
+        Some(CheckResult::Allowed)
     }
 
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {

@@ -704,7 +704,10 @@ permission mode, and escalates to deny in non-interactive contexts (`-p`,
 `--loop`) where no confirmation is possible. `allow` suppresses the
 interactive prompt for that one call only — it can never override a deny
 from a rule, security mode, managed policy, or another hook. `PreToolUse` may
-also set `"updatedInput"` to rewrite the tool's arguments before it runs, and
+also set `"updatedInput"` to rewrite the tool's arguments before it runs.
+When a hook requests approval, the confirmation shows those effective
+arguments. Approval applies to that invocation only; any unused grant is
+removed on completion, failure, or cancellation.
 `PostToolUse` may set `"redactions"` to an array of exact, non-empty strings.
 Every occurrence is replaced with the fixed marker `[REDACTED]`. Hook-authored
 `"result"` replacements are ignored so a hook cannot substitute arbitrary

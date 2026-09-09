@@ -31,7 +31,7 @@ impl ToolDyn for EchoTool {
 }
 
 /// Mirrors how real tools gate themselves: calls `check_perm` with the same
-/// shared `PermCheck`, so `force_ask_once`/`allow_once` routing can be
+/// shared `PermCheck`, so per-invocation approval routing can be
 /// exercised end to end through `HookedTool::call`.
 struct PermCheckingTool {
     permission: Option<crate::permission::checker::PermCheck>,
@@ -179,9 +179,7 @@ fn permission() -> Option<crate::permission::checker::PermCheck> {
     )))
 }
 
-/// Restrictive mode asks for everything by default, so ask/allow one-shot
-/// routing has an observable effect to test against (Standard would allow
-/// bash unconditionally, masking the difference).
+/// Restrictive mode makes an unused or missing one-shot approval observable.
 fn permission_restrictive() -> Option<crate::permission::checker::PermCheck> {
     Some(Arc::new(std::sync::Mutex::new(
         PermissionChecker::new(
@@ -276,6 +274,59 @@ async fn pre_tool_use_updated_input_is_applied_before_the_inner_call() {
 }
 
 #[tokio::test]
+async fn hook_approval_describes_the_rewritten_call_and_runs_only_when_approved() {
+    use crate::permission::ask::UserDecision;
+
+    for mode in [SecurityMode::Yolo, SecurityMode::Restrictive] {
+        for approve in [true, false] {
+            let dispatcher = dispatcher_with(
+                "PreToolUse",
+                vec![handler(
+                    r#"echo '{"permissionDecision":"ask","updatedInput":{"command":"echo rewritten"}}'"#,
+                )],
+            );
+            let perm = permission().unwrap();
+            perm.lock().unwrap().set_mode(mode);
+            let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+            let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(JsonCommandPermCheckingTool {
+                permission: Some(perm.clone()),
+            })];
+            let wrapped = wrap_all(tools, dispatcher, Some(perm), Some(ask_tx));
+            let mut call = wrapped[0].call(r#"{"command":"echo original"}"#.into());
+            let request = tokio::select! {
+                request = ask_rx.recv() => request.expect("approval channel closed"),
+                result = &mut call => panic!("call completed before approval: {result:?}"),
+            };
+            assert_eq!(request.tool, "bash");
+            assert_eq!(request.input, r#"{"command":"echo rewritten"}"#);
+            request
+                .reply
+                .send(if approve {
+                    UserDecision::AllowOnce
+                } else {
+                    UserDecision::Deny
+                })
+                .unwrap();
+            let result = call.await;
+            if approve {
+                assert_eq!(result.unwrap(), r#"{"command":"echo rewritten"}"#);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Permission denied by user")
+                );
+            }
+            assert!(
+                ask_rx.try_recv().is_err(),
+                "one invocation must prompt only once"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn pre_tool_use_rewrite_cannot_bypass_a_permission_deny_rule() {
     // A PreToolUse hook can rewrite `updatedInput` (e.g. to canonicalize or
     // redact args), but that must not let a buggy or malicious hook sneak a
@@ -365,15 +416,17 @@ async fn post_tool_use_no_decision_leaves_result_unchanged() {
 
 #[tokio::test]
 async fn ask_verdict_escalates_to_deny_when_no_ask_tx_is_available() {
-    // Restrictive would otherwise Ask (not straight-allow) for bash, but with
-    // no ask_tx present the inner check_perm call must escalate to deny —
-    // proving force_ask_once actually forced a prompt rather than silently
-    // falling through to whatever Restrictive would have resolved to.
+    // A hook ask must prompt even when Yolo would otherwise allow the call.
     let dispatcher = dispatcher_with(
         "PreToolUse",
         vec![handler(r#"echo '{"permissionDecision":"ask"}'"#)],
     );
     let perm = permission();
+    perm.as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .set_mode(SecurityMode::Yolo);
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(PermCheckingTool {
         permission: perm.clone(),
     })];
@@ -411,22 +464,78 @@ async fn allow_verdict_suppresses_the_prompt_for_the_inner_tools_own_check() {
 }
 
 #[tokio::test]
-async fn unused_hook_allow_is_cleared_when_the_owning_call_finishes() {
-    let dispatcher = dispatcher_with(
-        "PreToolUse",
-        vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
-    );
-    let perm = permission_restrictive();
-    let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
-    let wrapped = wrap_all(tools, dispatcher, perm.clone(), None);
+async fn unused_hook_allow_is_cleared_on_completion_failure_and_cancellation() {
+    struct WaitingTool {
+        entered: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ToolDyn for WaitingTool {
+        fn name(&self) -> String {
+            "waiting_tool".into()
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+            Box::pin(async move {
+                self.entered.send(()).await.unwrap();
+                self.release.notified().await;
+                if args == "failure" {
+                    return Err(ToolError::ToolCallError(Box::new(
+                        crate::agent::tools::ToolError::Msg("inner failure".into()),
+                    )));
+                }
+                Ok(args)
+            })
+        }
+    }
 
-    wrapped[0].call("first".into()).await.unwrap();
-    let later = perm
-        .unwrap()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .check("echo_tool", "different call");
-    assert_eq!(later, crate::permission::checker::CheckResult::Ask);
+    for outcome in ["success", "failure", "cancel"] {
+        let dispatcher = dispatcher_with(
+            "PreToolUse",
+            vec![handler(r#"echo '{"permissionDecision":"allow"}'"#)],
+        );
+        let perm = permission_restrictive().unwrap();
+        // Token zero is reserved by this fixture; production tokens start at one.
+        perm.lock().unwrap().allow_once_scoped("other".into(), 0);
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(WaitingTool {
+            entered: entered_tx,
+            release: release.clone(),
+        })];
+        let wrapped = wrap_all(tools, dispatcher, Some(perm.clone()), None);
+        let mut call = wrapped[0].call(outcome.into());
+        tokio::select! {
+            entered = entered_rx.recv() => assert_eq!(entered, Some(())),
+            result = &mut call => panic!("tool did not wait: {result:?}"),
+        }
+        assert_eq!(perm.lock().unwrap().hook_decision_count(), 2);
+        if outcome == "cancel" {
+            drop(call);
+        } else {
+            release.notify_one();
+            let result = call.await;
+            if outcome == "success" {
+                assert_eq!(result.unwrap(), "success");
+            } else {
+                assert!(result.unwrap_err().to_string().contains("inner failure"));
+            }
+        }
+        let checker = perm.lock().unwrap();
+        assert_eq!(
+            checker.hook_decision_count(),
+            1,
+            "{outcome} leaked its grant"
+        );
+        assert!(
+            checker.hook_decision_is_pending(0),
+            "another invocation lost its grant"
+        );
+    }
 }
 
 #[test]
@@ -608,52 +717,14 @@ async fn an_ask_verdict_denies_todo_write_before_it_short_circuits() {
     assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-/// Waits until both concurrent invocations have recorded their hook verdict
-/// before either reaches its permission check, which is exactly the window in
-/// which a single shared decision slot loses one of them.
-struct BarrieredPermCheckingTool {
-    permission: Option<crate::permission::checker::PermCheck>,
-    barrier: Arc<tokio::sync::Barrier>,
-}
-
-impl ToolDyn for BarrieredPermCheckingTool {
-    fn name(&self) -> String {
-        "bash".to_string()
-    }
-
-    fn description(&self) -> String {
-        String::new()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({})
-    }
-
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            self.barrier.wait().await;
-            crate::agent::tools::check_perm(&self.permission, &None, "bash", &args)
-                .await
-                .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
-            Ok(args)
-        })
-    }
-}
-
 #[tokio::test]
 async fn concurrent_ask_verdicts_deny_every_call() {
     let perm = permission();
     let dispatcher = ask_dispatcher();
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tools: Vec<Box<dyn ToolDyn>> = vec![
-        Box::new(BarrieredPermCheckingTool {
-            permission: perm.clone(),
-            barrier: barrier.clone(),
-        }),
-        Box::new(BarrieredPermCheckingTool {
-            permission: perm.clone(),
-            barrier: barrier.clone(),
-        }),
+        Box::new(SideEffectTool { ran: ran.clone() }),
+        Box::new(SideEffectTool { ran: ran.clone() }),
     ];
     let wrapped = wrap_all(tools, dispatcher, perm, None);
 
@@ -666,6 +737,7 @@ async fn concurrent_ask_verdicts_deny_every_call() {
         let error = result.expect_err("both concurrent asks must deny without an ask channel");
         assert!(error.to_string().contains("non-interactive"), "{error}");
     }
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
