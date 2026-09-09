@@ -6,13 +6,17 @@
 //! direct-process behavior but share executable pinning, environment
 //! hardening, bounded output, deadlines, and child cleanup.
 
+#[cfg(any(test, feature = "git-worktree"))]
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
+#[cfg(any(test, feature = "git-worktree"))]
+use std::sync::{Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use tokio::process::Command;
+#[cfg(any(test, feature = "git-worktree"))]
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::sandbox::{
@@ -25,12 +29,14 @@ pub(crate) const QUERY_LIMITS: CommandLimits = CommandLimits {
     stderr_bytes: 256 * 1024,
     combined_bytes: 384 * 1024,
 };
+#[cfg(any(test, feature = "git-worktree"))]
 pub(crate) const LOCAL_MUTATION_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(60),
     stdout_bytes: 512 * 1024,
     stderr_bytes: 512 * 1024,
     combined_bytes: 768 * 1024,
 };
+#[cfg(feature = "git-worktree")]
 pub(crate) const NETWORK_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(120),
     stdout_bytes: 512 * 1024,
@@ -53,11 +59,13 @@ const REDIRECTING_ENV: &[&str] = &[
     "GIT_ATTR_NOSYSTEM",
 ];
 
+#[cfg(any(test, feature = "git-worktree"))]
 static PROCESS_GIT_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
 
 /// Cached git environment variables. Built once per process lifetime.
 /// Assumes PATH and relevant environment variables do not change mid-session.
+#[cfg(any(test, feature = "git-worktree"))]
 static CACHED_GIT_ENVIRONMENT: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
 
 /// Checked runner cached for the production process lifetime. Tests discover
@@ -70,6 +78,7 @@ static CACHED_GIT_RUNNER: OnceLock<Result<GitRunner, String>> = OnceLock::new();
 /// lock additionally keeps mini-agent worktree and structured-tool mutations
 /// for the same repository from racing between before/after snapshots without
 /// serializing independent repositories.
+#[cfg(any(test, feature = "git-worktree"))]
 fn repository_mutation_lock(repository_key: &Path) -> Arc<Mutex<()>> {
     let locks = PROCESS_GIT_MUTATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut locks = locks
@@ -140,6 +149,7 @@ impl GitRunner {
         })
     }
 
+    #[cfg(feature = "git-worktree")]
     pub(crate) fn verify_contained(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -189,6 +199,7 @@ impl GitRunner {
         Ok(command)
     }
 
+    #[cfg(any(test, feature = "git-worktree"))]
     fn contained_command<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -204,6 +215,7 @@ impl GitRunner {
 
     /// Like [`Self::contained_command`] but with additional environment
     /// entries appended to the hardened, non-credential base environment.
+    #[cfg(any(test, feature = "git-worktree"))]
     fn contained_command_with_env<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -235,6 +247,7 @@ impl GitRunner {
     /// resolved here with uncontained `git config --get` calls (honouring
     /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` overrides from the parent process
     /// environment) and injected as explicit values.
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn resolve_commit_identity(
         &self,
         repo_path: &Path,
@@ -247,6 +260,7 @@ impl GitRunner {
     /// environment for the host `git config` query. `env` supplies the
     /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` overrides; `config_env` lets tests
     /// isolate the lookup from the developer's global config.
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn resolve_commit_identity_with(
         &self,
         repo_path: &Path,
@@ -291,6 +305,7 @@ impl GitRunner {
 
     /// Reads one config key with an uncontained `git config --get` in the
     /// repository. Returns `Ok(None)` when the key is unset.
+    #[cfg(any(test, feature = "git-worktree"))]
     async fn host_config_value(
         &self,
         repo_path: &Path,
@@ -337,6 +352,7 @@ impl GitRunner {
         command_result(operation, limits, output)
     }
 
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn acquire_mutation(
         &self,
         repo_path: &Path,
@@ -356,6 +372,7 @@ impl GitRunner {
         Ok(repository_mutation_lock(&key).lock_owned().await)
     }
 
+    #[cfg(feature = "git-worktree")]
     pub(crate) async fn run_with_input<I, S>(
         &self,
         repo_path: &Path,
@@ -376,6 +393,7 @@ impl GitRunner {
         command_result(operation, limits, output)
     }
 
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn run_allow_exit<I, S>(
         &self,
         repo_path: &Path,
@@ -442,6 +460,7 @@ impl GitRunner {
             .map_err(|_| format!("git {operation} runner failed"))
     }
 
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn run_contained<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -471,6 +490,7 @@ impl GitRunner {
 
     /// Runs a contained mutation and returns every observed terminal outcome
     /// so the caller can capture the truthful post-operation repository state.
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn run_contained_observed<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -490,6 +510,7 @@ impl GitRunner {
             .map_err(|_| format!("git {operation} runner failed"))
     }
 
+    #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) async fn run_contained_with_input_observed<I, S>(
         &self,
         workspace: &crate::paths::WorkspaceBinding,
@@ -521,6 +542,7 @@ impl GitRunner {
 }
 
 /// Author and committer identity resolved on the host for a contained commit.
+#[cfg(any(test, feature = "git-worktree"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommitIdentity {
     pub(crate) author_name: String,
@@ -529,6 +551,7 @@ pub(crate) struct CommitIdentity {
     pub(crate) committer_email: String,
 }
 
+#[cfg(any(test, feature = "git-worktree"))]
 impl CommitIdentity {
     /// Environment entries that hand the identity to `git commit` without
     /// any config-file access inside the sandbox.
@@ -554,6 +577,7 @@ impl CommitIdentity {
     }
 }
 
+#[cfg(any(test, feature = "git-worktree"))]
 pub(crate) const COMMIT_IDENTITY_UNRESOLVED: &str = "git commit requires an author identity: \
 the contained git process has no HOME or global config, so set user.name and user.email in \
 this repository (`git config user.name ...` / `git config user.email ...`) or export \
@@ -569,6 +593,7 @@ pub(crate) fn contained_commit_environment(identity: &CommitIdentity) -> Vec<(Os
 }
 
 /// Normalises a config/env identity value: trimmed, non-empty, single line.
+#[cfg(any(test, feature = "git-worktree"))]
 fn identity_value(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() || value.contains(['\0', '\n', '\r']) {
@@ -578,6 +603,7 @@ fn identity_value(raw: &str) -> Option<String> {
     }
 }
 
+#[cfg(any(test, feature = "git-worktree"))]
 fn output_path(bytes: &[u8]) -> PathBuf {
     let mut end = bytes.len();
     while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
@@ -604,6 +630,7 @@ fn apply_git_environment(command: &mut Command) {
         .env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
+#[cfg(any(test, feature = "git-worktree"))]
 fn build_git_environment() -> Vec<(OsString, OsString)> {
     let values = vec![
         (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
@@ -632,6 +659,7 @@ fn build_git_environment() -> Vec<(OsString, OsString)> {
 /// reference to the cached vector at no cost.
 ///
 /// Assumption: PATH and environment variables do not change mid-session.
+#[cfg(any(test, feature = "git-worktree"))]
 fn git_environment() -> &'static [(OsString, OsString)] {
     CACHED_GIT_ENVIRONMENT.get_or_init(build_git_environment)
 }
@@ -847,46 +875,44 @@ mod tests {
     }
 
     #[test]
-    fn git_environment_contains_required_keys() {
+    fn cached_git_environment_enforces_exact_policy() {
         let env = git_environment();
-        let keys: Vec<String> = env
+        let required = [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_PAGER", "cat"),
+            ("GIT_EXTERNAL_DIFF", ""),
+            ("GIT_LITERAL_PATHSPECS", "1"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
+        let values = env
             .iter()
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
-        for required in &[
-            "GIT_TERMINAL_PROMPT",
-            "GIT_NO_LAZY_FETCH",
-            "GIT_PAGER",
-            "GIT_EXTERNAL_DIFF",
-            "GIT_LITERAL_PATHSPECS",
-            "GIT_CONFIG_NOSYSTEM",
-        ] {
-            assert!(
-                keys.contains(&(*required).to_string()),
-                "missing key {required} in git_environment"
+            .cloned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values.len(), env.len(), "duplicate environment keys");
+        for (key, value) in required {
+            assert_eq!(
+                values.get(OsStr::new(key)).map(OsString::as_os_str),
+                Some(OsStr::new(value)),
+                "incorrect policy for {key}"
             );
         }
-    }
-
-    #[test]
-    fn git_environment_is_cached_and_not_reallocated() {
-        // Fails if the OnceLock cache is removed: two calls would then return
-        // distinct allocations rather than the same borrowed slice.
-        let first = git_environment();
-        let second = git_environment();
+        for key in values.keys() {
+            let policy_key = required.iter().any(|(name, _)| key == name);
+            #[cfg(windows)]
+            let platform_key = ["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"]
+                .iter()
+                .any(|name| key == name);
+            #[cfg(not(windows))]
+            let platform_key = false;
+            assert!(
+                policy_key || platform_key,
+                "unexpected environment key {key:?}"
+            );
+        }
         assert!(
-            std::ptr::eq(first, second),
-            "git_environment must hand back the same cached slice on every call"
-        );
-    }
-
-    #[test]
-    fn cached_git_environment_matches_freshly_built() {
-        // The cache must not change what git actually receives.
-        assert_eq!(
-            git_environment(),
-            build_git_environment().as_slice(),
-            "cached git environment diverged from a freshly built one"
+            std::ptr::eq(env, git_environment()),
+            "the cached environment must reuse its allocation"
         );
     }
 }

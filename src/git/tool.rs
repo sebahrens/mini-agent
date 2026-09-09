@@ -50,6 +50,7 @@ pub(crate) struct GitTool {
 }
 
 impl GitTool {
+    #[cfg(feature = "git-worktree")]
     pub(crate) fn capture(
         workspace: Arc<crate::paths::WorkspaceBinding>,
         sandbox: Sandbox,
@@ -1116,92 +1117,63 @@ mod tests {
     }
 
     #[test]
-    fn hardened_args_starts_with_no_optional_locks() {
-        let result = hardened_args(vec!["log".into()]);
-        assert_eq!(result[0], "--no-optional-locks");
-    }
+    fn hardened_args_enforces_policy_before_preserving_literal_operands() {
+        use std::collections::{BTreeMap, BTreeSet};
 
-    #[test]
-    fn hardened_args_appends_caller_args_at_end() {
-        let result = hardened_args(vec!["log".into(), "--oneline".into()]);
-        // Caller args must appear and be in order relative to each other
-        let log_pos = result.iter().position(|s| s == "log").expect("log missing");
-        let oneline_pos = result
-            .iter()
-            .position(|s| s == "--oneline")
-            .expect("--oneline missing");
-        assert!(log_pos < oneline_pos, "caller arg order must be preserved");
-        // Safety flags precede caller args
-        let safety_end = result
-            .iter()
-            .position(|s| s == "--no-optional-locks")
-            .unwrap();
-        assert!(
-            safety_end < log_pos,
-            "safety flags must precede caller args"
-        );
-    }
-
-    #[test]
-    fn hardened_args_disables_hooks() {
-        let result = hardened_args(vec!["commit".into()]);
-        assert!(
-            result
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "core.hooksPath=/dev/null"),
-            "expected core.hooksPath=/dev/null in {result:?}"
-        );
-    }
-
-    #[test]
-    fn hardened_args_clears_credential_helper() {
-        let result = hardened_args(vec!["fetch".into()]);
-        assert!(
-            result
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "credential.helper="),
-            "expected credential.helper= in {result:?}"
-        );
-    }
-
-    #[test]
-    fn hardened_args_blocks_file_protocol() {
-        let result = hardened_args(vec!["fetch".into()]);
-        assert!(
-            result
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "protocol.file.allow=never"),
-            "expected protocol.file.allow=never in {result:?}"
-        );
-    }
-
-    #[test]
-    fn hardened_args_blocks_ext_protocol() {
-        let result = hardened_args(vec!["fetch".into()]);
-        assert!(
-            result
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "protocol.ext.allow=never"),
-            "expected protocol.ext.allow=never in {result:?}"
-        );
-    }
-
-    #[test]
-    fn hardened_args_disables_fsmonitor() {
-        let result = hardened_args(vec![]);
-        assert!(
-            result
-                .windows(2)
-                .any(|w| w[0] == "-c" && w[1] == "core.fsmonitor=false"),
-            "expected core.fsmonitor=false in {result:?}"
-        );
-    }
-
-    #[test]
-    fn hardened_args_empty_caller_args_still_has_safety_flags() {
-        let result = hardened_args(vec![]);
-        assert!(!result.is_empty());
-        assert_eq!(result[0], "--no-optional-locks");
+        let expected_config = BTreeMap::from([
+            ("core.fsmonitor", "false"),
+            ("core.untrackedCache", "false"),
+            ("core.hooksPath", "/dev/null"),
+            ("commit.gpgSign", "false"),
+            ("tag.gpgSign", "false"),
+            ("diff.external", ""),
+            ("diff.trustExitCode", "false"),
+            ("credential.helper", ""),
+            ("core.askPass", ""),
+            ("submodule.recurse", "false"),
+            ("fetch.recurseSubmodules", "false"),
+            ("protocol.file.allow", "never"),
+            ("protocol.ext.allow", "never"),
+        ]);
+        for caller in [
+            vec![],
+            vec!["log", "--oneline"],
+            vec!["commit", "--file=-"],
+            vec!["show", "--", "-c", "file name", "unicodé", "*.txt"],
+        ] {
+            let caller = caller.into_iter().map(String::from).collect::<Vec<_>>();
+            let result = hardened_args(caller.clone());
+            assert!(result.len() >= caller.len());
+            let (policy, operands) = result.split_at(result.len() - caller.len());
+            assert_eq!(operands, caller, "caller operands changed");
+            let mut flags = BTreeSet::new();
+            let mut config = BTreeMap::new();
+            let mut arguments = policy.iter();
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--no-optional-locks" | "--literal-pathspecs" => {
+                        assert!(flags.insert(argument.as_str()), "duplicate global flag");
+                    }
+                    "-c" => {
+                        let (key, value) = arguments
+                            .next()
+                            .expect("configuration flag requires a value")
+                            .split_once('=')
+                            .expect("configuration requires key=value");
+                        assert!(
+                            config.insert(key, value).is_none(),
+                            "duplicate policy key {key}"
+                        );
+                    }
+                    other => panic!("unexpected argument before the command: {other}"),
+                }
+            }
+            assert_eq!(
+                flags,
+                BTreeSet::from(["--no-optional-locks", "--literal-pathspecs"])
+            );
+            assert_eq!(config, expected_config);
+        }
     }
 
     fn isolated_host_config() -> Vec<(String, std::ffi::OsString)> {

@@ -31,6 +31,12 @@ submodule recursion, and protocol-based network/file helpers. Filters and
 working-tree encodings are inspected before staging; paths with external
 transforms are rejected.
 
+The typed tool, mutation helpers, and contained execution helpers compile with `git-worktree`;
+portable Git regression tests retain those helpers in test builds. Executable discovery
+and bounded read-only queries remain available in every build for headless change
+reporting and session status. The registration-time containment probe and internal
+worktree stdin/network entry points follow their `git-worktree` callers.
+
 ## Threat model
 
 Git can execute hooks, clean/smudge/process filters, signing programs,

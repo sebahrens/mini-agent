@@ -2,4 +2,5 @@
 //! model-visible typed Git tool.
 
 pub(crate) mod runner;
+#[cfg(any(test, feature = "git-worktree"))]
 pub(crate) mod tool;
