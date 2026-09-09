@@ -72,35 +72,50 @@ fn snapshot_does_not_mutate_session() {
     assert_eq!(session.messages.len(), before_len + 1);
 }
 
-#[cfg(all(test, feature = "git-worktree"))]
 mod btw_lifecycle_tests {
     use std::time::Duration;
 
-    use crate::ui::retire_scoped_task;
-
     #[tokio::test]
-    async fn retire_scoped_task_cancels_and_settles_within_timeout() {
-        let scope = crate::agent::runner::AgentWorkScope::new();
-        let task = tokio::spawn(async {
-            // Infinite sleep — only abort() stops this.
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+    async fn retire_scoped_task_waits_for_owned_blocking_child() {
+        let (scope, started_rx, release) =
+            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+        let task_scope = scope.clone();
+        let task = tokio::spawn(async move {
+            task_scope
+                .run(async {
+                    let _child = crate::agent::runner::spawn_blocking_scoped(|| ());
+                    std::future::pending::<()>().await;
+                })
+                .await;
         });
-        // retire_scoped_task aborts the task and awaits it; must complete < 1 s.
-        let result = retire_scoped_task(task, scope, "test", Duration::from_secs(1)).await;
-        assert!(result.is_ok(), "retire must succeed within 1s: {result:?}");
-    }
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("scoped blocking child should start");
+        })
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn abort_handle_finishes_task_immediately() {
-        let task = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
-        task.abort_handle().abort();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(task.is_finished(), "task must be finished after abort");
+        let mut retirement = tokio::spawn(crate::ui::retire_scoped_task(
+            task,
+            scope.clone(),
+            "test owner",
+            Duration::from_secs(1),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut retirement)
+                .await
+                .is_err(),
+            "retirement must wait for scoped blocking children"
+        );
+        assert!(scope.is_cancelled());
+        assert_eq!(scope.active_children(), 1);
+        release.release();
+        tokio::time::timeout(Duration::from_secs(1), retirement)
+            .await
+            .expect("retirement should finish after child release")
+            .expect("retirement task should not panic")
+            .expect("retirement should succeed");
+        assert_eq!(scope.active_children(), 0);
     }
 }

@@ -26,6 +26,15 @@ commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.
 
+Interactive teardown runs after both normal exit and event-loop errors. It closes
+the input receiver before joining the event thread, cancels the main runner and
+side questions, and waits for their owned work before closing shared services.
+`src/ui/prebuild.rs` owns background agent construction and its work scope. It
+lets cancelled MCP initialization finish process cleanup, explicitly closes MCP
+managers in rejected or queued prebuild results, and waits for scoped children.
+Retirement has a five-second bound per owner; a timeout is reported in the log
+and remaining cleanup still runs.
+
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher
 closes its temporary workspace-authority descriptor inside the namespace before the model's shell

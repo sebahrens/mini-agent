@@ -383,6 +383,21 @@ pub(crate) struct AgentRunState {
     pub pending_compaction_pressure: Option<f64>,
 }
 
+impl AgentRunState {
+    pub(crate) async fn retire(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
+        self.agent = None;
+        if let Some(abort) = self.main_abort.take() {
+            abort.abort();
+        }
+        if let Some(mut events) = self.agent_rx.take() {
+            tokio::time::timeout(timeout, async { while events.recv().await.is_some() {} })
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out retiring the active agent workspace"))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "loop")]
 impl AgentRunState {
     pub(crate) fn begin_validation(
@@ -492,5 +507,56 @@ mod validation_generation_tests {
         assert!(run.complete_validation(current));
         assert!(!run.validation_active());
         assert!(!run.complete_validation(current));
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    #[tokio::test]
+    async fn main_run_retirement_waits_for_lifecycle_channel_after_abort() {
+        use crate::agent::runner::{AgentRunCleanupGuard, AgentWorkScope, spawn_blocking_scoped};
+        use crate::ui::state::AgentRunState;
+        use std::time::Duration;
+
+        let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+        let task_scope = scope.clone();
+        let task = tokio::spawn(async move {
+            let _cleanup = AgentRunCleanupGuard::new(task_scope.clone(), events_tx);
+            task_scope
+                .run(async {
+                    let _child = spawn_blocking_scoped(|| ());
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        });
+        tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2)).unwrap())
+            .await
+            .unwrap();
+        let mut run = AgentRunState {
+            agent: Some(crate::ui::prebuild::test_agent()),
+            main_abort: Some(task.abort_handle()),
+            agent_rx: Some(events_rx),
+            ..AgentRunState::default()
+        };
+        let mut retirement = tokio::spawn(async move {
+            run.retire(Duration::from_secs(2)).await.unwrap();
+            assert!(run.agent.is_none());
+            assert!(run.main_abort.is_none());
+            assert!(run.agent_rx.is_none());
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut retirement)
+                .await
+                .is_err()
+        );
+        assert!(scope.is_cancelled());
+        assert!(
+            task.is_finished(),
+            "runner abort must precede waiting for children"
+        );
+        release.release();
+        retirement.await.unwrap();
+        assert_eq!(scope.active_children(), 0);
     }
 }

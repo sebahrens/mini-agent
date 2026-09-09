@@ -1091,6 +1091,94 @@ async fn acp_cancelled_mcp_startup_reaps_ready_and_initializing_servers() {
 }
 
 #[tokio::test]
+async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results() {
+    use crate::ui::prebuild::{AgentPrebuild, test_agent};
+
+    let fixture = FixtureBuild::compile();
+    for delivery in ["pending", "queued", "rejected"] {
+        let mut servers = HashMap::new();
+        let mut leases = Vec::new();
+        let count = if delivery == "pending" { 10 } else { 1 };
+        for index in 0..count {
+            let name = format!("{delivery}-{index:02}");
+            let lease = fixture.lease(&name);
+            servers.insert(
+                name,
+                fixture.config(
+                    fixture.executable.display().to_string(),
+                    Vec::new(),
+                    if delivery == "pending" && index > 0 {
+                        "hang-init"
+                    } else {
+                        "normal"
+                    },
+                    &lease,
+                ),
+            );
+            leases.push(lease);
+        }
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
+        let (prebuild, receiver) = AgentPrebuild::start(scope.clone(), async move {
+            let manager = McpClientManager::connect_all_in_binding(&servers, &workspace).await;
+            if delivery == "rejected" {
+                connected_tx.send(()).unwrap();
+                publish_rx.await.unwrap();
+            }
+            (test_agent(), Some(manager))
+        });
+        let mut receiver = Some(receiver);
+        let mut pids = Vec::new();
+        for lease in leases
+            .iter()
+            .take(if delivery == "pending" { 9 } else { 1 })
+        {
+            pids.push(wait_for_pid(lease).await);
+        }
+        if delivery == "queued" {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while receiver.as_ref().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("connected result must reach the prebuild queue");
+        } else if delivery == "rejected" {
+            // A memory refresh can discard the receiver independently of quit.
+            connected_rx.await.unwrap();
+            drop(receiver.take());
+            publish_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while process_is_alive(pids[0]) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("rejected publication must close its server without waiting for quit");
+        } else {
+            assert!(!leases[9].exists(), "last connection must still be queued");
+        }
+        prebuild
+            .retire(receiver, Duration::from_secs(3))
+            .await
+            .unwrap();
+        for pid in pids {
+            assert!(
+                !process_is_alive(pid),
+                "{delivery}: server {pid} survived prebuild retirement"
+            );
+        }
+        if delivery == "pending" {
+            assert!(!leases[9].exists());
+        }
+        assert_eq!(scope.active_children(), 0);
+    }
+    fixture.cleanup();
+}
+
+#[tokio::test]
 async fn mcp_tools_list_hang_does_not_block_other_servers() {
     let fixture = FixtureBuild::compile();
     let slow_lease = fixture.lease("hang-tools-list-slow");

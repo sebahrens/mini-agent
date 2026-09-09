@@ -1,5 +1,5 @@
 mod app;
-#[cfg(all(test, feature = "git-worktree"))]
+#[cfg(test)]
 pub(crate) use app::retire_scoped_task;
 #[cfg(test)]
 pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};
@@ -10,6 +10,7 @@ pub(crate) mod input;
 pub(crate) mod markdown;
 mod permission_handler;
 pub(crate) mod pickers;
+pub(crate) mod prebuild;
 pub(crate) mod renderer;
 pub(crate) mod slash;
 pub(crate) mod state;
@@ -967,9 +968,9 @@ pub async fn run_interactive(
         session_start_task,
     )
     .await?;
-    app.run().await?;
+    let result = app.run().await;
     app.teardown().await;
-    Ok(())
+    result
 }
 
 #[cfg(feature = "advisor")]

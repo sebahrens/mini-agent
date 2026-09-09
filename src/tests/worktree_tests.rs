@@ -679,57 +679,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn workspace_owner_retirement_waits_for_scoped_blocking_child() {
-        let app = include_str!("../ui/app.rs");
-        let btw_interrupt = app
-            .split("InterruptTarget::Btw =>")
-            .nth(1)
-            .unwrap()
-            .split("InterruptTarget::Validation")
-            .next()
-            .unwrap();
-        assert!(btw_interrupt.contains("retire_scoped_task"));
-
-        let (scope, started_rx, release) =
-            crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
-        let task_scope = scope.clone();
-        let task = tokio::spawn(async move {
-            task_scope
-                .run(async {
-                    let _child = crate::agent::runner::spawn_blocking_scoped(|| ());
-                    std::future::pending::<()>().await;
-                })
-                .await;
-        });
-        tokio::task::spawn_blocking(move || {
-            started_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("scoped blocking child should start");
-        })
-        .await
-        .unwrap();
-
-        let mut retirement = tokio::spawn(crate::ui::retire_scoped_task(
-            task,
-            scope,
-            "test owner",
-            Duration::from_secs(1),
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut retirement)
-                .await
-                .is_err(),
-            "retirement must wait for scoped blocking children"
-        );
-        release.release();
-        tokio::time::timeout(Duration::from_secs(1), retirement)
-            .await
-            .expect("retirement should finish after child release")
-            .expect("retirement task should not panic")
-            .expect("retirement should succeed");
-    }
-
     #[cfg(feature = "hooks")]
     #[tokio::test]
     async fn worktree_rebind_updates_production_hook_child_envelope_and_project_dir() {

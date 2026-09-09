@@ -458,8 +458,7 @@ pub(crate) struct App<'a> {
     running: Arc<AtomicBool>,
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild_rx: Option<mpsc::Receiver<PrebuildPayload>>,
-    prebuild_task: Option<tokio::task::JoinHandle<()>>,
-    prebuild_scope: Option<std::sync::Arc<crate::agent::runner::AgentWorkScope>>,
+    prebuild_task: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
 }
 
@@ -709,9 +708,7 @@ impl<'a> App<'a> {
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
 
-        let (prebuild_tx, prebuild_rx_raw) = mpsc::channel::<PrebuildPayload>(1);
-        let prebuild_rx = Some(prebuild_rx_raw);
-        let (prebuild_task, prebuild_scope) = if auto_trigger_msg.is_none() && run.agent.is_none() {
+        let (prebuild_task, prebuild_rx) = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
             let session_model = ui.session.model.to_string();
             let tool_output_session_id = ui.session.id.to_string();
@@ -731,60 +728,57 @@ impl<'a> App<'a> {
             let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
             let prebuild_scope = crate::agent::runner::AgentWorkScope::new();
-            let task_scope = prebuild_scope.clone();
-            let task = tokio::spawn(async move {
-                task_scope
-                    .run(async move {
-                        #[cfg(feature = "mcp")]
-                        let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
-                            None
-                        } else if let Some(ref servers) = cfg_clone.mcp_servers {
-                            if !servers.is_empty() {
-                                Some(
-                                    McpClientManager::connect_all_in_binding(
-                                        servers,
-                                        &workspace_clone,
-                                    )
+            let (task, receiver) =
+                super::prebuild::AgentPrebuild::start(prebuild_scope, async move {
+                    #[cfg(feature = "mcp")]
+                    let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
+                        None
+                    } else if let Some(ref servers) = cfg_clone.mcp_servers {
+                        if !servers.is_empty() {
+                            Some(
+                                McpClientManager::connect_all_in_binding(servers, &workspace_clone)
                                     .await,
-                                )
-                            } else {
-                                None
-                            }
+                            )
                         } else {
                             None
-                        };
-
-                        let a = crate::ui::state::AgentBuildCtx {
-                            cli: &cli_clone,
-                            cfg: &cfg_clone,
-                            context: &context_clone,
-                            workspace: &workspace_clone,
-                            client: &client_clone,
-                            permission: &permission_clone,
-                            ask_tx: &ask_tx_clone,
-                            sandbox: &sandbox_clone,
-                            read_tracker: &read_tracker_clone,
-                            todo_store: &todo_store_clone,
-                            tool_output_session_id: &tool_output_session_id,
-                            tool_result_spills: &tool_result_spills,
-                            #[cfg(feature = "js")]
-                            js_session_state: &js_session_state,
-                            #[cfg(feature = "skills")]
-                            skill_services: &skill_services_clone,
-                            #[cfg(feature = "mcp")]
-                            mcp_manager: mcp.as_ref(),
                         }
-                        .rebuild_agent(&session_model, reasoning_enabled)
-                        .await;
+                    } else {
+                        None
+                    };
 
+                    let a = crate::ui::state::AgentBuildCtx {
+                        cli: &cli_clone,
+                        cfg: &cfg_clone,
+                        context: &context_clone,
+                        workspace: &workspace_clone,
+                        client: &client_clone,
+                        permission: &permission_clone,
+                        ask_tx: &ask_tx_clone,
+                        sandbox: &sandbox_clone,
+                        read_tracker: &read_tracker_clone,
+                        todo_store: &todo_store_clone,
+                        tool_output_session_id: &tool_output_session_id,
+                        tool_result_spills: &tool_result_spills,
+                        #[cfg(feature = "js")]
+                        js_session_state: &js_session_state,
+                        #[cfg(feature = "skills")]
+                        skill_services: &skill_services_clone,
                         #[cfg(feature = "mcp")]
-                        let _ = prebuild_tx.send((a, mcp)).await;
-                        #[cfg(not(feature = "mcp"))]
-                        let _ = prebuild_tx.send(a).await;
-                    })
+                        mcp_manager: mcp.as_ref(),
+                    }
+                    .rebuild_agent(&session_model, reasoning_enabled)
                     .await;
-            });
-            (Some(task), Some(prebuild_scope))
+
+                    #[cfg(feature = "mcp")]
+                    {
+                        (a, mcp)
+                    }
+                    #[cfg(not(feature = "mcp"))]
+                    {
+                        a
+                    }
+                });
+            (Some(task), Some(receiver))
         } else {
             (None, None)
         };
@@ -826,7 +820,6 @@ impl<'a> App<'a> {
             event_handle,
             prebuild_rx,
             prebuild_task,
-            prebuild_scope,
             terminal_guard,
         };
         app.request_git_status_refresh();
@@ -855,7 +848,7 @@ impl<'a> App<'a> {
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         let result = self.run_inner().await;
         if result.is_err() && self.run.pending_turn.is_some() {
-            self.fail_pending_main_turn();
+            self.fail_pending_main_turn().await;
         }
         result
     }
@@ -958,12 +951,28 @@ impl<'a> App<'a> {
     pub(crate) async fn teardown(mut self) {
         self.running.store(false, Ordering::Relaxed);
 
-        // Cancel and await all in-flight btw tasks with a timeout
+        self.user_rx.close();
+
+        // Retire owned work before closing the services it can still use.
         const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
         for (_, abort, task, scope) in self.btw_abort.drain(..) {
             abort.abort();
-            scope.cancellation_handle().cancel();
-            let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, task).await;
+            if let Err(error) =
+                retire_scoped_task(task, scope, "side-question", TEARDOWN_TIMEOUT).await
+            {
+                tracing::warn!(%error, "TUI side-question cleanup failed");
+            }
+        }
+
+        if let Err(error) = self.run.retire(TEARDOWN_TIMEOUT).await {
+            tracing::warn!(%error, "TUI main-run cleanup failed");
+        }
+        if let Some(prebuild) = self.prebuild_task.take()
+            && let Err(error) = prebuild
+                .retire(self.prebuild_rx.take(), TEARDOWN_TIMEOUT)
+                .await
+        {
+            tracing::warn!(%error, "TUI prebuild cleanup failed");
         }
 
         if let Some(h) = self.event_handle {
@@ -1110,7 +1119,7 @@ impl<'a> App<'a> {
                             self.renderer.write_line("btw cancelled", C_ERROR)?;
                         }
                         InterruptTarget::Validation | InterruptTarget::MainRun => {
-                            self.abort_main_run()?;
+                            self.abort_main_run().await?;
                         }
                         InterruptTarget::Exit => return Ok(ControlFlow::Break(())),
                     }
@@ -1529,7 +1538,7 @@ impl<'a> App<'a> {
                 // Presentation is part of the event handler and can fail after
                 // a tool/stream event mutated live state. App unwind ends the
                 // turn, so apply the same rollback policy as cancellation.
-                self.fail_pending_main_turn();
+                self.fail_pending_main_turn().await;
             }
             return Err(error);
         }
@@ -1547,7 +1556,7 @@ impl<'a> App<'a> {
                 anyhow::anyhow!("runner reached an unrequested compaction boundary")
             })?;
             if let Err(error) = self.mid_turn_compact(pressure, &interactions).await {
-                self.fail_pending_main_turn();
+                self.fail_pending_main_turn().await;
                 return Err(error);
             }
             self.run.awaiting_compaction_relief = true;
@@ -1573,7 +1582,7 @@ impl<'a> App<'a> {
                 crate::agent::runner::CompactionBoundaryDecision::Continue
             };
             if decision_tx.send(decision).await.is_err() && self.run.is_running {
-                self.fail_pending_main_turn();
+                self.fail_pending_main_turn().await;
                 return Err(anyhow::anyhow!("agent compaction boundary channel closed"));
             }
         }
@@ -1583,7 +1592,7 @@ impl<'a> App<'a> {
                 let (real_input_tokens, threshold, _) =
                     mid_turn_pressure.expect("over-threshold action requires measured pressure");
                 if let Err(error) = self.stop_context_exhausted(real_input_tokens, threshold) {
-                    self.fail_pending_main_turn();
+                    self.fail_pending_main_turn().await;
                     return Err(error);
                 }
                 self.run.awaiting_compaction_relief = false;
@@ -1604,7 +1613,7 @@ impl<'a> App<'a> {
         }
         if mid_turn_pressure.is_some() {
             if let Err(error) = self.refresh() {
-                self.fail_pending_main_turn();
+                self.fail_pending_main_turn().await;
                 return Err(error.into());
             }
             return Ok(());
@@ -1709,7 +1718,7 @@ impl<'a> App<'a> {
 
     /// Exception-safe failure transition with no required presentation. Used
     /// when rendering or mid-turn post-processing itself is what failed.
-    fn fail_pending_main_turn(&mut self) {
+    async fn fail_pending_main_turn(&mut self) {
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         self.run.cancel_validation();
@@ -1718,7 +1727,9 @@ impl<'a> App<'a> {
         }
         self.ui.sandbox.kill_active();
         self.run.is_running = false;
-        self.run.agent_rx = None;
+        if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
+            tracing::warn!(%error, "TUI failed-run cleanup failed");
+        }
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -1740,7 +1751,7 @@ impl<'a> App<'a> {
         }
     }
 
-    fn abort_main_run(&mut self) -> anyhow::Result<()> {
+    async fn abort_main_run(&mut self) -> anyhow::Result<()> {
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
         #[cfg(feature = "loop")]
         let validation_active = self.run.cancel_validation();
@@ -1757,7 +1768,9 @@ impl<'a> App<'a> {
         if let Some(ss) = self.ui.status_signals.as_ref() {
             ss.send_stop();
         }
-        self.run.agent_rx = None;
+        if let Err(error) = self.run.retire(Duration::from_secs(5)).await {
+            tracing::warn!(%error, "TUI interrupted-run cleanup failed");
+        }
         self.run.compaction_decision_tx = None;
         self.run.turn_trace.clear();
         self.run.awaiting_compaction_relief = false;
@@ -3098,28 +3111,15 @@ impl<'a> App<'a> {
     async fn retire_workspace_owners_before_cleanup(&mut self) -> anyhow::Result<()> {
         const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-        self.run.agent = None;
-        if let Some(abort) = self.run.main_abort.take() {
-            abort.abort();
-        }
-        if let Some(mut events) = self.run.agent_rx.take() {
-            tokio::time::timeout(RETIRE_TIMEOUT, async {
-                while events.recv().await.is_some() {}
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out retiring the active agent workspace"))?;
-        }
+        self.run.retire(RETIRE_TIMEOUT).await?;
         for (_, _, task, scope) in self.btw_abort.drain(..) {
             retire_scoped_task(task, scope, "side-question", RETIRE_TIMEOUT).await?;
         }
         self.btw_inflight = 0;
-        self.prebuild_rx = None;
-        if let Some(task) = self.prebuild_task.take() {
-            let scope = self
-                .prebuild_scope
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("agent prebuild workspace scope is unavailable"))?;
-            retire_scoped_task(task, scope, "agent prebuild", RETIRE_TIMEOUT).await?;
+        if let Some(prebuild) = self.prebuild_task.take() {
+            prebuild
+                .retire(self.prebuild_rx.take(), RETIRE_TIMEOUT)
+                .await?;
         }
         #[cfg(feature = "mcp")]
         if let Some(manager) = self.ui.mcp_manager.take() {
