@@ -890,12 +890,23 @@ pub(crate) fn current_work_scope_is_cancelled() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(any(feature = "hooks", feature = "mcp", test))]
 pub(crate) async fn current_work_scope_cancelled() {
     let scope = AGENT_WORK_SCOPE.try_with(Arc::clone).ok();
     match scope {
         Some(scope) => scope.cancelled().await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+/// Interrupt one headless await while leaving the caller's accumulated turn
+/// state available for persistence. The outer driver owns child settlement.
+pub(crate) async fn await_headless_work<F: std::future::Future>(
+    work: F,
+) -> anyhow::Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = current_work_scope_cancelled() => Err(anyhow::anyhow!("headless agent interrupted")),
+        result = work => Ok(result),
     }
 }
 
@@ -3248,7 +3259,7 @@ pub(crate) struct HeadlessTurn {
 
 impl HeadlessTurn {
     /// A failure that happened before any progress was made.
-    fn failed_before_start(error: anyhow::Error) -> Self {
+    pub(crate) fn failed_before_start(error: anyhow::Error) -> Self {
         Self {
             response: String::new(),
             usage: rig::completion::Usage::default(),
@@ -3295,7 +3306,7 @@ where
     }
 
     let mut first_attempt_history = Some(history.to_vec());
-    let stream = retry::retry_stream_chat(retry_config, || {
+    let stream = await_headless_work(retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
         let h = first_attempt_history
             .take()
@@ -3307,8 +3318,12 @@ where
                 .tool_concurrency(crate::agent::tools::concurrency::DEFAULT_TOOL_CONCURRENCY)
                 .await
         }
-    })
-    .await
+    }))
+    .await;
+    let stream = match stream {
+        Ok(result) => result,
+        Err(error) => return HeadlessTurn::failed_before_start(error),
+    }
     .map_err(|e| anyhow::anyhow!(retry::with_context_length_hint(&e.to_string())));
     let stream = match stream {
         Ok(stream) => stream,
@@ -3359,6 +3374,14 @@ where
             };
         }};
     }
+    macro_rules! await_turn {
+        ($work:expr) => {
+            match await_headless_work($work).await {
+                Ok(result) => result,
+                Err(error) => fail_turn!(error),
+            }
+        };
+    }
     #[cfg(feature = "hooks")]
     let mut stop_hook_active = false;
     #[cfg(feature = "hooks")]
@@ -3370,7 +3393,7 @@ where
         continue_turn = false;
         let mut terminal_response_seen = false;
         let mut retrying_interrupted_completion = false;
-        while let Some(item) = stream.next().await {
+        while let Some(item) = await_turn!(stream.next()) {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
                     text,
@@ -3512,7 +3535,7 @@ where
                     if verification_ran && let Some(verification) = completion_verification.as_ref()
                     {
                         verification_attempt = verification_attempt.saturating_add(1);
-                        let result = verification.run().await;
+                        let result = await_turn!(verification.run());
                         let passed = result.succeeded();
                         #[cfg(feature = "skills")]
                         verification.record_verify_outcome(passed, verification_attempt);
@@ -3539,12 +3562,11 @@ where
                     }
                     #[cfg(feature = "hooks")]
                     if let crate::extras::hooks::StopGate::Continue { reason } =
-                        crate::extras::hooks::dispatch_stop(
+                        await_turn!(crate::extras::hooks::dispatch_stop(
                             stop_hook_active,
                             loop_info.map(|info| u64::from(info.iteration)),
                             loop_info.map(|info| info.active),
-                        )
-                        .await
+                        ))
                     {
                         consecutive_stop_blocks += 1;
                         if consecutive_stop_blocks <= MAX_STOP_BLOCKS {
@@ -3577,7 +3599,7 @@ where
                             "agent retry {attempt}/{max} after mid-stream error: {e}",
                             max = retry_config.max_attempts,
                         );
-                        tokio::time::sleep(delay).await;
+                        await_turn!(tokio::time::sleep(delay));
                         next_instruction = Some(TRANSIENT_PROVIDER_CONTINUATION.to_string());
                         retrying_interrupted_completion = true;
                         continue_turn = true;
@@ -3630,16 +3652,13 @@ where
             // persists the returned string as the assistant message, so
             // clearing it here would drop turn-1 output the user already saw
             // and desync the saved transcript from the terminal.
-            stream = stream_policy.apply(
-                continue_prompt_injector(
-                    agent,
-                    prompt,
-                    &retry_history,
-                    &continuation_bridge,
-                    remaining_turns,
-                )
-                .await,
-            );
+            stream = stream_policy.apply(await_turn!(continue_prompt_injector(
+                agent,
+                prompt,
+                &retry_history,
+                &continuation_bridge,
+                remaining_turns,
+            )));
             usage_ledger.start_stream();
             turns_at_stream_start = turns_used;
             response_len_at_stream_start = full_response.len();

@@ -1162,39 +1162,32 @@ impl AnyAgent {
     where
         H: Into<std::sync::Arc<[Message]>>,
     {
-        let history = history.into();
-        #[cfg(feature = "skills")]
-        let _turn_guard = if self.skills.is_some() {
-            Some(self.turn_gate.lock().await)
-        } else {
-            None
-        };
-        #[cfg(feature = "skills")]
-        let prompt = if let Some(skills) = &self.skills {
-            skills.prepare_prompt(prompt).await
-        } else {
-            prompt.to_string()
-        };
-        #[cfg(not(feature = "skills"))]
-        let prompt = prompt.to_string();
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => {
-                runner::run_print_with_verification(
-                    a,
-                    &prompt,
-                    pure_stdout,
-                    emit_stdout,
-                    retry_config,
-                    self.turn_token_budget,
-                    history,
-                    self.completion_verification.clone(),
-                    #[cfg(feature = "hooks")]
-                    loop_info,
+        crate::print::run_headless_turn(async {
+            let history = history.into();
+            #[cfg(feature = "skills")]
+            let _turn_guard = if self.skills.is_some() {
+                Some(
+                    match runner::await_headless_work(self.turn_gate.lock()).await {
+                        Ok(guard) => guard,
+                        Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                    },
                 )
-                .await
-            }
-            AnyAgentInner::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => {
+            } else {
+                None
+            };
+            #[cfg(feature = "skills")]
+            let prompt = if let Some(skills) = &self.skills {
+                match runner::await_headless_work(skills.prepare_prompt(prompt)).await {
+                    Ok(prompt) => prompt,
+                    Err(error) => return runner::HeadlessTurn::failed_before_start(error),
+                }
+            } else {
+                prompt.to_string()
+            };
+            #[cfg(not(feature = "skills"))]
+            let prompt = prompt.to_string();
+            match &self.inner {
+                AnyAgentInner::OpenRouter(a) => {
                     runner::run_print_with_verification(
                         a,
                         &prompt,
@@ -1209,7 +1202,39 @@ impl AnyAgent {
                     )
                     .await
                 }
-                OpenAiAgent::Completions(a) => {
+                AnyAgentInner::OpenAI(a) => match a {
+                    OpenAiAgent::Responses(a) => {
+                        runner::run_print_with_verification(
+                            a,
+                            &prompt,
+                            pure_stdout,
+                            emit_stdout,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                        .await
+                    }
+                    OpenAiAgent::Completions(a) => {
+                        runner::run_print_with_verification(
+                            a,
+                            &prompt,
+                            pure_stdout,
+                            emit_stdout,
+                            retry_config,
+                            self.turn_token_budget,
+                            history,
+                            self.completion_verification.clone(),
+                            #[cfg(feature = "hooks")]
+                            loop_info,
+                        )
+                        .await
+                    }
+                },
+                AnyAgentInner::Anthropic(a) => {
                     runner::run_print_with_verification(
                         a,
                         &prompt,
@@ -1224,53 +1249,39 @@ impl AnyAgent {
                     )
                     .await
                 }
-            },
-            AnyAgentInner::Anthropic(a) => {
-                runner::run_print_with_verification(
-                    a,
-                    &prompt,
-                    pure_stdout,
-                    emit_stdout,
-                    retry_config,
-                    self.turn_token_budget,
-                    history,
-                    self.completion_verification.clone(),
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                )
-                .await
+                AnyAgentInner::Gemini(a) => {
+                    runner::run_print_with_verification(
+                        a,
+                        &prompt,
+                        pure_stdout,
+                        emit_stdout,
+                        retry_config,
+                        self.turn_token_budget,
+                        history,
+                        self.completion_verification.clone(),
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
+                }
+                AnyAgentInner::Ollama(a) => {
+                    runner::run_print_with_verification(
+                        a,
+                        &prompt,
+                        pure_stdout,
+                        emit_stdout,
+                        retry_config,
+                        self.turn_token_budget,
+                        history,
+                        self.completion_verification.clone(),
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
+                }
             }
-            AnyAgentInner::Gemini(a) => {
-                runner::run_print_with_verification(
-                    a,
-                    &prompt,
-                    pure_stdout,
-                    emit_stdout,
-                    retry_config,
-                    self.turn_token_budget,
-                    history,
-                    self.completion_verification.clone(),
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                )
-                .await
-            }
-            AnyAgentInner::Ollama(a) => {
-                runner::run_print_with_verification(
-                    a,
-                    &prompt,
-                    pure_stdout,
-                    emit_stdout,
-                    retry_config,
-                    self.turn_token_budget,
-                    history,
-                    self.completion_verification.clone(),
-                    #[cfg(feature = "hooks")]
-                    loop_info,
-                )
-                .await
-            }
-        }
+        })
+        .await
     }
 
     #[cfg(feature = "subagents")]

@@ -219,6 +219,12 @@ or session save fails. Failed turns retain observed output, tool counts, changed
 and cost, and exit nonzero; completed tool records are saved unless `--no-session` is set or
 persistence itself fails. Errors before a turn result is available can exit without JSON.
 
+During headless agent turns (`-p` and `--loop`), Ctrl+C or Unix SIGTERM cancels provider
+waits and active work, waits for registered tool and hook cleanup, then saves completed
+tool records and observed usage before exiting nonzero. An interrupted `-p --output json`
+turn reports `"stop_reason":"failed"` with its partial result. Completion verification
+is interrupted through the same cleanup path.
+
 `files_changed` combines workspace paths whose bounded Git status changed during the invocation
 with `write` and `edit` targets visible in the provider transcript. It is empty when no
 change can be observed (for example, a non-Git workspace changed only by an opaque shell command).

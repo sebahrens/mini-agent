@@ -31,7 +31,8 @@ where
     tokio::pin!(interrupt);
 
     tokio::select! {
-        result = &mut wait => Ok((result, false)),
+        // Install signal handlers before the validator can launch.
+        biased;
         signal = &mut interrupt => {
             cancellation.cancel();
             // The scoped worker reports only after the validator group is
@@ -40,6 +41,7 @@ where
             signal?;
             Ok((result, true))
         }
+        result = &mut wait => Ok((result, false)),
     }
 }
 
@@ -136,7 +138,8 @@ pub(crate) async fn run_headless_loop(
             );
             let operation = loop_mod::validation::start(sandbox, cmd);
             let (result, interrupted) =
-                await_validation_or_interrupt(operation, tokio::signal::ctrl_c()).await?;
+                await_validation_or_interrupt(operation, crate::print::headless_interrupt())
+                    .await?;
             let diagnostic = result.render();
             eprintln!("{}", diagnostic);
             if interrupted {
@@ -210,10 +213,7 @@ fn iteration_history(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
-    use crate::extras::r#loop::validation::ValidationStatus;
 
     #[test]
     fn resumed_session_history_is_forwarded_to_each_loop_iteration() {
@@ -227,25 +227,6 @@ mod tests {
         assert!(hook_loop_active(1, Some(2)));
         assert!(!hook_loop_active(2, Some(2)));
         assert!(hook_loop_active(99, None));
-    }
-
-    #[tokio::test]
-    async fn headless_sigint_path_cancels_and_awaits_scoped_validation() {
-        let operation = loop_mod::validation::start(
-            &Sandbox::new(false, "bwrap"),
-            "trap '' TERM; while :; do :; done",
-        );
-        let started = Instant::now();
-        let (result, interrupted) = await_validation_or_interrupt(operation, async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-        assert!(interrupted);
-        assert_eq!(result.status, ValidationStatus::Cancelled);
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 

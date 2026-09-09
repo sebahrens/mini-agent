@@ -60,6 +60,35 @@ where
     result
 }
 
+/// Let the runner observe cancellation and return its partial transcript before
+/// waiting for tool and hook cleanup. Dropping the whole turn would lose it.
+pub(crate) async fn run_headless_turn<F>(turn: F) -> crate::agent::runner::HeadlessTurn
+where
+    F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
+{
+    let scope = crate::agent::runner::AgentWorkScope::new();
+    let result = scope
+        .run(async {
+            tokio::pin!(turn);
+            tokio::select! {
+                biased;
+                signal = headless_interrupt() => {
+                    scope.cancellation_handle().cancel();
+                    let mut result = turn.await;
+                    if let Err(error) = signal {
+                        result.failure = Some(anyhow::anyhow!(error).context("headless signal handler failed"));
+                    }
+                    result
+                }
+                result = &mut turn => result,
+            }
+        })
+        .await;
+    scope.cancellation_handle().cancel();
+    scope.wait_idle().await;
+    result
+}
+
 /// Char-safe short preview of a session id for listings. Ids are normally
 /// 32 hex chars, but imported sessions (`/import`) may carry shorter or
 /// non-ASCII ids, where a byte slice (`&id[..8]`) would panic.
@@ -884,6 +913,44 @@ mod tests {
         installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
         render_headless_json, write_output,
     };
+
+    #[tokio::test]
+    async fn headless_turn_settles_registered_blocking_work_before_returning() {
+        use std::time::Duration;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut turn = tokio::spawn(super::run_headless_turn(async move {
+            std::mem::drop(crate::agent::runner::spawn_blocking_scoped(move || {
+                let _ = started_tx.send(());
+                // Dropping the sender during assertion unwinding also releases
+                // the worker, so a failing negative control cannot hang Tokio.
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            }));
+            crate::agent::runner::HeadlessTurn {
+                response: "done".to_owned(),
+                usage: Usage::default(),
+                interactions: Vec::new(),
+                failure: None,
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut turn)
+                .await
+                .is_err(),
+            "headless result returned while registered blocking work was live"
+        );
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.response, "done");
+        assert!(result.failure.is_none());
+    }
 
     struct BrokenPipeWriter;
 
