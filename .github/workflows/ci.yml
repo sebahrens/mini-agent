@@ -435,7 +435,7 @@ jobs:
           rustflags: ''
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: bash scripts/install-ci-bubblewrap.sh
 
       - name: Enable the hosted runner's unprivileged namespace boundary
         shell: bash
@@ -2057,7 +2057,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install packaged-runtime containment dependency
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: bash scripts/install-ci-bubblewrap.sh
 
       - name: Enable the hosted runner's unprivileged namespace boundary
         shell: bash

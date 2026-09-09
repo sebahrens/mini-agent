@@ -493,7 +493,7 @@ steps:
         mutations = (
             ('--expect-js "$JS_EXPECTATION"', "--expect-js no"),
             ('js_expectation: "unavailable"', 'js_expectation: "yes"'),
-            ("sudo apt-get install -y bubblewrap", "true # skipped bubblewrap"),
+            ("bash scripts/install-ci-bubblewrap.sh", "true # skipped bubblewrap"),
             (
                 "kernel.apparmor_restrict_unprivileged_userns=0",
                 "true # skipped user namespace enablement",

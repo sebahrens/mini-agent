@@ -97,6 +97,14 @@ Static musl builds also pin the `cross` CLI version and both cross-rs container 
 `Cross.toml`. Update those digests only after reviewing the upstream image definition and resolving
 the intended published tag to its platform-specific immutable digest.
 
+Linux sandbox CI, packaged-runtime CI, and native release smoke tests install bubblewrap through
+`scripts/install-ci-bubblewrap.sh`. It scopes both APT refresh and installation to the hosted
+Ubuntu image's `/etc/apt/sources.list.d/ubuntu.sources`, excluding unrelated vendor repositories
+without changing package authentication. A missing source file, refresh/install failure, or failed
+`bwrap --version` stops the job. Custom CI images can pass an absolute Ubuntu source-file path to
+the helper. The hosted image's source-file layout is documented in its
+[APT configuration script](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/configure-apt.sh).
+
 The package metadata policy enforces both the release pins and the Dependabot configuration:
 
 ```bash

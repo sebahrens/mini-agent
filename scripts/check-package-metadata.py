@@ -456,7 +456,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
     archive_smoke_fragments = (
         "needs: [package-metadata, build, build-static, build-windows]",
         "name: archives-${{ matrix.target }}",
-        "sudo apt-get install -y bubblewrap",
+        "bash scripts/install-ci-bubblewrap.sh",
         "kernel.apparmor_restrict_unprivileged_userns=0",
         "python3 scripts/release_artifacts.py smoke \\",
         'js_expectation: "unavailable"',
@@ -1044,7 +1044,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "npm run package:linux-x64",
             "npm run sbom",
             "Install packaged-runtime containment dependency",
-            "sudo apt-get update && sudo apt-get install -y bubblewrap",
+            "bash scripts/install-ci-bubblewrap.sh",
             "kernel.apparmor_restrict_unprivileged_userns=0",
         ),
         "src/product.rs": (

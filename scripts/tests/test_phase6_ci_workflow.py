@@ -4,6 +4,11 @@
 from __future__ import annotations
 
 import re
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -439,6 +444,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
 
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
+        self.assertIn("bash scripts/install-ci-bubblewrap.sh", linux)
         self.assertIn("kernel.apparmor_restrict_unprivileged_userns", linux)
         self.assertIn(
             "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
@@ -583,6 +589,55 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("name: js-worker-resource-baseline", body)
         self.assertIn("js-worker-baseline.json", body)
         self.assertIn("if-no-files-found: error", body)
+
+
+class BubblewrapInstallerTests(unittest.TestCase):
+    def test_isolated_sources_and_failures_preserve_the_install_gate(self) -> None:
+        for failure in ["none", "update", "install", "probe", "missing"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sources = root / "ubuntu sources.sources"
+                if failure != "missing":
+                    sources.write_text("Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\nSuites: noble\nComponents: universe\n")
+                log = root / "calls.jsonl"
+                binaries = root / "bin"
+                binaries.mkdir()
+                sudo = binaries / "sudo"
+                sudo.write_text('#!/bin/sh\nexec "$@"\n')
+                sudo.chmod(0o755)
+                command = (
+                    f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
+                    "name=Path(sys.argv[0]).name\nargs=sys.argv[1:]\n"
+                    "options={}\n"
+                    "while args and args[0]=='-o':\n"
+                    " key,value=args[1].split('=',1); options[key]=value; args=args[2:]\n"
+                    "phase=args[0] if name=='apt-get' else 'probe'\n"
+                    f"with open({str(log)!r},'a') as handle: handle.write(json.dumps([phase,options,args])+'\\n')\n"
+                    "if name=='apt-get':\n"
+                    f" if options!={{'Dir::Etc::sourcelist':{str(sources)!r},'Dir::Etc::sourceparts':'-'}}:\n"
+                    "  print('unrelated vendor repository hash mismatch',file=sys.stderr); sys.exit(100)\n"
+                    f"if phase=={failure!r}: sys.exit(19)\n"
+                    "if name=='bwrap': print('bubblewrap fixture')\n"
+                )
+                for name in ["apt-get", "bwrap"]:
+                    stub = binaries / name
+                    stub.write_text(command)
+                    stub.chmod(0o755)
+                completed = subprocess.run(
+                    ["bash", str(REPOSITORY_ROOT / "scripts/install-ci-bubblewrap.sh"), str(sources)],
+                    env={**os.environ, "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", "")},
+                    capture_output=True, text=True, timeout=5,
+                )
+                expected_phases = {"none": ["update", "install", "probe"], "update": ["update"],
+                                   "install": ["update", "install"], "probe": ["update", "install", "probe"], "missing": []}
+                calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+                self.assertEqual([call[0] for call in calls], expected_phases[failure], completed.stderr)
+                self.assertEqual(completed.returncode, 0 if failure == "none" else 2 if failure == "missing" else 19,
+                                 completed.stderr)
+                if len(calls) >= 2:
+                    self.assertEqual(calls[1][2], ["install", "-y", "bubblewrap"])
+                if failure == "none":
+                    self.assertIn("bubblewrap fixture", completed.stdout)
 
 
 if __name__ == "__main__":

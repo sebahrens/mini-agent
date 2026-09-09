@@ -334,8 +334,7 @@ jobs:
       - name: Prepare Linux worker containment
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          bash scripts/install-ci-bubblewrap.sh
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
