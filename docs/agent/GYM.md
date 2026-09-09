@@ -164,9 +164,10 @@ For each task and each arm the runner:
 7. removes the worktree, runs `git worktree prune`, and deletes the run tree in a `finally`, so
    these cleanup steps also run after a timeout or install failure.
 
-Agent, library-install, and command-oracle output is drained concurrently, retaining only the last
-2,000 bytes of each stream. Timeout diagnostics use those same tails. The exit deadline still
-applies if a process closes its output pipes early.
+Agent, library-install, and command-oracle output in both training and task mining is drained
+concurrently by [process_capture.py](../../scripts/gym/process_capture.py), retaining only the last
+2,000 bytes of each stream. Git data queries retain their complete output. Timeout diagnostics use
+those same tails. The exit deadline still applies if a process closes its output pipes early.
 Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
 groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.
 

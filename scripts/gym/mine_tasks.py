@@ -15,10 +15,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+if __package__:
+    from .process_capture import OUTPUT_TAIL_BYTES, run_bounded
+else:
+    from process_capture import OUTPUT_TAIL_BYTES, run_bounded
+
 SCHEMA_VERSION = 1
 MAX_BLOB_BYTES = 256_000
 ORACLE_TIMEOUT_SECS = 300
-STDERR_TAIL_BYTES = 2000
 DEFAULT_BUDGETS = {"max_provider_turns": 12, "max_tool_calls": 24, "max_total_tokens": 16000}
 # Only these variables reach a mined oracle run, matching the training runner.
 BASE_ENV_ALLOWLIST = (
@@ -47,7 +51,7 @@ def out(result: subprocess.CompletedProcess[bytes]) -> str:
     return result.stdout.decode("utf-8", errors="replace")
 
 
-def tail_text(data: bytes | None, limit: int = STDERR_TAIL_BYTES) -> str:
+def tail_text(data: bytes | None, limit: int = OUTPUT_TAIL_BYTES) -> str:
     return data[-limit:].decode("utf-8", errors="replace").strip() if data else ""
 
 
@@ -136,11 +140,10 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
             print(f"gym mine: worktree add {revision} failed: {tail_text(added.stderr)}", file=sys.stderr)
             return False
         try:
-            result = subprocess.run(
+            result = run_bounded(
                 ["/bin/sh", "-c", command],
                 cwd=worktree,
                 env=isolated_env(root),
-                capture_output=True,
                 timeout=ORACLE_TIMEOUT_SECS,
             )
         except subprocess.TimeoutExpired:

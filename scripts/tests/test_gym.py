@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-import importlib.util
+import contextlib
+import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
-import tracemalloc
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from scripts.gym import mine_tasks as MINE
+from scripts.gym import train as TRAIN_MODULE
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,17 +34,6 @@ def scratch_outside_tmp() -> tempfile.TemporaryDirectory:
     """
     return tempfile.TemporaryDirectory(prefix=".gym-setup-", dir=ROOT)
 
-
-def load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-MINE = load("gym_mine_tasks", ROOT / "scripts/gym/mine_tasks.py")
-TRAIN_MODULE = load("gym_train", TRAIN)
 
 DB_HELPER = """
 import pathlib
@@ -289,6 +284,7 @@ class GymFileOracleTests(unittest.TestCase):
             os.mkfifo(workspace / "result.txt")
             script = (
                 "import importlib.util,json,sys; from pathlib import Path; "
+                "sys.path.insert(0,str(Path(sys.argv[1]).parent)); "
                 "spec=importlib.util.spec_from_file_location('train',sys.argv[1]); "
                 "train=importlib.util.module_from_spec(spec); spec.loader.exec_module(train); "
                 "print(json.dumps(train.run_oracle({'expected_files': {'result.txt':'ok'}},Path(sys.argv[2]),{})))"
@@ -566,12 +562,46 @@ class GymTrainerTests(unittest.TestCase):
 
 
 class GymMinerTests(unittest.TestCase):
+    def test_miner_oracle_floods_are_bounded_and_worktrees_are_cleaned(self) -> None:
+        for outcome in ["success", "failure", "timeout"]:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                revision = git(repo, "rev-parse", "HEAD").strip()
+                code = (
+                    "import os,sys,time\n"
+                    "for _ in range(64): os.write(1,b'x'*65536); os.write(2,b'y'*65536)\n"
+                    "os.write(2,b'stderr-end\\n')\n"
+                    "if sys.argv[1]=='timeout': time.sleep(30)\n"
+                    "sys.exit(7 if sys.argv[1]=='failure' else 0)"
+                )
+                command = "exec " + shlex.join([sys.executable, "-c", code, outcome])
+                with mock.patch.object(MINE, "ORACLE_TIMEOUT_SECS", 1 if outcome == "timeout" else 5):
+                    with contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                        tracemalloc.start()
+                        try:
+                            result = MINE.oracle_at(repo, revision, command)
+                            peak = tracemalloc.get_traced_memory()[1]
+                        finally:
+                            tracemalloc.stop()
+                self.assertEqual(result, outcome == "success")
+                self.assertLess(peak, 1024 * 1024, "miner retained complete oracle output")
+                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                if outcome == "success":
+                    self.assertEqual(diagnostic.getvalue(), "")
+                elif outcome == "failure":
+                    self.assertIn("oracle exited 7", diagnostic.getvalue())
+                    self.assertTrue(diagnostic.getvalue().endswith("stderr-end\n"))
+                    self.assertLess(len(diagnostic.getvalue()), 2100)
+                else:
+                    self.assertIn("oracle timed out after 1s", diagnostic.getvalue())
+
     def test_miner_preserves_crlf_and_reports_deletions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
             git(repo, "config", "core.autocrlf", "false")
-            (repo / "value.txt").write_bytes(b"broken\r\n")
+            (repo / "value.txt").write_bytes(b"broken\r\n" * 512)
             (repo / "gone.txt").write_text("bye\n", encoding="utf-8")
             (repo / "binary.bin").write_bytes(b"\x00\xff\xfe")
             nested = repo / ".github" / "workflows"
@@ -580,7 +610,7 @@ class GymMinerTests(unittest.TestCase):
             git(repo, "add", "-A")
             git(repo, "commit", "-qm", "setup")
             parent = git(repo, "rev-parse", "HEAD").strip()
-            (repo / "value.txt").write_bytes(b"fixed\r\n")
+            (repo / "value.txt").write_bytes(b"fixed\r\n" * 512)
             (repo / "gone.txt").unlink()
             (repo / "binary.bin").write_bytes(b"\x00\xff\xfd")
             (nested / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
@@ -589,8 +619,8 @@ class GymMinerTests(unittest.TestCase):
             commit = git(repo, "rev-parse", "HEAD").strip()
 
             before, after, deleted = MINE.changed_text_files(repo, parent, commit)
-            self.assertEqual(before["value.txt"], "broken\r\n")
-            self.assertEqual(after["value.txt"], "fixed\r\n")
+            self.assertEqual(before["value.txt"], "broken\r\n" * 512)
+            self.assertEqual(after["value.txt"], "fixed\r\n" * 512)
             self.assertEqual(deleted, ["gone.txt"])
             self.assertEqual(before["gone.txt"], "bye\n")
             self.assertNotIn("gone.txt", after)
@@ -789,6 +819,17 @@ class GymEntrypointTests(unittest.TestCase):
     def test_shell_entrypoints_are_syntax_valid(self) -> None:
         for script in (SETUP, ROOT / "scripts/gym/train.sh"):
             subprocess.run(["bash", "-n", str(script)], check=True)
+
+    def test_python_entrypoints_load_shared_capture_outside_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for script, option in [(TRAIN, "--tasks"), (ROOT / "scripts/gym/mine_tasks.py", "--oracle-map")]:
+                with self.subTest(script=script.name):
+                    completed = subprocess.run(
+                        [sys.executable, str(script), "--help"], cwd=directory,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertIn(option, completed.stdout)
 
     def test_setup_installs_and_preflights_with_the_same_feature_set(self) -> None:
         # Behavioural: the argv `setup.sh` really hands cargo, not a substring
