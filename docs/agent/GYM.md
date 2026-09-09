@@ -116,7 +116,11 @@ Each `map.json` value is either an oracle command string or an object with `comm
 the **oldest** commit reachable from `--main-ref` whose message mentions the bead id, so a
 follow-up mention or an abandoned branch cannot be selected. Every bead that cannot be turned into
 a task is reported on stderr with the reason (no matching commit, unresolvable base, oracle already
-green at base, oracle not green at the fix, or no bounded text delta).
+green at base, oracle not green at the fix, checkout unavailable, or no bounded text delta).
+Checkout failures provide no oracle evidence: the candidate is skipped if either revision cannot
+be checked out. Cleanup also removes a partially created worktree when a post-checkout hook fails,
+including its Git registration. Command timeouts remain reported oracle failures, allowing tasks
+that fix hangs or excessive runtime; the fix revision must complete successfully within the limit.
 
 Diffs are captured as bytes and decoded as strict UTF-8, so CRLF files survive verbatim and binary
 blobs are skipped rather than raising. Both the parent and child blob are bounded at 256000 bytes:

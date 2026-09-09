@@ -562,6 +562,32 @@ class GymTrainerTests(unittest.TestCase):
 
 
 class GymMinerTests(unittest.TestCase):
+    def test_checkout_failures_skip_tasks_and_clean_partial_worktrees(self) -> None:
+        for failed_content in ["broken", "fixed"]:
+            with self.subTest(failed_content=failed_content), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                parent = git(repo, "rev-parse", "HEAD").strip()
+                (repo / "value.txt").write_text("fixed\n", encoding="utf-8")
+                git(repo, "commit", "-qam", "fix mini-agent-test")
+                commit = git(repo, "rev-parse", "HEAD").strip()
+                hook = repo / ".git" / "hooks" / "post-checkout"
+                hook.write_text(f"#!/bin/sh\n! grep -qx {failed_content} value.txt\n", encoding="utf-8")
+                hook.chmod(0o755)
+                beads = root / "beads.jsonl"
+                beads.write_text(json.dumps({"id": "mini-agent-test", "status": "closed"}) + "\n", encoding="utf-8")
+                # At the base, even an always-green oracle must not be mined
+                # when checkout fails. At the fix, exercise a real base failure
+                # followed by an unavailable fix checkout.
+                command = "true" if failed_content == "broken" else "grep -qx fixed value.txt"
+                tasks, skipped = MINE.mine(repo, {"mini-agent-test": command}, True, 10, "main", beads)
+                self.assertEqual(tasks, [])
+                self.assertEqual(len(skipped), 1)
+                failed_revision = parent if failed_content == "broken" else commit
+                self.assertIn(f"worktree add {failed_revision} failed", skipped[0])
+                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                self.assertEqual((repo / "value.txt").read_text(), "fixed\n")
+
     def test_miner_oracle_floods_are_bounded_and_worktrees_are_cleaned(self) -> None:
         for outcome in ["success", "failure", "timeout"]:
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
@@ -800,7 +826,7 @@ class GymMinerTests(unittest.TestCase):
         self.assertEqual(bare, "just a title")
         self.assertEqual(MINE.mined_prompt({"id": "mini-agent-test"}), "mini-agent-test")
 
-    def test_mined_tasks_use_the_composed_prompt(self) -> None:
+    def test_miner_emits_a_loadable_document_with_the_composed_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = make_repo(root)
@@ -827,22 +853,6 @@ class GymMinerTests(unittest.TestCase):
             prompt = str(tasks[0]["prompt"])
             self.assertIn("The import left value.txt reading broken.", prompt)
             self.assertIn("grep -qx fixed value.txt passes.", prompt)
-
-    def test_miner_emits_a_loadable_document_for_a_real_fix_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            (repo / "value.txt").write_text("fixed\n", encoding="utf-8")
-            git(repo, "commit", "-qam", "fix mini-agent-test")
-            beads = root / "beads.jsonl"
-            beads.write_text(
-                json.dumps({"id": "mini-agent-test", "title": "make value.txt say fixed", "status": "closed"}) + "\n",
-                encoding="utf-8",
-            )
-            tasks, skipped = MINE.mine(
-                repo, {"mini-agent-test": "grep -qx fixed value.txt"}, True, 10, "main", beads
-            )
-            self.assertEqual(skipped, [])
             self.assertEqual(len(tasks), 1)
             output = root / "tasks.json"
             output.write_text(json.dumps(MINE.document(tasks)), encoding="utf-8")

@@ -41,6 +41,10 @@ BASE_ENV_ALLOWLIST = (
 )
 
 
+class OracleSetupError(RuntimeError):
+    """The oracle could not run, so there is no fail-to-pass evidence."""
+
+
 def run(argv: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
     result = subprocess.run(argv, cwd=cwd, capture_output=True)
     if check:
@@ -153,13 +157,12 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
     with tempfile.TemporaryDirectory(prefix="mini-agent-gym-mine-") as directory:
         root = Path(directory)
         worktree = root / "worktree"
-        added = subprocess.run(
-            ["git", "worktree", "add", "--detach", str(worktree), revision], cwd=repo, capture_output=True
-        )
-        if added.returncode:
-            print(f"gym mine: worktree add {revision} failed: {tail_text(added.stderr)}", file=sys.stderr)
-            return False
         try:
+            added = subprocess.run(
+                ["git", "worktree", "add", "--detach", str(worktree), revision], cwd=repo, capture_output=True
+            )
+            if added.returncode:
+                raise OracleSetupError(f"worktree add {revision} failed: {tail_text(added.stderr)}")
             result = run_bounded(
                 ["/bin/sh", "-c", command],
                 cwd=worktree,
@@ -170,6 +173,8 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
             print(f"gym mine: oracle timed out after {ORACLE_TIMEOUT_SECS}s at {revision[:12]}", file=sys.stderr)
             return False
         finally:
+            # A failing post-checkout hook can make add fail after registering
+            # the worktree. Remove that partial checkout before its temp root.
             subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
             subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)
         if result.returncode:
@@ -338,11 +343,15 @@ def mine(
             skipped.append(f"{bead_id}: {reason}")
             continue
         if validate:
-            if oracle_at(repo, parent, command):
-                skipped.append(f"{bead_id}: oracle already passes at base {parent[:12]}")
-                continue
-            if not oracle_at(repo, commit, command):
-                skipped.append(f"{bead_id}: oracle does not pass at fix {commit[:12]}")
+            try:
+                if oracle_at(repo, parent, command):
+                    skipped.append(f"{bead_id}: oracle already passes at base {parent[:12]}")
+                    continue
+                if not oracle_at(repo, commit, command):
+                    skipped.append(f"{bead_id}: oracle does not pass at fix {commit[:12]}")
+                    continue
+            except OracleSetupError as error:
+                skipped.append(f"{bead_id}: {error}")
                 continue
         initial, expected, deleted = changed_text_files(repo, parent, commit)
         if not expected:
