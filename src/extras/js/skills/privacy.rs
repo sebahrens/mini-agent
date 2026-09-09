@@ -16,13 +16,52 @@ static PRIVATE_KEY_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
 /// doubled quotes are included so they cannot hide the pair from the matcher.
 /// The scheme prefix also covers `Authorization: Bearer <token>`.
 static LABELED_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r#"(?i)(?P<prefix>["']?\b(?:api[_-]?key|apikey|access[_-]?token|"#,
-        r#"refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|"#,
-        r#"token|password|passwd|secret|authorization)\b["']?\s*[:=]\s*)"#,
-        r#"(?P<value>"(?:\\(?s:.|$)|[^"\\])*(?:"|$)|"#,
-        r#"'(?:\\*''|\\(?s:.|$)|[^'\\])*(?:'|$)|"#,
-        r#"(?:bearer\s+|basic\s+|token\s+)?[^"',;\s}\[\]]+)"#,
+    // Expand the fixed ASCII names once, rather than decoding/re-serializing
+    // arbitrary input. A JSON key can escape any letter or separator, and its
+    // original spelling must survive redaction. Underscores denote optional
+    // underscore/hyphen separators, including their JSON escape forms.
+    let labels = [
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "client_secret",
+        "private_key",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "authorization",
+    ]
+    .map(|label| {
+        label
+            .bytes()
+            .map(|byte| {
+                if byte == b'_' {
+                    r"(?:[_-]|\\u005f|\\u002d)?".to_string()
+                } else {
+                    format!(
+                        r"(?:{}|\\u{:04x}|\\u{:04x})",
+                        char::from(byte),
+                        byte,
+                        byte.to_ascii_uppercase()
+                    )
+                }
+            })
+            .collect::<String>()
+    })
+    .join("|");
+    // A fully quoted name can start with an escape, which has no leading word
+    // boundary. Retain the bare/suffix branch for headers such as X-API-Key.
+    let prefix =
+        format!(r#"(?i)(?P<prefix>(?:["'](?:{labels})["']|["']?\b(?:{labels})\b["']?)\s*[:=]\s*)"#);
+    Regex::new(&format!(
+        "{prefix}{}",
+        concat!(
+            r#"(?P<value>"(?:\\(?s:.|$)|[^"\\])*(?:"|$)|"#,
+            r#"'(?:\\*''|\\(?s:.|$)|[^'\\])*(?:'|$)|"#,
+            r#"(?:bearer\s+|basic\s+|token\s+)?[^"',;\s}\[\]]+)"#,
+        )
     ))
     .expect("static labeled credential regex")
 });
@@ -62,9 +101,6 @@ impl Redactor {
 
     pub fn redact(&self, input: &str) -> String {
         let mut value = input.to_string();
-        for secret in &self.exact_secrets {
-            value = value.replace(secret, "[REDACTED]");
-        }
         // Redact common credential shapes without retaining the value. The
         // block form runs first so a labelled `private_key: -----BEGIN ...`
         // cannot leave the body behind.
@@ -88,6 +124,11 @@ impl Redactor {
         value = PREFIXED_CREDENTIAL
             .replace_all(&value, "[REDACTED]")
             .into_owned();
+        // Substituting exact secrets earlier could hide a credential label or
+        // introduce a delimiter inside its value before the shape is matched.
+        for secret in &self.exact_secrets {
+            value = value.replace(secret, "[REDACTED]");
+        }
         truncate_utf8(&value, self.max_bytes)
     }
 

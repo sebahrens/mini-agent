@@ -250,12 +250,123 @@ fn feedback_redaction_removes_unconfigured_credential_shapes() {
 }
 
 #[test]
+fn feedback_redaction_recognizes_escaped_json_credential_names() {
+    let redactor = Redactor::new(vec![], 4096);
+    for label in [
+        "API_KEY",
+        "api-key",
+        "apikey",
+        "access_token",
+        "access-token",
+        "accessToken",
+        "refresh_token",
+        "refresh-token",
+        "refreshToken",
+        "id_token",
+        "id-token",
+        "idToken",
+        "client_secret",
+        "client-secret",
+        "clientSecret",
+        "private_key",
+        "private-key",
+        "privateKey",
+        "token",
+        "password",
+        "PASSWD",
+        "secret",
+        "Authorization",
+    ] {
+        // Escape each position independently, then the whole name. These are
+        // equivalent JSON keys, including optional separators and uppercase.
+        for escaped_at in (0..label.len()).map(Some).chain(std::iter::once(None)) {
+            let encoded: String = label
+                .bytes()
+                .enumerate()
+                .map(|(index, byte)| {
+                    if escaped_at.is_none_or(|position| position == index) {
+                        format!(r"\u{byte:04X}")
+                    } else {
+                        char::from(byte).to_string()
+                    }
+                })
+                .collect();
+            let input = format!(r#"{{"{encoded}":"key-canary","count":2}}"#);
+            let parsed: serde_json::Value = serde_json::from_str(&input).unwrap();
+            assert_eq!(
+                parsed[label], "key-canary",
+                "the fixture must encode {label}"
+            );
+            assert_eq!(
+                redactor.redact(&input),
+                format!(r#"{{"{encoded}":"[REDACTED]","count":2}}"#),
+                "{input}"
+            );
+        }
+    }
+    for (input, expected) in [
+        (
+            r#"before {"pass\u0077ord":"escaped-key-canary","count":2} after"#,
+            r#"before {"pass\u0077ord":"[REDACTED]","count":2} after"#,
+        ),
+        (
+            r#"{"payload":{"\u0070assword":"nested-canary"},"count":2}"#,
+            r#"{"payload":{"\u0070assword":"[REDACTED]"},"count":2}"#,
+        ),
+        (
+            r#"{"X-API-Key":"header-canary","X-API-\u004Bey":"escaped-header-canary"}"#,
+            r#"{"X-API-Key":"[REDACTED]","X-API-\u004Bey":"[REDACTED]"}"#,
+        ),
+        (
+            r#"{"pass\u0077ord_hint":"safe","tokenizer":"safe","notasecret":"safe","\\u0070assword":"safe"}"#,
+            r#"{"pass\u0077ord_hint":"safe","tokenizer":"safe","notasecret":"safe","\\u0070assword":"safe"}"#,
+        ),
+    ] {
+        assert_eq!(redactor.redact(input), expected);
+    }
+}
+
+#[test]
+fn feedback_redaction_keeps_shape_detection_intact_with_configured_secrets() {
+    for (secret, input, expected) in [
+        (
+            "SPLIT",
+            "password=beforeSPLITafter; status=ok",
+            "password=[REDACTED]; status=ok",
+        ),
+        (
+            "word",
+            "password=label-canary; status=ok",
+            "pass[REDACTED]=[REDACTED]; status=ok",
+        ),
+        (
+            "sk-",
+            "used sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789; status=ok",
+            "used [REDACTED]; status=ok",
+        ),
+        (
+            "BEGIN",
+            "-----BEGIN PRIVATE KEY-----\nPRIVATE-BODY-CANARY\n-----END PRIVATE KEY-----; status=ok",
+            "[REDACTED PRIVATE KEY]; status=ok",
+        ),
+        (
+            "standalone-canary",
+            "used standalone-canary; status=ok",
+            "used [REDACTED]; status=ok",
+        ),
+    ] {
+        let redactor = Redactor::new(vec![secret.into()], 4096);
+        assert_eq!(redactor.redact(input), expected, "configured {secret}");
+    }
+}
+
+#[test]
 fn stored_feedback_text_never_retains_an_unconfigured_credential() {
     let (_root, mut store, skill, invocation) = fixture();
     let actor = owner(&skill.id);
     let mut command = negative_command(&skill.id, &invocation, "text-leak");
     command.reason_text = Some(
-        r#"wrong output; repro used {"password":"feedback first; feedback-tail-canary"} and password: 'first''YAML-PAST-QUOTE-CANARY' and Authorization: Bearer abcdefghijklmnop012345"#.into(),
+        r#"wrong output; repro used {"password":"feedback first; feedback-tail-canary","pass\u0077ord":"ESCAPED-KEY-CANARY"} and password: 'first''YAML-PAST-QUOTE-CANARY' and Authorization: Bearer abcdefghijklmnop012345"#.into(),
     );
     let id = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
         .submit(&actor, &command, 2)
@@ -272,6 +383,7 @@ fn stored_feedback_text_never_retains_an_unconfigured_credential() {
     assert!(!stored.contains("feedback first"), "{stored}");
     assert!(!stored.contains("feedback-tail-canary"), "{stored}");
     assert!(!stored.contains("YAML-PAST-QUOTE-CANARY"), "{stored}");
+    assert!(!stored.contains("ESCAPED-KEY-CANARY"), "{stored}");
     assert!(stored.contains("wrong output"), "{stored}");
 }
 

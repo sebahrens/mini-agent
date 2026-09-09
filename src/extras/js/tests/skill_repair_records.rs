@@ -76,6 +76,9 @@ fn repair_record_persists_and_phase4_adapter_links_quarantined_predecessor() {
         )
         .unwrap();
     let mut repair_input = input("REPAIR-JSON-CANARY");
+    repair_input.argument_shape = Some(
+        r#"{"argc":1,"token":"REPAIR-JSON-CANARY","\u0063lient_secret":"REPAIR-ESCAPED-KEY-CANARY"}"#.into(),
+    );
     repair_input.failing_skill_id = predecessor.id.clone();
     repair_input.direct_outcome = "exception password: 'first''REPAIR-YAML-CANARY'".into();
     let record = create_record(repair_input, &Redactor::new(vec![], 1_024)).unwrap();
@@ -94,7 +97,11 @@ fn repair_record_persists_and_phase4_adapter_links_quarantined_predecessor() {
     assert_eq!(outcome, "exception password: '[REDACTED]'");
     let shape: serde_json::Value =
         serde_json::from_str(payload["argument_shape"].as_str().unwrap()).unwrap();
-    assert_eq!(shape, serde_json::json!({"argc": 1, "token": "[REDACTED]"}));
+    assert_eq!(
+        shape,
+        serde_json::json!({"argc": 1, "token": "[REDACTED]", "client_secret": "[REDACTED]"})
+    );
+    assert!(!stored.contains("REPAIR-ESCAPED-KEY-CANARY"), "{stored}");
     submit_repair_proposal(&mut store, &predecessor, &candidate, &record).unwrap();
     let predecessor_link: String = store
         .conn()
