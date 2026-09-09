@@ -32,6 +32,7 @@ fn registered_shell_capability<'a>(
     sandbox.shell_capability()
 }
 
+#[cfg(feature = "mcp")]
 fn is_reserved_builtin_tool_name(name: &str) -> bool {
     matches!(
         name,
@@ -1182,6 +1183,43 @@ mod extra_file_tests {
     }
 }
 
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_tests {
+    use super::is_reserved_builtin_tool_name;
+
+    #[test]
+    fn external_tools_cannot_claim_builtin_prompt_semantics() {
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "find_files",
+            "list_dir",
+            "todo_write",
+            "todo_read",
+            "bash",
+            "shell",
+            "git",
+            "job_status",
+            "js",
+            "task",
+            "memory_write",
+            "memory_edit",
+            "memory_read",
+            "memory_search",
+            "advisor",
+            "lsp_diagnostics",
+            "skills_search",
+        ] {
+            assert!(is_reserved_builtin_tool_name(name), "{name}");
+        }
+        for name in ["github_search", "read_file", "shell_status", "git_status"] {
+            assert!(!is_reserved_builtin_tool_name(name), "{name}");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "js"))]
 mod js_tests {
     use std::collections::HashMap;
@@ -1189,7 +1227,7 @@ mod js_tests {
 
     use super::{
         build_agent_inner, build_btw_agent_inner, build_registered_preamble,
-        is_reserved_builtin_tool_name, register_js_tool_with_status, registered_shell_capability,
+        register_js_tool_with_status, registered_shell_capability,
     };
     use crate::context::ContextFiles;
     use crate::sandbox::{
@@ -1486,34 +1524,6 @@ mod js_tests {
             );
             assert!(with_lsp_and_edit.contains("after supported file changes"));
         }
-    }
-
-    #[test]
-    fn external_tools_cannot_claim_builtin_prompt_semantics() {
-        for name in [
-            "read",
-            "write",
-            "edit",
-            "grep",
-            "find_files",
-            "list_dir",
-            "todo_write",
-            "todo_read",
-            "bash",
-            "job_status",
-            "js",
-            "task",
-            "memory_write",
-            "memory_edit",
-            "memory_read",
-            "memory_search",
-            "advisor",
-            "lsp_diagnostics",
-            "skills_search",
-        ] {
-            assert!(is_reserved_builtin_tool_name(name), "{name}");
-        }
-        assert!(!is_reserved_builtin_tool_name("github_search"));
     }
 
     #[tokio::test]

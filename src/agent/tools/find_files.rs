@@ -733,6 +733,7 @@ impl BoundDirectory {
         Ok(entries)
     }
 
+    #[cfg(feature = "js")]
     pub(crate) fn list_entries_bounded(
         &self,
         max_entries: usize,
@@ -787,6 +788,7 @@ impl BoundDirectory {
     }
 }
 
+#[cfg(feature = "js")]
 pub(crate) struct BoundDiscoveryEntry {
     pub(crate) file_name: OsString,
     pub(crate) is_directory: bool,

@@ -377,6 +377,7 @@ impl Config {
     /// what the turn actually cost. OpenAI (Responses and Chat Completions),
     /// Anthropic and the OpenAI-compatible gateways all fold reasoning into
     /// `output_tokens` — adding it there charges the same tokens twice.
+    #[cfg(any(test, feature = "subagents"))]
     pub fn reasoning_tokens_are_exclusive_of_output(&self, provider: &str) -> bool {
         let kind_name = self
             .custom_providers

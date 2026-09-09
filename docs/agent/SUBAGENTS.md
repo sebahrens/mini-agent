@@ -43,6 +43,10 @@ default = ["loop", "git-worktree", "mcp", "acp", "subagents", "archmd",
            "status-signals", "multithread", "export", "js", "sandbox", "memory"]
 ```
 
+Task-specific schema/provenance adapters and reasoning-budget accounting follow
+the `subagents` feature; portable metadata and provider tests retain their helpers.
+Main-agent definition loading remains available when subagents are disabled.
+
 ## The `task` Tool
 
 The main agent has a new tool called `task`. It accepts:

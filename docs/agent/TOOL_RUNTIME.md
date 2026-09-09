@@ -7,6 +7,11 @@ description, and JSON parameter schema once, then returns owned clones when Rig
 requests provider definitions on later completion turns. Calls and structured
 results are delegated unchanged to the original tool.
 
+MCP collection rejects names reserved for built-in tools, including optional tools
+whose features are disabled. The reserved-name policy and its test matrix compile
+with `mcp`, independently of `js`. The JS directory-discovery adapter compiles
+with `js`; ordinary `find_files` and `list_dir` retain their shared directory access.
+
 `/editsys` rebuilds the agent immediately after changing the edit system, so the memoized
 `read`/`edit` definitions and their runtime behavior always switch together.
 

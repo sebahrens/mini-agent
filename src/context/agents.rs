@@ -324,6 +324,7 @@ impl AgentDefinition {
         }
     }
 
+    #[cfg(any(test, feature = "subagents"))]
     pub fn project_override_path(&self, name: &str) -> Option<PathBuf> {
         match &self.source {
             AgentDefinitionSource::ProjectOverride { directory } => {
@@ -348,6 +349,7 @@ impl AgentDefinition {
         }
     }
 
+    #[cfg(any(test, feature = "subagents"))]
     pub(crate) fn result_notice(&self, name: &str) -> Option<String> {
         let mut notices = self.ignored_definition_notices.clone();
         if let Some(path) = self.project_override_path(name) {
@@ -365,6 +367,7 @@ impl AgentDefinition {
         (!notices.is_empty()).then(|| notices.join("\n"))
     }
 
+    #[cfg(any(test, feature = "subagents"))]
     fn one_line_description(&self) -> String {
         if let Some(description) = &self.description {
             return description.clone();
@@ -651,10 +654,12 @@ fn load_for_paths_and_workspace(
 }
 
 /// Look up the system prompt and its provenance for a named agent type.
+#[cfg(any(test, feature = "subagents"))]
 pub fn lookup(name: &str) -> Option<AgentDefinition> {
     load().remove(name)
 }
 
+#[cfg(any(test, feature = "subagents"))]
 pub(crate) fn available_names_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> Vec<String> {
@@ -668,6 +673,7 @@ pub(crate) fn available_names_for_workspace(
     names
 }
 
+#[cfg(feature = "subagents")]
 pub(crate) fn available_schema_entries_for_workspace(
     workspace: Option<&crate::paths::WorkspaceBinding>,
 ) -> Vec<(String, String)> {
@@ -683,6 +689,7 @@ pub(crate) fn available_schema_entries_for_workspace(
     entries
 }
 
+#[cfg(any(test, feature = "subagents"))]
 pub(crate) fn lookup_for_workspace(
     name: &str,
     workspace: Option<&crate::paths::WorkspaceBinding>,
@@ -697,6 +704,7 @@ pub(crate) fn lookup_for_workspace(
 /// reading or parsing any persona contents. Permission prompts use this before
 /// a task delegation is authorized; full definition loading happens only
 /// after approval.
+#[cfg(feature = "subagents")]
 pub(crate) fn source_hint_for_workspace(
     name: &str,
     workspace: Option<&crate::paths::WorkspaceBinding>,
