@@ -612,6 +612,15 @@ fn chat_history_path_policy_entry() -> (&'static str, String) {
     )
 }
 
+#[cfg(feature = "advisor")]
+fn advisor_context_limit_entry(kilobytes: u32) -> (&'static str, String) {
+    let per_side = u64::from(kilobytes) * 1024 / 2;
+    (
+        "context-limit",
+        format!("{kilobytes} KB ({per_side} head / {per_side} tail)"),
+    )
+}
+
 fn append_section(output: &mut String, title: &str, entries: &[(&str, String)]) {
     writeln!(output, "{}:", title).expect("writing configuration output to a String cannot fail");
     let width = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -884,15 +893,7 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
                 ("model", advisor_model),
                 ("human-handoff", human_handoff.to_string()),
                 ("max-uses", max_uses),
-                (
-                    "context-limit",
-                    format!(
-                        "{} KB ({} head / {} tail)",
-                        cli.resolve_advisor_kilobytes_limit(cfg),
-                        cli.resolve_advisor_kilobytes_limit(cfg) * 1024 / 2,
-                        cli.resolve_advisor_kilobytes_limit(cfg) * 1024 / 2,
-                    ),
-                ),
+                advisor_context_limit_entry(cli.resolve_advisor_kilobytes_limit(cfg)),
             ],
         );
     }
@@ -1103,6 +1104,25 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "advisor")]
+    #[test]
+    fn config_reports_advisor_limits_without_overflow_across_the_u32_range() {
+        for (kilobytes, expected) in [
+            (0, "0 KB (0 head / 0 tail)"),
+            (256, "256 KB (131072 head / 131072 tail)"),
+            (4_194_304, "4194304 KB (2147483648 head / 2147483648 tail)"),
+            (
+                u32::MAX,
+                "4294967295 KB (2199023255040 head / 2199023255040 tail)",
+            ),
+        ] {
+            assert_eq!(
+                super::advisor_context_limit_entry(kilobytes),
+                ("context-limit", expected.to_owned())
+            );
+        }
     }
 
     #[test]

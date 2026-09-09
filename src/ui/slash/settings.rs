@@ -125,13 +125,11 @@ async fn handle_advisor(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
             };
             let mut cfg = current;
             cfg.human_handoff = new_state;
-            // In human handoff mode, need a handoff_tx; use existing client's
-            // tx or create a new channel
+            // Interactive startup owns a channel independently of the initial mode.
             if new_state && cfg.handoff_tx.is_none() {
-                // Can't create a new handoff channel at runtime without TUI
                 write_error(
                     ctx.renderer,
-                    "Human handoff requires a TUI channel (start with --advisor-human-handoff)",
+                    "Human handoff requires an interactive session",
                 );
                 return Ok(());
             }

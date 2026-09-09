@@ -977,25 +977,17 @@ impl Startup {
                 }
             };
 
-            let (handoff_tx, handoff_rx) = if human_handoff && self.is_interactive {
-                let (tx, rx) = tokio::sync::mpsc::channel(8);
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
-
-            let config = crate::extras::advisor::AdvisorToolConfig {
+            let mut config = crate::extras::advisor::AdvisorToolConfig {
                 client: advisor_client,
                 advisor_model,
                 human_handoff,
                 max_uses,
-                handoff_tx,
+                handoff_tx: None,
                 enabled,
                 kilobytes_limit,
             };
+            self.handoff_rx = config.prepare_handoff_channel(self.is_interactive);
             crate::extras::advisor::init_config(config);
-
-            self.handoff_rx = handoff_rx;
         }
 
         Ok(())

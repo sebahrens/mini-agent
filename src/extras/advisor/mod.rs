@@ -46,6 +46,24 @@ pub struct AdvisorToolConfig {
     pub kilobytes_limit: u32,
 }
 
+impl AdvisorToolConfig {
+    /// Keep the interactive receiver available even when handoff starts disabled,
+    /// so a later mode change can use the same UI-owned channel.
+    pub(crate) fn prepare_handoff_channel(
+        &mut self,
+        is_interactive: bool,
+    ) -> Option<HandoffReceiver> {
+        if is_interactive {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            self.handoff_tx = Some(tx);
+            Some(rx)
+        } else {
+            self.handoff_tx = None;
+            None
+        }
+    }
+}
+
 static CONFIG: Mutex<Option<AdvisorToolConfig>> = Mutex::new(None);
 static SESSION_MESSAGES: Mutex<Vec<SessionMessage>> = Mutex::new(Vec::new());
 
@@ -364,6 +382,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interactive_handoff_can_be_enabled_after_model_only_startup() {
+        let initial = AdvisorToolConfig {
+            client: None,
+            advisor_model: "model".into(),
+            human_handoff: false,
+            max_uses: Some(3),
+            handoff_tx: None,
+            enabled: false,
+            kilobytes_limit: 256,
+        };
+        let mut config = initial.clone();
+        let mut ui_rx = config
+            .prepare_handoff_channel(true)
+            .expect("interactive receiver");
+        assert!(!config.enabled && !config.human_handoff);
+
+        // Runtime settings clone and replace this config. Repeated mode changes
+        // must retain the channel whose receiver was handed to the UI at startup.
+        for response in ["first answer", "second answer"] {
+            let mut updated = config.clone();
+            updated.enabled = true;
+            updated.human_handoff = true;
+            config = updated;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            config
+                .handoff_tx
+                .as_ref()
+                .expect("runtime handoff sender")
+                .send(HandoffRequest {
+                    question: "continue?".into(),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            let request = ui_rx
+                .try_recv()
+                .expect("request reaches original UI receiver");
+            assert_eq!(request.question, "continue?");
+            request.reply.send(response.into()).unwrap();
+            assert_eq!(reply_rx.await.unwrap(), response);
+            config.human_handoff = false;
+        }
+
+        // Headless startup never exposes a UI channel, even for handoff mode.
+        for handoff in [false, true] {
+            let mut headless = initial.clone();
+            headless.human_handoff = handoff;
+            assert!(headless.prepare_handoff_channel(false).is_none());
+            assert!(headless.handoff_tx.is_none());
+        }
+    }
 
     #[test]
     fn with_config_without_init_returns_error() {
