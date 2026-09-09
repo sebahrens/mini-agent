@@ -56,8 +56,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
-    OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetDriveTypeW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::JobObjects::{
@@ -965,7 +966,7 @@ fn attest_existing_private_root(path: &Path) -> Result<ProfileJournalRootAuthori
     let directory = open_stable_path(
         path,
         true,
-        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )
     .map_err(|_| "sandbox: preserved production-preflight root is unverifiable".to_string())?;
@@ -1583,6 +1584,11 @@ fn build_helper_with_ready_and_roots(
 
     let executable = std::env::current_exe()
         .map_err(|error| format!("sandbox: locate Windows helper executable: {error}"))?;
+    // Libtest replaces main and cannot dispatch production helper arguments.
+    #[cfg(test)]
+    let executable = std::env::var_os("MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE")
+        .map(PathBuf::from)
+        .unwrap_or(executable);
     let mut helper = Command::new(executable);
     helper
         .arg(HELPER_ARG)
@@ -3491,10 +3497,12 @@ fn token_user_sid(buffer: &[usize]) -> PSID {
 }
 
 fn protect_and_attest_control_root(root: &Path) -> Result<File, String> {
+    // Metadata-only handles do not pin the directory against rename. Directory-list
+    // access makes this handle participate in the no-delete-share contract.
     let directory = open_stable_path(
         root,
         true,
-        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
     let user = current_user_sid_buffer()?;
@@ -5576,6 +5584,13 @@ mod tests {
 
     const PREFLIGHT_RECOVERY_CHILD_ROOT: &str = "ZS_TEST_PREFLIGHT_RECOVERY_ROOT";
 
+    fn installed_sandbox_test_executable() -> PathBuf {
+        let path = std::env::var_os("MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE")
+            .expect("set MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE to a cargo-installed debug binary");
+        canonical_file(Path::new(&path), "installed sandbox test executable")
+            .expect("canonicalize installed sandbox test executable")
+    }
+
     struct RootPolicyFixture(PathBuf);
 
     impl RootPolicyFixture {
@@ -5819,32 +5834,42 @@ mod tests {
 
     #[test]
     fn control_root_authority_denies_root_swap_after_attestation() {
-        let base = std::env::temp_dir().join(format!(
-            "mini-agent-control-root-swap-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let cache = base.join("state/cache");
-        std::fs::create_dir_all(&cache).expect("create root-swap cache");
-        let authority = profile_journal_root(&cache, &[], &[]).expect("bind private control root");
-        let replacement = authority.path().with_extension("replacement");
+        for recovered in [false, true] {
+            let base = std::env::temp_dir().join(format!(
+                "mini-agent-control-root-swap-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let cache = base.join("state/cache");
+            std::fs::create_dir_all(&cache).expect("create root-swap cache");
+            let authority =
+                profile_journal_root(&cache, &[], &[]).expect("bind private control root");
+            let authority = if recovered {
+                let path = authority.path().to_path_buf();
+                drop(authority);
+                attest_existing_private_root(&path).expect("rebind recovered private control root")
+            } else {
+                authority
+            };
+            let replacement = authority.path().with_extension("replacement");
 
-        let error =
-            attempt_control_directory_swap(authority.path().to_path_buf(), replacement.clone());
-        assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
-        authority
-            .revalidate()
-            .expect("failed swap must leave the original authority valid");
-        assert!(!replacement.exists());
-        assert_eq!(
-            std::fs::read_dir(authority.path())
-                .expect("enumerate protected control root")
-                .count(),
-            0,
-            "failed swap must not create an external journal or residue"
-        );
+            let error =
+                attempt_control_directory_swap(authority.path().to_path_buf(), replacement.clone());
+            assert!(matches!(error.raw_os_error(), Some(5 | 32 | 33)));
+            authority
+                .revalidate()
+                .expect("failed swap must leave the original authority valid");
+            assert!(!replacement.exists());
+            assert_eq!(
+                std::fs::read_dir(authority.path())
+                    .expect("enumerate protected control root")
+                    .count(),
+                0,
+                "failed swap must not create an external journal or residue"
+            );
 
-        drop(authority);
-        std::fs::remove_dir_all(base).expect("remove root-swap tree");
+            drop(authority);
+            std::fs::remove_dir_all(base).expect("remove root-swap tree");
+        }
     }
 
     #[test]
@@ -6124,11 +6149,7 @@ mod tests {
         let cache = abandoned.join("cache");
         std::fs::create_dir(&workspace).expect("create restart-recovery workspace");
         std::fs::create_dir(&cache).expect("create restart-recovery cache");
-        let executable = canonical_file(
-            &std::env::current_exe().expect("resolve restart-recovery executable"),
-            "restart-recovery executable",
-        )
-        .expect("canonicalize restart-recovery executable");
+        let executable = installed_sandbox_test_executable();
         let ready = workspace.join("restart-ready.txt");
         let mut command = build_helper_with_ready(
             executable.clone(),
@@ -6432,11 +6453,7 @@ mod tests {
         let cache = base.join("cache");
         std::fs::create_dir_all(&workspace).expect("create timeout-test workspace");
         std::fs::create_dir_all(&cache).expect("create timeout-test cache");
-        let executable = canonical_file(
-            &std::env::current_exe().expect("resolve test executable"),
-            "timeout-test executable",
-        )
-        .expect("canonicalize test executable");
+        let executable = installed_sandbox_test_executable();
         let cleanup_ready = workspace.join("cleanup-ready.txt");
         let tree_ready = workspace.join("tree-ready.txt");
         let leaked_marker = workspace.join("leaked.txt");

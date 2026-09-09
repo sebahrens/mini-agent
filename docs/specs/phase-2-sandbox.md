@@ -186,6 +186,10 @@ The Windows general-sandbox CI job runs the complete native policy and recovery 
 serially, including the cache, path-identity, ACL, restart-recovery, and timeout-cleanup tests.
 It also runs the installed-binary boundary probe; source-text checks alone do not establish
 native recovery behavior.
+The recovery fixtures use the cargo-installed debug binary for production helper and target
+markers (`MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`), while their Rust recovery-child checks still
+use the test harness. Newly created and recovered control roots retain directory-list access
+without delete sharing so their names cannot be replaced between validation and journal I/O.
 
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded

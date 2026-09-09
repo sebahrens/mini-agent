@@ -86,6 +86,11 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn(".Count -ne 1", native_step)
         self.assertIn("cargo test --locked $suite -- --test-threads=1", native_step)
         self.assertNotIn("cargo test --locked $test --", native_step)
+        self.assertLess(
+            windows_job.index("name: Install the debug binary used by the native sandbox probe"),
+            windows_job.index("name: Test native general-sandbox policy and recovery"),
+        )
+        self.assertIn("$env:MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE = $env:WINDOWS_GENERAL_SANDBOX_EXE", native_step)
 
     def test_each_platform_gate_runs_real_probe_and_both_feature_rows(self) -> None:
         requirements = {
