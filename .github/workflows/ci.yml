@@ -861,6 +861,19 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
         run: cargo test --locked windows_appcontainer_source -- --test-threads=1
 
+      - name: Test cached native preflight results
+        shell: pwsh
+        run: |
+          $test = 'sandbox::windows::tests::general_preflight_cache_retains_success_and_failure_without_reprobing'
+          $tests = cargo test --locked $test -- --list
+          if ($LASTEXITCODE -ne 0 -or @($tests | Select-String -SimpleMatch "${test}: test").Count -ne 1) {
+            throw 'Expected exactly one native preflight cache regression test'
+          }
+          cargo test --locked $test -- --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native preflight cache regression failed with exit code $LASTEXITCODE"
+          }
+
       - name: Install the debug binary used by the native sandbox probe
         shell: pwsh
         run: |

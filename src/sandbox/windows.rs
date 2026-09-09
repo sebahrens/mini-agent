@@ -201,7 +201,7 @@ const HELPER_STAGE_RESUME: u8 = 26;
 
 static ACTIVE_REQUEST_FEEDERS: AtomicUsize = AtomicUsize::new(0);
 static HELPER_STAGE: AtomicU8 = AtomicU8::new(HELPER_STAGE_REQUEST);
-static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static GENERAL_SANDBOX_AVAILABLE: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn mark_helper_stage(stage: u8) {
     HELPER_STAGE.store(stage, Ordering::Release);
@@ -717,6 +717,10 @@ impl Drop for PrivateDesktop {
 }
 
 pub(crate) fn is_available() -> bool {
+    general_sandbox_preflight().is_ok()
+}
+
+fn general_sandbox_preflight() -> &'static Result<(), String> {
     cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
         let started = Instant::now();
         let result = run_production_preflight();
@@ -731,10 +735,10 @@ pub(crate) fn is_available() -> bool {
 }
 
 fn cached_general_sandbox_availability(
-    cache: &OnceLock<bool>,
+    cache: &OnceLock<Result<(), String>>,
     probe: impl FnOnce() -> Result<(), String>,
-) -> bool {
-    *cache.get_or_init(|| probe().is_ok())
+) -> &Result<(), String> {
+    cache.get_or_init(probe)
 }
 
 struct TemporaryPreflightRoot {
@@ -4893,8 +4897,10 @@ fn run_runtime_probe() -> Result<i32, String> {
         return Err("parent death did not kill the restricted Job tree".into());
     }
     let _ = std::fs::remove_dir_all(&base);
-    if !is_available() || !is_available() {
-        return Err("cached production AppContainer preflight failed".into());
+    for _ in 0..2 {
+        general_sandbox_preflight()
+            .as_ref()
+            .map_err(|error| format!("cached production AppContainer preflight failed: {error}"))?;
     }
     println!(
         "WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated"
@@ -5633,30 +5639,40 @@ mod tests {
     }
 
     #[test]
-    fn general_preflight_cache_runs_an_unavailable_probe_once() {
-        let cache = Arc::new(OnceLock::new());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(8));
-        let mut threads = Vec::new();
-        for _ in 0..8 {
-            let cache = cache.clone();
-            let calls = calls.clone();
-            let barrier = barrier.clone();
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
+    fn general_preflight_cache_retains_success_and_failure_without_reprobing() {
+        for expected in [Ok(()), Err("closed injected failure".to_string())] {
+            let cache = Arc::new(OnceLock::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(8));
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                let cache = cache.clone();
+                let calls = calls.clone();
+                let barrier = barrier.clone();
+                let expected = expected.clone();
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    cached_general_sandbox_availability(&cache, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        expected
+                    })
+                    .clone()
+                }));
+            }
+            for thread in threads {
+                assert_eq!(
+                    thread.join().expect("cache caller must not panic"),
+                    expected
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
                 cached_general_sandbox_availability(&cache, || {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Err("closed injected failure".into())
-                })
-            }));
+                    panic!("cached result must not rerun its probe")
+                }),
+                &expected
+            );
         }
-        for thread in threads {
-            assert!(!thread.join().expect("cache caller must not panic"));
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(!cached_general_sandbox_availability(&cache, || {
-            panic!("cached unavailable result must not rerun its probe")
-        }));
     }
 
     #[test]

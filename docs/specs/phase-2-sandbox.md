@@ -179,7 +179,8 @@ On Windows, an eligible general AppContainer preflight is cached once per proces
 run-and-cleanup lifecycle. Before starting a new probe it spends at most five seconds recovering
 exact, privately owned preflight roots preserved by an earlier interrupted process; malformed,
 active, or unverifiable roots remain untouched and fail closed. Timeout remains a cached fail-closed
-result.
+result. The cache retains its original failure diagnostic, which the explicit native runtime
+probe reports without rerunning the failed preflight.
 
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded

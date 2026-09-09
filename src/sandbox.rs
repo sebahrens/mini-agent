@@ -4348,9 +4348,6 @@ mod sandbox_tests {
         assert!(!source.contains("CreateRestrictedToken"));
         assert!(!source.contains("WRITE_RESTRICTED"));
         assert!(!source.contains("RegOverridePredefKey"));
-        assert!(source.contains("static GENERAL_SANDBOX_AVAILABLE: OnceLock<bool>"));
-        assert!(source.contains("cached_general_sandbox_availability("));
-        assert!(source.contains("*cache.get_or_init(|| probe().is_ok())"));
         assert!(source.contains("fn run_production_preflight() -> Result<(), String>"));
         assert!(source.contains("const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration"));
         assert!(source.contains("const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration"));
@@ -4439,7 +4436,6 @@ mod sandbox_tests {
             .and_then(|source| source.split("fn sweep_stale_profile_intent(").next())
             .expect("stale profile journal sweep missing");
         assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)?"));
-        assert!(source.contains("if !is_available() || !is_available()"));
 
         let update = source
             .split("fn update_handle_ace(")
