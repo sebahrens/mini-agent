@@ -817,6 +817,8 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
+const MAX_CONCURRENT_QUERY_EMBEDDINGS: usize = 4;
+
 /// Reusable embedding service with model lifecycle and caching.
 ///
 /// Initialized once and shared across multiple indexes.
@@ -829,6 +831,7 @@ pub struct Embedder {
     backend: Arc<dyn EmbeddingBackend>,
     metadata: ModelMetadata,
     cache: Arc<tokio::sync::Mutex<QueryCache>>,
+    query_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// The backend is a trait object and the cache sits behind an async mutex, so
@@ -932,6 +935,7 @@ impl Embedder {
                 100,
                 1024 * 1024 * 10,
             ))), // 100 entries, 10MB
+            query_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_QUERY_EMBEDDINGS)),
         })
     }
 
@@ -1002,21 +1006,30 @@ impl Embedder {
             }
         }
 
+        // Reject excess cache misses before copying the query or entering Tokio's
+        // blocking queue. The closure owns the slot: dropping the awaiting future
+        // cannot release capacity while its blocking inference is still running.
+        let slot = Arc::clone(&self.query_slots)
+            .try_acquire_owned()
+            .map_err(|_| EmbeddingError::WorkerSaturated)?;
+
         // Inference is CPU-bound (local model) or blocking I/O (external API), so it
         // must never run on the async executor. Hand it to a blocking worker and map
         // join failures onto the cancellation/panic error classes.
         let backend = Arc::clone(&self.backend);
         let owned_query = normalized_query.to_string();
-        let embedding =
-            crate::agent::runner::spawn_blocking_scoped(move || backend.embed_query(&owned_query))
-                .await
-                .map_err(|join_error| {
-                    if join_error.is_cancelled() {
-                        EmbeddingError::Cancelled
-                    } else {
-                        EmbeddingError::WorkerPanic
-                    }
-                })??;
+        let embedding = crate::agent::runner::spawn_blocking_scoped(move || {
+            let _slot = slot;
+            backend.embed_query(&owned_query)
+        })
+        .await
+        .map_err(|join_error| {
+            if join_error.is_cancelled() {
+                EmbeddingError::Cancelled
+            } else {
+                EmbeddingError::WorkerPanic
+            }
+        })??;
 
         // Validate
         if embedding.len() != self.metadata.dimensions {
@@ -1160,6 +1173,42 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct QueryTestBackend(std::sync::atomic::AtomicUsize);
+
+    impl EmbeddingBackend for QueryTestBackend {
+        fn embed_documents(&self, documents: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            documents
+                .iter()
+                .map(|query| self.embed_query(query))
+                .collect()
+        }
+
+        fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbeddingError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match query {
+                "failure" => Err(EmbeddingError::RequestFailed("injected".into())),
+                "panic" => panic!("injected embedding worker panic"),
+                "invalid" => Ok(vec![f32::NAN, 0.0]),
+                "short" => Ok(vec![1.0]),
+                _ => Ok(vec![1.0, 0.0]),
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            "query-test"
+        }
+        fn model_revision(&self) -> &str {
+            "1"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn normalized(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn test_deterministic_backend_creates_embeddings() {
         let backend = DeterministicBackend::new();
@@ -1242,8 +1291,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedder_cache_hit() {
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
+        let backend = Arc::new(QueryTestBackend::default());
+        let embedder = Embedder::with_backend(backend.clone()).unwrap();
 
         let query = "what is rust?";
         let emb1 = embedder.embed_query_cached(query).await.unwrap();
@@ -1255,25 +1304,128 @@ mod tests {
         let stats2 = embedder.cache_stats().await;
         assert_eq!(stats2.entries, 1);
         assert_eq!(stats2.hits, 1);
-        assert_eq!(emb1, emb2);
+        assert_eq!(&*emb1, &[1.0, 0.0]);
+        assert!(Arc::ptr_eq(&emb1, &emb2));
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stats2.bytes, 2 * std::mem::size_of::<f32>());
+        embedder
+            .embed_query_cached("different query")
+            .await
+            .unwrap();
+        let stats3 = embedder.cache_stats().await;
+        assert_eq!(stats3.entries, 2);
+        assert_eq!(stats3.hits, 1);
+        assert_eq!(stats3.bytes, 4 * std::mem::size_of::<f32>());
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn query_admission_holds_slots_until_cancelled_workers_exit() {
+        use crate::agent::runner::AgentWorkScope;
+        use std::time::Duration;
+
+        async fn query(embedder: &Embedder, text: &str) -> Result<Arc<[f32]>, EmbeddingError> {
+            tokio::time::timeout(Duration::from_secs(5), embedder.embed_query_cached(text))
+                .await
+                .expect("cache hits and excess queries must not wait for blocked workers")
+        }
+
+        let embedder = Arc::new(Embedder::new().unwrap());
+        let cached = embedder.embed_query_cached("cached").await.unwrap();
+        // A second full wave proves every cancelled worker returned its slot.
+        for wave in 0..2 {
+            let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
+            let mut requests = Vec::new();
+            for index in 0..MAX_CONCURRENT_QUERY_EMBEDDINGS {
+                let embedder = Arc::clone(&embedder);
+                let scope = Arc::clone(&scope);
+                requests.push(tokio::spawn(async move {
+                    scope
+                        .run(embedder.embed_query_cached(&format!("wave-{wave}-{index}")))
+                        .await
+                }));
+            }
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..MAX_CONCURRENT_QUERY_EMBEDDINGS {
+                    started.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                query(&embedder, "overflow").await,
+                Err(EmbeddingError::WorkerSaturated)
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &query(&embedder, "cached").await.unwrap()
+            ));
+            for request in requests {
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+            }
+            assert_eq!(scope.active_children(), MAX_CONCURRENT_QUERY_EMBEDDINGS);
+            assert_eq!(
+                query(&embedder, "after-cancellation").await,
+                Err(EmbeddingError::WorkerSaturated)
+            );
+            release.release();
+            tokio::time::timeout(Duration::from_secs(5), scope.wait_idle())
+                .await
+                .unwrap();
+        }
+        assert!(embedder.embed_query_cached("recovered").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn query_admission_recovers_from_backend_errors_panics_and_invalid_vectors() {
+        let embedder = Embedder::with_backend(Arc::new(QueryTestBackend::default())).unwrap();
+        for (query, expected) in [
+            ("failure", EmbeddingError::RequestFailed("injected".into())),
+            ("panic", EmbeddingError::WorkerPanic),
+            ("invalid", EmbeddingError::NonFiniteValue),
+            (
+                "short",
+                EmbeddingError::DimensionMismatch {
+                    expected: 2,
+                    actual: 1,
+                },
+            ),
+        ] {
+            for _ in 0..=MAX_CONCURRENT_QUERY_EMBEDDINGS {
+                assert_eq!(
+                    embedder.embed_query_cached(query).await.unwrap_err(),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            &*embedder.embed_query_cached("recovered").await.unwrap(),
+            &[1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn document_embedding_rejects_malformed_backend_vectors() {
+        let embedder = Embedder::with_backend(Arc::new(QueryTestBackend::default())).unwrap();
+        for (query, expected) in [
+            ("invalid", EmbeddingError::NonFiniteValue),
+            (
+                "short",
+                EmbeddingError::DimensionMismatch {
+                    expected: 2,
+                    actual: 1,
+                },
+            ),
+        ] {
+            assert_eq!(embedder.embed_documents(&[query.into()]), Err(expected));
+        }
     }
 
     #[tokio::test]
     async fn test_embedder_cache_eviction_by_count() {
-        // Create a small cache with only 3 entries
-        let backend = Arc::new(DeterministicBackend::new());
-        let metadata = ModelMetadata {
-            model_id: backend.model_id().to_string(),
-            model_revision: backend.model_revision().to_string(),
-            dimensions: backend.dimensions(),
-            normalized: backend.normalized(),
-        };
-
-        let embedder = Embedder {
-            backend: backend.clone(),
-            metadata,
-            cache: Arc::new(tokio::sync::Mutex::new(QueryCache::new(3, usize::MAX))),
-        };
+        let embedder = Embedder::new().unwrap();
+        *embedder.cache.lock().await = QueryCache::new(3, usize::MAX);
 
         let queries = vec!["query1", "query2", "query3", "query4"];
         for q in &queries {
@@ -1287,80 +1439,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedder_cache_eviction_by_bytes() {
-        let backend = Arc::new(DeterministicBackend::new());
-        let metadata = ModelMetadata {
-            model_id: backend.model_id().to_string(),
-            model_revision: backend.model_revision().to_string(),
-            dimensions: backend.dimensions(),
-            normalized: backend.normalized(),
-        };
-
-        // Create cache with tiny byte limit: one 384-float vector is ~1.5KB
-        // So only 1-2 vectors should fit in 2KB
-        let embedder = Embedder {
-            backend: backend.clone(),
-            metadata,
-            cache: Arc::new(tokio::sync::Mutex::new(QueryCache::new(usize::MAX, 2000))),
-        };
+        let embedder = Embedder::new().unwrap();
+        // One 384-float vector fits in 2KB; two do not.
+        *embedder.cache.lock().await = QueryCache::new(usize::MAX, 2000);
 
         embedder.embed_query_cached("query1").await.unwrap();
         embedder.embed_query_cached("query2").await.unwrap();
 
         let stats = embedder.cache_stats().await;
         assert!(stats.evictions > 0, "cache should have evicted");
-    }
-
-    #[tokio::test]
-    async fn test_cache_hit_does_not_reallocate_embedding() {
-        // Test that the cached Arc is reused across hits, not reallocated.
-        // We inspect the cache directly to verify Arc pointer equality.
-        let backend = Arc::new(DeterministicBackend::new());
-        let metadata = ModelMetadata {
-            model_id: backend.model_id().to_string(),
-            model_revision: backend.model_revision().to_string(),
-            dimensions: backend.dimensions(),
-            normalized: backend.normalized(),
-        };
-
-        let cache = Arc::new(tokio::sync::Mutex::new(QueryCache::new(100, usize::MAX)));
-        let embedder = Embedder {
-            backend,
-            metadata,
-            cache: Arc::clone(&cache),
-        };
-
-        let query = "test query for arc sharing";
-        let emb1 = embedder.embed_query_cached(query).await.unwrap();
-
-        let emb2 = embedder.embed_query_cached(query).await.unwrap();
-
-        assert!(Arc::ptr_eq(&emb1, &emb2));
-        assert_eq!(cache.lock().await.hits, 1);
-    }
-
-    #[test]
-    fn test_query_cache_arc_sharing_on_hit() {
-        // Unit test: verify that get() returns the same Arc, not a cloned vector.
-        let mut cache = QueryCache::new(10, usize::MAX);
-        let embedding = vec![1.0, 2.0, 3.0, 4.0];
-        let key = "test_key".to_string();
-
-        cache.insert(key.clone(), embedding.into());
-
-        // First get
-        let arc1 = cache.get(&key).expect("should find key");
-        let ptr1 = Arc::as_ptr(&arc1);
-
-        // Second get on same key
-        let arc2 = cache.get(&key).expect("should find key");
-        let ptr2 = Arc::as_ptr(&arc2);
-
-        // Both should point to the same Arc allocation
-        assert_eq!(ptr1, ptr2, "cache should return the same Arc on hit");
-
-        // Verify the data is correct
-        assert_eq!(arc1.len(), 4);
-        assert_eq!(arc1[0], 1.0);
     }
 
     #[test]
@@ -1380,21 +1467,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_lru_eviction_respects_recency() {
-        // Test that LRU eviction is based on last used (via get), not insertion order.
-        let backend = Arc::new(DeterministicBackend::new());
-        let metadata = ModelMetadata {
-            model_id: backend.model_id().to_string(),
-            model_revision: backend.model_revision().to_string(),
-            dimensions: backend.dimensions(),
-            normalized: backend.normalized(),
-        };
-
-        // Create a small cache: max 2 entries
-        let embedder = Embedder {
-            backend,
-            metadata,
-            cache: Arc::new(tokio::sync::Mutex::new(QueryCache::new(2, usize::MAX))),
-        };
+        let embedder = Embedder::new().unwrap();
+        *embedder.cache.lock().await = QueryCache::new(2, usize::MAX);
 
         // Insert q1, q2
         embedder.embed_query_cached("query1").await.unwrap();

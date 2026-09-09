@@ -317,6 +317,10 @@ lazily in the request path.
 Query embedding runs in a bounded blocking worker because local model inference is CPU-bound. A
 cache keyed by `(model_revision, sha256(retrieval_query))` avoids repeated inference for retries
 and tool continuations. Cache entries are bounded by count/bytes and have explicit eviction.
+Each `Embedder` admits at most four queued or running query-inference jobs. Excess cache misses
+return `WorkerSaturated` immediately; cache hits need no slot. The blocking job owns its slot until
+it exits, including after caller cancellation or backend failure. Document batches remain on
+their existing indexing/admission execution paths.
 
 ### Embedding API
 

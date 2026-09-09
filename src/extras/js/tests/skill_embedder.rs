@@ -1,20 +1,19 @@
 //! Comprehensive test suite for the embedding system.
 //!
 //! Tests verify:
-//! - Single model initialization under concurrent callers
 //! - Batching and document handling
 //! - Deterministic embeddings and document rendering
 //! - Finite normalization properties
 //! - Cache behavior (hits, evictions, bounds)
 //! - Error handling and edge cases
-//! - Async/blocking worker separation
+//!
+//! Admission, cancellation, backend-failure, and cache-policy tests live with `Embedder`.
 
 #[cfg(test)]
 mod tests {
     use crate::extras::js::skills::embed::{
-        CacheStats, DeterministicBackend, Embedder, EmbeddingBackend, EmbeddingError, SkillDocument,
+        DeterministicBackend, Embedder, EmbeddingBackend, EmbeddingError, SkillDocument,
     };
-    use std::sync::Arc;
 
     #[test]
     fn test_deterministic_backend_finite_output() {
@@ -158,103 +157,6 @@ mod tests {
         assert_eq!(meta1.dimensions, meta2.dimensions);
     }
 
-    #[tokio::test]
-    async fn test_embedder_concurrent_queries_reuse_model() {
-        let embedder = Arc::new(Embedder::new().unwrap());
-        embedder.clear_cache().await;
-
-        let mut handles = vec![];
-        for i in 0..5 {
-            let embedder = embedder.clone();
-            let handle =
-                tokio::spawn(
-                    async move { embedder.embed_query_cached(&format!("query {}", i)).await },
-                );
-            handles.push(handle);
-        }
-
-        let mut results = vec![];
-        for handle in handles {
-            results.push(handle.await.unwrap());
-        }
-
-        // All should succeed and cache should have 5 entries (or fewer if timing/eviction)
-        for result in results {
-            assert!(result.is_ok(), "concurrent query failed");
-        }
-
-        let stats = embedder.cache_stats().await;
-        assert!(stats.entries <= 5);
-    }
-
-    #[tokio::test]
-    async fn test_cache_hit_tracking() {
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
-
-        let query = "repeated query";
-        embedder.embed_query_cached(query).await.unwrap();
-        let stats_after_1 = embedder.cache_stats().await;
-        assert_eq!(stats_after_1.hits, 0, "first query should not count as hit");
-        assert_eq!(stats_after_1.entries, 1);
-
-        embedder.embed_query_cached(query).await.unwrap();
-        let stats_after_2 = embedder.cache_stats().await;
-        assert_eq!(
-            stats_after_2.hits, 1,
-            "second identical query should be a cache hit"
-        );
-        assert_eq!(stats_after_2.entries, 1);
-
-        embedder.embed_query_cached("different").await.unwrap();
-        let stats_after_3 = embedder.cache_stats().await;
-        assert_eq!(
-            stats_after_3.hits, 1,
-            "new query should not affect hit count"
-        );
-        assert_eq!(stats_after_3.entries, 2);
-    }
-
-    #[tokio::test]
-    async fn test_cache_eviction_shows_progression() {
-        // Test cache eviction by observing stats progression with default embedder
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
-
-        // Fill with many queries
-        for i in 0..50 {
-            embedder
-                .embed_query_cached(&format!("query {}", i))
-                .await
-                .unwrap();
-        }
-
-        let stats = embedder.cache_stats().await;
-        // Should not exceed default max_entries of 100
-        assert!(stats.entries <= 100, "cache should not exceed max entries");
-    }
-
-    #[tokio::test]
-    async fn test_cache_tracks_bytes() {
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
-
-        embedder.embed_query_cached("query 1").await.unwrap();
-        let stats1 = embedder.cache_stats().await;
-        let bytes1 = stats1.bytes;
-
-        embedder.embed_query_cached("query 2").await.unwrap();
-        let stats2 = embedder.cache_stats().await;
-        let bytes2 = stats2.bytes;
-
-        // With 2 entries, bytes should increase
-        assert!(
-            bytes2 > bytes1,
-            "cache bytes should increase with more entries"
-        );
-        assert!(bytes2 > 0, "cache should track non-zero bytes");
-    }
-
     #[test]
     fn test_skill_document_renders_correctly() {
         let doc = SkillDocument::new("Parse JSON with error handling".to_string())
@@ -345,35 +247,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embedder_dimension_mismatch_detection() {
-        // The deterministic backend always produces correct dimensions,
-        // but we test the validation logic exists and would catch mismatches.
-        let embedder = Embedder::new().unwrap();
-        let docs = vec!["test".to_string()];
-        let embeddings = embedder.embed_documents(&docs).unwrap();
-        assert_eq!(embeddings[0].len(), 384);
-    }
-
-    #[tokio::test]
-    async fn test_cache_key_includes_model_revision() {
-        // Different model revisions should use different cache entries
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
-
-        let query = "same query";
-        embedder.embed_query_cached(query).await.unwrap();
-        let stats1 = embedder.cache_stats().await;
-        assert_eq!(stats1.entries, 1);
-
-        // Even with the same query string, model revision is part of cache key.
-        // For now, embedder uses one model, so cache key includes that revision.
-        embedder.embed_query_cached(query).await.unwrap();
-        let stats2 = embedder.cache_stats().await;
-        assert_eq!(stats2.entries, 1, "same query should use same cache entry");
-        assert_eq!(stats2.hits, 1);
-    }
-
-    #[tokio::test]
     async fn test_cache_normalized_queries() {
         let embedder = Embedder::new().unwrap();
         embedder.clear_cache().await;
@@ -440,23 +313,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cache_stats_equality() {
-        let stats1 = CacheStats {
-            entries: 5,
-            bytes: 8000,
-            hits: 10,
-            evictions: 2,
-        };
-        let stats2 = CacheStats {
-            entries: 5,
-            bytes: 8000,
-            hits: 10,
-            evictions: 2,
-        };
-        assert_eq!(stats1, stats2);
-    }
-
     #[tokio::test]
     async fn test_embedder_default() {
         let embedder = Embedder::default();
@@ -480,25 +336,6 @@ mod tests {
             stats2.entries, 0,
             "different embedders should have separate caches"
         );
-    }
-
-    #[tokio::test]
-    async fn test_cache_handles_many_embeddings() {
-        let embedder = Embedder::new().unwrap();
-        embedder.clear_cache().await;
-
-        // Fill cache with many queries
-        for i in 0..20 {
-            embedder
-                .embed_query_cached(&format!("query {}", i))
-                .await
-                .ok();
-        }
-
-        let stats = embedder.cache_stats().await;
-        // Default cache should hold 100 entries, so all 20 should fit
-        assert!(stats.entries <= 100);
-        assert!(stats.entries > 0);
     }
 
     #[test]
