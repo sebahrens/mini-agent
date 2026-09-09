@@ -552,6 +552,10 @@ The target scale applies to active and retained revisions, not unlimited raw tel
 - Query fingerprints use a local keyed hash; no raw prompt is persisted.
 - Argument values and file contents are never stored by default.
 - Secret redaction runs before any repair fixture or evidence payload is persisted.
+  Feedback explanations and repair text redact bare and quoted credential assignments,
+  including JSON keys, spaces and escaped quotes inside values, and unfinished quoted values.
+  Complete quoted assignments retain their surrounding syntax; UTF-8 truncation happens after
+  redaction.
 - An explicit privacy purge removes the artifact and all dependent data and records a non-secret
   tombstone so stale indexes cannot resurrect the ID.
 

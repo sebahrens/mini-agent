@@ -153,6 +153,24 @@ fn feedback_redaction_removes_unconfigured_credential_shapes() {
     let control = "the tokenizer emitted 12 tokens and the run returned 200";
     for (leak, secret) in [
         (
+            r#"{"password":"json-password-canary"}"#,
+            "json-password-canary",
+        ),
+        (
+            r#"{'api_key': 'single-quoted-canary'}"#,
+            "single-quoted-canary",
+        ),
+        (r#"password="first second; tail-canary""#, "tail-canary"),
+        (
+            r#"{"client_secret":"first\"escaped-tail-canary"}"#,
+            "escaped-tail-canary",
+        ),
+        (
+            r#"password='first\'escaped-single-tail-canary'"#,
+            "escaped-single-tail-canary",
+        ),
+        ("password=\"unterminated tail-canary", "tail-canary"),
+        (
             "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
             "abcdefghijklmnopqrstuvwxyz012345",
         ),
@@ -188,6 +206,29 @@ fn feedback_redaction_removes_unconfigured_credential_shapes() {
         );
         assert!(redacted.contains("returned 200"), "{redacted}");
     }
+    for (input, expected) in [
+        (
+            r#"before {"password":"first\"second; third","count":2} after"#,
+            r#"before {"password":"[REDACTED]","count":2} after"#,
+        ),
+        (
+            "before password='first second' after",
+            "before password='[REDACTED]' after",
+        ),
+        ("password=\"unfinished phrase", "password=\"[REDACTED]\""),
+        ("password='unfinished phrase", "password='[REDACTED]'"),
+        (r#"password="unfinished\"#, "password=\"[REDACTED]\""),
+        (r#"password='unfinished\"#, "password='[REDACTED]'"),
+        ("token=one; status=ok", "token=[REDACTED]; status=ok"),
+    ] {
+        assert_eq!(redactor.redact(input), expected);
+    }
+    for (limit, expected) in [(0, ""), (1, ""), (2, "é"), (3, "é")] {
+        assert_eq!(
+            Redactor::new(vec![], limit).redact("éé password='private value'"),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -195,8 +236,9 @@ fn stored_feedback_text_never_retains_an_unconfigured_credential() {
     let (_root, mut store, skill, invocation) = fixture();
     let actor = owner(&skill.id);
     let mut command = negative_command(&skill.id, &invocation, "text-leak");
-    command.reason_text =
-        Some("wrong output; repro used Authorization: Bearer abcdefghijklmnop012345".into());
+    command.reason_text = Some(
+        r#"wrong output; repro used {"password":"feedback first; feedback-tail-canary"} and Authorization: Bearer abcdefghijklmnop012345"#.into(),
+    );
     let id = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
         .submit(&actor, &command, 2)
         .unwrap();
@@ -209,6 +251,8 @@ fn stored_feedback_text_never_retains_an_unconfigured_credential() {
         )
         .unwrap();
     assert!(!stored.contains("abcdefghijklmnop012345"), "{stored}");
+    assert!(!stored.contains("feedback first"), "{stored}");
+    assert!(!stored.contains("feedback-tail-canary"), "{stored}");
     assert!(stored.contains("wrong output"), "{stored}");
 }
 

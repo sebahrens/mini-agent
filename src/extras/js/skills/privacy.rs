@@ -10,12 +10,18 @@ static PRIVATE_KEY_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static private key block regex")
 });
 
-/// `label: value` and `label=value` credential assignments. The optional scheme
-/// prefix keeps `Authorization: Bearer <token>` from stopping at the space.
+/// Bare or quoted credential assignments. Quoted values include whitespace,
+/// punctuation, and escaped quotes; an unfinished quote consumes the remainder
+/// of the input. The scheme prefix also covers `Authorization: Bearer <token>`.
 static LABELED_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b(api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|token|password|passwd|secret|authorization)\b\s*[:=]\s*["']?(?:bearer\s+|basic\s+|token\s+)?[^"',;\s}\[\]]+"#,
-    )
+    Regex::new(concat!(
+        r#"(?i)(?P<prefix>["']?\b(?:api[_-]?key|apikey|access[_-]?token|"#,
+        r#"refresh[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|"#,
+        r#"token|password|passwd|secret|authorization)\b["']?\s*[:=]\s*)"#,
+        r#"(?P<value>"(?:\\(?s:.|$)|[^"\\])*(?:"|$)|"#,
+        r#"'(?:\\(?s:.|$)|[^'\\])*(?:'|$)|"#,
+        r#"(?:bearer\s+|basic\s+|token\s+)?[^"',;\s}\[\]]+)"#,
+    ))
     .expect("static labeled credential regex")
 });
 
@@ -65,8 +71,13 @@ impl Redactor {
             .into_owned();
         value = LABELED_CREDENTIAL
             .replace_all(&value, |captures: &regex::Captures<'_>| {
-                let label = captures.get(1).map_or("secret", |value| value.as_str());
-                format!("{label}=[REDACTED]")
+                let prefix = &captures["prefix"];
+                let value = &captures["value"];
+                match value.as_bytes()[0] {
+                    b'"' => format!("{prefix}\"[REDACTED]\""),
+                    b'\'' => format!("{prefix}'[REDACTED]'"),
+                    _ => format!("{prefix}[REDACTED]"),
+                }
             })
             .into_owned();
         value = BEARER_CREDENTIAL

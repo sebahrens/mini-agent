@@ -75,11 +75,24 @@ fn repair_record_persists_and_phase4_adapter_links_quarantined_predecessor() {
             [&predecessor.id],
         )
         .unwrap();
-    let mut repair_input = input("safe");
+    let mut repair_input = input("REPAIR-JSON-CANARY");
     repair_input.failing_skill_id = predecessor.id.clone();
     let record = create_record(repair_input, &Redactor::new(vec![], 1_024)).unwrap();
     persist_record(&mut store, &record, 10).unwrap();
     persist_record(&mut store, &record, 11).unwrap();
+    let stored: String = store
+        .conn()
+        .query_row(
+            "SELECT sanitized_payload FROM skill_repair_records WHERE repair_id = ?",
+            [&record.repair_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored.contains("REPAIR-JSON-CANARY"), "{stored}");
+    let payload: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let shape: serde_json::Value =
+        serde_json::from_str(payload["argument_shape"].as_str().unwrap()).unwrap();
+    assert_eq!(shape, serde_json::json!({"argc": 1, "token": "[REDACTED]"}));
     submit_repair_proposal(&mut store, &predecessor, &candidate, &record).unwrap();
     let predecessor_link: String = store
         .conn()
