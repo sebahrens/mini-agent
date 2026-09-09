@@ -1403,11 +1403,29 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-SUPPORT-UTILITY",
     ),
-    ("src/ui/renderer.rs", ".spawn()", 2, "TC-SUPPORT-UTILITY"),
+    ("src/ui/renderer.rs", ".spawn()", 1, "TC-SUPPORT-UTILITY"),
+    (
+        "src/ui/renderer.rs",
+        "let Ok(mut child) = command.spawn() else {",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "let mut command = tokio::process::Command::new(cmd);",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "mut command: tokio::process::Command,",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
     (
         "src/ui/renderer.rs",
         "let Ok(mut child) = std::process::Command::new(cmd)",
-        2,
+        1,
         "TC-SUPPORT-UTILITY",
     ),
     (
@@ -2228,7 +2246,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/renderer.rs",
-        "if wrote && matches!(child.wait(), Ok(status) if status.success()) {",
+        "}) => matches!(result, Ok(Ok(status)) if status.success()),",
         1,
         "NON-PROCESS",
     ),
@@ -3002,10 +3020,16 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/ui/renderer.rs",
-        &[(
-            "f915b7e6296aa7d6023439adbe8a3ba928a784a87d51c606c30480b43ef54183",
-            2,
-        )],
+        &[
+            (
+                "f915b7e6296aa7d6023439adbe8a3ba928a784a87d51c606c30480b43ef54183",
+                1,
+            ),
+            (
+                "99da3c2607b5ae5cbf0cf0a647827d0338e6fe9a07b83397ef5eee860a43fe20",
+                1,
+            ),
+        ],
     ),
     (
         "src/ui/slash/features.rs",

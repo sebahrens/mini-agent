@@ -1,12 +1,180 @@
 use std::cell::{Cell, RefCell};
 
-#[cfg(not(windows))]
-use crate::ui::renderer::{ClipboardCopyOutcome, copy_to_clipboard};
 use crate::ui::renderer::{
     MAX_CLIPBOARD_BYTES, base64_encode, dispatch_windows_open, is_nul_terminated_utf16,
     is_safe_url, normalize_internal_clipboard_newlines, normalize_windows_clipboard_newlines,
     osc52_request, validate_clipboard_text, windows_open_request,
 };
+
+#[cfg(unix)]
+mod clipboard_process_tests {
+    use crate::ui::renderer::run_clipboard_command;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("clipboard-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn command(&self, script: &str) -> tokio::process::Command {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    &format!("echo $$ > \"$1\"; {script}"),
+                    "clipboard-fixture",
+                ])
+                .arg(self.0.join("pid"))
+                .arg(self.0.join("input"))
+                .arg(self.0.join("owner.pid"))
+                .arg(self.0.join("request"))
+                .arg(self.0.join("served"))
+                .current_dir(&self.0);
+            command
+        }
+
+        fn pid(&self, name: &str) -> Option<i32> {
+            std::fs::read_to_string(self.0.join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        }
+
+        async fn started(&self) -> i32 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(pid) = self.pid("pid") {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("clipboard fixture must start")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid("pid") {
+                crate::sandbox::kill_process_group_if_live(pid as u32);
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn assert_reaped(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while kill(Pid::from_raw(pid), None).is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("clipboard helper must be reaped");
+    }
+
+    #[tokio::test]
+    async fn clipboard_helpers_receive_exact_input_and_keep_successful_owners() {
+        for (input, owner) in [
+            ("", false),
+            ("snowman ☃\nsecond line", false),
+            ("owned", true),
+        ] {
+            let fixture = Fixture::new();
+            let script = if owner {
+                "/bin/cat > \"$2\"; (while [ ! -f \"$4\" ]; do /bin/sleep 0.01; done; echo served > \"$5\") </dev/null >/dev/null 2>&1 & echo $! > \"$3\""
+            } else {
+                "/bin/cat > \"$2\""
+            };
+            assert!(
+                run_clipboard_command(fixture.command(script), input, Duration::from_secs(2)).await
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("input")).unwrap(),
+                input
+            );
+            assert_reaped(fixture.started().await).await;
+            if owner {
+                fixture.pid("owner.pid").expect("clipboard owner published");
+                // Require work after the copy completes: kill(pid, 0) alone
+                // would also accept a recently killed zombie owner.
+                std::fs::write(fixture.0.join("request"), "copy completed").unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !fixture.0.join("served").exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("successful owner must still serve the clipboard");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_helpers_bound_input_exit_and_reap_failed_or_cancelled_copies() {
+        let input = "x".repeat(1024 * 1024);
+        let missing = Fixture::new();
+        assert!(
+            !run_clipboard_command(
+                tokio::process::Command::new(missing.0.join("missing-helper")),
+                &input,
+                Duration::from_secs(2),
+            )
+            .await
+        );
+        assert!(missing.pid("pid").is_none());
+        for (mode, script) in [
+            ("input-stall", "exec /bin/sleep 30"),
+            (
+                "exit-stall",
+                "/bin/cat >/dev/null; /bin/sleep 30 & echo $! > \"$3\"; wait",
+            ),
+            ("closed-input", "exec 0<&-; exec /bin/sleep 30"),
+            ("nonzero", "/bin/cat >/dev/null; exit 7"),
+            ("cancel", "exec /bin/sleep 30"),
+        ] {
+            let fixture = Fixture::new();
+            if mode == "cancel" {
+                {
+                    let copy = run_clipboard_command(
+                        fixture.command(script),
+                        &input,
+                        Duration::from_secs(30),
+                    );
+                    tokio::pin!(copy);
+                    tokio::select! {
+                        result = &mut copy => panic!("copy completed before cancellation: {result}"),
+                        _ = fixture.started() => {}
+                    }
+                }
+            } else {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    run_clipboard_command(
+                        fixture.command(script),
+                        &input,
+                        Duration::from_millis(250),
+                    ),
+                )
+                .await
+                .expect("clipboard transfer must be bounded");
+                assert!(!result, "{mode} must not report a confirmed copy");
+            }
+            assert_reaped(fixture.started().await).await;
+            if let Some(descendant) = fixture.pid("owner.pid") {
+                assert_reaped(descendant).await;
+            }
+        }
+    }
+}
 
 #[test]
 fn base64_encode_exact_vectors_cover_padding_and_binary_alphabet() {
@@ -32,26 +200,6 @@ fn base64_encode_long_input_preserves_every_block_without_line_wrapping() {
     input.push(b'd');
     let expected = "YWJj".repeat(256) + "ZA==";
     assert_eq!(base64_encode(&input), expected);
-}
-
-#[test]
-#[cfg(not(windows))]
-fn copy_to_clipboard_does_not_panic() {
-    let outcome = copy_to_clipboard("test text").expect("copy should succeed");
-    assert!(matches!(
-        outcome,
-        ClipboardCopyOutcome::Confirmed | ClipboardCopyOutcome::FallbackRequested
-    ));
-}
-
-#[test]
-#[cfg(not(windows))]
-fn copy_to_clipboard_empty_string() {
-    let outcome = copy_to_clipboard("").expect("copy should succeed");
-    assert!(matches!(
-        outcome,
-        ClipboardCopyOutcome::Confirmed | ClipboardCopyOutcome::FallbackRequested
-    ));
 }
 
 #[test]

@@ -825,7 +825,7 @@ impl<'a> App<'a> {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end = Some(idx);
                     }
-                    self.copy_selection_to_clipboard()?;
+                    self.copy_selection_to_clipboard().await?;
                 }
             }
             UserEvent::Paste(data) => {
@@ -842,7 +842,7 @@ impl<'a> App<'a> {
             UserEvent::Key(key) => {
                 match clipboard_shortcut(key, cfg!(windows)) {
                     Some(ClipboardShortcut::CopySelection) => {
-                        self.copy_selection_to_clipboard()?;
+                        self.copy_selection_to_clipboard().await?;
                         self.refresh()?;
                         return Ok(ControlFlow::Continue(()));
                     }
@@ -910,12 +910,12 @@ impl<'a> App<'a> {
         Ok(ControlFlow::Continue(()))
     }
 
-    fn copy_selection_to_clipboard(&mut self) -> anyhow::Result<()> {
+    async fn copy_selection_to_clipboard(&mut self) -> anyhow::Result<()> {
         let Some(text) = self.renderer.selected_text() else {
             self.renderer.clear_selection();
             return Ok(());
         };
-        match copy_to_clipboard(&text) {
+        match copy_to_clipboard(&text).await {
             Ok(ClipboardCopyOutcome::Confirmed) => {
                 self.renderer.write_line("copied selection", Color::Green)?;
                 self.renderer.clear_selection();
@@ -936,7 +936,7 @@ impl<'a> App<'a> {
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         if self.renderer.selection_active && key.code == KeyCode::Char('y') {
-            self.copy_selection_to_clipboard()?;
+            self.copy_selection_to_clipboard().await?;
             return Ok(());
         }
         if self.renderer.selection_active && key.code == KeyCode::Esc {
@@ -1976,7 +1976,7 @@ impl<'a> App<'a> {
                         match crate::extras::mcp::oauth::begin_login(&server, &url, &settings).await
                         {
                             Ok(login) => {
-                                let copy_status = match copy_to_clipboard(&login.auth_url) {
+                                let copy_status = match copy_to_clipboard(&login.auth_url).await {
                                     Ok(ClipboardCopyOutcome::Confirmed) => {
                                         "open this URL to authorize (copied to clipboard):"
                                     }

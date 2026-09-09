@@ -1672,7 +1672,7 @@ fn request_terminal_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome
 /// Copy `text` to the system clipboard. Native Windows CF_UNICODETEXT and
 /// successful Unix clipboard utilities are confirmed. OSC 52 only reports
 /// that a terminal fallback was requested because it has no acknowledgement.
-pub fn copy_to_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
+pub async fn copy_to_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
     validate_clipboard_text(text)?;
 
     #[cfg(windows)]
@@ -1691,29 +1691,77 @@ pub fn copy_to_clipboard(text: &str) -> anyhow::Result<ClipboardCopyOutcome> {
             ("pbcopy", &[]),
         ];
         for &(cmd, args) in cmds {
-            let Ok(mut child) = std::process::Command::new(cmd)
-                .args(args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn_guarded()
-            else {
-                continue; // tool not installed
-            };
-            let wrote = match child.stdin.take() {
-                Some(mut stdin) => {
-                    let ok = stdin.write_all(text.as_bytes()).is_ok();
-                    drop(stdin); // close stdin so the tool sees EOF
-                    ok
-                }
-                None => false,
-            };
-            if wrote && matches!(child.wait(), Ok(status) if status.success()) {
+            let mut command = tokio::process::Command::new(cmd);
+            command.args(args);
+            if run_clipboard_command(command, text, std::time::Duration::from_secs(2)).await {
                 return Ok(ClipboardCopyOutcome::Confirmed);
             }
         }
         request_terminal_clipboard(text)
     }
+}
+
+#[cfg(not(windows))]
+struct ClipboardProcessGroup(Option<u32>);
+
+#[cfg(not(windows))]
+impl Drop for ClipboardProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::sandbox::kill_process_group_if_live(pid);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn run_clipboard_command(
+    mut command: tokio::process::Command,
+    text: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    use crate::process_creation::TokioCommandCreationExt;
+    use tokio::io::AsyncWriteExt;
+
+    let input = text.as_bytes().to_vec();
+    let (mut response, receiver) = tokio::sync::oneshot::channel();
+    // The owner finishes cleanup even if the UI abandons its copy request.
+    tokio::spawn(async move {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::sandbox::configure_child_lifetime(&mut command);
+        let Ok(mut child) = command.spawn_guarded() else {
+            let _ = response.send(false);
+            return;
+        };
+        let mut cleanup = ClipboardProcessGroup(child.id());
+        let copied = tokio::select! {
+            biased;
+            _ = response.closed() => false,
+            result = tokio::time::timeout(timeout, async {
+                let mut stdin = child.stdin.take().ok_or_else(|| {
+                    std::io::Error::other("clipboard helper has no stdin")
+                })?;
+                stdin.write_all(&input).await?;
+                stdin.shutdown().await?;
+                drop(stdin);
+                child.wait().await
+            }) => matches!(result, Ok(Ok(status)) if status.success()),
+        };
+        if copied {
+            cleanup.0 = None;
+        }
+        drop(cleanup);
+        if !copied {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        // wl-copy and xclip may leave a clipboard-owner daemon after a
+        // successful exit. Its lifetime belongs to the desktop session.
+        let _ = response.send(copied);
+    });
+    receiver.await.unwrap_or(false)
 }
 
 pub fn read_from_clipboard() -> anyhow::Result<String> {
