@@ -1981,6 +1981,12 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("src/extras/js/skills/store.rs", "status,", 5, "NON-PROCESS"),
     (
+        "src/extras/js/skills/store.rs",
+        "let revision_changed = if matches!(status.as_str(), \"verified\" | \"awaiting_approval\") {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/js/skills/telemetry.rs",
         "if !matches!(status, LifecycleStatus::Canary | LifecycleStatus::Active) {",
         1,
@@ -2721,6 +2727,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "37b1d55d03713d423bc79e2bdfc046830486adddb9997708182cbd6434852b94",
+                1,
+            ),
+            (
+                "77c64a52f67e32ce3f54a58973a20dd8c3c1c99797b07d43cf1fd780469e8f99",
                 1,
             ),
         ],

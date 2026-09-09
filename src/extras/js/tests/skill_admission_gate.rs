@@ -1005,43 +1005,86 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
 
 #[test]
 fn skill_store_pending_lifecycle_missing_suite_is_verified_but_not_approvable() {
-    let (root, _paths, mut evaluator, artifact) = evaluator(false);
-    let report = evaluator.evaluate_next(20).unwrap().unwrap();
-    assert_eq!(
-        report.reason_code.as_deref(),
-        Some("held_out_suite_required")
-    );
-    let proposal = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(proposal.status, ProposalStatus::Verified);
-    assert!(matches!(
-        evaluator.review_and_admit(&artifact.id, &Cancelled, 21),
-        Err(AdmissionError::NotAwaitingApproval)
-    ));
-    assert_eq!(evaluator.store().desired_generation().unwrap(), 0);
-
-    let admin = AdminIdentity::authenticated("suite-admin").unwrap();
-    suite()
-        .import(evaluator.store_mut(), &admin, 22)
-        .expect("trusted suite");
-    evaluator
-        .request_reevaluation(&artifact.id, &admin, 23)
-        .expect("authenticated reevaluation");
-    let report = evaluator.evaluate_next(24).unwrap().unwrap();
-    assert_eq!(report.outcome, "passed");
-    assert_eq!(
-        evaluator
+    for final_claim in [false, true] {
+        let (root, _paths, mut evaluator, artifact) = evaluator(false);
+        let mut now = 20;
+        if final_claim {
+            // Expired leases consume the earlier claims before the evaluator
+            // finally reaches the missing-suite decision on its last attempt.
+            for attempt in 1..MAX_EVALUATION_ATTEMPTS {
+                let lease = evaluator
+                    .store_mut()
+                    .claim_due_proposal("crashed-worker", now, 1)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(lease.attempt, attempt);
+                now += 2;
+            }
+        }
+        let blocked_report = evaluator.evaluate_next(now).unwrap().unwrap();
+        assert_eq!(
+            blocked_report.reason_code.as_deref(),
+            Some("held_out_suite_required")
+        );
+        assert_eq!(
+            blocked_report.attempt,
+            if final_claim {
+                MAX_EVALUATION_ATTEMPTS
+            } else {
+                1
+            }
+        );
+        let proposal = evaluator
             .store()
             .get_proposal(&artifact.id)
             .unwrap()
+            .unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Verified);
+        assert!(matches!(
+            evaluator.review_and_admit(&artifact.id, &Cancelled, now + 1),
+            Err(AdmissionError::NotAwaitingApproval)
+        ));
+        assert_eq!(evaluator.store().desired_generation().unwrap(), 0);
+
+        let admin = AdminIdentity::authenticated("suite-admin").unwrap();
+        suite()
+            .import(evaluator.store_mut(), &admin, now + 2)
+            .expect("trusted suite");
+        evaluator
+            .request_reevaluation(&artifact.id, &admin, now + 3)
+            .expect("authenticated reevaluation");
+        let pending = evaluator
+            .store()
+            .get_proposal(&artifact.id)
             .unwrap()
-            .status,
-        ProposalStatus::AwaitingApproval
-    );
-    let _ = std::fs::remove_dir_all(root);
+            .unwrap();
+        assert_eq!(pending.status, ProposalStatus::Pending);
+        let report = evaluator
+            .evaluate_next(now + 4)
+            .unwrap()
+            .expect("one reevaluation request must make the restored proposal claimable");
+        assert_eq!(pending.attempt_count, if final_claim { 0 } else { 1 });
+        assert_eq!(report.outcome, "passed");
+        assert_eq!(report.attempt, blocked_report.attempt + 1);
+        assert_eq!(
+            evaluator
+                .store()
+                .get_evaluation_report(&blocked_report.report_id)
+                .unwrap()
+                .unwrap(),
+            blocked_report
+        );
+        assert_eq!(
+            evaluator
+                .store()
+                .get_proposal(&artifact.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::AwaitingApproval
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 struct UnavailableEmbedding;

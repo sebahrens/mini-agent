@@ -203,7 +203,10 @@ character and spacing, token-tree kind, nested delimiter, and literal spelling; 
 reconstructed path or stringified token stream. Matching only the terminal line, inner invocation,
 or macro name cannot confer an exemption. Only
 syntactically proven task/thread or local associated `spawn` calls are excluded; ambiguous and
-unrecognized terminals fail closed. Spawn/status helpers hold the Windows creation mutex only through
+unrecognized terminals fail closed. The learned-skill reevaluation branch
+`matches!(status.as_str(), "verified" | "awaiting_approval")` compares a database status string;
+its exact source expression and full macro-context digest are classified `NON-PROCESS`.
+Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so
 explicit stdio and reusable-builder semantics remain exact; that synchronous helper can therefore
 hold the mutex through output completion. Raw terminals in async functions, after `.await`, or in

@@ -2437,15 +2437,15 @@ impl SkillStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::Stale(proposal_id.to_string()))?;
-        // Reset an exhausted claim budget, including an awaiting proposal whose
-        // last evaluation used the final claim. Report numbering is allocated
+        // Reset any spent claim budget on an eligible reopen, including a final
+        // evaluation that reached verified while waiting for a suite or approval.
+        // Report numbering is allocated
         // independently by claim_due_proposal and never rewinds with this counter.
         let proposal_changed = tx.execute(
             "UPDATE skill_proposals
              SET status = 'pending',
                  attempt_count = CASE
-                     WHEN reason_code = ?6
-                          OR (status = 'awaiting_approval' AND attempt_count >= ?7)
+                     WHEN reason_code = ?6 OR attempt_count >= ?7
                      THEN 0 ELSE attempt_count END,
                  infrastructure_attempt_count = 0,
                  next_attempt_at = ?1, report_id = NULL,

@@ -186,8 +186,9 @@ recoverable proposals while importing their matching baselines.
 Claims use persisted leases and retries so a crash cannot strand a row in `evaluating`.
 The bounded claim counter and durable report attempt number are distinct. A claim allocates its
 report number above every stored report for that proposal inside the claim transaction. Explicit
-recovery can reset an exhausted claim budget, including a final successful evaluation now awaiting
-approval, without colliding with or replacing historical reports.
+recovery resets a spent claim budget for every eligible proposal, including a final evaluation
+waiting for a held-out suite or awaiting approval, without colliding with or replacing historical
+reports. Restoring the suite and requesting reevaluation once must make the proposal claimable.
 Evaluation reports bind proposal ID, artifact ID, verifier version, matched held-out suite hashes,
 predecessor ID, attempt number, and timestamps. Reason codes are stable; human-readable messages
 are supplementary, generated only from fixed templates and sanitized typed fields, and never embed
