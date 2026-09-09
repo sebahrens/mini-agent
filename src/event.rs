@@ -161,6 +161,7 @@ pub enum UserEvent {
     ScrollDown,
     Resize,
     Paste(String),
+    LinkOpenFailed(String),
     #[cfg(feature = "loop")]
     LoopValidationDone(LoopValidationEvent),
     MouseDown {

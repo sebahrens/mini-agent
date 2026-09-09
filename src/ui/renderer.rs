@@ -13,9 +13,6 @@ use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 use smallvec::SmallVec;
 
-#[cfg(not(windows))]
-use crate::process_creation::StdCommandCreationExt;
-
 use super::feed::{BlockStyle, Feed, FeedLines, style_from_color};
 use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
@@ -1575,40 +1572,68 @@ fn open_url_windows(url: &str) -> anyhow::Result<()> {
     dispatch_windows_open(url, shell_execute_windows)
 }
 
-/// Open `url` in the system browser. The URL is validated first; the error
-/// describes why nothing was opened (rejected URL or no working opener), so
-/// callers can surface it instead of failing silently.
-pub fn open_url(url: &str) -> anyhow::Result<()> {
+fn validate_open_url(url: &str) -> anyhow::Result<()> {
     if !is_safe_url(url) {
         let preview: String = url.chars().take(80).collect();
         anyhow::bail!("refusing to open invalid or non-http(s) URL: {}", preview);
     }
 
+    Ok(())
+}
+
+/// Dispatch a validated URL to the desktop. A running opener may be the browser
+/// itself, so successful dispatch does not imply that a page has finished opening.
+pub async fn open_url(url: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return open_url_windows(url);
+    {
+        validate_open_url(url)?;
+        open_url_windows(url)
+    }
 
     #[cfg(not(windows))]
-    let openers: &[(&str, &[&str])] = &[
-        ("xdg-open", &[url]),
-        ("open", &[url]), // macOS
-    ];
-    #[cfg(not(windows))]
-    for &(cmd, args) in openers {
-        let Ok(mut child) = std::process::Command::new(cmd)
-            .args(args)
+    {
+        let mut commands = [
+            tokio::process::Command::new("xdg-open"),
+            tokio::process::Command::new("open"),
+        ];
+        open_url_with_commands(url, &mut commands, std::time::Duration::from_secs(2)).await
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn open_url_with_commands(
+    url: &str,
+    commands: &mut [tokio::process::Command],
+    observation: std::time::Duration,
+) -> anyhow::Result<()> {
+    use crate::process_creation::TokioCommandCreationExt;
+
+    validate_open_url(url)?;
+    for command in commands {
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn_guarded()
-        else {
+            .kill_on_drop(false);
+        #[cfg(unix)]
+        command.process_group(0);
+        let Ok(mut child) = command.spawn_guarded() else {
             continue; // opener not installed
         };
-        // A spawned opener can still fail (e.g. xdg-open without a display);
-        // honor its exit status and fall through to the next one.
-        if matches!(child.wait(), Ok(status) if status.success()) {
-            return Ok(());
+        match tokio::time::timeout(observation, child.wait()).await {
+            Ok(Ok(status)) if status.success() => return Ok(()),
+            Ok(_) => continue,
+            Err(_) => {
+                // xdg-open can run the browser in the foreground. Do not kill
+                // it or launch a duplicate fallback; reap it whenever it exits.
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Ok(());
+            }
         }
     }
-    #[cfg(not(windows))]
     anyhow::bail!("no working opener found (tried xdg-open and open)")
 }
 

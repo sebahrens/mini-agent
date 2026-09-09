@@ -1403,11 +1403,10 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "TC-SUPPORT-UTILITY",
     ),
-    ("src/ui/renderer.rs", ".spawn()", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/ui/renderer.rs",
         "let Ok(mut child) = command.spawn() else {",
-        1,
+        2,
         "TC-SUPPORT-UTILITY",
     ),
     (
@@ -1424,7 +1423,19 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/renderer.rs",
-        "let Ok(mut child) = std::process::Command::new(cmd)",
+        "commands: &mut [tokio::process::Command],",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "tokio::process::Command::new(\"open\"),",
+        1,
+        "TC-SUPPORT-UTILITY",
+    ),
+    (
+        "src/ui/renderer.rs",
+        "tokio::process::Command::new(\"xdg-open\"),",
         1,
         "TC-SUPPORT-UTILITY",
     ),
@@ -2240,12 +2251,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/renderer.rs",
-        "if matches!(child.wait(), Ok(status) if status.success()) {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/ui/renderer.rs",
         "}) => matches!(result, Ok(Ok(status)) if status.success()),",
         1,
         "NON-PROCESS",
@@ -2349,14 +2354,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "add018d80d10cb6a3d585ccb97bcdbe26bd63ccec9cca4519b6075fa172c2eb8",
-                1,
-            ),
-            (
-                "bb696e69e39aa81f50ef752ce4bc1564021298890472dce79dedaf55263346f6",
-                1,
-            ),
-            (
                 "d70f631d43aa86b91b591554981d4ba8cb2a723cd349bc1742f6a6a2e2f2fd54",
                 1,
             ),
@@ -2394,10 +2391,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/agent/tools/find_files.rs",
         &[
             (
-                "115510326f281b766408701156e3b61bd28b08fb8a83e1a83ae95034bfab337e",
-                1,
-            ),
-            (
                 "205b255efe38d50d4e3ffd4840977d3744af25b4be13bacd284867d626d6eea0",
                 1,
             ),
@@ -2411,10 +2404,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "56e99f3288d12b12f3643fdb1a5a4e56eddec6c5ce068190a6056d9fd6e7412e",
-                1,
-            ),
-            (
-                "645122c3dee305566d960b4846b998a32de6fdaeac386e21e3d0e19e644409d7",
                 1,
             ),
             (
@@ -2630,13 +2619,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         )],
     ),
     (
-        "src/extras/js/audit.rs",
-        &[(
-            "01ea14b48b35ce7c8b962bcb1ba243817f0a63f230d414850118cee9fed9f6cc",
-            1,
-        )],
-    ),
-    (
         "src/extras/js/host.rs",
         &[
             (
@@ -2754,15 +2736,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/skills/turn.rs",
         &[
             (
-                "09e954887c1888a296255a04fc1d10ba7806e8fc67dbd9d9b8a34d53a537dc5d",
-                1,
-            ),
-            (
                 "28e6f4ffe8d995be8ac3f65f2da51fc77225808714039ef01a22669ad78e1143",
-                1,
-            ),
-            (
-                "3fc20275d0f702215459b51e6b690a67ad684f7bd750513503d007b6fe8635ac",
                 1,
             ),
             (
@@ -2786,15 +2760,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "b3292455b91810203a439b84d52e261c6838155a4d035a19eb84fbd763610159",
-                1,
-            ),
-            (
                 "bc4fb0706aaa17dcb6d23c47773435403f4660ebf1230b57349ea16e489978c3",
-                1,
-            ),
-            (
-                "bd88f4885b162d21bd6c9c9819b78cba7017fda84d546275d93eb40ee3f05037",
                 1,
             ),
             (
@@ -2877,7 +2843,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "b5b1fd8ecd14c3b459885cace1c89d97456db2d65fb24b23305042f2207f7d95",
-                4,
+                1,
             ),
         ],
     ),
@@ -2948,15 +2914,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "b9ba7b946e716954ba269b40394f014187892aff4dbe028a7cffda9ae5c63bea",
-                1,
-            ),
-            (
                 "77288e0715e2e881aa2f70d0c79e2dc255ad6bb1cb187ddef46359df73a23762",
-                1,
-            ),
-            (
-                "21bedd3fe703d7764c0026616b47d5daf97fbfa36447f47f26a10b5cfefd84b4",
                 1,
             ),
             (
@@ -2977,10 +2935,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "87927df2c7d794eca3102771a06a4b3da45f0924beeb7715e6bd2fd0c917a654",
-                1,
-            ),
-            (
-                "8b1974fee65ca7148d7b05d7e2a5e68f3c46a111c04dfeb6bebf139a9c0ee5ed",
                 1,
             ),
             (
@@ -3020,16 +2974,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/ui/renderer.rs",
-        &[
-            (
-                "f915b7e6296aa7d6023439adbe8a3ba928a784a87d51c606c30480b43ef54183",
-                1,
-            ),
-            (
-                "99da3c2607b5ae5cbf0cf0a647827d0338e6fe9a07b83397ef5eee860a43fe20",
-                1,
-            ),
-        ],
+        &[(
+            "99da3c2607b5ae5cbf0cf0a647827d0338e6fe9a07b83397ef5eee860a43fe20",
+            1,
+        )],
     ),
     (
         "src/ui/slash/features.rs",
@@ -4066,6 +4014,7 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
     let expected = checked_inventory();
     let macro_non_process = checked_macro_non_process_contexts();
     let mut unguarded = Vec::new();
+    let mut observed_macro_contexts = BTreeSet::new();
 
     for source in rust_sources(&source_root) {
         let relative = source
@@ -4084,6 +4033,17 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
             continue;
         }
         let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
+        for call in terminal_calls(&contents).expect("Rust terminals must be discoverable") {
+            if !call.guarded
+                && let Some(context) = call.macro_context
+            {
+                observed_macro_contexts.insert((
+                    relative.clone(),
+                    context.digest,
+                    context.occurrence,
+                ));
+            }
+        }
         unguarded.extend(
             creation_boundary_violations(&relative, &contents, &expected, &macro_non_process)
                 .unwrap_or_else(|error| panic!("could not inspect {relative}: {error}")),
@@ -4093,6 +4053,13 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
     assert!(
         unguarded.is_empty(),
         "Windows-capable production process terminals bypass the crate creation boundary: {unguarded:#?}"
+    );
+    let stale: Vec<_> = macro_non_process
+        .difference(&observed_macro_contexts)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "stale macro non-process exemptions: {stale:#?}"
     );
 }
 

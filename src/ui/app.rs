@@ -802,10 +802,12 @@ impl<'a> App<'a> {
                     && let Some(idx) = self.renderer.buffer_line_at_row(row)
                 {
                     if let Some(url) = self.renderer.link_url_at(idx, col) {
-                        if let Err(e) = renderer_mod::open_url(&url) {
-                            self.renderer
-                                .write_line(&format!("cannot open link: {}", e), C_ERROR)?;
-                        }
+                        let tx = self.user_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = renderer_mod::open_url(&url).await {
+                                let _ = tx.send(UserEvent::LinkOpenFailed(error.to_string())).await;
+                            }
+                        });
                     } else {
                         self.renderer.selection_active = true;
                         self.renderer.selection_start = Some(idx);
@@ -827,6 +829,10 @@ impl<'a> App<'a> {
                     }
                     self.copy_selection_to_clipboard().await?;
                 }
+            }
+            UserEvent::LinkOpenFailed(error) => {
+                self.renderer
+                    .write_line(&format!("cannot open link: {error}"), C_ERROR)?;
             }
             UserEvent::Paste(data) => {
                 self.input.handle_paste(data);

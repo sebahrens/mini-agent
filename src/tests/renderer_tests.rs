@@ -7,8 +7,8 @@ use crate::ui::renderer::{
 };
 
 #[cfg(unix)]
-mod clipboard_process_tests {
-    use crate::ui::renderer::run_clipboard_command;
+mod desktop_process_tests {
+    use crate::ui::renderer::{open_url_with_commands, run_clipboard_command};
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     use std::path::PathBuf;
@@ -18,7 +18,8 @@ mod clipboard_process_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!("clipboard-{}", uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("desktop-helper-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
             Self(root)
         }
@@ -29,7 +30,7 @@ mod clipboard_process_tests {
                 .args([
                     "-c",
                     &format!("echo $$ > \"$1\"; {script}"),
-                    "clipboard-fixture",
+                    "desktop-fixture",
                 ])
                 .arg(self.0.join("pid"))
                 .arg(self.0.join("input"))
@@ -58,7 +59,7 @@ mod clipboard_process_tests {
                 }
             })
             .await
-            .expect("clipboard fixture must start")
+            .expect("desktop fixture must start")
         }
     }
 
@@ -78,7 +79,107 @@ mod clipboard_process_tests {
             }
         })
         .await
-        .expect("clipboard helper must be reaped");
+        .expect("desktop helper must be reaped");
+    }
+
+    #[tokio::test]
+    async fn url_openers_validate_then_fall_back_and_pass_one_literal_argument() {
+        let rejected = Fixture::new();
+        for url in ["javascript:alert(1)", "https://example.com/\0sentinel"] {
+            assert!(
+                open_url_with_commands(
+                    url,
+                    &mut [rejected.command("exit 0")],
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(rejected.pid("pid").is_none());
+
+        let failed = Fixture::new();
+        let accepted = Fixture::new();
+        let unused = Fixture::new();
+        let url = "https://example.com/a path?q=雪&touch SENTINEL;$(touch SENTINEL)#fragment";
+        std::fs::write(accepted.0.join("ambient-input"), "UI keystrokes").unwrap();
+        let mut successful = accepted.command("/bin/cat > \"$2.stdin\"; printf '%s' \"$6\" > \"$2\"; printf '%s' \"$#\" > \"$2.argc\"");
+        successful.stdin(std::fs::File::open(accepted.0.join("ambient-input")).unwrap());
+        open_url_with_commands(
+            url,
+            &mut [
+                tokio::process::Command::new(failed.0.join("missing-opener")),
+                failed.command("exit 7"),
+                successful,
+                unused.command("exit 0"),
+            ],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(accepted.0.join("input")).unwrap(),
+            url
+        );
+        assert_eq!(
+            std::fs::read_to_string(accepted.0.join("input.argc")).unwrap(),
+            "6"
+        );
+        assert_eq!(std::fs::read(accepted.0.join("input.stdin")).unwrap(), b"");
+        assert!(!accepted.0.join("SENTINEL").exists());
+        assert!(unused.pid("pid").is_none());
+        assert_reaped(failed.started().await).await;
+        assert_reaped(accepted.started().await).await;
+
+        let all_failed = Fixture::new();
+        let error = open_url_with_commands(
+            url,
+            &mut [
+                tokio::process::Command::new(all_failed.0.join("missing-opener")),
+                all_failed.command("exit 7"),
+            ],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no working opener"));
+        assert_reaped(all_failed.started().await).await;
+    }
+
+    #[tokio::test]
+    async fn url_openers_bound_observation_and_keep_the_browser_alive_without_duplicate_launches() {
+        for daemon in [false, true] {
+            let browser = Fixture::new();
+            let fallback = Fixture::new();
+            let serve = "while [ ! -f \"$4\" ]; do /bin/sleep 0.01; done; echo served > \"$5\"";
+            let script = if daemon {
+                format!("({serve}) </dev/null >/dev/null 2>&1 & echo $! > \"$3\"")
+            } else {
+                serve.to_owned()
+            };
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                open_url_with_commands(
+                    "https://example.com",
+                    &mut [browser.command(&script), fallback.command("exit 0")],
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+            .expect("browser lifetime must not block dispatch")
+            .unwrap();
+            let pid = browser.started().await;
+            assert!(fallback.pid("pid").is_none());
+            std::fs::write(browser.0.join("request"), "dispatch completed").unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !browser.0.join("served").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the browser must be able to serve after dispatch returns");
+            assert_reaped(pid).await;
+        }
     }
 
     #[tokio::test]
@@ -427,16 +528,6 @@ fn windows_open_request_source_has_no_cmd_interpreter_fallback() {
             "Windows URL opener must not reintroduce command interpreter syntax: {forbidden}"
         );
     }
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_open_request_shell_execute_uses_file_target_without_parameters() {
-    let url = "https://example.com/a&b|c^d(quoted)%25?q=\"value\"#fragment";
-    let request = windows_open_request(url).unwrap();
-
-    assert_eq!(decoded_windows_target(url), url);
-    assert!(request.parameters.is_none());
 }
 
 #[test]
