@@ -13,6 +13,8 @@ const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error(transparent)]
+    StableRead(#[from] super::ImportError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Portable(#[from] portable::PortablePathError),
@@ -39,7 +41,11 @@ pub fn load_skill_markdown(record: &AgentSkillRecord) -> Result<String, LoadErro
     {
         return Err(LoadError::TooLarge);
     }
-    let bytes = fs::read(&record.skill_md_path)?;
+    let bytes = super::import::read_stable_file(
+        &record.skill_md_path,
+        record.skill_md_bytes.min(MAX_SKILL_MD_BYTES),
+        false,
+    )?;
     verify_sha256(&bytes, &record.skill_md_sha256)?;
     String::from_utf8(bytes).map_err(|_| LoadError::NonUtf8)
 }
@@ -66,7 +72,7 @@ pub fn load_resource(record: &AgentSkillRecord, relative_path: &str) -> Result<V
     {
         return Err(LoadError::TooLarge);
     }
-    let bytes = fs::read(path)?;
+    let bytes = super::import::read_stable_file(&path, resource.bytes, false)?;
     verify_sha256(&bytes, &resource.sha256)?;
     Ok(bytes)
 }

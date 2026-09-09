@@ -212,6 +212,13 @@ Only a missing pointer permits the legacy single-digest fallback; invalid explic
 that package. The corruption regression covers invalid, unreadable, non-file, oversized, and
 linked pointers, fresh startup, retained siblings, and repair.
 
+Catalog instruction and resource reads use the same stable, no-follow bounded-file primitive
+as import, capped at the 48 KiB instruction limit and 16 MiB import resource limit respectively.
+Progressive loading retains its 1 MiB resource limit and bounds each read to the selected
+manifest size before checking its digest. Growth and replacement between metadata validation
+and opening are rejected; the catalog boundary regression accepts exact limits and omits a
+package one byte above either limit while retaining valid siblings.
+
 Catalog generation belongs to the immutable index and the frozen turn. Search results retain
 immutable records without a duplicate generation field. The active-version switch regression
 checks that a retained selection still loads its original instructions after a new index is published.

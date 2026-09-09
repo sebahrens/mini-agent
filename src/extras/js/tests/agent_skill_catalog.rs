@@ -472,55 +472,86 @@ fn agent_skill_catalog_refuses_to_guess_between_digests_without_a_pointer() {
     assert_eq!(selected[0].record.digest, first.identity.digest);
 }
 
-/// A tree already installed above the turn instruction budget is omitted
-/// rather than ranked first and then dropped on every turn.
+/// Catalog limits must apply before ranking, while retaining each exact-limit tree.
 #[test]
-fn agent_skill_catalog_omits_a_tree_over_the_turn_instruction_budget() {
-    let temp = TempPaths::new();
-    let source = write_skill(&temp, "v1");
-    let small = import_agent_skill(&source, &temp.paths).unwrap();
-
-    let oversized_digest = "f".repeat(64);
-    let oversized_root = temp
-        .paths
-        .data_dir
-        .join("agent-skills")
-        .join("verbose-code")
-        .join(&oversized_digest);
-    fs::create_dir_all(&oversized_root).unwrap();
-    let header = "---\nname: verbose-code\ndescription: Reviews Rust code at length.\n---\n\n";
-    let budget = usize::try_from(crate::extras::skills::MAX_SKILL_INSTRUCTION_BYTES).unwrap();
-    fs::write(
-        oversized_root.join("SKILL.md"),
-        format!("{header}{}", "x".repeat(budget)),
-    )
-    .unwrap();
-    fs::write(
-        oversized_root.parent().unwrap().join("ACTIVE"),
-        format!("{oversized_digest}\n"),
-    )
-    .unwrap();
-
-    let embedder = Embedder::new().unwrap();
-    let mut catalog = AgentSkillCatalog::new(&temp.paths);
-    let index = catalog.refresh(&embedder).unwrap();
-    let query = embedder
-        .embed_documents(&["review rust".to_string()])
-        .unwrap()
-        .remove(0);
-    // A budget wide enough to select the oversized tree if the catalog had
-    // admitted it: the omission must come from the catalog, not from the
-    // per-turn budget that silently dropped it afterwards.
-    let selected = index
-        .search(
-            &query,
-            &AgentSkillSearchPolicy {
-                score_floor: -1.0,
-                instruction_byte_budget: 8 * 1024 * 1024,
-                ..AgentSkillSearchPolicy::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(selected.len(), 1, "the oversized tree must not be indexed");
-    assert_eq!(selected[0].record.digest, small.identity.digest);
+fn agent_skill_catalog_enforces_instruction_and_resource_read_limits() {
+    for (markdown, limit) in [
+        (true, crate::extras::skills::MAX_SKILL_INSTRUCTION_BYTES),
+        (false, 16 * 1024 * 1024),
+    ] {
+        let temp = TempPaths::new();
+        let source = write_skill(&temp, "v1");
+        let small = import_agent_skill(&source, &temp.paths).unwrap();
+        let digest = "f".repeat(64);
+        let root = temp
+            .paths
+            .data_dir
+            .join("agent-skills")
+            .join("verbose-code")
+            .join(&digest);
+        fs::create_dir_all(&root).unwrap();
+        let header = "---\nname: verbose-code\ndescription: Reviews Rust code at length.\n---\n\n";
+        fs::write(root.join("SKILL.md"), header).unwrap();
+        let path = if markdown {
+            root.join("SKILL.md")
+        } else {
+            root.join("asset.bin")
+        };
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        file.set_len(limit).unwrap();
+        fs::write(root.parent().unwrap().join("ACTIVE"), format!("{digest}\n")).unwrap();
+        let embedder = Embedder::new().unwrap();
+        let mut catalog = AgentSkillCatalog::new(&temp.paths);
+        let query = embedder
+            .embed_documents(&["review rust".to_string()])
+            .unwrap()
+            .remove(0);
+        // This generous selection budget cannot itself hide an over-limit instruction tree.
+        let policy = AgentSkillSearchPolicy {
+            score_floor: -1.0,
+            instruction_byte_budget: 8 * 1024 * 1024,
+            ..AgentSkillSearchPolicy::default()
+        };
+        let at_limit = catalog
+            .refresh(&embedder)
+            .unwrap()
+            .search(&query, &policy)
+            .unwrap();
+        assert_eq!(
+            at_limit.len(),
+            2,
+            "markdown={markdown}: exact limit must be accepted"
+        );
+        if !markdown {
+            let record = &at_limit
+                .iter()
+                .find(|skill| skill.record.digest == digest)
+                .unwrap()
+                .record;
+            assert!(
+                matches!(
+                    load_resource(record, "asset.bin"),
+                    Err(crate::extras::skills::loader::LoadError::TooLarge)
+                ),
+                "catalog import limit must not enlarge progressive loading's 1 MiB budget"
+            );
+        }
+        file.set_len(limit + 1).unwrap();
+        let selected = catalog
+            .refresh(&embedder)
+            .unwrap()
+            .search(&query, &policy)
+            .unwrap();
+        assert_eq!(
+            selected.len(),
+            1,
+            "markdown={markdown}: oversized tree must be omitted"
+        );
+        assert_eq!(selected[0].record.digest, small.identity.digest);
+    }
 }

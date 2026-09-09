@@ -242,7 +242,7 @@ fn scan_record(
     if !metadata.is_file() || metadata.len() > MAX_SKILL_MD_BYTES {
         return Ok(None);
     }
-    let markdown = fs::read(&markdown_path)?;
+    let markdown = super::import::read_stable_file(&markdown_path, MAX_SKILL_MD_BYTES, false)?;
     let manifest = parse_skill_markdown(&markdown)?;
     if name_entry.file_name().to_string_lossy() != manifest.name {
         return Ok(None);
@@ -270,7 +270,7 @@ fn scan_record(
         tags,
         identifiers,
         skill_md_path: markdown_path,
-        skill_md_bytes: metadata.len(),
+        skill_md_bytes: markdown.len() as u64,
         skill_md_sha256: sha256_hex(&markdown),
         resources,
         allowed_tools: manifest.allowed_tools,
@@ -356,12 +356,16 @@ fn resources(root: &Path) -> Result<Vec<ResourceMetadata>, CatalogError> {
                     .to_string_lossy()
                     .replace('\\', "/");
                 if relative != "SKILL.md" {
-                    let bytes = fs::read(&path)?;
+                    let bytes = super::import::read_stable_file(
+                        &path,
+                        super::import::MAX_FILE_BYTES,
+                        false,
+                    )?;
                     output.insert(
                         relative.clone(),
                         ResourceMetadata {
                             relative_path: relative,
-                            bytes: metadata.len(),
+                            bytes: bytes.len() as u64,
                             sha256: sha256_hex(&bytes),
                         },
                     );

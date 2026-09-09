@@ -16,7 +16,7 @@ use crate::extras::js::skills::store::SkillStore;
 const TREE_IDENTITY_VERSION: &[u8] = b"mini-agent-agent-skill-tree-v1";
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_DEPTH: usize = 16;
 const MAX_COMPRESSION_RATIO: u64 = 100;
@@ -764,6 +764,8 @@ pub(super) fn read_stable_file(
         });
     }
 
+    #[cfg(test)]
+    tests::interpose_before_file_open(path);
     let file = open_source_file(path)?;
     let opened = secure_fs::checked_file_metadata(&file)?;
     secure_fs::ensure_same_file(path, &before, &opened)?;
@@ -963,6 +965,34 @@ mod tests {
 
     use super::*;
 
+    type ReadInterposition = (PathBuf, Box<dyn FnOnce()>);
+    thread_local! {
+        static BEFORE_FILE_OPEN: std::cell::RefCell<Option<ReadInterposition>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn interpose_before_file_open(path: &Path) {
+        let action = BEFORE_FILE_OPEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(target, _)| target == path) {
+                slot.take().map(|(_, action)| action)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
+            action();
+        }
+    }
+
+    struct ReadInterpositionGuard;
+    impl Drop for ReadInterpositionGuard {
+        fn drop(&mut self) {
+            BEFORE_FILE_OPEN.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
     struct TempRoot(PathBuf);
 
     impl TempRoot {
@@ -989,6 +1019,78 @@ mod tests {
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = remove_tree_no_follow(&self.0);
+        }
+    }
+
+    #[test]
+    fn selected_content_read_rejects_growth_and_replacement_between_check_and_open() {
+        use crate::extras::js::skills::embed::Embedder;
+        use crate::extras::skills::{index::AgentSkillSearchPolicy, loader};
+
+        for markdown in [true, false] {
+            for replace in [false, true] {
+                let temp = TempRoot::new();
+                let source =
+                    write_directory_skill(&temp.0, "bounded-skill", &temp.0.join("never-run"));
+                import_agent_skill(&source, &temp.paths()).unwrap();
+                let embedder = Embedder::new().unwrap();
+                let mut catalog = AgentSkillCatalog::new(&temp.paths());
+                let record = catalog
+                    .refresh(&embedder)
+                    .unwrap()
+                    .search_lexical("bounded", &AgentSkillSearchPolicy::default())
+                    .unwrap()
+                    .remove(0)
+                    .record;
+                let path = if markdown {
+                    record.skill_md_path.clone()
+                } else {
+                    record
+                        .skill_md_path
+                        .parent()
+                        .unwrap()
+                        .join("assets/note.txt")
+                };
+                let load = || {
+                    if markdown {
+                        loader::load_skill_markdown(&record).map(String::into_bytes)
+                    } else {
+                        loader::load_resource(&record, "assets/note.txt")
+                    }
+                };
+                let original = load().unwrap();
+                assert!(!original.is_empty());
+                make_writable(&path, false).unwrap();
+                make_writable(path.parent().unwrap(), true).unwrap();
+                let target = path.clone();
+                BEFORE_FILE_OPEN.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some((
+                        path,
+                        Box::new(move || {
+                            if replace {
+                                let replacement = target.with_extension("replacement");
+                                fs::write(&replacement, &original).unwrap();
+                                fs::rename(replacement, &target).unwrap();
+                            } else {
+                                fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&target)
+                                    .unwrap()
+                                    .set_len(MAX_FILE_BYTES + 1)
+                                    .unwrap();
+                            }
+                        }),
+                    ));
+                });
+                let _reset = ReadInterpositionGuard;
+                assert!(
+                    matches!(load(), Err(loader::LoadError::StableRead(_))),
+                    "markdown={markdown}, replacement={replace}"
+                );
+                BEFORE_FILE_OPEN
+                    .with(|slot| assert!(slot.borrow().is_none(), "safe reader was bypassed"));
+            }
         }
     }
 
