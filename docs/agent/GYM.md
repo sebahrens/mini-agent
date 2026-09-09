@@ -124,7 +124,7 @@ a task is reported on stderr with the reason (no matching commit, unresolvable b
 green at base, oracle not green at the fix, checkout unavailable, or no bounded text delta).
 Checkout failures provide no oracle evidence: the candidate is skipped if either revision cannot
 be checked out. Cleanup also removes a partially created worktree when a post-checkout hook fails,
-including its Git registration. Command timeouts remain reported oracle failures, allowing tasks
+including its Gym-owned Git registration even if the hook locked it. Command timeouts remain reported oracle failures, allowing tasks
 that fix hangs or excessive runtime; the fix revision must complete successfully within the limit.
 Validated tasks receive the `fail-to-pass` tag. With `--no-validate`, neither oracle runs: tasks
 receive `validation-skipped` and the CLI reports them as unvalidated. These two provenance tags
@@ -163,8 +163,9 @@ For each task and each arm the runner:
 
 1. creates a detached worktree at `base_commit` under `<gym root>/worktrees/`, removes
    `deleted_files`, and overlays `initial_files`. A worktree that cannot be created is a failed row
-   with `failure_reason=workspace_unavailable`; `--allow-empty-workspace` restores the old silent
-   empty-directory behaviour;
+   with `failure_reason=workspace_unavailable`. With `--allow-empty-workspace`, any partial
+   checkout and its registration are removed before creating an empty directory and applying the
+   task's initial files. If cleanup leaves the destination behind, the episode fails;
 2. builds a fresh AppPaths tree under `<gym root>/runs/` and a curated environment (below);
 3. for the `library` arm, installs the library from a neutral directory, approves and activates only
    the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
@@ -197,6 +198,8 @@ retain their complete output. Timeout diagnostics use
 those same tails. The exit deadline still applies if a process closes its output pipes early.
 Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
 groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.
+Git worktree setup and cleanup commands still lack deadlines; bounded administrative execution is
+tracked separately in `mini-agent-i7r1`.
 
 Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
 finished.
@@ -205,7 +208,8 @@ finished.
 
 Episodes never read the operator's configuration. `ZS_CONFIG_DIR` and `ZS_CREDENTIALS_DIR` point at
 gym-owned directories seeded with a minimal `config.toml` holding only `--provider`/`--model` when
-given, alongside gym-owned `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`,
+given. Quotes, backslashes, control characters, and Unicode in these values are preserved as
+string content. The runner also sets gym-owned `ZS_DATA_DIR`, `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`,
 `TMPDIR`, and `MINI_AGENT_GYM=1`. The environment is an allowlist, not a copy: `PATH`, `HOME`,
 `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TZ`, `SSL_CERT_DIR`, `SSL_CERT_FILE`, the
 known provider key variables (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY`,

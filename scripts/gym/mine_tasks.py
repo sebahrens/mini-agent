@@ -179,8 +179,9 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
             return False
         finally:
             # A failing post-checkout hook can make add fail after registering
-            # the worktree. Remove that partial checkout before its temp root.
-            subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
+            # the worktree, possibly locking it. Remove this Gym-owned checkout
+            # and its registration before deleting its temp root.
+            subprocess.run(["git", "worktree", "remove", "--force", "--force", str(worktree)], cwd=repo, capture_output=True)
             subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)
         if result.returncode:
             print(

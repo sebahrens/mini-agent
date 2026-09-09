@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import tracemalloc
 import unittest
 from pathlib import Path
@@ -462,8 +463,11 @@ class GymTrainerTests(unittest.TestCase):
             root = Path(directory)
             repo = make_repo(root)
             binary, log = make_stub(root, "success")
+            provider = 'gateway "quoted"\\route\nsecurity_mode = "yolo"'
+            model = 'model-🚀\tfast\r\n\\edition\x7f'
             completed, rows, gym_root = run_training(
-                root, repo, binary, task_document([{"name": "fix", "tags": []}]), "--keep-run-dirs"
+                root, repo, binary, task_document([{"name": "fix", "tags": []}]), "--keep-run-dirs",
+                "--provider", provider, "--model", model,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             observed = [
@@ -481,7 +485,11 @@ class GymTrainerTests(unittest.TestCase):
                     self.assertEqual(Path(owned).resolve().parent.parent, runs, owned)
             # --keep-run-dirs leaves the AppPaths trees behind; they are the
             # gym's, so they are inside the gym root.
-            self.assertTrue(sorted((gym_root / "runs").iterdir()))
+            run_dirs = sorted((gym_root / "runs").iterdir())
+            self.assertEqual(len(run_dirs), 2)
+            for run_dir in run_dirs:
+                with (run_dir / "config/config.toml").open("rb") as config:
+                    self.assertEqual(tomllib.load(config), {"provider": provider, "model": model})
 
     def test_elapsed_ms_times_the_agent_without_the_oracle(self) -> None:
         # A one-second oracle runs twice per episode (before and after the
@@ -562,18 +570,52 @@ class GymTrainerTests(unittest.TestCase):
             self.assertIn("seed import exploded", rows[1]["failure_detail"])
             self.assertIsNone(rows[1]["agent_exit"])
 
-    def test_unreachable_base_commit_is_a_failed_row_not_an_empty_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_repo(root)
-            binary, _ = make_stub(root, "success")
-            document = task_document([{"name": "fix", "tags": [], "base_commit": "0" * 40}])
-            completed, rows, _ = run_training(root, repo, binary, document)
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            for row in rows:
-                self.assertFalse(row["success"])
-                self.assertEqual(row["failure_reason"], "workspace_unavailable")
-                self.assertIn("git worktree add", row["failure_detail"])
+    def test_failed_checkouts_require_opt_in_and_a_fresh_empty_fallback(self) -> None:
+        for failure in ["missing_revision", "checkout_hook", "locked_hook"]:
+            for allow_empty in [False, True]:
+                with self.subTest(failure=failure, allow_empty=allow_empty), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo = make_repo(root)
+                    base = "0" * 40
+                    if failure != "missing_revision":
+                        base = "HEAD"
+                        hook = repo / ".git/hooks/post-checkout"
+                        lock = 'git worktree lock "$PWD"\n' if failure == "locked_hook" else ""
+                        hook.write_text("#!/bin/sh\n" + lock + "printf stray > hook-artifact\nexit 1\n")
+                        hook.chmod(0o755)
+                    binary, log = make_stub(root, "success")
+                    document = task_document([{"name": "fix", "base_commit": base, "initial_files": {"seed": "input"}}])
+                    document["defaults"]["oracle"] = {
+                        "command": "test -f fixed.txt && test -f seed && test ! -e .git && test ! -e value.txt && test ! -e hook-artifact"
+                    }
+                    completed, rows, gym_root = run_training(
+                        root, repo, binary, document, *(["--allow-empty-workspace"] if allow_empty else [])
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(len(rows), 2)
+                    self.assertEqual(log.exists(), allow_empty)
+                    for row in rows:
+                        self.assertEqual(row["success"], allow_empty, row)
+                        if allow_empty:
+                            self.assertEqual(row["oracle_pre_exit"], 1)
+                            self.assertEqual(row["oracle_exit"], 0)
+                        else:
+                            self.assertEqual(row["failure_reason"], "workspace_unavailable")
+                            self.assertIn("git worktree add", row["failure_detail"])
+                            self.assertIsNone(row["agent_exit"])
+                    self.assertEqual(list((gym_root / "worktrees").iterdir()), [])
+                    self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                    if failure == "checkout_hook" and allow_empty:
+                        # A cleanup failure must not let the overlay modify a
+                        # partial checkout while calling it an empty fallback.
+                        destination = root / "cleanup-failed"
+                        task = {"base_commit": "HEAD", "initial_files": {"value.txt": "changed"}, "deleted_files": []}
+                        with mock.patch.object(TRAIN_MODULE, "remove_workspace"):
+                            with self.assertRaises(TRAIN_MODULE.EpisodeFailure) as failed:
+                                TRAIN_MODULE.prepare_workspace(repo, task, destination, True)
+                        self.assertEqual(failed.exception.reason, "workspace_unavailable")
+                        self.assertEqual((destination / "value.txt").read_text(), "broken\n")
+                        TRAIN_MODULE.remove_workspace(repo, destination)
 
     def test_agent_args_are_forwarded_and_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -700,16 +742,21 @@ class GymTrainerTests(unittest.TestCase):
 
 class GymMinerTests(unittest.TestCase):
     def test_checkout_failures_skip_tasks_and_clean_partial_worktrees(self) -> None:
-        for failed_content in ["broken", "fixed"]:
-            with self.subTest(failed_content=failed_content), tempfile.TemporaryDirectory() as directory:
+        for failed_content, locked in [(content, locked) for content in ["broken", "fixed"] for locked in [False, True]]:
+            with self.subTest(failed_content=failed_content, locked=locked), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 repo = make_repo(root)
                 parent = git(repo, "rev-parse", "HEAD").strip()
                 (repo / "value.txt").write_text("fixed\n", encoding="utf-8")
                 git(repo, "commit", "-qam", "fix mini-agent-test")
                 commit = git(repo, "rev-parse", "HEAD").strip()
+                unrelated = root / "unrelated"
+                git(repo, "worktree", "add", "--detach", str(unrelated), commit)
+                git(repo, "worktree", "lock", "--reason", "preserve this workspace", str(unrelated))
+                original_registrations = git(repo, "worktree", "list", "--porcelain")
                 hook = repo / ".git" / "hooks" / "post-checkout"
-                hook.write_text(f"#!/bin/sh\n! grep -qx {failed_content} value.txt\n", encoding="utf-8")
+                lock = 'git worktree lock "$PWD"\n' if locked else ""
+                hook.write_text("#!/bin/sh\n" + lock + f"! grep -qx {failed_content} value.txt\n", encoding="utf-8")
                 hook.chmod(0o755)
                 beads = root / "beads.jsonl"
                 beads.write_text(json.dumps({"id": "mini-agent-test", "status": "closed"}) + "\n", encoding="utf-8")
@@ -722,7 +769,8 @@ class GymMinerTests(unittest.TestCase):
                 self.assertEqual(len(skipped), 1)
                 failed_revision = parent if failed_content == "broken" else commit
                 self.assertIn(f"worktree add {failed_revision} failed", skipped[0])
-                self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                self.assertEqual(git(repo, "worktree", "list", "--porcelain"), original_registrations)
+                self.assertEqual((unrelated / "value.txt").read_text(), "fixed\n")
                 self.assertEqual((repo / "value.txt").read_text(), "fixed\n")
 
     def test_miner_oracle_floods_are_bounded_and_worktrees_are_cleaned(self) -> None:
