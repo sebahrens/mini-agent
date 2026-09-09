@@ -391,8 +391,8 @@ when all conditions hold:
    Tier 0 and explicitly idempotent Tier 1 operations. **Automatic fallback is not implemented.**
    `router.rs` computes and freezes the route (`FrozenRoute`, including
    `fallback_before_effects`) and `turn.rs` emits a canary-exposure audit record for every turn
-   that had an eligible candidate, but `FrozenRoute::may_fallback` has no production caller and
-   nothing in `JsTool` or the worker ever re-invokes the predecessor after a canary failure. A
+   that had an eligible candidate. This is eligibility metadata only: nothing in `JsTool` or
+   the worker re-invokes the predecessor after a canary failure. A
    failed canary invocation fails the step; it does not silently retry on the active revision.
 
 Promotion from canary to active requires at least 25 qualified candidate invocations, no severe
@@ -700,8 +700,8 @@ From the 2026-09-07 review. Each bead below is closed with its regression covera
 4. **Decision scheduler gated out** (mini-agent-fegd). `skills/scheduler.rs` had no production
    caller and was moved behind `#[cfg(test)]` rather than left as apparently-live machinery.
 5. **Canary route audited, fallback not implemented** (mini-agent-sdt9). The frozen route is
-   recorded on a per-turn canary-exposure audit record. `may_fallback` remains uncalled in
-   production; section 7 rule 5 is downgraded accordingly.
+   recorded on a per-turn canary-exposure audit record; section 7 rule 5 describes eligibility
+   metadata only. The unused `may_fallback` predicate was subsequently removed (mini-agent-3l4w).
 6. **Purge guard** (mini-agent-zod2). `--purge-learned-skill` refuses a non-terminal target or one
    with dependent revisions unless `--purge-learned-skill-force` is passed, and names every
    revision a forced purge re-roots.

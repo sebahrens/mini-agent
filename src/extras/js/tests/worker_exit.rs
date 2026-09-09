@@ -128,16 +128,25 @@ async fn exit_poll_drains_the_pending_read_with_cancellation_and_a_bound() {
             cancellation.clone(),
         );
         tokio::pin!(read);
-        tokio::select! {
-            result = &mut read => panic!("exit poll discarded the pending frame: {result:?}"),
-            _ = async {
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    while live.load(Ordering::Acquire) != 0 {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                }).await.expect("the read loop must observe and reap the exited worker");
-            } => {}
-        }
+        // Observe reaping in the same poll that enters the drain. A separate
+        // timer can be scheduled after the 100 ms drain expires while this
+        // fixture still holds the pipe reader locked.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| {
+                if let std::task::Poll::Ready(result) = std::future::Future::poll(read.as_mut(), cx)
+                {
+                    panic!("exit poll discarded the pending frame: {result:?}");
+                }
+                if live.load(Ordering::Acquire) == 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the read loop must observe and reap the exited worker");
         if action == "release" {
             drop(guard);
             assert_eq!(

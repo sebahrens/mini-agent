@@ -68,6 +68,7 @@ fn skill_canary_routing_races_ineligible_and_root_canaries_never_replace_active(
         let routed = route(b"key", &input).unwrap();
         assert_eq!(routed.route_kind, RouteKind::Active, "{status:?}");
         assert_eq!(routed.candidate_id, None, "{status:?}");
+        assert!(!routed.fallback_before_effects, "{status:?}");
     }
     let mut root = eligible;
     let candidate = root.candidate.as_mut().unwrap();
@@ -76,32 +77,32 @@ fn skill_canary_routing_races_ineligible_and_root_canaries_never_replace_active(
     let routed = route(b"key", &root).unwrap();
     assert_eq!(routed.route_kind, RouteKind::Active);
     assert_eq!(routed.candidate_id, None);
+    assert!(!routed.fallback_before_effects);
 }
 
 #[test]
-fn fallback_never_replays_effects() {
-    let mut selected = None;
-    for turn in 0..100 {
-        let routed = route(b"local-secret", &request(&format!("turn-{turn}"))).unwrap();
-        if routed.route_kind == RouteKind::Canary {
-            selected = Some(routed);
-            break;
-        }
+fn frozen_fallback_eligibility_matches_capability_and_idempotence() {
+    let selected = (0..100)
+        .map(|turn| request(&format!("turn-{turn}")))
+        .find(|input| route(b"local-secret", input).unwrap().route_kind == RouteKind::Canary)
+        .expect("deterministic fixture should select a canary");
+    for (tier, idempotent, eligible) in [
+        (CapabilityTier::Pure, false, true),
+        (CapabilityTier::Pure, true, true),
+        (CapabilityTier::ReadOnly, false, false),
+        (CapabilityTier::ReadOnly, true, true),
+        (CapabilityTier::SideEffecting, false, false),
+        (CapabilityTier::SideEffecting, true, false),
+    ] {
+        let mut input = selected.clone();
+        let candidate = input.candidate.as_mut().unwrap();
+        candidate.capability_tier = tier;
+        candidate.explicitly_idempotent = idempotent;
+        let routed = route(b"local-secret", &input).unwrap();
+        assert_eq!(routed.route_kind, RouteKind::Canary);
+        assert_eq!(
+            routed.fallback_before_effects, eligible,
+            "{tier:?}, idempotent={idempotent}"
+        );
     }
-    let selected = selected.expect("deterministic fixture should select a canary");
-    assert!(selected.may_fallback(false));
-    assert!(!selected.may_fallback(true));
-
-    let mut tier_two = request("known");
-    tier_two.canary_share_basis_points = 1_000;
-    tier_two.candidate.as_mut().unwrap().capability_tier = CapabilityTier::SideEffecting;
-    for turn in 0..100 {
-        tier_two.turn_id = format!("tier2-{turn}");
-        let routed = route(b"local-secret", &tier_two).unwrap();
-        if routed.route_kind == RouteKind::Canary {
-            assert!(!routed.may_fallback(false));
-            return;
-        }
-    }
-    panic!("deterministic fixture should select a tier-two canary");
 }

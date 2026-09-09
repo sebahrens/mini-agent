@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_tests_in_order() {
+    fn embedded_tests_report_the_first_failure_at_its_original_index() {
         let s = skill(
             "function add(_cap, a, b) { return a + b; }",
             vec!["add(1, 1) === 2", "add(2, 3) === 5", "add(0, 0) === 0"],
@@ -226,6 +226,31 @@ mod tests {
         let report = verify_skill(&s).unwrap();
         assert_eq!(report.test_results.len(), 3);
         assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
+        for failed_index in 0..s.tests.len() {
+            let mut expressions = s.tests.clone();
+            // Make the suffix fail too: verification must identify the first
+            // failure, not the last one or a filtered-result position.
+            for expression in &mut expressions[failed_index..] {
+                *expression = "false".into();
+            }
+            let rejected = skill(
+                &s.source,
+                expressions.iter().map(String::as_str).collect(),
+                vec![("add", "(a, b): number")],
+                CapabilityTier::Pure,
+                vec![],
+            );
+            assert!(
+                matches!(
+                    verify_skill(&rejected),
+                    Err(VerificationError::TestFailed {
+                        index,
+                        outcome: TestResult::ReturnedFalse,
+                    }) if index == failed_index
+                ),
+                "first failure at {failed_index}"
+            );
+        }
     }
 
     #[test]
@@ -447,22 +472,6 @@ mod tests {
                 .iter()
                 .all(|o| *o == MutationOutcome::Detected)
         );
-    }
-
-    #[test]
-    fn test_separate_script_locations() {
-        // Each test should be a separate script location in the context.
-        // This test verifies they can have independent line numbers.
-        let s = skill(
-            "function check() { return true; }",
-            vec!["check()", "check()", "check()"],
-            vec![("check", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 3);
-        assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
     }
 
     #[test]
