@@ -209,6 +209,13 @@ impl AdmissionEvaluator {
         let held_out = match evaluate(&self.store, &artifact, predecessor.as_ref()) {
             Ok(report) => report,
             Err(HeldOutError::SuiteRequired) => return Err(EvaluationFailure::SuiteRequired),
+            Err(error @ HeldOutError::CorpusCapacity(_)) => {
+                // Trusted corpus size says nothing about candidate correctness.
+                // Keep its identity recoverable when the corpus is corrected.
+                return Err(EvaluationFailure::Infrastructure {
+                    error: error.to_string(),
+                });
+            }
             Err(HeldOutError::Identity(_)) => {
                 return Err(deterministic(
                     "identity_invalid",
@@ -930,6 +937,7 @@ fn review_gate_verification_error(error: &VerificationError) -> AdmissionError {
 
 fn review_gate_held_out_error(error: HeldOutError) -> AdmissionError {
     match error {
+        HeldOutError::CorpusCapacity(_) => AdmissionError::Infrastructure(error.to_string()),
         HeldOutError::Infrastructure(error)
         | HeldOutError::Embedded(error)
         | HeldOutError::Inherited(error) => review_gate_verification_error(&error),

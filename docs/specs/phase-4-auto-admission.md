@@ -363,7 +363,12 @@ Expected values, fixture responses, and transcripts are never included in agent 
 The evaluator permits at most 32 distinct matched suites and 64 total held-out cases across the
 candidate and its complete predecessor lineage. Shared suites count once. If either bound is
 exceeded, evaluation refuses the corpus before running any held-out case; it must never truncate
-the suite union or execute a partial suite. Every successful report covers the complete union.
+the suite union or execute a partial suite. Every successful report covers the complete union. A corpus
+capacity failure belongs to trusted evaluation infrastructure, not candidate source. It follows
+bounded infrastructure retry and then `evaluation_infrastructure_deferred`; correcting the corpus
+and resubmitting the unchanged artifact permits reevaluation. During human approval, the same
+capacity failure reports infrastructure unavailability and leaves the reviewed proposal intact.
+Actual failed cases remain deterministic rejections.
 
 If no suitable suite matches, the proposal remains verified with
 `held_out_suite_required`. It cannot enter canary until a human imports or approves a suite and

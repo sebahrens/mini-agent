@@ -144,61 +144,113 @@ fn verification_scheduler_cancellation_retries_without_rejecting_candidate() {
 }
 
 #[test]
-fn verification_scheduler_cancellation_parks_after_bounded_infrastructure_retries() {
-    let (root, _paths, mut evaluator, artifact) = evaluator(true);
-
-    let mut now = 20;
-    for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
-        evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
-        let error = evaluator
-            .evaluate_next(now)
-            .expect_err("scheduler cancellation must remain infrastructure-only");
-        assert!(matches!(error, AdmissionError::Retryable(_)));
+fn skill_admission_infrastructure_failures_park_and_recover_without_rejecting_identity() {
+    // All three failures belong to evaluation infrastructure, not candidate source.
+    // Exercise their shared bounded retry/recovery path with real corpus imports.
+    for (name, extra_suites, cases_per_suite) in [
+        ("scheduler cancellation", 0, 0),
+        ("suite capacity", 32, 1),
+        ("case capacity", 1, 64),
+    ] {
+        let (root, _paths, mut evaluator, artifact) = evaluator(true);
+        let admin = AdminIdentity::authenticated("suite-admin").unwrap();
+        let mut excess_ids = Vec::new();
+        for suite_index in 0..extra_suites {
+            let mut draft = suite();
+            draft.cases = (0..cases_per_suite)
+                .map(|case_index| {
+                    let mut case = draft.cases[0].clone();
+                    case.expression =
+                        format!("normalize(' value ') /* {suite_index}:{case_index} */");
+                    case
+                })
+                .collect();
+            excess_ids.push(draft.import(evaluator.store_mut(), &admin, 15).unwrap());
+        }
+        let mut now = 20;
+        for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
+            if extra_suites == 0 {
+                evaluator.fail_next_verification_for_test(worker_error(WorkerError::Cancelled));
+            }
+            let error = evaluator.evaluate_next(now).expect_err(name);
+            assert!(
+                matches!(error, AdmissionError::Retryable(_)),
+                "{name}: {error}"
+            );
+            let proposal = evaluator
+                .store()
+                .get_proposal(&artifact.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(proposal.infrastructure_attempt_count, attempt, "{name}");
+            if attempt < MAX_EVALUATION_ATTEMPTS {
+                now = proposal.next_attempt_at.expect("bounded retry remains due");
+            }
+        }
         let proposal = evaluator
             .store()
             .get_proposal(&artifact.id)
             .unwrap()
             .unwrap();
-        assert_eq!(proposal.infrastructure_attempt_count, attempt);
-        if attempt < MAX_EVALUATION_ATTEMPTS {
-            now = proposal.next_attempt_at.expect("bounded retry remains due");
-        }
-    }
+        assert_eq!(proposal.status, ProposalStatus::Deferred, "{name}");
+        assert_eq!(proposal.attempt_count, 0, "{name}");
+        assert_eq!(
+            proposal.infrastructure_attempt_count, MAX_EVALUATION_ATTEMPTS,
+            "{name}"
+        );
+        assert_eq!(proposal.next_attempt_at, None, "{name}");
+        assert_eq!(proposal.report_id, None, "{name}");
+        assert_eq!(
+            proposal.reason_code.as_deref(),
+            Some("evaluation_infrastructure_deferred"),
+            "{name}"
+        );
+        assert_eq!(
+            evaluator.store().revision_status(&artifact.id).unwrap(),
+            Some("pending".to_string()),
+            "{name}"
+        );
 
-    let proposal = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .expect("proposal remains parked after repeated infrastructure failures");
-    assert_eq!(proposal.status, ProposalStatus::Deferred);
-    assert_eq!(proposal.attempt_count, 0);
-    assert_eq!(
-        proposal.infrastructure_attempt_count,
-        MAX_EVALUATION_ATTEMPTS
-    );
-    assert_eq!(proposal.next_attempt_at, None);
-    assert_eq!(proposal.report_id, None);
-    assert_eq!(
-        proposal.reason_code.as_deref(),
-        Some("evaluation_infrastructure_deferred")
-    );
-    assert_eq!(
-        evaluator.store().revision_status(&artifact.id).unwrap(),
-        Some("pending".to_string())
-    );
-    let reopened = evaluator
-        .store_mut()
-        .enqueue_proposal(&artifact, None, now.saturating_add(1))
-        .expect("byte-identical resubmission reopens deferred infrastructure work");
-    assert_eq!(reopened.status, EnqueueStatus::Pending);
-    let proposal = evaluator
-        .store()
-        .get_proposal(&artifact.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(proposal.status, ProposalStatus::Pending);
-    assert_eq!(proposal.infrastructure_attempt_count, 0);
-    let _ = std::fs::remove_dir_all(root);
+        // Simulate an operator correcting the trusted corpus, then resubmitting
+        // the exact same artifact. No candidate identity change is necessary.
+        for suite_id in excess_ids {
+            evaluator
+                .store()
+                .conn()
+                .execute(
+                    "UPDATE held_out_suites SET enabled = 0 WHERE suite_id = ?1",
+                    [suite_id],
+                )
+                .unwrap();
+        }
+        let reopened = evaluator
+            .store_mut()
+            .enqueue_proposal(&artifact, None, now + 1)
+            .expect("byte-identical resubmission reopens deferred infrastructure work");
+        assert_eq!(reopened.status, EnqueueStatus::Pending, "{name}");
+        let proposal = evaluator
+            .store()
+            .get_proposal(&artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending, "{name}");
+        assert_eq!(proposal.infrastructure_attempt_count, 0, "{name}");
+        let report = evaluator.evaluate_next(now + 2).unwrap().unwrap();
+        assert_eq!(report.outcome, "passed", "{name}");
+        assert_eq!(report.skill_id, artifact.id, "{name}");
+        assert_eq!(
+            evaluator
+                .store()
+                .get_proposal(&artifact.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::AwaitingApproval,
+            "{name}"
+        );
+        drop(evaluator);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 }
 
 fn skill_source_diagnostic(class: DiagnosticClass, stage: DiagnosticStage) -> Diagnostic {
@@ -650,18 +702,28 @@ impl HumanReviewer for TamperingApprover {
     }
 }
 
-struct SuiteDisablingApprover {
+struct SuiteChangingApprover {
     paths: AppPaths,
     now: i64,
+    exceed_capacity: bool,
 }
 
-impl HumanReviewer for SuiteDisablingApprover {
+impl HumanReviewer for SuiteChangingApprover {
     fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-        let store = SkillStore::open_at(&self.paths).expect("second connection");
-        store
-            .conn()
-            .execute("UPDATE held_out_suites SET enabled = 0", [])
-            .expect("disable suite");
+        let mut store = SkillStore::open_at(&self.paths).expect("second connection");
+        if self.exceed_capacity {
+            let admin = AdminIdentity::authenticated("suite-admin").unwrap();
+            for index in 0..32 {
+                let mut draft = suite();
+                draft.cases[0].expression = format!("normalize('value') /* {index} */");
+                draft.import(&mut store, &admin, self.now).unwrap();
+            }
+        } else {
+            store
+                .conn()
+                .execute("UPDATE held_out_suites SET enabled = 0", [])
+                .expect("disable suite");
+        }
         ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
             "decision-stale-suite",
             "human-reviewer",
@@ -694,21 +756,69 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
     assert_eq!(approvals, 0);
     let _ = std::fs::remove_dir_all(root);
 
-    let (root, paths, mut suite_evaluator, artifact) = evaluator(true);
-    suite_evaluator.evaluate_next(20).unwrap().unwrap();
-    let error = suite_evaluator
-        .review_and_admit(&artifact.id, &SuiteDisablingApprover { paths, now: 21 }, 21)
-        .expect_err("changed held-out suite selection must fail");
-    assert!(matches!(error, AdmissionError::StaleReview));
-    assert_ne!(
-        suite_evaluator
-            .store()
-            .revision_status(&artifact.id)
-            .unwrap(),
-        Some("canary".to_string())
-    );
-    assert_eq!(suite_evaluator.store().desired_generation().unwrap(), 0);
-    let _ = std::fs::remove_dir_all(root);
+    for exceed_capacity in [false, true] {
+        let (root, paths, mut suite_evaluator, artifact) = evaluator(true);
+        let report = suite_evaluator.evaluate_next(20).unwrap().unwrap();
+        let error = suite_evaluator
+            .review_and_admit(
+                &artifact.id,
+                &SuiteChangingApprover {
+                    paths,
+                    now: 21,
+                    exceed_capacity,
+                },
+                21,
+            )
+            .expect_err("changed held-out corpus must block admission");
+        if exceed_capacity {
+            assert!(
+                matches!(error, AdmissionError::Infrastructure(_)),
+                "{error}"
+            );
+        } else {
+            assert!(matches!(error, AdmissionError::StaleReview), "{error}");
+        }
+        assert_eq!(
+            suite_evaluator
+                .store()
+                .get_proposal(&artifact.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::AwaitingApproval
+        );
+        assert_ne!(
+            suite_evaluator
+                .store()
+                .revision_status(&artifact.id)
+                .unwrap(),
+            Some("canary".to_string())
+        );
+        assert_eq!(suite_evaluator.store().desired_generation().unwrap(), 0);
+        if exceed_capacity {
+            suite_evaluator
+                .store()
+                .conn()
+                .execute(
+                    "UPDATE held_out_suites SET enabled = 0 WHERE suite_id != ?1",
+                    [&report.suite_hashes[0]],
+                )
+                .unwrap();
+            let recovered = suite_evaluator
+                .review_and_admit(
+                    &artifact.id,
+                    &Approver {
+                        now: 22,
+                        packet: Mutex::new(None),
+                    },
+                    22,
+                )
+                .unwrap();
+            assert!(matches!(recovered, ReviewOutcome::Canary(_)));
+        }
+        drop(suite_evaluator);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
     let (root, _paths, mut evaluator, artifact) = evaluator(true);
     evaluator.evaluate_next(20).unwrap().unwrap();

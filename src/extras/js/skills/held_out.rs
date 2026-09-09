@@ -388,7 +388,7 @@ pub(crate) fn evaluate(
     // Apply the bound to the deduplicated candidate/lineage union. Sampling a
     // prefix could omit required ancestor regressions while reporting success.
     if suites.len() > MAX_MATCHED_SUITES {
-        return Err(HeldOutError::InvalidSuite(format!(
+        return Err(HeldOutError::CorpusCapacity(format!(
             "matched held-out suites exceed the {MAX_MATCHED_SUITES}-suite evaluation cap: {} suites",
             suites.len()
         )));
@@ -407,7 +407,7 @@ pub(crate) fn evaluate(
         .try_fold(0usize, |total, count| total.checked_add(count))
         .unwrap_or(usize::MAX);
     if matched_cases > MAX_MATCHED_CASES {
-        return Err(HeldOutError::InvalidSuite(format!(
+        return Err(HeldOutError::CorpusCapacity(format!(
             "matched held-out cases exceed the {MAX_MATCHED_CASES}-case evaluation cap: \
              {matched_cases} cases across {} suites",
             suites.len()
@@ -506,6 +506,8 @@ fn transcript_matches(expected: &TranscriptExpectation, actual: &FakeTranscript)
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeldOutError {
+    #[error("held-out corpus exceeds evaluator capacity: {0}")]
+    CorpusCapacity(String),
     #[error("invalid held-out suite: {0}")]
     InvalidSuite(String),
     #[error("unsupported held-out suite version: {0}")]

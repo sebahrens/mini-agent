@@ -171,7 +171,7 @@ fn skill_held_out_evaluator_enforces_complete_corpus_limits_after_inheritance() 
             (ancestor_suites > 0).then_some(&predecessor),
         );
         match (refusal, result) {
-            (Some(limit), Err(HeldOutError::InvalidSuite(detail))) => {
+            (Some(limit), Err(HeldOutError::CorpusCapacity(detail))) => {
                 assert!(
                     detail.contains(&format!("{limit} evaluation cap")),
                     "{name}: {detail}"
