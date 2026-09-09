@@ -244,24 +244,17 @@ impl InvocationCapabilityRuntime {
         Ok(handle)
     }
 
-    /// Activate exactly the parent-prepared handle; public artifact metadata is validation only.
-    pub(crate) fn begin(
+    /// Test setup uses the same binding and one-shot claim as a production wrapper call.
+    #[cfg(test)]
+    pub(crate) fn activate_for_test(
         &self,
         handle: PreparedInvocationHandle,
         skill_id: &str,
         export_name: &str,
         manifest: &CapabilityManifest,
     ) -> Result<u64, CapabilityError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CapabilityError::InvalidInvocation)?;
-        let position = state
-            .prepared
-            .iter()
-            .position(|candidate| candidate.handle == handle)
-            .ok_or(CapabilityError::InvalidInvocation)?;
-        Self::activate(&mut state, position, skill_id, export_name, manifest)
+        let _binding = self.bind(handle)?;
+        self.claim_bound(skill_id, export_name, manifest)
     }
 
     /// Bind one exact prepared handle for the immediately following direct wrapper call.

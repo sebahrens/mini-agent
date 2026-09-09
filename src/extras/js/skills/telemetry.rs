@@ -667,6 +667,7 @@ pub struct TelemetryDispatcher {
     #[cfg(test)]
     test_batch_tx: Option<SyncSender<EventBatch>>,
     observability_lost: Arc<AtomicU64>,
+    #[cfg(test)]
     busy_retries: Arc<AtomicU64>,
     shutdown: TelemetryShutdown,
     shutdown_budget: Duration,
@@ -728,7 +729,9 @@ impl TelemetryDispatcher {
         let (tx, rx) = std::sync::mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
         let observability_lost = Arc::new(AtomicU64::new(0));
         let worker_observability_lost = Arc::clone(&observability_lost);
+        #[cfg(test)]
         let busy_retries = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
         let worker_busy_retries = Arc::clone(&busy_retries);
         let shutdown = TelemetryShutdown::default();
         let worker_shutdown = shutdown.clone();
@@ -738,9 +741,12 @@ impl TelemetryDispatcher {
                 while let Ok(command) = rx.recv() {
                     let TelemetryCommand::Events(batch) = command else {
                         if let TelemetryCommand::TaskOutcome(outcome) = command
-                            && ingest_retrying_busy(&worker_busy_retries, &worker_shutdown, || {
-                                ingest_task_outcome(&mut store, &outcome)
-                            })
+                            && ingest_retrying_busy(
+                                #[cfg(test)]
+                                &worker_busy_retries,
+                                &worker_shutdown,
+                                || ingest_task_outcome(&mut store, &outcome),
+                            )
                             .is_err()
                         {
                             worker_observability_lost.fetch_add(1, Ordering::Relaxed);
@@ -750,9 +756,12 @@ impl TelemetryDispatcher {
                         }
                         continue;
                     };
-                    match ingest_retrying_busy(&worker_busy_retries, &worker_shutdown, || {
-                        TelemetryIngestor::new(&mut store).ingest(&batch)
-                    }) {
+                    match ingest_retrying_busy(
+                        #[cfg(test)]
+                        &worker_busy_retries,
+                        &worker_shutdown,
+                        || TelemetryIngestor::new(&mut store).ingest(&batch),
+                    ) {
                         Ok(report) if report.evidence_complete => {
                             if let Some(coordinator) = &coordinator {
                                 apply_automatic_quarantine(&mut store, coordinator, &batch);
@@ -778,6 +787,7 @@ impl TelemetryDispatcher {
             #[cfg(test)]
             test_batch_tx: None,
             observability_lost,
+            #[cfg(test)]
             busy_retries,
             shutdown,
             shutdown_budget: TELEMETRY_SHUTDOWN_FLUSH_BUDGET,
@@ -921,7 +931,7 @@ fn ingest_task_outcome(
 }
 
 fn ingest_retrying_busy<T>(
-    busy_retries: &AtomicU64,
+    #[cfg(test)] busy_retries: &AtomicU64,
     shutdown: &TelemetryShutdown,
     mut ingest: impl FnMut() -> Result<T, TelemetryError>,
 ) -> Result<T, TelemetryError> {
@@ -938,6 +948,7 @@ fn ingest_retrying_busy<T>(
         }
         match ingest() {
             Err(error) if error.is_sqlite_busy() => {
+                #[cfg(test)]
                 busy_retries.fetch_add(1, Ordering::Relaxed);
                 attempts = attempts.saturating_add(1);
                 // Both command types retain their position in the FIFO queue.

@@ -369,10 +369,10 @@ fn effect_attribution_comes_from_the_explicit_invocation_not_map_order() {
         );
     }
     let first = capabilities
-        .begin(handles[0], &skill_id, "run", &manifest)
+        .activate_for_test(handles[0], &skill_id, "run", &manifest)
         .unwrap();
     let second = capabilities
-        .begin(handles[1], &skill_id, "run", &manifest)
+        .activate_for_test(handles[1], &skill_id, "run", &manifest)
         .unwrap();
     capabilities
         .dispatch(first, HostCapability::ReadFile, r#"["first"]"#)
@@ -431,7 +431,7 @@ fn nested_same_and_different_exports_keep_exact_handles_and_outer_authority() {
                     .pop_front()
                     .expect("nested handle prepared");
                 let token = runtime
-                    .begin(
+                    .activate_for_test(
                         handle,
                         &captured_skill_id,
                         expected_export,
@@ -477,7 +477,7 @@ fn nested_same_and_different_exports_keep_exact_handles_and_outer_authority() {
     nested.lock().unwrap().extend([inner, same_export]);
 
     let outer_token = capabilities
-        .begin(outer, &skill_id, "outer", &manifest)
+        .activate_for_test(outer, &skill_id, "outer", &manifest)
         .unwrap();
     capabilities
         .dispatch(outer_token, HostCapability::ReadFile, r#"["outer-before"]"#)

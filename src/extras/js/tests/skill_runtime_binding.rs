@@ -206,7 +206,7 @@ fn cancellation_and_worker_recycle_revoke_before_effect_dispatch() {
         )
         .unwrap();
     let cancelled_token = capabilities
-        .begin(cancelled_handle, &skill_id, "run", &manifest)
+        .activate_for_test(cancelled_handle, &skill_id, "run", &manifest)
         .unwrap();
     let lifecycle = WorkerCapabilityLifecycle::new(capabilities.clone());
     lifecycle.cancel(&first);
@@ -232,7 +232,7 @@ fn cancellation_and_worker_recycle_revoke_before_effect_dispatch() {
         )
         .unwrap();
     let recycled_token = capabilities
-        .begin(recycled_handle, &skill_id, "run", &manifest)
+        .activate_for_test(recycled_handle, &skill_id, "run", &manifest)
         .unwrap();
     drop(lifecycle);
     assert_eq!(capabilities.active_count(), 0);
@@ -300,7 +300,7 @@ fn wrapper_entry_claims_only_the_exact_bound_prepared_handle() {
         .unwrap();
     capabilities.finish(second);
     let first = capabilities
-        .begin(first_handle, &skill_id, "first", &manifest)
+        .activate_for_test(first_handle, &skill_id, "first", &manifest)
         .unwrap();
     capabilities.finish(first);
     assert!(capabilities.bind(second_handle).is_err());
@@ -342,10 +342,10 @@ fn all_active_invocations_share_one_effect_ordinal_budget() {
     let first_handle = prepare("aggregate-first", 41);
     let second_handle = prepare("aggregate-second", 42);
     let first = capabilities
-        .begin(first_handle, &skill_id, "run", &manifest)
+        .activate_for_test(first_handle, &skill_id, "run", &manifest)
         .unwrap();
     let second = capabilities
-        .begin(second_handle, &skill_id, "run", &manifest)
+        .activate_for_test(second_handle, &skill_id, "run", &manifest)
         .unwrap();
 
     for ordinal in 0..MAX_EFFECTS_PER_STEP {
@@ -376,7 +376,7 @@ fn all_active_invocations_share_one_effect_ordinal_budget() {
     capabilities.recycle();
     let after_recycle_handle = prepare("aggregate-after-recycle", 43);
     let after_recycle = capabilities
-        .begin(after_recycle_handle, &skill_id, "run", &manifest)
+        .activate_for_test(after_recycle_handle, &skill_id, "run", &manifest)
         .unwrap();
     capabilities
         .dispatch(

@@ -26,23 +26,6 @@ pub(crate) enum AgentTool {
 }
 
 impl AgentTool {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Grep => "grep",
-            Self::FindFiles => "find_files",
-            Self::ListDir => "list_dir",
-            #[cfg(feature = "js")]
-            Self::Js => "js",
-            #[cfg(feature = "skills")]
-            Self::SkillsSearch => "skills_search",
-            #[cfg(feature = "memory")]
-            Self::MemoryRead => "memory_read",
-            #[cfg(feature = "memory")]
-            Self::MemorySearch => "memory_search",
-        }
-    }
-
     fn parse(value: &str) -> Option<Self> {
         match value
             .trim()
@@ -72,16 +55,6 @@ pub(crate) enum AgentEffort {
     Low,
     Medium,
     High,
-}
-
-impl AgentEffort {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
