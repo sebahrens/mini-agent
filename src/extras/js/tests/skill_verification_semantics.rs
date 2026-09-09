@@ -48,17 +48,75 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_boolean_true_passes() {
+    fn verification_report_binds_results_metadata_and_pure_transcript() {
+        use crate::extras::js::skills::fakes::FAKES_VERSION;
+        use crate::extras::js::skills::verify::VERIFIER_VERSION;
+        use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
+
         let s = skill(
-            "function test() { return true; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
+            "function foo() { return true; } function bar() { return true; }",
+            vec!["foo()", "bar()", "foo() && bar()"],
+            vec![("foo", "(): boolean"), ("bar", "(): boolean")],
             CapabilityTier::Pure,
             vec![],
         );
         let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 1);
-        assert_eq!(report.test_results[0], TestResult::Passed);
+        assert_eq!(report.skill_id, s.id);
+        assert_eq!(report.identity_version, s.identity_version);
+        assert_eq!(report.capability, s.capability);
+        assert_eq!(report.verifier_version, VERIFIER_VERSION);
+        assert_eq!(report.fakes_version, FAKES_VERSION);
+        assert_eq!(report.memory_limit, MEMORY_LIMIT);
+        assert_eq!(report.stack_limit, STACK_LIMIT);
+        assert_eq!(report.timeout, std::time::Duration::from_secs(30));
+        assert_eq!(report.test_results, vec![TestResult::Passed; 3]);
+        assert_eq!(report.mutation_outcomes, vec![MutationOutcome::Detected; 2]);
+        assert!(report.transcript.is_empty());
+    }
+
+    #[test]
+    fn verifier_exposes_only_declared_hosts_on_hidden_capabilities() {
+        use HostCapability::{Fetch, ReadFile, Spawn, WriteFile};
+
+        for (name, tier, hosts, expected) in [
+            (
+                "pure",
+                CapabilityTier::Pure,
+                vec![],
+                "undefined,undefined,undefined,undefined",
+            ),
+            (
+                "read_only",
+                CapabilityTier::ReadOnly,
+                vec![ReadFile],
+                "function,undefined,undefined,undefined",
+            ),
+            (
+                "restricted_effects",
+                CapabilityTier::SideEffecting,
+                vec![Spawn],
+                "undefined,undefined,function,undefined",
+            ),
+            (
+                "all_declared",
+                CapabilityTier::SideEffecting,
+                vec![ReadFile, WriteFile, Spawn, Fetch],
+                "function,function,function,function",
+            ),
+        ] {
+            let expected = format!("undefined,undefined,undefined,undefined|{expected}");
+            let expression = format!("inspect() === {expected:?}");
+            let s = skill(
+                "const ambient = [typeof read_file, typeof write_file, typeof spawn, typeof fetch].join(','); function inspect(cap) { return ambient + '|' + [typeof cap.read_file, typeof cap.write_file, typeof cap.spawn, typeof cap.fetch].join(','); }",
+                vec![&expression],
+                vec![("inspect", "(): string")],
+                tier,
+                hosts,
+            );
+            let report = verify_skill(&s).expect(name);
+            assert_eq!(report.test_results, vec![TestResult::Passed], "{name}");
+            assert_eq!(report.capability, s.capability, "{name}");
+        }
     }
 
     #[test]
@@ -69,6 +127,14 @@ mod tests {
             ("string", "'true'", TestResult::ReturnedFalse),
             ("object", "{}", TestResult::ReturnedFalse),
             ("array", "[]", TestResult::ReturnedFalse),
+            ("function", "(() => true)", TestResult::ReturnedFalse),
+            ("symbol", "Symbol('truthy')", TestResult::ReturnedFalse),
+            ("bigint", "1n", TestResult::ReturnedFalse),
+            (
+                "boxed_boolean",
+                "new Boolean(true)",
+                TestResult::ReturnedFalse,
+            ),
             ("undefined", "undefined", TestResult::ReturnedFalse),
             ("null", "null", TestResult::ReturnedFalse),
             (
@@ -320,33 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn verifier_exposes_declared_effects_only_on_the_hidden_capability_object() {
-        let s = skill(
-            "const ambient = typeof read_file; function inspect(cap) { return ambient === 'undefined' && typeof cap.read_file === 'function'; }",
-            vec!["inspect()"],
-            vec![("inspect", "(): boolean")],
-            CapabilityTier::ReadOnly,
-            vec![HostCapability::ReadFile],
-        );
-
-        assert!(verify_skill(&s).is_ok());
-    }
-
-    #[test]
-    fn test_mutation_detected_when_export_is_used() {
-        let s = skill(
-            "function getValue() { return 42; }",
-            vec!["getValue() === 42"],
-            vec![("getValue", "(): number")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.mutation_outcomes.len(), 1);
-        assert_eq!(report.mutation_outcomes[0], MutationOutcome::Detected);
-    }
-
-    #[test]
     fn assertion_free_export_call_does_not_satisfy_mutation_coverage() {
         let s = skill(
             "function run() { return 42; }",
@@ -406,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mutation_context_is_fresh_for_each_export() {
+    fn mutation_coverage_does_not_leak_between_exports() {
         let s = skill(
             "function used() { return 1; } function unused() { return 2; }",
             vec!["used() === 1"],
@@ -418,60 +457,6 @@ mod tests {
             verify_skill(&s),
             Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
         ));
-    }
-
-    #[test]
-    fn test_tier_0_pure_has_no_capability() {
-        let s = skill(
-            "function test() { return typeof read_file === 'undefined'; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 1);
-        assert_eq!(report.test_results[0], TestResult::Passed);
-    }
-
-    #[test]
-    fn test_report_contains_metadata() {
-        let s = skill(
-            "function test() { return true; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.skill_id, s.id);
-        assert_eq!(report.identity_version, s.identity_version);
-        assert_eq!(report.capability, s.capability);
-        assert!(report.verifier_version > 0);
-        assert_eq!(report.fakes_version, 4);
-        assert!(report.memory_limit > 0);
-        assert!(report.stack_limit > 0);
-    }
-
-    #[test]
-    fn test_multiple_exports() {
-        let s = skill(
-            "function foo() { return true; } function bar() { return true; }",
-            vec!["foo()", "bar()", "foo() && bar()"],
-            vec![("foo", "(): boolean"), ("bar", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 3);
-        assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
-        assert_eq!(report.mutation_outcomes.len(), 2);
-        assert!(
-            report
-                .mutation_outcomes
-                .iter()
-                .all(|o| *o == MutationOutcome::Detected)
-        );
     }
 
     #[test]
@@ -501,43 +486,6 @@ mod tests {
         assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
         assert_eq!(report.mutation_outcomes.len(), 1);
         assert_eq!(report.mutation_outcomes[0], MutationOutcome::Detected);
-    }
-
-    #[test]
-    fn test_mutation_multiple_exports() {
-        let s = skill(
-            "function foo() { return 1; } function bar() { return 2; }",
-            vec!["foo() === 1 && bar() === 2"],
-            vec![("foo", "(): number"), ("bar", "(): number")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 1);
-        assert_eq!(report.test_results[0], TestResult::Passed);
-        assert_eq!(report.mutation_outcomes.len(), 2);
-        // Both should be detected since the test uses both.
-        assert!(
-            report
-                .mutation_outcomes
-                .iter()
-                .all(|o| *o == MutationOutcome::Detected)
-        );
-    }
-
-    #[test]
-    fn test_multi_export_vacuity_is_rejected() {
-        let s = skill(
-            "function covered() { return true; } function unused() { return true; }",
-            vec!["covered()"],
-            vec![("covered", "(): boolean"), ("unused", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        assert!(matches!(
-            verify_skill(&s),
-            Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
-        ));
     }
 
     #[test]
@@ -631,95 +579,6 @@ mod tests {
             };
             assert_eq!(reason, expected, "{worker:?}");
         }
-    }
-
-    #[test]
-    fn test_transcript_empty_for_tier_0() {
-        let s = skill(
-            "function test() { return true; }",
-            vec!["test()"],
-            vec![("test", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert!(report.transcript.is_empty());
-    }
-}
-
-/// Gap probes for requirements bead y8n lists as mandatory. These assert the
-/// specified behaviour, not the behaviour that happens to be implemented.
-#[cfg(test)]
-mod required_behaviour_probes {
-    use crate::extras::js::skills::verify::verify_skill;
-    use crate::extras::js::skills::{
-        CapabilityTier, HostCapability, SkillArtifact, SkillExport, test_manifest,
-    };
-
-    fn artifact(
-        source: &str,
-        tests: Vec<&str>,
-        exports: Vec<(&str, &str)>,
-        tier: CapabilityTier,
-        hosts: Vec<HostCapability>,
-    ) -> SkillArtifact {
-        SkillArtifact::new(
-            source.to_string(),
-            "probe".to_string(),
-            vec![],
-            exports
-                .into_iter()
-                .map(|(name, signature)| SkillExport {
-                    name: name.to_string(),
-                    signature: signature.to_string(),
-                })
-                .collect(),
-            tests.into_iter().map(str::to_string).collect(),
-            test_manifest(tier, hosts).expect("valid manifest"),
-        )
-        .expect("valid artifact")
-    }
-
-    #[test]
-    fn probe_tier0_genuinely_lacks_hosts_while_tier1_has_them() {
-        // This is only meaningful if some tier DOES get globals; otherwise the
-        // Tier 0 assertion is vacuous.
-        let tier0 = artifact(
-            "function f(cap) { return typeof cap.read_file; }",
-            vec!["f() === 'undefined'"],
-            vec![("f", "f(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        assert!(verify_skill(&tier0).is_ok(), "Tier 0 must see no read_file");
-
-        let tier1 = artifact(
-            "function f(cap) { return typeof cap.read_file; }",
-            vec!["f() === 'function'"],
-            vec![("f", "f(): boolean")],
-            CapabilityTier::ReadOnly,
-            vec![HostCapability::ReadFile],
-        );
-        assert!(
-            verify_skill(&tier1).is_ok(),
-            "Tier 1 declaring read_file must see it as a function"
-        );
-    }
-
-    #[test]
-    fn probe_undeclared_host_is_unavailable_to_tier2() {
-        // Declares Spawn only; fetch must not appear.
-        let skill = artifact(
-            "function f(cap) { return typeof cap.spawn === 'function' && typeof cap.fetch === 'undefined'; }",
-            vec!["f()"],
-            vec![("f", "f(): boolean")],
-            CapabilityTier::SideEffecting,
-            vec![HostCapability::Spawn],
-        );
-        assert!(
-            verify_skill(&skill).is_ok(),
-            "only declared hosts may be present"
-        );
     }
 }
 
