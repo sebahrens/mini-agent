@@ -196,8 +196,14 @@ running for that episode. Failed file publication removes its temporary file.
 
 Agent, library-install, command-oracle, and worktree-command output in training and task mining is drained
 concurrently by [process_capture.py](../../scripts/gym/process_capture.py), retaining only the last
-2,000 bytes of each stream. Git blobs use its capped complete-stdout mode; other Git data queries
-retain their complete output. Timeout diagnostics use
+2,000 bytes of each stream. Git blobs use its capped complete-stdout mode. The miner's Git metadata
+and `bd list`/`bd version` commands retain complete stdout up to 16 MiB, bounded stderr tails,
+and have a 30-second deadline per command. Oversized metadata is rejected before parsing;
+Git metadata timeouts, output overflow, and launch failures stop mining without replacing the
+output artifact. A failed, timed-out,
+or overflowing `bd list` falls back to the exported JSONL source; its version diagnostic uses
+the same bounds. Invalid tracker metadata is reported as unreadable without blocking fallback.
+Explicit JSON/JSONL source files are read directly. Timeout diagnostics use
 those same tails. The exit deadline still applies if a process closes its output pipes early.
 Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
 groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.

@@ -1001,6 +1001,107 @@ class GymTrainerTests(unittest.TestCase):
 
 
 class GymMinerTests(unittest.TestCase):
+    def test_tracker_command_limits_preserve_fallback_and_complete_records(self) -> None:
+        for outcome in ["timeout", "overflow", "exact"]:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                (repo / ".beads").mkdir()
+                (repo / ".beads/issues.jsonl").write_text('{"id":"fallback","status":"closed"}\n')
+                shim_dir = root / "bin"
+                shim_dir.mkdir()
+                calls = root / "calls"
+                payload = b'[{"id":"live","status":"closed"}]'
+                limit = 65536
+                shim = shim_dir / "bd"
+                shim.write_text(
+                    f"#!{sys.executable}\nimport os,sys,time,json\n"
+                    f"with open({str(calls)!r},'a') as log: log.write(json.dumps([sys.argv[1],os.getpid()])+'\\n')\n"
+                    "for _ in range(64): os.write(2,b'e'*65536)\n"
+                    "os.write(2,b'tracker-tail')\n"
+                    f"if {outcome!r}=='timeout': time.sleep(3)\n"
+                    f"os.write(1,{payload!r})\n"
+                    f"for _ in range(64 if {outcome!r}=='overflow' else 0): os.write(1,b' '*65536)\n"
+                    f"if {outcome!r}=='exact': os.write(1,b' '*({limit}-len({payload!r})))\n"
+                )
+                shim.chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
+                     mock.patch.object(MINE, "METADATA_TIMEOUT_SECS", 1, create=True), \
+                     mock.patch.object(MINE, "MAX_METADATA_BYTES", limit, create=True), \
+                     contextlib.redirect_stderr(io.StringIO()) as diagnostics:
+                    tracemalloc.start()
+                    try:
+                        loaded = MINE.load_beads(repo, None)
+                        peak = tracemalloc.get_traced_memory()[1]
+                    finally:
+                        tracemalloc.stop()
+                self.assertEqual([bead["id"] for bead in loaded], ["live" if outcome == "exact" else "fallback"])
+                self.assertLess(peak, 1024 * 1024, "metadata retained the full stream flood")
+                observed = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual([call[0] for call in observed], ["list"] if outcome == "exact" else ["list", "version"])
+                for _, pid in observed:
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                if outcome == "exact":
+                    self.assertEqual(diagnostics.getvalue(), "")
+                else:
+                    self.assertIn("timed out" if outcome == "timeout" else "exceeded", diagnostics.getvalue())
+                    self.assertIn("falling back to", diagnostics.getvalue())
+                    self.assertLess(len(diagnostics.getvalue()), 3000)
+
+    def test_git_metadata_failure_aborts_without_replacing_task_output(self) -> None:
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        for operation, outcome in [("log", "timeout"), ("rev-parse", "overflow"),
+                                   ("diff", "overflow"), ("cat-file", "timeout")]:
+            with self.subTest(operation=operation, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                (repo / "value.txt").write_text("fixed\n")
+                git(repo, "commit", "-qam", "fix mini-agent-probe")
+                beads = root / "beads.json"
+                beads.write_text('[{"id":"mini-agent-probe","status":"closed"}]')
+                oracle_map = root / "oracles.json"
+                oracle_map.write_text('{"mini-agent-probe":"false"}')
+                output = root / "tasks.json"
+                output.write_text("existing task artifact\n")
+                pid_file = root / "failed-command"
+                shim_dir = root / "bin"
+                shim_dir.mkdir()
+                shim = shim_dir / "git"
+                shim.write_text(
+                    f"#!{sys.executable}\nimport os,sys,time\nfrom pathlib import Path\n"
+                    f"if sys.argv[1]=={operation!r}:\n"
+                    f" Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                    " for _ in range(64): os.write(2,b'e'*65536)\n"
+                    " os.write(2,b'metadata-tail')\n"
+                    f" if {outcome!r}=='timeout': time.sleep(3)\n"
+                    f" else:\n  for _ in range(64): os.write(1,b'x'*65536)\n"
+                    f"os.execv({real_git!r},[{real_git!r},*sys.argv[1:]])\n"
+                )
+                shim.chmod(0o755)
+                argv = [str(MINE.__file__), "--repo", str(repo), "--oracle-map", str(oracle_map),
+                        "--beads-json", str(beads), "--output", str(output), "--no-validate"]
+                with mock.patch.dict(os.environ, {"PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", "")}), \
+                     mock.patch.object(MINE, "METADATA_TIMEOUT_SECS", 1, create=True), \
+                     mock.patch.object(MINE, "MAX_METADATA_BYTES", 65536, create=True), \
+                     mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()) as diagnostics, \
+                     contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    tracemalloc.start()
+                    try:
+                        result = MINE.main()
+                        peak = tracemalloc.get_traced_memory()[1]
+                    finally:
+                        tracemalloc.stop()
+                self.assertEqual(result, 2, diagnostics.getvalue())
+                self.assertEqual(output.read_text(), "existing task artifact\n")
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("timed out" if outcome == "timeout" else "exceeded", diagnostics.getvalue())
+                self.assertLess(len(diagnostics.getvalue()), 2200)
+                self.assertLess(peak, 1024 * 1024)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), 0)
+
     def test_checkout_failures_skip_tasks_and_clean_partial_worktrees(self) -> None:
         for failed_content, locked in [(content, locked) for content in ["broken", "fixed"] for locked in [False, True]]:
             with self.subTest(failed_content=failed_content, locked=locked), tempfile.TemporaryDirectory() as directory:
@@ -1273,10 +1374,13 @@ class GymMinerTests(unittest.TestCase):
                     {"id": "mini-agent-aaa", "status": "closed"}]
             jsonl = "".join(json.dumps(row) + "\n" for row in rows)
             (repo / ".beads").mkdir()
-            (repo / ".beads/metadata.json").write_text(json.dumps({"dolt_mode": "embedded"}))
+            metadata = repo / ".beads/metadata.json"
             (repo / ".beads/issues.jsonl").write_text(jsonl)
-            for source in ["explicit-json", "explicit-jsonl", "bd", "fallback-missing", "fallback-error", "fallback-malformed"]:
+            for source in ["explicit-json", "explicit-jsonl", "bd", "fallback-missing", "fallback-error", "fallback-malformed",
+                           "fallback-metadata-list", "fallback-metadata-null", "fallback-metadata-utf8"]:
                 with self.subTest(source=source):
+                    metadata.write_bytes({"fallback-metadata-list": b"[]", "fallback-metadata-null": b"null",
+                                          "fallback-metadata-utf8": b"\xff"}.get(source, b'{"dolt_mode":"embedded"}'))
                     explicit = root / "export" if source.startswith("explicit") else None
                     if explicit is not None:
                         explicit.write_text(json.dumps(rows) if source == "explicit-json" else jsonl)
@@ -1286,7 +1390,7 @@ class GymMinerTests(unittest.TestCase):
                             self.fail("an explicit export must not invoke bd")
                         if argv[1] == "version":
                             return subprocess.CompletedProcess(argv, 0, b"bd fixture\n", b"")
-                        if source == "fallback-missing":
+                        if source == "fallback-missing" or source.startswith("fallback-metadata"):
                             raise FileNotFoundError("bd")
                         if source == "fallback-error":
                             raise subprocess.CalledProcessError(2, argv, stderr=b"tracker unavailable")
@@ -1298,7 +1402,9 @@ class GymMinerTests(unittest.TestCase):
                     self.assertEqual([row["id"] for row in loaded], ["mini-agent-aaa", "mini-agent-legacy", "mini-agent-zzz"])
                     if source.startswith("fallback"):
                         self.assertIn("falling back to", diagnostics.getvalue())
-                        if source != "fallback-malformed":
+                        if source.startswith("fallback-metadata"):
+                            self.assertIn("dolt_mode: unreadable", diagnostics.getvalue())
+                        elif source != "fallback-malformed":
                             self.assertIn("dolt_mode: embedded", diagnostics.getvalue())
                     else:
                         self.assertEqual(diagnostics.getvalue(), "")

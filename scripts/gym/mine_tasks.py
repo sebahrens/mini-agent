@@ -26,6 +26,8 @@ else:
 SCHEMA_VERSION = 1
 MAX_BLOB_BYTES = 256_000
 GIT_BLOB_TIMEOUT_SECS = 30
+MAX_METADATA_BYTES = 16 * 1024 * 1024
+METADATA_TIMEOUT_SECS = 30
 ORACLE_TIMEOUT_SECS = 300
 DEFAULT_BUDGETS = {"max_provider_turns": 12, "max_tool_calls": 24, "max_total_tokens": 16000}
 # Only these variables reach a mined oracle run, matching the training runner.
@@ -49,7 +51,13 @@ class OracleSetupError(RuntimeError):
 
 
 def run(argv: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(argv, cwd=cwd, capture_output=True)
+    """Read complete bounded metadata; never pass a truncated prefix to a parser."""
+    try:
+        result = run_bounded(argv, cwd, dict(os.environ), METADATA_TIMEOUT_SECS, stdout_limit=MAX_METADATA_BYTES)
+    except subprocess.TimeoutExpired as error:
+        raise OSError(f"{argv[0]} metadata command timed out after {METADATA_TIMEOUT_SECS}s: {tail_text(error.stderr)}") from error
+    if len(result.stdout) > MAX_METADATA_BYTES:
+        raise OSError(f"{argv[0]} metadata output exceeded {MAX_METADATA_BYTES} bytes: {tail_text(result.stderr)}")
     if check:
         result.check_returncode()
     return result
@@ -195,15 +203,17 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
 
 def beads_hint(repo: Path) -> str:
     try:
-        version = out(run(["bd", "version"], repo, check=False)).strip().splitlines()[:1]
-    except (OSError, IndexError):
+        result = run(["bd", "version"], repo, check=False)
+        version = result.stdout[:OUTPUT_TAIL_BYTES].decode("utf-8", errors="replace").strip().splitlines()[:1]
+    except OSError:
         version = []
     mode = "unknown"
     metadata = repo / ".beads" / "metadata.json"
     if metadata.is_file():
         try:
-            mode = str(json.loads(metadata.read_text(encoding="utf-8")).get("dolt_mode", "unknown"))
-        except (OSError, json.JSONDecodeError):
+            parsed = json.loads(metadata.read_text(encoding="utf-8"))
+            mode = str(parsed.get("dolt_mode", "unknown")) if isinstance(parsed, dict) else "unreadable"
+        except (OSError, UnicodeError, json.JSONDecodeError):
             mode = "unreadable"
     return (
         f"bd version: {version[0] if version else 'unknown'}; .beads/metadata.json dolt_mode: {mode}. "
@@ -250,6 +260,9 @@ def collect_beads(repo: Path, beads_json: Path | None) -> list[dict[str, object]
         parsed = json.loads(out(result) or "[]")
     except FileNotFoundError:
         print(f"gym mine: bd is not on PATH. {beads_hint(repo)}", file=sys.stderr)
+        parsed = None
+    except OSError as error:
+        print(f"gym mine: bd list unavailable: {error}\n{beads_hint(repo)}", file=sys.stderr)
         parsed = None
     except subprocess.CalledProcessError as error:
         print(
@@ -428,7 +441,14 @@ def main() -> int:
     oracle_map = json.loads(args.oracle_map.read_text(encoding="utf-8"))
     if not isinstance(oracle_map, dict):
         raise SystemExit("gym mine: --oracle-map must be a JSON object keyed by bead id")
-    tasks, skipped = mine(repo, oracle_map, not args.no_validate, max(1, args.limit), args.main_ref, args.beads_json)
+    try:
+        tasks, skipped = mine(repo, oracle_map, not args.no_validate, max(1, args.limit), args.main_ref, args.beads_json)
+    except OSError as error:
+        print(f"gym mine: {error}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as error:
+        print(f"gym mine: metadata command exited {error.returncode}: {tail_text(error.stderr)}", file=sys.stderr)
+        return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(document(tasks), indent=2) + "\n", encoding="utf-8")
     for note in skipped:
