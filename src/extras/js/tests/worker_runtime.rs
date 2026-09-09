@@ -1535,6 +1535,37 @@ fn worker_runtime_verification_oom_remains_terminal_after_fake_transcript_exhaus
     assert!(error.is_resource_limit(), "{error:?}");
 }
 
+// libtest's parallel harness emits a slow-test notice after 60 seconds. This
+// explicit check is slow by construction; keep it out of ordinary unit runs.
+#[tokio::test]
+#[ignore = "holds a reused libtest worker past the 60-second slow-test notice"]
+async fn worker_supervisor_reused_test_worker_stdout_stays_protocol_only() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let first = supervisor
+        .execute(
+            RunStep::new("41".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, StepOutcome::Value("41".into()));
+    let generation = supervisor.generation_for_test().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(62)).await;
+    let second = supervisor
+        .execute(
+            RunStep::new("42".into()),
+            RecordingEffects::default(),
+            PermCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, StepOutcome::Value("42".into()));
+    assert_eq!(supervisor.generation_for_test().await, Some(generation));
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
 #[test]
 fn worker_runtime_verification_bounds_terminal_result_expansion() {
     #[cfg(feature = "skills")]

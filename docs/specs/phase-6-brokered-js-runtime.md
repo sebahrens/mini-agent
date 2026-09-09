@@ -84,6 +84,15 @@ containment decisions remain unchanged. Libtest worker launches bypass the
 production sealed-image and guardian path; their transport failures do not by
 themselves implicate production image publication.
 
+Re-executed libtest workers use `--test-threads=1`. The parallel libtest harness
+can print a slow-test notice to stdout after 60 seconds, corrupting a reused
+worker's binary protocol stream. Single-threaded harness execution avoids that
+notice; production framing and worker reuse limits stay strict. The ignored
+`worker_supervisor_reused_test_worker_stdout_stays_protocol_only` regression
+holds one generation past that deadline and verifies a second successful request.
+Run it explicitly with `cargo test --features skills
+worker_supervisor_reused_test_worker_stdout_stays_protocol_only -- --ignored --test-threads=1`.
+
 ## Worker lifecycle
 
 `src/extras/js/memory.rs` owns each worker runtime's bounded allocator. The 64 MiB

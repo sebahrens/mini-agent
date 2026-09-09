@@ -619,6 +619,10 @@ impl WorkerLauncher for TestWorkerLauncher {
             .env("MINI_AGENT_CONFIG", "A07_CONFIG_CANARY_MUST_NOT_LEAK")
             .env("MINI_AGENT_WORKSPACE", "A07_WORKSPACE_CANARY_MUST_NOT_LEAK")
             .env_clear()
+            // Parallel libtest prints a 60-second slow-test notice to stdout.
+            // A reused protocol worker can outlive that timer; the serial
+            // harness waits without injecting text into its binary stream.
+            .arg("--test-threads=1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
