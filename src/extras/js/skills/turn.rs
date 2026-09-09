@@ -244,8 +244,6 @@ impl SkillTurnContext {
 #[derive(Debug, Clone)]
 pub struct TurnDiscoveryBundle {
     pub learned_js: Arc<TurnSkillBundle>,
-    pub agent_skill_generation: u64,
-    pub selected_agent_digests: Vec<String>,
     pub agent_skills: Vec<ResolvedAgentSkill>,
     pub diagnostics: Vec<String>,
     pub trusted_context: String,
@@ -274,6 +272,7 @@ impl SkillRuntime {
     }
 
     /// Build both typed indexes off the request path. A failure in one domain leaves the other.
+    #[cfg(test)]
     pub fn open(
         paths: &AppPaths,
         embedding_config: Option<&crate::config::EmbeddingConfig>,
@@ -281,6 +280,7 @@ impl SkillRuntime {
         Self::open_with_learned_js(paths, embedding_config, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_learned_js(
         paths: &AppPaths,
         embedding_config: Option<&crate::config::EmbeddingConfig>,
@@ -730,7 +730,6 @@ impl SkillRuntime {
         }
 
         let mut agent_skill_generation = 0;
-        let mut selected_agent_digests = Vec::new();
         let mut selected_agent_skills = Vec::new();
         let mut agent_sections = Vec::new();
         if let (Some(vector), Some(index)) = (&query_embedding, &agent_skills) {
@@ -793,7 +792,6 @@ impl SkillRuntime {
                     for (skill, markdown, resources) in skills {
                         match markdown {
                             Ok(markdown) => {
-                                selected_agent_digests.push(skill.record.digest.clone());
                                 selected_agent_skills.push(ResolvedAgentSkill {
                                     name: skill.record.name.clone(),
                                     description: skill.record.description.clone(),
@@ -842,8 +840,6 @@ impl SkillRuntime {
         log_skill_diagnostics(&diagnostics[startup..]);
         TurnDiscoveryBundle {
             learned_js: learned_bundle,
-            agent_skill_generation,
-            selected_agent_digests,
             agent_skills: selected_agent_skills,
             diagnostics,
             trusted_context,
@@ -1659,7 +1655,7 @@ mod tests {
             discovery.diagnostics
         );
         assert!(discovery.learned_js.skills.is_empty());
-        assert!(discovery.selected_agent_digests.is_empty());
+        assert!(discovery.agent_skills.is_empty());
         assert!(
             discovery.trusted_context.is_empty(),
             "diagnostics must not force a model-facing block: {}",

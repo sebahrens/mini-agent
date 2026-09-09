@@ -4,13 +4,24 @@ use std::path::PathBuf;
 use crate::extras::js::skills::embed::SkillDocument;
 use crate::extras::js::skills::index::RetrievalPolicy;
 use crate::extras::js::skills::store::SkillStore;
-use crate::extras::js::skills::turn::SkillRuntime;
+use crate::extras::js::skills::turn::{ResolvedAgentSkill, SkillRuntime, TurnDiscoveryBundle};
 use crate::extras::js::skills::{
     CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
 };
-use crate::extras::skills::import_agent_skill;
 use crate::extras::skills::index::AgentSkillSearchPolicy;
+use crate::extras::skills::{ImportedSkill, import_agent_skill};
 use crate::paths::AppPaths;
+
+fn assert_agent_selection(discovery: &TurnDiscoveryBundle, imported: &ImportedSkill) {
+    assert_eq!(
+        discovery.agent_skills,
+        vec![ResolvedAgentSkill {
+            name: imported.manifest.name.clone(),
+            description: imported.manifest.description.clone(),
+            digest: imported.identity.digest.clone(),
+        }]
+    );
+}
 
 struct TempPaths {
     root: PathBuf,
@@ -171,7 +182,7 @@ async fn live_runtime_discovers_an_agent_skill_imported_after_open() {
         runtime
             .prepare_turn("late imported workflow")
             .await
-            .selected_agent_digests
+            .agent_skills
             .is_empty()
     );
 
@@ -185,10 +196,7 @@ async fn live_runtime_discovers_an_agent_skill_imported_after_open() {
     let imported = import_agent_skill(&source, &temp.paths).unwrap();
 
     let discovery = runtime.prepare_turn("late imported workflow").await;
-    assert_eq!(
-        discovery.selected_agent_digests,
-        vec![imported.identity.digest]
-    );
+    assert_agent_selection(&discovery, &imported);
     assert!(discovery.trusted_context.contains("# Late import"));
 }
 
@@ -275,10 +283,7 @@ async fn prompt_discovery_reuses_one_query_embedding_for_both_typed_indexes() {
     assert_eq!(runtime.embedding_cache_stats().await.entries, 1);
     assert_eq!(discovery.learned_js.skills.len(), 1);
     assert_eq!(discovery.learned_js.skills[0].id, learned.id);
-    assert_eq!(
-        discovery.selected_agent_digests,
-        vec![imported.identity.digest.clone()]
-    );
+    assert_agent_selection(&discovery, &imported);
     assert!(
         discovery
             .trusted_context
@@ -351,10 +356,7 @@ async fn selected_agent_skill_attaches_its_exact_active_learned_js_identity() {
         );
     let discovery = runtime.prepare_turn("coordinate the bridge workflow").await;
 
-    assert_eq!(
-        discovery.selected_agent_digests,
-        vec![imported.identity.digest]
-    );
+    assert_agent_selection(&discovery, &imported);
     assert_eq!(discovery.learned_js.skills.len(), 1);
     assert_eq!(discovery.learned_js.skills[0].id, learned.id);
     assert_eq!(discovery.learned_js.skills[0].rank, 1);
@@ -409,10 +411,7 @@ async fn agent_skill_learned_js_association_never_bypasses_activation() {
         .prepare_turn("coordinate the gated bridge workflow")
         .await;
 
-    assert_eq!(
-        discovery.selected_agent_digests,
-        vec![imported.identity.digest.clone()]
-    );
+    assert_agent_selection(&discovery, &imported);
     assert!(discovery.learned_js.skills.is_empty());
     assert!(discovery.diagnostics.iter().any(|diagnostic| {
         diagnostic
@@ -480,10 +479,7 @@ async fn unavailable_js_worker_disables_learned_js_but_preserves_agent_skills() 
     let discovery = runtime.prepare_turn(&retrieval_document(&learned)).await;
 
     assert!(discovery.learned_js.skills.is_empty());
-    assert_eq!(
-        discovery.selected_agent_digests,
-        vec![imported.identity.digest]
-    );
+    assert_agent_selection(&discovery, &imported);
     assert!(
         discovery
             .trusted_context
