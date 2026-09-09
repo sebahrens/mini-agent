@@ -6,6 +6,7 @@ capture with an overflow sentinel for callers such as the miner's Git blob reade
 
 from __future__ import annotations
 
+import math
 import os
 import selectors
 import subprocess
@@ -16,6 +17,19 @@ OUTPUT_TAIL_BYTES = 2000
 PROCESS_REAP_TIMEOUT_SECS = 5
 
 
+def validate_timeout(timeout: int) -> int:
+    """Reject invalid deadlines before a caller creates processes or workspaces."""
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        raise ValueError("timeout must be an integer of at least 1")
+    try:
+        finite = math.isfinite(timeout)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise ValueError("timeout is too large to represent as a finite deadline")
+    return timeout
+
+
 def run_bounded(
     argv: list[str], cwd: Path, env: dict[str, str], timeout: int, *, stdout_limit: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -24,10 +38,10 @@ def run_bounded(
     Limited stdout retains one overflow byte and terminates the child on
     overflow. Callers must reject that result instead of accepting a prefix.
     """
+    deadline = time.monotonic() + validate_timeout(timeout)
     tails = [bytearray(), bytearray()]
     with selectors.DefaultSelector() as selector:
         process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.monotonic() + timeout
         try:
             for stream, tail in zip((process.stdout, process.stderr), tails):
                 os.set_blocking(stream.fileno(), False)
@@ -36,7 +50,7 @@ def run_bounded(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv, timeout)
-                for key, _ in selector.select(remaining):
+                for key, _ in selector.select(min(remaining, 60.0)):
                     try:
                         chunk = os.read(key.fd, 64 * 1024)
                     except (BlockingIOError, InterruptedError):

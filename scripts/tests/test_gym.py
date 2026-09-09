@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.gym import mine_tasks as MINE
+from scripts.gym import process_capture as CAPTURE
 from scripts.gym import train as TRAIN_MODULE
 from scripts.gym import worktrees as WORKTREES
 
@@ -180,6 +181,23 @@ def run_training(root: Path, repo: Path, binary: Path, document: dict[str, objec
 
 
 class GymSubprocessTests(unittest.TestCase):
+    def test_deadline_boundaries_reject_before_spawn_and_accept_large_finite_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for timeout in [True, 0, -1, 1.5, float("inf"), float("nan"), 10**400]:
+                with self.subTest(invalid_timeout=timeout), mock.patch.object(CAPTURE.subprocess, "Popen") as spawn:
+                    with self.assertRaisesRegex(ValueError, "timeout"):
+                        CAPTURE.run_bounded([sys.executable, "-c", "pass"], root, dict(os.environ), timeout)
+                    spawn.assert_not_called()
+            for timeout in [1, 10**100]:
+                for close_pipes in [False, True]:
+                    with self.subTest(timeout=timeout, close_pipes=close_pipes):
+                        code = ("import os,sys; os.write(1,b'OUT'); os.write(2,b'ERR'); "
+                                + ("os.close(1); os.close(2); " if close_pipes else "")
+                                + "sys.exit(3)")
+                        result = CAPTURE.run_bounded([sys.executable, "-c", code], root, dict(os.environ), timeout)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, b"OUT", b"ERR"))
+
     def test_output_floods_retain_exact_tails_with_bounded_memory(self) -> None:
         limit = 2000
         for mode, exit_code in [("stdout", 0), ("stderr", 7), ("mixed", 0)]:
@@ -1119,8 +1137,10 @@ class GymTrainerTests(unittest.TestCase):
                 self.assertTrue(row["success"], row)
             self.assertEqual(sentinel.read_text(), "untouched")
 
-    def test_invalid_budget_or_root_file_path_fails_before_any_episode(self) -> None:
-        cases = [("budgets", 0)] + [(field, path) for field in ["initial_files", "deleted_files", "oracle"]
+    def test_invalid_budget_path_or_timeout_fails_before_any_episode(self) -> None:
+        cases = [("budgets", 0)] + [("timeout_secs", value) for value in [True, 0, -1, 1.5, 10**400]]
+        cases += [("entry_timeout", 10**400), ("cli_timeout", 10**400)]
+        cases += [(field, path) for field in ["initial_files", "deleted_files", "oracle"]
                                      for path in [".", "./"]]
         for field, value in cases:
             with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
@@ -1128,15 +1148,25 @@ class GymTrainerTests(unittest.TestCase):
                 repo = make_repo(root)
                 binary, log = make_stub(root, "success")
                 document = task_document([{"name": "fix", "tags": []}])
+                extra = []
                 if field == "budgets":
                     document["defaults"][field]["max_provider_turns"] = value
+                elif field == "timeout_secs":
+                    document["defaults"][field] = value
+                elif field == "entry_timeout":
+                    document["tasks"][0]["timeout_secs"] = value
+                elif field == "cli_timeout":
+                    extra = ["--task-timeout", str(value)]
                 elif field == "oracle":
                     document["defaults"][field] = {"expected_files": {value: "content"}}
                 else:
                     document["defaults"][field] = {value: "content"} if field == "initial_files" else [value]
-                completed, rows, _ = run_training(root, repo, binary, document)
+                completed, rows, gym_root = run_training(root, repo, binary, document, *extra)
                 self.assertEqual(completed.returncode, 2)
-                self.assertIn("max_provider_turns" if field == "budgets" else "must stay inside the workspace", completed.stderr)
+                expected = "timeout_secs" if "timeout" in field else ("max_provider_turns" if field == "budgets" else "must stay inside the workspace")
+                self.assertIn(expected, completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertFalse(gym_root.exists(), "invalid input created episode directories")
                 self.assertEqual(rows, [])
                 self.assertFalse(log.exists())
 

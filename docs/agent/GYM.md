@@ -10,6 +10,10 @@ same task in a `none` arm and a `library` arm, runs a mechanical oracle, and wri
 `GYM_OUTCOME` JSON record per episode. It is not a release gate and it never turns evaluation data
 into production evidence.
 
+Task timeouts must be positive integers representable as finite deadlines. Invalid
+timeouts are rejected before episode setup or subprocess launch. Long finite
+deadlines use bounded selector waits so they do not overflow native timeout fields.
+
 ## Prerequisites
 
 - Linux or macOS. `scripts/gym/setup.sh` exits 2 on any other host, and the runner shells out to

@@ -26,10 +26,10 @@ import uuid
 from pathlib import Path
 
 if __package__:
-    from .process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
+    from .process_capture import OUTPUT_TAIL_BYTES, run_bounded as run, validate_timeout
     from .worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 else:
-    from process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
+    from process_capture import OUTPUT_TAIL_BYTES, run_bounded as run, validate_timeout
     from worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
@@ -188,6 +188,10 @@ def load_tasks(path: Path, default_timeout: int) -> list[dict[str, object]]:
             # Imports run from a fresh neutral directory. Bind relative package
             # paths to the invocation directory before that cwd change.
             library = str(Path(library).absolute())
+        try:
+            timeout = validate_timeout(merged.get("timeout_secs", default_timeout))
+        except ValueError as error:
+            raise TaskError(f"{label}.timeout_secs: {error}") from None
         tasks.append(
             {
                 "name": name,
@@ -200,7 +204,7 @@ def load_tasks(path: Path, default_timeout: int) -> list[dict[str, object]]:
                 "oracle": validated_oracle(merged.get("oracle"), label),
                 "budgets": validated_budgets(merged.get("budgets"), label),
                 "library": library,
-                "timeout_secs": positive_int(merged.get("timeout_secs", default_timeout), f"{label}.timeout_secs"),
+                "timeout_secs": timeout,
                 "tags": list(merged.get("tags") or []),
             }
         )
