@@ -824,10 +824,9 @@ fn parse_pre_decision_part(output: &HookOutput) -> PreDecisionPart {
             reason: None,
             updated_input: None,
         },
-        ChannelResult::Error { exit_code, .. } => {
+        ChannelResult::Error { exit_code } => {
             // Hook stderr is untrusted and may contain credentials or input
-            // data. The bounded bytes remain available to the channel
-            // contract, but audit logs record only the closed outcome.
+            // data. Decision and audit payloads carry only the closed outcome.
             tracing::warn!("hooks: PreToolUse hook exited {exit_code:?}; denying tool call");
             PreDecisionPart {
                 verdict: Verdict::Deny,

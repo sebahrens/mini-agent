@@ -208,7 +208,10 @@ async fn deny_blocks_the_call_with_guard_rail_message() {
 
 #[tokio::test]
 async fn broken_pre_tool_hook_fails_closed() {
-    let dispatcher = dispatcher_with("PreToolUse", vec![handler("exit 7")]);
+    let dispatcher = dispatcher_with(
+        "PreToolUse",
+        vec![handler("printf 'fixture-secret\\033[31m' >&2; exit 7")],
+    );
     let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(EchoTool)];
     let wrapped = wrap_all(tools, dispatcher, permission(), None);
 
@@ -217,6 +220,8 @@ async fn broken_pre_tool_hook_fails_closed() {
         .await
         .expect_err("a failed guard must deny the tool call");
     assert!(error.to_string().contains("PreToolUse hook failed"));
+    assert!(!error.to_string().contains("fixture-secret"));
+    assert!(!error.to_string().contains('\x1b'));
 }
 
 #[tokio::test]

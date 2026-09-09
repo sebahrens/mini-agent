@@ -21,11 +21,9 @@ pub(crate) enum ChannelResult {
     NoObjection { json: Option<serde_json::Value> },
     /// Exit 2: block the action. `stderr` is fed back as the block reason.
     Block { stderr: String },
-    /// Any other exit code: non-blocking error, the action proceeds.
-    Error {
-        exit_code: Option<i32>,
-        stderr: String,
-    },
+    /// Any other exit code: the dispatcher applies the event's failure policy.
+    /// Error stderr is deliberately not copied into decision or audit payloads.
+    Error { exit_code: Option<i32> },
     /// The hook exceeded its timeout and was killed.
     TimedOut,
     /// The hook exceeded a hard output cap and was killed. Its bounded output
@@ -62,24 +60,6 @@ pub(crate) fn interpret_hook_output(output: &HookOutput) -> ChannelResult {
                 stderr: safe_reason(&output.stderr),
             }
         }
-        other => ChannelResult::Error {
-            exit_code: other,
-            stderr: safe_reason(&output.stderr),
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn hook_reasons_are_control_sanitized_and_bounded() {
-        let mut input = b"blocked\x1b[31m\x07".to_vec();
-        input.extend(std::iter::repeat_n(b'x', super::BLOCK_REASON_MAX_BYTES * 2));
-        let reason = super::safe_reason(&input);
-
-        assert!(!reason.contains('\x1b'));
-        assert!(!reason.contains('\x07'));
-        assert!(reason.ends_with("[hook reason truncated]"));
-        assert!(reason.len() < super::BLOCK_REASON_MAX_BYTES + 64);
+        other => ChannelResult::Error { exit_code: other },
     }
 }

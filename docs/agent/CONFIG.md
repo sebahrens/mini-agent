@@ -731,6 +731,9 @@ reason, and any other exit code is a non-blocking error. Exit `2` combined
 with stdout JSON is a mixed-channel warning — the JSON is ignored. For
 `PreToolUse`, an unexpected exit, timeout, policy-denied launch, or output-limit
 failure denies the tool call: a configured guard must fail closed.
+Unexpected-exit stderr is not copied into the decision or audit message; the
+pre-tool denial uses a fixed failure reason. Exit `2` retains its bounded,
+control-sanitized block reason.
 
 ### Trust model
 
