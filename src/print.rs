@@ -455,8 +455,10 @@ fn javascript_worker_entries_for_status(
     };
     let assurance = match (assurance, available) {
         (WorkerContainmentAssurance::Enforced, true) => "enforced",
+        #[cfg(any(test, target_os = "macos"))]
         (WorkerContainmentAssurance::DeprecatedBestEffort, true) => "deprecated weaker best-effort",
         (WorkerContainmentAssurance::Enforced, false) => "enforced backend class; inactive",
+        #[cfg(any(test, target_os = "macos"))]
         (WorkerContainmentAssurance::DeprecatedBestEffort, false) => {
             "deprecated weaker best-effort backend class; inactive"
         }

@@ -234,6 +234,7 @@ enum WorkerChildInner {
     Contained {
         process: WinHandle,
         job: Option<WinHandle>,
+        #[cfg(test)]
         process_id: u32,
         status: Option<ExitStatus>,
     },
@@ -242,12 +243,13 @@ enum WorkerChildInner {
 }
 
 impl WorkerChild {
-    fn contained(process: WinHandle, job: WinHandle, process_id: u32) -> Self {
+    fn contained(process: WinHandle, job: WinHandle, _process_id: u32) -> Self {
         Self {
             inner: WorkerChildInner::Contained {
                 process,
                 job: Some(job),
-                process_id,
+                #[cfg(test)]
+                process_id: _process_id,
                 status: None,
             },
         }
@@ -260,6 +262,7 @@ impl WorkerChild {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn id(&self) -> u32 {
         match &self.inner {
             WorkerChildInner::Contained { process_id, .. } => *process_id,

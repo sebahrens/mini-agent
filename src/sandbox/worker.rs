@@ -187,6 +187,7 @@ pub(crate) enum WorkerContainmentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkerContainmentAssurance {
     Enforced,
+    #[cfg(any(test, target_os = "macos"))]
     DeprecatedBestEffort,
 }
 
@@ -311,6 +312,7 @@ pub(crate) struct WindowsWorkerProcessObservation {
 }
 
 impl WorkerProcess {
+    #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn id(&self) -> u32 {
         self.process.id()
     }

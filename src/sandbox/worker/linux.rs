@@ -1561,6 +1561,7 @@ impl WorkerChild {
         Self { child }
     }
 
+    #[cfg(test)]
     pub(super) fn id(&self) -> u32 {
         self.child.id()
     }
