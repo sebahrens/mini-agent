@@ -78,9 +78,9 @@ twice; the honest record is a target that reports what it measures.
 
 ## Follow-up
 
-The remaining serial cost is the image proof running before the child starts.
-Overlapping it with process start — sealing and exec'ing first, then completing
-the proof before Ready is authenticated, so no work is ever dispatched to an
-unverified image — would remove roughly 365 ms without weakening the guarantee.
-That restructures a Phase 6 security path and is tracked separately rather than
-folded into this finding.
+The overlap experiment and matched-host measurements are recorded in
+[the September 9 follow-up](2026-09-09-macos-worker-startup-overlap.md).
+The original projection of roughly 365 ms savings was too optimistic: the
+post-launch remainder above also includes the independent image rehash during
+Ready-time unlink, which must remain serialized. The follow-up preserves all
+three digest operations and measures the resulting startup overlap directly.

@@ -571,14 +571,28 @@ fn launch_executable_unchecked_with_probe(
     })?;
     launch_profile.publication_sweep_us = elapsed_micros(sweep_started);
     let image_started = Instant::now();
-    let image =
-        one_time_image::OneTimeWorkerImage::prepare_from(&executable, &root).map_err(|source| {
-            WorkerLaunchError::Io {
-                backend: BACKEND,
-                source,
-            }
-        })?;
-    launch_profile.image_preparation_us = elapsed_micros(image_started);
+    let (image, guardian) = one_time_image::OneTimeWorkerImage::prepare_from_and_start(
+        &executable,
+        &root,
+        |image_path| {
+            start_pending_guardian(
+                &executable,
+                image_path,
+                worker_args,
+                probe,
+                &mut launch_profile,
+            )
+        },
+    )
+    .map_err(|source| WorkerLaunchError::Io {
+        backend: BACKEND,
+        source,
+    })?;
+    // The callback's render/spawn costs have their own fields. Image hashing
+    // overlaps child startup, but all proof work finishes before IPC escapes.
+    launch_profile.image_preparation_us = elapsed_micros(image_started)
+        .saturating_sub(launch_profile.profile_render_us)
+        .saturating_sub(launch_profile.guardian_spawn_us);
     if let Some(timing) = LAST_IMAGE_TIMING
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -588,26 +602,107 @@ fn launch_executable_unchecked_with_probe(
         launch_profile.image_digest_us = timing.image_digest_us;
         launch_profile.image_clone_us = timing.clone_us;
     }
+    record_launch_profile(launch_profile);
+    guardian.into_process(image)
+}
+
+/// Own the guardian while the sealed image's byte proof is still pending.
+/// Dropping this guard kills and reaps before publication cleanup can run.
+struct PendingGuardian {
+    child: Option<Child>,
+    heartbeat: Option<UnixStream>,
+}
+
+impl PendingGuardian {
+    fn terminate_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.heartbeat.take();
+            let _ = super::terminate_worker_process_group(child.id());
+            let _ = child.wait();
+        }
+    }
+
+    fn into_process(
+        mut self,
+        image: one_time_image::OneTimeWorkerImage,
+    ) -> Result<WorkerProcess, WorkerLaunchError> {
+        let pipes = (|| {
+            let child = self
+                .child
+                .as_mut()
+                .expect("pending guardian owns its child");
+            let input = child
+                .stdin
+                .take()
+                .ok_or(WorkerLaunchError::MissingPipe { pipe: "stdin" })?;
+            let output = child
+                .stdout
+                .take()
+                .ok_or(WorkerLaunchError::MissingPipe { pipe: "stdout" })?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or(WorkerLaunchError::MissingPipe { pipe: "stderr" })?;
+            Ok((input, output, stderr))
+        })();
+        let (input, output, stderr) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                self.terminate_and_reap();
+                return Err(error);
+            }
+        };
+        Ok(WorkerProcess {
+            process: WorkerChild {
+                child: self.child.take().expect("verified guardian owns its child"),
+                image: Some(image),
+                heartbeat: self.heartbeat.take(),
+                #[cfg(test)]
+                unconfined_test_child: false,
+            },
+            input: super::child_stdin_file(input),
+            output: super::child_stdout_file(output),
+            stderr: super::child_stderr_file(stderr),
+            backend: BACKEND,
+            #[cfg(test)]
+            reap_observer: None,
+            #[cfg(test)]
+            force_tree_termination_error: false,
+            #[cfg(test)]
+            authenticated_ready_observer: None,
+            #[cfg(test)]
+            force_authenticated_ready_finalization_error: false,
+            #[cfg(test)]
+            parent_write_observer: None,
+        })
+    }
+}
+
+impl Drop for PendingGuardian {
+    fn drop(&mut self) {
+        self.terminate_and_reap();
+    }
+}
+
+fn start_pending_guardian(
+    executable: &Path,
+    image_path: &Path,
+    worker_args: &[&str],
+    probe: Option<&HostedProbePaths>,
+    launch_profile: &mut WorkerLaunchProfile,
+) -> io::Result<PendingGuardian> {
     let render_started = Instant::now();
-    let profile = seatbelt_profile(image.image_path()).map_err(|source| WorkerLaunchError::Io {
-        backend: BACKEND,
-        source,
-    })?;
+    let profile = seatbelt_profile(image_path)?;
     launch_profile.profile_render_us = elapsed_micros(render_started);
     let spawn_started = Instant::now();
-
-    let (heartbeat_parent, heartbeat_guardian) =
-        UnixStream::pair().map_err(|source| WorkerLaunchError::Io {
-            backend: BACKEND,
-            source,
-        })?;
+    let (heartbeat_parent, heartbeat_guardian) = UnixStream::pair()?;
     let guardian_descriptor = heartbeat_guardian.as_raw_fd();
-    let mut command = Command::new(&executable);
+    let mut command = Command::new(executable);
     command
         .env_clear()
         .env(super::MACOS_GUARDIAN_MARKER, GUARDIAN_MARKER_VALUE)
         .arg(&profile)
-        .arg(image.image_path())
+        .arg(image_path)
         .arg("--")
         .args(worker_args)
         .stdin(Stdio::piped())
@@ -620,57 +715,15 @@ fn launch_executable_unchecked_with_probe(
             .env(HOSTED_WORKSPACE_SENTINEL, &probe.workspace)
             .env(HOSTED_SKILL_SENTINEL, &probe.skill)
             .env(HOSTED_CREDENTIAL_SENTINEL, &probe.credential)
-            .env(HOSTED_ORIGINAL_EXECUTABLE, &executable)
-            .env(HOSTED_ONE_TIME_IMAGE, image.image_path());
+            .env(HOSTED_ORIGINAL_EXECUTABLE, executable)
+            .env(HOSTED_ONE_TIME_IMAGE, image_path);
     }
-    configure_guardian_spawn(&mut command, guardian_descriptor).map_err(|source| {
-        WorkerLaunchError::Io {
-            backend: BACKEND,
-            source,
-        }
-    })?;
-
-    let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {
-        backend: BACKEND,
-        source,
-    })?;
+    configure_guardian_spawn(&mut command, guardian_descriptor)?;
+    let child = command.spawn()?;
     launch_profile.guardian_spawn_us = elapsed_micros(spawn_started);
-    record_launch_profile(launch_profile);
-    let input = child
-        .stdin
-        .take()
-        .ok_or_else(|| cleanup_failed_launch(&mut child, "stdin"))?;
-    let output = child
-        .stdout
-        .take()
-        .ok_or_else(|| cleanup_failed_launch(&mut child, "stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| cleanup_failed_launch(&mut child, "stderr"))?;
-
-    Ok(WorkerProcess {
-        process: WorkerChild {
-            child,
-            image: Some(image),
-            heartbeat: Some(heartbeat_parent),
-            #[cfg(test)]
-            unconfined_test_child: false,
-        },
-        input: super::child_stdin_file(input),
-        output: super::child_stdout_file(output),
-        stderr: super::child_stderr_file(stderr),
-        backend: BACKEND,
-        #[cfg(test)]
-        reap_observer: None,
-        #[cfg(test)]
-        force_tree_termination_error: false,
-        #[cfg(test)]
-        authenticated_ready_observer: None,
-        #[cfg(test)]
-        force_authenticated_ready_finalization_error: false,
-        #[cfg(test)]
-        parent_write_observer: None,
+    Ok(PendingGuardian {
+        child: Some(child),
+        heartbeat: Some(heartbeat_parent),
     })
 }
 
@@ -1706,12 +1759,6 @@ fn guardian_group_matches(expected: libc::pid_t) -> bool {
         && (unsafe { libc::getpid() }) != expected
 }
 
-fn cleanup_failed_launch(child: &mut Child, pipe: &'static str) -> WorkerLaunchError {
-    let _ = super::terminate_worker_process_group(child.id());
-    let _ = child.wait();
-    WorkerLaunchError::MissingPipe { pipe }
-}
-
 fn authenticate_ready_and_probe(
     process: &mut WorkerProcess,
     graceful_teardown: bool,
@@ -2391,6 +2438,7 @@ mod one_time_image {
         PermissionsSealed,
         BeforeReopen,
         Reopened,
+        Started,
         Hashed,
         MetadataValidated,
     }
@@ -2612,18 +2660,35 @@ mod one_time_image {
     }
 
     impl OneTimeWorkerImage {
+        #[cfg(test)]
         pub(super) fn prepare_from(source: &Path, private_root: &Path) -> io::Result<Self> {
             Self::prepare_from_with_fault(source, private_root, |_, _| Ok(()))
         }
 
-        fn prepare_from_with_fault<F>(
+        pub(super) fn prepare_from_and_start<T>(
             source: &Path,
             private_root: &Path,
-            mut fault: F,
-        ) -> io::Result<Self>
-        where
-            F: FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
-        {
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
+            Self::prepare_from_with_fault_and_start(source, private_root, |_, _| Ok(()), start)
+        }
+
+        #[cfg(test)]
+        fn prepare_from_with_fault(
+            source: &Path,
+            private_root: &Path,
+            fault: impl FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
+        ) -> io::Result<Self> {
+            Self::prepare_from_with_fault_and_start(source, private_root, fault, |_| Ok(()))
+                .map(|(image, ())| image)
+        }
+
+        fn prepare_from_with_fault_and_start<T>(
+            source: &Path,
+            private_root: &Path,
+            mut fault: impl FnMut(PreparationFaultStage, &Path) -> io::Result<()>,
+            start: impl FnOnce(&Path) -> io::Result<T>,
+        ) -> io::Result<(Self, T)> {
             let supplied_root = std::fs::symlink_metadata(private_root)?;
             validate_private_directory(&supplied_root, "one-time image root")?;
             let private_root = std::fs::canonicalize(private_root)?;
@@ -2703,8 +2768,7 @@ mod one_time_image {
                 // APFS supplies an atomic copy-on-write snapshot with its own inode. Hashing both
                 // pinned descriptors below retains the original byte-for-byte proof without the
                 // full executable rewrite and durable data flush on every worker generation.
-                // Measured at ~30 ms of a ~835 ms fresh worker, and deliberately
-                // not memoized across launches: the publisher's contract is to
+                // Deliberately not memoized across launches: the publisher's contract is to
                 // independently hash both pinned descriptors on every
                 // publication (docs/specs/phase-6-brokered-js-runtime.md).
                 let source_digest_started = std::time::Instant::now();
@@ -2754,6 +2818,11 @@ mod one_time_image {
                     ));
                 }
                 ensure_no_extended_acl(publication.image()?, "sealed one-time worker image")?;
+                // All writable descriptors are closed and source/ownership/ACL
+                // checks have passed. Keep the started process's cleanup guard
+                // local: any later proof error drops it before publication.
+                let started = start(&image_path)?;
+                fault(PreparationFaultStage::Started, &image_path)?;
                 let image_digest_started = std::time::Instant::now();
                 let image_sha256 = hash_file(publication.image_mut()?)?;
                 timing.image_digest_us = super::elapsed_micros(image_digest_started);
@@ -2787,21 +2856,24 @@ mod one_time_image {
                 };
                 let (image, lease) = publication.commit()?;
 
-                Ok(Self {
-                    root,
-                    directory_name: directory_name.clone(),
-                    #[cfg(test)]
-                    directory_path: directory_path.clone(),
-                    image_path: image_path.clone(),
-                    directory,
-                    lease: Some(lease),
-                    image: Some(image),
-                    proof,
-                    linked: true,
-                    lease_linked: true,
-                    directory_linked: true,
-                    retired: false,
-                })
+                Ok((
+                    Self {
+                        root,
+                        directory_name: directory_name.clone(),
+                        #[cfg(test)]
+                        directory_path: directory_path.clone(),
+                        image_path: image_path.clone(),
+                        directory,
+                        lease: Some(lease),
+                        image: Some(image),
+                        proof,
+                        linked: true,
+                        lease_linked: true,
+                        directory_linked: true,
+                        retired: false,
+                    },
+                    started,
+                ))
             })();
             *super::LAST_IMAGE_TIMING
                 .lock()
@@ -3606,10 +3678,8 @@ mod one_time_image {
     fn hash_file(file: &mut std::fs::File) -> io::Result<[u8; 32]> {
         file.seek(std::io::SeekFrom::Start(0))?;
         let mut digest = Sha256::new();
-        // Measured on macOS 26 (docs/benchmarks/2026-09-08-macos-worker-cold-start.md):
-        // this proof is bound by materializing the freshly cloned image's
-        // copy-on-write extents, not by syscall count or SHA throughput, so a
-        // larger buffer changes nothing.
+        // The macOS cold-start experiment found no measurable improvement from
+        // a larger buffer; keep reads bounded without changing the byte proof.
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;
@@ -3965,6 +4035,17 @@ mod one_time_image {
             assert!(extended_acl_present_from_first_entry(-1, 5).is_err());
         }
 
+        struct StartedPublication<'a> {
+            path: PathBuf,
+            dropped_before_cleanup: &'a std::cell::Cell<bool>,
+        }
+
+        impl Drop for StartedPublication<'_> {
+            fn drop(&mut self) {
+                self.dropped_before_cleanup.set(self.path.is_file());
+            }
+        }
+
         #[test]
         fn partial_publication_faults_clean_owned_image_and_directory() {
             for injected_stage in [
@@ -3974,12 +4055,15 @@ mod one_time_image {
                 PreparationFaultStage::PermissionsSealed,
                 PreparationFaultStage::BeforeReopen,
                 PreparationFaultStage::Reopened,
+                PreparationFaultStage::Started,
                 PreparationFaultStage::Hashed,
                 PreparationFaultStage::MetadataValidated,
             ] {
                 let root = TestRoot::new();
                 let source = root.source("source-worker", b"worker");
-                let error = OneTimeWorkerImage::prepare_from_with_fault(
+                let started = std::cell::Cell::new(false);
+                let dropped_before_cleanup = std::cell::Cell::new(false);
+                let error = OneTimeWorkerImage::prepare_from_with_fault_and_start(
                     &source,
                     &root.path,
                     |observed_stage, _| {
@@ -3991,9 +4075,32 @@ mod one_time_image {
                             Ok(())
                         }
                     },
+                    |path| {
+                        let metadata = std::fs::metadata(path)?;
+                        assert_eq!(metadata.mode() & 0o7777, 0o500);
+                        assert_eq!(metadata.nlink(), 1);
+                        started.set(true);
+                        Ok(StartedPublication {
+                            path: path.to_owned(),
+                            dropped_before_cleanup: &dropped_before_cleanup,
+                        })
+                    },
                 )
-                .unwrap_err();
+                .err()
+                .expect("injected failure must reject publication");
 
+                let after_start = matches!(
+                    injected_stage,
+                    PreparationFaultStage::Started
+                        | PreparationFaultStage::Hashed
+                        | PreparationFaultStage::MetadataValidated
+                );
+                assert_eq!(started.get(), after_start, "{injected_stage:?}");
+                assert_eq!(
+                    dropped_before_cleanup.get(),
+                    after_start,
+                    "{injected_stage:?}"
+                );
                 assert!(error.to_string().contains("injected fault"));
                 let entries = std::fs::read_dir(&root.path)
                     .unwrap()
@@ -4005,6 +4112,97 @@ mod one_time_image {
                     "owned publication artifacts remained after {injected_stage:?}"
                 );
             }
+        }
+
+        fn pending_sleep() -> super::super::PendingGuardian {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            super::super::PendingGuardian {
+                child: Some(child),
+                heartbeat: None,
+            }
+        }
+
+        #[allow(unsafe_code)]
+        fn assert_child_reaped(pid: u32) {
+            let mut status = 0;
+            // SAFETY: observe only the exact test child, without blocking; status is writable.
+            let result = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            assert_eq!(result, -1, "pending child was not reaped");
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+
+        #[test]
+        fn image_digest_mismatch_reaps_started_child_and_removes_publication() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let pid = std::cell::Cell::new(0);
+            let result = OneTimeWorkerImage::prepare_from_with_fault_and_start(
+                &source,
+                &root.path,
+                |stage, path| {
+                    if stage == PreparationFaultStage::Started {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+                        std::fs::write(path, b"tamper")?;
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))?;
+                    }
+                    Ok(())
+                },
+                |_| {
+                    let pending = pending_sleep();
+                    pid.set(pending.child.as_ref().unwrap().id());
+                    Ok(pending)
+                },
+            );
+            let error = result
+                .err()
+                .expect("tampered image must fail its byte proof");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("did not match its source"));
+            assert_child_reaped(pid.get());
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+            assert_eq!(std::fs::read(source).unwrap(), b"worker");
+        }
+
+        #[test]
+        fn verified_image_retains_pending_child_until_pipe_validation() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let error = OneTimeWorkerImage::prepare_from_and_start(&source, &root.path, |_| {
+                Err::<(), _>(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "injected spawn failure",
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+            let (image, pending) =
+                OneTimeWorkerImage::prepare_from_and_start(&source, &root.path, |_| {
+                    Ok(pending_sleep())
+                })
+                .unwrap();
+            assert_eq!(image.proof().source.sha256, image.proof().image.sha256);
+            let image_path = image.image_path().to_owned();
+            let pid = pending.child.as_ref().unwrap().id();
+            // A successful proof hands off ownership; a missing protocol pipe then
+            // kills and reaps before retiring the proven publication.
+            let error = pending
+                .into_process(image)
+                .expect_err("sleep has no protocol pipes");
+            assert!(matches!(
+                error,
+                super::super::WorkerLaunchError::MissingPipe { pipe: "stdin" }
+            ));
+            assert_child_reaped(pid);
+            assert!(!image_path.exists());
         }
 
         #[test]

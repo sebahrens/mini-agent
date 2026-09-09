@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "benchmark": "mini-agent-js-worker",
+  "evidence_state": "single_platform_record",
+  "profile": "debug",
+  "sampling": {
+    "warmups": 10,
+    "samples": 100,
+    "percentile": "nearest-rank",
+    "variance": "unbiased sample variance in microseconds squared",
+    "documented_p95_variance_ratio": 0.15
+  },
+  "targets": {
+    "cold_ready_us": {
+      "linux": 250000.0,
+      "macos": 1000000.0,
+      "windows": 750000.0
+    },
+    "warm_pure_call_us": 10000.0,
+    "broker_ipc_4kib_us": 10000.0,
+    "idle_private_bytes": 33554432,
+    "post_cancel_recovery_us": 1000000.0,
+    "maximum_worker_processes": 1,
+    "idle_runtimes": 0
+  },
+  "security_ceilings": {
+    "native_memory_bytes": 268435456,
+    "native_cpu_seconds": 35,
+    "relationship_to_targets": "enforced security ceilings; never inferred from benchmark measurements",
+    "verification": "verified by the platform containment probe job, separately from this benchmark"
+  },
+  "platform_evidence": [
+    {
+      "status": "measured",
+      "run": {
+        "machine": {
+          "host": "macos-local-m3-ultra",
+          "os": "macos",
+          "arch": "aarch64",
+          "kernel": "Darwin 25.4.0",
+          "cpu": "Apple M3 Ultra",
+          "logical_cpus": 32,
+          "memory_bytes": 549755813888,
+          "binary_profile": "debug",
+          "package_version": "1.8.0",
+          "build_identity": "1.8.0+6737862e199ccc2ea77a869873a9adeb46f448c05817e906997ae731c332ef6f"
+        },
+        "containment": {
+          "backend": "seatbelt",
+          "assurance": "deprecated-best-effort"
+        },
+        "latency": {
+          "cold_ready": {
+            "samples": 100,
+            "mean_us": 1056051.82955,
+            "p50_us": 1055628.791,
+            "p95_us": 1061325.5,
+            "variance_us2": 162110711.77700436,
+            "standard_deviation_us": 12732.270487898235,
+            "minimum_us": 1020911.417,
+            "maximum_us": 1166694.0829999999
+          },
+          "warm_pure_call": {
+            "samples": 100,
+            "mean_us": 659.6058700000001,
+            "p50_us": 656.708,
+            "p95_us": 677.709,
+            "variance_us2": 206.9176526798991,
+            "standard_deviation_us": 14.384632518069383,
+            "minimum_us": 643.042,
+            "maximum_us": 766.042
+          },
+          "broker_ipc_4kib": {
+            "samples": 100,
+            "mean_us": 813.3483500000001,
+            "p50_us": 813.792,
+            "p95_us": 825.375,
+            "variance_us2": 65.611798189394,
+            "standard_deviation_us": 8.100110998584771,
+            "minimum_us": 792.625,
+            "maximum_us": 832.25
+          },
+          "post_cancel_recovery": {
+            "samples": 100,
+            "mean_us": 1045327.3437399998,
+            "p50_us": 1042719.166,
+            "p95_us": 1055913.25,
+            "variance_us2": 204543848.26238102,
+            "standard_deviation_us": 14301.882682443631,
+            "minimum_us": 1035229.959,
+            "maximum_us": 1165105.25
+          }
+        },
+        "idle_private_memory": {
+          "samples": 100,
+          "mean_bytes": 4440064.0,
+          "maximum_bytes": 4440064,
+          "measurement": "vmmap -summary Physical footprint"
+        },
+        "counts": {
+          "maximum_observed_worker_processes": 1,
+          "maximum_observed_containment_helper_processes": 1,
+          "idle_worker_processes": 1,
+          "worker_process_observation_kind": "macos_guardian_process_group",
+          "worker_process_observation": "bounded libproc enumeration after authenticated Ready; the authenticated guardian owns its dedicated process group; exactly one live non-guardian member is the worker and the guardian is counted separately",
+          "idle_runtimes": 0,
+          "idle_runtime_observation_kind": "protocol_lifecycle_proof",
+          "idle_runtime_observation": "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime"
+        },
+        "target_results": {
+          "cold_ready": false,
+          "warm_pure_call": true,
+          "broker_ipc_4kib": true,
+          "idle_private_memory": true,
+          "post_cancel_recovery": false,
+          "one_worker_zero_idle_runtimes": true,
+          "timing_targets_are_informational": true
+        },
+        "comparison": null
+      }
+    }
+  ]
+}

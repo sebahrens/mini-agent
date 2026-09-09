@@ -791,6 +791,18 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
 /// the inventory to source line numbers.
 const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/extras/js/skills/operations.rs",
+        "let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/js/skills/operations.rs",
+        "let restarted = TelemetryDispatcher::spawn(&paths).unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
         "src/sandbox.rs",
         "std::mem::drop(runtime.spawn(async move {",
         1,
@@ -1014,13 +1026,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        "let mut command = Command::new(&executable);",
-        1,
-        "TC-BROKER-JS-WORKER",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
-        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        "let child = command.spawn()?;",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -1033,7 +1039,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(executable);",
-        1,
+        2,
         "TC-BROKER-JS-WORKER",
     ),
     (
@@ -1051,6 +1057,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(\"/usr/bin/true\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let child = std::process::Command::new(\"/bin/sleep\")",
         1,
         "TEST-ONLY",
     ),
@@ -3111,7 +3123,7 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/worker/macos.rs",
         ".spawn()",
-        &["TC-BROKER-JS-WORKER", "TEST-ONLY"],
+        &["TC-BROKER-JS-WORKER", "TEST-ONLY", "TEST-ONLY"],
     ),
     (
         "src/sandbox.rs",
@@ -3156,6 +3168,18 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/extras/js/skills/operations.rs",
+        "let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/extras/js/skills/operations.rs",
+        "let restarted = TelemetryDispatcher::spawn(&paths).unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
         "src/extras/mcp/client.rs",
         "assert_eq!(response.status(), reqwest::StatusCode::FOUND);",
         1,
@@ -3193,13 +3217,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
-        "let mut command = Command::new(&executable);",
-        1,
-        "TC-BROKER-JS-WORKER",
-    ),
-    (
-        "src/sandbox/worker/macos.rs",
-        "let mut child = command.spawn().map_err(|source| WorkerLaunchError::Io {",
+        "let child = command.spawn()?;",
         1,
         "TC-BROKER-JS-WORKER",
     ),
@@ -3212,7 +3230,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(executable);",
-        1,
+        2,
         "TC-BROKER-JS-WORKER",
     ),
     (
@@ -3230,6 +3248,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let mut command = Command::new(\"/usr/bin/true\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let child = std::process::Command::new(\"/bin/sleep\")",
         1,
         "TEST-ONLY",
     ),
@@ -3668,7 +3692,7 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/worker/macos.rs",
         ".spawn()",
-        &["TC-BROKER-JS-WORKER", "TEST-ONLY"],
+        &["TC-BROKER-JS-WORKER", "TEST-ONLY", "TEST-ONLY"],
     ),
     (
         "src/sandbox.rs",

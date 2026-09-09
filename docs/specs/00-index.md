@@ -182,6 +182,18 @@ the macOS publisher still independently hashes both pinned descriptors on every 
 | ACP retains a protocol-valid partial turn on failure or cancellation | — (ACP) | mini-agent-wldr.26 |
 | Skill utility statistics computed with grouped set queries | Phase 5 | mini-agent-wldr.27 |
 
+## Delivered startup follow-up (2026-09-09)
+
+`mini-agent-jnuz` overlaps contained macOS worker startup with the sealed-image
+byte proof. The complete proof still precedes protocol handoff; a pending
+guardian guard kills the process group and reaps the guardian before failed
+publication cleanup. Ready-time revalidation and rehash remain mandatory.
+The owning [Phase 6 publisher contract](phase-6-brokered-js-runtime.md) and
+[matched-host measurements](../benchmarks/2026-09-09-macos-worker-startup-overlap.md)
+record the ordering, regression coverage, and modest observed timing change.
+The native production-binary containment matrix passes; this local measurement
+does not complete the pending cross-platform benchmark manifest.
+
 ## Feature relationships
 
 Cargo features are not phase-completion claims:

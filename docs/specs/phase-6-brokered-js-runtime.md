@@ -684,8 +684,19 @@ one to eight distinct, exact 20-byte data values before any typed access; the ge
 is capped at 512 bytes before parsing. Candidate signing information is never accepted after a
 validation failure.
 
+After source proof and metadata validation, the publisher seals the destination to `0500`,
+closes its writable descriptor, reopens it read-only, and validates ownership, ACLs, single-link
+identity and distinct inode before starting the trusted guardian. Sealed-image hashing and the
+remaining publication checks then overlap contained process startup. A pending guardian guard
+owns the child and heartbeat inside the publication operation: any subsequent proof failure
+kills the process group and reaps the guardian before publication cleanup. Only a successful full proof hands
+the child and protocol pipes to the supervisor, so no bootstrap challenge, authenticated Ready,
+request, or brokered effect can precede proof completion. Ready-time descriptor revalidation,
+rehashing and unlink remain unchanged.
+
 Unit tests cover source/root rejection, exclusive copy-on-write cloning, secure cross-volume copy,
 source/image mutation independence, publication permissions and identity, descriptor flags,
+pre-proof startup ordering, child reaping on digest mismatch and missing pipes,
 replacement detection, unlink refusal when an unexpected directory entry exists, and rejection of
 tampered or malformed executables. Positive source/copy and distinct-system-image identity probes
 exist but are ignored unless explicitly selected because macOS 26.5.2 on the development host

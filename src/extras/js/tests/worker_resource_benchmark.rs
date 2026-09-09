@@ -31,25 +31,18 @@ const LINUX_COLD_READY_TARGET_US: f64 = 250_000.0;
 /// Reviewed macOS exception, recorded in
 /// `docs/benchmarks/2026-09-08-macos-worker-cold-start.md`.
 ///
-/// A fresh macOS worker spends its time in exactly two places, measured with
-/// the launcher's own phase profile on macOS 26: proving the sealed one-time
-/// image byte-for-byte against its source (~365 ms, bound by materializing the
-/// clone's copy-on-write extents) and starting the debug worker binary under
-/// Seatbelt through authenticated Ready (~445 ms). Everything else — the
-/// publication sweep, the clone itself, profile rendering and the guardian
-/// spawn — is under 1% combined. Reaching 300 ms would mean dropping the byte
-/// proof, which is a containment guarantee, so the target is restated at the
-/// measured envelope instead of being reported as met.
+/// The publisher independently hashes source and image; Ready-time unlink
+/// revalidates the image digest. Process startup overlaps the initial sealed
+/// image proof. The original profile and the matched-host overlap experiment
+/// are recorded in docs/benchmarks; timing targets remain informational.
 const MACOS_COLD_READY_TARGET_US: f64 = 1_000_000.0;
 const WINDOWS_COLD_READY_TARGET_US: f64 = 750_000.0;
 const WARM_PURE_CALL_TARGET_US: f64 = 10_000.0;
 const BROKER_IPC_TARGET_US: f64 = 10_000.0;
 const IDLE_PRIVATE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
-/// Cancel-and-recover replaces the worker, so on macOS it carries the same
-/// fresh-launch cost as cold Ready plus teardown and is expected to report
-/// `false` there. The target stays a single cross-platform scalar; the macOS
-/// overrun is recorded as a reviewed exception rather than hidden by widening
-/// it (docs/benchmarks/2026-09-08-macos-worker-cold-start.md).
+/// Cancel-and-recover replaces the worker and carries the same fresh-launch
+/// cost plus teardown. Keep this single cross-platform target and report the
+/// measured outcome without widening it to hide a platform overrun.
 const POST_CANCEL_RECOVERY_TARGET_US: f64 = 1_000_000.0;
 const IDLE_RUNTIME_OBSERVATION_KIND: &str = "protocol_lifecycle_proof";
 const IDLE_RUNTIME_PROOF: &str = "authenticated StepResult is emitted only after execute_fresh_step returns and drops its request-local QuickJS Runtime";
