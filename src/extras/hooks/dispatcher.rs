@@ -191,6 +191,7 @@ pub(crate) struct HookDispatcher {
 }
 
 impl HookDispatcher {
+    #[cfg(test)]
     pub(crate) fn from_config(config: &HooksConfig) -> Result<Self, String> {
         let backend = if cfg!(target_os = "macos") {
             "seatbelt"
@@ -200,6 +201,7 @@ impl HookDispatcher {
         Self::from_config_with_backend(config, backend)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_config_with_backend(
         config: &HooksConfig,
         sandbox_backend: &str,
@@ -289,7 +291,11 @@ impl HookDispatcher {
         }
     }
 
-    fn policy_context(&self, ctx: &HookCtx) -> Result<(HookCtx, HookExecutionRootLease), String> {
+    /// Capture the selected workspace and its launch lease for one dispatch.
+    pub(crate) fn policy_context(
+        &self,
+        ctx: &HookCtx,
+    ) -> Result<(HookCtx, HookExecutionRootLease), String> {
         let mut ctx = ctx.clone();
         let state = self
             .execution_root

@@ -233,6 +233,7 @@ fn filter_trusted_project_hooks(
 /// filtering, and builds the resulting dispatcher. Explicit paths and a
 /// confirmation callback make this fully unit-testable without a TUI.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_dispatcher_from_paths(
     global_path: &Path,
     project_path: &Path,

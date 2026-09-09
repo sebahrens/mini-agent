@@ -624,29 +624,6 @@ fn output_from_capture(
     }
 }
 
-pub(crate) async fn run_hook_with_policy(
-    command: &str,
-    args: Option<&[String]>,
-    stdin_json: &[u8],
-    timeout: std::time::Duration,
-    project_dir: &str,
-    policy: &HookPolicy,
-) -> HookOutput {
-    run_hook_with_policy_and_limits(
-        command,
-        args,
-        stdin_json,
-        timeout,
-        project_dir,
-        HookRunControls {
-            policy,
-            limits: DEFAULT_HOOK_LIMITS,
-            execution_root: None,
-        },
-    )
-    .await
-}
-
 pub(crate) async fn run_hook_with_policy_at_root(
     command: &str,
     args: Option<&[String]>,

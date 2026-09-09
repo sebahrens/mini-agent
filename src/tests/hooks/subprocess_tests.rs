@@ -1,7 +1,7 @@
 use crate::extras::hooks::settings::HookTrust;
 use crate::extras::hooks::subprocess::{
     HookLimits, HookPolicy, HookStatus, OutputLimit, build_hook_invocation, run_hook,
-    run_hook_with_limits, run_hook_with_policy,
+    run_hook_with_limits, run_hook_with_policy_at_root,
 };
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -29,6 +29,28 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
         "zerostack-hook-subprocess-{name}-{}-{nonce}",
         std::process::id()
     ))
+}
+
+#[cfg(unix)]
+fn bound_context(
+    project: &std::path::Path,
+) -> (
+    crate::extras::hooks::HookCtx,
+    crate::extras::hooks::dispatcher::HookExecutionRootLease,
+) {
+    use crate::extras::hooks::HookCtx;
+    use crate::extras::hooks::dispatcher::HookDispatcher;
+    let dispatcher =
+        HookDispatcher::from_config_with_backend_and_root(&Default::default(), "unused", project)
+            .unwrap();
+    dispatcher
+        .policy_context(&HookCtx {
+            session_id: "subprocess-policy-test".into(),
+            session_path: String::new(),
+            cwd: project.to_string_lossy().into_owned(),
+            permission_mode: "standard".into(),
+        })
+        .unwrap()
 }
 
 #[test]
@@ -142,23 +164,48 @@ fn sandbox_readiness_signal_is_removed_before_interpreting_hook_output() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn seatbelt_starts_but_missing_inner_executable_is_policy_denied() {
+async fn seatbelt_readiness_distinguishes_missing_target_from_started_hook() {
     let policy = HookPolicy::new(HookTrust::Sandboxed, "seatbelt", BTreeMap::new());
-    let args = Vec::new();
-
-    let output = run_hook_with_policy(
-        "__mini_agent_missing_hook_executable__",
+    let (ctx, lease) = bound_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let args = vec!["hook-started".to_string()];
+    let started = run_hook_with_policy_at_root(
+        "/bin/echo",
         Some(&args),
         b"",
         Duration::from_secs(2),
-        env!("CARGO_MANIFEST_DIR"),
+        &ctx.cwd,
         &policy,
+        &lease,
+    )
+    .await;
+    assert_eq!(started.status, HookStatus::Completed);
+    assert!(started.started);
+    assert_eq!(started.exit_code, Some(0));
+    assert_eq!(started.stdout, b"hook-started\n");
+
+    // An absolute target bypasses PATH lookup, reaching the actual contained
+    // readiness launcher, which must reject it before marking the hook started.
+    let missing =
+        std::path::Path::new(&ctx.cwd).join(format!("missing-hook-{}", uuid::Uuid::new_v4()));
+    assert!(!missing.exists());
+    let output = run_hook_with_policy_at_root(
+        missing.to_str().unwrap(),
+        Some(&[]),
+        b"",
+        Duration::from_secs(2),
+        &ctx.cwd,
+        &policy,
+        &lease,
     )
     .await;
 
     assert_eq!(output.status, HookStatus::PolicyDenied);
     assert!(!output.started);
     assert_eq!(output.exit_code, None);
+    assert_eq!(
+        output.stderr,
+        b"sandbox wrapper failed before hook launch readiness"
+    );
 }
 
 #[tokio::test]
@@ -341,13 +388,15 @@ async fn hook_subprocess_async_cancellation_terminates_descendants() {
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", BTreeMap::new());
     let project_text = project.to_string_lossy().into_owned();
     let task = tokio::spawn(async move {
-        run_hook_with_policy(
+        let (ctx, lease) = bound_context(std::path::Path::new(&project_text));
+        run_hook_with_policy_at_root(
             "sh",
             Some(&args),
             b"",
             Duration::from_secs(30),
-            &project_text,
+            &ctx.cwd,
             &policy,
+            &lease,
         )
         .await
     });
@@ -472,13 +521,15 @@ async fn hook_subprocess_policy_sets_project_cwd_and_minimal_explicit_environmen
         "printf '%s|%s|%s|%s' \"$PWD\" \"$ZEROSTACK_PROJECT_DIR\" \"$HOOK_EXPLICIT\" \"${CARGO_MANIFEST_DIR-unset}\"",
     );
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "sh",
         Some(&args),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
@@ -510,13 +561,15 @@ async fn hook_subprocess_policy_unavailable_sandbox_denies_before_child_creation
         BTreeMap::new(),
     );
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "sh",
         Some(&args),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
@@ -544,13 +597,15 @@ async fn hook_subprocess_policy_rejects_reserved_environment_override() {
     );
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", env);
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "true",
         Some(&[]),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
@@ -572,13 +627,15 @@ async fn hook_subprocess_policy_rejects_case_colliding_environment_keys() {
     .collect();
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", env);
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "true",
         Some(&[]),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
@@ -600,13 +657,15 @@ async fn hook_subprocess_policy_resolves_relative_program_from_project_without_r
     let args = vec!["literal $HOME ; *".to_string()];
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", BTreeMap::new());
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "./show-argv.sh",
         Some(&args),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
@@ -628,13 +687,15 @@ async fn hook_subprocess_policy_denies_relative_program_escape() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let policy = HookPolicy::new(HookTrust::Trusted, "unused", BTreeMap::new());
 
-    let output = run_hook_with_policy(
+    let (ctx, lease) = bound_context(&project);
+    let output = run_hook_with_policy_at_root(
         "../outside.sh",
         Some(&[]),
         b"",
         Duration::from_secs(2),
-        project.to_str().unwrap(),
+        &ctx.cwd,
         &policy,
+        &lease,
     )
     .await;
 
