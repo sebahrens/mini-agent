@@ -208,11 +208,16 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--status-socket <path>` | Send start/stop status messages to a Unix socket. |
 | `--load-prompt <prompt>` | Use a specific prompt |
 
-`-p --output json` reserves stdout for exactly one JSON object after a successful run:
+`-p --output json` reserves stdout for exactly one JSON object when a turn result is available:
 
 ```json
 {"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
 ```
+
+`stop_reason` is `"completed"` on success and `"failed"` when the agent, explicit shell command,
+or session save fails. Failed turns retain observed output, tool counts, changed files, usage,
+and cost, and exit nonzero; completed tool records are saved unless `--no-session` is set or
+persistence itself fails. Errors before a turn result is available can exit without JSON.
 
 `files_changed` combines workspace paths whose bounded Git status changed during the invocation
 with `write` and `edit` targets visible in the provider transcript. It is empty when no

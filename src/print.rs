@@ -96,7 +96,14 @@ pub(crate) struct HeadlessJsonOutput {
     pub tool_calls: HeadlessToolCalls,
     pub usage: Usage,
     pub cost: f64,
-    pub stop_reason: &'static str,
+    pub stop_reason: HeadlessStopReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HeadlessStopReason {
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +267,7 @@ pub(crate) fn render_headless_json(
     usage: Usage,
     files_changed: Vec<String>,
     pricing: HeadlessPricing,
+    stop_reason: HeadlessStopReason,
 ) -> serde_json::Result<String> {
     let (tool_calls, explicit_files) = interaction_summary(root, interactions);
     let files_changed = files_changed
@@ -287,7 +295,7 @@ pub(crate) fn render_headless_json(
         tool_calls,
         usage,
         cost,
-        stop_reason: "completed",
+        stop_reason,
     })
 }
 
@@ -968,6 +976,7 @@ mod tests {
                 input_token_cost: 3.0,
                 output_token_cost: 15.0,
             },
+            super::HeadlessStopReason::Completed,
         )
         .expect("headless JSON should serialize");
         let value: serde_json::Value =

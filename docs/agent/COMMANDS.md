@@ -266,6 +266,9 @@ and rolls the transcript back.
 Prefix a message with `!` to run it as a shell command instead of sending it to
 the agent. The command's output is captured and stored in the session history as
 an Assistant message. Works in both TUI and `--print` mode.
+In `--print` mode, a failed command or empty `!` exits nonzero. Captured output is still
+rendered and saved before reporting a command failure; `--output json` marks that result
+with `"stop_reason":"failed"`.
 
 At startup, mini-agent resolves the configured shell once against the canonical
 workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh

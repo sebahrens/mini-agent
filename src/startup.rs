@@ -1381,37 +1381,35 @@ impl Startup {
                 )
                 .await?;
                 let result = run.rendered_output();
-                let rendered_json = if json_output {
+                let json_context = if json_output {
                     let files_changed = crate::print::files_changed_since(
                         self.workspace.root(),
                         change_baseline.as_ref(),
                         &[],
                     )
                     .await;
-                    Some(crate::print::render_headless_json(
-                        self.workspace.root(),
-                        &result,
-                        &[],
-                        rig::completion::Usage::default(),
+                    Some((
                         files_changed,
                         crate::print::HeadlessPricing {
                             anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
                             input_token_cost: self.session.input_token_cost,
                             output_token_cost: self.session.output_token_cost,
                         },
-                    )?)
+                    ))
                 } else {
                     None
                 };
                 if !json_output {
                     println!("{result}");
                 }
+                let mut persistence_failure = None;
                 if !self.cli.no_session {
                     let mut session = self.session;
                     session.add_message(MessageRole::User, &msg);
                     session.add_message(MessageRole::Assistant, &result);
-                    session::storage::save_session(&session)?;
-                    if let Err(e) = session::chat_history::append_entry(
+                    if let Err(error) = session::storage::save_session(&session) {
+                        persistence_failure = Some(error);
+                    } else if let Err(e) = session::chat_history::append_entry(
                         &session::chat_history::ChatHistoryEntry {
                             content: msg,
                             timestamp: session.updated_at.clone(),
@@ -1420,11 +1418,39 @@ impl Startup {
                         eprintln!("warning: failed to append chat history entry: {}", e);
                     }
                 }
-                if let Some(json) = rendered_json {
-                    println!("{json}");
+                if let Some((files_changed, pricing)) = json_context {
+                    let stop_reason = if run.succeeded() && persistence_failure.is_none() {
+                        crate::print::HeadlessStopReason::Completed
+                    } else {
+                        crate::print::HeadlessStopReason::Failed
+                    };
+                    println!(
+                        "{}",
+                        crate::print::render_headless_json(
+                            self.workspace.root(),
+                            &result,
+                            &[],
+                            rig::completion::Usage::default(),
+                            files_changed,
+                            pricing,
+                            stop_reason,
+                        )?
+                    );
+                }
+                if !run.succeeded() {
+                    let failure = anyhow::anyhow!("explicit shell command failed");
+                    return Err(match persistence_failure {
+                        Some(error) => failure.context(format!(
+                            "the command result could not be persisted either: {error}"
+                        )),
+                        None => failure,
+                    });
+                }
+                if let Some(error) = persistence_failure {
+                    return Err(error);
                 }
             } else {
-                eprintln!("error: empty command after '!'");
+                anyhow::bail!("empty command after '!'");
             }
         } else {
             let pending_tokens = Session::estimate_tokens(&msg);
@@ -1542,25 +1568,21 @@ impl Startup {
                 interactions,
                 failure,
             } = response_result;
-            let rendered_json = if json_output {
+            let json_context = if json_output {
                 let files_changed = crate::print::files_changed_since(
                     self.workspace.root(),
                     change_baseline.as_ref(),
                     &interactions,
                 )
                 .await;
-                Some(crate::print::render_headless_json(
-                    self.workspace.root(),
-                    &response,
-                    &interactions,
-                    usage,
+                Some((
                     files_changed,
                     crate::print::HeadlessPricing {
                         anthropic_native: self.cfg.is_anthropic_native(&self.session.provider),
                         input_token_cost: self.session.input_token_cost,
                         output_token_cost: self.session.output_token_cost,
                     },
-                )?)
+                ))
             } else {
                 None
             };
@@ -1584,8 +1606,24 @@ impl Startup {
                     );
                 }
             }
-            if let Some(json) = rendered_json {
-                println!("{json}");
+            if let Some((files_changed, pricing)) = json_context {
+                let stop_reason = if failure.is_none() && persistence_failure.is_none() {
+                    crate::print::HeadlessStopReason::Completed
+                } else {
+                    crate::print::HeadlessStopReason::Failed
+                };
+                println!(
+                    "{}",
+                    crate::print::render_headless_json(
+                        self.workspace.root(),
+                        &response,
+                        &interactions,
+                        usage,
+                        files_changed,
+                        pricing,
+                        stop_reason,
+                    )?
+                );
             }
             // The turn's own failure wins: a partial persistence failure is
             // reported too, but neither is ever presented as success.
