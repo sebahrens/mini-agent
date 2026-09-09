@@ -1987,8 +1987,8 @@ model only when needed.
 [advisor]
 enabled = true
 model = "deepseek-v4-pro"
-# max_uses = 3                    # max advisor calls per request (nil = unlimited)
-# human_handoff = true            # struct default is true, but currently has no effect from config alone; see the note below
+# max_uses = 3                    # max advisor calls per request (0 = unlimited)
+human_handoff = false            # use the advisor model; an advisor section defaults this to true
 # advisor_kilobytes_limit = 256   # max KB of conversation context (split half head / half tail)
 ```
 
@@ -2009,15 +2009,15 @@ advisor:
 |------|-------------|
 | `--advisor` | Enable the advisor tool |
 | `--advisor-model <name>` | Advisor model name |
-| `--advisor-max-uses <n>` | Max advisor calls per request |
-| `--advisor-human-handoff[=<bool>]` | Route advisor calls to the user instead of a model. Bare flag or `=true` enables it; CLI default is `false` unless passed |
+| `--advisor-max-uses <n>` | Max advisor calls per request; `0` means unlimited |
+| `--advisor-human-handoff[=<bool>]` | Override the configured mode. Bare flag or `=true` enables human handoff; `=false` uses the advisor model |
 | `--advisor-kilobytes-limit <n>` | Max KB of conversation context sent to advisor (default: 256) |
 
-**Known quirk:** the CLI flag always supplies a value (`Some(false)` when not
-passed), so `resolve_advisor_human_handoff()` never falls through to the
-config file's `human_handoff` key in practice. Use `--advisor-human-handoff`
-or the `/advisor handoff on` runtime command to actually enable it; setting
-`human_handoff` in the config file alone currently has no effect.
+Explicit CLI values override the advisor configuration, including `false`, `0`,
+and a context limit of `256`. Omitted flags use the config values. With no
+advisor section, the defaults are model mode, unlimited calls, and 256 KB of
+context. An advisor section defaults to human handoff, three calls, and 256 KB;
+set `human_handoff = false` to use its configured model.
 
 ### Human handoff mode
 

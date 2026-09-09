@@ -703,7 +703,7 @@ pub struct Cli {
     #[cfg(feature = "advisor")]
     #[arg(
         long = "advisor-max-uses",
-        help = "Maximum advisor calls per request (default: 3)"
+        help = "Maximum advisor calls per request (0 = unlimited; uses config when omitted)"
     )]
     pub advisor_max_uses: Option<usize>,
 
@@ -713,18 +713,16 @@ pub struct Cli {
         help = "Route advisor calls to the user instead of a model",
         default_missing_value = "true",
         num_args = 0..=1,
-        require_equals = true,
-        default_value = "false"
+        require_equals = true
     )]
     pub advisor_human_handoff: Option<bool>,
 
     #[cfg(feature = "advisor")]
     #[arg(
         long = "advisor-kilobytes-limit",
-        help = "Max total kilobytes of conversation context to send to the advisor (head: half, tail: half). Default: 256",
-        default_value = "256"
+        help = "Max total kilobytes of conversation context to send to the advisor (head: half, tail: half). Default: 256"
     )]
-    pub advisor_kilobytes_limit: u32,
+    pub advisor_kilobytes_limit: Option<u32>,
 
     #[cfg(feature = "status-signals")]
     #[arg(
@@ -1005,6 +1003,7 @@ impl Cli {
     pub fn resolve_advisor_max_uses(&self, cfg: &config::Config) -> Option<usize> {
         self.advisor_max_uses
             .or_else(|| cfg.advisor.as_ref().and_then(|a| a.max_uses))
+            .filter(|&limit| limit != 0)
     }
 
     #[cfg(feature = "advisor")]
@@ -1019,14 +1018,9 @@ impl Cli {
 
     #[cfg(feature = "advisor")]
     pub fn resolve_advisor_kilobytes_limit(&self, cfg: &config::Config) -> u32 {
-        if self.advisor_kilobytes_limit != 256 {
-            self.advisor_kilobytes_limit
-        } else {
-            cfg.advisor
-                .as_ref()
-                .map(|a| a.advisor_kilobytes_limit)
-                .unwrap_or(256)
-        }
+        self.advisor_kilobytes_limit
+            .or_else(|| cfg.advisor.as_ref().map(|a| a.advisor_kilobytes_limit))
+            .unwrap_or(256)
     }
 }
 
@@ -1040,6 +1034,89 @@ mod tests {
 
     use super::{Cli, OutputFormat, default_sandbox_backend};
     use crate::config;
+
+    #[cfg(feature = "advisor")]
+    #[test]
+    fn advisor_handoff_cli_config_precedence() {
+        for (source, configured) in [
+            ("", false),
+            ("[advisor]", true),
+            ("[advisor]\nhuman_handoff = false", false),
+            ("[advisor]\nhuman_handoff = true", true),
+        ] {
+            let cfg: config::Config = toml::from_str(source).unwrap();
+            for (args, explicit) in [
+                (&[][..], None),
+                (&["--advisor-human-handoff"][..], Some(true)),
+                (&["--advisor-human-handoff=true"][..], Some(true)),
+                (&["--advisor-human-handoff=false"][..], Some(false)),
+            ] {
+                let cli =
+                    Cli::try_parse_from(std::iter::once("mini-agent").chain(args.iter().copied()))
+                        .unwrap();
+                assert_eq!(
+                    cli.resolve_advisor_human_handoff(&cfg),
+                    explicit.unwrap_or(configured),
+                    "{source:?}, {args:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "advisor")]
+    #[test]
+    fn advisor_context_limit_cli_config_precedence() {
+        for (source, configured) in [
+            ("", 256),
+            ("[advisor]", 256),
+            ("[advisor]\nadvisor_kilobytes_limit = 128", 128),
+            ("[advisor]\nadvisor_kilobytes_limit = 0", 0),
+        ] {
+            let cfg: config::Config = toml::from_str(source).unwrap();
+            for explicit in [None, Some(0u32), Some(256), Some(512), Some(u32::MAX)] {
+                let mut args = vec!["mini-agent".to_owned()];
+                if let Some(limit) = explicit {
+                    args.extend(["--advisor-kilobytes-limit".to_owned(), limit.to_string()]);
+                }
+                let cli = Cli::try_parse_from(&args).unwrap();
+                assert_eq!(
+                    cli.resolve_advisor_kilobytes_limit(&cfg),
+                    explicit.unwrap_or(configured),
+                    "{source:?}, {args:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "advisor")]
+    #[test]
+    fn advisor_call_limit_cli_config_precedence() {
+        for (source, configured) in [
+            ("", None),
+            ("[advisor]", Some(3)),
+            ("[advisor]\nmax_uses = 0", None),
+            ("[advisor]\nmax_uses = 7", Some(7)),
+        ] {
+            let cfg: config::Config = toml::from_str(source).unwrap();
+            for (explicit, expected) in [
+                (None, configured),
+                (Some(0), None),
+                (Some(3), Some(3)),
+                (Some(9), Some(9)),
+            ] {
+                let mut args = vec!["mini-agent".to_owned()];
+                if let Some(limit) = explicit {
+                    args.extend(["--advisor-max-uses".to_owned(), limit.to_string()]);
+                }
+                let cli = Cli::try_parse_from(&args).unwrap();
+                assert_eq!(
+                    cli.resolve_advisor_max_uses(&cfg),
+                    expected,
+                    "{source:?}, {args:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn print_output_format_defaults_to_text_and_accepts_json() {
