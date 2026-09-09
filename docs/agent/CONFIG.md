@@ -2019,6 +2019,10 @@ advisor section, the defaults are model mode, unlimited calls, and 256 KB of
 context. An advisor section defaults to human handoff, three calls, and 256 KB;
 set `human_handoff = false` to use its configured model.
 
+The call allowance belongs to each agent request. Parallel advisor calls and
+retries within that request share it; a new request gets a fresh allowance even
+when the app reuses its cached agent.
+
 ### Human handoff mode
 
 When enabled, the agent's advisor calls are redirected to the

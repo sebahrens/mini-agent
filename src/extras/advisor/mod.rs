@@ -117,6 +117,22 @@ impl AdvisorTool {
             uses: AtomicUsize::new(0),
         }
     }
+
+    fn reserve_use(&self, max_uses: Option<usize>) -> Result<(), ToolError> {
+        // Cached agents share tools across requests; the request owns its budget.
+        // Direct calls outside a runner retain the tool's local allowance.
+        let scoped = crate::agent::runner::current_advisor_usage();
+        let uses = scoped.as_deref().unwrap_or(&self.uses);
+        if let Some(max) = max_uses {
+            uses.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < max).then(|| used + 1)
+            })
+            .map_err(|_| ToolError::Msg("Advisor call limit reached for this request".into()))?;
+        } else {
+            uses.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 impl Tool for AdvisorTool {
@@ -175,17 +191,7 @@ conversation, so focus your question on the specific decision you need help with
 
         let cfg = with_config(|c| c.clone()).map_err(|e| ToolError::Msg(e.to_string()))?;
 
-        if let Some(max) = cfg.max_uses {
-            self.uses
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
-                    if u >= max { None } else { Some(u + 1) }
-                })
-                .map_err(|_| {
-                    ToolError::Msg("Advisor call limit reached for this request".into())
-                })?;
-        } else {
-            self.uses.fetch_add(1, Ordering::Relaxed);
-        }
+        self.reserve_use(cfg.max_uses)?;
 
         if cfg.human_handoff {
             let Some(ref tx) = cfg.handoff_tx else {
@@ -382,6 +388,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_advisor_tool_has_a_fresh_allowance_for_each_request() {
+        use crate::agent::runner::AgentWorkScope;
+        let tool = AdvisorTool::new();
+        // Unscoped calls remain bounded, but must not consume a later request.
+        tool.reserve_use(Some(1)).unwrap();
+        assert!(tool.reserve_use(Some(1)).is_err());
+        for _ in 0..2 {
+            let request = AgentWorkScope::new();
+            request
+                .run(async {
+                    tool.reserve_use(Some(1)).unwrap();
+                    assert!(tool.reserve_use(Some(1)).is_err());
+                })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn advisor_allowances_are_shared_with_children_and_isolated_between_requests() {
+        use crate::agent::runner::{AgentWorkScope, spawn_async_scoped};
+        let tool = std::sync::Arc::new(AdvisorTool::new());
+        let first = AgentWorkScope::new();
+        let second = AgentWorkScope::new();
+        let run = || async {
+            let mut calls = Vec::new();
+            for _ in 0..3 {
+                let tool = std::sync::Arc::clone(&tool);
+                calls.push(spawn_async_scoped(async move {
+                    tool.reserve_use(Some(2)).is_ok()
+                }));
+            }
+            let mut accepted = 0;
+            for call in calls {
+                accepted += usize::from(call.await.unwrap());
+            }
+            assert_eq!(accepted, 2);
+            assert!(tool.reserve_use(Some(2)).is_err());
+            assert!(AdvisorTool::new().reserve_use(Some(2)).is_err());
+        };
+        tokio::join!(first.run(run()), second.run(run()));
+        first.wait_idle().await;
+        second.wait_idle().await;
+
+        // Re-entering the same scope (as retries/continuations do) keeps its usage.
+        first
+            .run(async {
+                assert!(tool.reserve_use(Some(2)).is_err());
+            })
+            .await;
+        let unlimited = AgentWorkScope::new();
+        unlimited
+            .run(async {
+                for _ in 0..4 {
+                    tool.reserve_use(None).unwrap();
+                }
+                assert!(tool.reserve_use(Some(4)).is_err());
+                tool.reserve_use(Some(5)).unwrap();
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn interactive_handoff_can_be_enabled_after_model_only_startup() {

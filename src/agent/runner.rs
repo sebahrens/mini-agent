@@ -635,6 +635,8 @@ tokio::task_local! {
 pub(crate) struct AgentWorkScope {
     cancelled: AtomicBool,
     active_children: AtomicUsize,
+    #[cfg(feature = "advisor")]
+    advisor_uses: Arc<AtomicUsize>,
     cancellation: Notify,
     idle: Notify,
     #[cfg(test)]
@@ -646,6 +648,8 @@ impl AgentWorkScope {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             active_children: AtomicUsize::new(0),
+            #[cfg(feature = "advisor")]
+            advisor_uses: Arc::new(AtomicUsize::new(0)),
             cancellation: Notify::new(),
             idle: Notify::new(),
             #[cfg(test)]
@@ -669,6 +673,8 @@ impl AgentWorkScope {
             Arc::new(Self {
                 cancelled: AtomicBool::new(false),
                 active_children: AtomicUsize::new(0),
+                #[cfg(feature = "advisor")]
+                advisor_uses: Arc::new(AtomicUsize::new(0)),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
                 blocking_gate: Some(gate),
@@ -881,6 +887,13 @@ where
         let _guard = scoped;
         operation()
     })
+}
+
+#[cfg(feature = "advisor")]
+pub(crate) fn current_advisor_usage() -> Option<Arc<AtomicUsize>> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| Arc::clone(&scope.advisor_uses))
+        .ok()
 }
 
 #[cfg(feature = "mcp")]
