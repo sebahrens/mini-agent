@@ -1094,9 +1094,9 @@ mod tests {
 
         let (root, paths) = app_paths();
         let services = super::SkillSessionServices::start_proposal_services(&paths, None).unwrap();
-        let result = services
+        let prepared = services
             .service
-            .execute(JsProposal {
+            .authorize_reserved(JsProposal {
                 source: "function run(_cap) { return 1; }".to_string(),
                 description: "Session proposal service test".to_string(),
                 exports: vec![JsExport {
@@ -1112,6 +1112,8 @@ mod tests {
                 predecessor_id: None,
             })
             .unwrap();
+        services.service.reserve_attempt().unwrap();
+        let result = services.service.execute_prepared(prepared).unwrap();
         assert!(
             crate::extras::js::skills::store::SkillStore::open_at(&paths)
                 .unwrap()

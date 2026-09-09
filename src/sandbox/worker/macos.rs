@@ -2419,6 +2419,7 @@ mod one_time_image {
         directory_name: OsString,
         #[cfg(test)]
         directory_path: PathBuf,
+        #[cfg(test)]
         image_path: PathBuf,
         directory: std::fs::File,
         lease: Option<std::fs::File>,
@@ -2862,6 +2863,7 @@ mod one_time_image {
                         directory_name: directory_name.clone(),
                         #[cfg(test)]
                         directory_path: directory_path.clone(),
+                        #[cfg(test)]
                         image_path: image_path.clone(),
                         directory,
                         lease: Some(lease),
@@ -2893,6 +2895,7 @@ mod one_time_image {
             }
         }
 
+        #[cfg(test)]
         pub(super) fn image_path(&self) -> &Path {
             &self.image_path
         }

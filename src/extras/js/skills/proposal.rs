@@ -843,47 +843,8 @@ impl ProposalEffectService {
         Self { host }
     }
 
-    pub(crate) fn execute(
-        &self,
-        proposal: JsProposal,
-    ) -> Result<ProposalEffectResult, ProposalError> {
-        let prepared = self.authorize_reserved(proposal)?;
-        self.reserve_attempt()?;
-        self.execute_prepared(prepared)
-    }
-
-    /// Cancellation-aware parent API. Cancellation before dispatch is exact;
-    /// once the bounded queue command is handed off, cancellation returns the
-    /// truthful unknown-outcome class while the blocking waiter drains on the
-    /// blocking pool.
-    // Test-only: the host prepares the effect first and calls execute_prepared_cancellable.
-    #[cfg(test)]
-    pub(crate) async fn execute_cancellable(
-        &self,
-        proposal: JsProposal,
-        cancellation: PermCancellation,
-    ) -> Result<ProposalEffectResult, EffectServiceError> {
-        if cancellation.is_cancelled() {
-            return Err(EffectServiceError::Cancelled);
-        }
-        let prepared = self
-            .authorize_reserved(proposal)
-            .map_err(proposal_service_error)?;
-        self.reserve_attempt().map_err(proposal_service_error)?;
-        if cancellation.is_cancelled() {
-            return Err(EffectServiceError::Cancelled);
-        }
-        let service = self.clone();
-        let execution = tokio::task::spawn_blocking(move || service.execute_prepared(prepared));
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(EffectServiceError::OutcomeUnknown),
-            result = execution => result
-                .map_err(|_| EffectServiceError::BackendFailure)?
-                .map_err(proposal_service_error),
-        }
-    }
-
+    /// Cancellation observed before scheduling is exact. After handoff to the
+    /// blocking pool, cancellation returns unknown outcome while its waiter drains.
     pub(crate) async fn execute_prepared_cancellable(
         &self,
         prepared: PreparedProposalEffect,
@@ -1061,17 +1022,21 @@ impl ProposalReceiver {
 
     pub(crate) fn respond_next(
         &self,
-        delay: Duration,
-        result: Result<EnqueueResult, ProposalError>,
+        respond: impl FnOnce(&SkillArtifact) -> Result<EnqueueResult, ProposalError>,
     ) {
-        match self.receiver.recv().expect("proposal command") {
-            ProposalCommand::Enqueue { reply, .. } => {
-                std::thread::sleep(delay);
-                let _ = reply.send(result);
+        let command = self
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("proposal command");
+        match command {
+            ProposalCommand::Enqueue {
+                artifact, reply, ..
+            } => {
+                reply
+                    .send(respond(&artifact))
+                    .expect("proposal waiter must drain the response");
             }
-            ProposalCommand::Observe { reply, .. } => {
-                let _ = reply.send(Ok(None));
-            }
+            ProposalCommand::Observe { .. } => panic!("expected enqueue, received observation"),
         }
     }
 }

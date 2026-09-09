@@ -243,6 +243,13 @@ opens the store, or owns the attempt budget. The parent effect service performs 
 canonicalization checks, appends audit intent before queue dispatch, and durably reconciles the
 completion. Evaluation happens in bounded blocking workers after the current tool call.
 
+Proposal cancellation coverage calls the same prepared-effect entry point as the parent
+broker. It verifies an empty queue for pre-dispatch cancellation and holds a received queue
+command's reply until the caller observes `OutcomeUnknown`; the background waiter must still
+accept the late reply, and the next proposal succeeds. This uses explicit receipt/reply
+coordination. The contained `JsTool` budget test covers missing tests and invalid capability
+tiers; broker-level coverage retains wire-limit rejection and durable audit checks.
+
 Example response:
 
 ```json

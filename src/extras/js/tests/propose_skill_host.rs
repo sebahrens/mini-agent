@@ -61,52 +61,73 @@ fn assert_denial_records(audit: &Arc<Mutex<EffectAudit>>, expected: usize) {
 
 #[tokio::test]
 async fn worker_effect_cancellation_bounds_proposal_enqueue_and_next_call_succeeds() {
-    let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
+    let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(5));
     let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
 
     let before_dispatch = PermCancellation::new();
     before_dispatch.cancel();
+    let prepared = service.authorize_reserved(proposal("-before")).unwrap();
     assert_eq!(
         service
-            .execute_cancellable(proposal("-before"), before_dispatch)
+            .execute_prepared_cancellable(prepared, before_dispatch)
             .await,
         Err(EffectServiceError::Cancelled)
     );
+    assert!(
+        receiver.is_empty(),
+        "pre-dispatch cancellation must enqueue nothing"
+    );
 
+    let (received, receipt) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
     let responder = std::thread::spawn(move || {
-        receiver.respond_next(
-            Duration::from_millis(50),
+        receiver.respond_next(|artifact| {
+            assert!(artifact.source.ends_with("-during"));
+            received.send(()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(3))
+                .expect("release cancelled response");
             Ok(EnqueueResult {
                 proposal_id: "cancelled-proposal".to_string(),
                 skill_id: "cancelled-skill".to_string(),
                 status: EnqueueStatus::Pending,
                 report_id: None,
-            }),
-        );
-        receiver.respond_next(
-            Duration::ZERO,
+            })
+        });
+        receiver.respond_next(|artifact| {
+            assert!(artifact.source.ends_with("-next"));
             Ok(EnqueueResult {
                 proposal_id: "next-proposal".to_string(),
                 skill_id: "next-skill".to_string(),
                 status: EnqueueStatus::Pending,
                 report_id: None,
-            }),
-        );
+            })
+        });
     });
     let cancellation = PermCancellation::new();
-    let cancel_later = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        cancel_later.cancel();
+    let pending_cancellation = cancellation.clone();
+    let pending_service = service.clone();
+    let prepared = service.authorize_reserved(proposal("-during")).unwrap();
+    let pending = tokio::spawn(async move {
+        pending_service
+            .execute_prepared_cancellable(prepared, pending_cancellation)
+            .await
     });
-    assert_eq!(
-        service
-            .execute_cancellable(proposal("-during"), cancellation)
-            .await,
-        Err(EffectServiceError::OutcomeUnknown)
-    );
+    tokio::time::timeout(Duration::from_secs(2), receipt)
+        .await
+        .unwrap()
+        .unwrap();
+    cancellation.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    // The queue has the command but cannot reply yet: only unknown outcome is truthful.
+    assert_eq!(outcome, Err(EffectServiceError::OutcomeUnknown));
+    release.send(()).unwrap();
+    let prepared = service.authorize_reserved(proposal("-next")).unwrap();
     let next = service
-        .execute_cancellable(proposal("-next"), PermCancellation::new())
+        .execute_prepared_cancellable(prepared, PermCancellation::new())
         .await
         .expect("subsequent proposal succeeds");
     assert_eq!(next.proposal_id, "next-proposal");
@@ -191,33 +212,6 @@ fn propose_skill_host_budget_is_per_session_and_exact() {
 
     let second = AttemptBudget::new(1);
     assert!(second.consume().is_ok(), "budgets must not be global");
-}
-
-#[test]
-fn malformed_proposals_do_not_consume_the_session_budget() {
-    let (root, paths) = paths();
-    let store = SkillStore::open_at(&paths).expect("store");
-    let worker =
-        ProposalQueue::start_store_worker(store, 2, Duration::from_secs(1)).expect("worker");
-    let service =
-        ProposalEffectService::new(ProposalHost::new(worker.sender(), AttemptBudget::new(1)));
-    let mut malformed = proposal("");
-    malformed.tests.clear();
-
-    for _ in 0..3 {
-        assert!(matches!(
-            service.execute(malformed.clone()),
-            Err(ProposalError::InvalidField { .. })
-        ));
-    }
-    assert!(service.execute(proposal("")).is_ok());
-    assert!(matches!(
-        service.execute(proposal("-second")),
-        Err(ProposalError::BudgetExhausted)
-    ));
-    drop(service);
-    drop(worker);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -854,21 +848,20 @@ async fn proposal_host_validation_failures_do_not_consume_the_session_budget() {
         worker,
     );
 
-    for _ in 0..3 {
-        let output = tool
-            .call(JsArgs {
-                code: format!(
-                    "propose_skill({{...{}, capability: {{tier: 'admin', grants: []}}}})",
-                    js_payload()
-                ),
-            })
-            .await
-            .expect("structured validation error");
-        assert!(
-            output.starts_with("JS exception at ")
-                && output.ends_with("(stage: evaluation; script: model)"),
-            "unexpected: {output}"
-        );
+    for invalid_field in ["capability: {tier: 'admin', grants: []}", "tests: []"] {
+        for _ in 0..3 {
+            let output = tool
+                .call(JsArgs {
+                    code: format!("propose_skill({{...{}, {invalid_field}}})", js_payload()),
+                })
+                .await
+                .expect("structured validation error");
+            assert!(
+                output.starts_with("JS exception at ")
+                    && output.ends_with("(stage: evaluation; script: model)"),
+                "unexpected: {output}"
+            );
+        }
     }
     // None of the rejected drafts may have spent an attempt, so the whole
     // session budget is still available to well-formed proposals.
@@ -904,15 +897,14 @@ fn settled_proposal_outcomes_are_observed_once_and_queued_ones_stay_tracked() {
     let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
     let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
     let responder = std::thread::spawn(move || {
-        receiver.respond_next(
-            Duration::ZERO,
+        receiver.respond_next(|_| {
             Ok(EnqueueResult {
                 proposal_id: "settling-proposal".to_string(),
                 skill_id: "settling-skill".to_string(),
                 status: EnqueueStatus::Pending,
                 report_id: None,
-            }),
-        );
+            })
+        });
         // First observation: still queued. Second: settled.
         receiver.respond_next_observation(Ok(None));
         receiver.respond_next_observation(Ok(Some(SettledProposal {
@@ -924,7 +916,9 @@ fn settled_proposal_outcomes_are_observed_once_and_queued_ones_stay_tracked() {
         })));
     });
 
-    service.execute(proposal("")).expect("enqueue");
+    let prepared = service.authorize_reserved(proposal("")).unwrap();
+    service.reserve_attempt().unwrap();
+    service.execute_prepared(prepared).expect("enqueue");
     assert!(
         service.settled_outcomes().is_empty(),
         "a queued proposal has no settled outcome yet"
@@ -946,15 +940,14 @@ fn settled_proposal_outcomes_are_appended_to_the_tool_result() {
     let (sender, receiver) = ProposalQueue::bounded(2, Duration::from_secs(1));
     let service = ProposalEffectService::new(ProposalHost::new(sender, AttemptBudget::new(3)));
     let responder = std::thread::spawn(move || {
-        receiver.respond_next(
-            Duration::ZERO,
+        receiver.respond_next(|_| {
             Ok(EnqueueResult {
                 proposal_id: "reported-proposal".to_string(),
                 skill_id: "reported-skill".to_string(),
                 status: EnqueueStatus::Pending,
                 report_id: None,
-            }),
-        );
+            })
+        });
         receiver.respond_next_observation(Ok(Some(SettledProposal {
             proposal_id: "reported-proposal".to_string(),
             skill_id: "reported-skill".to_string(),
@@ -964,7 +957,9 @@ fn settled_proposal_outcomes_are_appended_to_the_tool_result() {
         })));
     });
 
-    service.execute(proposal("")).expect("enqueue");
+    let prepared = service.authorize_reserved(proposal("")).unwrap();
+    service.reserve_attempt().unwrap();
+    service.execute_prepared(prepared).expect("enqueue");
     let rendered = crate::extras::js::tool::with_settled_proposal_outcomes(
         "step result".to_string(),
         &service,
