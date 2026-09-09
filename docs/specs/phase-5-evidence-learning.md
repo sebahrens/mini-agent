@@ -332,6 +332,8 @@ there is no configuration key for any of them. The only skill-related configurat
 - minimum qualified invocations before `active`: 25;
 - evidence must span at least 25 distinct user turns because one revision receives at most one
   promotion evidence unit per turn;
+- each turn retains its worst direct outcome and maximum invocation latency independently;
+  a fast failing call cannot hide a slower successful call from the p95 latency gate;
 - zero integrity, capability, timeout, or OOM faults;
 - no held-out or inherited regression failure;
 - direct-call error rate below 5%;
@@ -650,11 +652,14 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    `MINI_AGENT_GYM=1` can only downgrade it. Gym and deterministic-evaluation evidence is therefore
    retained for analysis but cannot qualify for production promotion, and neither
    `no_verify_command` nor `gate_skipped` can become a pass or a failure. (The current store schema
-   is version 13; migration 11 → 12 widened the deferred proposal reason-code CHECK, and 12 → 13
-   widened the task-outcome source CHECK to admit `gate_skipped`.)
+   is version 14; migration 11 → 12 widened the deferred proposal reason-code CHECK, 12 → 13
+   widened the task-outcome source CHECK to admit `gate_skipped`, and 13 → 14 added task-outcome
+   completeness.)
 2. **Promotion gate.** When a policy version sets `min_verified_task_passes`, promotion counts
-   distinct production turns in the window where the candidate was actually invoked and a real
-   verifier/oracle passed. That policy cannot fall through to the historical 25-invocation path.
+   distinct production turns in the window where the candidate was actually invoked, task
+   evidence is complete, and a real verifier/oracle passed. Durable promotion loading preserves
+   the stored completeness flag; incomplete task passes and failures never qualify. That policy
+   cannot fall through to the historical 25-invocation path.
    Verification failure is a signal for review and statistics, never an automatic quarantine
    trigger; behavioral quarantine remains fault-only.
 3. **Operator utility.** `--learned-skill-stats` reports `tasks_with`, `passed_with`, and

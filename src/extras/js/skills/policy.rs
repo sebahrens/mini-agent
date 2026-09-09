@@ -259,6 +259,7 @@ pub fn evaluate_promotion_with_task_outcomes(
         .iter()
         .filter(|outcome| {
             outcome.production
+                && outcome.evidence_complete
                 && outcome
                     .skill_ids
                     .iter()
@@ -395,30 +396,32 @@ pub fn qualify(
 
     // One conservative evidence unit per skill revision per user turn. If a
     // model loops, retain the worst direct outcome and highest latency.
-    let mut by_turn: BTreeMap<&str, &InvocationEvidence> = BTreeMap::new();
+    let mut by_turn: BTreeMap<&str, (DirectOutcome, u64)> = BTreeMap::new();
     for event in by_invocation.values().copied() {
         by_turn
             .entry(&event.turn_id)
-            .and_modify(|current| {
-                if event.outcome.severity() > current.outcome.severity()
-                    || (event.outcome == current.outcome && event.latency_us > current.latency_us)
-                {
-                    *current = event;
+            .and_modify(|(outcome, latency_us)| {
+                if event.outcome.severity() > outcome.severity() {
+                    *outcome = event.outcome;
                 }
+                *latency_us = (*latency_us).max(event.latency_us);
             })
-            .or_insert(event);
+            .or_insert((event.outcome, event.latency_us));
     }
 
     let failures = by_turn
         .values()
-        .filter(|event| event.outcome.is_error())
+        .filter(|(outcome, _)| outcome.is_error())
         .count();
     let successes = by_turn.len() - failures;
     let severe_faults = by_turn
         .values()
-        .filter(|event| event.outcome.is_severe())
+        .filter(|(outcome, _)| outcome.is_severe())
         .count();
-    let mut latencies: Vec<u64> = by_turn.values().map(|event| event.latency_us).collect();
+    let mut latencies: Vec<u64> = by_turn
+        .values()
+        .map(|(_, latency_us)| *latency_us)
+        .collect();
     latencies.sort_unstable();
     let p95_latency_us = nearest_rank_percentile(&latencies, 95).unwrap_or(0);
     let observed_error_rate = if by_turn.is_empty() {
@@ -495,141 +498,4 @@ fn canonical_inputs(
         verified_task_failures,
         gates,
     })?)
-}
-
-#[cfg(test)]
-mod gate_skipped_evidence_tests {
-    use super::*;
-
-    fn calls(skill: &str, count: usize) -> Vec<InvocationEvidence> {
-        (0..count)
-            .map(|index| InvocationEvidence {
-                invocation_id: format!("{skill}-invocation-{index}"),
-                skill_id: skill.into(),
-                turn_id: format!("{skill}-turn-{index}"),
-                outcome: DirectOutcome::Success,
-                latency_us: 100,
-                production: true,
-                observability_complete: true,
-                created_at: 100,
-            })
-            .collect()
-    }
-
-    fn context(candidate_id: &str) -> PromotionContext {
-        PromotionContext {
-            candidate_id: candidate_id.into(),
-            predecessor_id: Some("predecessor".into()),
-            capability_tier: CapabilityTier::Pure,
-            capability_increased: false,
-            inherited_tests_passed: true,
-            held_out_tests_passed: true,
-            unresolved_negative_feedback: false,
-            identity_valid: true,
-            row_version_current: true,
-            generation_current: true,
-        }
-    }
-
-    fn outcome(
-        candidate_id: &str,
-        turn: &str,
-        verify_passed: bool,
-        source: TaskOutcomeSource,
-    ) -> TaskOutcomeEvidence {
-        TaskOutcomeEvidence {
-            turn_id: turn.into(),
-            skill_ids: vec![candidate_id.to_string()],
-            verify_passed,
-            attempt: 1,
-            source,
-            production: true,
-            evidence_complete: true,
-            created_at: 100,
-        }
-    }
-
-    /// v98t: a turn that ran under a configured verify command but never
-    /// touched the workspace records `GateSkipped`. It is auditable, but the
-    /// gate never ran, so promotion must not count it as evidence — exactly
-    /// like `NoVerifyCommand`.
-    #[test]
-    fn a_skipped_gate_is_never_counted_as_promotion_evidence() {
-        let candidate_id = "a".repeat(64);
-        let mut policy = PromotionPolicy::conservative("v1", 0, 200);
-        policy.min_verified_task_passes = Some(1);
-        let result = evaluate_promotion_with_task_outcomes(
-            &policy,
-            &context(&candidate_id),
-            &calls(&candidate_id, 100),
-            &calls("predecessor", 100),
-            &[
-                outcome(
-                    &candidate_id,
-                    "candidate-turn-0",
-                    true,
-                    TaskOutcomeSource::GateSkipped,
-                ),
-                outcome(
-                    &candidate_id,
-                    "candidate-turn-1",
-                    false,
-                    TaskOutcomeSource::GateSkipped,
-                ),
-            ],
-        )
-        .unwrap();
-        assert_eq!(result.verified_task_passes, 0);
-        assert_eq!(result.verified_task_failures, 0);
-        assert_eq!(result.decision, PromotionDecision::Hold);
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|reason| reason == "insufficient_verified_task_passes"),
-            "{:?}",
-            result.reasons
-        );
-    }
-
-    /// The exclusion must be specific to the skip sources: a real verified
-    /// pass in the same shape still promotes, so the test above is pinning
-    /// `GateSkipped` and not a broken evidence path.
-    #[test]
-    fn a_real_verified_pass_still_promotes_in_the_same_shape() {
-        let candidate_id = "a".repeat(64);
-        let mut policy = PromotionPolicy::conservative("v1", 0, 200);
-        policy.min_verified_task_passes = Some(1);
-        let result = evaluate_promotion_with_task_outcomes(
-            &policy,
-            &context(&candidate_id),
-            &calls(&candidate_id, 100),
-            &calls("predecessor", 100),
-            &[outcome(
-                &candidate_id,
-                "candidate-turn-0",
-                true,
-                TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
-            )],
-        )
-        .unwrap();
-        assert_eq!(result.verified_task_passes, 1);
-        assert_eq!(result.decision, PromotionDecision::Promote);
-    }
-
-    /// `GateSkipped` must serialise to the same token the durable store and
-    /// `telemetry.rs`/`lifecycle.rs` agree on.
-    #[test]
-    fn gate_skipped_serialises_under_its_own_tag() {
-        let json = serde_json::to_string(&TaskOutcomeSource::GateSkipped).unwrap();
-        assert!(json.contains("gate_skipped"), "{json}");
-        assert_ne!(
-            json,
-            serde_json::to_string(&TaskOutcomeSource::NoVerifyCommand).unwrap()
-        );
-        assert_eq!(
-            serde_json::from_str::<TaskOutcomeSource>(&json).unwrap(),
-            TaskOutcomeSource::GateSkipped
-        );
-    }
 }

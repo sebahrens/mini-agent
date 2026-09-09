@@ -51,7 +51,13 @@ fn conservative_policy_promotes_only_qualified_non_inferior_replacement() {
     .unwrap();
     assert_eq!(result.decision, PromotionDecision::Promote);
     assert_eq!(result.candidate.distinct_turns, 100);
-    assert_eq!(result.canonical_inputs, result.canonical_inputs.clone());
+    let inputs: serde_json::Value = serde_json::from_str(&result.canonical_inputs).unwrap();
+    assert_eq!(inputs["policy"], serde_json::to_value(&policy).unwrap());
+    assert_eq!(inputs["context"], serde_json::to_value(context()).unwrap());
+    assert_eq!(
+        inputs["candidate"],
+        serde_json::to_value(&result.candidate).unwrap()
+    );
 }
 
 #[test]
@@ -141,10 +147,11 @@ fn exact_boundaries_use_nearest_rank_and_wilson_confidence() {
 }
 
 #[test]
-fn configured_task_outcome_gate_cannot_fall_back_to_invocation_counts() {
-    let mut policy = PromotionPolicy::conservative("v1", 0, 200);
+fn configured_task_outcome_gate_counts_only_qualified_distinct_turns() {
+    let mut policy = PromotionPolicy::conservative("v1", 50, 200);
     policy.min_verified_task_passes = Some(1);
     let candidate_id = "a".repeat(64);
+    let unrelated_id = "b".repeat(64);
     let mut promotion_context = context();
     promotion_context.candidate_id = candidate_id.clone();
     let candidate = calls(&candidate_id, 100, 0, 100);
@@ -156,56 +163,132 @@ fn configured_task_outcome_gate_cannot_fall_back_to_invocation_counts() {
     assert!(
         without_outcome
             .reasons
-            .contains(&"insufficient_verified_task_passes".to_string())
+            .iter()
+            .any(|reason| reason == "insufficient_verified_task_passes")
     );
 
-    let verified = TaskOutcomeEvidence {
-        turn_id: "candidate-turn-0".into(),
-        skill_ids: vec![candidate_id],
-        verify_passed: true,
-        attempt: 1,
-        source: TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
-        production: true,
-        evidence_complete: true,
-        created_at: 100,
-    };
-    let result = evaluate_promotion_with_task_outcomes(
-        &policy,
-        &promotion_context,
-        &candidate,
-        &predecessor,
-        &[verified],
-    )
-    .unwrap();
-    assert_eq!(result.decision, PromotionDecision::Promote);
-    assert_eq!(result.verified_task_passes, 1);
+    for (source, carries_verdict) in [
+        (
+            TaskOutcomeSource::VerifyCommand("0123456789abcdef".into()),
+            true,
+        ),
+        (TaskOutcomeSource::Oracle("task-oracle".into()), true),
+        (TaskOutcomeSource::NoVerifyCommand, false),
+        (TaskOutcomeSource::GateSkipped, false),
+    ] {
+        for (production, evidence_complete, created_at, skill_id, in_scope) in [
+            (true, true, 100, &candidate_id, true),
+            (false, true, 100, &candidate_id, false),
+            (true, false, 100, &candidate_id, false),
+            (true, true, 49, &candidate_id, false),
+            (true, true, 201, &candidate_id, false),
+            (true, true, 100, &unrelated_id, false),
+        ] {
+            let passed = TaskOutcomeEvidence {
+                turn_id: "candidate-turn-0".into(),
+                skill_ids: vec![skill_id.clone()],
+                verify_passed: true,
+                attempt: 1,
+                source: source.clone(),
+                production,
+                evidence_complete,
+                created_at,
+            };
+            let failed = TaskOutcomeEvidence {
+                turn_id: "candidate-turn-1".into(),
+                verify_passed: false,
+                ..passed.clone()
+            };
+            let result = evaluate_promotion_with_task_outcomes(
+                &policy,
+                &promotion_context,
+                &candidate,
+                &predecessor,
+                &[passed.clone(), failed.clone(), passed, failed],
+            )
+            .unwrap();
+            let qualifies = carries_verdict && in_scope;
+            let count = usize::from(qualifies);
+            assert_eq!(
+                (result.verified_task_passes, result.verified_task_failures),
+                (count, count),
+                "{source:?}, production={production}, complete={evidence_complete}, time={created_at}, skill={skill_id}"
+            );
+            assert_eq!(
+                result.decision,
+                if qualifies {
+                    PromotionDecision::Promote
+                } else {
+                    PromotionDecision::Hold
+                }
+            );
+            if !qualifies {
+                assert!(
+                    result
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "insufficient_verified_task_passes")
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn no_verify_command_is_auditable_but_never_counts_as_a_pass() {
+fn turn_latency_keeps_the_slowest_call_even_when_another_call_fails() {
     let mut policy = PromotionPolicy::conservative("v1", 0, 200);
-    policy.min_verified_task_passes = Some(1);
-    let candidate_id = "a".repeat(64);
-    let mut promotion_context = context();
-    promotion_context.candidate_id = candidate_id.clone();
-    let no_verify = TaskOutcomeEvidence {
-        turn_id: "candidate-turn-0".into(),
-        skill_ids: vec![candidate_id.clone()],
-        verify_passed: true,
-        attempt: 1,
-        source: TaskOutcomeSource::NoVerifyCommand,
-        production: true,
-        evidence_complete: true,
-        created_at: 100,
-    };
-    let result = evaluate_promotion_with_task_outcomes(
-        &policy,
-        &promotion_context,
-        &calls(&candidate_id, 100, 0, 100),
-        &calls("predecessor", 100, 0, 100),
-        &[no_verify],
-    )
-    .unwrap();
+    policy.absolute_p95_latency_us = 500;
+    let mut candidate = calls("candidate", 100, 0, 100);
+    for event in &mut candidate[..6] {
+        event.latency_us = 1_000;
+    }
+    let mut failed = candidate[0].clone();
+    failed.invocation_id = "fast-failure".into();
+    failed.outcome = DirectOutcome::Throw;
+    failed.latency_us = 1;
+    candidate.push(failed);
+    let predecessor = calls("predecessor", 100, 0, 100);
+    let result = evaluate_promotion(&policy, &context(), &candidate, &predecessor).unwrap();
+    assert_eq!(result.candidate.distinct_turns, 100);
+    assert_eq!(result.candidate.failures, 1);
+    assert_eq!(result.candidate.p95_latency_us, 1_000);
     assert_eq!(result.decision, PromotionDecision::Hold);
-    assert_eq!(result.verified_task_passes, 0);
+    for reason in [
+        "absolute_latency_budget_exceeded",
+        "relative_latency_budget_exceeded",
+    ] {
+        assert!(result.reasons.iter().any(|actual| actual == reason));
+    }
+    candidate.reverse();
+    candidate.extend(candidate.clone());
+    let replay = evaluate_promotion(&policy, &context(), &candidate, &predecessor).unwrap();
+    assert_eq!(replay.canonical_inputs, result.canonical_inputs);
+}
+
+#[test]
+fn task_outcome_source_tags_preserve_verifier_and_skip_identity() {
+    for (source, expected) in [
+        (
+            TaskOutcomeSource::VerifyCommand("hash".into()),
+            serde_json::json!({"kind":"verify_command","id":"hash"}),
+        ),
+        (
+            TaskOutcomeSource::Oracle("oracle".into()),
+            serde_json::json!({"kind":"oracle","id":"oracle"}),
+        ),
+        (
+            TaskOutcomeSource::NoVerifyCommand,
+            serde_json::json!({"kind":"no_verify_command"}),
+        ),
+        (
+            TaskOutcomeSource::GateSkipped,
+            serde_json::json!({"kind":"gate_skipped"}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&source).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<TaskOutcomeSource>(expected).unwrap(),
+            source
+        );
+    }
 }

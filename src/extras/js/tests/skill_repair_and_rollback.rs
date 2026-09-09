@@ -6,7 +6,8 @@ use crate::extras::js::skills::lifecycle::{
     EvidenceSnapshot, HumanApproval, LifecycleError, LifecycleService, LifecycleStatus,
     ReplacementTransitionRequest,
 };
-use crate::extras::js::skills::policy::PromotionPolicy;
+use crate::extras::js::skills::policy::{PromotionPolicy, TaskOutcomeEvidence, TaskOutcomeSource};
+use crate::extras::js::skills::telemetry::TelemetryDispatcher;
 use crate::extras::js::skills::{
     CapabilityManifest, SkillArtifact, SkillExport, store::SkillStore,
 };
@@ -114,14 +115,12 @@ fn insert_successful_invocations(store: &mut SkillStore, skill_id: &str, prefix:
 #[test]
 fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
     let (paths, mut store, predecessor, candidate) = fixture();
+    let mut policy = PromotionPolicy::conservative("v1", 0, 100);
+    policy.min_verified_task_passes = Some(1);
     {
         let mut service = LifecycleService::new(&mut store);
         service
-            .register_policy(
-                "v1",
-                &serde_json::to_string(&PromotionPolicy::conservative("v1", 0, 100)).unwrap(),
-                0,
-            )
+            .register_policy("v1", &serde_json::to_string(&policy).unwrap(), 0)
             .unwrap();
     }
     for (evidence_id, evidence_kind) in [
@@ -141,6 +140,37 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
     }
     insert_successful_invocations(&mut store, &candidate.id, 'a');
     insert_successful_invocations(&mut store, &predecessor.id, 'b');
+    let record_outcome = |turn: &str, evidence_complete| {
+        let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();
+        dispatcher
+            .record_task_outcome(TaskOutcomeEvidence {
+                turn_id: turn.into(),
+                skill_ids: vec![candidate.id.clone()],
+                verify_passed: true,
+                attempt: 1,
+                source: TaskOutcomeSource::VerifyCommand("1".repeat(64)),
+                production: true,
+                evidence_complete,
+                created_at: 0,
+            })
+            .unwrap();
+        drop(dispatcher);
+    };
+    record_outcome("promotion-a-0", false);
+    let complete: bool = store
+        .conn()
+        .query_row(
+            "SELECT outcome.evidence_complete FROM skill_task_outcomes AS outcome
+             JOIN skill_task_outcome_links AS link USING (evidence_id)
+             WHERE link.skill_id = ? AND outcome.turn_id = 'promotion-a-0'",
+            [&candidate.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !complete,
+        "the fixture must retain a linked incomplete outcome"
+    );
     {
         let mut service = LifecycleService::new(&mut store);
         let promote_request = request(&predecessor, &candidate);
@@ -151,6 +181,16 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
             service.promote_replacement(&forged_request, 1),
             Err(LifecycleError::UnknownEvidence)
         ));
+        let incomplete = service.promote_replacement(&promote_request, 1);
+        assert!(
+            matches!(
+                &incomplete,
+                Err(LifecycleError::PromotionHeld(reason))
+                    if reason.contains("insufficient_verified_task_passes")
+            ),
+            "{incomplete:?}"
+        );
+        record_outcome("promotion-a-1", true);
         let promoted = service.promote_replacement(&promote_request, 1).unwrap();
         assert_eq!(promoted.candidate_status, LifecycleStatus::Active);
         assert_eq!(promoted.predecessor_status, LifecycleStatus::Superseded);

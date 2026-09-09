@@ -1815,7 +1815,7 @@ fn read_task_outcomes(
     let mut statement = tx.prepare(
         "SELECT outcome.turn_id, outcome.verify_passed, outcome.attempt,
                 outcome.source_kind, outcome.source_id, outcome.production,
-                outcome.created_at
+                outcome.created_at, outcome.evidence_complete
          FROM skill_task_outcomes AS outcome
          JOIN skill_task_outcome_links AS link
            ON link.evidence_id = outcome.evidence_id
@@ -1842,7 +1842,7 @@ fn read_task_outcomes(
             })?,
             source,
             production: row.get(5)?,
-            evidence_complete: true,
+            evidence_complete: row.get(7)?,
             created_at: row.get(6)?,
         });
     }
