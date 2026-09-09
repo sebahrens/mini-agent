@@ -32,21 +32,26 @@ def run_worktree(repo: Path, operation: str, *arguments: str) -> subprocess.Comp
         raise WorktreeError(f"git worktree {operation} could not complete: {error}") from error
 
 
+def remove_tree(path: Path) -> None:
+    """Remove an owned entry without following root links; report incomplete removal."""
+    try:
+        if stat.S_ISDIR(path.lstat().st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    if os.path.lexists(path):
+        raise OSError(f"directory entry remains after removal: {path}")
+
+
 def remove_workspace(repo: Path, workspace: Path) -> None:
     """Remove filesystem entries without following links, then clean registration."""
     try:
         # Canonicalize the parent only. Resolving a replaced root itself
         # would redirect cleanup to its symlink target.
         workspace = workspace.parent.resolve() / workspace.name
-        try:
-            if stat.S_ISDIR(workspace.lstat().st_mode):
-                shutil.rmtree(workspace)
-            else:
-                workspace.unlink()
-        except FileNotFoundError:
-            pass
-        if os.path.lexists(workspace):
-            raise OSError(f"workspace remains after removal: {workspace}")
+        remove_tree(workspace)
     except OSError as error:
         # Do not prune registration while filesystem cleanup is incomplete.
         raise WorktreeError(f"workspace filesystem cleanup failed: {error}") from error

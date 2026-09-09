@@ -588,6 +588,98 @@ class GymFileOracleTests(unittest.TestCase):
 
 
 class GymTrainerTests(unittest.TestCase):
+    def test_apppaths_setup_requires_a_fresh_root(self) -> None:
+        for case in ["symlink", "file", "protected"]:
+            if case == "protected" and os.geteuid() == 0:
+                continue
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                binary, log = make_stub(root, "success")
+                owned = root / "gym/runs/fix-none"
+                owned.parent.mkdir(parents=True)
+                outside = root / "outside"
+                (outside / "config").mkdir(parents=True)
+                sentinel = outside / "config/config.toml"
+                sentinel.write_text("sentinel = true\n")
+                protected = owned / "local/retained"
+                if case == "symlink":
+                    owned.symlink_to(outside, target_is_directory=True)
+                elif case == "file":
+                    owned.write_text("stale entry")
+                else:
+                    protected.mkdir(parents=True)
+                    (protected / "stale").write_text("prior episode")
+                    protected.chmod(0o500)
+                try:
+                    completed, rows, _ = run_training(
+                        root, repo, binary, task_document([{"name": "fix"}]), "--keep-run-dirs"
+                    )
+                    self.assertEqual(sentinel.read_text(), "sentinel = true\n")
+                    if case == "protected":
+                        self.assertEqual(completed.returncode, 2, completed.stderr)
+                        self.assertIn("AppPaths", completed.stderr)
+                        self.assertEqual(rows, [])
+                        self.assertFalse(log.exists(), "stale state must not reach the agent")
+                        self.assertEqual((protected / "stale").read_text(), "prior episode")
+                    else:
+                        self.assertEqual(completed.returncode, 0, completed.stderr)
+                        self.assertEqual(len(rows), 2)
+                        self.assertTrue(all(row["success"] for row in rows), rows)
+                        self.assertFalse(owned.is_symlink())
+                        self.assertTrue((owned / "config/config.toml").is_file())
+                finally:
+                    if case == "protected":
+                        protected.chmod(0o700)
+
+    def test_apppaths_cleanup_reports_failures_and_runs_after_worktree_errors(self) -> None:
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        for case in ["filesystem", "worktree", "both", "keep"]:
+            if case in ("filesystem", "both") and os.geteuid() == 0:
+                continue
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = make_repo(root)
+                binary, log = make_stub(root, "success")
+                marker = root / "agent-ran"
+                suffix = "\ntouch " + shlex.quote(str(marker)) + "\n"
+                if case in ("filesystem", "both"):
+                    suffix += ('mkdir -p "$ZS_LOCAL_DATA_DIR/retained"\n'
+                               'printf stale > "$ZS_LOCAL_DATA_DIR/retained/stale"\n'
+                               'chmod 500 "$ZS_LOCAL_DATA_DIR/retained"\n')
+                binary.write_text(binary.read_text().replace("printf 'fixed\\n' > fixed.txt", suffix + "printf 'fixed\\n' > fixed.txt"))
+                shim_dir = root / "bin"
+                shim_dir.mkdir()
+                shim = shim_dir / "git"
+                shim.write_text(
+                    "#!/bin/sh\n"
+                    f"if test -f {shlex.quote(str(marker))} && test \"$1 $2\" = 'worktree prune'; then\n"
+                    " echo 'fixture prune failure' >&2; exit 7\nfi\n"
+                    f"exec {shlex.quote(real_git)} \"$@\"\n"
+                )
+                shim.chmod(0o755)
+                extra = ("--keep-run-dirs",) if case == "keep" else ()
+                try:
+                    with mock.patch.dict(os.environ, {"PATH": (str(shim_dir) + os.pathsep if case != "filesystem" else "")
+                                                     + os.environ.get("PATH", "")}):
+                        completed, rows, gym = run_training(root, repo, binary, task_document([{"name": "fix"}]), *extra)
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertEqual(rows, [], "cleanup failure cannot publish a successful episode")
+                    self.assertTrue(log.exists(), "failure must happen after agent execution")
+                    if case != "filesystem":
+                        self.assertIn("fixture prune failure", completed.stderr)
+                    owned = gym / "runs/fix-none"
+                    if case in ("filesystem", "both"):
+                        self.assertIn("AppPaths", completed.stderr)
+                        self.assertEqual((owned / "local/retained/stale").read_text(), "stale")
+                    else:
+                        self.assertEqual(owned.exists(), case == "keep")
+                    self.assertEqual(len(git(repo, "worktree", "list").splitlines()), 1)
+                finally:
+                    for protected in (root / "gym/runs").glob("*/local/retained"):
+                        protected.chmod(0o700)
+
     def test_successful_run_records_rows_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

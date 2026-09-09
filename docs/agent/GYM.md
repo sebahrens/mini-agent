@@ -167,7 +167,9 @@ For each task and each arm the runner:
    checkout and its registration are removed before creating an empty directory and applying the
    task's initial files. If cleanup leaves the destination behind, the episode fails. A timed-out
    setup fails the episode even when the empty-workspace fallback is enabled;
-2. builds a fresh AppPaths tree under `<gym root>/runs/` and a curated environment (below);
+2. requires successful removal of any prior AppPaths entry under `<gym root>/runs/`,
+   creates the episode root exclusively, and builds a fresh AppPaths tree and curated
+   environment (below). Root symlinks are unlinked without modifying their targets;
 3. for the `library` arm, installs the library from a neutral directory, approves and activates only
    the **lineage-root** proposals (`predecessor_id IS NULL`), and fails the episode unless at least
    one revision ends up `active`. The runner reads `skills.db` directly with read-only SQLite to
@@ -208,6 +210,12 @@ timeouts and launch failures are separate from oracle verdicts: training records
 before launching the agent, and mining skips the candidate. A cleanup command timeout, launch
 failure, filesystem cleanup failure, or nonzero prune exit stops training with a runner error and makes mining skip the
 candidate. These command bounds do not establish complete descendant ownership.
+
+The trainer attempts both worktree and AppPaths cleanup even when either fails and reports
+all cleanup errors as a runner failure. Incomplete AppPaths removal prevents the next episode
+from reusing stale state. `--keep-run-dirs` preserves the current episode's AppPaths for debugging;
+it does not allow a later episode to reuse that state. The shared filesystem removal helper in
+`worktrees.py` handles both owned directory trees and replaced root entries.
 
 Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
 finished.

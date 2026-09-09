@@ -27,10 +27,10 @@ from pathlib import Path
 
 if __package__:
     from .process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
-    from .worktrees import WorktreeError, remove_workspace, run_worktree
+    from .worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 else:
     from process_capture import OUTPUT_TAIL_BYTES, run_bounded as run
-    from worktrees import WorktreeError, remove_workspace, run_worktree
+    from worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
 ARMS = ("none", "library")
@@ -408,6 +408,22 @@ def permission_mode(agent_args: list[str]) -> str:
     return "yolo" if "--yolo" in agent_args else "standard"
 
 
+def cleanup_episode(repo: Path, workspace: Path, root: Path, keep_run_dirs: bool) -> None:
+    """Attempt both independent cleanups, retaining all filesystem/admin failures."""
+    errors: list[OSError] = []
+    try:
+        remove_workspace(repo, workspace)
+    except OSError as error:
+        errors.append(error)
+    if not keep_run_dirs:
+        try:
+            remove_tree(root)
+        except OSError as error:
+            errors.append(OSError(f"AppPaths cleanup failed: {error}"))
+    if errors:
+        raise OSError("; ".join(str(error) for error in errors)) from errors[0]
+
+
 def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, repo: Path, gym_root: Path) -> dict[str, object]:
     name = str(task["name"])
     budgets = dict(task["budgets"])  # type: ignore[arg-type]
@@ -444,8 +460,10 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
     }
     workspace = gym_root / "worktrees" / slug
     root = gym_root / "runs" / slug
-    shutil.rmtree(root, ignore_errors=True)
-    remove_workspace(repo, workspace)
+    cleanup_episode(repo, workspace, root, keep_run_dirs=False)
+    # Refuse reuse if another entry appears after cleanup. Child directories
+    # may use exist_ok only once this episode owns a freshly created root.
+    root.mkdir(parents=True)
     started = time.monotonic()
     oracle_ms = 0
     try:
@@ -487,9 +505,7 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
         record["failure_reason"] = failure.reason
         record["failure_detail"] = failure.detail
     finally:
-        remove_workspace(repo, workspace)
-        if not args.keep_run_dirs:
-            shutil.rmtree(root, ignore_errors=True)
+        cleanup_episode(repo, workspace, root, args.keep_run_dirs)
         record["oracle_ms"] = oracle_ms
         # Everything the episode cost, so the library arm's seed-import and
         # workspace setup overhead stays visible instead of hiding inside the
