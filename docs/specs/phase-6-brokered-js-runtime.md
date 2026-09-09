@@ -208,6 +208,10 @@ retryable admission-infrastructure failure and cannot produce an admission succe
 The parent scheduler, its blocking cancellation wakeups, and its submission APIs compile with
 `skills` or in transport tests. Plain-JS production builds omit that unused scheduling surface;
 the worker wire protocol and verification-result validation remain intact in every JS build.
+Skill-only parent grant principals, proposal audit targets, and scoped-manifest construction
+errors follow their feature consumers. Generic broker tests retain manufactured skill principals
+and proposal targets to exercise attribution and writer denials without requiring the skills
+feature. Wire enums, serialized audit kinds, and closed error codes remain available in every JS build.
 
 All full-agent rebuilds in the parent obtain this same lazy, authority-free supervisor. A rebuild
 snapshots its own permission bridge, file/fetch policy, selected skill artifacts, invocation IDs,

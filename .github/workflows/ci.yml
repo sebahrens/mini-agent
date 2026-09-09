@@ -247,13 +247,18 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Run Clippy (${{ matrix.features }})
-        # Removal is tracked by mini-agent-66u0. Feature-isolated builds still
+        # Default is strict, including dead code. Feature-isolated builds still
         # compile APIs used only by other supported rows, and some learned-skill
         # library contracts intentionally have no shipped operator yet. Gate
         # each actual consumer; retain documented contract APIs deliberately.
         # A clean rich row does not establish that the isolated rows are clean.
-        # Remove this exception only after every listed row passes without it.
-        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings -A dead-code
+        # Remove their exception under mini-agent-66u0 as each becomes clean.
+        run: |
+          lint_args=(-D warnings)
+          if [[ -n "${{ matrix.features }}" ]]; then
+            lint_args+=(-A dead-code)
+          fi
+          cargo clippy --locked --all-targets ${{ matrix.features }} -- "${lint_args[@]}"
 
   test:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

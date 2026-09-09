@@ -10,7 +10,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import shlex
 from pathlib import Path
+
+from scripts import check_feature_graph
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -265,10 +268,35 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                 self.assertIn("rustflags: ''", install)
 
         self.assertNotIn("rustflags: ''", job_body(self.workflow, "clippy"))
-        self.assertIn(
-            "-- -D warnings -A dead-code",
-            job_body(self.workflow, "clippy"),
-        )
+        commands = check_feature_graph._workflow_run_commands(self.workflow, "clippy")
+        command = next(command for command in commands if "cargo clippy" in command)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorded = root / "arguments.json"
+            cargo = root / "cargo"
+            cargo.write_text(
+                f"#!{sys.executable}\n"
+                "import json,os,sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['CARGO_TRACE']).write_text(json.dumps(sys.argv[1:]))\n"
+                "sys.exit(int(os.environ['CARGO_STUB_EXIT']))\n"
+            )
+            cargo.chmod(0o755)
+            for features in check_feature_graph.workflow_matrix_values(self.workflow, "clippy"):
+                for exit_code in (0, 7):
+                    with self.subTest(features=features, exit_code=exit_code):
+                        result = subprocess.run(
+                            ["bash", "-e", "-o", "pipefail", "-c",
+                             command.replace("${{ matrix.features }}", features)],
+                            env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                 "CARGO_TRACE": str(recorded), "CARGO_STUB_EXIT": str(exit_code)},
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        self.assertEqual(result.returncode, exit_code, result.stderr)
+                        expected = ["clippy", "--locked", "--all-targets", *shlex.split(features), "--", "-D", "warnings"]
+                        if features:
+                            expected += ["-A", "dead-code"]
+                        self.assertEqual(json.loads(recorded.read_text()), expected)
 
     def test_phase6_adversarial_suites_use_isolated_serialized_processes(self) -> None:
         for job in (

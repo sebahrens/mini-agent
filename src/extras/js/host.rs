@@ -23,11 +23,13 @@ use unicode_normalization::UnicodeNormalization;
 use crate::agent::tools::find_files::BoundDirectory;
 use crate::agent::tools::grep::{GrepTool, truncate_output_line};
 
+#[cfg(any(test, feature = "skills"))]
+use crate::extras::js::broker::GrantPrincipal;
 use crate::extras::js::broker::{
     AuthorizedEffect, AuthorizedTarget, ExecutablePreparationControl,
-    ExecutablePreparationWaitError, GrantPrincipal, HostEffectError, NormalizedTarget,
-    ParentEffectFuture, ParentEffectService, SpawnExecutableIdentity,
-    resolve_program_identity_controlled, run_executable_preparation,
+    ExecutablePreparationWaitError, HostEffectError, NormalizedTarget, ParentEffectFuture,
+    ParentEffectService, SpawnExecutableIdentity, resolve_program_identity_controlled,
+    run_executable_preparation,
 };
 #[cfg(target_os = "linux")]
 use crate::extras::js::broker::{ExecutableCopyError, copy_and_hash_executable_controlled};
@@ -3969,7 +3971,7 @@ impl ParentEffectService for ParentHostEffectService {
 
     fn ensure_backend(
         &mut self,
-        authorized: &AuthorizedEffect,
+        _authorized: &AuthorizedEffect,
         operation: &EffectOperation,
     ) -> Result<(), HostEffectError> {
         match operation {
@@ -3980,9 +3982,14 @@ impl ParentEffectService for ParentHostEffectService {
             #[cfg(not(feature = "sandbox"))]
             EffectOperation::Fetch { .. } => Err(HostEffectError::BackendFailure),
             EffectOperation::Spawn { .. }
-                if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable
-                    || (matches!(authorized.principal(), GrantPrincipal::Skill { .. })
-                        && !self.spawn.sandbox.supports_immutable_executable_snapshot()) =>
+                if self.spawn.sandbox.policy() == SandboxPolicy::RequiredButUnavailable =>
+            {
+                Err(HostEffectError::BackendFailure)
+            }
+            #[cfg(any(test, feature = "skills"))]
+            EffectOperation::Spawn { .. }
+                if matches!(_authorized.principal(), GrantPrincipal::Skill { .. })
+                    && !self.spawn.sandbox.supports_immutable_executable_snapshot() =>
             {
                 Err(HostEffectError::BackendFailure)
             }

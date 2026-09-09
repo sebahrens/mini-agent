@@ -220,6 +220,7 @@ impl SanitizedTarget {
         }
     }
 
+    #[cfg(any(test, feature = "skills"))]
     const fn proposal() -> Self {
         Self {
             kind: SanitizedTargetKind::Proposal,
@@ -722,6 +723,7 @@ impl EffectAudit {
         SanitizedTarget::session_state(&self.target_key, operation, key, encoded_bytes)
     }
 
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) const fn proposal_target(&self) -> SanitizedTarget {
         SanitizedTarget::proposal()
     }

@@ -30,13 +30,13 @@ class FeatureGraphTests(unittest.TestCase):
     MATRIX_INTERPOLATION = "${{ matrix.features }}"
 
     def cargo_command_line(self, subcommand: str) -> str:
-        """Return the checked-in single-line run command that consumes the matrix.
+        """Return the Cargo command line that consumes the matrix.
 
         The exact Cargo flags around the interpolation change over time, so tests
         locate the line by its subcommand instead of hard-coding the flag list.
         """
         pattern = re.compile(
-            rf"^ *run: cargo {re.escape(subcommand)} --locked\b[^\n]*"
+            rf"^ *(?:run: )?cargo {re.escape(subcommand)} --locked\b[^\n]*"
             rf"{re.escape(self.MATRIX_INTERPOLATION)}[^\n]*$",
             re.MULTILINE,
         )
@@ -44,7 +44,7 @@ class FeatureGraphTests(unittest.TestCase):
         self.assertEqual(
             1,
             len(matches),
-            f"expected exactly one single-line cargo {subcommand} matrix command",
+            f"expected exactly one cargo {subcommand} matrix command line",
         )
         return matches[0]
 

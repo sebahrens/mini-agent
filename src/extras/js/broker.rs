@@ -96,6 +96,7 @@ pub(crate) enum GrantPrincipal {
     ModelAuthored {
         tool_call_id: String,
     },
+    #[cfg(any(test, feature = "skills"))]
     Skill {
         artifact_id: String,
         export: String,
@@ -732,6 +733,7 @@ pub(crate) enum HostEffectError {
     #[error("invocation grant denies the operation")]
     CapabilityDenied,
     #[error("skill manifest denies the operation target")]
+    #[cfg(feature = "skills")]
     ManifestDenied,
     #[error("operation target is invalid")]
     InvalidTarget,
@@ -770,7 +772,9 @@ impl HostEffectError {
             Self::BackendFailure => EffectErrorCode::BackendFailure,
             Self::AuditFailure => EffectErrorCode::AuditFailure,
             Self::OutcomeUnknown => EffectErrorCode::OutcomeUnknown,
-            Self::CapabilityDenied | Self::ManifestDenied => EffectErrorCode::CapabilityDenied,
+            Self::CapabilityDenied => EffectErrorCode::CapabilityDenied,
+            #[cfg(feature = "skills")]
+            Self::ManifestDenied => EffectErrorCode::CapabilityDenied,
             Self::UnknownGrant
             | Self::ReplayedGrant
             | Self::ExpiredGrant
@@ -856,6 +860,7 @@ pub(crate) enum AuthorizedTarget {
         key: Option<String>,
         encoded_bytes: usize,
     },
+    #[cfg(any(test, feature = "skills"))]
     ProposeSkill,
 }
 
@@ -880,6 +885,7 @@ pub(crate) enum NormalizedTarget {
         resolved_executable: SpawnExecutableIdentity,
     },
     SessionState,
+    #[cfg(any(test, feature = "skills"))]
     ProposeSkill,
 }
 
@@ -894,6 +900,7 @@ impl AuthorizedEffect {
         &self.grant_id
     }
 
+    #[cfg(any(test, feature = "skills"))]
     pub(crate) fn principal(&self) -> &GrantPrincipal {
         &self.principal
     }
@@ -968,16 +975,22 @@ pub(crate) enum BrokerBuildError {
     #[error("duplicate invocation grant")]
     DuplicateGrant,
     #[error("scoped grant principal is not a learned skill")]
+    #[cfg(feature = "skills")]
     InvalidScopedPrincipal,
     #[error("scoped grant manifest is invalid")]
+    #[cfg(feature = "skills")]
     InvalidManifest,
     #[error("scoped grant manifest names an unavailable executable")]
+    #[cfg(feature = "skills")]
     UnavailableManifestProgram,
     #[error("scoped grant construction was cancelled")]
+    #[cfg(feature = "skills")]
     Cancelled,
     #[error("scoped grant construction exceeded its deadline")]
+    #[cfg(feature = "skills")]
     TimedOut,
     #[error("scoped grant executable preparation worker failed")]
+    #[cfg(feature = "skills")]
     ExecutablePreparationFailed,
     #[cfg(feature = "skills")]
     #[error("persisted skill call authority is invalid")]
@@ -1318,11 +1331,14 @@ impl<S: ParentEffectService> InvocationBroker<S> {
         if !attribution_matches(&grant.principal, &request.advisory) {
             return Err(HostEffectError::AttributionMismatch);
         }
-        if !grant.allowed.contains(&capability)
-            || (matches!(
-                capability,
-                HostCapability::ProposeSkill | HostCapability::SessionState
-            ) && matches!(grant.principal, GrantPrincipal::Skill { .. }))
+        if !grant.allowed.contains(&capability) {
+            return Err(HostEffectError::CapabilityDenied);
+        }
+        #[cfg(any(test, feature = "skills"))]
+        if matches!(
+            capability,
+            HostCapability::ProposeSkill | HostCapability::SessionState
+        ) && matches!(grant.principal, GrantPrincipal::Skill { .. })
         {
             return Err(HostEffectError::CapabilityDenied);
         }
@@ -1526,6 +1542,7 @@ impl<S: ParentEffectService> InvocationBroker<S> {
 fn audit_identity(principal: &GrantPrincipal) -> (Option<String>, Option<String>) {
     match principal {
         GrantPrincipal::ModelAuthored { .. } => (None, None),
+        #[cfg(any(test, feature = "skills"))]
         GrantPrincipal::Skill {
             artifact_id,
             export,
@@ -1875,6 +1892,7 @@ fn sanitize_target(
                 resolved_executable,
             },
         ) => Ok(audit.spawn_target(&resolved_executable)),
+        #[cfg(any(test, feature = "skills"))]
         (HostCapability::ProposeSkill, AuthorizedTarget::ProposeSkill) => {
             Ok(audit.proposal_target())
         }
@@ -2017,6 +2035,7 @@ fn attribution_matches(principal: &GrantPrincipal, advisory: &AdvisoryAttributio
         GrantPrincipal::ModelAuthored { .. } => {
             advisory.artifact_id.is_none() && advisory.export.is_none()
         }
+        #[cfg(any(test, feature = "skills"))]
         GrantPrincipal::Skill {
             artifact_id,
             export,

@@ -748,6 +748,7 @@ pub(crate) enum ProposalStatus {
     Approved,
 }
 
+#[cfg(feature = "skills")]
 impl ProposalStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
