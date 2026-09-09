@@ -807,6 +807,13 @@ impl BlockingTestRelease {
     }
 }
 
+#[cfg(test)]
+impl Drop for BlockingTestRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl Drop for AgentWorkGuard {
     fn drop(&mut self) {
         if self.scope.active_children.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -5216,6 +5223,50 @@ mod tests {
         })
         .await
         .expect("the event channel should close after blocking tool work is reaped");
+    }
+
+    #[tokio::test]
+    async fn blocking_test_gate_releases_its_worker_during_unwinding() {
+        let (scope, started, release) = super::AgentWorkScope::new_with_blocking_test_gate();
+        // Explicit rescue keeps the negative control bounded even without Drop.
+        let rescue = super::BlockingTestRelease(std::sync::Arc::clone(&release.0));
+        let mut worker = None;
+        scope
+            .run(async { worker = Some(super::spawn_blocking_scoped(|| 42)) })
+            .await;
+        let mut worker = worker.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if started.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _release = release;
+            panic!("fixture assertion failed");
+        });
+        assert!(unwound.is_err());
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await;
+        rescue.release();
+        let released_on_unwind = match finished {
+            Ok(result) => {
+                assert_eq!(result.unwrap(), 42);
+                true
+            }
+            Err(_) => {
+                assert_eq!(worker.await.unwrap(), 42);
+                false
+            }
+        };
+        scope.wait_idle().await;
+        assert!(
+            released_on_unwind,
+            "unwinding left the native worker blocked"
+        );
     }
 
     #[cfg(all(feature = "hooks", unix))]
