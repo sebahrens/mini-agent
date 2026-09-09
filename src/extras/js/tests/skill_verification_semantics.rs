@@ -73,7 +73,7 @@ mod tests {
             ("null", "null", TestResult::ReturnedFalse),
             (
                 "exception",
-                "(() => { throw new Error('must stay private'); })()",
+                "(() => { throw new Error('out of memory: must stay private'); })()",
                 TestResult::Threw("Exception/Evaluation/EmbeddedTest".into()),
             ),
         ] {
@@ -94,6 +94,40 @@ mod tests {
                 }
                 result => panic!("{name}: expected a test rejection, got {result:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn verifier_heap_and_stack_bounds_report_resource_limits() {
+        for (name, expression) in [
+            (
+                "retained_heap",
+                "globalThis.chunks = []; while (true) { globalThis.chunks.push(new ArrayBuffer(1024 * 1024)); }",
+            ),
+            (
+                "heap",
+                "(() => { const chunks = []; while (true) { chunks.push(new ArrayBuffer(1024 * 1024)); } })()",
+            ),
+            (
+                "stack",
+                "(() => { function recurse() { return recurse(); } return recurse(); })()",
+            ),
+        ] {
+            let script = format!("test(); {expression}");
+            let artifact = skill(
+                "function test() { return true; }",
+                vec![&script],
+                vec![("test", "(): boolean")],
+                CapabilityTier::Pure,
+                vec![],
+            );
+            let error = verify_skill(&artifact).expect_err(name);
+            assert!(error.is_resource_limit(), "{name}: {error:?}");
+            assert_eq!(
+                error.to_string(),
+                "test at index 0 failed: ResourceLimit",
+                "{name}"
+            );
         }
     }
 
