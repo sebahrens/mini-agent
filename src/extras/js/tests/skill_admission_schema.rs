@@ -188,6 +188,7 @@ fn skill_admission_schema_v6_backfills_v5_awaiting_approval_report_binding() {
             [&artifact.id],
         )
         .unwrap();
+    super::skill_store_schema::remove_turn_loss_schema_for_legacy_fixture(&store).unwrap();
     store
         .conn_mut()
         .execute_batch(
@@ -276,6 +277,7 @@ fn skill_admission_schema_v6_backfills_v5_root_canary_and_can_activate() {
             [],
         )
         .unwrap();
+    super::skill_store_schema::remove_turn_loss_schema_for_legacy_fixture(&store).unwrap();
     store
         .conn_mut()
         .execute_batch(
@@ -349,6 +351,7 @@ fn skill_admission_schema_v6_quarantines_v5_root_canary_without_first_approval()
             rusqlite::params![artifact.id, "a".repeat(64)],
         )
         .unwrap();
+    super::skill_store_schema::remove_turn_loss_schema_for_legacy_fixture(&store).unwrap();
     store
         .conn_mut()
         .execute_batch(
@@ -438,6 +441,7 @@ fn skill_admission_schema_v6_quarantines_v5_root_canary_with_unapproved_proposal
             rusqlite::params![artifact.id, evaluation.report_id],
         )
         .unwrap();
+    super::skill_store_schema::remove_turn_loss_schema_for_legacy_fixture(&store).unwrap();
     store
         .conn_mut()
         .execute_batch(
@@ -542,7 +546,9 @@ fn skill_admission_schema_upgrades_legacy_phase4_v2_collision() {
 #[test]
 fn skill_admission_schema_quarantines_all_identity_v1_tiers_without_inference() {
     let (root, paths) = paths();
-    drop(SkillStore::open_at(&paths).expect("create current schema"));
+    let store = SkillStore::open_at(&paths).expect("create current schema");
+    super::skill_store_schema::remove_turn_loss_schema_for_legacy_fixture(&store).unwrap();
+    drop(store);
     let database = paths.local_data_dir.join("skills/skills.db");
     let connection = Connection::open(&database).expect("open fixture database");
     connection

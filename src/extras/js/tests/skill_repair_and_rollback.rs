@@ -243,6 +243,110 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
 }
 
 #[test]
+fn invocation_promotion_excludes_a_turn_after_async_ingestion_failure() {
+    use crate::extras::js::skills::telemetry::{
+        EventBatch, SkillEvent, SkillEventKind, TelemetryIngestor,
+        behavioral_window_counts_for_test,
+    };
+    let (paths, mut store, predecessor, candidate) = fixture();
+    let now = 2_000_000_000;
+    let policy = PromotionPolicy::conservative("v1", now, now + 100);
+    LifecycleService::new(&mut store)
+        .register_policy("v1", &serde_json::to_string(&policy).unwrap(), now)
+        .unwrap();
+    store
+        .conn()
+        .execute(
+            "INSERT INTO skill_evidence (evidence_id, skill_id, evidence_kind, payload_json,
+         policy_version, created_at) VALUES ('promotion-evidence', ?, 'qualified', '{}', 'v1', ?)",
+            rusqlite::params![candidate.id, now],
+        )
+        .unwrap();
+    insert_successful_invocations(&mut store, &candidate.id, 'a');
+    insert_successful_invocations(&mut store, &predecessor.id, 'b');
+    store
+        .conn()
+        .execute("UPDATE skill_events SET created_at = ?", [now])
+        .unwrap();
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_selected BEFORE INSERT ON skill_events
+         WHEN NEW.event_kind = 'selected'
+         BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        )
+        .unwrap();
+    let original = SkillEvent {
+        invocation_id: Some(format!("a{:063x}", 0)),
+        skill_id: candidate.id.clone(),
+        turn_id: "promotion-a-0".into(),
+        tool_call_id: None,
+        kind: SkillEventKind::Invoked,
+        export_name: Some("run".into()),
+        outcome: None,
+        latency_us: None,
+        retrieval_score: None,
+        retrieval_rank: None,
+        query_fingerprint: None,
+        index_generation: 0,
+        evidence_complete: true,
+        production: true,
+        argument_shape: None,
+        created_at: now,
+    };
+    let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();
+    let failed = SkillEvent {
+        kind: SkillEventKind::Selected,
+        ..original.clone()
+    };
+    dispatcher
+        .try_dispatch(EventBatch::new(vec![failed]).unwrap())
+        .unwrap();
+    let probe = dispatcher.shutdown_probe_for_test();
+    drop(dispatcher);
+    assert_eq!(probe().1, 1);
+    // Reopening must preserve the loss without changing the original event's
+    // idempotent replay or requiring a task outcome to have been recorded.
+    drop(store);
+    let mut store = SkillStore::open_at(&paths).unwrap();
+    let replay = TelemetryIngestor::new(&mut store)
+        .ingest(&EventBatch::new(vec![original.clone()]).unwrap())
+        .unwrap();
+    assert_eq!((replay.inserted, replay.replayed), (0, 1));
+    let counts = behavioral_window_counts_for_test(&store, &candidate.id, now + 1).unwrap();
+    let held = LifecycleService::new(&mut store)
+        .promote_replacement(&request(&predecessor, &candidate), now + 1);
+    assert!(
+        matches!(&held, Err(LifecycleError::PromotionHeld(reason))
+        if reason.contains("insufficient_distinct_turns")),
+        "{held:?}; behavioral counts {counts:?}"
+    );
+    assert_eq!(counts, (24, 0));
+    let fresh = SkillEvent {
+        invocation_id: Some(format!("a{:063x}", 25)),
+        turn_id: "promotion-a-25".into(),
+        ..original
+    };
+    let returned = SkillEvent {
+        kind: SkillEventKind::Returned,
+        latency_us: Some(100),
+        ..fresh.clone()
+    };
+    TelemetryIngestor::new(&mut store)
+        .ingest(&EventBatch::new(vec![fresh, returned]).unwrap())
+        .unwrap();
+    assert_eq!(
+        behavioral_window_counts_for_test(&store, &candidate.id, now + 1).unwrap(),
+        (25, 0)
+    );
+    LifecycleService::new(&mut store)
+        .promote_replacement(&request(&predecessor, &candidate), now + 1)
+        .unwrap();
+    drop(store);
+    std::fs::remove_dir_all(paths.data_dir).unwrap();
+}
+
+#[test]
 fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
     let (paths, store, predecessor, candidate) = fixture();
     let embedder = std::sync::Arc::new(Embedder::new().unwrap());

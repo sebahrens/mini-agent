@@ -293,7 +293,17 @@ quarantine evidence. The asynchronous ingestion worker tracks incomplete turns i
 of the parent's enqueue-time snapshot. A failed event write invalidates earlier task outcomes
 for that turn and marks subsequent outcomes and retries incomplete, without excluding healthy
 turns elsewhere in the session. This also keeps missing invocation links from being interpreted
-as a verified no-library baseline.
+as a verified no-library baseline. Schema 15 persists these signals in `skill_turn_losses`,
+keyed by turn and production context, so invocation promotion and behavioral windows also
+exclude the entire incomplete turn after a restart. Original event rows remain immutable and
+exact retries still match. Explicit incomplete events and outcomes record the same loss;
+migration backfills existing incomplete rows and `observability_lost` events. Complete direct
+safety faults retain their immediate-quarantine path.
+
+Loss records contain only turn ID, production context, and last loss time. Raw-event compaction
+removes an aged loss record only when no event or task outcome still references its turn.
+Privacy purge removes losses owned exclusively by the purged revision and retains shared-turn
+losses needed to keep surviving evidence excluded.
 
 The brokered effect audit is separate from skill evidence. If an approved effect may have happened
 but cannot be classified after cancellation, deadline, or transport failure, the audit records
@@ -656,9 +666,9 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
    `MINI_AGENT_GYM=1` can only downgrade it. Gym and deterministic-evaluation evidence is therefore
    retained for analysis but cannot qualify for production promotion, and neither
    `no_verify_command` nor `gate_skipped` can become a pass or a failure. (The current store schema
-   is version 14; migration 11 → 12 widened the deferred proposal reason-code CHECK, 12 → 13
+   is version 15; migration 11 → 12 widened the deferred proposal reason-code CHECK, 12 → 13
    widened the task-outcome source CHECK to admit `gate_skipped`, and 13 → 14 added task-outcome
-   completeness.)
+   completeness; 14 → 15 added durable turn-loss records and indexed turn lookups.)
 2. **Promotion gate.** When a policy version sets `min_verified_task_passes`, promotion counts
    distinct production turns in the window where the candidate was actually invoked, task
    evidence is complete, and a real verifier/oracle passed. Durable promotion loading preserves

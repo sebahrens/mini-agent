@@ -313,6 +313,18 @@ impl<'a> RetentionService<'a> {
             )?;
             tx.execute("DELETE FROM skill_events WHERE event_id <= ?", [through])?;
         }
+        // Loss summaries outlive raw rows while any task evidence still
+        // depends on them. Only aged, unreferenced turns can be forgotten.
+        tx.execute(
+            "DELETE FROM skill_turn_losses WHERE created_at < ?1
+             AND NOT EXISTS (SELECT 1 FROM skill_events AS event
+                 WHERE event.turn_id = skill_turn_losses.turn_id
+                   AND event.production = skill_turn_losses.production)
+             AND NOT EXISTS (SELECT 1 FROM skill_task_outcomes AS outcome
+                 WHERE outcome.turn_id = skill_turn_losses.turn_id
+                   AND outcome.production = skill_turn_losses.production)",
+            [cutoff],
+        )?;
         tx.commit()?;
         Ok(CompactionReport {
             compacted_events: count,
@@ -415,6 +427,32 @@ impl<'a> RetentionService<'a> {
         tx.execute(
             "UPDATE skill_proposals SET predecessor_id = NULL
              WHERE predecessor_id = ?",
+            [skill_id],
+        )?;
+        // Remove loss metadata owned only by the revision being purged.
+        // Keep a turn's loss if any event or task outcome will survive below.
+        tx.execute(
+            "DELETE FROM skill_turn_losses
+             WHERE (EXISTS (SELECT 1 FROM skill_events AS owned
+                        WHERE owned.skill_id = ?1
+                          AND owned.turn_id = skill_turn_losses.turn_id
+                          AND owned.production = skill_turn_losses.production)
+                 OR EXISTS (SELECT 1 FROM skill_task_outcomes AS outcome
+                        JOIN skill_task_outcome_links AS owned USING (evidence_id)
+                        WHERE owned.skill_id = ?1
+                          AND outcome.turn_id = skill_turn_losses.turn_id
+                          AND outcome.production = skill_turn_losses.production))
+               AND NOT EXISTS (SELECT 1 FROM skill_events AS other
+                        WHERE other.skill_id <> ?1
+                          AND other.turn_id = skill_turn_losses.turn_id
+                          AND other.production = skill_turn_losses.production)
+               AND NOT EXISTS (SELECT 1 FROM skill_task_outcomes AS outcome
+                        WHERE outcome.turn_id = skill_turn_losses.turn_id
+                          AND outcome.production = skill_turn_losses.production
+                          AND (NOT EXISTS (SELECT 1 FROM skill_task_outcome_links AS owned
+                                  WHERE owned.evidence_id = outcome.evidence_id AND owned.skill_id = ?1)
+                            OR EXISTS (SELECT 1 FROM skill_task_outcome_links AS other
+                                  WHERE other.evidence_id = outcome.evidence_id AND other.skill_id <> ?1)))",
             [skill_id],
         )?;
         // A task outcome is stored once and attributed through
@@ -720,6 +758,9 @@ mod tests {
         store.insert_verified(&kept).unwrap();
         seed_telemetry(&mut store, &purged.id, &kept.id);
         assert_eq!(surviving_outcomes(&store).len(), 3);
+        store.conn().execute_batch(
+            "INSERT INTO skill_turn_losses SELECT turn_id, production, 10 FROM skill_task_outcomes;",
+        ).unwrap();
 
         RetentionService::new(&mut store)
             .privacy_purge(&purged.id, "test_request", 10)
@@ -735,6 +776,15 @@ mod tests {
             1,
             "the surviving skill keeps its own attribution"
         );
+        let losses = store
+            .conn()
+            .prepare("SELECT turn_id FROM skill_turn_losses ORDER BY turn_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(losses, ["turn-baseline", "turn-shared"]);
         let _ = std::fs::remove_dir_all(root);
     }
 

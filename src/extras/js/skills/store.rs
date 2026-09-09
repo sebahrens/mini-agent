@@ -18,7 +18,7 @@ use super::{CapabilityManifest, IdentityError, SKILL_ABI_VERSION, SkillArtifact,
 
 /// Database schema version. Bump when schema changes; migrations bring older
 /// databases forward idempotently.
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 15;
 pub(crate) const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Model-versioned vector loaded only while constructing an immutable index generation.
@@ -3928,6 +3928,39 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                      ADD COLUMN evidence_complete INTEGER NOT NULL DEFAULT 1
                      CHECK (evidence_complete IN (0, 1));
                  PRAGMA user_version = 14;",
+            )?;
+            Ok(())
+        })?;
+    }
+
+    // Turn-wide loss is independent of any invocation or artifact. Keep the
+    // original event rows immutable while qualification consults this ledger.
+    if current_version < 15 {
+        migration_step(db, 15, true, || {
+            db.execute_batch(
+                "CREATE TABLE skill_turn_losses (
+                     turn_id TEXT NOT NULL,
+                     production INTEGER NOT NULL CHECK (production IN (0, 1)),
+                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
+                     PRIMARY KEY (turn_id, production)
+                 );
+                 CREATE INDEX skill_events_turn_production_idx
+                     ON skill_events(turn_id, production);
+                 CREATE INDEX skill_task_outcomes_turn_production_idx
+                     ON skill_task_outcomes(turn_id, production);
+                 INSERT INTO skill_turn_losses
+                     SELECT turn_id, production, MAX(created_at) FROM (
+                         SELECT turn_id, production, created_at FROM skill_events
+                         WHERE evidence_complete = 0 OR event_kind = 'observability_lost'
+                         UNION ALL
+                         SELECT turn_id, production, created_at FROM skill_task_outcomes
+                         WHERE evidence_complete = 0
+                     ) GROUP BY turn_id, production;
+                 UPDATE skill_task_outcomes SET evidence_complete = 0
+                     WHERE EXISTS (SELECT 1 FROM skill_turn_losses AS loss
+                         WHERE loss.turn_id = skill_task_outcomes.turn_id
+                           AND loss.production = skill_task_outcomes.production);
+                 PRAGMA user_version = 15;",
             )?;
             Ok(())
         })?;

@@ -12,6 +12,18 @@ use std::path::{Path, PathBuf};
 // Test Fixtures and Helpers
 // ============================================================================
 
+/// Older-version fixtures start from a current store; remove the turn-loss
+/// extension before setting their historical user_version.
+pub(super) fn remove_turn_loss_schema_for_legacy_fixture(
+    store: &SkillStore,
+) -> rusqlite::Result<()> {
+    store.conn().execute_batch(
+        "DROP TABLE skill_turn_losses;
+         DROP INDEX skill_events_turn_production_idx;
+         DROP INDEX skill_task_outcomes_turn_production_idx;",
+    )
+}
+
 /// Create a temporary AppPaths for testing without touching the repository.
 fn temp_app_paths() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -849,6 +861,7 @@ fn test_schema_v6_to_current_adds_active_identity_index() -> Result<(), Box<dyn 
     let paths = resolve_test_paths(&temp_dir)?;
     {
         let store = SkillStore::open_at(&paths)?;
+        remove_turn_loss_schema_for_legacy_fixture(&store)?;
         store.conn().execute_batch(
             "DROP INDEX skill_revisions_status_identity_version_idx;
              PRAGMA user_version = 6;",
@@ -883,6 +896,7 @@ fn test_schema_v7_allows_sibling_canaries_but_only_one_active_successor()
     let paths = resolve_test_paths(&temp_dir)?;
     {
         let store = SkillStore::open_at(&paths)?;
+        remove_turn_loss_schema_for_legacy_fixture(&store)?;
         store.conn().execute_batch(
             "DROP INDEX skill_revisions_one_active_successor;
              CREATE UNIQUE INDEX skill_revisions_one_live_successor
@@ -1283,5 +1297,84 @@ fn test_migration_step_skips_a_version_another_migrator_already_applied()
     );
 
     std::fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+#[test]
+fn schema_15_backfills_turn_loss_without_mutating_events() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = temp_app_paths();
+    let paths = resolve_test_paths(&root)?;
+    let skill = minimal_skill()?;
+    {
+        let mut store = SkillStore::open_at(&paths)?;
+        store.insert_verified(&skill)?;
+        remove_turn_loss_schema_for_legacy_fixture(&store)?;
+        store.conn().execute_batch("PRAGMA user_version = 14;")?;
+        for (turn, kind, complete) in [
+            ("raw-incomplete", "invoked", 0),
+            ("explicit-loss", "observability_lost", 1),
+            ("raw-incomplete", "observability_lost", 1),
+        ] {
+            store.conn().execute(
+                "INSERT INTO skill_events (skill_id, turn_id, event_kind, index_generation,
+                 evidence_complete, production, created_at) VALUES (?1, ?2, ?3, 0, ?4, 1, ?5)",
+                rusqlite::params![
+                    skill.id,
+                    turn,
+                    kind,
+                    complete,
+                    if kind == "observability_lost" { 20 } else { 10 }
+                ],
+            )?;
+        }
+        for (id, turn, complete, production) in [
+            ("task-loss", "task-incomplete", 0, 1),
+            ("production", "raw-incomplete", 1, 1),
+            ("gym", "raw-incomplete", 1, 0),
+        ] {
+            store.conn().execute(
+                "INSERT INTO skill_task_outcomes (evidence_id, turn_id, verify_passed, attempt,
+                 source_kind, source_id, production, evidence_complete, created_at)
+                 VALUES (?1, ?2, 1, 1, 'oracle', ?1, ?3, ?4, 10)",
+                rusqlite::params![id, turn, production, complete],
+            )?;
+        }
+    }
+    for _ in 0..2 {
+        let store = SkillStore::open_at(&paths)?;
+        let losses = store
+            .conn()
+            .prepare("SELECT turn_id FROM skill_turn_losses ORDER BY turn_id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            losses,
+            ["explicit-loss", "raw-incomplete", "task-incomplete"]
+        );
+        assert_eq!(store.conn().query_row(
+            "SELECT created_at FROM skill_turn_losses WHERE turn_id = 'raw-incomplete' AND production = 1",
+            [], |row| row.get::<_, i64>(0),
+        )?, 20);
+        let complete = store.conn().prepare("SELECT evidence_id, evidence_complete FROM skill_task_outcomes ORDER BY evidence_id")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            complete,
+            [
+                ("gym".into(), true),
+                ("production".into(), false),
+                ("task-loss".into(), false)
+            ]
+        );
+        assert_eq!(
+            store.conn().query_row(
+                "SELECT evidence_complete FROM skill_events WHERE turn_id = 'explicit-loss'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+    }
+    std::fs::remove_dir_all(root)?;
     Ok(())
 }

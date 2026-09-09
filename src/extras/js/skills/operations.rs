@@ -2314,6 +2314,25 @@ mod tests {
                 ("worker-lost".into(), false),
             ]
         );
+        let restarted = TelemetryDispatcher::spawn(&paths).unwrap();
+        restarted
+            .record_task_outcome(TaskOutcomeEvidence {
+                turn_id: "worker-lost".into(),
+                skill_ids: vec![artifact.id.clone()],
+                verify_passed: true,
+                attempt: 2,
+                source: TaskOutcomeSource::Oracle("shared-oracle".into()),
+                production: true,
+                evidence_complete: true,
+                created_at: 2_000_000_002,
+            })
+            .unwrap();
+        drop(restarted);
+        let complete: bool = store.conn().query_row(
+            "SELECT evidence_complete FROM skill_task_outcomes WHERE turn_id = 'worker-lost' AND attempt = 2",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!complete, "a restarted dispatcher cannot heal a lost turn");
         let rows = load_skill_stats(&store).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].tasks_with, rows[0].passed_with), (1, 1));

@@ -765,8 +765,8 @@ impl TelemetryDispatcher {
                                     &worker_busy_retries,
                                     &worker_shutdown,
                                     || {
-                                        invalidate_task_outcomes(
-                                            store.connection(),
+                                        persist_turn_loss(
+                                            &mut store,
                                             &outcome.turn_id,
                                             outcome.production,
                                         )
@@ -775,7 +775,7 @@ impl TelemetryDispatcher {
                                 .is_err()
                                 {
                                     tracing::error!(
-                                        "could not invalidate earlier task outcomes after evidence loss"
+                                        "could not persist turn-wide evidence loss"
                                     );
                                 }
                                 tracing::error!(
@@ -801,16 +801,16 @@ impl TelemetryDispatcher {
                         .collect::<BTreeSet<_>>();
                     for (turn_id, production) in affected_turns {
                         incomplete_turns.insert((turn_id.clone(), production));
-                        if ingest_retrying_busy(
+                        if failed && ingest_retrying_busy(
                             #[cfg(test)]
                             &worker_busy_retries,
                             &worker_shutdown,
-                            || invalidate_task_outcomes(store.connection(), &turn_id, production),
+                            || persist_turn_loss(&mut store, &turn_id, production),
                         )
                         .is_err()
                         {
                             tracing::error!(
-                                "could not invalidate earlier task outcomes after evidence loss"
+                                "could not persist turn-wide evidence loss"
                             );
                         }
                     }
@@ -923,8 +923,14 @@ fn ingest_task_outcome(
         .connection_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     if !outcome.evidence_complete {
-        invalidate_task_outcomes(&tx, &outcome.turn_id, outcome.production)?;
+        record_turn_loss(&tx, &outcome.turn_id, outcome.production)?;
     }
+    let evidence_complete = outcome.evidence_complete
+        && !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM skill_turn_losses WHERE turn_id = ?1 AND production = ?2)",
+            params![outcome.turn_id, i64::from(outcome.production)],
+            |row| row.get::<_, bool>(0),
+        )?;
     let (source_kind, source_id) = task_outcome_source_columns(&outcome.source);
     let mut attributed_skills = Vec::new();
     for skill_id in &outcome.skill_ids {
@@ -956,7 +962,7 @@ fn ingest_task_outcome(
     let evidence_id = crate::hex::encode_lower(Sha256::digest(canonical));
     // A turn that recorded fewer invocation links than the parent selected is
     // not by itself incomplete — selected-but-unused skills are ordinary. The
-    // parent's own completeness bit is what distinguishes a verified
+    // parent snapshot and durable turn-loss ledger distinguish a verified
     // no-invocation turn from one whose telemetry was lost.
     tx.execute(
         "INSERT OR IGNORE INTO skill_task_outcomes (
@@ -971,7 +977,7 @@ fn ingest_task_outcome(
             source_kind,
             source_id,
             i64::from(outcome.production),
-            i64::from(outcome.evidence_complete),
+            i64::from(evidence_complete),
             outcome.created_at,
         ],
     )?;
@@ -986,12 +992,32 @@ fn ingest_task_outcome(
     Ok(())
 }
 
-fn invalidate_task_outcomes(
-    connection: &rusqlite::Connection,
+fn persist_turn_loss(
+    store: &mut SkillStore,
     turn_id: &str,
     production: bool,
 ) -> Result<(), TelemetryError> {
-    connection.execute(
+    let tx = store
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    record_turn_loss(&tx, turn_id, production)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn record_turn_loss(
+    tx: &Transaction<'_>,
+    turn_id: &str,
+    production: bool,
+) -> Result<(), TelemetryError> {
+    let now = current_timestamp().map_err(|_| TelemetryError::InvalidEvent)?;
+    tx.execute(
+        "INSERT INTO skill_turn_losses (turn_id, production, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(turn_id, production) DO UPDATE SET
+             created_at = MAX(created_at, excluded.created_at)",
+        params![turn_id, i64::from(production), now],
+    )?;
+    tx.execute(
         "UPDATE skill_task_outcomes SET evidence_complete = 0
          WHERE turn_id = ?1 AND production = ?2 AND evidence_complete = 1",
         params![turn_id, i64::from(production)],
@@ -1090,7 +1116,9 @@ fn behavioral_window_counts(
            AND invoked.production = 1 AND invoked.evidence_complete = 1
            AND terminal.production = 1 AND terminal.evidence_complete = 1
            AND invoked.created_at >= ?2 AND invoked.created_at <= ?3
-           AND terminal.created_at >= ?2 AND terminal.created_at <= ?3",
+           AND terminal.created_at >= ?2 AND terminal.created_at <= ?3
+           AND NOT EXISTS (SELECT 1 FROM skill_turn_losses AS loss
+               WHERE loss.turn_id = terminal.turn_id AND loss.production = 1)",
         params![skill_id, window_start, window_end],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1350,6 +1378,17 @@ impl<'a> TelemetryIngestor<'a> {
             } else {
                 replayed += 1;
             }
+        }
+        let lost_turns = batch
+            .events()
+            .iter()
+            .filter(|event| {
+                !event.evidence_complete || event.kind == SkillEventKind::ObservabilityLost
+            })
+            .map(|event| (event.turn_id.as_str(), event.production))
+            .collect::<BTreeSet<_>>();
+        for (turn_id, production) in lost_turns {
+            record_turn_loss(&tx, turn_id, production)?;
         }
         tx.commit()?;
         Ok(IngestionReport {

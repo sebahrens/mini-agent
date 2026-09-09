@@ -384,6 +384,12 @@ fn skill_retention_recovery_compaction_is_idempotent_and_preserves_aggregates() 
     TelemetryIngestor::new(&mut store)
         .ingest(&EventBatch::new(events).unwrap())
         .unwrap();
+    store.conn().execute_batch(
+        "INSERT INTO skill_turn_losses VALUES ('turn-0', 1, 100), ('retained-task', 1, 100), ('recent-orphan', 1, 250);
+         INSERT INTO skill_task_outcomes (evidence_id, turn_id, verify_passed, attempt, source_kind,
+             source_id, production, evidence_complete, created_at)
+         VALUES ('retained', 'retained-task', 1, 1, 'oracle', 'retention', 1, 0, 100);",
+    ).unwrap();
     let mut retention = RetentionService::new(&mut store);
     let first = retention.compact_before(200, 1, 300).unwrap();
     let replay = retention.compact_before(200, 1, 300).unwrap();
@@ -399,6 +405,16 @@ fn skill_retention_recovery_compaction_is_idempotent_and_preserves_aggregates() 
         )
         .unwrap();
     assert_eq!(counts, (2, 1, 1));
+    let losses = store
+        .conn()
+        .prepare("SELECT turn_id FROM skill_turn_losses ORDER BY turn_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(losses, ["recent-orphan", "retained-task"]);
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -508,14 +524,39 @@ fn skill_retention_recovery_never_advances_past_an_ineligible_event() {
         .ingest(&EventBatch::new(events).unwrap())
         .unwrap();
 
+    store
+        .conn()
+        .execute(
+            "INSERT INTO skill_turn_losses VALUES ('ordered-turn-1', 1, 100)",
+            [],
+        )
+        .unwrap();
     let first = RetentionService::new(&mut store)
         .compact_before(200, 1, 300)
         .unwrap();
     assert_eq!(first.compacted_events, 0);
+    assert_eq!(
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_turn_losses", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+
     let second = RetentionService::new(&mut store)
         .compact_before(400, 1, 500)
         .unwrap();
     assert_eq!(second.compacted_events, 2);
+    assert_eq!(
+        store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_turn_losses", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
     let invoked: i64 = store
         .conn()
         .query_row(

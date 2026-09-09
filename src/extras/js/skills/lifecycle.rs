@@ -1743,7 +1743,10 @@ fn read_invocation_evidence(
         "SELECT terminal.invocation_id, terminal.turn_id, terminal.event_kind,
                 COALESCE(terminal.latency_us, 0),
                 invoked.production AND terminal.production,
-                invoked.evidence_complete AND terminal.evidence_complete,
+                invoked.evidence_complete AND terminal.evidence_complete
+                    AND NOT EXISTS (SELECT 1 FROM skill_turn_losses AS loss
+                        WHERE loss.turn_id = terminal.turn_id
+                          AND loss.production = terminal.production),
                 terminal.created_at
          FROM skill_events AS terminal
          JOIN skill_events AS invoked

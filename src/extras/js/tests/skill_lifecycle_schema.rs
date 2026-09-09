@@ -84,6 +84,7 @@ fn phase5_schema_is_restartable_and_complete() {
         );
         for table in [
             "skill_events",
+            "skill_turn_losses",
             "skill_evidence",
             "skill_transitions",
             "skill_stats",
