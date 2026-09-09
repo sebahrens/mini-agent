@@ -31,33 +31,6 @@ mod ui;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod operator_error_tests {
-    use super::{OperatorCommandFailure, add_configuration_hint, operator_command_failure};
-
-    #[test]
-    fn the_provider_setup_hint_is_appended_only_to_non_operator_failures() {
-        let provider = add_configuration_hint(anyhow::anyhow!("no API key for the provider"));
-        let rendered = format!("{provider:#}");
-        assert!(rendered.contains("mini-agent --setup"), "{rendered}");
-        assert!(
-            rendered.contains("no API key for the provider"),
-            "{rendered}"
-        );
-
-        let operator = add_configuration_hint(operator_command_failure(anyhow::anyhow!(
-            "reviewed proposal changed before approval"
-        )));
-        let rendered = format!("{operator:#}");
-        assert!(!rendered.contains("mini-agent --setup"), "{rendered}");
-        assert!(
-            rendered.contains("reviewed proposal changed before approval"),
-            "{rendered}"
-        );
-        assert!(operator.downcast_ref::<OperatorCommandFailure>().is_some());
-    }
-}
-
 use anyhow::Context;
 use clap::Parser;
 use std::io::IsTerminal;
@@ -90,45 +63,7 @@ fn main() -> anyhow::Result<ExitCode> {
     }
 
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
-    match runtime.block_on(run()) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(error) => Err(add_configuration_hint(error)),
-    }
-}
-
-/// Sentinel context marking a failure that came from an explicit operator
-/// command rather than from provider initialization.
-#[derive(Debug)]
-struct OperatorCommandFailure;
-
-impl std::fmt::Display for OperatorCommandFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("operator command failed")
-    }
-}
-
-/// Append the provider-setup hint only where it can be true.
-///
-/// Every failure used to be reported as an incomplete configuration, so an
-/// operator command that failed on its own preconditions printed as a provider
-/// problem — and any script surfacing stderr repeated that.
-fn add_configuration_hint(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<OperatorCommandFailure>().is_some() {
-        return error;
-    }
-    error.context(
-        "This error might derive from an incomplete configuration: run `mini-agent --setup` to configure your providers and models interactively, or `mini-agent --tutor` to see the getting started guide",
-    )
-}
-
-/// Mark an explicit operator-command failure so [`add_configuration_hint`]
-/// leaves it alone.
-///
-/// Every operator command that can fail this way is behind `skills`, so the
-/// non-`skills` binary keeps the helper only for its own tests.
-#[cfg_attr(not(feature = "skills"), allow(dead_code))]
-fn operator_command_failure(error: anyhow::Error) -> anyhow::Error {
-    error.context(OperatorCommandFailure)
+    runtime.block_on(run()).map(|()| ExitCode::SUCCESS)
 }
 
 fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -196,8 +131,7 @@ async fn run_inner() -> anyhow::Result<()> {
     // would validate and install a tree nothing ever reads.
     #[cfg(feature = "skills")]
     if let Some(source) = cli.import_agent_skill.as_deref() {
-        let imported = extras::skills::import_agent_skill(source, &app_paths)
-            .map_err(|error| operator_command_failure(error.into()))?;
+        let imported = extras::skills::import_agent_skill(source, &app_paths)?;
         println!(
             "Agent Skill imported: {} digest={} identity_version={} entries={} files={} \
              bytes={} path={} reimported={}",
@@ -268,22 +202,19 @@ async fn run_inner() -> anyhow::Result<()> {
 
     #[cfg(feature = "skills")]
     if cli.learned_skill_stats {
-        extras::js::skills::operations::print_skill_stats(&app_paths)
-            .map_err(operator_command_failure)?;
+        extras::js::skills::operations::print_skill_stats(&app_paths)?;
         return Ok(());
     }
 
     #[cfg(feature = "skills")]
     if cli.list_learned_skill_proposals {
-        extras::js::skills::operations::print_proposal_queue(&app_paths)
-            .map_err(operator_command_failure)?;
+        extras::js::skills::operations::print_proposal_queue(&app_paths)?;
         return Ok(());
     }
 
     #[cfg(feature = "skills")]
     if let Some(proposal_id) = cli.learned_skill_proposal.as_deref() {
-        extras::js::skills::operations::print_proposal(&app_paths, proposal_id)
-            .map_err(operator_command_failure)?;
+        extras::js::skills::operations::print_proposal(&app_paths, proposal_id)?;
         return Ok(());
     }
 
@@ -296,9 +227,7 @@ async fn run_inner() -> anyhow::Result<()> {
         let [session_id, tool_call_id] = target else {
             anyhow::bail!("--distill-learned-skill takes exactly a session id and a tool call id");
         };
-        extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id)
-            .await
-            .map_err(operator_command_failure)?;
+        extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id).await?;
         return Ok(());
     }
 
@@ -384,8 +313,7 @@ async fn run_inner() -> anyhow::Result<()> {
             library,
             &app_paths,
             cfg.embedding.as_ref(),
-        )
-        .map_err(operator_command_failure)?;
+        )?;
         return Ok(());
     }
 

@@ -218,6 +218,8 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 or session save fails. Failed turns retain observed output, tool counts, changed files, usage,
 and cost, and exit nonzero; completed tool records are saved unless `--no-session` is set or
 persistence itself fails. Errors before a turn result is available can exit without JSON.
+Runtime errors retain their specific cause on stderr; missing credentials and unknown
+providers include setup guidance from provider initialization.
 
 During headless agent turns (`-p` and `--loop`), Ctrl+C or Unix SIGTERM cancels provider
 waits and active work, waits for registered tool and hook cleanup, then saves completed

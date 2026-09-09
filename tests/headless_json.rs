@@ -300,6 +300,64 @@ fn loop_resumes_existing_plan_without_reading_piped_stdin() {
 }
 
 #[test]
+fn startup_errors_keep_provider_guidance_without_mislabeling_other_failures() {
+    for (args, setup_hint, detail) in [
+        (
+            &["--provider", "missing-key"][..],
+            true,
+            "No API key found for custom provider 'missing-key'",
+        ),
+        (
+            &["--provider", "unknown-test-provider"][..],
+            true,
+            "Unknown provider: 'unknown-test-provider'",
+        ),
+        (
+            &["--session", "missing-session"][..],
+            false,
+            "no session matching 'missing-session'",
+        ),
+        #[cfg(feature = "skills")]
+        (
+            &["--import-agent-skill", "missing-package"][..],
+            false,
+            "Agent Skill source must be one real directory or one .zip file",
+        ),
+    ] {
+        let root = TempRoot::new();
+        std::fs::write(root.0.join("config.toml"),
+            "[custom_providers.missing-key]\nprovider_type=\"openai\"\nbase_url=\"http://127.0.0.1:1/v1\"\napi_key_env=\"HEADLESS_MISSING_TEST_KEY\"\n"
+        ).unwrap();
+        let mut command = root.command();
+        command
+            .env_remove("HEADLESS_MISSING_TEST_KEY")
+            .args([
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-tools",
+                "-p",
+                "--output",
+                "json",
+                "ignored",
+            ])
+            .args(args);
+        let output = bounded_output(command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "startup failure has no turn result"
+        );
+        assert!(stderr.contains(detail), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.contains("mini-agent --setup"),
+            setup_hint,
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn explicit_print_json_reports_command_outcomes_in_one_value() {
     for (message, disabled, expected, detail, saves_session) in [
         (
@@ -343,6 +401,10 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
         command.args(["-p", "--output", "json", message]);
         let output = bounded_output(command);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("mini-agent --setup"),
+            "runtime failure must retain its own cause: {stderr}"
+        );
         assert_eq!(
             output.status.success(),
             expected == "completed",
@@ -401,6 +463,10 @@ fn provider_print_json_retains_progress_and_reports_terminal_failures() {
         command.args(["-p", "--output", "json", "write the file"]);
         let output = bounded_output(command);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("mini-agent --setup"),
+            "runtime failure must retain its own cause: {stderr}"
+        );
         assert!(server.join().unwrap().is_ok(), "{outcome}: {stderr}");
         assert_eq!(
             output.status.success(),
@@ -586,6 +652,10 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
             }
             let output = child.wait_with_output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("mini-agent --setup"),
+                "runtime failure must retain its own cause: {stderr}"
+            );
             if let Some(server) = server {
                 server
                     .join()
