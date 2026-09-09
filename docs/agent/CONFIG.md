@@ -2023,7 +2023,10 @@ or the `/advisor handoff on` runtime command to actually enable it; setting
 
 When enabled, the agent's advisor calls are redirected to the
 user instead of a second model. The agent pauses, shows its question, and the
-user types a response. This is useful for:
+user types or pastes a response, then presses Enter to send it. Escape, Ctrl-C,
+or Ctrl-D cancels the response. The prompt also closes if input ends or the
+requesting task is cancelled. Background events are queued for the main UI loop.
+This is useful for:
 
 - Reviewing the agent's approach before it writes code
 - Stepping in when the agent is stuck or uncertain

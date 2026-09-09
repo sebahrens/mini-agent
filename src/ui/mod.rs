@@ -982,12 +982,66 @@ pub async fn run_interactive(
 }
 
 #[cfg(feature = "advisor")]
+async fn read_handoff_response(
+    user_rx: &mut mpsc::Receiver<UserEvent>,
+    deferred: &mut VecDeque<UserEvent>,
+    reply: &mut tokio::sync::oneshot::Sender<String>,
+    mut render_preview: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<String> {
+    let mut buffer = String::new();
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = reply.closed() => return Ok(String::new()),
+            event = user_rx.recv() => match event {
+                Some(event) => event,
+                None => return Ok(String::new()),
+            },
+        };
+        match event {
+            UserEvent::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))
+                {
+                    return Ok(String::new());
+                }
+                if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => return Ok(buffer),
+                    KeyCode::Esc => return Ok(String::new()),
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    _ => continue,
+                }
+            }
+            UserEvent::Paste(text) => buffer.push_str(&text),
+            event => {
+                deferred.push_back(event);
+                continue;
+            }
+        }
+        render_preview(&sanitize_output(&buffer))?;
+    }
+}
+
+#[cfg(feature = "advisor")]
 pub(crate) async fn handle_human_handoff(
-    req: crate::extras::advisor::HandoffRequest,
+    mut req: crate::extras::advisor::HandoffRequest,
     renderer: &mut Renderer,
     user_rx: &mut mpsc::Receiver<UserEvent>,
+    deferred: &mut VecDeque<UserEvent>,
     run: &mut AgentRunState,
 ) -> anyhow::Result<()> {
+    if req.reply.is_closed() {
+        return Ok(());
+    }
     run.was_reasoning = false;
     if run.agent_line_started {
         renderer.write_line("", Color::White)?;
@@ -1000,42 +1054,194 @@ pub(crate) async fn handle_human_handoff(
     }
     renderer.write_line("", C_HANDOFF)?;
     renderer.write_line(
-        "  Type your response and press Enter (ESC to cancel):",
+        "  Type or paste your response and press Enter (ESC or Ctrl-C to cancel):",
         C_HANDOFF,
     )?;
 
-    let mut buffer = String::new();
-    let response = loop {
-        tokio::select! {
-            Some(ev) = user_rx.recv() => {
-                if let crate::event::UserEvent::Key(key) = ev {
-                    match key.code {
-                        crossterm::event::KeyCode::Enter => break buffer,
-                        crossterm::event::KeyCode::Esc => break String::new(),
-                        crossterm::event::KeyCode::Char(c) => {
-                            buffer.push(c);
-                            renderer.write_line(&format!("  > {}", buffer), C_HANDOFF)?;
-                        }
-                        crossterm::event::KeyCode::Backspace => {
-                            buffer.pop();
-                            renderer.write_line(&format!("  > {}", buffer), C_HANDOFF)?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    };
+    let response = read_handoff_response(user_rx, deferred, &mut req.reply, |preview| {
+        renderer.write_line(&format!("  > {preview}"), C_HANDOFF)
+    })
+    .await?;
 
     if response.is_empty() {
         renderer.write_line("  [cancelled]", C_HANDOFF)?;
     } else {
-        renderer.write_line(&format!("  [sent: {}]", response), C_HANDOFF)?;
+        renderer.write_line(
+            &format!("  [sent: {}]", sanitize_output(&response)),
+            C_HANDOFF,
+        )?;
     }
     renderer.write_line("", Color::White)?;
 
     let _ = req.reply.send(response);
     Ok(())
+}
+
+#[cfg(all(test, feature = "advisor"))]
+mod handoff_input_tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use tokio::sync::oneshot;
+
+    fn key(code: KeyCode) -> UserEvent {
+        UserEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[tokio::test]
+    async fn editing_and_paste_preserve_exact_reply_and_defer_background_events() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let (mut reply, reply_rx) = oneshot::channel();
+        let pasted = "Привет\n\x1b[31mred\x1b[0m";
+        for event in [
+            UserEvent::Resize,
+            UserEvent::Paste(pasted.into()),
+            key(KeyCode::Char('界')),
+            key(KeyCode::Backspace),
+            UserEvent::LinkOpenFailed("open failed".into()),
+            UserEvent::Key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT)),
+            key(KeyCode::Enter),
+            UserEvent::ScrollDown,
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let mut deferred = VecDeque::from([UserEvent::ScrollUp]);
+        let mut previews = Vec::new();
+        let response = read_handoff_response(&mut rx, &mut deferred, &mut reply, |text| {
+            previews.push(text.to_owned());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        reply.send(response).unwrap();
+        assert_eq!(reply_rx.await.unwrap(), format!("{pasted}Z"));
+        assert_eq!(previews.last().unwrap(), "Привет\nredZ");
+        assert!(previews.iter().all(|text| !text.contains('\x1b')));
+        assert!(matches!(deferred.pop_front(), Some(UserEvent::ScrollUp)));
+        assert!(matches!(deferred.pop_front(), Some(UserEvent::Resize)));
+        assert!(
+            matches!(deferred.pop_front(), Some(UserEvent::LinkOpenFailed(s)) if s == "open failed")
+        );
+        assert!(deferred.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(UserEvent::ScrollDown)));
+    }
+
+    #[tokio::test]
+    async fn interrupts_cancel_and_unrelated_shortcuts_cannot_edit_or_submit() {
+        let mut cases = vec![(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), "")];
+        for c in ['c', 'C', 'd', 'D'] {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                cases.push((KeyEvent::new(KeyCode::Char(c), modifiers), ""));
+            }
+        }
+        for event in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+            KeyEvent::new_with_kind(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Repeat),
+        ] {
+            cases.push((event, "draft"));
+        }
+        for (event, expected) in cases {
+            let (tx, mut rx) = mpsc::channel(4);
+            let (mut reply, _reply_rx) = oneshot::channel();
+            tx.send(UserEvent::Paste("draft".into())).await.unwrap();
+            tx.send(UserEvent::Key(event)).await.unwrap();
+            tx.send(key(KeyCode::Enter)).await.unwrap();
+            tx.send(UserEvent::ScrollDown).await.unwrap();
+            drop(tx);
+            let mut deferred = VecDeque::new();
+            assert_eq!(
+                read_handoff_response(&mut rx, &mut deferred, &mut reply, |_| Ok(()))
+                    .await
+                    .unwrap(),
+                expected,
+                "{event:?}"
+            );
+            assert!(deferred.is_empty());
+            if expected.is_empty() {
+                assert!(matches!(rx.try_recv(), Ok(UserEvent::Key(k)) if k.code == KeyCode::Enter));
+            }
+            assert!(matches!(rx.try_recv(), Ok(UserEvent::ScrollDown)));
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_input_cancels_partial_response_and_preview_errors_propagate() {
+        for render_fails in [false, true] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let (mut reply, _reply_rx) = oneshot::channel();
+            tx.send(UserEvent::Resize).await.unwrap();
+            tx.send(UserEvent::Paste("unfinished".into()))
+                .await
+                .unwrap();
+            drop(tx);
+            let mut deferred = VecDeque::new();
+            let result = read_handoff_response(&mut rx, &mut deferred, &mut reply, |_| {
+                if render_fails {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed display"))
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            if render_fails {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                assert_eq!(result.unwrap(), "");
+            }
+            assert!(matches!(deferred.pop_front(), Some(UserEvent::Resize)));
+            assert!(deferred.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn requester_cancellation_wakes_prompt_without_consuming_later_input() {
+        for already_closed in [false, true] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let (mut reply, reply_rx) = oneshot::channel();
+            let mut receiver = Some(reply_rx);
+            let mut deferred = VecDeque::new();
+            if already_closed {
+                drop(receiver.take());
+            }
+            {
+                let response =
+                    read_handoff_response(&mut rx, &mut deferred, &mut reply, |_| Ok(()));
+                tokio::pin!(response);
+                if !already_closed {
+                    // Poll into a pending receive before cancelling the requesting task.
+                    tokio::select! {
+                        biased;
+                        result = &mut response => panic!("live prompt finished early: {result:?}"),
+                        _ = std::future::ready(()) => {}
+                    }
+                    drop(receiver.take());
+                }
+                tx.send(key(KeyCode::Char('n'))).await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), &mut response)
+                        .await
+                        .expect("orphaned prompt must close")
+                        .unwrap(),
+                    ""
+                );
+            }
+            assert!(matches!(rx.try_recv(), Ok(UserEvent::Key(k)) if k.code == KeyCode::Char('n')));
+            assert!(deferred.is_empty());
+        }
+    }
 }
 
 #[cfg(test)]

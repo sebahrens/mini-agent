@@ -939,8 +939,14 @@ impl<'a> App<'a> {
             if let Some(ref mut rx) = self.handoff_rx
                 && let Ok(req) = rx.try_recv()
             {
-                handle_human_handoff(req, &mut self.renderer, &mut self.user_rx, &mut self.run)
-                    .await?;
+                handle_human_handoff(
+                    req,
+                    &mut self.renderer,
+                    &mut self.user_rx,
+                    &mut self.deferred_user_events,
+                    &mut self.run,
+                )
+                .await?;
                 self.refresh()?;
             }
         }
