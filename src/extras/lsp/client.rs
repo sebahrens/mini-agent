@@ -28,10 +28,6 @@ pub(crate) struct Document {
     content: crate::fs::ContentDigest,
 }
 
-pub(crate) async fn read_stable_document(path: &Path) -> std::io::Result<Document> {
-    read_document(crate::fs::open_stable_file(path).await?).await
-}
-
 /// Capture identity from the same authorized handle that supplies the text.
 pub(crate) async fn read_document(file: tokio::fs::File) -> std::io::Result<Document> {
     let identity = crate::fs::checked_tokio_file_metadata(&file).await?;
@@ -155,7 +151,6 @@ const MAX_DIAGNOSTIC_FILES_PER_SERVER: usize = 128;
 pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 50;
 const MAX_DIAGNOSTIC_URI_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1024;
-const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 256;
 const LSP_WORKSPACE_FD: i32 = 198;
 
 pub(crate) fn workspace_service_root(_fallback: &Path) -> std::path::PathBuf {
@@ -360,6 +355,7 @@ impl LspClient {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn spawn_with_timeout(
         name: &str,
         cfg: &LspServerConfig,
@@ -770,14 +766,6 @@ impl LspClient {
             return;
         }
         notified.await;
-    }
-
-    /// Synchronize a file through the same authorized read path as the manager.
-    pub async fn sync_file(&self, path: &Path) {
-        let Ok(document) = read_stable_document(path).await else {
-            return;
-        };
-        let _ = self.sync_document(path, document).await;
     }
 
     #[cfg(test)]

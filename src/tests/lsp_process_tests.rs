@@ -198,9 +198,6 @@ fn main() {
                 }
             }
             if mode == "close-stdin" {
-                if let Some(path) = env::var_os("LSP_FIXTURE_STDIN_CLOSED_FILE") {
-                    fs::write(path, "closed").unwrap();
-                }
                 break;
             }
         } else if body.contains("\"method\":\"textDocument/didOpen\"")
@@ -249,6 +246,9 @@ fn main() {
     drop(reader);
     if mode == "close-stdin" {
         close_stdin();
+        if let Some(path) = env::var_os("LSP_FIXTURE_STDIN_CLOSED_FILE") {
+            fs::write(path, "closed").unwrap();
+        }
         loop {
             thread::sleep(Duration::from_secs(60));
         }
@@ -301,7 +301,7 @@ impl FixtureBuild {
     fn workspace(&self, name: &str) -> PathBuf {
         let workspace = self.root.join(name);
         fs::create_dir_all(&workspace).unwrap();
-        workspace
+        workspace.canonicalize().unwrap()
     }
 
     fn config(&self, mode: &str, lease: &Path) -> LspServerConfig {
@@ -380,6 +380,12 @@ async fn spawn_client(
 ) -> Option<Arc<LspClient>> {
     let (diags, notify) = client_parts();
     LspClient::spawn_with_timeout("fixture", cfg, root, diags, notify, timeout).await
+}
+
+async fn read_stable_document(
+    path: &Path,
+) -> std::io::Result<crate::extras::lsp::client::Document> {
+    crate::extras::lsp::client::read_document(crate::fs::open_stable_file(path).await?).await
 }
 
 async fn wait_for_file(path: &Path) -> String {
@@ -1041,6 +1047,126 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn lsp_process_permission_wait_rejects_leaf_and_parent_symlink_retargets() {
+    use crate::agent::tools::lsp::{LspArgs, LspTool};
+    use crate::permission::ask::UserDecision;
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+    use std::os::unix::fs::symlink;
+    use std::sync::Mutex;
+
+    let fixture = FixtureBuild::compile("permission-retarget");
+    for relative in [false, true] {
+        for parent in [false, true] {
+            for external in [false, true] {
+                let case = format!("relative-{relative}-parent-{parent}-external-{external}");
+                let workspace = fixture.workspace(&case).canonicalize().unwrap();
+                let approved_dir = workspace.join("approved");
+                fs::create_dir(&approved_dir).unwrap();
+                let denied_dir = if external {
+                    fixture
+                        .workspace(&format!("outside-{case}"))
+                        .canonicalize()
+                        .unwrap()
+                } else {
+                    let denied = workspace.join("denied");
+                    fs::create_dir(&denied).unwrap();
+                    denied
+                };
+                let source = approved_dir.join("document.probe");
+                let denied = denied_dir.join("document.probe");
+                fs::write(&source, "approved content").unwrap();
+                fs::write(&denied, "DENIED_LSP_CONTENT").unwrap();
+                let lease = workspace.join("lease");
+                let sync_log = workspace.join("sync.log");
+                let mut cfg = fixture.config("normal", &lease);
+                cfg.env.insert(
+                    "LSP_FIXTURE_SYNC_LOG".into(),
+                    sync_log.display().to_string(),
+                );
+                let manager = LspManager::new(
+                    &LspConfig {
+                        enabled: true,
+                        servers: HashMap::from([("fixture".into(), cfg)]),
+                    },
+                    workspace.clone(),
+                );
+                let permission = PermissionConfig {
+                    default: Some(Action::Deny),
+                    read: Some(ToolPerm::Granular(
+                        [
+                            (source.display().to_string(), Action::Ask),
+                            (denied.display().to_string(), Action::Deny),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )),
+                    ..Default::default()
+                };
+                let permission = Arc::new(Mutex::new(
+                    PermissionChecker::new(
+                        &PermissionConfigs::from(permission),
+                        SecurityMode::Standard,
+                        Some(workspace.clone()),
+                        Some(vec!["standard".into()]),
+                    )
+                    .unwrap(),
+                ));
+                let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+                let tool = LspTool::new(manager.clone(), Some(permission), Some(ask_tx));
+                let requested = if relative {
+                    "approved/document.probe".into()
+                } else {
+                    source.display().to_string()
+                };
+                let query = tokio::spawn(async move {
+                    tool.call(LspArgs {
+                        path: Some(requested),
+                    })
+                    .await
+                });
+                let request = tokio::time::timeout(Duration::from_secs(5), ask_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(Path::new(&request.input), source);
+                if parent {
+                    fs::rename(&approved_dir, workspace.join("retired")).unwrap();
+                    symlink(&denied_dir, &approved_dir).unwrap();
+                } else {
+                    fs::remove_file(&source).unwrap();
+                    symlink(&denied, &source).unwrap();
+                }
+                request.reply.send(UserDecision::AllowOnce).unwrap();
+                let output = tokio::time::timeout(Duration::from_secs(5), query)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let launched = lease.exists();
+                let sent = if launched {
+                    wait_for_file(&sync_log).await
+                } else {
+                    String::new()
+                };
+                manager.shutdown().await;
+                drop(manager);
+                assert!(
+                    !launched,
+                    "{case}: unapproved retarget reached the language server: {sent}"
+                );
+                assert!(
+                    output.starts_with("No diagnostics for "),
+                    "{case}: {output}"
+                );
+            }
+        }
+    }
+    fixture.cleanup().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn lsp_process_concurrent_sync_preserves_document_version_order() {
     let fixture = FixtureBuild::compile("sync-order");
@@ -1062,9 +1188,7 @@ async fn lsp_process_concurrent_sync_preserves_document_version_order() {
         let first_client = client.clone();
         let first_path = source.clone();
         let first = tokio::spawn(async move {
-            let document = crate::extras::lsp::client::read_stable_document(&first_path)
-                .await
-                .unwrap();
+            let document = read_stable_document(&first_path).await.unwrap();
             first_client.sync_document(&first_path, document).await
         });
         first_advanced.await.unwrap();
@@ -1073,9 +1197,7 @@ async fn lsp_process_concurrent_sync_preserves_document_version_order() {
         let second_client = client.clone();
         let second_path = source.clone();
         let second = tokio::spawn(async move {
-            let document = crate::extras::lsp::client::read_stable_document(&second_path)
-                .await
-                .unwrap();
+            let document = read_stable_document(&second_path).await.unwrap();
             second_client.sync_document(&second_path, document).await
         });
         second_queued.await.unwrap();
@@ -1101,9 +1223,7 @@ async fn lsp_process_concurrent_sync_preserves_document_version_order() {
             (first_result, second.await.unwrap())
         };
         let recovery = if rewrite_queued {
-            let current = crate::extras::lsp::client::read_stable_document(&source)
-                .await
-                .unwrap();
+            let current = read_stable_document(&source).await.unwrap();
             client.sync_document(&source, current).await
         } else {
             None
@@ -1179,15 +1299,16 @@ async fn lsp_process_cancelled_document_sync_rejects_queued_calls_before_reaping
     let (_, advanced, _release) = client.pause_next_sync_for_test();
     let caller = client.clone();
     let path = source.clone();
-    let sync = tokio::spawn(async move { caller.sync_file(&path).await });
+    let sync = tokio::spawn(async move {
+        let document = read_stable_document(&path).await.unwrap();
+        caller.sync_document(&path, document).await
+    });
     advanced.await.unwrap();
     let (queued, queued_advanced, release_queued) = client.pause_next_sync_for_test();
     let caller = client.clone();
     let queued_path = source.clone();
     let queued_call = tokio::spawn(async move {
-        let document = crate::extras::lsp::client::read_stable_document(&queued_path)
-            .await
-            .unwrap();
+        let document = read_stable_document(&queued_path).await.unwrap();
         caller.sync_document(&queued_path, document).await
     });
     queued.await.unwrap();
@@ -1342,12 +1463,8 @@ async fn lsp_process_transport_deadlines_are_independent_between_clients() {
     slow_client.set_write_timeout_for_test(Some(Duration::from_secs(30)));
     let (_, fast_advanced, _release_fast) = fast_client.pause_next_sync_for_test();
     let (_, slow_advanced, release_slow) = slow_client.pause_next_sync_for_test();
-    let fast_document = crate::extras::lsp::client::read_stable_document(&source)
-        .await
-        .unwrap();
-    let slow_document = crate::extras::lsp::client::read_stable_document(&source)
-        .await
-        .unwrap();
+    let fast_document = read_stable_document(&source).await.unwrap();
+    let slow_document = read_stable_document(&source).await.unwrap();
     let caller = fast_client.clone();
     let path = source.clone();
     let mut fast = tokio::spawn(async move { caller.sync_document(&path, fast_document).await });
@@ -1394,48 +1511,53 @@ async fn lsp_process_rejected_documents_do_not_poison_sync_state() {
         "LSP_FIXTURE_SYNC_LOG".to_string(),
         sync_log.display().to_string(),
     );
-    let client = spawn_client(&cfg, &workspace, Duration::from_secs(2))
+    let manager = LspManager::new(
+        &LspConfig {
+            enabled: true,
+            servers: HashMap::from([("fixture".into(), cfg)]),
+        },
+        workspace.clone(),
+    );
+    let client = manager
+        .client_for_test(&source)
         .await
         .expect("fixture must initialize");
     let parent_pid = wait_for_pid(&lease).await;
 
     fs::write(&source, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
-    client.sync_file(&source).await;
+    assert!(manager.notify_changed(&source).await.is_none());
     assert!(!sync_log.exists(), "oversized document was synchronized");
 
     fs::write(&source, "original document").unwrap();
-    let original = crate::extras::lsp::client::read_stable_document(&source)
-        .await
-        .unwrap();
+    let original = read_stable_document(&source).await.unwrap();
     fs::rename(&source, workspace.join("original.probe")).unwrap();
     fs::write(&source, "small document").unwrap();
     assert!(
         client.sync_document(&source, original).await.is_none(),
         "a file replaced after reading must not advance synchronization"
     );
-    let original = crate::extras::lsp::client::read_stable_document(&source)
-        .await
-        .unwrap();
+    let original = read_stable_document(&source).await.unwrap();
     rewrite_preserving_length_and_mtime(&source);
     assert!(
         client.sync_document(&source, original).await.is_none(),
         "a file rewritten after reading must not advance synchronization"
     );
-    client.sync_file(&source).await;
+    assert!(manager.notify_changed(&source).await.is_some());
     let first = wait_for_file(&sync_log).await;
     assert!(first.contains("textDocument/didOpen"), "{first}");
     assert!(first.contains("\"version\":1"), "{first}");
     assert!(!first.contains("textDocument/didChange"), "{first}");
 
     fs::write(&source, "changed document").unwrap();
-    client.sync_file(&source).await;
+    assert!(manager.notify_changed(&source).await.is_some());
     let second = wait_for_file_contains(&sync_log, "textDocument/didChange").await;
     assert!(second.contains("textDocument/didChange"), "{second}");
     assert!(second.contains("\"version\":2"), "{second}");
 
-    client.shutdown().await;
+    manager.shutdown().await;
     assert_process_reaped(parent_pid).await;
     drop(client);
+    drop(manager);
     fixture.cleanup().await;
 }
 
@@ -1458,7 +1580,8 @@ async fn lsp_process_broken_stdin_is_terminal_and_reaped() {
     let parent_pid = wait_for_pid(&lease).await;
     wait_for_file(&closed).await;
 
-    client.sync_file(&source).await;
+    let document = read_stable_document(&source).await.unwrap();
+    assert!(client.sync_document(&source, document).await.is_none());
     assert!(client.is_stopped());
     assert_process_reaped(parent_pid).await;
     drop(client);
@@ -1612,12 +1735,8 @@ async fn lsp_process_stalled_and_queued_writers_are_bounded_and_reaped() {
         .await
         .expect("fixture must initialize before it stops reading");
     let parent_pid = wait_for_pid(&lease).await;
-    let first_document = crate::extras::lsp::client::read_stable_document(&first)
-        .await
-        .unwrap();
-    let second_document = crate::extras::lsp::client::read_stable_document(&second)
-        .await
-        .unwrap();
+    let first_document = read_stable_document(&first).await.unwrap();
+    let second_document = read_stable_document(&second).await.unwrap();
 
     client.set_write_timeout_for_test(Some(Duration::from_millis(300)));
     let started = Instant::now();

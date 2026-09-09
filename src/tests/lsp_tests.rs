@@ -78,33 +78,6 @@ async fn answer_once(mut ask_rx: AskReceiver, expected_path: &Path) {
     request.reply.send(UserDecision::AllowOnce).unwrap();
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn lsp_sync_rejects_file_swapped_to_external_symlink_after_resolution() {
-    let temp = std::env::temp_dir().join(format!("mini-agent-lsp-swap-{}", uuid::Uuid::new_v4()));
-    let workspace = temp.join("workspace");
-    let external = temp.join("external");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::create_dir_all(&external).unwrap();
-    let source = workspace.join("source.rs");
-    let secret = external.join("secret.rs");
-    std::fs::write(&source, "fn safe() {}").unwrap();
-    std::fs::write(&secret, "compile_error!(\"LSP_SECRET\");").unwrap();
-
-    let binding = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
-    let manager = LspManager::new(&LspConfig::default(), binding);
-    let approved = manager.resolve_path(Path::new("source.rs")).unwrap();
-    std::fs::remove_file(&source).unwrap();
-    std::os::unix::fs::symlink(&secret, &source).unwrap();
-
-    assert!(
-        crate::extras::lsp::client::read_stable_document(&approved)
-            .await
-            .is_err()
-    );
-    std::fs::remove_dir_all(temp).unwrap();
-}
-
 // ── rpc framing ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1923,51 +1896,6 @@ async fn explicit_non_utf8_canonical_path_cannot_reuse_lossy_permission_key() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("require a UTF-8 file path"), "{error}");
     assert_eq!(manager.cached_client_count().await, 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn symlink_replacement_during_ask_never_reaches_lsp_client() {
-    use std::os::unix::fs::symlink;
-
-    let root = TempRoot::new("sync-swap-root");
-    let external = TempRoot::new("sync-swap-external");
-    let file = root.path().join("sample.guarded");
-    let denied = external.path().join("denied.guarded");
-    std::fs::write(&file, "allowed content").unwrap();
-    std::fs::write(&denied, "DENIED CONTENT").unwrap();
-
-    let mut cfg = LspConfig::default();
-    cfg.servers.insert(
-        "guarded".to_string(),
-        custom("definitely-not-a-real-language-server", &[".guarded"]),
-    );
-    let manager = LspManager::new(&cfg, root.path().to_path_buf());
-    let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
-    let tool = LspTool::new(
-        manager.clone(),
-        Some(permission(root.path(), read_permission(Action::Ask))),
-        Some(ask_tx),
-    );
-    let queried = file.clone();
-    let task = tokio::spawn(async move {
-        tool.call(LspArgs {
-            path: Some(queried.display().to_string()),
-        })
-        .await
-    });
-    let request = ask_rx.recv().await.unwrap();
-    std::fs::remove_file(&file).unwrap();
-    symlink(&denied, &file).unwrap();
-    request.reply.send(UserDecision::AllowOnce).unwrap();
-
-    let output = task.await.unwrap().unwrap();
-    assert!(output.starts_with("No diagnostics for "), "{output}");
-    assert_eq!(
-        manager.cached_client_count().await,
-        0,
-        "stable-file rejection must happen before client launch"
-    );
 }
 
 #[cfg(unix)]

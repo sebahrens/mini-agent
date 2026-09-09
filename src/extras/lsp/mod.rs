@@ -309,25 +309,20 @@ impl LspManager {
         failures.insert(name.to_string(), next);
     }
 
-    /// Syncs a file's disk content with its language server (no-op when no
-    /// server handles the extension or the server failed to start).
+    /// Sync a canonical path already resolved by the caller's permission check.
+    /// Reopening stays relative to the captured workspace: resolving again here
+    /// would let a symlink replacement redirect an already-approved read.
     pub async fn notify_changed(&self, path: &Path) -> Option<u64> {
-        let path = std::fs::canonicalize(path).ok()?;
-        if !self.handles(&path) {
-            return None;
-        }
-        // Bind the file before server selection so an unapproved replacement
-        // never reaches the language server.
-        let file = crate::fs::open_stable_file(&path).await.ok()?;
-        let document = client::read_document(file).await.ok()?;
-        self.client_for(&path)
-            .await?
-            .sync_document(&path, document)
-            .await
+        let relative = path.strip_prefix(self.inner.workspace.root()).ok()?;
+        self.notify_changed_relative(relative).await
     }
 
     pub async fn notify_changed_relative(&self, relative: &Path) -> Option<u64> {
         self.inner.workspace.validate().ok()?;
+        let lookup = self.inner.workspace.root().join(relative);
+        if !self.handles(&lookup) {
+            return None;
+        }
         let file = self.inner.workspace.open_relative(relative).ok()?;
         if !file.metadata().ok()?.is_file() {
             return None;
@@ -335,7 +330,6 @@ impl LspManager {
         let document = client::read_document(tokio::fs::File::from_std(file))
             .await
             .ok()?;
-        let lookup = self.inner.workspace.root().join(relative);
         self.client_for(&lookup)
             .await?
             .sync_document(&lookup, document)

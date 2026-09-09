@@ -109,6 +109,11 @@ the no-effect skill verifier's in-memory fake `spawn`; it never authorizes an OS
 
 ### LSP disk-work ownership
 
+Synchronization uses the canonical path already approved by the caller, converted to a relative
+path under the captured workspace. It never canonicalizes that name again after a permission wait.
+Both absolute and relative notifications use the same no-follow workspace open, rejecting leaf
+and parent-directory symlink replacements before reading text or starting a language server.
+
 Content validation requested by edit feedback and diagnostic queries registers with the active
 agent work scope. Cancelling the calling tool leaves its retained-handle disk work owned until
 the turn settles. Background diagnostic publication instead belongs to the persistent LSP
