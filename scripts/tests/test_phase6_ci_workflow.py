@@ -74,14 +74,18 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             "name: Test AppContainer source and capability policy", 1
         )[1].split("- name:", 1)[0]
         self.assertIn("inputs.scope != 'windows-general-sandbox'", source_step)
-        cache_step = windows_job.split(
-            "name: Test cached native preflight results", 1
+        native_step = windows_job.split(
+            "name: Test native general-sandbox policy and recovery", 1
         )[1].split("- name:", 1)[0]
-        self.assertNotIn("if:", cache_step)
-        self.assertIn("general_preflight_cache_retains_success_and_failure_without_reprobing", cache_step)
-        self.assertIn("-- --list", cache_step)
-        self.assertIn(".Count -ne 1", cache_step)
-        self.assertIn("-- --exact --test-threads=1", cache_step)
+        self.assertNotIn("if:", native_step)
+        self.assertIn("$suite = 'sandbox::windows::tests::'", native_step)
+        self.assertIn("general_preflight_cache_retains_success_and_failure_without_reprobing", native_step)
+        self.assertIn("next_process_recovers_a_preserved_profile_job_acls_and_root", native_step)
+        self.assertIn("timed_out_general_preflight_reaps_tree_and_removes_recovery_state", native_step)
+        self.assertIn("-- --list", native_step)
+        self.assertIn(".Count -ne 1", native_step)
+        self.assertIn("cargo test --locked $suite -- --test-threads=1", native_step)
+        self.assertNotIn("cargo test --locked $test --", native_step)
 
     def test_each_platform_gate_runs_real_probe_and_both_feature_rows(self) -> None:
         requirements = {

@@ -182,6 +182,11 @@ active, or unverifiable roots remain untouched and fail closed. Timeout remains 
 result. The cache retains its original failure diagnostic, which the explicit native runtime
 probe reports without rerunning the failed preflight.
 
+The Windows general-sandbox CI job runs the complete native policy and recovery unit suite
+serially, including the cache, path-identity, ACL, restart-recovery, and timeout-cleanup tests.
+It also runs the installed-binary boundary probe; source-text checks alone do not establish
+native recovery behavior.
+
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded
 AppContainer identity, scoped filesystem grants and writes, zero-capability network

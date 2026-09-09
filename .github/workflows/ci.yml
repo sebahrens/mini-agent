@@ -861,17 +861,32 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
         run: cargo test --locked windows_appcontainer_source -- --test-threads=1
 
-      - name: Test cached native preflight results
+      - name: Test native general-sandbox policy and recovery
         shell: pwsh
         run: |
-          $test = 'sandbox::windows::tests::general_preflight_cache_retains_success_and_failure_without_reprobing'
-          $tests = cargo test --locked $test -- --list
-          if ($LASTEXITCODE -ne 0 -or @($tests | Select-String -SimpleMatch "${test}: test").Count -ne 1) {
-            throw 'Expected exactly one native preflight cache regression test'
-          }
-          cargo test --locked $test -- --exact --test-threads=1
+          $suite = 'sandbox::windows::tests::'
+          $tests = cargo test --locked $suite -- --list
           if ($LASTEXITCODE -ne 0) {
-            throw "Native preflight cache regression failed with exit code $LASTEXITCODE"
+            throw "Native general-sandbox test discovery failed with exit code $LASTEXITCODE"
+          }
+          $required = @(
+            'general_preflight_cache_retains_success_and_failure_without_reprobing',
+            'control_root_authority_denies_ancestor_swap_after_attestation',
+            'profile_intent_transition_excludes_a_concurrent_sweeper',
+            'next_process_recovers_a_preserved_profile_job_acls_and_root',
+            'changed_preflight_root_dacl_is_rejected_without_cleanup',
+            'malformed_preflight_schema_is_preserved_without_mutation',
+            'hardlinked_preflight_file_is_preserved_without_cleanup',
+            'timed_out_general_preflight_reaps_tree_and_removes_recovery_state'
+          )
+          foreach ($test in $required) {
+            if (@($tests | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -eq "${suite}${test}: test" }).Count -ne 1) {
+              throw "Expected exactly one native general-sandbox regression: $test"
+            }
+          }
+          cargo test --locked $suite -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native general-sandbox regressions failed with exit code $LASTEXITCODE"
           }
 
       - name: Install the debug binary used by the native sandbox probe

@@ -832,14 +832,6 @@ fn run_production_preflight() -> Result<(), String> {
     run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline)
 }
 
-fn run_production_preflight_owned(
-    run_deadline: Instant,
-    reap_deadline: Instant,
-) -> Result<(), String> {
-    let temp_root = canonical_preflight_temp_root()?;
-    run_production_preflight_owned_in(&temp_root, run_deadline, reap_deadline)
-}
-
 fn run_production_preflight_owned_in(
     temp_root: &Path,
     run_deadline: Instant,

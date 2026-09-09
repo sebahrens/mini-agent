@@ -4359,9 +4359,13 @@ mod sandbox_tests {
             source.contains("create_profile_intent(&journal_root, &name_text, &profile_control)?")
         );
         let production_preflight = source
-            .split("fn run_production_preflight_owned(")
+            .split("fn run_production_preflight_owned_in(")
             .nth(1)
-            .and_then(|source| source.split("fn run_bounded_preflight_helper(").next())
+            .and_then(|source| {
+                source
+                    .split("fn next_general_preflight_recovery_deadline(")
+                    .next()
+            })
             .expect("bounded Windows production preflight missing");
         assert!(!production_preflight.contains("output_guarded"));
         assert!(!production_preflight.contains("std::thread::"));
