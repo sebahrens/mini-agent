@@ -1509,6 +1509,32 @@ fn worker_runtime_verification_stops_after_resource_faults_and_shares_job_budget
     assert!(timeout_results[1].passed);
 }
 
+// Keep this exact crash regression in the native CI verifier suite. Exhausting
+// the fake transcript before OOM used to strand Rust-held promise resolvers and
+// abort JS_FreeRuntime instead of returning a closed resource failure.
+#[cfg(feature = "skills")]
+#[test]
+fn worker_runtime_verification_oom_remains_terminal_after_fake_transcript_exhaustion() {
+    use crate::extras::js::skills::verify::verify_skill;
+    use crate::extras::js::skills::{
+        CapabilityManifest, CapabilityScope, CapabilityTier, SkillArtifact, SkillExport,
+    };
+
+    let skill = SkillArtifact::new(
+        "function f(cap) { for (let i=0; i<300; i++) { try { cap.write_file('virtual/a.txt', 'x'); } catch (_) {} } try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} return true; }".into(),
+        "combined transcript and allocation failure".into(),
+        vec![],
+        vec![SkillExport { name: "f".into(), signature: "f(): boolean".into() }],
+        vec!["f() === true".into()],
+        CapabilityManifest::new(
+            CapabilityTier::SideEffecting,
+            vec![CapabilityScope::WriteFile { workspace_prefixes: vec!["virtual".into()] }],
+        ).unwrap(),
+    ).unwrap();
+    let error = verify_skill(&skill).expect_err("OOM cannot become a transcript-only failure");
+    assert!(error.is_resource_limit(), "{error:?}");
+}
+
 #[test]
 fn worker_runtime_verification_bounds_terminal_result_expansion() {
     #[cfg(feature = "skills")]

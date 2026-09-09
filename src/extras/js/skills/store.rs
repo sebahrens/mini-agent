@@ -80,18 +80,6 @@ pub(crate) enum ProposalStatus {
 }
 
 impl ProposalStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Evaluating => "evaluating",
-            Self::Deferred => "deferred",
-            Self::Verified => "verified",
-            Self::Rejected => "rejected",
-            Self::AwaitingApproval => "awaiting_approval",
-            Self::Approved => "approved",
-        }
-    }
-
     fn parse(value: &str) -> Result<Self, StoreError> {
         match value {
             "pending" => Ok(Self::Pending),
@@ -330,9 +318,6 @@ pub enum StoreError {
 
     #[error("proposal predecessor is not eligible: {0}")]
     PredecessorIneligible(String),
-
-    #[error("database locked or busy")]
-    Busy,
 
     #[error("unauthorized operation")]
     Unauthorized,
@@ -580,6 +565,8 @@ impl SkillStore {
     ///
     /// In Phase 3, only 'active' status rows are retrievable. Recomputes identity
     /// for each row; invalid rows are skipped and never returned to retrieval.
+    /// Test snapshots use this view; production retrieval loads an index generation.
+    #[cfg(test)]
     pub fn list_retrievable(&self) -> Result<Vec<SkillArtifact>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT id, identity_version, source, description, tags_json,
@@ -1211,6 +1198,7 @@ impl SkillStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn schema_version(&self) -> Result<u32, StoreError> {
         Ok(self
             .db
@@ -2568,6 +2556,7 @@ pub(super) fn consume_approval_authorization(
     Ok(())
 }
 
+#[cfg(test)]
 fn is_full_skill_id(id: &str) -> bool {
     id.len() == 64
         && id

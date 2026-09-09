@@ -775,17 +775,6 @@ mod fake_integrity_probes {
     }
 
     #[test]
-    fn allocation_failure_remains_terminal_after_fake_transcript_exhaustion() {
-        let skill = artifact(
-            "function f(cap) { for (let i=0; i<300; i++) { try { cap.write_file('virtual/a.txt', 'x'); } catch (_) {} } try { new ArrayBuffer(128 * 1024 * 1024); } catch (_) {} return true; }",
-            vec!["f() === true"],
-            vec![HostCapability::WriteFile],
-        );
-        let error = verify_skill(&skill).expect_err("OOM cannot become a transcript-only failure");
-        assert!(error.is_resource_limit(), "{error:?}");
-    }
-
-    #[test]
     fn probe_fake_calls_are_recorded_in_the_transcript() {
         let skill = artifact(
             "function f(cap) { cap.write_file('virtual/b.txt', 'x'); return true; }",
