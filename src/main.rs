@@ -247,6 +247,8 @@ async fn run_inner() -> anyhow::Result<()> {
         || cli.promote_learned_skill.is_some()
         || cli.retire_learned_skill.is_some()
         || cli.reevaluate_learned_skill.is_some()
+        || cli.list_learned_skill_suites
+        || cli.disable_learned_skill_suite.is_some()
     {
         let feedback = cli.learned_skill_feedback.as_deref().map(|skill_id| {
             extras::js::skills::operations::FeedbackOperation {
@@ -303,6 +305,15 @@ async fn run_inner() -> anyhow::Result<()> {
                 cli.reevaluate_learned_skill
                     .as_deref()
                     .map(extras::js::skills::operations::LibraryOperation::Reevaluate)
+            })
+            .or_else(|| {
+                cli.list_learned_skill_suites
+                    .then_some(extras::js::skills::operations::LibraryOperation::ListSuites)
+            })
+            .or_else(|| {
+                cli.disable_learned_skill_suite
+                    .as_deref()
+                    .map(extras::js::skills::operations::LibraryOperation::DisableSuite)
             });
         let purge = cli.purge_learned_skill.as_deref().map(|skill_id| {
             extras::js::skills::operations::PurgeOperation {

@@ -365,6 +365,57 @@ pub struct Cli {
 
     #[cfg(feature = "skills")]
     #[arg(
+        long = "list-learned-skill-suites",
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "learned_skill_proposal",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill",
+            "retire_learned_skill",
+            "reevaluate_learned_skill",
+            "distill_learned_skill",
+            "disable_learned_skill_suite",
+        ],
+        help = "List trusted held-out suite IDs and enabled state without hidden cases, then exit"
+    )]
+    pub list_learned_skill_suites: bool,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "disable-learned-skill-suite",
+        value_name = "SHA256",
+        conflicts_with_all = [
+            "learned_skill_stats",
+            "list_learned_skill_proposals",
+            "learned_skill_proposal",
+            "purge_learned_skill",
+            "compact_learned_skill_events",
+            "learned_skill_feedback",
+            "import_learned_skill",
+            "install_learned_skill_seeds",
+            "approve_learned_skill",
+            "reject_learned_skill",
+            "activate_learned_skill",
+            "promote_learned_skill",
+            "retire_learned_skill",
+            "reevaluate_learned_skill",
+            "distill_learned_skill",
+            "list_learned_skill_suites",
+        ],
+        help = "Disable one trusted held-out suite as the local owner; validated reimport re-enables it"
+    )]
+    pub disable_learned_skill_suite: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
         long = "distill-learned-skill",
         value_names = ["SESSION_ID", "TOOL_CALL_ID"],
         num_args = 2,
@@ -1445,6 +1496,51 @@ mod tests {
                 "--learned-skill-proposal",
                 &"c".repeat(64),
                 "--list-learned-skill-proposals",
+            ])
+            .is_err()
+        );
+
+        let id = "d".repeat(64);
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--list-learned-skill-suites",
+                "--learned-skill-json"
+            ])
+            .unwrap()
+            .list_learned_skill_suites
+        );
+        assert_eq!(
+            Cli::try_parse_from(["mini-agent", "--disable-learned-skill-suite", &id])
+                .unwrap()
+                .disable_learned_skill_suite,
+            Some(id.clone())
+        );
+        for new_mode in [
+            vec!["--list-learned-skill-suites"],
+            vec!["--disable-learned-skill-suite", id.as_str()],
+        ] {
+            for other_mode in [
+                vec!["--learned-skill-stats"],
+                vec!["--import-learned-skill", "package.json"],
+                vec!["--reevaluate-learned-skill", id.as_str()],
+                vec!["--distill-learned-skill", "session", "call"],
+            ] {
+                let mut args = vec!["mini-agent"];
+                args.extend(new_mode.iter().copied());
+                args.extend(other_mode);
+                assert!(
+                    Cli::try_parse_from(args).is_err(),
+                    "suite operation must not be silently ignored"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--list-learned-skill-suites",
+                "--disable-learned-skill-suite",
+                &id
             ])
             .is_err()
         );

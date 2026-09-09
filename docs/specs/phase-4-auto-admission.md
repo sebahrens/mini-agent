@@ -12,7 +12,7 @@
 independent held-out cases, and human approval into canary state.
 
 **Shipped-binary status**: a build with the `skills` feature exposes authenticated local-owner
-commands for package/held-out-suite import, seed installation, stats, approval, rejection, and
+commands for package/held-out-suite import, seed installation, stats, reevaluation, approval, rejection, and
 explicit lineage-root activation. Trusted `enable_skill_proposals = true` configuration registers
 `propose_skill` and starts the bounded proposal/admission workers; it is off by default. Proposals
 stop at `awaiting_approval`, approval creates a non-retrievable canary, and activation remains a
@@ -50,9 +50,10 @@ agent proposal → pending → evaluating → verified → awaiting approval →
 
 `deferred` parks a proposal whose *evaluation infrastructure* failed or whose claim budget was
 spent. It is not a judgement about the artifact: the authenticated reevaluation transition can
-return it to `pending`. No shipped command reopens a deferred row today — the only production
-caller of that transition is `--import-learned-skill`, and only for a `verified` +
-`held_out_suite_required` row after it imports a matching baseline.
+return it to `pending`. The shipped `--reevaluate-learned-skill <SHA256>` command reopens a
+proposal deferred for infrastructure failure or an exhausted claim budget, or a `verified` +
+`held_out_suite_required` proposal. Importing the same package also requeues recoverable proposals
+after restoring its matching baseline.
 
 The evaluator:
 
@@ -165,9 +166,9 @@ is still `pending` or holding an expired `evaluating` lease is swept to
 `evaluation_attempts_exhausted`. Both reason codes are accepted by the same authenticated
 reevaluation transition that reopens a `verified` + `held_out_suite_required` row; reopening an
 exhausted row also clears its spent claim budget, and neither reopen alters identity-bearing bytes
-or resets a deterministic rejection. That transition currently has one production caller —
-`--import-learned-skill`, which uses it only for the `held_out_suite_required` case after importing
-a matching baseline — so a `deferred` row has no operator command to unpark it yet.
+or resets a deterministic rejection. The shipped `--reevaluate-learned-skill` command invokes
+this transition directly for all three parking reasons. `--import-learned-skill` also requeues
+recoverable proposals while importing their matching baselines.
 
 Claims use persisted leases and retries so a crash cannot strand a row in `evaluating`.
 Evaluation reports bind proposal ID, artifact ID, verifier version, matched held-out suite hashes,
@@ -354,6 +355,18 @@ Suite IDs are SHA-256 hashes of a versioned canonical payload. Human/admin-only 
 bounds and records approval. The proposal API cannot list suite inputs or expected outputs, write
 the suite database, or choose which suite runs.
 
+Authenticated reimport of the same canonical suite restores damaged stored representations and
+re-enables the suite. A repair records fresh approval metadata and advances the row version;
+an unchanged enabled suite is an idempotent no-op. Changing suite content produces a new ID.
+
+The local-owner `--list-learned-skill-suites` command lists canonical suite IDs and enabled state
+without exposing selectors, cases, fixture responses, or transcripts. The authenticated
+`--disable-learned-skill-suite <SHA256>` command disables one suite without deleting its immutable
+data or historical report bindings. Repeated disabling is idempotent; an unknown ID fails.
+After correcting the corpus, `--reevaluate-learned-skill` requeues a parked proposal. Explicit
+validated reimport re-enables a disabled suite. These commands are unavailable to proposal APIs;
+approval continues to revalidate the currently enabled corpus.
+
 Within each case, spawn fixtures must have distinct `(program, args)` keys and fetch fixtures
 must have distinct `(url, method)` keys. Duplicate keys are rejected at import, even when their
 responses agree. Different cases own independent fixture maps and may reuse the same keys.
@@ -382,8 +395,8 @@ requests reevaluation. Agent-authored embedded tests alone never satisfy this ga
 The authenticated reevaluation transition atomically returns only that blocked proposal and its
 revision to `pending`; it cannot reset deterministic rejection or alter identity-bearing bytes. It
 also accepts the two `deferred` reason codes above. In the shipped binary this transition is
-invoked from `--import-learned-skill` alone: importing a package whose held-out baseline is bundled
-with it imports the baseline and then requeues the blocked proposal in the same command.
+available through `--reevaluate-learned-skill <SHA256>`. Importing a package whose held-out
+baseline is bundled with it also imports the baseline and requeues a recoverable proposal.
 
 ## Promotion gate
 

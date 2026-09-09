@@ -338,6 +338,8 @@ reference — package format, held-out suites, feedback semantics, stats columns
 | `--import-learned-skill <DIR_OR_JSON>` | Import and contained-verify learned-skill JSON package(s) for approval. A directory imports 1–32 sorted `.json` files. |
 | `--install-learned-skill-seeds` | Import and contained-verify the five bundled pure seed packages. Reports each seed independently and is idempotent. |
 | `--list-learned-skill-proposals` | List proposals still awaiting an operator decision, as TSV, then exit. A `verified` proposal whose reason is `held_out_suite_required` is listed but is not approvable. |
+| `--list-learned-skill-suites` | List trusted held-out suite IDs and enabled state, without hidden cases or fixtures. Supports `--learned-skill-json`. |
+| `--disable-learned-skill-suite <SHA256>` | Disable one trusted suite as the local owner, preserving its data and historical reports. Repeated disabling is idempotent; validated reimport re-enables it. |
 | `--learned-skill-proposal <SHA256>` | Print one proposal's admission outcome, including the `reason_code` and `report_id` of a rejected or deferred decision, then exit. Unlike the listing, this also finds terminal proposals. |
 | `--learned-skill-stats` | Print the per-revision usage table (TSV) and exit. See [Reading `--learned-skill-stats`](SKILLS.md#reading---learned-skill-stats) before drawing conclusions from the `success` column. |
 | `--approve-learned-skill <SHA256>` | Approve an evaluated proposal into the non-retrievable canary state. Requires `awaiting_approval`. |

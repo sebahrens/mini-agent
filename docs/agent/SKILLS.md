@@ -157,6 +157,18 @@ make the import command fail, rather than misclassifying infrastructure failure 
 Replacement activation continues to require the
 evidence-based promotion path and is deliberately rejected by this root-activation command.
 
+Reimporting the same validated package repairs damaged stored baseline data and re-enables its
+held-out suites. Repairs retain each suite's canonical ID and record fresh local-owner approval.
+Repeated imports of an intact enabled suite remain idempotent.
+
+Use `--list-learned-skill-suites` to inspect suite IDs and enabled state without revealing hidden
+cases or fixtures. To remove an obsolete or damaged suite from evaluation, run
+`--disable-learned-skill-suite <SUITE_SHA256>`, then
+`--reevaluate-learned-skill <PROPOSAL_SHA256>` for a parked proposal. Disabling preserves the
+suite data and historical reports; approval still rechecks the enabled corpus. Both suite
+commands support `--learned-skill-json` and require a separate invocation from other library
+operations.
+
 `--install-learned-skill-seeds` imports five bundled pure packages: JSON, bounded TOML, and CSV
 parsing, whole-file unified-diff formatting, and aligned text-table formatting. The seeds use the
 same held-out evaluation and two-action approval/activation route as external packages; they are

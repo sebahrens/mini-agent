@@ -62,6 +62,8 @@ pub(crate) enum LibraryOperation<'a> {
     Promote(&'a str),
     Retire(&'a str),
     Reevaluate(&'a str),
+    ListSuites,
+    DisableSuite(&'a str),
 }
 
 /// Explicit privacy purge of one revision.
@@ -717,7 +719,32 @@ fn run_library_operation(
         LibraryOperation::Promote(id) => promote_replacement_skill(id, paths, embedding),
         LibraryOperation::Retire(id) => retire_skill(id, paths, embedding),
         LibraryOperation::Reevaluate(id) => reevaluate_skill(id, paths, embedding),
+        LibraryOperation::ListSuites => {
+            let store = SkillStore::open_at(paths)?;
+            suite_listing_report(&store)?.emit();
+            Ok(())
+        }
+        LibraryOperation::DisableSuite(id) => {
+            let mut store = SkillStore::open_at(paths)?;
+            let admin = AdminIdentity::authenticated("local-owner")?;
+            let changed = store.disable_held_out_suite(Some(&admin), id)?;
+            OperatorReport::new("disable-suite")
+                .with("id", id)
+                .with("enabled", false)
+                .with("idempotent", !changed)
+                .emit();
+            Ok(())
+        }
     }
+}
+
+fn suite_listing_report(store: &SkillStore) -> anyhow::Result<OperatorReport> {
+    let suites: Vec<_> = store
+        .held_out_suite_states()?
+        .into_iter()
+        .map(|(id, enabled)| serde_json::json!({ "id": id, "enabled": enabled }))
+        .collect();
+    Ok(OperatorReport::new("list-suites").with("suites", suites))
 }
 
 /// Requeue a proposal that admission parked, without an identical re-import.
@@ -3678,6 +3705,118 @@ mod tests {
             .unwrap()
             .id;
 
+        let admin = AdminIdentity::authenticated("local-owner").unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
+        let baseline = package.held_out_suites[0].clone();
+        let baseline_id = baseline.clone().import(&mut store, &admin, 1).unwrap();
+        let mut extra_id = String::new();
+        for index in 0..32 {
+            let mut extra = baseline.clone();
+            extra.cases.truncate(1);
+            extra.cases[0]
+                .expression
+                .push_str(&format!(" /* extra {index} */"));
+            extra_id = extra.import(&mut store, &admin, 1).unwrap();
+        }
+        drop(store);
+        import_package_within(package, &paths, None, "test-seed", Duration::ZERO).unwrap();
+        let mut evaluator = AdmissionEvaluator::new(
+            SkillStore::open_at(&paths).unwrap(),
+            Arc::new(Embedder::new().unwrap()),
+            "corpus-recovery-test",
+        )
+        .unwrap();
+        let mut now = current_timestamp().unwrap();
+        for attempt in 1..=MAX_EVALUATION_ATTEMPTS {
+            assert!(matches!(
+                evaluator.evaluate_next(now),
+                Err(super::super::admission::AdmissionError::Retryable(_))
+            ));
+            let proposal = evaluator.store().get_proposal(&skill_id).unwrap().unwrap();
+            if attempt < MAX_EVALUATION_ATTEMPTS {
+                now = proposal.next_attempt_at.unwrap();
+            }
+        }
+        assert_eq!(
+            evaluator
+                .store()
+                .get_proposal(&skill_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::Deferred
+        );
+        let listing: serde_json::Value = serde_json::from_str(
+            &suite_listing_report(evaluator.store())
+                .unwrap()
+                .render(true),
+        )
+        .unwrap();
+        let entries = listing["suites"].as_array().unwrap();
+        assert_eq!(entries.len(), 33);
+        for entry in entries {
+            assert_eq!(
+                entry.as_object().unwrap().len(),
+                2,
+                "listing exposes only ID and enabled state"
+            );
+            assert_eq!(entry["id"].as_str().unwrap().len(), 64);
+            assert_eq!(entry["enabled"], true);
+        }
+        drop(evaluator);
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::ListSuites),
+            &paths,
+            None,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            run(
+                None,
+                false,
+                None,
+                Some(LibraryOperation::DisableSuite(&extra_id)),
+                &paths,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            run(
+                None,
+                false,
+                None,
+                Some(LibraryOperation::DisableSuite(&"0".repeat(64))),
+                &paths,
+                None
+            )
+            .is_err()
+        );
+        run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Reevaluate(&skill_id)),
+            &paths,
+            None,
+        )
+        .unwrap();
+        let store = SkillStore::open_at(&paths).unwrap();
+        assert_eq!(
+            store.get_proposal(&skill_id).unwrap().unwrap().status,
+            ProposalStatus::Pending
+        );
+        assert!(
+            store
+                .held_out_suite_states()
+                .unwrap()
+                .contains(&(extra_id.clone(), false))
+        );
+        drop(store);
+        let package = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
         import_package(package, &paths, None, "test-seed").unwrap();
         assert_eq!(
             SkillStore::open_at(&paths)
@@ -3688,6 +3827,21 @@ mod tests {
                 .status,
             ProposalStatus::AwaitingApproval
         );
+        // An authenticated package reimport must repair a damaged baseline
+        // before the existing proposal can pass the human approval gate.
+        let store = SkillStore::open_at(&paths).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE held_out_suites SET cases_json = '[]' WHERE suite_id = ?1",
+                [&baseline_id],
+            )
+            .unwrap();
+        drop(store);
+        assert!(review_proposal(&skill_id, true, &paths, None).is_err());
+        let package = serde_json::from_str(SEED_PACKAGES[0].1).unwrap();
+        import_package(package, &paths, None, "test-seed-repair")
+            .expect("reimport repairs the trusted baseline");
         review_proposal(&skill_id, true, &paths, None).unwrap();
         assert_eq!(
             SkillStore::open_at(&paths)

@@ -44,7 +44,7 @@ planning context only; it cannot override the cited section.
 their contracts are implemented and regression-tested. It does not mean every one of them is
 reachable from the shipped binary. Reachable today: retrieval, attributed telemetry, automatic
 quarantine, retention/compaction, privacy purge, and the local-owner commands for import, stats,
-proposal listing, feedback, approval, rejection, root activation, **replacement promotion**, and
+proposal listing, reevaluation, feedback, approval, rejection, root activation, **replacement promotion**, and
 **retirement**. Not reachable: `rollback_replacement` (a tested library operation with no
 production caller and no command), repair (`skills/repair.rs` is `#[cfg(test)]`), the evidence
 decision scheduler (`skills/scheduler.rs` is `#[cfg(test)]`), and automatic evidence-threshold

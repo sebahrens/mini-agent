@@ -231,11 +231,85 @@ fn skill_held_out_evaluator_import_selection_and_report_are_reproducible() {
     let first = evaluate(&store, &artifact, None).expect("evaluate");
     let second = evaluate(&store, &artifact, None).expect("repeat");
     assert_eq!(first, second);
-    assert_eq!(first.suite_hashes, vec![first_id]);
+    assert_eq!(first.suite_hashes, vec![first_id.clone()]);
     let serialized = serde_json::to_string(&first).expect("report");
     assert!(!serialized.contains("normalize('"));
     assert!(!serialized.contains("value"));
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(
+        selected[0].approved_at, 10,
+        "unchanged reimport keeps original approval"
+    );
+    for (index, assignment) in [
+        "selector_json = '{}'",
+        "cases_json = '[]'",
+        "canonical_payload = '{}'",
+        "content_hash = '0000000000000000000000000000000000000000000000000000000000000000'",
+        "enabled = 0",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before: i64 = store
+            .conn()
+            .query_row(
+                "SELECT row_version FROM held_out_suites WHERE suite_id = ?1",
+                [&first_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                &format!("UPDATE held_out_suites SET {assignment} WHERE suite_id = ?1"),
+                [&first_id],
+            )
+            .unwrap();
+        assert!(
+            !matches!(select_suites(&store, &artifact), Ok(suites) if !suites.is_empty()),
+            "fixture must damage or disable selection: {assignment}"
+        );
+        let now = 20 + index as i64;
+        assert_eq!(
+            pure_suite("value")
+                .import(&mut store, &admin, now)
+                .expect(assignment),
+            first_id
+        );
+        let restored = select_suites(&store, &artifact).expect("valid reimport repairs selection");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].approved_at, now,
+            "repair records fresh approval"
+        );
+        assert_eq!(
+            evaluate(&store, &artifact, None).unwrap(),
+            first,
+            "{assignment}"
+        );
+        let after: i64 = store
+            .conn()
+            .query_row(
+                "SELECT row_version FROM held_out_suites WHERE suite_id = ?1",
+                [&first_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "repair advances row version exactly once"
+        );
+        pure_suite("value")
+            .import(&mut store, &admin, now + 100)
+            .unwrap();
+        assert_eq!(
+            select_suites(&store, &artifact).unwrap()[0].approved_at,
+            now,
+            "repeat repair is an idempotent no-op"
+        );
+    }
+    drop(store);
+    std::fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]

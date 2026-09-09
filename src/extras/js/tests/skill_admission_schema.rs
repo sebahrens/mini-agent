@@ -821,6 +821,77 @@ fn held_out_suite_schema_requires_authenticated_import_and_hashes_content() {
     let selected = store.enabled_held_out_suites().expect("trusted selection");
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].content_hash, expected_hash);
+    store
+        .conn_mut()
+        .execute(
+            "UPDATE held_out_suites SET cases_json = '[]' WHERE suite_id = ?1",
+            [&suite.suite_id],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            store.import_held_out_suite(None, &suite, 11),
+            Err(StoreError::Unauthorized)
+        ),
+        "repair requires authentication just like first import"
+    );
+    assert_eq!(store.enabled_held_out_suites().unwrap()[0].cases_json, "[]");
+    store
+        .import_held_out_suite(Some(&admin), &suite, 12)
+        .expect("authenticated repair");
+    let restored = store.enabled_held_out_suites().unwrap();
+    assert_eq!(restored[0].cases_json, suite.cases_json);
+    assert_eq!(restored[0].approved_at, 12);
+    assert!(matches!(
+        store.disable_held_out_suite(None, &suite.suite_id),
+        Err(StoreError::Unauthorized)
+    ));
+    assert_eq!(
+        store.held_out_suite_states().unwrap(),
+        vec![(suite.suite_id.clone(), true)]
+    );
+    let state =
+        |store: &SkillStore| -> (String, i64) {
+            store.conn().query_row(
+            "SELECT canonical_payload, row_version FROM held_out_suites WHERE suite_id = ?1",
+            [&suite.suite_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap()
+        };
+    let before_disable = state(&store);
+    assert!(
+        store
+            .disable_held_out_suite(Some(&admin), &suite.suite_id)
+            .unwrap()
+    );
+    assert_eq!(
+        state(&store),
+        (suite.canonical_payload.clone(), before_disable.1 + 1)
+    );
+    assert!(
+        !store
+            .disable_held_out_suite(Some(&admin), &suite.suite_id)
+            .unwrap()
+    );
+    assert_eq!(
+        state(&store),
+        (suite.canonical_payload.clone(), before_disable.1 + 1),
+        "repeated disabling preserves both data and row version"
+    );
+    assert!(matches!(
+        store.disable_held_out_suite(Some(&admin), &"0".repeat(64)),
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(
+        store.held_out_suite_states().unwrap(),
+        vec![(suite.suite_id.clone(), false)]
+    );
+    store
+        .import_held_out_suite(Some(&admin), &suite, 13)
+        .unwrap();
+    assert_eq!(
+        store.held_out_suite_states().unwrap(),
+        vec![(suite.suite_id.clone(), true)]
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

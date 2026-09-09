@@ -1741,43 +1741,77 @@ impl SkillStore {
         }
         serde_json::from_str::<serde_json::Value>(&suite.selector_json)?;
         serde_json::from_str::<serde_json::Value>(&suite.cases_json)?;
-        self.db
-            .execute(
-                "INSERT INTO held_out_suites (
+        self.db.execute(
+            "INSERT INTO held_out_suites (
                 suite_id, selector_json, cases_json, canonical_payload, approved_by,
                 approved_at, content_hash, enabled, row_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-                params![
-                    suite.suite_id,
-                    suite.selector_json,
-                    suite.cases_json,
-                    suite.canonical_payload,
-                    admin.principal(),
-                    now,
-                    content_hash,
-                    i64::from(suite.enabled)
-                ],
-            )
-            .or_else(|error| {
-                if error.to_string().contains("UNIQUE") {
-                    let existing: Option<String> = self
-                        .db
-                        .query_row(
-                            "SELECT content_hash FROM held_out_suites WHERE suite_id = ?1",
-                            [&suite.suite_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    if existing.as_deref() == Some(content_hash.as_str()) {
-                        Ok(0)
-                    } else {
-                        Err(error)
-                    }
-                } else {
-                    Err(error)
-                }
-            })?;
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+             ON CONFLICT(suite_id) DO UPDATE SET
+                 selector_json = excluded.selector_json,
+                 cases_json = excluded.cases_json,
+                 canonical_payload = excluded.canonical_payload,
+                 approved_by = excluded.approved_by,
+                 approved_at = excluded.approved_at,
+                 content_hash = excluded.content_hash,
+                 enabled = excluded.enabled,
+                 row_version = held_out_suites.row_version + 1
+             WHERE held_out_suites.selector_json IS NOT excluded.selector_json
+                OR held_out_suites.cases_json IS NOT excluded.cases_json
+                OR held_out_suites.canonical_payload IS NOT excluded.canonical_payload
+                OR held_out_suites.content_hash IS NOT excluded.content_hash
+                OR held_out_suites.enabled IS NOT excluded.enabled",
+            params![
+                suite.suite_id,
+                suite.selector_json,
+                suite.cases_json,
+                suite.canonical_payload,
+                admin.principal(),
+                now,
+                content_hash,
+                i64::from(suite.enabled)
+            ],
+        )?;
         Ok(())
+    }
+
+    /// Source-free suite inventory for the local-owner operator surface.
+    pub(crate) fn held_out_suite_states(&self) -> Result<Vec<(String, bool)>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT suite_id, enabled FROM held_out_suites ORDER BY suite_id")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Disable one trusted suite without deleting historical report bindings.
+    /// Returns whether this invocation changed the suite's enabled state.
+    pub(crate) fn disable_held_out_suite(
+        &mut self,
+        admin: Option<&AdminIdentity>,
+        suite_id: &str,
+    ) -> Result<bool, StoreError> {
+        admin.ok_or(StoreError::Unauthorized)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enabled: bool = tx
+            .query_row(
+                "SELECT enabled FROM held_out_suites WHERE suite_id = ?1",
+                [suite_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(suite_id.to_string()))?;
+        if enabled {
+            tx.execute(
+                "UPDATE held_out_suites SET enabled = 0, row_version = row_version + 1
+                 WHERE suite_id = ?1",
+                [suite_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(enabled)
     }
 
     /// Trusted evaluator-only suite access. Proposal/model APIs do not expose this.
