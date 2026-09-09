@@ -47,7 +47,14 @@ lets cancelled MCP initialization finish process cleanup, explicitly closes MCP
 managers in rejected or queued prebuild results, and waits for scoped children.
 The result receiver stays with that owner. A memory refresh retires the stale
 prebuild before constructing a replacement; a retirement failure stops the new
-turn. Receiving a result preserves its owner until retirement.
+turn. Foreground agent builds invalidate the captured startup agent; prompt
+selections also invalidate it when they clear the cache without rebuilding.
+Consuming a late result retains its MCP services and rebuilds with the current
+model, prompt, and session. A newer foreground MCP manager remains authoritative,
+and duplicate startup connections are closed. Pending services are consumed even
+when a foreground agent is already cached, so interruption cannot expose an old
+startup agent later. Read-only commands leave the startup snapshot valid. Receiving
+a result preserves its owner until retirement.
 Retirement has a five-second bound per owner; a timeout is reported in the log
 and remaining cleanup still runs.
 

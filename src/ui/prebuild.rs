@@ -13,11 +13,13 @@ pub(crate) struct AgentPrebuild {
     task: tokio::task::JoinHandle<()>,
     scope: Arc<AgentWorkScope>,
     receiver: Option<mpsc::Receiver<PrebuildPayload>>,
+    invalidated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentPrebuild {
     pub(crate) fn start(
         scope: Arc<AgentWorkScope>,
+        invalidated: Arc<std::sync::atomic::AtomicBool>,
         build: impl Future<Output = PrebuildPayload> + Send + 'static,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(1);
@@ -40,7 +42,12 @@ impl AgentPrebuild {
             task,
             scope,
             receiver: Some(receiver),
+            invalidated,
         }
+    }
+
+    pub(crate) fn agent_is_current(&self) -> bool {
+        !self.invalidated.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PrebuildPayload> {
@@ -128,20 +135,24 @@ mod tests {
     async fn prebuild_retirement_waits_for_cooperative_cleanup_and_owned_work() {
         let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
         let (cleaned_tx, mut cleaned_rx) = tokio::sync::oneshot::channel();
-        let prebuild = AgentPrebuild::start(scope.clone(), async move {
-            let _child = crate::agent::runner::spawn_blocking_scoped(|| ());
-            crate::agent::runner::current_work_scope_cancelled().await;
-            let _ = cleaned_tx.send(());
-            let agent = test_agent();
-            #[cfg(feature = "mcp")]
-            {
-                (agent, None)
-            }
-            #[cfg(not(feature = "mcp"))]
-            {
-                agent
-            }
-        });
+        let prebuild = AgentPrebuild::start(
+            scope.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            async move {
+                let _child = crate::agent::runner::spawn_blocking_scoped(|| ());
+                crate::agent::runner::current_work_scope_cancelled().await;
+                let _ = cleaned_tx.send(());
+                let agent = test_agent();
+                #[cfg(feature = "mcp")]
+                {
+                    (agent, None)
+                }
+                #[cfg(not(feature = "mcp"))]
+                {
+                    agent
+                }
+            },
+        );
         tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2)).unwrap())
             .await
             .unwrap();
@@ -167,11 +178,15 @@ mod tests {
         let scope = AgentWorkScope::new();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
-        let prebuild = AgentPrebuild::start(scope.clone(), async move {
-            let _guard = dropped_tx;
-            entered_tx.send(()).unwrap();
-            std::future::pending().await
-        });
+        let prebuild = AgentPrebuild::start(
+            scope.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            async move {
+                let _guard = dropped_tx;
+                entered_tx.send(()).unwrap();
+                std::future::pending().await
+            },
+        );
         entered_rx.await.unwrap();
         let error = prebuild
             .retire(Duration::from_millis(20))

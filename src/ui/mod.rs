@@ -537,36 +537,62 @@ pub(crate) type PrebuildPayload = (AnyAgent, Option<McpClientManager>);
 #[cfg(not(feature = "mcp"))]
 pub(crate) type PrebuildPayload = AnyAgent;
 
-/// If the background prebuild hasn't delivered yet, block until it does.
-#[cfg(feature = "mcp")]
-pub(crate) async fn resolve_prebuild<'a>(
-    agent: &'a mut Option<AnyAgent>,
-    mcp_manager: &'a mut Option<McpClientManager>,
-    prebuild: &'a mut Option<prebuild::AgentPrebuild>,
+/// Consume startup services before using any cached foreground agent. A model
+/// or context rebuild must not leave a late startup result available for reuse.
+pub(crate) async fn resolve_prebuild(
+    agent: &mut Option<AnyAgent>,
+    ui: &mut UiContext<'_>,
+    prebuild: &mut Option<prebuild::AgentPrebuild>,
+    reasoning_enabled: bool,
 ) {
-    if agent.is_some() {
-        return;
-    }
     if let Some(prebuild) = prebuild.as_mut()
-        && let Some((a, mcp)) = prebuild.recv().await
+        && let Some(payload) = prebuild.recv().await
     {
-        *agent = Some(a);
-        *mcp_manager = mcp;
+        adopt_prebuild(
+            agent,
+            ui,
+            payload,
+            prebuild.agent_is_current(),
+            reasoning_enabled,
+        )
+        .await;
     }
 }
 
-#[cfg(not(feature = "mcp"))]
-pub(crate) async fn resolve_prebuild<'a>(
-    agent: &'a mut Option<AnyAgent>,
-    prebuild: &'a mut Option<prebuild::AgentPrebuild>,
+pub(crate) async fn adopt_prebuild(
+    agent: &mut Option<AnyAgent>,
+    ui: &mut UiContext<'_>,
+    payload: PrebuildPayload,
+    current: bool,
+    reasoning_enabled: bool,
 ) {
-    if agent.is_some() {
-        return;
-    }
-    if let Some(prebuild) = prebuild.as_mut()
-        && let Some(a) = prebuild.recv().await
-    {
-        *agent = Some(a);
+    let current = current && agent.is_none();
+    #[cfg(feature = "mcp")]
+    let (built_agent, manager) = payload;
+    #[cfg(not(feature = "mcp"))]
+    let built_agent = payload;
+    #[cfg(feature = "mcp")]
+    let current = {
+        let current = current && ui.mcp_manager.is_none();
+        if ui.mcp_manager.is_none() {
+            ui.mcp_manager = manager;
+        } else if let Some(manager) = manager {
+            // A newer foreground connection remains authoritative. The stale
+            // agent must release its clients before retiring duplicate services.
+            drop(built_agent);
+            manager.shutdown().await;
+            *agent = None;
+            ensure_agent(agent, ui, reasoning_enabled).await;
+            return;
+        }
+        current
+    };
+    if current {
+        *agent = Some(built_agent);
+    } else {
+        drop(built_agent);
+        *agent = None;
+        ensure_agent(agent, ui, reasoning_enabled).await;
     }
 }
 
@@ -592,11 +618,8 @@ pub(crate) async fn start_main_run(
             stale.retire(Duration::from_secs(5)).await?;
         }
     }
-    // Wait for the background prebuild if it hasn't completed yet.
-    #[cfg(feature = "mcp")]
-    resolve_prebuild(&mut run.agent, &mut ui.mcp_manager, prebuild).await;
-    #[cfg(not(feature = "mcp"))]
-    resolve_prebuild(&mut run.agent, prebuild).await;
+    // Even an explicitly rebuilt agent must wait for pending startup services.
+    resolve_prebuild(&mut run.agent, ui, prebuild, slash.reasoning_enabled).await;
 
     ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
     run.request_tool_results_cleared = ui

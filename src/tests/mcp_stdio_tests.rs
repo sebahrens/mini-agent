@@ -1121,14 +1121,18 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
         let scope = crate::agent::runner::AgentWorkScope::new();
         let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
         let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
-        let prebuild = AgentPrebuild::start(scope.clone(), async move {
-            let manager = McpClientManager::connect_all_in_binding(&servers, &workspace).await;
-            if delivery == "rejected" {
-                connected_tx.send(()).unwrap();
-                publish_rx.await.unwrap();
-            }
-            (test_agent(), Some(manager))
-        });
+        let prebuild = AgentPrebuild::start(
+            scope.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            async move {
+                let manager = McpClientManager::connect_all_in_binding(&servers, &workspace).await;
+                if delivery == "rejected" {
+                    connected_tx.send(()).unwrap();
+                    publish_rx.await.unwrap();
+                }
+                (test_agent(), Some(manager))
+            },
+        );
         let mut prebuild = Some(prebuild);
         let mut pids = Vec::new();
         for lease in leases
@@ -1177,6 +1181,38 @@ async fn tui_prebuild_retirement_reaps_pending_queued_and_rejected_mcp_results()
     fixture.cleanup();
 }
 
+fn isolated_prebuild_test(test_name: &str) -> bool {
+    if std::env::var("ZS_TEST_PREBUILD_CASE").as_deref() == Ok(test_name) {
+        return false;
+    }
+    let fixture = FixtureBuild::compile();
+    let root = fixture.root.canonicalize().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", test_name, "--nocapture"])
+        .current_dir(&root)
+        .env("ZS_TEST_PREBUILD_CASE", test_name);
+    for name in [
+        "CONFIG",
+        "DATA",
+        "LOCAL_DATA",
+        "STATE",
+        "CACHE",
+        "CREDENTIALS",
+    ] {
+        child.env(format!("ZS_{name}_DIR"), root.join(name));
+    }
+    let output = child.output().unwrap();
+    fixture.cleanup();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[cfg(feature = "memory")]
 #[tokio::test]
 async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
@@ -1185,32 +1221,9 @@ async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
     use crate::ui::state::{AgentRunState, SlashState, UiContext};
     use clap::Parser;
 
-    // Persistent memory uses process roots. Isolate this production entry-point
-    // test in a child, without replacing roots used by other tests or the user.
-    if std::env::var_os("ZS_TEST_MEMORY_PREFLIGHT").is_none() {
-        let fixture = FixtureBuild::compile();
-        let root = fixture.root.canonicalize().unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact", "tests::mcp_stdio_tests::memory_refresh_retires_queued_prebuild_before_starting_turn", "--nocapture"])
-            .current_dir(&root).env("ZS_TEST_MEMORY_PREFLIGHT", "1");
-        for name in [
-            "CONFIG",
-            "DATA",
-            "LOCAL_DATA",
-            "STATE",
-            "CACHE",
-            "CREDENTIALS",
-        ] {
-            child.env(format!("ZS_{name}_DIR"), root.join(name));
-        }
-        let output = child.output().unwrap();
-        fixture.cleanup();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if isolated_prebuild_test(
+        "tests::mcp_stdio_tests::memory_refresh_retires_queued_prebuild_before_starting_turn",
+    ) {
         return;
     }
 
@@ -1228,11 +1241,16 @@ async fn memory_refresh_retires_queued_prebuild_before_starting_turn() {
     let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
     let build_workspace = workspace.clone();
     let (scope, started, release) = AgentWorkScope::new_with_blocking_test_gate();
-    let prebuild = AgentPrebuild::start(scope.clone(), async move {
-        let manager = McpClientManager::connect_all_in_binding(&servers, &build_workspace).await;
-        let _child = spawn_blocking_scoped(|| ());
-        (test_agent(), Some(manager))
-    });
+    let prebuild = AgentPrebuild::start(
+        scope.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        async move {
+            let manager =
+                McpClientManager::connect_all_in_binding(&servers, &build_workspace).await;
+            let _child = spawn_blocking_scoped(|| ());
+            (test_agent(), Some(manager))
+        },
+    );
     tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(2)).unwrap())
         .await
         .unwrap();
@@ -1821,4 +1839,252 @@ async fn mcp_structured_error_explains_the_failure() {
         error.to_string().contains("quota exhausted"),
         "a structured-only error must still explain itself: {error}"
     );
+}
+
+#[tokio::test]
+async fn delayed_prebuild_preserves_configuration_and_services_across_interruption() {
+    use crate::agent::runner::AgentWorkScope;
+    use crate::ui::prebuild::AgentPrebuild;
+    use crate::ui::state::{AgentRunState, SlashState, UiContext};
+    use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if isolated_prebuild_test(
+        "tests::mcp_stdio_tests::delayed_prebuild_preserves_configuration_and_services_across_interruption",
+    ) {
+        return;
+    }
+    // Observe actual provider requests; never contact a model service. Holding
+    // response headers ensures retirement interrupts a genuinely active turn.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (requests_tx, mut requests_rx) = tokio::sync::mpsc::channel(1);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let (header_len, body_len) = loop {
+                let mut chunk = [0u8; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() < 1024 * 1024);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let len = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    assert!(len < 1024 * 1024);
+                    break (end + 4, len);
+                }
+            };
+            while bytes.len() < header_len + body_len {
+                let mut chunk = [0u8; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&bytes[header_len..header_len + body_len]).unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            requests_tx.send((request, release_tx)).await.unwrap();
+            let _ = release_rx.await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    let fixture = FixtureBuild::compile();
+    for scenario in ["unchanged", "model", "prompt", "newer-manager"] {
+        let lease = fixture.lease(scenario);
+        let servers = HashMap::from([(
+            "fixture".to_string(),
+            fixture.config(
+                fixture.executable.display().to_string(),
+                vec!["startup".into()],
+                "normal",
+                &lease,
+            ),
+        )]);
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&fixture.root).unwrap());
+        let manager = McpClientManager::connect_all_in_binding(&servers, &workspace).await;
+        let startup_pid = wait_for_pid(&lease).await;
+        let cli = crate::cli::Cli::parse_from([
+            "mini-agent",
+            "--no-session",
+            "--no-sandbox",
+            "--tools",
+            "probe",
+        ]);
+        let cfg = Config {
+            mcp_servers: Some(servers),
+            ..Config::default()
+        };
+        let mut session = crate::session::Session::new("openrouter", "startup-model", 128_000, "");
+        let mut context = crate::context::load_for_workspace(true, Some(workspace.root()));
+        context.current_prompt = Some("STARTUP_PROMPT_SENTINEL".into());
+        let client = rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .base_url(&endpoint)
+            .build()
+            .unwrap();
+        let sandbox =
+            crate::sandbox::Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+        let mut ui = UiContext::new(
+            &cli,
+            &cfg,
+            &mut session,
+            &mut context,
+            workspace,
+            crate::provider::AnyClient::OpenRouter(client),
+            None,
+            None,
+            sandbox,
+            None,
+        );
+        let old_agent = {
+            let mut build = ui.agent_build_ctx();
+            build.prebuild_invalidated = None;
+            build.mcp_manager = Some(&manager);
+            build.rebuild_agent("startup-model", false).await
+        };
+        let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
+        let scope = AgentWorkScope::new();
+        let mut prebuild = Some(AgentPrebuild::start(
+            scope.clone(),
+            ui.prebuild_invalidated.clone(),
+            async move {
+                publish_rx.await.unwrap();
+                (old_agent, Some(manager))
+            },
+        ));
+        let mut run = AgentRunState::default();
+        let slash = SlashState {
+            show_reasoning: false,
+            reasoning_enabled: false,
+            todo_tools_enabled: false,
+        };
+        let mut newer_pid = None;
+        if scenario == "newer-manager" {
+            let newer_lease = fixture.lease("replacement");
+            let newer = HashMap::from([(
+                "fixture".into(),
+                fixture.config(
+                    fixture.executable.display().to_string(),
+                    vec!["replacement".into()],
+                    "normal",
+                    &newer_lease,
+                ),
+            )]);
+            ui.mcp_manager =
+                Some(McpClientManager::connect_all_in_binding(&newer, &ui.workspace).await);
+            newer_pid = Some(wait_for_pid(&newer_lease).await);
+        }
+        if scenario != "unchanged" {
+            ui.session.model = "current-model".into();
+            ui.context.current_prompt = Some("CURRENT_PROMPT_SENTINEL".into());
+            if scenario == "prompt" {
+                // Dot prompts may change context and clear the cache without
+                // constructing a foreground agent before the first turn.
+                ui.invalidate_prebuild();
+            } else {
+                run.agent = Some(
+                    ui.agent_build_ctx()
+                        .rebuild_agent("current-model", false)
+                        .await,
+                );
+            }
+        }
+        let expected_model = ui.session.model.to_string();
+        let expected_prompt = ui.context.current_prompt.clone().unwrap();
+        let mut first = Box::pin(crate::ui::start_main_run(
+            "first",
+            false,
+            &mut run,
+            &mut ui,
+            &slash,
+            &mut prebuild,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut first)
+                .await
+                .is_err(),
+            "{scenario}: a cached agent must still wait for pending MCP services"
+        );
+        publish_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap();
+        for turn in 0..2 {
+            if turn == 1 {
+                crate::ui::start_main_run(
+                    "after interruption",
+                    false,
+                    &mut run,
+                    &mut ui,
+                    &slash,
+                    &mut prebuild,
+                )
+                .await
+                .unwrap();
+            }
+            let (request, release) =
+                tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(request["model"], expected_model, "{scenario}, turn {turn}");
+            assert!(
+                request["messages"].to_string().contains(&expected_prompt),
+                "{scenario}: {request}"
+            );
+            assert!(
+                request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "probe"),
+                "{scenario}: MCP tool missing from provider request"
+            );
+            run.retire(Duration::from_secs(3)).await.unwrap();
+            let _ = release.send(());
+            assert!(run.agent.is_none());
+        }
+        let observed = call_fixture_tool(ui.mcp_manager.as_ref().unwrap()).await;
+        assert_eq!(
+            observed["args"][0],
+            if newer_pid.is_some() {
+                "replacement"
+            } else {
+                "startup"
+            }
+        );
+        if newer_pid.is_some() {
+            assert_process_reaped(startup_pid).await;
+        } else {
+            assert!(
+                process_is_alive(startup_pid),
+                "startup services must survive agent invalidation"
+            );
+        }
+        prebuild
+            .take()
+            .unwrap()
+            .retire(Duration::from_secs(3))
+            .await
+            .unwrap();
+        shutdown(ui.mcp_manager.take().unwrap()).await;
+        assert_process_reaped(newer_pid.unwrap_or(startup_pid)).await;
+        assert_eq!(scope.active_children(), 0);
+    }
+    server.abort();
+    let _ = server.await;
+    fixture.cleanup();
 }

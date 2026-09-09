@@ -39,6 +39,7 @@ pub(crate) const C_RESULT: crossterm::style::Color = crossterm::style::Color::Da
 pub(crate) const C_ERROR: crossterm::style::Color = crossterm::style::Color::Red;
 
 pub struct SlashCtx<'a> {
+    pub prebuild_invalidated: &'a std::sync::atomic::AtomicBool,
     pub agent: &'a mut Option<AnyAgent>,
     pub client: &'a mut AnyClient,
     pub renderer: &'a mut Renderer,
@@ -68,6 +69,7 @@ impl SlashCtx<'_> {
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
+            prebuild_invalidated: Some(self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
@@ -97,6 +99,7 @@ impl SlashCtx<'_> {
         todo_store: &crate::agent::tools::TodoStore,
     ) -> AnyAgent {
         AgentBuildCtx {
+            prebuild_invalidated: Some(self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
@@ -598,6 +601,7 @@ pub async fn handle_slash(
     let _ = &chain;
     let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
     let mut ctx = SlashCtx {
+        prebuild_invalidated: &ui.prebuild_invalidated,
         agent: &mut run.agent,
         client: &mut ui.client,
         renderer,

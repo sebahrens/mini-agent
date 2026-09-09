@@ -727,55 +727,60 @@ impl<'a> App<'a> {
             let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
             let prebuild_scope = crate::agent::runner::AgentWorkScope::new();
-            let prebuild = super::prebuild::AgentPrebuild::start(prebuild_scope, async move {
-                #[cfg(feature = "mcp")]
-                let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
-                    None
-                } else if let Some(ref servers) = cfg_clone.mcp_servers {
-                    if !servers.is_empty() {
-                        Some(
-                            McpClientManager::connect_all_in_binding(servers, &workspace_clone)
-                                .await,
-                        )
+            let prebuild = super::prebuild::AgentPrebuild::start(
+                prebuild_scope,
+                ui.prebuild_invalidated.clone(),
+                async move {
+                    #[cfg(feature = "mcp")]
+                    let mcp = if !cli_clone.mcp_is_eligible(&cfg_clone) {
+                        None
+                    } else if let Some(ref servers) = cfg_clone.mcp_servers {
+                        if !servers.is_empty() {
+                            Some(
+                                McpClientManager::connect_all_in_binding(servers, &workspace_clone)
+                                    .await,
+                            )
+                        } else {
+                            None
+                        }
                     } else {
                         None
+                    };
+
+                    let a = crate::ui::state::AgentBuildCtx {
+                        prebuild_invalidated: None,
+                        cli: &cli_clone,
+                        cfg: &cfg_clone,
+                        context: &context_clone,
+                        workspace: &workspace_clone,
+                        client: &client_clone,
+                        permission: &permission_clone,
+                        ask_tx: &ask_tx_clone,
+                        sandbox: &sandbox_clone,
+                        read_tracker: &read_tracker_clone,
+                        todo_store: &todo_store_clone,
+                        tool_output_session_id: &tool_output_session_id,
+                        tool_result_spills: &tool_result_spills,
+                        #[cfg(feature = "js")]
+                        js_session_state: &js_session_state,
+                        #[cfg(feature = "skills")]
+                        skill_services: &skill_services_clone,
+                        #[cfg(feature = "mcp")]
+                        mcp_manager: mcp.as_ref(),
                     }
-                } else {
-                    None
-                };
+                    .rebuild_agent(&session_model, reasoning_enabled)
+                    .await;
 
-                let a = crate::ui::state::AgentBuildCtx {
-                    cli: &cli_clone,
-                    cfg: &cfg_clone,
-                    context: &context_clone,
-                    workspace: &workspace_clone,
-                    client: &client_clone,
-                    permission: &permission_clone,
-                    ask_tx: &ask_tx_clone,
-                    sandbox: &sandbox_clone,
-                    read_tracker: &read_tracker_clone,
-                    todo_store: &todo_store_clone,
-                    tool_output_session_id: &tool_output_session_id,
-                    tool_result_spills: &tool_result_spills,
-                    #[cfg(feature = "js")]
-                    js_session_state: &js_session_state,
-                    #[cfg(feature = "skills")]
-                    skill_services: &skill_services_clone,
                     #[cfg(feature = "mcp")]
-                    mcp_manager: mcp.as_ref(),
-                }
-                .rebuild_agent(&session_model, reasoning_enabled)
-                .await;
-
-                #[cfg(feature = "mcp")]
-                {
-                    (a, mcp)
-                }
-                #[cfg(not(feature = "mcp"))]
-                {
-                    a
-                }
-            });
+                    {
+                        (a, mcp)
+                    }
+                    #[cfg(not(feature = "mcp"))]
+                    {
+                        a
+                    }
+                },
+            );
             Some(prebuild)
         } else {
             None
@@ -889,8 +894,8 @@ impl<'a> App<'a> {
                         ControlFlow::Continue(()) => {}
                     }
                 }
-                Some(prebuilt) = async { self.prebuild.as_mut()?.recv().await }, if self.run.agent.is_none() => {
-                    self.take_prebuild(prebuilt);
+                Some(prebuilt) = async { self.prebuild.as_mut()?.recv().await }, if !self.run.is_running => {
+                    self.take_prebuild(prebuilt).await;
                     self.refresh()?;
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
@@ -916,10 +921,10 @@ impl<'a> App<'a> {
                 }
                 else => {
                     if let Some(rx) = self.prebuild.as_mut()
-                        && self.run.agent.is_none()
+                        && !self.run.is_running
                         && let Some(payload) = rx.try_recv()
                     {
-                        self.take_prebuild(payload);
+                        self.take_prebuild(payload).await;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -1879,6 +1884,13 @@ impl<'a> App<'a> {
     }
 
     async fn ensure_agent(&mut self) {
+        super::resolve_prebuild(
+            &mut self.run.agent,
+            &mut self.ui,
+            &mut self.prebuild,
+            self.slash.reasoning_enabled,
+        )
+        .await;
         event_handler::ensure_agent(
             &mut self.run.agent,
             &mut self.ui,
@@ -1893,6 +1905,7 @@ impl<'a> App<'a> {
         extra: Option<&str>,
     ) -> anyhow::Result<()> {
         let next_name = phase.next_prompt_name();
+        self.ui.invalidate_prebuild();
         apply_prompt_mode(next_name, self.ui.context, &self.ui.permission);
         apply_prompt_model(
             next_name,
@@ -1946,6 +1959,7 @@ impl<'a> App<'a> {
             let msg = msg.trim();
             if !prompt_name.is_empty() && self.ui.context.prompts.contains_key(prompt_name) {
                 self.chain.dot_prompt_restore = Some(self.ui.context.active_selection());
+                self.ui.invalidate_prebuild();
                 apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
                 apply_prompt_model(
                     prompt_name,
@@ -1967,6 +1981,7 @@ impl<'a> App<'a> {
 
         let prompt_name = after_dot.trim();
         if self.ui.context.prompts.contains_key(prompt_name) {
+            self.ui.invalidate_prebuild();
             apply_prompt_mode(prompt_name, self.ui.context, &self.ui.permission);
             apply_prompt_model(
                 prompt_name,
@@ -2643,17 +2658,19 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    fn take_prebuild(&mut self, prebuilt: PrebuildPayload) {
-        #[cfg(feature = "mcp")]
-        {
-            let (built_agent, built_mcp) = prebuilt;
-            self.run.agent = Some(built_agent);
-            self.ui.mcp_manager = built_mcp;
-        }
-        #[cfg(not(feature = "mcp"))]
-        {
-            self.run.agent = Some(prebuilt);
-        }
+    async fn take_prebuild(&mut self, prebuilt: PrebuildPayload) {
+        let current = self
+            .prebuild
+            .as_ref()
+            .is_some_and(|prebuild| prebuild.agent_is_current());
+        super::adopt_prebuild(
+            &mut self.run.agent,
+            &mut self.ui,
+            prebuilt,
+            current,
+            self.slash.reasoning_enabled,
+        )
+        .await;
     }
 
     #[cfg(feature = "mcp")]

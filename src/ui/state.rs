@@ -35,6 +35,9 @@ pub(crate) struct UiContext<'a> {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub sandbox: Sandbox,
+    /// One-way invalidation of this UI's single startup snapshot, shared with
+    /// its owner so clearing the agent cache cannot make the snapshot current.
+    pub prebuild_invalidated: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "skills")]
     pub skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     pub status_signals: Option<StatusSignals>,
@@ -43,9 +46,15 @@ pub(crate) struct UiContext<'a> {
 }
 
 impl<'a> UiContext<'a> {
+    pub(crate) fn invalidate_prebuild(&self) {
+        self.prebuild_invalidated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Borrow the pieces [`AgentBuildCtx::rebuild_agent`] needs.
     pub(crate) fn agent_build_ctx(&self) -> AgentBuildCtx<'_> {
         AgentBuildCtx {
+            prebuild_invalidated: Some(&self.prebuild_invalidated),
             cli: self.cli,
             cfg: self.cfg,
             context: self.context,
@@ -91,6 +100,7 @@ impl<'a> UiContext<'a> {
             permission,
             ask_tx,
             sandbox,
+            prebuild_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "skills")]
             skill_services: Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
             status_signals,
@@ -107,6 +117,9 @@ impl<'a> UiContext<'a> {
 /// temperature, extra_body) and the `build_agent` call itself so every
 /// rebuild path stays in sync.
 pub(crate) struct AgentBuildCtx<'a> {
+    /// Foreground builds supersede the startup snapshot. Only the startup
+    /// prebuild itself passes None.
+    pub prebuild_invalidated: Option<&'a std::sync::atomic::AtomicBool>,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
     pub context: &'a ContextFiles,
@@ -131,6 +144,9 @@ impl AgentBuildCtx<'_> {
     /// Build the main agent for `model_id` (usually `session.model`; model
     /// switches pass the not-yet-committed new id).
     pub(crate) async fn rebuild_agent(&self, model_id: &str, reasoning_enabled: bool) -> AnyAgent {
+        if let Some(invalidated) = self.prebuild_invalidated {
+            invalidated.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let model = self.client.completion_model(model_id.to_string());
         let temperature = crate::config::resolve_temperature(self.cli, self.cfg, model_id);
         let extra_body = crate::config::resolve_extra_body(self.cfg, model_id);
