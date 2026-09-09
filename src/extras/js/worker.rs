@@ -26,8 +26,9 @@ use super::protocol::{
     EffectRequest, EffectResponse, EffectResult, GrepMatch, GrepOptions, JsErrorCode,
     JsExceptionClass, ModelEffectProfile, ParentFrame, ParentWireFrame, ProtocolError,
     ProtocolFault, ProtocolFaultCode, ProtocolStage, RunStep, ScriptRole, StepOutcome, StepResult,
-    VerificationCaseResult, VerificationResult, VerifyArtifact, WireFrame, WorkerFrame,
-    WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid, write_frame,
+    VERIFICATION_LOADER_VERSION, VerificationCaseResult, VerificationResult, VerifyArtifact,
+    WireFrame, WorkerFrame, WorkerProtocol, WorkerWireFrame, read_frame, source_position_is_valid,
+    write_frame,
 };
 #[cfg(feature = "sandbox")]
 use super::protocol::{HttpHeader, HttpMethod};
@@ -59,7 +60,6 @@ const MAX_CONSOLE_BYTES: usize = 256 * 1024;
 const MAX_CONSOLE_RECORD_BYTES: usize = 8 * 1024;
 const MAX_VERIFICATION_CASES: usize = 4_096;
 const MAX_VERIFICATION_CASE_ID_BYTES: usize = 128;
-const VERIFICATION_LOADER_VERSION: u16 = 1;
 const EFFECT_PATH_MAX_BYTES: usize = READ_FILE_MAX_BYTES;
 const SPAWN_ARGUMENT_MAX_COUNT: usize = 4_096;
 const SPAWN_ARGUMENTS_MAX_BYTES: usize = 1024 * 1024;

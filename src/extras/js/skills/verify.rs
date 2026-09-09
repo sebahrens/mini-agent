@@ -24,7 +24,6 @@ pub const VERIFIER_VERSION: u32 = 4;
 
 /// Timeout for one whole worker verification request.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
-const VERIFICATION_LOADER_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestResult {
@@ -63,10 +62,6 @@ pub enum VerificationError {
     NoTests,
     #[error("skill must have at least one declared export")]
     NoExports,
-    #[error("failed to create JS runtime: {0}")]
-    RuntimeCreationFailed(String),
-    #[error("failed to create JS context: {0}")]
-    ContextCreationFailed(String),
     #[error("verification infrastructure is temporarily unavailable: {0}")]
     InfrastructureUnavailable(String),
     #[error("skill source failed to evaluate: {0}")]
@@ -153,12 +148,7 @@ impl VerificationError {
     /// verification contract are parent- and build-owned, so they are always
     /// infrastructure.
     pub(crate) fn is_infrastructure(&self) -> bool {
-        matches!(
-            self,
-            Self::InfrastructureUnavailable(_)
-                | Self::RuntimeCreationFailed(_)
-                | Self::ContextCreationFailed(_)
-        )
+        matches!(self, Self::InfrastructureUnavailable(_))
     }
 
     /// True when the candidate itself exhausted a verification resource bound
@@ -219,7 +209,6 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         artifact: skill.clone(),
         cases,
     })?;
-    validate_worker_result(&result, embedded_count + skill.exports.len() * 2)?;
 
     if let Some(source_failure) = result.cases.iter().find(|case| {
         !case.passed
@@ -310,7 +299,6 @@ pub(crate) fn verify_inherited_cases(
         artifact: skill.clone(),
         cases,
     })?;
-    validate_worker_result(&result, scripts.len())?;
 
     for (index, case) in result.cases.iter().enumerate() {
         if case.passed {
@@ -355,7 +343,6 @@ pub(crate) fn verify_held_out_case(
             },
         }],
     })?;
-    validate_worker_result(&result, 1)?;
     let case = &result.cases[0];
     if case.passed {
         return Ok(case.transcript.clone());
@@ -452,19 +439,6 @@ pub(crate) fn worker_error(error: WorkerError) -> VerificationError {
             unreachable!("verification queue failures return above")
         }
     }
-}
-
-pub(crate) fn validate_worker_result(
-    result: &VerificationResult,
-    expected_cases: usize,
-) -> Result<(), VerificationError> {
-    if result.loader_version != VERIFICATION_LOADER_VERSION || result.cases.len() != expected_cases
-    {
-        return Err(VerificationError::RuntimeCreationFailed(
-            "worker verification contract mismatch".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// The worker emits `DiagnosticClass::Internal` only for its own host-side

@@ -494,23 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_contract_mismatch_is_verification_infrastructure() {
-        let mismatch = crate::extras::js::skills::verify::validate_worker_result(
-            &crate::extras::js::protocol::VerificationResult {
-                passed: false,
-                cases: Vec::new(),
-                loader_version: 1,
-            },
-            1,
-        )
-        .expect_err("a case-count mismatch breaks the worker verification contract");
-        assert!(
-            mismatch.is_infrastructure(),
-            "build/loader skew is not attributable to the skill source: {mismatch:?}"
-        );
-    }
-
-    #[test]
     fn worker_internal_diagnostic_is_verification_infrastructure() {
         use crate::extras::js::protocol::{
             Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole,
@@ -999,17 +982,7 @@ mod failure_attribution {
 
     #[test]
     fn worker_contract_mismatch_does_not_reject_the_identity() {
-        assert_not_rejected_by(
-            crate::extras::js::skills::verify::validate_worker_result(
-                &crate::extras::js::protocol::VerificationResult {
-                    passed: false,
-                    cases: Vec::new(),
-                    loader_version: 1,
-                },
-                1,
-            )
-            .expect_err("a case-count mismatch breaks the worker verification contract"),
-        );
+        assert_not_rejected_by(worker_error(WorkerError::Protocol));
     }
 
     #[test]

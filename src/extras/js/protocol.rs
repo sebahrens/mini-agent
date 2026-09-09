@@ -13,6 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) const PROTOCOL_VERSION: u16 = 11;
+pub(crate) const VERIFICATION_LOADER_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_EFFECTS_PER_STEP: u32 = 256;
 #[cfg(feature = "skills")]

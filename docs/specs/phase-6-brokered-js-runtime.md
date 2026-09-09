@@ -967,6 +967,16 @@ return to the idle pool. `src/extras/js/tests/worker_exit.rs` forces both exit/r
 checks protocol validation, abnormal/native CPU exits, cancellation, and the bounded drain;
 the skill identity/ABI boundary tests run without transport retries.
 
+Verification terminals must also use the current loader version, return exactly the ordered case
+identities sent by the parent, and agree with the conjunction of their per-case verdicts. Without
+the skills feature, the expected list includes the implicit embedded cases before the explicit
+request cases; skills requests enumerate all cases explicitly. The supervisor rejects mismatches
+as protocol failures and retires the worker before any result reaches admission or another request
+can reuse that generation. All report paths use this gate. Admission treats failures as
+infrastructure outages, preserving the candidate identity for a later retry. The real-process verification contract matrix covers
+missing, extra, duplicate, reordered, and unrelated cases, version skew, contradictory verdicts,
+and recovery on a fresh generation.
+
 An unavailable audit prevents broker construction and therefore sends no request to a worker. An
 effect whose durable completion is `outcome_unknown` immediately erases invocation authority,
 closes that invocation in both protocol state machines, and forces process recycle without retry.

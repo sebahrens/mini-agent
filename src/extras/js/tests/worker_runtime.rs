@@ -3125,6 +3125,66 @@ fn worker_supervisor_verification_internal_terminal_recycles_generation() {
 }
 
 #[test]
+fn worker_supervisor_verification_binds_case_identity_order_and_aggregate_verdict() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for fault in [
+        "wrong-id",
+        "duplicate",
+        "reordered",
+        "false-summary",
+        "true-summary",
+        "loader",
+        "missing",
+        "extra",
+        "valid",
+        "valid-failure",
+    ] {
+        let supervisor = JsWorkerSupervisor::with_launcher_for_test(
+            TestWorkerLauncher::scripted_internal_worker(0),
+        );
+        let mut request = verification_with_source(&format!("__verification_contract:{fault}"));
+        let mut second = request.cases[0].clone();
+        second.case_id = "held-out-second".into();
+        request.cases.push(second);
+        let result = supervisor.verify_blocking(request);
+        if fault == "valid" || fault == "valid-failure" {
+            let result = result.unwrap();
+            let implicit = usize::from(!cfg!(feature = "skills"));
+            assert_eq!(result.cases.len(), implicit + 2);
+            if implicit == 1 {
+                assert_eq!(result.cases[0].case_id, "embedded-0");
+            }
+            assert_eq!(result.cases[implicit].case_id, "held-out-fault");
+            assert_eq!(result.cases[implicit + 1].case_id, "held-out-second");
+            assert_eq!(result.passed, fault == "valid");
+        } else {
+            let error = result.expect_err(fault);
+            assert_eq!(error, WorkerError::Protocol, "{fault}");
+            #[cfg(feature = "skills")]
+            assert!(crate::extras::js::skills::verify::worker_error(error).is_infrastructure());
+            assert_eq!(
+                runtime.block_on(supervisor.generation_for_test()),
+                None,
+                "{fault}"
+            );
+            let recovered = supervisor
+                .verify_blocking(verification_with_source("__verification_contract:valid"))
+                .unwrap();
+            assert!(recovered.passed);
+            assert_eq!(
+                recovered.cases.len(),
+                1 + usize::from(!cfg!(feature = "skills"))
+            );
+            assert_eq!(runtime.block_on(supervisor.generation_for_test()), Some(2));
+        }
+        runtime.block_on(supervisor.shutdown_for_test()).unwrap();
+    }
+}
+
+#[test]
 fn worker_supervisor_rejects_verifier_source_positions_and_recovers() {
     let supervisor = scripted_supervisor(0);
     assert_eq!(
@@ -3645,62 +3705,85 @@ fn run_scripted_supervisor_worker() -> ! {
                 let internal = verification.artifact.source == "__verification_internal__";
                 let positions = verification.artifact.source == "__verification_positions__";
                 let failed = internal || positions;
-                let mut cases = verification
-                    .artifact
-                    .tests
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| VerificationCaseResult {
-                        case_id: format!("embedded-{index}"),
-                        passed: !failed,
-                        diagnostic: failed.then_some(crate::extras::js::protocol::Diagnostic {
-                            class: if internal {
-                                DiagnosticClass::Internal
-                            } else {
-                                DiagnosticClass::Exception
-                            },
-                            stage: DiagnosticStage::Verification,
-                            script_role: ScriptRole::EmbeddedTest,
-                            exception_class: positions.then_some(JsExceptionClass::TypeError),
-                            line: positions.then_some(1),
-                            column: positions.then_some(1),
+                let case_result = |case_id: String, script_role| VerificationCaseResult {
+                    case_id,
+                    passed: !failed,
+                    diagnostic: failed.then_some(crate::extras::js::protocol::Diagnostic {
+                        class: if internal {
+                            DiagnosticClass::Internal
+                        } else {
+                            DiagnosticClass::Exception
+                        },
+                        stage: DiagnosticStage::Verification,
+                        script_role,
+                        exception_class: positions.then_some(JsExceptionClass::TypeError),
+                        line: positions.then_some(1),
+                        column: positions.then_some(1),
+                    }),
+                    #[cfg(feature = "skills")]
+                    transcript: Default::default(),
+                };
+                let mut cases = Vec::new();
+                // Skills requests already enumerate embedded/mutation/held-out cases explicitly.
+                #[cfg(not(feature = "skills"))]
+                cases.extend(
+                    verification
+                        .artifact
+                        .tests
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            case_result(format!("embedded-{index}"), ScriptRole::EmbeddedTest)
                         }),
-                        #[cfg(feature = "skills")]
-                        transcript: Default::default(),
-                    })
-                    .collect::<Vec<_>>();
+                );
                 cases.extend(
                     verification
                         .cases
                         .iter()
-                        .map(|case| VerificationCaseResult {
-                            case_id: case.case_id.clone(),
-                            passed: !failed,
-                            diagnostic: failed.then_some(crate::extras::js::protocol::Diagnostic {
-                                class: if internal {
-                                    DiagnosticClass::Internal
-                                } else {
-                                    DiagnosticClass::Exception
-                                },
-                                stage: DiagnosticStage::Verification,
-                                script_role: ScriptRole::HeldOutTest,
-                                exception_class: positions.then_some(JsExceptionClass::TypeError),
-                                line: positions.then_some(1),
-                                column: positions.then_some(1),
-                            }),
-                            #[cfg(feature = "skills")]
-                            transcript: Default::default(),
-                        }),
+                        .map(|case| case_result(case.case_id.clone(), ScriptRole::HeldOutTest)),
                 );
+                let mut result = VerificationResult {
+                    passed: !failed,
+                    cases,
+                    loader_version: 1,
+                };
+                if let Some(fault) = verification
+                    .artifact
+                    .source
+                    .strip_prefix("__verification_contract:")
+                {
+                    match fault {
+                        "loader" => result.loader_version += 1,
+                        "missing" => {
+                            result.cases.pop();
+                        }
+                        "extra" => result.cases.push(result.cases[0].clone()),
+                        "wrong-id" => result.cases[0].case_id = "unrequested-case".into(),
+                        "duplicate" => result.cases[1].case_id = result.cases[0].case_id.clone(),
+                        "reordered" => result.cases.swap(0, 1),
+                        "false-summary" => result.passed = false,
+                        "true-summary" | "valid-failure" => {
+                            result.cases[0].passed = false;
+                            result.cases[0].diagnostic =
+                                Some(crate::extras::js::protocol::Diagnostic {
+                                    class: DiagnosticClass::Contract,
+                                    stage: DiagnosticStage::Verification,
+                                    script_role: ScriptRole::HeldOutTest,
+                                    exception_class: None,
+                                    line: None,
+                                    column: None,
+                                });
+                            result.passed = fault == "true-summary";
+                        }
+                        "valid" => {}
+                        _ => panic!("unknown verification contract fixture"),
+                    }
+                }
                 let terminal = WireFrame::invocation(
                     build.clone(),
                     invocation,
                     request.sequence + 1,
-                    WorkerFrame::VerificationResult(VerificationResult {
-                        passed: !failed,
-                        cases,
-                        loader_version: 1,
-                    }),
+                    WorkerFrame::VerificationResult(result),
                 );
                 protocol.on_send(&terminal).unwrap();
                 write_frame(&mut output, &terminal).unwrap();

@@ -1117,12 +1117,8 @@ pub(crate) enum AdmissionError {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
-    use crate::extras::js::protocol::{
-        Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationResult,
-    };
-    use crate::extras::js::skills::verify::{
-        SourceFailure, TestResult, test_result, validate_worker_result,
-    };
+    use crate::extras::js::protocol::{Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole};
+    use crate::extras::js::skills::verify::{SourceFailure, TestResult, test_result};
 
     fn assert_never_permanently_rejects(error: &VerificationError, context: &str) {
         let failure = classify_verification(
@@ -1183,33 +1179,6 @@ mod scheduler_tests {
             deterministic_failure,
             EvaluationFailure::Deterministic { .. }
         ));
-    }
-
-    #[test]
-    fn worker_verification_contract_mismatch_is_retryable_admission_infrastructure() {
-        let case_count_mismatch = VerificationResult {
-            passed: false,
-            cases: Vec::new(),
-            loader_version: 1,
-        };
-        let error = validate_worker_result(&case_count_mismatch, 1)
-            .expect_err("a case-count mismatch breaks the worker contract");
-        assert!(matches!(error, VerificationError::RuntimeCreationFailed(_)));
-        assert_never_permanently_rejects(&error, "a worker verification case-count mismatch");
-
-        let loader_skew = VerificationResult {
-            passed: false,
-            cases: Vec::new(),
-            loader_version: u16::MAX,
-        };
-        let error = validate_worker_result(&loader_skew, 0)
-            .expect_err("loader-version skew breaks the worker contract");
-        assert_never_permanently_rejects(&error, "worker loader-version skew");
-
-        assert_never_permanently_rejects(
-            &VerificationError::ContextCreationFailed("allocation failed".to_string()),
-            "a worker context creation failure",
-        );
     }
 
     #[test]

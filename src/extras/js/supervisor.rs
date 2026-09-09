@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
     FrameError, InvocationId, JsErrorCode, JsExceptionClass, ParentFrame, ParentProtocol,
-    ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VerificationResult,
-    VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
+    ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
+    VerificationResult, VerifyArtifact, WireFrame, WorkerFrame, WorkerWireFrame, read_frame,
+    write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -1794,6 +1795,20 @@ async fn run_invocation<H: InvocationEffectHandler>(
     cancellation: &PermCancellation,
     deadline: Instant,
 ) -> Result<InvocationTerminal, WorkerError> {
+    let expected_verification_cases = if let InvocationRequest::Verify(request) = &request {
+        let cases = request.cases.iter().map(|case| case.case_id.clone());
+        #[cfg(not(feature = "skills"))]
+        let cases = request
+            .artifact
+            .tests
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("embedded-{index}"))
+            .chain(cases);
+        Some(cases.collect::<Vec<_>>())
+    } else {
+        None
+    };
     let parent_message = match request {
         InvocationRequest::Run(request) => ParentFrame::RunStep(request),
         #[cfg(feature = "skills")]
@@ -1962,7 +1977,22 @@ async fn run_invocation<H: InvocationEffectHandler>(
             }
             WorkerFrame::StepResult(result) => return Ok(InvocationTerminal::Step(result)),
             WorkerFrame::VerificationResult(result) => {
-                if !verification_diagnostics_are_closed(&result) {
+                // Positional report construction is safe only when this response accounts for
+                // precisely the requested cases, in order, with a consistent overall verdict.
+                // Reject here so a malformed verifier is recycled before another request starts.
+                if result.loader_version != VERIFICATION_LOADER_VERSION
+                    || result.passed != result.cases.iter().all(|case| case.passed)
+                    || !expected_verification_cases
+                        .as_ref()
+                        .is_some_and(|expected| {
+                            result
+                                .cases
+                                .iter()
+                                .map(|case| &case.case_id)
+                                .eq(expected.iter())
+                        })
+                    || !verification_diagnostics_are_closed(&result)
+                {
                     return Err(WorkerError::Protocol);
                 }
                 return Ok(InvocationTerminal::Verification(result));
