@@ -361,6 +361,8 @@ impl SkillStore {
         std::fs::create_dir_all(&db_dir)?;
 
         let db_path = db_dir.join("skills.db");
+        #[cfg(test)]
+        crate::extras::js::tests::sqlite_contention::observe_open(&db_path);
         let db = Connection::open(&db_path)?;
 
         // Every process-local connection must use the same concurrency policy.

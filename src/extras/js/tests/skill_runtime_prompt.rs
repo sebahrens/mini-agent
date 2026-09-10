@@ -205,35 +205,16 @@ async fn prepare_turn_keeps_current_thread_executor_responsive_while_sqlite_wait
     let temp = TempPaths::new();
     let runtime = SkillRuntime::open(&temp.paths, None).unwrap();
     runtime.settle_learned_rebuild_for_test().await;
+    let prompt = "keep the async executor responsive";
+    let baseline = runtime.prepare_turn(prompt).await;
 
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-    let holder = runtime
-        .hold_learned_store_lock_for_test(entered_tx, release_rx)
+    let (holder, probe) = runtime
+        .hold_learned_store_lock_for_test()
         .expect("learned coordinator");
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("test must hold the SQLite mutex");
-    let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        release_tx.send(()).unwrap();
-    });
-
-    let started = std::time::Instant::now();
-    let (_, timer_elapsed) = tokio::join!(
-        runtime.prepare_turn("keep the async executor responsive"),
-        async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            started.elapsed()
-        }
-    );
-    holder.join().unwrap();
-    watchdog.join().unwrap();
-
-    assert!(
-        timer_elapsed < std::time::Duration::from_millis(150),
-        "executor timer was delayed by synchronous SQLite for {timer_elapsed:?}"
-    );
+    holder.wait_until_held();
+    let discovery =
+        super::sqlite_contention::run_while_held(holder, probe, runtime.prepare_turn(prompt)).await;
+    assert_eq!(discovery.diagnostics, baseline.diagnostics);
 }
 
 #[tokio::test]

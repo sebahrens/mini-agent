@@ -604,6 +604,14 @@ the subsequent request's skill bundle (mini-agent-a8a0, delivered).
 
 ## Acceptance criteria
 
+SQLite responsiveness regressions share the test-only
+`src/extras/js/tests/sqlite_contention.rs` fixture. It owns the writer or store
+mutex holder, observes the store-open or refresh-lock boundary on a worker
+thread, and releases the real lock from the current-thread async test. Normal
+drop and unwinding join the holder. Its rescue timeout only bounds broken tests;
+elapsed latency is not an acceptance criterion. Observation hooks are compiled
+only in unit-test builds.
+
 All must pass under `cargo test --features js,skills`:
 
 - [x] Identity changes when source, test/order, export/signature, description/tag, capability, or

@@ -210,6 +210,9 @@ The pricing metadata assertions in `startup.rs` compare numeric `output` values,
 and the task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
 `NON-PROCESS`. The ACP hook test's reused `kill -0` probe is `TEST-ONLY`.
+The SQLite contention tests in `skills/session.rs` and `skills/coordinator.rs`
+construct `HeldTestLock` fixtures that own standard-library threads. Their two
+exact `HeldTestLock::spawn` expressions are classified `NON-PROCESS`.
 The `CommandWrap` creation adapter compiles with its LSP caller; MCP uses the separate RMCP
 creation adapter. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so

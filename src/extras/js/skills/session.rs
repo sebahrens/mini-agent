@@ -1013,53 +1013,38 @@ mod tests {
     /// contended startup leaves the executor responsive.
     #[tokio::test]
     async fn startup_keeps_the_async_executor_responsive_while_sqlite_is_busy() {
-        use std::time::{Duration, Instant};
-
         use crate::extras::js::skills::store::SkillStore;
+        use crate::extras::js::tests::sqlite_contention::{
+            HeldTestLock, run_while_held, watch_open,
+        };
 
         let (root, paths) = app_paths();
-        // Create the store first so the writer below contends with startup
-        // rather than racing its creation.
+        let _root = crate::extras::js::tests::TestTempDir::own(root);
         drop(SkillStore::open_at(&paths).expect("store"));
-
-        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let lock_paths = paths.clone();
-        let holder = std::thread::spawn(move || {
+        let holder = HeldTestLock::spawn(move |wait| {
             let mut store = SkillStore::open_at(&lock_paths).expect("store");
             let tx = store
                 .connection_mut()
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .expect("write lock");
-            held_tx.send(()).expect("signal");
-            std::thread::sleep(Duration::from_millis(400));
+            let released = wait.wait();
             tx.rollback().expect("release");
+            released
         });
-        held_rx.recv().expect("the writer must take the lock");
-
-        let timer = tokio::spawn(async {
-            let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            started.elapsed()
-        });
-
-        let started = Instant::now();
-        let services = super::SkillSessionServices::open_with_paths(paths, None, false).await;
-        let startup_elapsed = started.elapsed();
-        let timer_elapsed = timer.await.expect("timer task");
-        holder.join().expect("writer thread");
-
-        assert!(
-            timer_elapsed < Duration::from_millis(200),
-            "the 20ms timer ran after {timer_elapsed:?}; startup blocked the executor"
-        );
-        // The startup itself did wait on the contended store, which is what
-        // makes the timer assertion meaningful.
-        assert!(
-            startup_elapsed >= Duration::from_millis(100),
-            "the fixture must actually contend with the writer: {startup_elapsed:?}"
-        );
+        holder.wait_until_held();
+        // Register only after the holder's own store open, and observe the real
+        // startup open before it reaches the contended SQLite schema operation.
+        let probe = watch_open(paths.local_data_dir.join("skills/skills.db"));
+        let services = run_while_held(
+            holder,
+            probe,
+            super::SkillSessionServices::open_with_paths(paths, None, false),
+        )
+        .await
+        .expect("startup must succeed after the writer is released");
+        assert!(services.degradation().is_none());
         drop(services);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1291,12 +1291,13 @@ impl SkillRuntime {
 
     pub(crate) fn hold_learned_store_lock_for_test(
         &self,
-        entered: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> Option<std::thread::JoinHandle<()>> {
+    ) -> Option<(
+        crate::extras::js::tests::sqlite_contention::HeldTestLock,
+        crate::extras::js::tests::sqlite_contention::BlockingProbe,
+    )> {
         self.learned
             .as_ref()
-            .map(|coordinator| coordinator.hold_store_lock_for_test(entered, release))
+            .map(|coordinator| coordinator.hold_store_lock_for_test())
     }
 }
 

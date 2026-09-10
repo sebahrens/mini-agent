@@ -54,6 +54,8 @@ mod skill_targeted_feedback;
 mod skill_telemetry_retention;
 #[cfg(feature = "skills")]
 mod skill_verification_semantics;
+#[cfg(feature = "skills")]
+pub(super) mod sqlite_contention;
 mod tool_console_output;
 mod vendor_integrity;
 mod worker_broker;
@@ -75,12 +77,16 @@ use crate::permission::{PermissionConfig, PermissionConfigs, SecurityMode};
 use crate::sandbox::Sandbox;
 use crate::sandbox::worker::TestWorkerLauncher;
 
-struct TestTempDir(std::path::PathBuf);
+pub(super) struct TestTempDir(std::path::PathBuf);
 
 impl TestTempDir {
     fn new(label: &str) -> Self {
         let path =
             std::env::temp_dir().join(format!("mini-agent-{label}-{}", uuid::Uuid::new_v4()));
+        Self::own(path)
+    }
+
+    pub(super) fn own(path: std::path::PathBuf) -> Self {
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }

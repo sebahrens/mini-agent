@@ -184,6 +184,8 @@ impl IndexCoordinator {
         if self.rebuild_in_flight.load(Ordering::Acquire) {
             return Ok(true);
         }
+        #[cfg(test)]
+        crate::extras::js::tests::sqlite_contention::observe_refresh(self);
         let state = self
             .store
             .lock()
@@ -800,15 +802,18 @@ impl IndexCoordinator {
     #[cfg(test)]
     pub(crate) fn hold_store_lock_for_test(
         self: &Arc<Self>,
-        entered: std::sync::mpsc::SyncSender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> (
+        crate::extras::js::tests::sqlite_contention::HeldTestLock,
+        crate::extras::js::tests::sqlite_contention::BlockingProbe,
+    ) {
+        use crate::extras::js::tests::sqlite_contention::{HeldTestLock, watch_refresh};
+        let probe = watch_refresh(self);
         let coordinator = Arc::clone(self);
-        std::thread::spawn(move || {
+        let holder = HeldTestLock::spawn(move |wait| {
             let _store = coordinator.store.lock().expect("test store lock");
-            entered.send(()).expect("announce held test store lock");
-            release.recv().expect("release held test store lock");
-        })
+            wait.wait()
+        });
+        (holder, probe)
     }
 
     /// Retire durable state before publishing removal to readers.
