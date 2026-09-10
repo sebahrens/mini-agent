@@ -63,6 +63,14 @@ const REDIRECTING_ENV: &[&str] = &[
 static PROCESS_GIT_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
 
+#[cfg(all(test, feature = "git-worktree", unix))]
+tokio::task_local! {
+    /// First poll of actual mutation admission: resolved common directory and
+    /// whether the lock was immediately acquired. Scoped to the test caller.
+    pub(crate) static MUTATION_LOCK_OBSERVER:
+        tokio::sync::mpsc::UnboundedSender<(PathBuf, bool)>;
+}
+
 /// Cached git environment variables. Built once per process lifetime.
 /// Assumes PATH and relevant environment variables do not change mid-session.
 #[cfg(any(test, feature = "git-worktree"))]
@@ -369,7 +377,24 @@ impl GitRunner {
         let key = output_path(&output.stdout)
             .canonicalize()
             .map_err(|error| format!("failed to resolve common Git directory: {error}"))?;
-        Ok(repository_mutation_lock(&key).lock_owned().await)
+        let lock = repository_mutation_lock(&key).lock_owned();
+        #[cfg(all(test, feature = "git-worktree", unix))]
+        let lock = async {
+            tokio::pin!(lock);
+            let mut observed = false;
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(lock.as_mut(), cx);
+                if !observed {
+                    observed = true;
+                    let _ = MUTATION_LOCK_OBSERVER.try_with(|observer| {
+                        let _ = observer.send((key.clone(), result.is_ready()));
+                    });
+                }
+                result
+            })
+            .await
+        };
+        Ok(lock.await)
     }
 
     #[cfg(feature = "git-worktree")]

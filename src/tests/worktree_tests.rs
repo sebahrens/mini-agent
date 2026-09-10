@@ -3,7 +3,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use rig::tool::Tool;
 
@@ -1127,154 +1127,435 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn worktree_concurrent_cwd_isolation() {
-        let first = TempRepo::new("concurrent first");
-        let second = TempRepo::new("concurrent second");
-        configure_delay_alias(first.path(), "delay", "1");
-        configure_delay_alias(second.path(), "delay", "1");
-        let original_cwd = std::env::current_dir().unwrap();
-        let original_manifest = std::fs::read_to_string("Cargo.toml").unwrap();
-        let started = Instant::now();
-
-        let relative_reader = async {
-            for _ in 0..20 {
-                assert_eq!(std::env::current_dir().unwrap(), original_cwd);
-                assert_eq!(
-                    std::fs::read_to_string("Cargo.toml").unwrap(),
-                    original_manifest
-                );
-                tokio::time::sleep(Duration::from_millis(40)).await;
-            }
-        };
-        let (first_result, second_result, ()) = tokio::join!(
-            run_locked_git_with_limits_for_test(
-                first.path(),
-                &["delay"],
-                test_limits(Duration::from_secs(3)),
-            ),
-            run_locked_git_with_limits_for_test(
-                second.path(),
-                &["delay"],
-                test_limits(Duration::from_secs(3)),
-            ),
-            relative_reader,
-        );
-
-        first_result.expect("first independent repository command");
-        second_result.expect("second independent repository command");
-        assert!(
-            started.elapsed() < Duration::from_millis(1800),
-            "independent repositories were serialized: {:?}",
-            started.elapsed()
-        );
-        assert_eq!(std::env::current_dir().unwrap(), original_cwd);
-        assert_eq!(
-            std::fs::read_to_string("Cargo.toml").unwrap(),
-            original_manifest
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn same_repository_mutations_are_serialized() {
-        let repo = TempRepo::new("same repo serialization");
-        configure_delay_alias(repo.path(), "delay", "1");
-        let started = Instant::now();
-
-        let (first, second) = tokio::join!(
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["delay"],
-                test_limits(Duration::from_secs(4)),
-            ),
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["delay"],
-                test_limits(Duration::from_secs(4)),
-            ),
-        );
-
-        first.expect("first same-repository command");
-        second.expect("second same-repository command");
-        assert!(
-            started.elapsed() >= Duration::from_millis(1800),
-            "same repository commands overlapped: {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn linked_worktree_mutations_share_the_common_repository_lock() {
-        let repo = TempRepo::new("linked worktree serialization");
-        let linked = repo.path().with_extension("linked");
-        git(
-            repo.path(),
-            [
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("-b"),
-                OsStr::new("linked-lock-test"),
-                linked.as_os_str(),
-            ],
-        );
-        configure_delay_alias(repo.path(), "delay", "1");
-        let started = Instant::now();
-
-        let (main, worktree) = tokio::join!(
-            run_locked_git_with_limits_for_test(
-                repo.path(),
-                &["delay"],
-                test_limits(Duration::from_secs(4)),
-            ),
-            run_locked_git_with_limits_for_test(
-                &linked,
-                &["delay"],
-                test_limits(Duration::from_secs(4)),
-            ),
-        );
-
-        main.expect("main worktree command");
-        worktree.expect("linked worktree command");
-        assert!(
-            started.elapsed() >= Duration::from_millis(1800),
-            "linked worktree commands overlapped: {:?}",
-            started.elapsed()
-        );
-        git(
-            repo.path(),
-            ["worktree", "remove", "--force", linked.to_str().unwrap()],
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn delayed_git_hook_does_not_block_runtime_or_change_cwd() {
+    mod concurrency {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Condvar, Mutex};
 
-        let repo = TempRepo::new("delayed hook");
-        std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
-        let hook = repo.path().join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        let timer_started = Instant::now();
+        const FIXTURE_GUARD: Duration = Duration::from_secs(15);
+        type GitTask = tokio::task::JoinHandle<Result<(), String>>;
 
-        let (commit, timer_elapsed) = tokio::join!(worktree_auto_commit_all(repo.path()), async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            timer_started.elapsed()
-        });
+        struct ReleaseState {
+            writer: std::fs::File,
+            released: bool,
+            rescued: bool,
+            write_failed: bool,
+        }
 
-        commit.expect("commit with delayed hook");
-        assert!(
-            timer_elapsed < Duration::from_millis(400),
-            "delayed hook blocked the async runtime: {:?}",
-            timer_elapsed
-        );
-        assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+        impl ReleaseState {
+            fn release(&mut self) {
+                if !self.released {
+                    self.write_failed = self.writer.write_all(b"release\n").is_err();
+                    self.released = true;
+                }
+            }
+        }
+
+        struct CommandGate {
+            script: PathBuf,
+            ready: PathBuf,
+            finished: PathBuf,
+            release: Arc<(Mutex<ReleaseState>, Condvar)>,
+            rescuer: Option<std::thread::JoinHandle<()>>,
+        }
+
+        fn quote(path: &Path) -> String {
+            format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"))
+        }
+
+        impl CommandGate {
+            fn new(repo: &Path, name: &str) -> Self {
+                let dir = repo.join(".git").join(name);
+                std::fs::create_dir(&dir).unwrap();
+                let fifo = dir.join("release");
+                let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                // SAFETY: c_path is a valid, NUL-terminated path owned for this call.
+                assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+                // Keep both ends open so the shell can announce readiness before
+                // blocking in read, and cleanup can always write without a reader.
+                let writer = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .unwrap();
+                let script = dir.join("command");
+                let ready = dir.join("ready");
+                let finished = dir.join("finished");
+                std::fs::write(&script, format!(
+                    "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$PWD\" > {}\nIFS= read -r reply < {}\nprintf finished > {}\n",
+                    quote(&ready), quote(&fifo), quote(&finished),
+                )).unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let release = Arc::new((
+                    Mutex::new(ReleaseState {
+                        writer,
+                        released: false,
+                        rescued: false,
+                        write_failed: false,
+                    }),
+                    Condvar::new(),
+                ));
+                let rescue_release = release.clone();
+                let rescuer = std::thread::spawn(move || {
+                    let (state, wake) = &*rescue_release;
+                    let (mut state, _) = wake
+                        .wait_timeout_while(state.lock().unwrap(), FIXTURE_GUARD, |state| {
+                            !state.released
+                        })
+                        .unwrap();
+                    if !state.released {
+                        state.rescued = true;
+                        state.release();
+                    }
+                });
+                Self {
+                    script,
+                    ready,
+                    finished,
+                    release,
+                    rescuer: Some(rescuer),
+                }
+            }
+
+            fn release(&self) {
+                let (state, wake) = &*self.release;
+                state.lock().unwrap().release();
+                wake.notify_all();
+            }
+
+            async fn wait_started(&self, task: &GitTask, expected_cwd: &Path) {
+                let cwd = tokio::time::timeout(FIXTURE_GUARD, async {
+                    loop {
+                        // Opening the marker precedes printf's write. Wait for
+                        // its complete line instead of treating existence as readiness.
+                        if let Ok(cwd) = std::fs::read_to_string(&self.ready)
+                            && cwd.ends_with('\n')
+                        {
+                            break cwd;
+                        }
+                        assert!(!task.is_finished(), "Git command stopped before readiness");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("Git command did not announce readiness");
+                assert_eq!(cwd.strip_suffix('\n'), expected_cwd.to_str());
+                assert!(!task.is_finished(), "held Git command already finished");
+                assert!(
+                    !self.finished.exists(),
+                    "Git command bypassed its release gate"
+                );
+            }
+        }
+
+        impl Drop for CommandGate {
+            fn drop(&mut self) {
+                self.release();
+                if let Some(rescuer) = self.rescuer.take() {
+                    let joined = rescuer.join();
+                    if !std::thread::panicking() {
+                        assert!(joined.is_ok(), "command rescue thread panicked");
+                    }
+                }
+            }
+        }
+
+        struct Fixture {
+            gates: Vec<CommandGate>,
+            tasks: Vec<Option<GitTask>>,
+        }
+
+        impl Fixture {
+            fn start(
+                &mut self,
+                future: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+                fail: bool,
+            ) {
+                self.tasks.push(Some(tokio::spawn(async move {
+                    let result = future.await;
+                    if fail {
+                        panic!("injected Git caller failure");
+                    }
+                    result
+                })));
+            }
+
+            fn start_alias(
+                &mut self,
+                repo: &Path,
+                gate: usize,
+                fail: bool,
+            ) -> tokio::sync::mpsc::UnboundedReceiver<(PathBuf, bool)> {
+                let path = repo.to_path_buf();
+                let alias = format!("held-{gate}");
+                let (observer, events) = tokio::sync::mpsc::unbounded_channel();
+                self.start(
+                    async move {
+                        crate::git::runner::MUTATION_LOCK_OBSERVER
+                            .scope(observer, async {
+                                run_locked_git_with_limits_for_test(
+                                    &path,
+                                    &[&alias],
+                                    test_limits(Duration::from_secs(60)),
+                                )
+                                .await
+                                .map(|_| ())
+                            })
+                            .await
+                    },
+                    fail,
+                );
+                events
+            }
+
+            async fn settle(&mut self) {
+                for gate in &self.gates {
+                    gate.release();
+                }
+                let mut results = Vec::new();
+                for task in &mut self.tasks {
+                    if let Some(task) = task.take() {
+                        results.push(task.await);
+                    }
+                }
+                let joins: Vec<_> = self
+                    .gates
+                    .iter_mut()
+                    .filter_map(|gate| gate.rescuer.take())
+                    .map(|rescuer| rescuer.join())
+                    .collect();
+                // Validate only after every command and rescue thread is joined.
+                for result in results {
+                    result.unwrap().unwrap();
+                }
+                assert!(joins.iter().all(Result::is_ok));
+                for gate in &self.gates {
+                    let (rescued, write_failed) = {
+                        let state = gate.release.0.lock().unwrap();
+                        (state.rescued, state.write_failed)
+                    };
+                    assert!(!rescued, "command needed fixture rescue");
+                    assert!(!write_failed, "command gate release failed");
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum Case {
+            Independent,
+            SameRepository,
+            LinkedWorktree,
+            Hook,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Failure {
+            None,
+            Controller,
+            Caller,
+        }
+
+        fn run_case(case: Case, failure: Failure) {
+            let repo = TempRepo::new("held first 'repo'");
+            let second =
+                matches!(case, Case::Independent).then(|| TempRepo::new("held second repo"));
+            let linked = repo.path().join("linked checkout");
+            if matches!(case, Case::LinkedWorktree) {
+                git(
+                    repo.path(),
+                    [
+                        OsStr::new("worktree"),
+                        OsStr::new("add"),
+                        OsStr::new("-b"),
+                        OsStr::new("held-linked"),
+                        linked.as_os_str(),
+                    ],
+                );
+            }
+            let second_path = match case {
+                Case::Independent => second.as_ref().unwrap().path(),
+                Case::LinkedWorktree => &linked,
+                _ => repo.path(),
+            };
+            let count = if matches!(case, Case::Hook) { 1 } else { 2 };
+            let gates: Vec<_> = (0..count)
+                .map(|i| CommandGate::new(repo.path(), &format!("held-gate-{i}")))
+                .collect();
+            if matches!(case, Case::Hook) {
+                std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+                std::fs::copy(&gates[0].script, repo.path().join(".git/hooks/pre-commit")).unwrap();
+            } else {
+                for (i, (path, gate)) in [repo.path(), second_path]
+                    .into_iter()
+                    .zip(&gates)
+                    .enumerate()
+                {
+                    git(
+                        path,
+                        [
+                            OsStr::new("config"),
+                            OsStr::new(&format!("alias.held-{i}")),
+                            OsStr::new(&format!("!{}", quote(&gate.script))),
+                        ],
+                    );
+                }
+            }
+            let original_cwd = std::env::current_dir().unwrap();
+            let original_manifest = std::fs::read_to_string("Cargo.toml").unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut fixture = Fixture {
+                gates,
+                tasks: Vec::new(),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    tokio::time::timeout(FIXTURE_GUARD, async {
+                        if matches!(case, Case::Hook) {
+                            let path = repo.path().to_path_buf();
+                            fixture.start(
+                                async move { worktree_auto_commit_all(&path).await.map(|_| ()) },
+                                matches!(failure, Failure::Caller),
+                            );
+                            fixture.gates[0]
+                                .wait_started(
+                                    fixture.tasks[0].as_ref().unwrap(),
+                                    &repo.path().canonicalize().unwrap(),
+                                )
+                                .await;
+                        } else {
+                            let mut first_events = fixture.start_alias(
+                                repo.path(),
+                                0,
+                                matches!(failure, Failure::Caller),
+                            );
+                            let (first_key, ready) = first_events.recv().await.unwrap();
+                            assert!(ready, "first repository lock was unexpectedly busy");
+                            fixture.gates[0]
+                                .wait_started(
+                                    fixture.tasks[0].as_ref().unwrap(),
+                                    &repo.path().canonicalize().unwrap(),
+                                )
+                                .await;
+                            let mut second_events = fixture.start_alias(second_path, 1, false);
+                            let (second_key, ready) = second_events.recv().await.unwrap();
+                            if matches!(case, Case::Independent) {
+                                assert_ne!(first_key, second_key);
+                                assert!(ready, "independent repositories shared admission");
+                                fixture.gates[1]
+                                    .wait_started(
+                                        fixture.tasks[1].as_ref().unwrap(),
+                                        &second_path.canonicalize().unwrap(),
+                                    )
+                                    .await;
+                            } else {
+                                assert_eq!(
+                                    first_key, second_key,
+                                    "linked worktrees must resolve one common directory"
+                                );
+                                assert!(
+                                    !ready,
+                                    "second caller acquired an already-held repository lock"
+                                );
+                                assert!(
+                                    !fixture.gates[1].ready.exists(),
+                                    "second command bypassed repository admission"
+                                );
+                            }
+                        }
+                        // This controller runs on the same single-threaded runtime
+                        // while a real Git alias or pre-commit hook remains held.
+                        assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+                        assert_eq!(
+                            std::fs::read_to_string("Cargo.toml").unwrap(),
+                            original_manifest
+                        );
+                        if matches!(failure, Failure::Controller) {
+                            panic!("injected with Git work held");
+                        }
+                        fixture.gates[0].release();
+                        let first_result = fixture.tasks[0].as_mut().unwrap().await;
+                        fixture.tasks[0].take();
+                        if let Err(error) = first_result {
+                            std::panic::resume_unwind(error.into_panic());
+                        }
+                        first_result.unwrap().unwrap();
+                        if count == 2 {
+                            fixture.gates[1]
+                                .wait_started(
+                                    fixture.tasks[1].as_ref().unwrap(),
+                                    &second_path.canonicalize().unwrap(),
+                                )
+                                .await;
+                            fixture.gates[1].release();
+                        }
+                    })
+                    .await
+                    .expect("worktree scenario exceeded hang guard");
+                });
+            }));
+            runtime.block_on(fixture.settle());
+            assert!(fixture.tasks.iter().all(Option::is_none));
+            for gate in &fixture.gates {
+                assert!(
+                    gate.finished.exists(),
+                    "command was not released to completion"
+                );
+            }
+            if matches!(case, Case::Hook) {
+                assert_eq!(
+                    git_stdout(repo.path(), ["show", "HEAD:tracked.txt"]),
+                    "changed"
+                );
+            }
+            assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+            assert_eq!(
+                std::fs::read_to_string("Cargo.toml").unwrap(),
+                original_manifest
+            );
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+            assert!(
+                matches!(failure, Failure::None),
+                "injected worktree fault was not reached"
+            );
+        }
+
+        #[test]
+        fn worktree_concurrency_independent_repositories_preserve_cwd() {
+            run_case(Case::Independent, Failure::None);
+        }
+
+        #[test]
+        fn worktree_concurrency_shared_repository_lock() {
+            for case in [Case::SameRepository, Case::LinkedWorktree] {
+                run_case(case, Failure::None);
+            }
+        }
+
+        #[test]
+        fn worktree_concurrency_hook_preserves_runtime_and_cwd() {
+            run_case(Case::Hook, Failure::None);
+        }
+
+        #[test]
+        fn worktree_concurrency_failure_releases_commands_and_joins_tasks() {
+            for (failure, expected) in [
+                (Failure::Controller, "injected with Git work held"),
+                (Failure::Caller, "injected Git caller failure"),
+            ] {
+                for case in [Case::Independent, Case::LinkedWorktree, Case::Hook] {
+                    let panic = std::panic::catch_unwind(|| run_case(case, failure))
+                        .expect_err("fault must propagate after cleanup");
+                    assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

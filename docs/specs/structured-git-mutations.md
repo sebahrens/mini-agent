@@ -61,3 +61,14 @@ paths, symlinks and submodules, hostile hooks/attributes/signing/editor config,
 index lock contention, concurrent callers, cancellation, bounded output, and
 truthful partial staging. A platform where the executable or workspace cannot
 be verified is rejected before launch.
+
+The Unix worktree concurrency tests hold real Git aliases and pre-commit hooks
+behind owned FIFO release gates. Independent repositories must both reach their
+held commands; same-root and linked-worktree cases share one exclusion matrix.
+A caller-scoped test observer records the first poll of the actual mutation-lock
+future after common-directory resolution, so exclusion requires a pending second
+admission rather than a duration threshold. The hook controller must progress on
+the same single-threaded runtime while the hook remains held, preserving process
+cwd and relative file reads. Controller-assertion and caller-panic cases release all
+commands and join their tasks and rescue threads before propagating the failure.
+Emergency rescue is independently driven and makes the test fail; it is not an acceptance deadline.
