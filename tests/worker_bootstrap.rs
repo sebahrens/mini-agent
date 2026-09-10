@@ -14,7 +14,6 @@ use std::fs::File;
 /// under test rather than a failure: the worker exited before it drained the
 /// frame. Every other error still fails. Each caller's assertion on the exit
 /// status is what actually decides the test.
-#[cfg(unix)]
 fn write_tolerating_rejection<W: Write>(writer: &mut W, frame: &[u8]) {
     match writer.write_all(frame) {
         Ok(()) => {}
