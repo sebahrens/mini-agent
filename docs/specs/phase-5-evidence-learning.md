@@ -27,9 +27,11 @@ document as a description of running behaviour requires the following correction
   `PromotionPolicy`) has no production caller; `--promote-learned-skill` uses a separate
   local-owner authorization that records `evidence_threshold_promotion: false` in its evidence
   payload. No shipped code path promotes a canary because its evidence crossed a threshold.
+  Its authority variant, transactional adapter, policy evaluator, and evidence readers compile
+  only for tests; production task-outcome recording and validation remain enabled.
 - **Rollback** (`rollback_replacement`) is a library operation with no production caller and no
-  operator command. Its transactional semantics below are implemented and tested, but nothing in
-  the binary invokes them.
+  operator command. Its transactional adapters compile only for tests. The shared replacement
+  transaction remains in production for explicit local-owner promotion.
 - **Repair** (`skills/repair.rs`) is compiled `#[cfg(test)]`. Repair-record construction and
   repair-proposal submission exist only in the verification suite.
 - **The evidence-decision scheduler** (`skills/scheduler.rs`) is also compiled `#[cfg(test)]`:
@@ -734,6 +736,10 @@ All must pass under `cargo test --features skills` and `cargo test --features js
 - [x] Quarantined/superseded/retired revisions are absent from new retrieval snapshots.
 - [x] Repair creates a new ID linked to the predecessor and cannot mutate the predecessor.
 - [x] Promotion and rollback are atomic under injected transaction failure and concurrent readers.
+  The pair test fails the second transition insert after both revision updates and the generation
+  write, then verifies unchanged durable state and exact rollback replay. An overlapping reader
+  retains the complete prior snapshot until its read transaction ends. The operator test uses
+  that failure point through the production command and verifies owner authority is not consumed.
 - [x] A lifecycle transition cannot let any newly starting turn read an older eligibility snapshot;
       failed rebuilds publish a removal-only emergency snapshot and recover by generation.
 - [x] Every automatic transition records the exact policy version and evidence snapshot.

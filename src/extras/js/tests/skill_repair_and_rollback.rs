@@ -171,65 +171,136 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
         !complete,
         "the fixture must retain a linked incomplete outcome"
     );
-    {
-        let mut service = LifecycleService::new(&mut store);
-        let promote_request = request(&predecessor, &candidate);
-        let mut forged_request = promote_request.clone();
-        forged_request.idempotency_key = "forged-promotion".into();
-        forged_request.snapshot.evidence_ids = vec!["rollback-evidence".into()];
-        assert!(matches!(
-            service.promote_replacement(&forged_request, 1),
-            Err(LifecycleError::UnknownEvidence)
-        ));
-        let incomplete = service.promote_replacement(&promote_request, 1);
-        assert!(
-            matches!(
-                &incomplete,
-                Err(LifecycleError::PromotionHeld(reason))
-                    if reason.contains("insufficient_verified_task_passes")
-            ),
-            "{incomplete:?}"
-        );
-        record_outcome("promotion-a-1", true);
-        let promoted = service.promote_replacement(&promote_request, 1).unwrap();
-        assert_eq!(promoted.candidate_status, LifecycleStatus::Active);
-        assert_eq!(promoted.predecessor_status, LifecycleStatus::Superseded);
-        assert!(
-            service
-                .promote_replacement(&promote_request, 2)
-                .unwrap()
-                .replayed
-        );
-        let mut conflicting_replay = promote_request.clone();
-        conflicting_replay.reason = "different-decision".into();
-        assert!(matches!(
-            service.promote_replacement(&conflicting_replay, 2),
-            Err(LifecycleError::IdempotencyConflict)
-        ));
+    let pair_state = |store: &mut SkillStore| {
+        let candidate = LifecycleService::new(store)
+            .revision(&candidate.id)
+            .unwrap();
+        let predecessor = LifecycleService::new(store)
+            .revision(&predecessor.id)
+            .unwrap();
+        let generations = LifecycleService::new(store).index_generations().unwrap();
+        let transitions: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_transitions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (candidate, predecessor, generations, transitions)
+    };
+    // The second audit row is written after both revisions, the generation,
+    // and the first audit row. Failing here must roll all of them back.
+    const FAIL_SECOND_TRANSITION: &str =
+        "CREATE TRIGGER fail_pair_transition BEFORE INSERT ON skill_transitions
+         WHEN NEW.idempotency_key LIKE '%:predecessor'
+         BEGIN SELECT RAISE(ABORT, 'injected pair transaction failure'); END;";
+    let promote_request = request(&predecessor, &candidate);
+    let mut forged_request = promote_request.clone();
+    forged_request.idempotency_key = "forged-promotion".into();
+    forged_request.snapshot.evidence_ids = vec!["rollback-evidence".into()];
+    assert!(matches!(
+        LifecycleService::new(&mut store).promote_replacement(&forged_request, 1),
+        Err(LifecycleError::UnknownEvidence)
+    ));
+    let incomplete = LifecycleService::new(&mut store).promote_replacement(&promote_request, 1);
+    assert!(
+        matches!(&incomplete, Err(LifecycleError::PromotionHeld(reason))
+            if reason.contains("insufficient_verified_task_passes")),
+        "{incomplete:?}"
+    );
+    record_outcome("promotion-a-1", true);
+    let before = pair_state(&mut store);
+    store.conn().execute_batch(FAIL_SECOND_TRANSITION).unwrap();
+    assert!(matches!(
+        LifecycleService::new(&mut store).promote_replacement(&promote_request, 1),
+        Err(LifecycleError::Sqlite(_))
+    ));
+    assert_eq!(pair_state(&mut store), before);
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER fail_pair_transition")
+        .unwrap();
 
-        let rollback = ReplacementTransitionRequest {
-            idempotency_key: "rollback-1".into(),
-            candidate_row_version: 2,
-            predecessor_row_version: 2,
-            reason: "regression".into(),
-            snapshot: EvidenceSnapshot::new(
-                candidate.id.clone(),
-                Some(predecessor.id.clone()),
-                "v1",
-                vec!["rollback-evidence".into()],
-                BTreeMap::from([("decision".into(), serde_json::json!("rollback"))]),
-                2,
-                Some(2),
-                1,
-            )
-            .unwrap(),
-            ..promote_request
-        };
-        let rolled_back = service.rollback_replacement(&rollback, 3).unwrap();
-        assert_eq!(rolled_back.candidate_status, LifecycleStatus::Quarantined);
-        assert_eq!(rolled_back.predecessor_status, LifecycleStatus::Active);
-        assert_eq!(rolled_back.desired_generation, 2);
-    }
+    // A separate reader holds the old snapshot while the writer commits the
+    // pair. It must see both old revisions until ending that read transaction.
+    let mut reader = SkillStore::open_at(&paths).unwrap();
+    reader.conn().execute_batch("BEGIN DEFERRED").unwrap();
+    assert_eq!(pair_state(&mut reader), before);
+    let promoted = LifecycleService::new(&mut store)
+        .promote_replacement(&promote_request, 1)
+        .unwrap();
+    assert_eq!(promoted.candidate_status, LifecycleStatus::Active);
+    assert_eq!(promoted.predecessor_status, LifecycleStatus::Superseded);
+    let after_promotion = pair_state(&mut store);
+    assert_eq!(pair_state(&mut reader), before);
+    reader.conn().execute_batch("COMMIT").unwrap();
+    assert_eq!(pair_state(&mut reader), after_promotion);
+    assert!(
+        LifecycleService::new(&mut store)
+            .promote_replacement(&promote_request, 2)
+            .unwrap()
+            .replayed
+    );
+    let mut conflicting_replay = promote_request.clone();
+    conflicting_replay.reason = "different-decision".into();
+    assert!(matches!(
+        LifecycleService::new(&mut store).promote_replacement(&conflicting_replay, 2),
+        Err(LifecycleError::IdempotencyConflict)
+    ));
+    assert_eq!(pair_state(&mut store), after_promotion);
+
+    let rollback = ReplacementTransitionRequest {
+        idempotency_key: "rollback-1".into(),
+        candidate_row_version: 2,
+        predecessor_row_version: 2,
+        reason: "regression".into(),
+        snapshot: EvidenceSnapshot::new(
+            candidate.id.clone(),
+            Some(predecessor.id.clone()),
+            "v1",
+            vec!["rollback-evidence".into()],
+            BTreeMap::from([("decision".into(), serde_json::json!("rollback"))]),
+            2,
+            Some(2),
+            1,
+        )
+        .unwrap(),
+        ..promote_request
+    };
+    store.conn().execute_batch(FAIL_SECOND_TRANSITION).unwrap();
+    assert!(matches!(
+        LifecycleService::new(&mut store).rollback_replacement(&rollback, 3),
+        Err(LifecycleError::Sqlite(_))
+    ));
+    assert_eq!(pair_state(&mut store), after_promotion);
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER fail_pair_transition")
+        .unwrap();
+    reader.conn().execute_batch("BEGIN DEFERRED").unwrap();
+    assert_eq!(pair_state(&mut reader), after_promotion);
+    let rolled_back = LifecycleService::new(&mut store)
+        .rollback_replacement(&rollback, 3)
+        .unwrap();
+    assert_eq!(rolled_back.candidate_status, LifecycleStatus::Quarantined);
+    assert_eq!(rolled_back.predecessor_status, LifecycleStatus::Active);
+    assert_eq!(rolled_back.desired_generation, 2);
+    let after_rollback = pair_state(&mut store);
+    assert_eq!(pair_state(&mut reader), after_promotion);
+    reader.conn().execute_batch("COMMIT").unwrap();
+    assert_eq!(pair_state(&mut reader), after_rollback);
+    drop(reader);
+    let replay = LifecycleService::new(&mut store)
+        .rollback_replacement(&rollback, 4)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.desired_generation, rolled_back.desired_generation);
+    let mut conflicting_rollback = rollback;
+    conflicting_rollback.reason = "another-regression".into();
+    assert!(matches!(
+        LifecycleService::new(&mut store).rollback_replacement(&conflicting_rollback, 4),
+        Err(LifecycleError::IdempotencyConflict)
+    ));
+    assert_eq!(pair_state(&mut store), after_rollback);
     let predecessor_successor: Option<String> = store
         .conn()
         .query_row(
@@ -239,6 +310,7 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
         )
         .unwrap();
     assert_eq!(predecessor_successor, None);
+    drop(store);
     std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 
@@ -412,6 +484,7 @@ fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
     let frozen = coordinator.lease().unwrap();
     assert!(!frozen.contains_id(&candidate.id));
     assert!(!frozen.contains_id(&predecessor.id));
+    drop(coordinator);
     std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 
@@ -493,5 +566,6 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
             .unwrap()
             .replayed
     );
+    drop(store);
     std::fs::remove_dir_all(paths.data_dir).unwrap();
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::coordinator::{
     CoordinatedMutationError, CoordinatorError, IndexCoordinator, PublicationReport,
 };
+#[cfg(test)]
 use super::policy::{
     DirectOutcome, InvocationEvidence, PromotionContext, PromotionDecision, PromotionPolicy,
     TaskOutcomeEvidence, TaskOutcomeSource, evaluate_promotion_with_task_outcomes,
@@ -247,6 +248,7 @@ pub struct ReplacementTransitionOutcome {
 /// property lineage-root activation enforces.
 #[derive(Debug, Clone, Copy)]
 enum PromotionAuthority<'a> {
+    #[cfg(test)]
     EvidenceThreshold,
     LocalOwner {
         approval: &'a HumanApproval,
@@ -365,6 +367,7 @@ pub enum LifecycleError {
     NotLineageRoot,
     #[error("privileged admission/activation/supersession requires its dedicated atomic service")]
     PrivilegedTransition,
+    #[cfg(test)]
     #[error("stored evidence does not qualify this replacement for promotion: {0}")]
     PromotionHeld(String),
 }
@@ -397,6 +400,7 @@ impl<'a> CoordinatedLifecycle<'a> {
         Self { coordinator }
     }
 
+    #[cfg(test)]
     pub(crate) fn promote_replacement(
         &self,
         request: &ReplacementTransitionRequest,
@@ -441,6 +445,7 @@ impl<'a> CoordinatedLifecycle<'a> {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback_replacement(
         &self,
         request: &ReplacementTransitionRequest,
@@ -908,6 +913,7 @@ impl<'a> LifecycleService<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn promote_replacement(
         &mut self,
         request: &ReplacementTransitionRequest,
@@ -963,6 +969,7 @@ impl<'a> LifecycleService<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback_replacement(
         &mut self,
         request: &ReplacementTransitionRequest,
@@ -1094,6 +1101,7 @@ impl<'a> LifecycleService<'a> {
         // kind; it must never satisfy — or be satisfied by — the `qualified`
         // evidence the evidence-threshold policy path requires.
         let required_evidence_kind = promoting.then_some(match authority {
+            #[cfg(test)]
             PromotionAuthority::EvidenceThreshold => "qualified",
             PromotionAuthority::LocalOwner { .. } => "operator_promotion",
         });
@@ -1149,6 +1157,7 @@ impl<'a> LifecycleService<'a> {
         }
         if promoting {
             match authority {
+                #[cfg(test)]
                 PromotionAuthority::EvidenceThreshold => {
                     revalidate_promotion(&tx, request, &candidate, &predecessor, desired)?;
                 }
@@ -1629,6 +1638,7 @@ fn authorize_local_owner_promotion(
     Ok(())
 }
 
+#[cfg(test)]
 fn revalidate_promotion(
     tx: &Transaction<'_>,
     request: &ReplacementTransitionRequest,
@@ -1719,6 +1729,7 @@ fn read_artifact_for_policy(
     }
 }
 
+#[cfg(test)]
 fn read_invocation_evidence(
     tx: &Transaction<'_>,
     skill_id: &str,
@@ -1782,6 +1793,7 @@ fn read_invocation_evidence(
 /// than to `NoVerifyCommand`, so promotion and audit keep seeing the reason the
 /// runner actually recorded. `None` means the row is undecodable and promotion
 /// must be held rather than guessing a source.
+#[cfg(test)]
 fn task_outcome_source_from_columns(
     source_kind: &str,
     source_id: Option<String>,
@@ -1795,6 +1807,7 @@ fn task_outcome_source_from_columns(
     }
 }
 
+#[cfg(test)]
 fn read_task_outcomes(
     tx: &Transaction<'_>,
     skill_id: &str,

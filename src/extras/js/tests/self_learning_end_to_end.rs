@@ -189,7 +189,8 @@ fn sibling_replacement_canaries_rotate_by_canonical_invocation_count() {
         .unwrap()
         .expect("both sibling canaries remain eligible");
     assert_eq!(selected.0.id, first.id);
-    let _ = std::fs::remove_dir_all(root);
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -415,5 +416,7 @@ fn self_learning_end_to_end_root_route_promote_repair_and_rollback() {
     persist_record(&mut store, &record, 7).unwrap();
     submit_repair_proposal(&mut store, &candidate, &repair, &record).unwrap();
     assert_eq!(store.count_proposals().unwrap(), 1);
-    let _ = std::fs::remove_dir_all(root);
+    drop(store);
+    drop(coordinator);
+    std::fs::remove_dir_all(root).unwrap();
 }

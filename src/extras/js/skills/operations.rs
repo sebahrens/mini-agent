@@ -2948,6 +2948,80 @@ mod tests {
             LifecycleStatus::Canary
         );
 
+        let durable_state = || {
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let candidate = LifecycleService::new(&mut store)
+                .revision(&candidate_id)
+                .unwrap();
+            let predecessor = LifecycleService::new(&mut store)
+                .revision(&predecessor_id)
+                .unwrap();
+            let desired = store.generation_state().unwrap().desired_generation;
+            let records = store
+                .connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM skill_transitions),
+                        (SELECT COUNT(*) FROM skill_lifecycle_approvals
+                         WHERE approval_kind = 'phase5_operator_promotion'),
+                        (SELECT COUNT(*) FROM skill_approval_authorizations
+                         WHERE consumed_at IS NOT NULL)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            (candidate, predecessor, desired, records)
+        };
+        let before = durable_state();
+        let store = SkillStore::open_at(&paths).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_operator_pair BEFORE INSERT ON skill_transitions
+             WHEN NEW.idempotency_key LIKE 'local-owner-promote:%:predecessor'
+             BEGIN SELECT RAISE(ABORT, 'injected operator pair failure'); END;",
+            )
+            .unwrap();
+        drop(store);
+        let failed = run(
+            None,
+            false,
+            None,
+            Some(LibraryOperation::Promote(&candidate_id)),
+            &paths,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("injected operator pair failure"),
+            "{failed:#}"
+        );
+        assert_eq!(durable_state(), before);
+        let store = SkillStore::open_at(&paths).unwrap();
+        let unconsumed: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM skill_approval_authorizations
+             WHERE artifact_id = ? AND transition = 'canary_to_active' AND consumed_at IS NULL",
+                [&candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unconsumed, 1,
+            "failed transaction must not consume its issued owner authority"
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_operator_pair")
+            .unwrap();
+        drop(store);
+
         run(
             None,
             false,

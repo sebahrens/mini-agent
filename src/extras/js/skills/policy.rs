@@ -1,13 +1,18 @@
 //! Versioned, reproducible evidence qualification and promotion policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use super::CapabilityTier;
 
+#[cfg(test)]
 const ONE_SIDED_95_Z: f64 = 1.644_853_626_951_472_2;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectOutcome {
@@ -18,6 +23,7 @@ pub enum DirectOutcome {
     CapabilityDenied,
 }
 
+#[cfg(test)]
 impl DirectOutcome {
     fn severity(self) -> u8 {
         match self {
@@ -38,6 +44,7 @@ impl DirectOutcome {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationEvidence {
     pub invocation_id: String,
@@ -109,6 +116,7 @@ impl TaskOutcomeEvidence {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromotionPolicy {
     pub version: String,
@@ -125,8 +133,8 @@ pub struct PromotionPolicy {
     pub min_verified_task_passes: Option<usize>,
 }
 
+#[cfg(test)]
 impl PromotionPolicy {
-    #[cfg(test)]
     pub fn conservative(version: impl Into<String>, window_start: i64, window_end: i64) -> Self {
         Self {
             version: version.into(),
@@ -158,6 +166,7 @@ impl PromotionPolicy {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotionContext {
     pub candidate_id: String,
@@ -172,6 +181,7 @@ pub struct PromotionContext {
     pub generation_current: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionDecision {
@@ -180,6 +190,7 @@ pub enum PromotionDecision {
     HumanReview,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QualifiedStatistics {
     pub distinct_turns: usize,
@@ -191,6 +202,7 @@ pub struct QualifiedStatistics {
     pub severe_faults: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromotionEvaluation {
     pub policy_version: String,
@@ -207,18 +219,21 @@ pub struct PromotionEvaluation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
+    #[cfg(test)]
     #[error("invalid promotion policy configuration")]
     InvalidConfiguration,
+    #[cfg(test)]
     #[error("evidence contains an invocation ID conflict")]
     InvocationConflict,
     #[error("invalid task-outcome evidence")]
     InvalidTaskOutcome,
+    #[cfg(test)]
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
-// Test-only no-task-outcome convenience wrapper. Production evaluates promotion through
-// [`evaluate_promotion_with_task_outcomes`] (lifecycle.rs), which must never drop task evidence.
+// No-task-outcome convenience for policy tests. The library lifecycle contract uses
+// evaluate_promotion_with_task_outcomes; shipped promotion requires a separate owner action.
 #[cfg(test)]
 pub fn evaluate_promotion(
     policy: &PromotionPolicy,
@@ -235,6 +250,7 @@ pub fn evaluate_promotion(
     )
 }
 
+#[cfg(test)]
 pub fn evaluate_promotion_with_task_outcomes(
     policy: &PromotionPolicy,
     context: &PromotionContext,
@@ -373,6 +389,7 @@ pub fn evaluate_promotion_with_task_outcomes(
     })
 }
 
+#[cfg(test)]
 pub fn qualify(
     policy: &PromotionPolicy,
     skill_id: &str,
@@ -441,6 +458,7 @@ pub fn qualify(
     })
 }
 
+#[cfg(test)]
 pub fn nearest_rank_percentile(sorted_values: &[u64], percentile: u32) -> Option<u64> {
     if sorted_values.is_empty() || percentile == 0 || percentile > 100 {
         return None;
@@ -449,6 +467,7 @@ pub fn nearest_rank_percentile(sorted_values: &[u64], percentile: u32) -> Option
     sorted_values.get(rank - 1).copied()
 }
 
+#[cfg(test)]
 pub fn wilson_upper(failures: usize, total: usize) -> f64 {
     if total == 0 {
         return 1.0;
@@ -461,6 +480,7 @@ pub fn wilson_upper(failures: usize, total: usize) -> f64 {
     ((center + radius) / (1.0 + z2 / n)).clamp(0.0, 1.0)
 }
 
+#[cfg(test)]
 fn canonical_inputs(
     policy: &PromotionPolicy,
     context: &PromotionContext,
