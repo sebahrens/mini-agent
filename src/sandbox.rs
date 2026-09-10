@@ -3467,6 +3467,12 @@ async fn finish_pipe_readers(
     }
 }
 
+/// How long a terminated process group may take to drain before the caller
+/// stops waiting. SIGKILL delivery converges in well under a millisecond, so
+/// this only has to cover scheduling delay on a loaded host; it exists at all
+/// because a member whose parent never reaps it must not stall cancellation.
+const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
         kill_process_group(pid);
@@ -3474,6 +3480,50 @@ async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     let _ = child.start_kill();
     if let Err(error) = child.wait().await {
         tracing::warn!("sandbox: failed to reap terminated command: {error}");
+    }
+    // kill_process_group only signals; returning here would report a settled
+    // tree while a descendant is still runnable, which is how a cancelled turn
+    // can answer before its process tree is gone. Drain after reaping the
+    // leader: the leader is a member of its own group, so waiting first would
+    // block on its own zombie until the budget expired on every termination.
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
+    }
+}
+
+/// Wait for an already-signalled process group to lose its last member.
+///
+/// Signal zero only observes the group, and succeeds while any member remains,
+/// including one that has exited but not yet been reaped by its parent. The
+/// bound therefore has to be real rather than a formality.
+#[cfg(unix)]
+async fn await_drained_process_group(pid: u32, budget: std::time::Duration) {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    let Ok(group) = i32::try_from(pid) else {
+        return;
+    };
+    if group <= 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match killpg(Pid::from_raw(group), None) {
+            Err(Errno::ESRCH) => return,
+            Ok(()) | Err(Errno::EPERM) => {}
+            Err(error) => {
+                tracing::warn!("sandbox: failed to observe draining group {pid}: {error}");
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("sandbox: process group {pid} did not drain within its budget");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
