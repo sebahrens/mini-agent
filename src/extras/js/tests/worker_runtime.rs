@@ -1988,127 +1988,40 @@ impl WorkerLauncher for RecoveryLauncher {
     }
 }
 
-#[derive(Clone)]
-struct DelayedLaunchLauncher {
-    launches: Arc<AtomicUsize>,
-    completed_launches: Arc<AtomicUsize>,
+const LAUNCH_FIXTURE_GUARD: Duration = Duration::from_secs(15);
+const LAUNCH_TEST_WATCHDOG: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct LaunchGateState {
+    released: bool,
+    closing: bool,
+    rescued: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct LaunchTrace {
+    gate: Mutex<LaunchGateState>,
+    wake: Condvar,
+    entered: tokio::sync::Notify,
+    launches: AtomicUsize,
+    completed: AtomicUsize,
+    created: AtomicUsize,
     live_processes: Arc<AtomicUsize>,
-    first_delay: Duration,
+    max_live_processes: AtomicUsize,
 }
 
-impl DelayedLaunchLauncher {
-    fn new(first_delay: Duration) -> Self {
-        Self {
-            launches: Arc::new(AtomicUsize::new(0)),
-            completed_launches: Arc::new(AtomicUsize::new(0)),
-            live_processes: Arc::new(AtomicUsize::new(0)),
-            first_delay,
-        }
-    }
+struct ActiveTestLaunch(Arc<LaunchTrace>);
 
-    async fn wait_for_launches(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.launches.load(Ordering::Acquire) < expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("synchronous launcher was not entered");
-    }
-
-    async fn wait_for_completed_launches(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.completed_launches.load(Ordering::Acquire) < expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("delayed launch did not return");
-    }
-
-    async fn wait_for_live_processes(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.live_processes.load(Ordering::Acquire) != expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("late worker process was not reaped");
-    }
-}
-
-impl WorkerLauncher for DelayedLaunchLauncher {
-    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
-        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
-    }
-
-    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
-        if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
-            std::thread::sleep(self.first_delay);
-        }
-        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
-        process.observe_reap_for_test(self.live_processes.clone());
-        self.completed_launches.fetch_add(1, Ordering::Release);
-        Ok(process)
+impl Drop for ActiveTestLaunch {
+    fn drop(&mut self) {
+        self.0.completed.fetch_add(1, Ordering::Release);
+        self.0.gate.lock().unwrap().active -= 1;
     }
 }
 
 #[derive(Clone)]
-struct BlockedFirstLaunchLauncher {
-    launches: Arc<AtomicUsize>,
-    completed_launches: Arc<AtomicUsize>,
-    live_processes: Arc<AtomicUsize>,
-    max_live_processes: Arc<AtomicUsize>,
-    release_first: Arc<(Mutex<bool>, Condvar)>,
-}
-
-impl BlockedFirstLaunchLauncher {
-    fn new() -> Self {
-        Self {
-            launches: Arc::new(AtomicUsize::new(0)),
-            completed_launches: Arc::new(AtomicUsize::new(0)),
-            live_processes: Arc::new(AtomicUsize::new(0)),
-            max_live_processes: Arc::new(AtomicUsize::new(0)),
-            release_first: Arc::new((Mutex::new(false), Condvar::new())),
-        }
-    }
-
-    fn release_first_launch(&self) {
-        let (released, wake) = &*self.release_first;
-        *released.lock().unwrap() = true;
-        wake.notify_all();
-    }
-
-    async fn wait_for_launches(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.launches.load(Ordering::Acquire) < expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("blocked launcher was not entered");
-    }
-
-    async fn wait_for_completed_launches(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.completed_launches.load(Ordering::Acquire) < expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("released launcher did not return");
-    }
-
-    async fn wait_for_live_processes(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while self.live_processes.load(Ordering::Acquire) != expected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("worker process count did not reach its expected value");
-    }
-}
+struct BlockedFirstLaunchLauncher(Arc<LaunchTrace>);
 
 impl WorkerLauncher for BlockedFirstLaunchLauncher {
     fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
@@ -2116,21 +2029,81 @@ impl WorkerLauncher for BlockedFirstLaunchLauncher {
     }
 
     fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
-        if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
-            let (released, wake) = &*self.release_first;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = wake.wait(released).unwrap();
+        let first = {
+            let mut state = self.0.gate.lock().unwrap();
+            if state.closing {
+                return Err(WorkerLaunchError::MissingPipe {
+                    pipe: "closed test fixture",
+                });
+            }
+            state.active += 1;
+            self.0.launches.fetch_add(1, Ordering::AcqRel) == 0
+        };
+        let _active = ActiveTestLaunch(self.0.clone());
+        if first {
+            let state = self.0.gate.lock().unwrap();
+            self.0.entered.notify_one();
+            let (mut state, _) = self
+                .0
+                .wake
+                .wait_timeout_while(state, LAUNCH_FIXTURE_GUARD, |state| !state.released)
+                .unwrap();
+            if !state.released {
+                state.rescued = true;
+                return Err(WorkerLaunchError::MissingPipe {
+                    pipe: "test launch rescue",
+                });
             }
         }
         let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
-        process.observe_reap_for_test(self.live_processes.clone());
-        self.max_live_processes.fetch_max(
-            self.live_processes.load(Ordering::Acquire),
+        process.observe_reap_for_test(self.0.live_processes.clone());
+        self.0.created.fetch_add(1, Ordering::Release);
+        self.0.max_live_processes.fetch_max(
+            self.0.live_processes.load(Ordering::Acquire),
             Ordering::AcqRel,
         );
-        self.completed_launches.fetch_add(1, Ordering::Release);
         Ok(process)
+    }
+}
+
+struct LaunchFixtureOwner(Arc<LaunchTrace>);
+
+impl LaunchFixtureOwner {
+    fn release(&self) {
+        self.0.gate.lock().unwrap().released = true;
+        self.0.wake.notify_all();
+    }
+
+    fn wait_for_quiescence(&self) -> bool {
+        let deadline = Instant::now() + LAUNCH_FIXTURE_GUARD;
+        loop {
+            if self.0.gate.lock().unwrap().active == 0
+                && self.0.live_processes.load(Ordering::Acquire) == 0
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for LaunchFixtureOwner {
+    fn drop(&mut self) {
+        // Prevent a not-yet-entered detached callback from creating a process
+        // after the owner has finished cleaning up.
+        self.0.gate.lock().unwrap().closing = true;
+        self.release();
+        let settled = self.wait_for_quiescence();
+        if !std::thread::panicking() {
+            assert!(settled, "launch callback or late worker did not settle");
+            assert!(
+                !self.0.gate.lock().unwrap().rescued,
+                "launch needed fixture rescue"
+            );
+        }
     }
 }
 
@@ -2234,164 +2207,165 @@ async fn assert_fault_then_recovery(
     launcher.wait_for_live_processes(0).await;
 }
 
-#[tokio::test]
-async fn worker_supervisor_watchdog_bounds_synchronous_launch_and_reaps_late_process() {
-    // Keep a wide separation between the deliberate launch stall and the watchdog so a healthy
-    // recovery child's handshake is not judged by sub-100-ms scheduler luck in the parallel suite.
-    let launcher = DelayedLaunchLauncher::new(Duration::from_secs(2));
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
-        launcher.clone(),
-        Duration::from_secs(1),
-    ));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchStop {
+    Cancel,
+    DeadlineAndRepeatedCallers,
+    Panic,
+}
 
-    let started = Instant::now();
-    let result = supervisor
-        .execute(
+fn launch_test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn exercise_blocked_launch(stop: LaunchStop, trace: Arc<LaunchTrace>) {
+    // Drop the supervisor (and any retained connection) before the fixture owner.
+    let owner = LaunchFixtureOwner(trace.clone());
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        BlockedFirstLaunchLauncher(trace.clone()),
+        LAUNCH_TEST_WATCHDOG,
+    );
+    let first = launch_test_runtime().block_on(async {
+        let cancellation = PermCancellation::new();
+        let request = supervisor.execute(
             RunStep::new("success".into()),
             RecordingEffects::default(),
-            PermCancellation::new(),
-        )
-        .await;
-    assert_eq!(result, Err(WorkerError::TimedOut));
-    assert!(
-        started.elapsed() < Duration::from_millis(1_500),
-        "synchronous launcher escaped the whole-call watchdog"
-    );
-
-    launcher.wait_for_completed_launches(1).await;
-    launcher.wait_for_live_processes(0).await;
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
-}
-
-#[tokio::test]
-async fn worker_supervisor_cancellation_bounds_synchronous_launch_and_reaps_late_process() {
-    let launcher = DelayedLaunchLauncher::new(Duration::from_millis(500));
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
-        launcher.clone(),
-        Duration::from_secs(2),
-    ));
-    let cancellation = PermCancellation::new();
-    let request_cancellation = cancellation.clone();
-    let request_supervisor = supervisor.clone();
-    let request = tokio::spawn(async move {
-        request_supervisor
-            .execute(
-                RunStep::new("success".into()),
-                RecordingEffects::default(),
-                request_cancellation,
-            )
-            .await
-    });
-    launcher.wait_for_launches(1).await;
-
-    let started = Instant::now();
-    cancellation.cancel();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_millis(250), request)
-            .await
-            .expect("cancellation did not interrupt synchronous startup")
-            .unwrap(),
-        Err(WorkerError::Cancelled)
-    );
-    assert!(started.elapsed() < Duration::from_millis(250));
-
-    launcher.wait_for_completed_launches(1).await;
-    launcher.wait_for_live_processes(0).await;
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
-}
-
-async fn assert_blocked_startup_does_not_accumulate_launches(repeated_call_count: usize) {
-    let launcher = BlockedFirstLaunchLauncher::new();
-    // The first launch is explicitly blocked, so a one-second watchdog still proves bounded
-    // callers while allowing the post-release recovery handshake to survive suite-wide load.
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
-        launcher.clone(),
-        Duration::from_secs(1),
-    ));
-
-    assert_eq!(
-        supervisor
-            .execute(
-                RunStep::new("success".into()),
-                RecordingEffects::default(),
-                PermCancellation::new(),
-            )
-            .await,
-        Err(WorkerError::TimedOut)
-    );
-    launcher.wait_for_launches(1).await;
-
-    let repeated = (0..repeated_call_count)
-        .map(|_| {
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move {
-                supervisor
-                    .execute(
-                        RunStep::new("success".into()),
-                        RecordingEffects::default(),
-                        PermCancellation::new(),
-                    )
-                    .await
-            })
+            cancellation.clone(),
+        );
+        tokio::pin!(request);
+        tokio::time::timeout(LAUNCH_FIXTURE_GUARD, async {
+            tokio::select! {
+                biased;
+                result = &mut request => panic!("request completed before launch entry: {result:?}"),
+                () = trace.entered.notified() => {}
+            }
         })
-        .collect::<Vec<_>>();
-    let mut repeated_results = Vec::new();
-    for request in repeated {
-        repeated_results.push(request.await.unwrap());
+        .await
+        .expect("first launch must announce readiness");
+        assert_eq!(trace.completed.load(Ordering::Acquire), 0);
+        match stop {
+            LaunchStop::Cancel => cancellation.cancel(),
+            LaunchStop::DeadlineAndRepeatedCallers => {
+                tokio::time::pause();
+                // Cross both the absolute deadline and its rounded timer tick.
+                tokio::time::advance(LAUNCH_TEST_WATCHDOG + Duration::from_secs(1)).await;
+            }
+            LaunchStop::Panic => panic!("injected while first worker launch is held"),
+        }
+        tokio::time::timeout(LAUNCH_FIXTURE_GUARD, &mut request)
+            .await
+            .expect("caller must return while synchronous launch remains held")
+    });
+    assert_eq!(
+        first,
+        Err(if stop == LaunchStop::Cancel {
+            WorkerError::Cancelled
+        } else {
+            WorkerError::TimedOut
+        })
+    );
+    assert_eq!(trace.completed.load(Ordering::Acquire), 0);
+    assert!(
+        supervisor.launch_in_flight_for_test(),
+        "timed-out caller released the launch lease"
+    );
+
+    if stop == LaunchStop::DeadlineAndRepeatedCallers {
+        // A fresh clock prevents the first virtual timeout from making these
+        // new callers already expired before they wait behind the launch.
+        launch_test_runtime().block_on(async {
+            let repeated = futures::future::join_all((0..8).map(|_| {
+                supervisor.execute(
+                    RunStep::new("success".into()),
+                    RecordingEffects::default(),
+                    PermCancellation::new(),
+                )
+            }));
+            tokio::pin!(repeated);
+            assert!(futures::poll!(&mut repeated).is_pending());
+            tokio::time::pause();
+            tokio::time::advance(LAUNCH_TEST_WATCHDOG + Duration::from_secs(1)).await;
+            let results = tokio::time::timeout(LAUNCH_FIXTURE_GUARD, &mut repeated)
+                .await
+                .expect("queued callers must respect their own deadlines");
+            assert!(
+                results
+                    .iter()
+                    .all(|result| *result == Err(WorkerError::TimedOut))
+            );
+        });
+        assert!(supervisor.launch_in_flight_for_test());
+        assert_eq!(trace.launches.load(Ordering::Acquire), 1);
+        assert_eq!(trace.completed.load(Ordering::Acquire), 0);
     }
-    let launches_while_first_was_blocked = launcher.launches.load(Ordering::Acquire);
 
-    // Release and clean up before making assertions so the intentionally failing old behavior
-    // cannot strand its synchronous launch thread or any worker process in the test binary.
-    launcher.release_first_launch();
-    launcher
-        .wait_for_completed_launches(launches_while_first_was_blocked)
-        .await;
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
-
+    owner.release();
+    assert!(owner.wait_for_quiescence(), "late worker was not reaped");
+    assert_eq!(trace.completed.load(Ordering::Acquire), 1);
     assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
+        trace.created.load(Ordering::Acquire),
+        1,
+        "late worker was never created"
     );
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
-    let maximum_live = launcher.max_live_processes.load(Ordering::Acquire);
-
-    assert_eq!(
-        launches_while_first_was_blocked, 1,
-        "immediate callers started additional detached launch threads"
-    );
-    assert!(
-        repeated_results
-            .iter()
-            .all(|result| *result == Err(WorkerError::TimedOut)),
-        "callers waiting behind an in-flight launch did not respect their own deadlines"
-    );
-    assert!(
-        maximum_live <= 1,
-        "overlapping launches created {maximum_live} workers"
-    );
+    assert_eq!(trace.live_processes.load(Ordering::Acquire), 0);
+    launch_test_runtime().block_on(async {
+        assert_eq!(
+            execute_success(&supervisor).await.outcome,
+            StepOutcome::Value("success".into())
+        );
+        supervisor.shutdown_for_test().await.unwrap();
+    });
+    assert_eq!(trace.launches.load(Ordering::Acquire), 2);
+    assert_eq!(trace.max_live_processes.load(Ordering::Acquire), 1);
 }
 
-#[tokio::test]
-async fn worker_supervisor_immediate_next_call_waits_behind_in_flight_launch() {
-    assert_blocked_startup_does_not_accumulate_launches(1).await;
-}
-
-#[tokio::test]
-async fn worker_supervisor_repeated_calls_do_not_accumulate_in_flight_launches() {
-    assert_blocked_startup_does_not_accumulate_launches(8).await;
+#[test]
+fn worker_supervisor_blocked_launch_is_owned_through_stop_repeated_calls_and_panic() {
+    for stop in [
+        LaunchStop::Cancel,
+        LaunchStop::DeadlineAndRepeatedCallers,
+        LaunchStop::Panic,
+    ] {
+        let trace = Arc::new(LaunchTrace::default());
+        let observed = trace.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            exercise_blocked_launch(stop, observed);
+        }));
+        match result {
+            Ok(()) => assert_ne!(stop, LaunchStop::Panic),
+            Err(error) => {
+                if stop != LaunchStop::Panic {
+                    std::panic::resume_unwind(error);
+                }
+                assert_eq!(
+                    error.downcast_ref::<&str>(),
+                    Some(&"injected while first worker launch is held")
+                );
+            }
+        }
+        let state = trace.gate.lock().unwrap();
+        assert!(!state.rescued, "{stop:?}: launch required rescue");
+        assert_eq!(
+            state.active, 0,
+            "{stop:?}: launch callback survived teardown"
+        );
+        assert_eq!(
+            trace.live_processes.load(Ordering::Acquire),
+            0,
+            "{stop:?}: worker survived teardown"
+        );
+        assert_eq!(
+            trace.launches.load(Ordering::Acquire),
+            trace.completed.load(Ordering::Acquire)
+        );
+        assert_eq!(
+            trace.created.load(Ordering::Acquire),
+            if stop == LaunchStop::Panic { 1 } else { 2 }
+        );
+    }
 }
 
 #[tokio::test]

@@ -1252,6 +1252,11 @@ owned release gate. Cancellation and a controlled async deadline must return
 while that read remains held; fixture drop releases the read and waits for
 snapshot cleanup, including during assertion unwinding. Readiness and cleanup
 have emergency hang guards, with no elapsed-latency acceptance threshold.
+The blocked-launch matrix likewise owns its release gate and late-process
+cleanup. It checks cancellation, controlled deadlines for an initial and eight
+subsequent callers, retained launch-lease ownership, successful recovery, and
+cleanup during an exact injected panic. Each virtual-time phase uses a fresh
+runtime so clock offsets cannot pre-expire later callers.
 
 The matrix defines required evidence. Phase 6 is delivered under the index exit rule using the
 dedicated containment gates. CI run 31319107422 and commit `9c6f164` retain historical v1.7

@@ -845,6 +845,11 @@ impl JsWorkerSupervisor {
     }
 
     #[cfg(test)]
+    pub(crate) fn launch_in_flight_for_test(&self) -> bool {
+        self.0.launch_gate.try_lock().is_err()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn shutdown_for_test(&self) -> Result<(), WorkerError> {
         self.shutdown().await
     }
