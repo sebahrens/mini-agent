@@ -3359,6 +3359,14 @@ mod protocol_tests {
 
                     let shell = ProcessIdentity::capture(shell_pid).unwrap();
                     let descendant = ProcessIdentity::capture(descendant_pid).unwrap();
+                    // Record the topology while the tree is still whole. A
+                    // survivor is only interpretable against the process group
+                    // it belonged to when the kill was sent: inside the shell's
+                    // group means killpg should have reached it, and a
+                    // different group means the descendant escaped the group
+                    // the killer targets. The states alone cannot say which.
+                    let shell_at_readiness = shell.state().unwrap();
+                    let descendant_at_readiness = descendant.state().unwrap();
                     observed_tree = Some((shell, descendant));
                     if fail_after_readiness {
                         panic!("injected after Bash process-tree readiness");
@@ -3382,7 +3390,9 @@ mod protocol_tests {
                             descendant_state,
                             ProcessState::Exited | ProcessState::Gone | ProcessState::Replaced
                         ),
-                        "Cancelled while Bash descendant remained live: {descendant_state:?}"
+                        "Cancelled while Bash descendant remained live: {descendant_state:?}; \
+                         at readiness shell {shell_pid} was {shell_at_readiness:?} and \
+                         descendant {descendant_pid} was {descendant_at_readiness:?}"
                     );
                     Ok::<(), agent_client_protocol::Error>(())
                 })
