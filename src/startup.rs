@@ -2005,7 +2005,7 @@ mod tests {
     struct LocalPricingServer {
         url: String,
         accepted: std::sync::mpsc::Receiver<()>,
-        started: std::sync::mpsc::Receiver<()>,
+        started: std::sync::mpsc::Receiver<Vec<u8>>,
         closed: std::sync::mpsc::Receiver<bool>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
@@ -2113,7 +2113,7 @@ mod tests {
                     break;
                 }
             }
-            let _ = started_tx.send(());
+            let _ = started_tx.send(request);
             if let Some((status, body)) = response {
                 let reason = if status == 200 { "OK" } else { "Failure" };
                 let response = format!(
@@ -2320,15 +2320,26 @@ mod tests {
         assert!(refresh.is_finished(), "pricing refresh did not finish");
     }
 
+    fn local_pricing_provider(url: &str) -> crate::config::CustomProviderConfig {
+        crate::config::CustomProviderConfig {
+            provider_type: "openrouter".into(),
+            base_url: url.strip_suffix("/models").unwrap().into(),
+            api_key_env: None,
+            danger_accept_invalid_certs: None,
+            api_style: None,
+            headers: std::collections::HashMap::new(),
+            timeout_secs: None,
+            connect_timeout_secs: None,
+            stream_idle_timeout_secs: None,
+            model: None,
+        }
+    }
+
     fn local_pricing_refresh(url: String) -> OpenRouterPricingRefresh {
+        let custom =
+            std::collections::HashMap::from([("openrouter".into(), local_pricing_provider(&url))]);
         OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
-            crate::provider::fetch_openrouter_pricing_from_url(
-                None,
-                &std::collections::HashMap::new(),
-                None,
-                &url,
-            )
-            .await
+            crate::provider::fetch_openrouter_pricing(None, &custom, None).await
         })
     }
 
@@ -2460,7 +2471,20 @@ mod tests {
 
     #[tokio::test]
     async fn completed_pricing_refresh_updates_missing_session_metadata() {
-        const BODY: &str = r#"{"data":[{"id":"test/model","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":64000}]}"#;
+        const BODY: &str = r#"{"data":[
+            {"id":"test/model","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":64000},
+            {"id":"nan","pricing":{"prompt":"NaN","completion":"0.000002"}},
+            {"id":"negative","pricing":{"prompt":"0.000001","completion":"-0.000002"}},
+            {"id":"infinity","pricing":{"prompt":"inf","completion":"-inf"},"context_length":32000},
+            {"id":"overflow","pricing":{"prompt":"1e308","completion":"0.000002"}},
+            {"id":"malformed","pricing":{"prompt":"invalid","completion":"0.000002"}},
+            {"id":"free","pricing":{"prompt":"0","completion":"0"},"context_length":16000},
+            {"id":"context-only","context_length":8000},
+            {"id":"zero-context","pricing":{"prompt":"0.000001","completion":"0.000002"},"context_length":0},
+            {"id":"no-metadata"},
+            {"id":"no-price-zero-context","context_length":0},
+            {"id":"invalid-only","pricing":{"prompt":"NaN","completion":"inf"}}
+        ]}"#;
         let server = spawn_local_pricing_server(Some((200, BODY)));
         let mut refresh = local_pricing_refresh(server.url.clone());
         recv_channel(
@@ -2469,15 +2493,49 @@ mod tests {
         )
         .await;
         wait_for_pricing_refresh(&refresh).await;
-        let result = refresh.finish_without_wait().await;
-        let mut session = Session::new("openrouter", "test/model", 128_000, "");
-
-        apply_openrouter_pricing_refresh_result(&mut session, &refresh, result);
-
-        assert_eq!(session.input_token_cost, 1.0);
-        assert_eq!(session.output_token_cost, 2.0);
-        assert_eq!(session.context_window, 64_000);
+        let infos = refresh.finish_without_wait().await.unwrap().unwrap();
         server.finish().unwrap();
+
+        for (model, input, output, context) in [
+            ("test/model", 1.0, 2.0, Some(64_000)),
+            ("nan", 0.0, 2.0, None),
+            ("negative", 1.0, 0.0, None),
+            ("infinity", 0.0, 0.0, Some(32_000)),
+            ("overflow", 0.0, 2.0, None),
+            ("malformed", 0.0, 2.0, None),
+            ("free", 0.0, 0.0, Some(16_000)),
+            ("context-only", 0.0, 0.0, Some(8_000)),
+            ("zero-context", 1.0, 2.0, None),
+        ] {
+            let info = infos.get(model).unwrap();
+            assert_eq!(info.input_cost, input, "{model} input");
+            assert_eq!(info.output_cost, output, "{model} output");
+            assert_eq!(info.context_length, context, "{model} context");
+            refresh.model = model.into();
+            let mut session = Session::new("openrouter", model, 128_000, "");
+            apply_openrouter_pricing_refresh_result(
+                &mut session,
+                &refresh,
+                Some(Ok(infos.clone())),
+            );
+            assert_eq!(session.input_token_cost, input, "{model}");
+            assert_eq!(session.output_token_cost, output, "{model}");
+            assert_eq!(
+                session.context_window,
+                context.unwrap_or(128_000),
+                "{model}"
+            );
+            let persisted = serde_json::to_string(&session).unwrap();
+            let restored: Session = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(restored.input_token_cost, input, "{model}");
+            assert_eq!(restored.output_token_cost, output, "{model}");
+            assert_eq!(restored.context_window, session.context_window, "{model}");
+        }
+        assert_eq!(
+            infos.len(),
+            9,
+            "entries without usable metadata must be omitted"
+        );
     }
 
     #[test]
@@ -2532,33 +2590,33 @@ mod tests {
 
     #[tokio::test]
     async fn custom_provider_timeout_still_controls_live_pricing_request() {
-        let server = spawn_local_pricing_server(None);
-        let url = server.url.clone();
-        let mut custom = std::collections::HashMap::new();
-        custom.insert(
-            "openrouter".to_string(),
-            crate::config::CustomProviderConfig {
-                provider_type: "openrouter".into(),
-                base_url: "https://openrouter.ai/api/v1".into(),
-                api_key_env: None,
-                danger_accept_invalid_certs: None,
-                api_style: None,
-                headers: std::collections::HashMap::new(),
-                timeout_secs: Some(1),
-                connect_timeout_secs: None,
-                stream_idle_timeout_secs: None,
-                model: None,
-            },
+        let mut server = spawn_local_pricing_server(None);
+        server.url = server.url.replace("/models", "/gateway/v1/models");
+        let mut config = local_pricing_provider(&server.url);
+        config.timeout_secs = Some(1);
+        config.headers.insert(
+            "x-gateway-key".into(),
+            "pricing-header-test-sentinel".into(),
         );
+        let custom = std::collections::HashMap::from([("openrouter".into(), config)]);
         let mut refresh =
             OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
-                crate::provider::fetch_openrouter_pricing_from_url(None, &custom, None, &url).await
+                crate::provider::fetch_openrouter_pricing(
+                    Some("pricing-bearer-test-sentinel"),
+                    &custom,
+                    None,
+                )
+                .await
             });
-        recv_channel(
+        let request = recv_channel(
             &server.started,
             "custom-timeout pricing request did not start",
         )
         .await;
+        let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /gateway/v1/models http/1.1\r\n"));
+        assert!(request.contains("\r\nauthorization: bearer pricing-bearer-test-sentinel\r\n"));
+        assert!(request.contains("\r\nx-gateway-key: pricing-header-test-sentinel\r\n"));
 
         wait_for_pricing_refresh(&refresh).await;
         assert!(matches!(refresh.finish_without_wait().await, Some(Err(_))));

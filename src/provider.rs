@@ -819,27 +819,11 @@ pub struct OpenRouterModelInfo {
     pub context_length: Option<u64>,
 }
 
-pub async fn fetch_openrouter_pricing(
+pub(crate) fn openrouter_pricing_request(
     api_key: Option<&str>,
     custom_providers: &HashMap<String, CustomProviderConfig>,
     config_api_keys: Option<&HashMap<String, String>>,
-) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
-    fetch_openrouter_pricing_from_url(
-        api_key,
-        custom_providers,
-        config_api_keys,
-        "https://openrouter.ai/api/v1/models",
-    )
-    .await
-}
-
-pub(crate) async fn fetch_openrouter_pricing_from_url(
-    api_key: Option<&str>,
-    custom_providers: &HashMap<String, CustomProviderConfig>,
-    config_api_keys: Option<&HashMap<String, String>>,
-    url: &str,
-) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
-    const MAX_PRICING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+) -> anyhow::Result<reqwest::RequestBuilder> {
     let config = resolve_provider_config("openrouter", custom_providers)?;
     let key = AuthResolver::new(config.kind)
         .with_cli_key(api_key)
@@ -849,16 +833,30 @@ pub(crate) async fn fetch_openrouter_pricing_from_url(
         .resolve()
         .ok();
     let custom = custom_providers.get("openrouter");
+    let base = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://openrouter.ai/api/v1");
     let http = build_http_client(
         "openrouter",
         config.danger_accept_invalid_certs,
         custom,
-        None,
+        Some(base),
     )?;
-    let mut req = http.get(url);
+    let mut req = http.get(format!("{}/models", base.trim_end_matches('/')));
     if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
     }
+    Ok(req)
+}
+
+pub async fn fetch_openrouter_pricing(
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    const MAX_PRICING_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    let req = openrouter_pricing_request(api_key, custom_providers, config_api_keys)?;
     #[derive(serde::Deserialize)]
     struct PricingResp {
         prompt: String,
@@ -890,21 +888,31 @@ pub(crate) async fn fetch_openrouter_pricing_from_url(
     }
     let resp: PricingList = serde_json::from_slice(&body)?;
     let mut map = HashMap::new();
+    // Validate after scaling too: a finite per-token price can overflow.
+    let price_per_million = |price: &str| {
+        price
+            .parse::<f64>()
+            .ok()
+            .map(|price| price * 1_000_000.0)
+            .filter(|price| price.is_finite() && *price >= 0.0)
+            .unwrap_or(0.0)
+    };
     for entry in resp.data {
         let (input, output) = match entry.pricing.as_ref() {
             Some(p) => (
-                p.prompt.parse().unwrap_or(0.0),
-                p.completion.parse().unwrap_or(0.0),
+                price_per_million(&p.prompt),
+                price_per_million(&p.completion),
             ),
             None => (0.0, 0.0),
         };
-        if input > 0.0 || output > 0.0 || entry.context_length.is_some() {
+        let context_length = entry.context_length.filter(|length| *length > 0);
+        if input > 0.0 || output > 0.0 || context_length.is_some() {
             map.insert(
                 entry.id,
                 OpenRouterModelInfo {
-                    input_cost: input * 1_000_000.0,
-                    output_cost: output * 1_000_000.0,
-                    context_length: entry.context_length,
+                    input_cost: input,
+                    output_cost: output,
+                    context_length,
                 },
             );
         }

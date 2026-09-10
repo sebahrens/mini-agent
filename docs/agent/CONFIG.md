@@ -935,8 +935,15 @@ boundary is cancelled, and the existing session/catalog values are kept. The
 foreground abort join has a 100 ms ceiling; a runtime reaper retains ownership
 of any task still cancelling until it completes. A refresh that finishes in
 time updates only fields that are still missing.
+Catalog prices must be finite and nonnegative after conversion to the
+per-million-token unit. Invalid prices use the existing zero-cost fallback;
+valid prices and context metadata from the same entry remain usable. A zero
+catalog context limit is treated as missing, preserving the session's existing
+limit.
 `custom_providers.openrouter.timeout_secs` continues to govern the request
-while it is live.
+while it is live. If a custom provider shadows `openrouter`, its pricing catalog
+is fetched from `{base_url}/models`, using that provider's credentials and
+headers. The built-in provider uses `https://openrouter.ai/api/v1/models`.
 
 ## Reasoning controls (`[reasoning]`)
 

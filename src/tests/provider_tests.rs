@@ -21,6 +21,42 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 #[test]
+fn pricing_request_keeps_credentials_at_the_configured_endpoint() {
+    for base in [
+        None,
+        Some("https://gateway.example.test/v1"),
+        Some("https://gateway.example.test/nested/v1/"),
+    ] {
+        let mut custom = HashMap::new();
+        if let Some(base) = base {
+            let mut provider = cfg(None);
+            provider.provider_type = "openrouter".into();
+            provider.base_url = base.into();
+            custom.insert("openrouter".into(), provider);
+        }
+        let request = crate::provider::openrouter_pricing_request(
+            Some("pricing-endpoint-test-sentinel"),
+            &custom,
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let expected = format!(
+            "{}/models",
+            base.unwrap_or("https://openrouter.ai/api/v1")
+                .trim_end_matches('/')
+        );
+        assert_eq!(request.url().as_str(), expected);
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer pricing-endpoint-test-sentinel"
+        );
+    }
+}
+
+#[test]
 fn compaction_limits_reserve_provider_envelope_and_output_headroom() {
     let input_budget = 127_000;
     let response_budget = 1_000;
