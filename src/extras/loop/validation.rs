@@ -296,7 +296,7 @@ pub(crate) fn start_with_limits(
     limits: CommandLimits,
 ) -> ValidationOperation {
     ValidationOperation {
-        sandbox: sandbox.clone(),
+        sandbox: sandbox.for_validation(),
         command: command.to_string(),
         limits,
         cancellation: ValidationCancellation {

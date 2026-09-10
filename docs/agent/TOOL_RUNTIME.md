@@ -87,6 +87,13 @@ Loop caller regressions exercise real CLI output and transcript persistence,
 and TUI completion handling with output limits, unavailable sandboxing, scoped
 cancellation, and a stale result arriving during a replacement validation.
 Headless signal cleanup remains covered by the existing CLI interrupt matrix.
+Operator-configured loop and completion validators resolve the configured shell
+independently of model tool eligibility. Their presence also preserves startup
+sandbox requirements, including refusal of an explicitly unavailable backend.
+Tool-free invocations without configured validation still skip shell lookup.
+A shell resolved solely for validation stays unavailable to ordinary commands
+and `!` interactions; only the validator's private sandbox clone may use it.
+Workspace rebinding preserves that restriction and revalidates the shell identity.
 
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher

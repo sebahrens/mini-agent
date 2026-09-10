@@ -900,9 +900,22 @@ impl Cli {
                     .any(|allowed| canonical_tool_name(allowed) == canonical_tool_name(name)))
     }
 
+    /// Operator-configured validation needs a shell even when the model has
+    /// no shell tool. This does not change model tool eligibility.
+    pub(crate) fn configured_validation_needs_shell(&self, cfg: &config::Config) -> bool {
+        #[cfg(feature = "loop")]
+        if self.loop_run.is_some() {
+            return true;
+        }
+        cfg.verify_command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+    }
+
     pub(crate) fn general_sandbox_is_eligible(&self, cfg: &config::Config) -> bool {
         self.tool_is_eligible(cfg, "shell")
             || cfg!(feature = "js") && self.tool_is_eligible(cfg, "js")
+            || self.configured_validation_needs_shell(cfg)
     }
 
     #[cfg(feature = "mcp")]

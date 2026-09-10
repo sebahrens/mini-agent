@@ -54,6 +54,8 @@ impl TempRoot {
         let address = listener.local_addr().unwrap();
         let verification_config = if outcome == "verification" {
             "verify_command=\"trap '' TERM; echo $$ > command.pid; exec /bin/sleep 30\"\n"
+        } else if outcome == "verification_without_shell" {
+            "verify_command=\"test -f effect.txt && printf checked > verified.txt\"\nverify_max_attempts=1\n"
         } else {
             ""
         };
@@ -70,6 +72,7 @@ impl TempRoot {
                     | "active_command"
                     | "second_wait"
                     | "verification"
+                    | "verification_without_shell"
             ) {
                 2
             } else {
@@ -114,7 +117,30 @@ impl TempRoot {
                 if length > 1024 * 1024 {
                     return Err(io::Error::other("request too large"));
                 }
-                socket.read_exact(&mut vec![0; length])?;
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body)?;
+                // Verify the actual model schema as well as the validator's
+                // effects: operator validation must not expose model tools.
+                let expected_tools: Option<&[&str]> = match outcome {
+                    "validation_no_tools" => Some(&[]),
+                    "validation_read_only" => Some(&["read"]),
+                    "verification_without_shell" => Some(&["write"]),
+                    _ => None,
+                };
+                if let Some(expected) = expected_tools {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).map_err(io::Error::other)?;
+                    let actual: Vec<_> = request["tools"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|tool| tool["function"]["name"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "operator validation changed model tool exposure"
+                    );
+                }
                 if outcome == "initial_wait"
                     || (index == 1 && matches!(outcome, "partial_wait" | "second_wait"))
                 {
@@ -134,10 +160,12 @@ impl TempRoot {
                 let (status, content_type, body) = if failed {
                     ("400 Bad Request", "application/json", r#"{"error":{"message":"local provider failure","type":"invalid_request_error"}}"#.to_owned())
                 } else {
-                    let partial = matches!(
-                        outcome,
-                        "partial_failure" | "partial_wait" | "active_command"
-                    ) || (outcome == "verification" && index == 0);
+                    let partial =
+                        matches!(
+                            outcome,
+                            "partial_failure" | "partial_wait" | "active_command"
+                        ) || (matches!(outcome, "verification" | "verification_without_shell")
+                            && index == 0);
                     let shell = outcome == "active_command" && index == 1;
                     let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
                         serde_json::json!({
@@ -516,6 +544,8 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
             .env("OPENROUTER_API_KEY", "headless-json-test-key")
             .args(["--no-sandbox", "--no-context-files"]);
         if disabled {
+            // Configured validation must not enable ordinary ! commands.
+            std::fs::write(root.0.join("config.toml"), "verify_command=\"true\"\n").unwrap();
             command.arg("--no-tools");
         }
         command.args(["-p", "--output", "json", message]);
@@ -888,17 +918,25 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
 #[cfg(all(unix, feature = "loop"))]
 #[test]
 fn loop_validation_cli_preserves_command_results_and_output_limits() {
-    for (command, status, detail) in [
+    for (command, status, detail, tools) in [
         (
             "printf caller-stdout; printf caller-stderr >&2; exit 7",
             "nonzero_exit",
             "exit_code=7",
+            "read",
         ),
-        ("yes loop-output", "output_truncated", "limit=stdout"),
+        ("yes loop-output", "output_truncated", "limit=stdout", ""),
     ] {
         let root = TempRoot::new();
-        let server = root.local_provider("completed");
-        let mut cli = root.provider_command("shell");
+        let server = root.local_provider(if tools.is_empty() {
+            "validation_no_tools"
+        } else {
+            "validation_read_only"
+        });
+        let mut cli = root.provider_command(tools);
+        if tools.is_empty() {
+            cli.arg("--no-tools");
+        }
         cli.args([
             "--shell",
             "/bin/sh",
@@ -945,4 +983,37 @@ fn loop_validation_cli_preserves_command_results_and_output_limits() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn completion_verification_runs_without_exposing_the_shell_tool() {
+    let root = TempRoot::new();
+    let server = root.local_provider("verification_without_shell");
+    let mut cli = root.provider_command("write");
+    cli.args([
+        "--shell",
+        "/bin/sh",
+        "-p",
+        "--output",
+        "json",
+        "write the file",
+    ]);
+    let output = bounded_output(cli);
+    server.join().unwrap().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["stop_reason"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("effect.txt")).unwrap(),
+        "written\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("verified.txt")).unwrap(),
+        "checked"
+    );
 }

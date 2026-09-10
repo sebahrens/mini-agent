@@ -232,9 +232,9 @@ pub(crate) fn resolve_configured_execution_authority(
     Ok((authority, sandbox))
 }
 
-/// Resolve the model-visible shell exactly once from the invocation's
-/// captured workspace and PATH. Tool-free modes intentionally perform no
-/// executable lookup.
+/// Resolve the shell exactly once from the invocation's captured workspace
+/// and PATH. Configured validators also need it; model tool eligibility stays
+/// independent. Tool-free modes without validation perform no executable lookup.
 pub(crate) fn bind_configured_shell(
     cli: &crate::cli::Cli,
     cfg: &crate::config::Config,
@@ -243,7 +243,8 @@ pub(crate) fn bind_configured_shell(
     search_path: Option<&std::ffi::OsStr>,
     sandbox: crate::sandbox::Sandbox,
 ) -> crate::sandbox::Sandbox {
-    if !authority.tools_enabled || !cli.tool_is_eligible(cfg, "shell") {
+    let model_shell_enabled = authority.tools_enabled && cli.tool_is_eligible(cfg, "shell");
+    if !model_shell_enabled && !cli.configured_validation_needs_shell(cfg) {
         return sandbox.with_resolved_shell(None);
     }
     let configured = cli.resolve_shell(cfg);
@@ -252,7 +253,12 @@ pub(crate) fn bind_configured_shell(
     if capability.is_none() {
         tracing::warn!(shell = %configured, "configured shell is unavailable or unsupported; shell tool disabled");
     }
-    sandbox.with_bound_resolved_shell(capability, workspace)
+    let sandbox = sandbox.with_bound_resolved_shell(capability, workspace);
+    if model_shell_enabled {
+        sandbox
+    } else {
+        sandbox.with_validation_only_shell()
+    }
 }
 
 /// Build a permission policy and approval channel for interactive startup.
@@ -477,9 +483,9 @@ pub fn default_bash_rules() -> Vec<(&'static str, Action)> {
 #[cfg(test)]
 mod execution_authority_tests {
     use super::{
-        SandboxResolution, SecurityMode, bind_configured_shell, build_interactive_permission_at,
-        build_noninteractive_permission, resolve_configured_execution_authority,
-        resolve_execution_authority,
+        ExecutionAuthorityError, SandboxResolution, SecurityMode, bind_configured_shell,
+        build_interactive_permission_at, build_noninteractive_permission,
+        resolve_configured_execution_authority, resolve_execution_authority,
     };
     use crate::cli::Cli;
     use crate::config::Config;
@@ -862,6 +868,47 @@ mod execution_authority_tests {
         ] {
             let (authority, _) = resolve_configured_execution_authority(&cli, &cfg).unwrap();
             assert_eq!(authority.sandbox, SandboxResolution::Disabled);
+        }
+    }
+
+    #[test]
+    fn configured_validation_keeps_explicit_sandbox_requirements_without_model_shell() {
+        for no_tools in [false, true] {
+            for command in [None, Some("  "), Some("true")] {
+                let cli = Cli {
+                    no_tools,
+                    tools: vec!["read".into()],
+                    sandbox: true,
+                    sandbox_backend: Some("__missing_validation_backend__".into()),
+                    ..Cli::default()
+                };
+                let cfg = Config {
+                    verify_command: command.map(Into::into),
+                    ..Config::default()
+                };
+                assert!(!cli.tool_is_eligible(&cfg, "shell"));
+                let result = resolve_configured_execution_authority(&cli, &cfg);
+                if command == Some("true") {
+                    assert!(matches!(
+                        result,
+                        Err(ExecutionAuthorityError::SandboxUnavailable { .. })
+                    ));
+                } else {
+                    assert_eq!(result.unwrap().0.sandbox, SandboxResolution::Disabled);
+                }
+                #[cfg(feature = "loop")]
+                {
+                    let cli = Cli {
+                        loop_run: Some("true".into()),
+                        ..cli
+                    };
+                    assert!(matches!(
+                        resolve_configured_execution_authority(&cli, &cfg),
+                        Err(ExecutionAuthorityError::SandboxUnavailable { .. })
+                    ));
+                    assert!(!cli.tool_is_eligible(&cfg, "shell"));
+                }
+            }
         }
     }
 

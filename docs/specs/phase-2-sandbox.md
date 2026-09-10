@@ -173,8 +173,11 @@ fails closed, and Windows always fails closed while its enabled backend is unava
 absence or setup failure never masquerades as isolation, and this fallback policy is never
 permission for an uncontained JS worker.
 
-Startup resolves intended model capabilities before probing this backend. `--no-tools` and a tool
-allowlist that omits both `bash` and `js` perform no general-process preflight or shell discovery.
+Startup resolves intended model capabilities and configured validation commands before probing
+this backend. `--no-tools` and a tool allowlist that omits both `bash` and `js` perform no
+general-process preflight or shell discovery unless `verify_command` or `--loop-run` requires
+execution. Configured validators retain the selected sandbox and pinned shell contract without
+adding model-visible tools.
 On Windows, an eligible general AppContainer preflight is cached once per process and owns a bounded
 run-and-cleanup lifecycle. Before starting a new probe it spends at most five seconds recovering
 exact, privately owned preflight roots preserved by an earlier interrupted process; malformed,

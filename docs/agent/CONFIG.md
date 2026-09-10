@@ -412,7 +412,10 @@ status events; headless mode writes the status and diagnostics to stderr.
 `verify_command` is executed by a shell and therefore carries the authority of
 the user who configured it. It is a sensitive project-local setting: an
 untrusted `.zerostack/config.toml` cannot activate it in TUI, headless, or ACP
-mode.
+mode. Configured verification and `--loop-run` resolve the selected shell even
+when `--no-tools` is set or the model's tool list excludes `shell`. They retain
+the configured sandbox policy and executable identity checks; enabling a
+validator does not add shell tools or shell guidance to model requests.
 
 Accepted top-level keys:
 

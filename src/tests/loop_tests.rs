@@ -329,13 +329,29 @@ async fn interactive_loop_validation_routes_results_cancellation_and_stale_event
             #[cfg(feature = "archmd")]
             architecture: None,
         };
-        let cli = crate::cli::Cli::parse_from(["mini-agent", "--no-session"]);
+        let cli = crate::cli::Cli::parse_from([
+            "mini-agent",
+            "--no-session",
+            "--no-tools",
+            "--no-sandbox",
+            "--shell",
+            "/bin/sh",
+            "--loop-run",
+            "configured validator",
+        ]);
         let cfg = crate::config::Config::default();
         let mut session = crate::session::Session::new("openrouter", "test", 128_000, "");
         let client = crate::provider::AnyClient::OpenRouter(
             rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
         );
         let sandbox = Sandbox::new(case == "unavailable", "__missing_loop_test_backend__");
+        let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
+            .unwrap()
+            .0;
+        let sandbox = crate::permission::bind_configured_shell(
+            &cli, &cfg, authority, &workspace, None, sandbox,
+        )
+        .with_workspace_binding(workspace.clone());
         let mut ui = UiContext::new(
             &cli,
             &cfg,
@@ -444,7 +460,7 @@ async fn interactive_loop_validation_routes_results_cancellation_and_stale_event
             assert_eq!(event.result.stderr, b"caller-err");
         } else if case == "unavailable" {
             assert!(event.result.stdout.is_empty());
-            assert!(diagnostic.contains("requested-but-unavailable"));
+            assert!(diagnostic.contains("configured shell is unavailable or unsupported"));
         }
         if let Some(unrelated) = unrelated {
             // Start another validation through the real Done handler before the

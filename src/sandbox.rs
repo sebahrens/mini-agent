@@ -46,6 +46,9 @@ pub struct Sandbox {
     shell_candidate: Option<ShellCapability>,
     shell_capability: Option<ShellCapability>,
     shell_resolution_complete: bool,
+    /// A configured validator may resolve a shell without enabling ordinary
+    /// commands. Only the trusted validator's private clone clears this bit.
+    validation_only_shell: bool,
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
     workspace_binding: Option<Arc<crate::paths::WorkspaceBinding>>,
@@ -1144,6 +1147,7 @@ impl Sandbox {
             shell_candidate: None,
             shell_capability: None,
             shell_resolution_complete: false,
+            validation_only_shell: false,
             disabled_reason: DisabledSandboxReason::UserTrustedBypass,
             working_dir: None,
             workspace_binding: None,
@@ -1423,7 +1427,24 @@ impl Sandbox {
     }
 
     pub(crate) fn shell_capability(&self) -> Option<&ShellCapability> {
-        self.shell_capability.as_ref()
+        if self.validation_only_shell {
+            None
+        } else {
+            self.shell_capability.as_ref()
+        }
+    }
+
+    pub(crate) fn with_validation_only_shell(mut self) -> Self {
+        self.validation_only_shell = true;
+        self
+    }
+
+    /// Configured validators retain the same workspace, executable identity,
+    /// containment policy, and scoped process ownership as ordinary commands.
+    pub(crate) fn for_validation(&self) -> Self {
+        let mut sandbox = self.clone();
+        sandbox.validation_only_shell = false;
+        sandbox
     }
 
     /// Preserve why startup disabled sandboxing after an unavailable backend
@@ -1633,6 +1654,9 @@ impl Sandbox {
     fn wrap_command_inner(&self, command: &str) -> Result<Command, String> {
         if let Some(workspace) = &self.workspace_binding {
             workspace.validate()?;
+        }
+        if self.validation_only_shell {
+            return Err("configured shell is unavailable or unsupported".to_string());
         }
         if self.shell_resolution_complete {
             self.shell_capability
@@ -3788,7 +3812,23 @@ mod sandbox_tests {
             .with_resolved_shell(Some(capability))
             .with_workspace_binding(binding_a);
 
-        let rebound = sandbox.clone().rebind_workspace_binding(binding_b).unwrap();
+        let rebound = sandbox
+            .clone()
+            .rebind_workspace_binding(binding_b.clone())
+            .unwrap();
+        let validation_only = sandbox
+            .clone()
+            .with_validation_only_shell()
+            .rebind_workspace_binding(binding_b)
+            .unwrap();
+        let validator = validation_only.for_validation();
+        assert!(validation_only.shell_capability().is_none());
+        assert!(validation_only.wrap_command("true").is_err());
+        assert_eq!(
+            validator.shell_capability().unwrap().executable(),
+            executable_b.canonicalize().unwrap()
+        );
+        assert!(validator.wrap_command("true").is_ok());
 
         assert_eq!(
             sandbox.shell_capability().unwrap().executable(),
@@ -3815,7 +3855,7 @@ mod sandbox_tests {
             );
         }
 
-        drop((sandbox, rebound));
+        drop((sandbox, rebound, validation_only, validator));
         std::fs::remove_dir_all(workspace_a).unwrap();
         std::fs::remove_dir_all(workspace_b).unwrap();
     }
@@ -3910,8 +3950,16 @@ mod sandbox_tests {
             .wrap_command("true")
             .expect_err("a replaced rebound shell image must fail closed");
         assert!(error.contains("identity changed"));
+        let validator = rebound
+            .clone()
+            .with_validation_only_shell()
+            .for_validation();
+        let error = validator
+            .wrap_command("true")
+            .expect_err("validation must reject a replaced rebound shell image too");
+        assert!(error.contains("identity changed"));
 
-        drop(rebound);
+        drop((rebound, validator));
         std::fs::remove_dir_all(workspace_a).unwrap();
         std::fs::remove_dir_all(workspace_b).unwrap();
     }
