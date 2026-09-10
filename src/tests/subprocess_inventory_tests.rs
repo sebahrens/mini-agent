@@ -878,6 +878,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
     (
         "src/extras/export.rs",
@@ -3160,6 +3161,7 @@ const ALLOWED_CURRENT_CLASSES: &[&str] = &[
 /// Exact ownership for every lexical disposition and every site in a source
 /// file that contains more than one production trust class.
 const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
+    ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     (
         "src/extras/js/skills/operations.rs",
         "let dispatcher = TelemetryDispatcher::spawn(&paths).unwrap();",

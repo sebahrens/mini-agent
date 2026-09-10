@@ -1189,7 +1189,7 @@ async fn drive_permission_bridge(
     const OPT_DENY: &str = "deny";
 
     loop {
-        let ask = tokio::select! {
+        let mut ask = tokio::select! {
             biased;
             _ = control.cancelled() => break,
             ask = ask_rx.recv() => match ask {
@@ -1204,6 +1204,11 @@ async fn drive_permission_bridge(
             .unwrap_or(&ask.input)
             .to_string();
         let synthetic_tool_call_id = ask.tool_call_id.is_none();
+        let title = if synthetic_tool_call_id {
+            format!("Permission: {}", ask.tool)
+        } else {
+            ask.tool.to_string()
+        };
         let tool_call_id = ToolCallId::new(
             ask.tool_call_id
                 .clone()
@@ -1213,7 +1218,7 @@ async fn drive_permission_bridge(
             ask.input.clone(),
         )))];
         if synthetic_tool_call_id {
-            let announced = ToolCall::new(tool_call_id.clone(), ask.tool.to_string())
+            let announced = ToolCall::new(tool_call_id.clone(), title.clone())
                 .content(content.clone())
                 .raw_input(Some(serde_json::Value::String(ask.input.clone())));
             if let Err(error) = cx.send_notification(SessionNotification::new(
@@ -1226,10 +1231,8 @@ async fn drive_permission_bridge(
             }
         }
         let tool_call = ToolCallUpdate::new(
-            tool_call_id,
-            ToolCallUpdateFields::new()
-                .title(ask.tool.to_string())
-                .content(content),
+            tool_call_id.clone(),
+            ToolCallUpdateFields::new().title(title).content(content),
         );
         let options = vec![
             PermissionOption::new(
@@ -1248,33 +1251,55 @@ async fn drive_permission_bridge(
 
         let response = tokio::select! {
             biased;
-            _ = control.cancelled() => {
-                let _ = ask.reply.send(UserDecision::Deny);
-                break;
-            }
-            res = cx.send_request(req).block_task() => res,
+            _ = control.cancelled() => None,
+            _ = ask.reply.closed() => None,
+            res = cx.send_request(req).block_task() => Some(res),
         };
 
-        let decision = match response {
-            Ok(resp) => match resp.outcome {
-                RequestPermissionOutcome::Cancelled => UserDecision::Deny,
+        let (decision, notice) = match response {
+            None => (UserDecision::Deny, "Permission request cancelled"),
+            Some(Ok(resp)) => match resp.outcome {
+                RequestPermissionOutcome::Cancelled => {
+                    (UserDecision::Deny, "Permission request cancelled")
+                }
                 RequestPermissionOutcome::Selected(sel) => {
                     let id = sel.option_id.0.as_ref();
                     if id == OPT_ALLOW_ALWAYS {
-                        UserDecision::AllowAlways(suggested)
+                        (UserDecision::AllowAlways(suggested), "Permission approved")
                     } else if id == OPT_ALLOW_ONCE {
-                        UserDecision::AllowOnce
+                        (UserDecision::AllowOnce, "Permission approved")
                     } else {
-                        UserDecision::Deny
+                        (UserDecision::Deny, "Permission denied")
                     }
                 }
-                _ => UserDecision::Deny,
+                _ => (UserDecision::Deny, "Permission denied"),
             },
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!("ACP permission request failed: {e}");
-                UserDecision::Deny
+                (UserDecision::Deny, "Permission request failed")
             }
         };
+        // This lifecycle represents the approval request, not the underlying
+        // effect. Ordinary tool calls remain owned by the runner's result event.
+        if synthetic_tool_call_id {
+            let status = match &decision {
+                UserDecision::AllowOnce | UserDecision::AllowAlways(_) => ToolCallStatus::Completed,
+                UserDecision::Deny => ToolCallStatus::Failed,
+            };
+            let fields =
+                ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(notice),
+                    ))]);
+            let update = ToolCallUpdate::new(tool_call_id, fields);
+            if let Err(error) = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::ToolCallUpdate(update),
+            )) {
+                tracing::warn!("ACP failed to settle synthetic permission tool call: {error}");
+            }
+        }
         let _ = ask.reply.send(decision);
     }
     // Drain remaining buffered asks as Deny after control cancelled.
@@ -2593,6 +2618,235 @@ mod protocol_tests {
             },
             Message::assistant("tools-complete"),
         ]
+    }
+
+    #[tokio::test]
+    async fn permission_bridge_settles_synthetic_calls_and_releases_abandoned_requests() {
+        use crate::permission::ask::{AskRequest, UserDecision};
+
+        let mut failures = Vec::new();
+        for synthetic in [true, false] {
+            for case in [
+                "once",
+                "always",
+                "deny",
+                "cancelled",
+                "invalid",
+                "error",
+                "control",
+                "abandoned",
+            ] {
+                let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                let control = Arc::new(TurnControl::new());
+                let bridge_control = control.clone();
+                let agent = Agent
+                    .builder()
+                    .on_receive_request(
+                        async |_: InitializeRequest, responder, _cx| {
+                            responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                        },
+                        on_receive_request!(),
+                    )
+                    .with_spawned(move |cx| async move {
+                        drive_permission_bridge(
+                            cx,
+                            SessionId::new("permission-test"),
+                            ask_rx,
+                            bridge_control,
+                        )
+                        .await;
+                        let _ = done_tx.send(());
+                        Ok(())
+                    });
+                let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+                let connection = Client
+                    .builder()
+                    .on_receive_notification(
+                        move |notification: SessionNotification, _cx| {
+                            let _ = notification_tx.send(notification);
+                            async { Ok(()) }
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .on_receive_request(
+                        move |request: RequestPermissionRequest, responder, _cx| {
+                            let _ = request_tx.send((request, responder));
+                            async { Ok(()) }
+                        },
+                        on_receive_request!(),
+                    )
+                    .connect_with(agent, async move |cx| {
+                        let send_ask = |name: &str| {
+                            let (reply, receiver) = tokio::sync::oneshot::channel();
+                            let ask = AskRequest {
+                                tool: "shell".into(),
+                                input: name.to_owned(),
+                                tool_call_id: (!synthetic).then(|| name.to_owned()),
+                                suggested_pattern: Some("approved/**".into()),
+                                additional_allow_patterns: Vec::new(),
+                                reply,
+                            };
+                            (ask, receiver)
+                        };
+                        let (ask, reply) = send_ask("first");
+                        ask_tx.send(ask).await.unwrap();
+                        let (request, responder) = request_rx.recv().await.unwrap();
+                        let mut ids = vec![request.tool_call.tool_call_id.clone()];
+                        let mut decisions = Vec::new();
+                        if case == "abandoned" {
+                            drop(reply);
+                            let (next, next_reply) = send_ask("next");
+                            ask_tx.send(next).await.unwrap();
+                            // Keep the first client response pending. Only caller
+                            // abandonment can let the bridge reach this request.
+                            let (next_request, next_responder) = request_rx.recv().await.unwrap();
+                            ids.push(next_request.tool_call.tool_call_id);
+                            next_responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                    "allow_once",
+                                )),
+                            ))?;
+                            decisions.push(next_reply.await.unwrap());
+                            drop(responder);
+                        } else if case == "control" {
+                            let (buffered, buffered_reply) = send_ask("buffered");
+                            ask_tx.send(buffered).await.unwrap();
+                            control.cancel();
+                            decisions.push(reply.await.unwrap());
+                            decisions.push(buffered_reply.await.unwrap());
+                            drop(responder);
+                        } else {
+                            if case == "error" {
+                                responder.respond_with_error(agent_client_protocol::Error::new(
+                                    -32603,
+                                    "client refusal",
+                                ))?;
+                            } else {
+                                let outcome = match case {
+                                    "cancelled" => RequestPermissionOutcome::Cancelled,
+                                    _ => RequestPermissionOutcome::Selected(
+                                        SelectedPermissionOutcome::new(match case {
+                                            "once" => "allow_once",
+                                            "always" => "allow_always",
+                                            "deny" => "deny",
+                                            _ => "unknown-option",
+                                        }),
+                                    ),
+                                };
+                                responder.respond(RequestPermissionResponse::new(outcome))?;
+                            }
+                            decisions.push(reply.await.unwrap());
+                        }
+                        drop(ask_tx);
+                        done_rx.await.unwrap();
+                        // An RPC round trip fences the already-enqueued terminal
+                        // notifications before inspecting the client-side stream.
+                        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await?;
+                        let mut updates = Vec::new();
+                        while let Ok(notification) = notification_rx.try_recv() {
+                            updates.push(notification.update);
+                        }
+                        Ok((ids, decisions, updates))
+                    });
+                let observed =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), connection).await;
+                let Ok(Ok((ids, decisions, updates))) = observed else {
+                    failures.push(format!(
+                        "{case} synthetic={synthetic}: connection did not settle: {observed:?}"
+                    ));
+                    continue;
+                };
+                let decision_kinds: Vec<_> = decisions
+                    .iter()
+                    .map(|decision| match decision {
+                        UserDecision::AllowOnce => "once".to_owned(),
+                        UserDecision::AllowAlways(pattern) => format!("always:{pattern}"),
+                        UserDecision::Deny => "deny".to_owned(),
+                    })
+                    .collect();
+                let expected_decisions = match case {
+                    "once" | "abandoned" => vec!["once"],
+                    "always" => vec!["always:approved/**"],
+                    "control" => vec!["deny", "deny"],
+                    _ => vec!["deny"],
+                };
+                if decision_kinds != expected_decisions {
+                    failures.push(format!(
+                        "{case} synthetic={synthetic}: decisions {decision_kinds:?}"
+                    ));
+                }
+                if !synthetic {
+                    if !updates.is_empty() || ids[0].0.as_ref() != "first" {
+                        failures.push(format!(
+                            "{case}: bridge changed an ordinary tool lifecycle: {updates:?}"
+                        ));
+                    }
+                    continue;
+                }
+                let announced: Vec<_> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        SessionUpdate::ToolCall(call) => Some(call),
+                        _ => None,
+                    })
+                    .collect();
+                let terminal: Vec<_> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        SessionUpdate::ToolCallUpdate(update) => Some(update),
+                        _ => None,
+                    })
+                    .collect();
+                if announced.len() != ids.len() || terminal.len() != ids.len() {
+                    failures.push(format!(
+                        "{case}: expected {} announcements and terminal updates, got {}/{}",
+                        ids.len(),
+                        announced.len(),
+                        terminal.len()
+                    ));
+                    continue;
+                }
+                for (index, id) in ids.iter().enumerate() {
+                    let approved =
+                        matches!(case, "once" | "always") || (case == "abandoned" && index == 1);
+                    let expected = if approved {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    };
+                    if announced[index].tool_call_id != *id
+                        || terminal[index].tool_call_id != *id
+                        || terminal[index].fields.status != Some(expected)
+                    {
+                        failures.push(format!(
+                            "{case}: mismatched synthetic lifecycle {updates:?}"
+                        ));
+                    }
+                    let notice = if approved {
+                        "Permission approved"
+                    } else if matches!(case, "control" | "cancelled" | "abandoned") {
+                        "Permission request cancelled"
+                    } else if case == "error" {
+                        "Permission request failed"
+                    } else {
+                        "Permission denied"
+                    };
+                    let content = vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(notice),
+                    ))];
+                    if announced[index].title != "Permission: shell"
+                        || terminal[index].fields.content.as_ref() != Some(&content)
+                    {
+                        failures.push(format!("{case}: synthetic result must describe an approval, not completed tool work"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]

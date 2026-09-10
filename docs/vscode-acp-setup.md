@@ -174,6 +174,12 @@ turn; any completed tool progress remains in its history.
 
 When a tool needs authorization, mini-agent sends a `session/request_permission` request to the connected client. The client (the native extension or another ACP client) displays the permission dialog; the user's choice (Allow once / Allow always / Deny) is forwarded back to the agent.
 
+Approvals with no existing tool-call identity appear as a separate `Permission:`
+entry. That entry finishes when the approval is granted, denied, cancelled, or
+fails; its result describes the permission decision. The underlying operation
+keeps its own lifecycle. If an operation stops waiting for approval, mini-agent
+cancels that pending request so later approvals can proceed.
+
 If no ACP client is connected, or if the session is non-interactive, tool calls that require a permission prompt are denied automatically.
 
 ## Troubleshooting
