@@ -180,6 +180,12 @@ after initialization failure; a failure after native bare-remote and linked-work
 setup verifies that every sibling disappears before rescue. Both preserve the
 original error. The create rollback fixture uses the same exclusive directory
 owner and keeps its existing supervisor rendezvous before directory removal.
+The standalone workspace-rebind, non-repository, and non-UTF8 path fixtures also
+acquire this owner before fallible setup. Workspace handles drop before their
+directory owner on both normal return and unwinding. Non-UTF8 creation retains
+the unsupported-filesystem skip; other creation errors still fail the test.
+The existing initialization-failure control also rejects adopting an already
+owned directory and checks that the failed acquisition leaves its contents intact.
 
 Create and merge transaction supervisors inherit the caller's `AgentWorkScope`
 through the shared scoped async spawn boundary. A supplied scope remains busy

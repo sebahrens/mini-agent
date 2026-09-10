@@ -45,10 +45,14 @@ mod tests {
 
     impl OwnedDirectory {
         fn create(path: PathBuf) -> Self {
+            Self::try_create(path).expect("create fixture directory")
+        }
+
+        fn try_create(path: PathBuf) -> std::io::Result<Self> {
             // Exclusive creation: a failed setup must not delete a path that
             // was already present before this fixture acquired ownership.
-            std::fs::create_dir(&path).expect("create fixture directory");
-            Self(path)
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
         }
 
         fn path(&self) -> &Path {
@@ -102,10 +106,18 @@ mod tests {
     }
 
     #[test]
-    fn temporary_repository_owns_failed_git_initialization() {
+    fn temporary_repository_preserves_directory_ownership_on_setup_failure() {
         let path =
             std::env::temp_dir().join(format!("mini-agent-failed-init-{}", uuid::Uuid::new_v4()));
         let repo = TempRepo::uninitialized(OwnedDirectory::create(path.clone()));
+        let collision = OwnedDirectory::try_create(path.clone())
+            .err()
+            .expect("must not adopt an existing fixture directory");
+        assert_eq!(collision.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            repo.path().is_dir(),
+            "failed creation removed the existing owner"
+        );
         // A malformed Git file makes the real git init fail after directory
         // creation, without changing process environment or global Git config.
         std::fs::write(repo.path().join(".git"), "invalid gitfile\n").unwrap();
@@ -532,6 +544,8 @@ mod tests {
             "mini-agent-workspace-rebind-{}",
             uuid::Uuid::new_v4()
         ));
+        let owner = OwnedDirectory::create(root);
+        let root = owner.path();
         let original = root.join("original");
         let missing = root.join("missing");
         std::fs::create_dir_all(&original).unwrap();
@@ -576,7 +590,6 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
         drop(sandbox);
         drop(workspace);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -585,6 +598,8 @@ mod tests {
             "mini-agent-shell-rebind-rollback-{}",
             uuid::Uuid::new_v4()
         ));
+        let owner = OwnedDirectory::create(root);
+        let root = owner.path();
         let original = root.join("original");
         let replacement = root.join("replacement");
         std::fs::create_dir_all(&original).unwrap();
@@ -659,7 +674,6 @@ mod tests {
         drop(checker);
 
         drop((sandbox, workspace, permission));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -841,10 +855,11 @@ mod tests {
             "mini-agent-8tbo-not-a-repo-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let owner = OwnedDirectory::create(directory);
+        let directory = owner.path();
         std::fs::write(directory.join("untouched.txt"), "untouched\n").unwrap();
 
-        let error = worktree_auto_commit_all(&directory)
+        let error = worktree_auto_commit_all(directory)
             .await
             .expect_err("mutation must require a common Git directory identity");
 
@@ -857,7 +872,6 @@ mod tests {
             "untouched\n"
         );
         assert!(!directory.join(".git").exists());
-        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
@@ -2595,24 +2609,28 @@ wait
         name.push(0xff);
         name.extend_from_slice(uuid::Uuid::new_v4().to_string().as_bytes());
         let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
-        if let Err(error) = std::fs::create_dir_all(&path) {
-            if error.kind() == std::io::ErrorKind::Unsupported
-                || matches!(error.raw_os_error(), Some(1 | 22 | 92))
+        let owner = match OwnedDirectory::try_create(path) {
+            Ok(owner) => owner,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Unsupported
+                    || matches!(error.raw_os_error(), Some(1 | 22 | 92)) =>
             {
                 eprintln!("filesystem does not support this non-UTF8 fixture: {error}");
                 return;
             }
-            panic!("failed to create non-UTF8 fixture for an unrelated reason: {error}");
-        }
-        git(&path, ["init", "-b", "main"]);
+            Err(error) => {
+                panic!("failed to create non-UTF8 fixture for an unrelated reason: {error}")
+            }
+        };
+        let path = owner.path();
+        git(path, ["init", "-b", "main"]);
 
         let result = run_git_with_limits_for_test(
-            &path,
+            path,
             &["status", "--porcelain"],
             test_limits(Duration::from_secs(2)),
         )
         .await;
-        let _ = std::fs::remove_dir_all(&path);
         result.expect("non-UTF8 repository path must remain an OsStr argument");
     }
 
