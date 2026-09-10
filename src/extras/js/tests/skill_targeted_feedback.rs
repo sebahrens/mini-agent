@@ -123,24 +123,93 @@ fn skill_feedback_authorization_is_idempotent_redacted_and_audited() {
 }
 
 #[test]
-fn model_and_unknown_targets_have_no_effect() {
-    let (_root, mut store, skill, _invocation) = fixture();
-    let model = AuthenticatedActor {
-        actor_id: "model".into(),
-        kind: ActorKind::Model,
-        allowed_skill_ids: None,
-    };
-    let command = FeedbackCommand {
-        idempotency_key: "forged".into(),
-        skill_id: skill.id,
-        invocation_id: Some("unknown".into()),
-        kind: FeedbackKind::Severe,
-        reason_code: "unsafe_effect".into(),
-        reason_text: None,
-    };
-    let result =
-        FeedbackService::new(&mut store, Redactor::new(vec![], 512)).submit(&model, &command, 2);
-    assert!(matches!(result, Err(FeedbackError::Unauthorized)));
+fn feedback_authorization_and_unknown_targets_leave_no_records_or_counters() {
+    fn totals(store: &SkillStore) -> (i64, i64, i64, i64) {
+        store
+            .conn()
+            .query_row(
+                "SELECT
+                (SELECT COUNT(*) FROM skill_feedback),
+                (SELECT COUNT(*) FROM skill_feedback_audit),
+                (SELECT COALESCE(SUM(user_positive_count), 0) FROM skill_stats),
+                (SELECT COALESCE(SUM(user_negative_count), 0) FROM skill_stats)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    let (root, mut store, skill, invocation) = fixture();
+    let baseline = totals(&store);
+    let command = negative_command(&skill.id, &invocation, "authorization");
+    let wrong_scope = Some(BTreeSet::from(["f".repeat(64)]));
+    assert_ne!(skill.id, "f".repeat(64));
+    for (case, kind, actor_id, allowed_skill_ids) in [
+        ("model", ActorKind::Model, "model", None),
+        ("anonymous", ActorKind::Anonymous, "guest", None),
+        ("empty owner", ActorKind::Owner, "", None),
+        ("empty reviewer", ActorKind::Reviewer, "", None),
+        (
+            "owner with empty scope",
+            ActorKind::Owner,
+            "owner",
+            Some(BTreeSet::new()),
+        ),
+        (
+            "reviewer with empty scope",
+            ActorKind::Reviewer,
+            "reviewer",
+            Some(BTreeSet::new()),
+        ),
+        (
+            "owner outside scope",
+            ActorKind::Owner,
+            "owner",
+            wrong_scope.clone(),
+        ),
+        (
+            "reviewer outside scope",
+            ActorKind::Reviewer,
+            "reviewer",
+            wrong_scope,
+        ),
+    ] {
+        let actor = AuthenticatedActor {
+            actor_id: actor_id.into(),
+            kind,
+            allowed_skill_ids,
+        };
+        let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+            .submit(&actor, &command, 2)
+            .expect_err(case);
+        assert!(
+            matches!(error, FeedbackError::Unauthorized),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            totals(&store),
+            baseline,
+            "{case} must not write feedback, audit, or stats"
+        );
+    }
+
+    // A valid actor and well-formed command must reach the unknown-skill
+    // check; an invalid invocation or scope must not hide that boundary.
+    let unknown = "f".repeat(64);
+    let mut unknown_command = command;
+    unknown_command.skill_id = unknown.clone();
+    unknown_command.invocation_id = None;
+    let error = FeedbackService::new(&mut store, Redactor::new(vec![], 512))
+        .submit(&owner(&unknown), &unknown_command, 2)
+        .expect_err("unknown skill");
+    assert!(matches!(error, FeedbackError::UnknownSkill { skill_id } if skill_id == unknown));
+    assert_eq!(
+        totals(&store),
+        baseline,
+        "unknown skill must not create orphan records"
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The exact-secret list is only the last line of defence: operators paste
