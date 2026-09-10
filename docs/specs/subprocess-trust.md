@@ -124,17 +124,25 @@ drains scoped work before propagating; cleanup polling cannot satisfy the earlie
 acceptance snapshot. These tests cover GitRunner's integration with the general
 subprocess lifecycle, alongside the sandbox's backend-specific tree tests.
 
-Worktree-create caller-drop coverage reuses the Git concurrency fixture's owned
-command gates. A held post-checkout hook establishes native readiness; a second
-hook holds the rollback ref transaction while another caller attempts repository
-admission. That caller must wait until rollback releases the repository lock.
-Before releasing the checkout fixture, the test verifies removal of the worktree,
-registration, branch, and private ownership ref. Failure controls cover setup
-before readiness, failure after readiness, failure during held rollback, and real
-Git rejection of rollback's ref transaction. Every path aborts and joins the caller,
-releases both hooks, awaits the supervisor's repository-lock release, and removes
-the sibling worktree base. The original panic and successful cleanup are checked
-independently, so a secondary cleanup failure cannot pass a failure-control test.
+Worktree-create caller-drop and timeout coverage share the Git concurrency
+fixture's owned command gates. Checkout readiness proves the worktree, registration,
+branch, and private ownership ref exist at the expected commit. Reservation readiness
+holds the committed reference-transaction hook and proves both refs exist before any
+worktree is registered. Timeout cases then advance only the already-armed command
+deadline; native startup and rollback use real progress, with no competing hook sleeps.
+The reservation hook holds only its first transaction so early-failure cleanup can
+complete subsequent ref transactions.
+
+A second hook holds rollback's ref transaction while another caller attempts repository
+admission. That caller must wait until rollback releases the repository lock. Before
+releasing the original fixture, each test verifies removal of the worktree, registration,
+branch, and private ownership ref; timeout cases also require the error to identify the
+specific command that expired. One failure matrix tests shared setup/readiness failures
+once, then covers all three distinct stop paths during held rollback and with real Git
+rejection of the rollback ref transaction. Every path joins the caller, releases both hooks, awaits the
+supervisor's repository-lock release, and removes the sibling worktree base. Original
+panics and successful cleanup are checked independently, so secondary cleanup failures
+cannot pass the failure controls.
 
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a

@@ -1637,40 +1637,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_branch_reservation_compare_deletes_its_exact_side_effect() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = TempRepo::new("timed branch reservation");
-        let base = repo.path().with_extension("timed branch reservation base");
-        std::fs::create_dir_all(&base).unwrap();
-        let hook = repo.path().join(".git/hooks/reference-transaction");
-        std::fs::write(
-            &hook,
-            "#!/bin/sh\nif [ \"$1\" = committed ]; then sleep 1; fi\nexit 0\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
-
-        let error = create_with_ref_limits_for_test(
-            repo.path(),
-            "ref-timeout",
-            Some(&base),
-            test_limits(Duration::from_millis(100)),
-        )
-        .await
-        .expect_err("branch reservation hook must time out");
-
-        assert!(error.contains("timed out"), "unexpected error: {error}");
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(["show-ref", "--verify", "refs/heads/ref-timeout"])
-            .status()
-            .unwrap();
-        assert!(!status.success(), "timed-out reservation leaked its ref");
-        assert!(!base.join("ref-timeout").exists());
-        let _ = std::fs::remove_dir_all(base);
+        run_create_rollback_case(CreateStop::ReservationTimeout).await;
     }
 
     #[cfg(unix)]
@@ -1721,77 +1688,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_worktree_create_rolls_back_the_new_ref_and_registration() {
-        use std::os::unix::fs::PermissionsExt;
+        run_create_rollback_case(CreateStop::CheckoutTimeout).await;
+    }
 
-        let repo = TempRepo::new("timed create rollback");
-        let base = repo.path().with_extension("timed create base");
-        std::fs::create_dir_all(&base).unwrap();
-        let target = base.join("create-timeout");
-        let started = repo.path().join("create-timeout-hook-started");
-        let hook = repo.path().join(".git/hooks/post-checkout");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 1\n",
-                started.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
+    #[cfg(unix)]
+    const CREATE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
-        let repo_path = repo.path().to_path_buf();
-        let base_path = base.clone();
-        let create_task = tokio::spawn(async move {
-            create_with_limits_for_test(
-                &repo_path,
-                "create-timeout",
-                Some(&base_path),
-                // Leave enough time for `git worktree add` to reach the hook in
-                // large feature-enabled test binaries while still timing out
-                // well before the hook's one-second sleep completes.
-                test_limits(Duration::from_millis(500)),
-            )
-            .await
-        });
-        wait_for_mutation_marker(
-            &started,
-            || create_task.is_finished(),
-            "timed worktree create",
-        )
-        .await;
-        // Keep the Tokio timer driver running while the hook sleeps. Blocking
-        // this current-thread test runtime makes the 500 ms production
-        // deadline and the one-second hook completion become ready together,
-        // which can let the child-success branch win under a loaded suite.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-
-        let error = create_task
-            .await
-            .expect("create task should not panic")
-            .expect_err("timed out create must fail");
-
-        assert!(error.contains("timed out"), "unexpected error: {error}");
-        assert!(
-            !target.exists(),
-            "timed out create left its worktree directory"
-        );
-        let ref_status = Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(["show-ref", "--verify", "refs/heads/create-timeout"])
-            .status()
-            .unwrap();
-        assert!(
-            !ref_status.success(),
-            "timed out create left its branch ref"
-        );
-        assert!(
-            !git_stdout(repo.path(), ["worktree", "list", "--porcelain"])
-                .contains(&target.to_string_lossy().into_owned())
-        );
-        let _ = std::fs::remove_dir_all(base);
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum CreateStop {
+        CallerDrop,
+        CheckoutTimeout,
+        ReservationTimeout,
     }
 
     #[cfg(unix)]
@@ -1805,7 +1713,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn exercise_create_cancellation(
+    async fn exercise_create_rollback(
+        stop: CreateStop,
         failure: CreateFixtureFailure,
         base: &Path,
         cleanup_ok: &mut bool,
@@ -1819,28 +1728,87 @@ mod tests {
             }
         }
 
-        let repo = TempRepo::new("dropped create 'rollback'");
+        let repo = TempRepo::new("held create 'rollback'");
         // Own the sibling directory before setup can fail, through the final
         // rollback rendezvous. TempRepo owns the hook and FIFO separately.
         let _base = WorktreeBase(base);
         std::fs::create_dir_all(base).unwrap();
-        let target = base.canonicalize().unwrap().join("create-dropped");
+        let target = base.canonicalize().unwrap().join("create-held");
         let mut rollback_gate = concurrency::CommandGate::new(repo.path(), "rollback-gate");
         let mut gate = concurrency::CommandGate::new(repo.path(), "create-gate");
-        std::fs::copy(&gate.script, repo.path().join(".git/hooks/post-checkout")).unwrap();
+        let hook = repo
+            .path()
+            .join(if matches!(stop, CreateStop::ReservationTimeout) {
+                ".git/hooks/reference-transaction"
+            } else {
+                ".git/hooks/post-checkout"
+            });
+        std::fs::copy(&gate.script, &hook).unwrap();
+        if matches!(stop, CreateStop::ReservationTimeout) {
+            // Cleanup may run before this hook has been replaced by the
+            // rollback gate. Never hold a second ref transaction on this FIFO.
+            let once = concurrency::quote(&repo.path().join(".git/reservation-held"));
+            std::fs::write(&hook, format!(
+                "#!/bin/sh\nif [ \"$1\" = committed ] && [ ! -e {once} ]; then\n: > {once}\n. {}\nfi\nexit 0\n",
+                concurrency::quote(&gate.script),
+            )).unwrap();
+        }
+        let expected_oid = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
         let repo_path = repo.path().to_path_buf();
         let base_path = base.to_path_buf();
         let mut task = Some(tokio::spawn(async move {
-            create(&repo_path, "create-dropped", Some(&base_path))
-                .await
-                .map(|_| ())
+            match stop {
+                CreateStop::CallerDrop => create(&repo_path, "create-held", Some(&base_path)).await,
+                CreateStop::CheckoutTimeout => {
+                    create_with_limits_for_test(
+                        &repo_path,
+                        "create-held",
+                        Some(&base_path),
+                        test_limits(CREATE_COMMAND_TIMEOUT),
+                    )
+                    .await
+                }
+                CreateStop::ReservationTimeout => {
+                    create_with_ref_limits_for_test(
+                        &repo_path,
+                        "create-held",
+                        Some(&base_path),
+                        test_limits(CREATE_COMMAND_TIMEOUT),
+                    )
+                    .await
+                }
+            }
+            .map(|_| ())
         }));
 
         let outcome = std::panic::AssertUnwindSafe(async {
             if matches!(failure, CreateFixtureFailure::BeforeReadiness) {
                 panic!("injected before create readiness");
             }
-            gate.wait_started(task.as_ref().unwrap(), &target).await;
+            let expected_cwd = if matches!(stop, CreateStop::ReservationTimeout) {
+                repo.path().canonicalize().unwrap()
+            } else {
+                target.clone()
+            };
+            gate.wait_started(task.as_ref().unwrap(), &expected_cwd).await;
+            // Prove the committed side effects before selecting a stop path.
+            // An absent ref after a timeout before reservation is not rollback.
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", "refs/heads/create-held"]), expected_oid);
+            let ownership = git_stdout(repo.path(), [
+                "for-each-ref", "--format=%(refname) %(objectname)", "refs/mini-agent/worktree-create/",
+            ]);
+            assert_eq!(ownership.lines().count(), 1, "reservation must own exactly one private ref");
+            let (reference, oid) = ownership.split_once(' ').unwrap();
+            assert!(reference.starts_with("refs/mini-agent/worktree-create/"));
+            assert_eq!(oid, expected_oid);
+            let registered = git_stdout(repo.path(), ["worktree", "list", "--porcelain"])
+                .contains(&target.to_string_lossy().into_owned());
+            if matches!(stop, CreateStop::ReservationTimeout) {
+                assert!(!target.exists() && !registered, "reservation advanced into worktree add before its hook completed");
+            } else {
+                assert!(target.exists() && registered, "checkout hook ran without its worktree registration");
+                assert_eq!(git_stdout(&target, ["rev-parse", "HEAD"]), expected_oid);
+            }
             if matches!(failure, CreateFixtureFailure::AfterReadiness) {
                 panic!("injected after create readiness");
             }
@@ -1853,10 +1821,24 @@ mod tests {
                 concurrency::quote(&rollback_gate.script),
                 u8::from(matches!(failure, CreateFixtureFailure::Rollback)),
             )).unwrap();
-            task.as_ref().unwrap().abort();
-            let joined = task.take().unwrap().await;
-            assert!(joined.unwrap_err().is_cancelled());
-            rollback_gate.wait_ready(|| false, &repo.path().canonicalize().unwrap()).await;
+            match stop {
+                CreateStop::CallerDrop => {
+                    task.as_ref().unwrap().abort();
+                    let joined = task.take().unwrap().await;
+                    assert!(joined.unwrap_err().is_cancelled());
+                }
+                CreateStop::CheckoutTimeout | CreateStop::ReservationTimeout => {
+                    // Native readiness and exact side effects precede the
+                    // clock advance. Both hooks remain held by the fixture.
+                    tokio::time::pause();
+                    tokio::time::advance(CREATE_COMMAND_TIMEOUT + Duration::from_secs(1)).await;
+                    tokio::time::resume();
+                }
+            }
+            rollback_gate.wait_ready(
+                || task.as_ref().is_some_and(|task| task.is_finished()),
+                &repo.path().canonicalize().unwrap(),
+            ).await;
             if matches!(failure, CreateFixtureFailure::DuringRollback) {
                 panic!("injected during create rollback");
             }
@@ -1877,21 +1859,34 @@ mod tests {
             let _admission = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, admission)
                 .await.expect("create rollback did not release repository admission").unwrap();
 
+            if let Some(caller) = task.as_mut() {
+                let joined = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, caller)
+                    .await.expect("timed out create did not return after rollback");
+                task.take();
+                let error = joined.expect("create caller panicked").expect_err("held create must time out");
+                let operation = match stop {
+                    CreateStop::CheckoutTimeout => "worktree-add",
+                    CreateStop::ReservationTimeout => "create-branch-ref",
+                    CreateStop::CallerDrop => unreachable!(),
+                };
+                assert!(error.contains(&format!("git {operation} timed out")), "unexpected create error: {error}");
+            }
+
             // Inspect rollback while owning repository admission and before
             // the fixture releases its hook. Release/rescue cannot make these
             // assertions pass after a broken production cancellation path.
             assert!(
                 !target.exists(),
-                "dropped create left its worktree directory"
+                "create rollback left its worktree directory"
             );
             assert!(
-                !optional_test_ref_exists(repo.path(), "refs/heads/create-dropped"),
-                "dropped create left its branch ref"
+                !optional_test_ref_exists(repo.path(), "refs/heads/create-held"),
+                "create rollback left its branch ref"
             );
             assert!(
                 !git_stdout(repo.path(), ["worktree", "list", "--porcelain"])
                     .contains(&target.to_string_lossy().into_owned()),
-                "dropped create left its worktree registration"
+                "create rollback left its worktree registration"
             );
             assert!(
                 git_stdout(
@@ -1903,7 +1898,7 @@ mod tests {
                     ]
                 )
                 .is_empty(),
-                "dropped create left its ownership ref"
+                "create rollback left its ownership ref"
             );
         })
         .catch_unwind()
@@ -1926,75 +1921,93 @@ mod tests {
         .catch_unwind()
         .await;
         let settled = [gate.settle(), rollback_gate.settle()];
-        *cleanup_ok = cleanup.is_ok()
-            && settled.iter().all(Result::is_ok)
-            && joined
-                .as_ref()
-                .is_none_or(|result| result.as_ref().is_err_and(|error| error.is_cancelled()));
+        let caller_settled = joined.as_ref().is_none_or(|result| {
+            result.is_ok() || result.as_ref().is_err_and(|error| error.is_cancelled())
+        });
+        *cleanup_ok = cleanup.is_ok() && settled.iter().all(Result::is_ok) && caller_settled;
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
         if let Err(panic) = cleanup {
             std::panic::resume_unwind(panic);
         }
-        if let Some(joined) = joined {
-            assert!(joined.unwrap_err().is_cancelled());
-        }
+        assert!(
+            caller_settled,
+            "create fixture caller panicked during cleanup"
+        );
         for result in settled {
             result.unwrap();
         }
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_worktree_create_rolls_back_before_releasing_the_repository() {
+    async fn run_create_rollback_case(stop: CreateStop) {
         let base =
             std::env::temp_dir().join(format!("mini-agent-create-base-{}", uuid::Uuid::new_v4()));
         let mut cleanup_ok = false;
-        exercise_create_cancellation(CreateFixtureFailure::None, &base, &mut cleanup_ok).await;
+        exercise_create_rollback(stop, CreateFixtureFailure::None, &base, &mut cleanup_ok).await;
         assert!(cleanup_ok, "create fixture cleanup did not settle");
         assert!(!base.exists(), "create fixture left its sibling base");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_cancellation_fixture_cleans_up_readiness_and_rollback_failures() {
+    async fn dropping_worktree_create_rolls_back_before_releasing_the_repository() {
+        run_create_rollback_case(CreateStop::CallerDrop).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_rollback_fixture_cleans_up_readiness_and_rollback_failures() {
+        use CreateStop::{CallerDrop, CheckoutTimeout, ReservationTimeout};
         use futures::FutureExt;
-        for (failure, expected) in [
+        // Before the caller first runs, all modes have the same owned cleanup.
+        // Checkout timeout and caller-drop also share checkout readiness; they
+        // diverge only when selecting their stop path. Exercise those prefixes
+        // once, then retain every distinct rollback/response lifecycle.
+        let cases: &[(CreateFixtureFailure, &[CreateStop], &str)] = &[
             (
                 CreateFixtureFailure::BeforeReadiness,
+                &[CallerDrop],
                 "injected before create readiness",
             ),
             (
                 CreateFixtureFailure::AfterReadiness,
+                &[CallerDrop, ReservationTimeout],
                 "injected after create readiness",
             ),
             (
                 CreateFixtureFailure::DuringRollback,
+                &[CallerDrop, CheckoutTimeout, ReservationTimeout],
                 "injected during create rollback",
             ),
             (
                 CreateFixtureFailure::Rollback,
-                "dropped create left its branch ref",
+                &[CallerDrop, CheckoutTimeout, ReservationTimeout],
+                "create rollback left its branch ref",
             ),
-        ] {
-            let base = std::env::temp_dir()
-                .join(format!("mini-agent-create-base-{}", uuid::Uuid::new_v4()));
-            let mut cleanup_ok = false;
-            let panic = std::panic::AssertUnwindSafe(exercise_create_cancellation(
-                failure,
-                &base,
-                &mut cleanup_ok,
-            ))
-            .catch_unwind()
-            .await
-            .expect_err("fixture failure must propagate after cleanup");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
-            assert!(cleanup_ok, "failed create fixture cleanup did not settle");
-            assert!(
-                !base.exists(),
-                "failed create fixture left its sibling base"
-            );
+        ];
+        for &(failure, stops, expected) in cases {
+            for &stop in stops {
+                let base = std::env::temp_dir()
+                    .join(format!("mini-agent-create-base-{}", uuid::Uuid::new_v4()));
+                let mut cleanup_ok = false;
+                let panic = std::panic::AssertUnwindSafe(exercise_create_rollback(
+                    stop,
+                    failure,
+                    &base,
+                    &mut cleanup_ok,
+                ))
+                .catch_unwind()
+                .await
+                .expect_err("fixture failure must propagate after cleanup");
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+                assert!(cleanup_ok, "failed create fixture cleanup did not settle");
+                assert!(
+                    !base.exists(),
+                    "failed create fixture left its sibling base"
+                );
+            }
         }
     }
 
