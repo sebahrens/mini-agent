@@ -233,32 +233,116 @@ class GymSubprocessTests(unittest.TestCase):
                     self.assertEqual(actual, fill * (limit - len(marker)) + marker if enabled else b"")
 
     def test_timeout_retains_tails_and_reaps_child_with_open_or_closed_pipes(self) -> None:
-        for close_pipes in [False, True]:
-            with self.subTest(close_pipes=close_pipes), tempfile.TemporaryDirectory() as directory:
+        real_spawn = subprocess.Popen
+        real_wait = CAPTURE._OwnedProcess.wait
+        expected_tails = [b"x" * 1997 + b"OUT", b"y" * 1997 + b"ERR"]
+        for close_pipes in (False, True):
+            with self.subTest(close_pipes=close_pipes), tempfile.TemporaryDirectory() as directory, \
+                 contextlib.ExitStack() as cleanup:
                 root = Path(directory)
+                gate_path = root / "gate"
+                os.mkfifo(gate_path, 0o600)
+                gate = os.open(gate_path, os.O_RDWR | os.O_NONBLOCK)
+                cleanup.callback(os.close, gate)
                 code = (
-                    "import os,sys,time; from pathlib import Path; "
-                    "Path('pid').write_text(str(os.getpid())); "
+                    "import os,sys; from pathlib import Path; "
+                    "Path('pid').write_text(str(os.getpid())+'\\n'); "
                     "os.write(1,b'x'*10000+b'OUT'); os.write(2,b'y'*10000+b'ERR')\n"
                     "if sys.argv[1]=='close': os.close(1); os.close(2)\n"
-                    "time.sleep(30)"
+                    "gate=os.open('gate',os.O_RDONLY); os.read(gate,1); os.close(gate)"
                 )
-                started = time.monotonic()
-                with self.assertRaises(subprocess.TimeoutExpired) as timed_out:
-                    TRAIN_MODULE.run(
-                        [sys.executable, "-c", code, "close" if close_pipes else "open"],
-                        root, dict(os.environ), 1,
-                    )
-                self.assertLess(time.monotonic() - started, 3)
-                self.assertEqual(timed_out.exception.timeout, 1)
-                self.assertEqual(timed_out.exception.output, b"x" * 1997 + b"OUT")
-                self.assertEqual(timed_out.exception.stderr, b"y" * 1997 + b"ERR")
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(int((root / "pid").read_text()), 0)
-                recovered = TRAIN_MODULE.run(
-                    [sys.executable, "-c", "print('recovered')"], root, dict(os.environ), 2,
-                )
-                self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
+                argv = [sys.executable, "-c", code, "close" if close_pipes else "open"]
+                owners, captured, pidfds, wait_timeouts, returncodes = [], [], [], [], []
+                now = 100.0
+                # Linux's supervisor retains its output copies until exit.
+                # Closing the command's copies reaches early EOF on macOS.
+                early_eof = close_pipes and sys.platform != "linux"
+                expected_waits = [0, CAPTURE.PROCESS_REAP_TIMEOUT_SECS] if early_eof else [CAPTURE.PROCESS_REAP_TIMEOUT_SECS]
+
+                def settle():
+                    # Release a surviving command even if readiness/assertions
+                    # fail, and drain its pipes before joining its native owner.
+                    os.write(gate, b"x")
+                    for owner in owners:
+                        owner.communicate(timeout=10)
+
+                cleanup.callback(settle)
+
+                def spawn(*args, **kwargs):
+                    owner = real_spawn(*args, **kwargs)
+                    owners.append(owner)
+                    return owner
+
+                def expire():
+                    nonlocal now
+                    self.assertEqual(now, 100.0, "deadline advanced more than once")
+                    self.assertEqual(captured, expected_tails, "expiry preceded output capture")
+                    record = (root / "pid").read_text()
+                    self.assertTrue(record.endswith("\n"), "incomplete command readiness record")
+                    pid = int(record)
+                    self.assertIsNone(owners[0].poll(), "owner exited before expiry")
+                    if sys.platform == "linux":
+                        pidfd = os.pidfd_open(pid)
+                        pidfds.append(pidfd)
+                        cleanup.callback(os.close, pidfd)
+                        self.assertEqual(select.select(pidfds, [], [], 0)[0], [], "command exited before expiry")
+                    else:
+                        self.assertEqual(pid, owners[0].pid)
+                    now = 101.0
+
+                def wait(owner, timeout):
+                    wait_timeouts.append(timeout)
+                    if now == 101.0:
+                        self.assertLessEqual(len(wait_timeouts), len(expected_waits))
+                        self.assertEqual(timeout, expected_waits[len(wait_timeouts) - 1])
+                    value = real_wait(owner, timeout)
+                    returncodes.append(value)
+                    return value
+
+                selector = CAPTURE.selectors.DefaultSelector()
+                cleanup.callback(selector.close)
+                real_select, real_unregister = selector.select, selector.unregister
+
+                def select_events(timeout):
+                    if not captured:
+                        captured.extend(selector.get_key(stream).data for stream in (owners[0].stdout, owners[0].stderr))
+                    if not early_eof and captured == expected_tails and now == 100.0:
+                        expire()
+                        return []
+                    self.assertEqual(now, 100.0, "capture kept selecting after its deadline")
+                    events = real_select(min(timeout, 10))
+                    self.assertTrue(events, "native capture made no progress within the fixture readiness guard")
+                    return events
+
+                def unregister(stream):
+                    key = real_unregister(stream)
+                    if not selector.get_map():
+                        expire()
+                    return key
+
+                # Only capture's clock is controlled. Native process waits,
+                # selector readiness, output reads and cleanup remain real.
+                with mock.patch.object(CAPTURE, "time", mock.Mock(monotonic=lambda: now)), \
+                     mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn), \
+                     mock.patch.object(CAPTURE._OwnedProcess, "wait", wait), \
+                     mock.patch.object(CAPTURE.selectors, "DefaultSelector", return_value=selector), \
+                     mock.patch.object(selector, "select", side_effect=select_events), \
+                     mock.patch.object(selector, "unregister", side_effect=unregister):
+                    with self.assertRaises(subprocess.TimeoutExpired) as timed_out:
+                        TRAIN_MODULE.run(argv, root, dict(os.environ), 1)
+                # Acceptance precedes fixture release: the command must have
+                # been killed/reaped by capture, not by the test's cleanup.
+                self.assertEqual(now, 101.0)
+                self.assertEqual(wait_timeouts, expected_waits)
+                self.assertLess(returncodes[-1], 0)
+                self.assertIsNotNone(owners[0].returncode)
+                self.assertEqual(select.select(pidfds, [], [], 0)[0], pidfds)
+                self.assertEqual((timed_out.exception.cmd, timed_out.exception.timeout,
+                                  timed_out.exception.output, timed_out.exception.stderr),
+                                 (argv, 1, *expected_tails))
+        # One recovery check covers both preceding failures.
+        recovered = TRAIN_MODULE.run([sys.executable, "-c", "print('recovered')"], ROOT, dict(os.environ), 20)
+        self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
 
 
     @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
