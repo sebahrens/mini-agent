@@ -2750,231 +2750,292 @@ fn held_out_verification() -> VerifyArtifact {
     }
 }
 
-#[derive(Clone)]
-struct VerificationSchedulerLauncher {
-    launches: Arc<AtomicUsize>,
-    live_processes: Arc<AtomicUsize>,
-    max_live_processes: Arc<AtomicUsize>,
-    first_launch_started: Arc<tokio::sync::Semaphore>,
-    release_first_launch: Arc<(Mutex<bool>, Condvar)>,
+struct VerificationCaller {
+    cancellation: PermCancellation,
+    result: tokio::sync::oneshot::Receiver<Result<VerificationResult, WorkerError>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl VerificationSchedulerLauncher {
-    fn new() -> Self {
-        Self {
-            launches: Arc::new(AtomicUsize::new(0)),
-            live_processes: Arc::new(AtomicUsize::new(0)),
-            max_live_processes: Arc::new(AtomicUsize::new(0)),
-            first_launch_started: Arc::new(tokio::sync::Semaphore::new(0)),
-            release_first_launch: Arc::new((Mutex::new(false), Condvar::new())),
-        }
-    }
-
-    async fn wait_for_first_launch(&self) {
-        self.first_launch_started
-            .acquire()
-            .await
-            .expect("verification launch barrier must remain open")
-            .forget();
-    }
-
-    fn release_first_launch(&self) {
-        let (released, wake) = &*self.release_first_launch;
-        *released.lock().unwrap() = true;
-        wake.notify_all();
-    }
+struct SchedulerFixture {
+    supervisor: Arc<JsWorkerSupervisor>,
+    launch: LaunchFixtureOwner,
+    callers: Vec<VerificationCaller>,
+    effects: GatedEffects,
+    interactive: Option<tokio::task::JoinHandle<Result<StepResult, WorkerError>>>,
 }
 
-impl WorkerLauncher for VerificationSchedulerLauncher {
-    fn containment_status(&self) -> crate::sandbox::worker::WorkerContainmentStatus {
-        TestWorkerLauncher::scripted_internal_worker(0).containment_status()
-    }
-
-    fn launch(&self) -> Result<WorkerProcess, WorkerLaunchError> {
-        if self.launches.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.first_launch_started.add_permits(1);
-            let (released, wake) = &*self.release_first_launch;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = wake.wait(released).unwrap();
-            }
-        }
-        let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
-        process.observe_reap_for_test(self.live_processes.clone());
-        self.max_live_processes.fetch_max(
-            self.live_processes.load(Ordering::Acquire),
-            Ordering::AcqRel,
-        );
-        Ok(process)
-    }
-}
-
-#[tokio::test]
-async fn verification_scheduler_prioritizes_interactive_between_atomic_requests() {
-    let launcher = VerificationSchedulerLauncher::new();
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(launcher.clone()));
-
-    let first_supervisor = supervisor.clone();
-    let first =
-        std::thread::spawn(move || first_supervisor.verify_blocking(held_out_verification()));
-    launcher.wait_for_first_launch().await;
-
-    let second_supervisor = supervisor.clone();
-    let second =
-        std::thread::spawn(move || second_supervisor.verify_blocking(held_out_verification()));
-    supervisor
-        .wait_for_verification_queue_depth_for_test(1)
-        .await;
-
-    let gated = GatedEffects::new();
-    let interactive_supervisor = supervisor.clone();
-    let interactive_effects = gated.clone();
-    let interactive = tokio::spawn(async move {
-        interactive_supervisor
-            .execute(
-                RunStep::new("effect-pending".into()),
-                interactive_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    supervisor.wait_for_interactive_waiters_for_test(1).await;
-    launcher.release_first_launch();
-
-    assert!(first.join().unwrap().unwrap().passed);
-    gated.wait_started().await;
-    assert_eq!(
-        supervisor.verification_queue_depth_for_test(),
-        1,
-        "queued verification bypassed an already-waiting interactive request"
-    );
-    gated.release();
-    assert_eq!(
-        interactive.await.unwrap().unwrap().outcome,
-        StepOutcome::Value("success".into())
-    );
-    assert!(second.join().unwrap().unwrap().passed);
-    assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
-    assert_eq!(launcher.max_live_processes.load(Ordering::Acquire), 1);
-}
-
-#[tokio::test]
-async fn verification_scheduler_cancels_before_dequeue_without_recycling_worker() {
-    let launcher = VerificationSchedulerLauncher::new();
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(launcher.clone()));
-
-    let first_supervisor = supervisor.clone();
-    let first =
-        std::thread::spawn(move || first_supervisor.verify_blocking(held_out_verification()));
-    launcher.wait_for_first_launch().await;
-
-    let cancellation = PermCancellation::new();
-    let queued_cancellation = cancellation.clone();
-    let queued_supervisor = supervisor.clone();
-    let queued = std::thread::spawn(move || {
-        queued_supervisor.verify_blocking_cancellable(held_out_verification(), queued_cancellation)
-    });
-    supervisor
-        .wait_for_verification_queue_depth_for_test(1)
-        .await;
-    cancellation.cancel();
-
-    assert_eq!(queued.join().unwrap(), Err(WorkerError::Cancelled));
-    launcher.release_first_launch();
-    assert!(first.join().unwrap().unwrap().passed);
-    assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
-    assert_eq!(supervisor.generation_for_test().await, Some(1));
-}
-
-#[tokio::test]
-async fn verification_scheduler_cancellation_wakes_priority_wait_while_interactive_stays_active() {
-    let supervisor = scripted_supervisor(0);
-    let gated = GatedEffects::new();
-    let interactive_supervisor = supervisor.clone();
-    let interactive_effects = gated.clone();
-    let interactive = tokio::spawn(async move {
-        interactive_supervisor
-            .execute(
-                RunStep::new("effect-pending".into()),
-                interactive_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    gated.wait_started().await;
-
-    let cancellation = PermCancellation::new();
-    let queued_cancellation = cancellation.clone();
-    let queued_supervisor = supervisor.clone();
-    let queued = std::thread::spawn(move || {
-        queued_supervisor.verify_blocking_cancellable(held_out_verification(), queued_cancellation)
-    });
-    supervisor
-        .wait_for_verification_queue_depth_for_test(1)
-        .await;
-
-    cancellation.cancel();
-    assert_eq!(queued.join().unwrap(), Err(WorkerError::Cancelled));
-    supervisor
-        .wait_for_verification_queue_depth_for_test(0)
-        .await;
-    assert!(
-        !interactive.is_finished(),
-        "cancellation must wake the scheduler without releasing interactive priority"
-    );
-
-    gated.release();
-    assert_eq!(
-        interactive.await.unwrap().unwrap().outcome,
-        StepOutcome::Value("success".into())
-    );
-}
-
-#[tokio::test]
-async fn verification_scheduler_bounds_queue_and_reports_retryable_overflow() {
-    let launcher = VerificationSchedulerLauncher::new();
-    let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(launcher.clone()));
-
-    let first_supervisor = supervisor.clone();
-    let first =
-        std::thread::spawn(move || first_supervisor.verify_blocking(held_out_verification()));
-    launcher.wait_for_first_launch().await;
-
-    let mut cancellations = Vec::new();
-    let mut queued = Vec::new();
-    for _ in 0..supervisor.verification_queue_capacity_for_test() {
+impl SchedulerFixture {
+    fn start_verification(&mut self) -> usize {
+        let supervisor = self.supervisor.clone();
         let cancellation = PermCancellation::new();
-        let queued_cancellation = cancellation.clone();
-        let queued_supervisor = supervisor.clone();
-        queued.push(std::thread::spawn(move || {
-            queued_supervisor
-                .verify_blocking_cancellable(held_out_verification(), queued_cancellation)
+        let caller_cancellation = cancellation.clone();
+        let (send, result) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let result = supervisor
+                .verify_blocking_cancellable(held_out_verification(), caller_cancellation);
+            let _ = send.send(result);
+        });
+        self.callers.push(VerificationCaller {
+            cancellation,
+            result,
+            thread: Some(thread),
+        });
+        self.callers.len() - 1
+    }
+
+    async fn join_verification(&mut self, index: usize) -> Result<VerificationResult, WorkerError> {
+        let caller = &mut self.callers[index];
+        // Bound readiness without giving up ownership if the test fails here.
+        let result = tokio::time::timeout(LAUNCH_FIXTURE_GUARD, &mut caller.result)
+            .await
+            .expect("verification caller did not finish");
+        caller.thread.take().unwrap().join().unwrap();
+        result.expect("verification caller dropped its result")
+    }
+
+    fn start_interactive(&mut self) {
+        let supervisor = self.supervisor.clone();
+        let effects = self.effects.clone();
+        assert!(self.interactive.is_none());
+        self.interactive = Some(tokio::spawn(async move {
+            supervisor
+                .execute(
+                    RunStep::new("effect-pending".into()),
+                    effects,
+                    PermCancellation::new(),
+                )
+                .await
         }));
-        cancellations.push(cancellation);
     }
-    supervisor
-        .wait_for_verification_queue_depth_for_test(
-            supervisor.verification_queue_capacity_for_test(),
-        )
-        .await;
 
-    let overflow_supervisor = supervisor.clone();
-    let overflow =
-        std::thread::spawn(move || overflow_supervisor.verify_blocking(held_out_verification()))
-            .join()
-            .unwrap();
-    assert_eq!(overflow, Err(WorkerError::VerificationQueueFull));
-    assert!(WorkerError::VerificationQueueFull.is_retryable_admission_infrastructure());
+    async fn finish_interactive(&mut self) {
+        self.effects.release();
+        let result = self.interactive.as_mut().unwrap().await;
+        self.interactive.take();
+        assert_eq!(
+            result.unwrap().unwrap().outcome,
+            StepOutcome::Value("success".into())
+        );
+    }
 
-    for cancellation in cancellations {
-        cancellation.cancel();
+    async fn settle(&mut self) {
+        self.launch.release();
+        self.effects.release();
+        for caller in &self.callers {
+            caller.cancellation.cancel();
+        }
+        // Drive cancellation on this runtime before synchronously joining callers:
+        // a waiting verification may need the interactive transport lease released.
+        let interactive_result = if let Some(task) = self.interactive.take() {
+            task.abort();
+            Some(task.await)
+        } else {
+            None
+        };
+        let joins: Vec<_> = self
+            .callers
+            .iter_mut()
+            .filter_map(|caller| caller.thread.take())
+            .map(|thread| thread.join())
+            .collect();
+        let shutdown = self.supervisor.shutdown().await;
+        // Check only after every resource has been settled, so one failed caller
+        // cannot skip the remaining joins or worker shutdown.
+        assert!(
+            joins.iter().all(Result::is_ok),
+            "verification caller panicked"
+        );
+        if let Some(Err(error)) = interactive_result {
+            assert!(error.is_cancelled(), "interactive task panicked: {error}");
+        }
+        shutdown.unwrap();
+        assert!(self.launch.wait_for_quiescence());
+        assert!(!self.launch.0.gate.lock().unwrap().rescued);
     }
-    launcher.release_first_launch();
-    assert!(first.join().unwrap().unwrap().passed);
-    for task in queued {
-        assert_eq!(task.join().unwrap(), Err(WorkerError::Cancelled));
+
+    async fn exercise(&mut self, case: SchedulerCase, fault: Option<SchedulerFault>) {
+        if matches!(case, SchedulerCase::CancelPriorityWait) {
+            self.launch.release();
+            self.start_interactive();
+            self.effects.wait_started().await;
+            inject_scheduler_fault(fault, SchedulerFault::Effect);
+            let queued = self.start_verification();
+            self.supervisor
+                .wait_for_verification_queue_depth_for_test(1)
+                .await;
+            self.callers[queued].cancellation.cancel();
+            assert_eq!(
+                self.join_verification(queued).await,
+                Err(WorkerError::Cancelled)
+            );
+            self.supervisor
+                .wait_for_verification_queue_depth_for_test(0)
+                .await;
+            assert!(
+                !self.interactive.as_ref().unwrap().is_finished(),
+                "cancellation must wake the scheduler without releasing interactive priority"
+            );
+            self.finish_interactive().await;
+            return;
+        }
+
+        let first = self.start_verification();
+        tokio::time::timeout(LAUNCH_FIXTURE_GUARD, self.launch.0.entered.notified())
+            .await
+            .expect("verification launch must announce readiness");
+        inject_scheduler_fault(fault, SchedulerFault::Launch);
+        let capacity = if matches!(case, SchedulerCase::Overflow) {
+            self.supervisor.verification_queue_capacity_for_test()
+        } else {
+            1
+        };
+        let queued: Vec<_> = (0..capacity).map(|_| self.start_verification()).collect();
+        self.supervisor
+            .wait_for_verification_queue_depth_for_test(capacity)
+            .await;
+        inject_scheduler_fault(fault, SchedulerFault::Queue);
+
+        match case {
+            SchedulerCase::InteractivePriority => {
+                self.start_interactive();
+                self.supervisor
+                    .wait_for_interactive_waiters_for_test(1)
+                    .await;
+                self.launch.release();
+                assert!(self.join_verification(first).await.unwrap().passed);
+                self.effects.wait_started().await;
+                inject_scheduler_fault(fault, SchedulerFault::Effect);
+                assert_eq!(
+                    self.supervisor.verification_queue_depth_for_test(),
+                    1,
+                    "queued verification bypassed an already-waiting interactive request"
+                );
+                self.finish_interactive().await;
+                assert!(self.join_verification(queued[0]).await.unwrap().passed);
+            }
+            SchedulerCase::CancelBeforeDequeue | SchedulerCase::Overflow => {
+                if matches!(case, SchedulerCase::Overflow) {
+                    let overflow = self.start_verification();
+                    assert_eq!(
+                        self.join_verification(overflow).await,
+                        Err(WorkerError::VerificationQueueFull)
+                    );
+                    assert!(
+                        WorkerError::VerificationQueueFull.is_retryable_admission_infrastructure()
+                    );
+                }
+                for &index in &queued {
+                    self.callers[index].cancellation.cancel();
+                }
+                for index in queued {
+                    assert_eq!(
+                        self.join_verification(index).await,
+                        Err(WorkerError::Cancelled)
+                    );
+                }
+                self.launch.release();
+                assert!(self.join_verification(first).await.unwrap().passed);
+                assert_eq!(self.supervisor.generation_for_test().await, Some(1));
+            }
+            SchedulerCase::CancelPriorityWait => unreachable!(),
+        }
+        assert_eq!(self.launch.0.launches.load(Ordering::Acquire), 1);
+        assert_eq!(self.launch.0.max_live_processes.load(Ordering::Acquire), 1);
     }
-    assert_eq!(launcher.max_live_processes.load(Ordering::Acquire), 1);
+}
+
+#[derive(Clone, Copy)]
+enum SchedulerCase {
+    InteractivePriority,
+    CancelBeforeDequeue,
+    CancelPriorityWait,
+    Overflow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchedulerFault {
+    Launch,
+    Queue,
+    Effect,
+}
+
+fn inject_scheduler_fault(selected: Option<SchedulerFault>, point: SchedulerFault) {
+    if selected == Some(point) {
+        panic!("injected while scheduler fixture holds work");
+    }
+}
+
+fn run_scheduler_case(case: SchedulerCase, fault: Option<SchedulerFault>) {
+    let runtime = launch_test_runtime();
+    let trace = Arc::new(LaunchTrace::default());
+    let mut fixture = SchedulerFixture {
+        supervisor: Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+            BlockedFirstLaunchLauncher(trace.clone()),
+            LAUNCH_TEST_WATCHDOG,
+        )),
+        launch: LaunchFixtureOwner(trace.clone()),
+        callers: Vec::new(),
+        effects: GatedEffects::new(),
+        interactive: None,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            tokio::time::timeout(LAUNCH_FIXTURE_GUARD, fixture.exercise(case, fault))
+                .await
+                .expect("scheduler scenario exceeded hang guard");
+        });
+    }));
+    runtime.block_on(fixture.settle());
+    assert!(fixture.callers.iter().all(|caller| caller.thread.is_none()));
+    assert!(fixture.interactive.is_none());
+    drop(fixture);
+    assert_eq!(trace.gate.lock().unwrap().active, 0);
+    assert_eq!(trace.live_processes.load(Ordering::Acquire), 0);
+    assert_eq!(
+        trace.launches.load(Ordering::Acquire),
+        trace.completed.load(Ordering::Acquire)
+    );
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(fault.is_none(), "injected fault point was not reached");
+}
+
+#[test]
+fn verification_scheduler_prioritizes_interactive_between_atomic_requests() {
+    run_scheduler_case(SchedulerCase::InteractivePriority, None);
+}
+
+#[test]
+fn verification_scheduler_cancels_before_dequeue_without_recycling_worker() {
+    run_scheduler_case(SchedulerCase::CancelBeforeDequeue, None);
+}
+
+#[test]
+fn verification_scheduler_cancellation_wakes_priority_wait_while_interactive_stays_active() {
+    run_scheduler_case(SchedulerCase::CancelPriorityWait, None);
+}
+
+#[test]
+fn verification_scheduler_bounds_queue_and_reports_retryable_overflow() {
+    run_scheduler_case(SchedulerCase::Overflow, None);
+}
+
+#[test]
+fn verification_scheduler_failure_settles_launch_queue_and_effect_work() {
+    for (case, fault) in [
+        (SchedulerCase::InteractivePriority, SchedulerFault::Launch),
+        (SchedulerCase::Overflow, SchedulerFault::Queue),
+        (SchedulerCase::InteractivePriority, SchedulerFault::Effect),
+        (SchedulerCase::CancelPriorityWait, SchedulerFault::Effect),
+    ] {
+        let panic = std::panic::catch_unwind(|| run_scheduler_case(case, Some(fault)))
+            .expect_err("scheduler fault must propagate after cleanup");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"injected while scheduler fixture holds work")
+        );
+    }
 }
 
 #[test]

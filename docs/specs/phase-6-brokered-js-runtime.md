@@ -1257,6 +1257,12 @@ cleanup. It checks cancellation, controlled deadlines for an initial and eight
 subsequent callers, retained launch-lease ownership, successful recovery, and
 cleanup during an exact injected panic. Each virtual-time phase uses a fresh
 runtime so clock offsets cannot pre-expire later callers.
+Scheduler priority, cancellation before dequeue, cancellation during interactive
+priority, and queue overflow retain separate behavioral checks through a shared
+fixture. The fixture reuses the owned launch gate and settles its interactive
+task and all verification caller threads before propagating a failed assertion.
+Injected failures with the launch, full queue, and interactive effect held must
+leave no active launch callbacks or live workers and require no gate rescue.
 
 The matrix defines required evidence. Phase 6 is delivered under the index exit rule using the
 dedicated containment gates. CI run 31319107422 and commit `9c6f164` retain historical v1.7
