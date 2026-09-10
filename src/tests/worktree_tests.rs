@@ -1827,29 +1827,37 @@ mod tests {
         let expected_oid = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
         let repo_path = repo.path().to_path_buf();
         let base_path = base.to_path_buf();
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let caller_scope = scope.clone();
         let mut task = Some(tokio::spawn(async move {
-            match stop {
-                CreateStop::CallerDrop => create(&repo_path, "create-held", Some(&base_path)).await,
-                CreateStop::CheckoutTimeout => {
-                    create_with_limits_for_test(
-                        &repo_path,
-                        "create-held",
-                        Some(&base_path),
-                        test_limits(CREATE_COMMAND_TIMEOUT),
-                    )
-                    .await
-                }
-                CreateStop::ReservationTimeout => {
-                    create_with_ref_limits_for_test(
-                        &repo_path,
-                        "create-held",
-                        Some(&base_path),
-                        test_limits(CREATE_COMMAND_TIMEOUT),
-                    )
-                    .await
-                }
-            }
-            .map(|_| ())
+            caller_scope
+                .run(async move {
+                    match stop {
+                        CreateStop::CallerDrop => {
+                            create(&repo_path, "create-held", Some(&base_path)).await
+                        }
+                        CreateStop::CheckoutTimeout => {
+                            create_with_limits_for_test(
+                                &repo_path,
+                                "create-held",
+                                Some(&base_path),
+                                test_limits(CREATE_COMMAND_TIMEOUT),
+                            )
+                            .await
+                        }
+                        CreateStop::ReservationTimeout => {
+                            create_with_ref_limits_for_test(
+                                &repo_path,
+                                "create-held",
+                                Some(&base_path),
+                                test_limits(CREATE_COMMAND_TIMEOUT),
+                            )
+                            .await
+                        }
+                    }
+                    .map(|_| ())
+                })
+                .await
         }));
 
         let outcome = std::panic::AssertUnwindSafe(async {
@@ -1862,6 +1870,7 @@ mod tests {
                 target.clone()
             };
             gate.wait_started(task.as_ref().unwrap(), &expected_cwd).await;
+            assert!(scope.wait_idle().now_or_never().is_none(), "create supervisor escaped the owning work scope");
             // Prove the committed side effects before selecting a stop path.
             // An absent ref after a timeout before reservation is not rollback.
             assert_eq!(git_stdout(repo.path(), ["rev-parse", "refs/heads/create-held"]), expected_oid);
@@ -1897,6 +1906,7 @@ mod tests {
                     task.as_ref().unwrap().abort();
                     let joined = task.take().unwrap().await;
                     assert!(joined.unwrap_err().is_cancelled());
+                    scope.cancellation_handle().cancel();
                 }
                 CreateStop::CheckoutTimeout | CreateStop::ReservationTimeout => {
                     // Native readiness and exact side effects precede the
@@ -1910,6 +1920,7 @@ mod tests {
                 || task.as_ref().is_some_and(|task| task.is_finished()),
                 &repo.path().canonicalize().unwrap(),
             ).await;
+            assert!(scope.wait_idle().now_or_never().is_none(), "create rollback escaped the owning work scope");
             if matches!(failure, CreateFixtureFailure::DuringRollback) {
                 panic!("injected during create rollback");
             }
@@ -1986,7 +1997,12 @@ mod tests {
         };
         gate.release();
         rollback_gate.release();
+        scope.cancellation_handle().cancel();
         let cleanup = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, scope.wait_idle())
+                .await
+                .expect("create fixture scope did not drain");
+            assert_eq!(scope.active_children(), 0);
             drop(acquire_released_mutation_lock(repo.path(), "create fixture cleanup").await);
         })
         .catch_unwind()
@@ -2330,9 +2346,15 @@ wait
             worktree_path: directory.path().join("unused worktree"),
             main_repo_path: repo.path().to_path_buf(),
         };
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let caller_scope = scope.clone();
         let mut task = Some(tokio::spawn(async move {
-            let (_, outcome) = try_merge(&info, "main").await;
-            Err::<(), _>(format!("merge returned before cancellation: {outcome:?}"))
+            caller_scope
+                .run(async move {
+                    let (_, outcome) = try_merge(&info, "main").await;
+                    Err::<(), _>(format!("merge returned before cancellation: {outcome:?}"))
+                })
+                .await
         }));
         let outcome = std::panic::AssertUnwindSafe(async {
             if matches!(failure, MergeFixtureFailure::BeforeReadiness) {
@@ -2341,6 +2363,7 @@ wait
             // Both the custom local upload-pack command and the commit hook
             // start from the working repository selected by GitRunner.
             gate.wait_started(task.as_ref().unwrap(), &repo.path().canonicalize().unwrap()).await;
+            assert!(scope.wait_idle().now_or_never().is_none(), "held merge escaped the owning work scope");
             let stash = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
             assert_eq!(git_stdout(repo.path(), ["show", &format!("{stash}:tracked.txt")]), "dirty");
             assert_eq!(git_stdout(repo.path(), ["rev-parse", &format!("{stash}^1")]), original_head);
@@ -2373,7 +2396,9 @@ wait
             task.as_ref().unwrap().abort();
             let joined = task.take().unwrap().await;
             assert!(joined.unwrap_err().is_cancelled());
+            scope.cancellation_handle().cancel();
             rollback_gate.wait_ready(|| false, &repo.path().canonicalize().unwrap()).await;
+            assert!(scope.wait_idle().now_or_never().is_none(), "merge rollback escaped the owning work scope");
             if matches!(stop, MergeStop::Fetch) {
                 assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "dirty\n");
                 assert_eq!(git_stdout(repo.path(), ["rev-parse", "refs/stash"]), stash);
@@ -2425,7 +2450,12 @@ wait
         };
         gate.release();
         rollback_gate.release();
+        scope.cancellation_handle().cancel();
         let cleanup = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, scope.wait_idle())
+                .await
+                .expect("merge fixture scope did not drain");
+            assert_eq!(scope.active_children(), 0);
             drop(acquire_released_mutation_lock(repo.path(), "merge fixture cleanup").await);
         })
         .catch_unwind()
@@ -3671,9 +3701,49 @@ wait
         assert!(!optional_test_ref_exists(repo.path(), "refs/stash"));
     }
 
-    #[tokio::test]
-    async fn concurrent_stash_before_exact_publication_is_never_captured_as_owned() {
-        let repo = TempRepo::new("concurrent stash publication");
+    #[test]
+    fn stash_publication_registration_owns_only_its_repository() {
+        let first = TempRepo::new("first publication registration");
+        let second = TempRepo::new("second publication registration");
+        let first_registration =
+            register_stash_publish_test_gate(first.path(), TestMutationGate::new());
+        let second_registration =
+            register_stash_publish_test_gate(second.path(), TestMutationGate::new());
+        assert!(first_registration.is_pending() && second_registration.is_pending());
+        let duplicate = std::panic::catch_unwind(|| {
+            register_stash_publish_test_gate(first.path(), TestMutationGate::new())
+        });
+        assert!(
+            duplicate.is_err(),
+            "duplicate registration replaced its live owner"
+        );
+        assert!(first_registration.is_pending() && second_registration.is_pending());
+        drop(first_registration);
+        let replacement = register_stash_publish_test_gate(first.path(), TestMutationGate::new());
+        assert!(replacement.is_pending() && second_registration.is_pending());
+        drop(replacement);
+        assert!(
+            second_registration.is_pending(),
+            "dropping another owner removed this registration"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum PublicationFixtureFailure {
+        None,
+        AfterRegistration,
+        AfterReadiness,
+        AfterInterference,
+    }
+
+    async fn exercise_stash_publication(
+        failure: PublicationFixtureFailure,
+        root: &Path,
+        cleanup_ok: &mut bool,
+    ) {
+        use futures::FutureExt;
+
+        let repo = TempRepo::uninitialized(OwnedDirectory::create(root.to_path_buf())).initialize();
         let remote = repo
             .path()
             .with_extension("concurrent stash publication remote");
@@ -3684,77 +3754,195 @@ wait
         git(&remote, ["init", "--bare"]);
         git(
             repo.path(),
-            vec![
-                OsString::from("remote"),
-                OsString::from("add"),
-                OsString::from("origin"),
-                remote.as_os_str().to_os_string(),
+            [
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                remote.as_os_str(),
             ],
         );
         git(repo.path(), ["push", "-u", "origin", "main"]);
         git(
             repo.path(),
-            vec![
-                OsString::from("worktree"),
-                OsString::from("add"),
-                OsString::from("-b"),
-                OsString::from("feature"),
-                worktree.as_os_str().to_os_string(),
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("feature"),
+                worktree.as_os_str(),
             ],
         );
         std::fs::write(worktree.join("tracked.txt"), "feature\n").unwrap();
         git(&worktree, ["add", "tracked.txt"]);
         git(&worktree, ["commit", "-m", "feature"]);
         std::fs::write(repo.path().join("tracked.txt"), "dirty main\n").unwrap();
-
+        let main = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
+        let feature = git_stdout(&worktree, ["rev-parse", "HEAD"]);
         let info = WorktreeInfo {
             branch: "feature".into(),
             worktree_path: worktree.clone(),
             main_repo_path: repo.path().to_path_buf(),
         };
         let gate = TestMutationGate::new();
-        set_next_stash_publish_test_gate(repo.path(), gate.clone());
-
+        let mut registration = Some(register_stash_publish_test_gate(repo.path(), gate.clone()));
+        // Registration already has an owner if unrelated setup fails.
         let unrelated = TempRepo::new("unrelated stash publication");
         std::fs::write(unrelated.path().join("tracked.txt"), "unrelated dirty\n").unwrap();
-        let unrelated_stash = tokio::time::timeout(
-            Duration::from_secs(2),
-            create_and_publish_stash_for_test(unrelated.path()),
-        )
-        .await
-        .expect("an unrelated repository must not consume the targeted publication gate")
-        .expect("unrelated stash publication should succeed");
-        assert!(unrelated_stash.is_some());
-
-        let task = tokio::spawn(async move { try_merge(&info, "main").await });
-        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let mut unrelated_operation = Some(Box::pin(
+            scope.run(create_and_publish_stash_for_test(unrelated.path())),
+        ));
+        let mut mutation = HeldGitMutation::new(&scope, gate, async {
+            let (state, outcome) = try_merge(&info, "main").await;
+            drop(state);
+            match outcome {
+                MergeOutcome::Error(error) => Err(error),
+                _ => Ok(()),
+            }
+        });
+        let outcome = std::panic::AssertUnwindSafe(async {
+            if matches!(failure, PublicationFixtureFailure::AfterRegistration) {
+                panic!("injected with unused publication registration");
+            }
+            let unrelated_stash = tokio::time::timeout(
+                TEST_MUTATION_ADMISSION_TIMEOUT,
+                unrelated_operation.as_mut().unwrap(),
+            )
             .await
-            .expect("stash creation must reach the pre-publication mutation gate");
-
-        git(repo.path(), ["stash", "push", "-m", "concurrent external"]);
-        let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
-        gate.resume();
-        let (_state, outcome) = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
-            .await
-            .expect("merge must finish after the stash publication gate resumes")
-            .unwrap();
-
+            .expect("unrelated repository consumed the targeted publication gate");
+            drop(unrelated_operation.take());
+            let unrelated_stash = unrelated_stash
+                .expect("unrelated stash publication should succeed")
+                .expect("unrelated dirty contents must create a stash");
+            assert_eq!(
+                git_stdout(
+                    unrelated.path(),
+                    ["show", &format!("{unrelated_stash}:tracked.txt")]
+                ),
+                "unrelated dirty"
+            );
+            assert!(
+                registration.as_ref().unwrap().is_pending(),
+                "unrelated repository consumed this registration"
+            );
+            mutation.wait_ready().await;
+            assert!(!registration.as_ref().unwrap().is_pending());
+            assert!(
+                scope.wait_idle().now_or_never().is_none(),
+                "merge supervisor escaped the owning work scope"
+            );
+            assert!(!optional_test_ref_exists(repo.path(), "refs/stash"));
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+                "dirty main\n"
+            );
+            if matches!(failure, PublicationFixtureFailure::AfterReadiness) {
+                panic!("injected while stash publication is held");
+            }
+            git(repo.path(), ["stash", "push", "-m", "concurrent external"]);
+            let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
+            if matches!(failure, PublicationFixtureFailure::AfterInterference) {
+                panic!("injected after external stash publication");
+            }
+            let error = mutation
+                .finish()
+                .await
+                .expect_err("publication must reject a concurrently changed stash ref");
+            assert!(
+                error.contains("publish-created-stash"),
+                "unexpected publication result: {error}"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["stash", "list", "--format=%H"]),
+                concurrent
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["show", &format!("{concurrent}:tracked.txt")]),
+                "dirty main"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/heads/main"]),
+                main
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]),
+                feature
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+                "initial\n"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["write-tree"]),
+                git_stdout(repo.path(), ["rev-parse", "HEAD^{tree}"])
+            );
+            assert!(
+                worktree.exists(),
+                "failed merge must retain the source worktree"
+            );
+        })
+        .catch_unwind()
+        .await;
+        drop(unrelated_operation.take());
+        // Dropping the registration releases a consumed gate or unregisters an
+        // unused one, before waiting for any pending merge/rollback work.
+        drop(registration.take());
+        *cleanup_ok = mutation.settle(repo.path()).await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
         assert!(
-            matches!(outcome, MergeOutcome::Error(error) if error.contains("publish-created-stash")),
-            "exact publication must fail when refs/stash changed"
+            *cleanup_ok,
+            "publication fixture did not settle before directory removal"
         );
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/stash"]),
-            concurrent
-        );
-        assert!(git_stdout(repo.path(), ["stash", "list"]).contains("concurrent external"));
-        assert!(
-            worktree.exists(),
-            "failed merge must retain the source worktree"
-        );
-        cleanup_worktree(&worktree, "feature", repo.path(), true)
+    }
+
+    #[tokio::test]
+    async fn concurrent_stash_before_exact_publication_is_never_captured_as_owned() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-publication-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cleanup_ok = false;
+        exercise_stash_publication(PublicationFixtureFailure::None, &root, &mut cleanup_ok).await;
+        assert!(cleanup_ok);
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn stash_publication_fixture_settles_registration_and_supervisor_failures() {
+        use futures::FutureExt;
+        for (failure, expected) in [
+            (
+                PublicationFixtureFailure::AfterRegistration,
+                "injected with unused publication registration",
+            ),
+            (
+                PublicationFixtureFailure::AfterReadiness,
+                "injected while stash publication is held",
+            ),
+            (
+                PublicationFixtureFailure::AfterInterference,
+                "injected after external stash publication",
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "mini-agent-publication-fixture-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut cleanup_ok = false;
+            let panic = std::panic::AssertUnwindSafe(exercise_stash_publication(
+                failure,
+                &root,
+                &mut cleanup_ok,
+            ))
+            .catch_unwind()
             .await
-            .unwrap();
+            .expect_err("publication fixture failure must propagate");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+            assert!(cleanup_ok, "publication failure skipped fixture settlement");
+            assert!(!root.exists());
+        }
     }
 
     #[tokio::test]

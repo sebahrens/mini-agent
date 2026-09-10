@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Mutex as StdMutex;
 
 use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
@@ -25,12 +27,18 @@ use crate::sandbox::{CommandLimits, CommandOutput};
 static PROCESS_WORKSPACE_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 #[cfg(test)]
-static STASH_PUBLISH_TEST_GATE: OnceLock<StdMutex<Option<StashPublishTestGate>>> = OnceLock::new();
+static STASH_PUBLISH_TEST_GATES: OnceLock<StdMutex<HashMap<PathBuf, StashPublishTestGate>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 struct StashPublishTestGate {
-    repo_path: PathBuf,
     gate: Arc<TestMutationGate>,
+    consumed: bool,
+}
+
+#[cfg(test)]
+fn stash_publish_test_gates() -> &'static StdMutex<HashMap<PathBuf, StashPublishTestGate>> {
+    STASH_PUBLISH_TEST_GATES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 #[derive(Debug, Clone)]
@@ -156,15 +164,58 @@ impl TestMutationGate {
 }
 
 #[cfg(test)]
-pub(crate) fn set_next_stash_publish_test_gate(repo_path: &Path, gate: Arc<TestMutationGate>) {
+#[must_use = "dropping the registration unregisters and releases its fixture gate"]
+pub(crate) struct StashPublishTestRegistration {
+    repo_path: PathBuf,
+}
+
+#[cfg(test)]
+impl StashPublishTestRegistration {
+    pub(crate) fn is_pending(&self) -> bool {
+        stash_publish_test_gates()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&self.repo_path)
+            .is_some_and(|entry| !entry.consumed)
+    }
+}
+
+#[cfg(test)]
+impl Drop for StashPublishTestRegistration {
+    fn drop(&mut self) {
+        let entry = stash_publish_test_gates()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.repo_path);
+        if let Some(entry) = entry {
+            entry.gate.resume();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_stash_publish_test_gate(
+    repo_path: &Path,
+    gate: Arc<TestMutationGate>,
+) -> StashPublishTestRegistration {
     let repo_path = repo_path
         .canonicalize()
         .expect("stash publication test repository must be canonicalizable");
-    *STASH_PUBLISH_TEST_GATE
-        .get_or_init(|| StdMutex::new(None))
+    let mut gates = stash_publish_test_gates()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        Some(StashPublishTestGate { repo_path, gate });
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !gates.contains_key(&repo_path),
+        "stash publication gate already registered for this repository"
+    );
+    gates.insert(
+        repo_path.clone(),
+        StashPublishTestGate {
+            gate,
+            consumed: false,
+        },
+    );
+    StashPublishTestRegistration { repo_path }
 }
 
 #[cfg(test)]
@@ -425,9 +476,9 @@ async fn create_with_limits(
         _repository_guard: guard,
     };
     let (response_tx, response_rx) = oneshot::channel();
-    tokio::spawn(async move {
+    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
         supervise_create(state, ref_limits, add_limits, response_tx).await;
-    });
+    }));
     response_rx.await.unwrap_or_else(|_| {
         Err("worktree-create supervisor stopped before returning a result".into())
     })
@@ -885,9 +936,9 @@ async fn try_merge_with_switch_limits(
     let (response_tx, response_rx) = oneshot::channel();
     let owned_info = info.clone();
     let owned_target = target.to_string();
-    tokio::spawn(async move {
+    std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
         supervise_merge(owned_info, owned_target, switch_limits, response_tx).await;
-    });
+    }));
     response_rx.await.unwrap_or_else(|_| {
         (
             empty_merge_state(&fallback_info),
@@ -1661,18 +1712,16 @@ async fn create_and_publish_stash(
 
     #[cfg(test)]
     let publish_gate = {
-        let mut slot = STASH_PUBLISH_TEST_GATE
-            .get_or_init(|| StdMutex::new(None))
+        let mut gates = stash_publish_test_gates()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|entry| entry.repo_path == repo_path)
-        {
-            slot.take().map(|entry| entry.gate)
-        } else {
-            None
-        }
+        gates
+            .get_mut(repo_path)
+            .filter(|entry| !entry.consumed)
+            .map(|entry| {
+                entry.consumed = true;
+                entry.gate.clone()
+            })
     };
     #[cfg(test)]
     if let Some(gate) = publish_gate {

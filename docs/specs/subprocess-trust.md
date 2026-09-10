@@ -181,8 +181,15 @@ setup verifies that every sibling disappears before rescue. Both preserve the
 original error. The create rollback fixture uses the same exclusive directory
 owner and keeps its existing supervisor rendezvous before directory removal.
 
-Exact-stash interference and rollback branch-switch tests share `HeldGitMutation`,
-which owns the operation future under an `AgentWorkScope`. The post-apply gate
+Create and merge transaction supervisors inherit the caller's `AgentWorkScope`
+through the shared scoped async spawn boundary. A supplied scope remains busy
+until its supervisor and native output workers finish, including caller-drop
+rollback. Tracking does not suppress recovery commands when the scope has been
+cancelled. Native create tests observe a pending scope at the held command and
+rollback boundaries; the publication fixture observes it while merge is held.
+
+Exact-stash interference, rollback branch-switch, and stash-publication tests
+share `HeldGitMutation`, which owns the operation future under an `AgentWorkScope`. The post-apply gate
 holds restoration while each stash case changes
 the stash stack, tracked contents, or untracked contents. Assertions compare the
 exact retained stash OIDs and preserved bytes. Every exit releases the gate,
@@ -195,6 +202,13 @@ branch while rollback was held, then checks all captured branch OIDs and the exa
 retained conflict index and file bytes. Its failure control interrupts that concrete
 interference point and reuses the shared settlement path; common lifecycle failures
 remain covered once by the stash fixture matrix.
+Publication gate registrations are owned per repository and consumed once;
+dropping an unused registration removes it, and dropping a consumed registration
+releases its waiter. Duplicate registrations cannot replace a live owner.
+The publication fixture retains the unrelated repository's operation future,
+checks that it leaves the targeted gate pending, and verifies exact external stash
+identity and contents after publication is rejected. Its distinct failure controls
+cover unused registration, held supervision, and external stash interference.
 
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
