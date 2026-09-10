@@ -92,7 +92,10 @@ impl TestTempDir {
 
 impl Drop for TestTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let removed = std::fs::remove_dir_all(&self.0);
+        if !std::thread::panicking() {
+            removed.expect("remove JS test directory after its owners have closed");
+        }
     }
 }
 
@@ -148,11 +151,8 @@ fn make_test_tool_with_permissions_and_process_tree(
 fn make_test_tool_in_workspace(
     workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     permission: PermCheck,
+    root: &std::path::Path,
 ) -> JsTool {
-    let root = std::env::temp_dir().join(format!(
-        "mini-agent-js-workspace-audit-{}",
-        uuid::Uuid::new_v4()
-    ));
     let paths = crate::paths::AppPaths {
         config_dir: root.join("config"),
         data_dir: root.join("data"),
@@ -410,7 +410,8 @@ async fn windows_workspace_authority_js_tool_relative_gold_eiffel() {
     use rig::tool::Tool;
 
     let temp = TestTempDir::new("js-workspace");
-    let root = temp.path().to_path_buf();
+    let root = temp.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
     let workspace = std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&root).unwrap());
     let permission = std::sync::Arc::new(std::sync::Mutex::new(
         PermissionChecker::new(
@@ -421,7 +422,7 @@ async fn windows_workspace_authority_js_tool_relative_gold_eiffel() {
         )
         .unwrap(),
     ));
-    let tool = make_test_tool_in_workspace(workspace, permission);
+    let tool = make_test_tool_in_workspace(workspace, permission, &temp.path().join("audit"));
 
     assert_eq!(
         tool.call(crate::extras::js::tool::JsArgs {

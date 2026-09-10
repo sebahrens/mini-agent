@@ -38,8 +38,29 @@ type ExistingFeedback = (
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
     Owner,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain scoped reviewer authority while operator integration is audited in mini-agent-kv9me"
+        )
+    )]
     Reviewer,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the explicitly unauthorized model actor; production constructs only the local owner (mini-agent-kv9me)"
+        )
+    )]
     Model,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the explicitly unauthorized anonymous actor; production constructs only the local owner (mini-agent-kv9me)"
+        )
+    )]
     Anonymous,
 }
 

@@ -14,8 +14,9 @@ use crate::extras::js::skills::{
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 
-fn fixture() -> (std::path::PathBuf, SkillStore, SkillArtifact, String) {
-    let root = std::env::temp_dir().join(format!("feedback-{}", uuid::Uuid::new_v4()));
+fn fixture() -> (super::TestTempDir, SkillStore, SkillArtifact, String) {
+    let directory = super::TestTempDir::new("feedback");
+    let root = directory.path().to_path_buf();
     let env = PathEnvironment {
         platform: if cfg!(target_os = "macos") {
             PathPlatform::MacOs
@@ -69,57 +70,146 @@ fn fixture() -> (std::path::PathBuf, SkillStore, SkillArtifact, String) {
     TelemetryIngestor::new(&mut store)
         .ingest(&EventBatch::new(vec![event]).unwrap())
         .unwrap();
-    (root, store, skill, invocation)
+    (directory, store, skill, invocation)
 }
 
 #[test]
 fn skill_feedback_authorization_is_idempotent_redacted_and_audited() {
-    let (root, mut store, skill, invocation) = fixture();
-    let actor = AuthenticatedActor {
-        actor_id: "owner".into(),
-        kind: ActorKind::Owner,
-        allowed_skill_ids: Some(BTreeSet::from([skill.id.clone()])),
-    };
-    let command = FeedbackCommand {
-        idempotency_key: "feedback-1".into(),
-        skill_id: skill.id.clone(),
-        invocation_id: Some(invocation),
-        kind: FeedbackKind::Negative,
-        reason_code: "incorrect_result".into(),
-        reason_text: Some("token=SECRET-CANARY".into()),
-    };
-    let mut service =
-        FeedbackService::new(&mut store, Redactor::new(vec!["SECRET-CANARY".into()], 512));
-    let id = service.submit(&actor, &command, 2).unwrap();
-    assert_eq!(id, service.submit(&actor, &command, 3).unwrap());
-    let mut changed_payload = command.clone();
-    changed_payload.reason_text = Some("different explanation".into());
-    assert!(matches!(
-        service.submit(&actor, &changed_payload, 3),
-        Err(FeedbackError::IdempotencyConflict)
-    ));
-    service
-        .change_state(&actor, &id, 1, FeedbackState::Resolved, "fixed", 4)
-        .unwrap();
-    let payload: String = store
-        .conn()
-        .query_row(
-            "SELECT COALESCE(reason_text, '') FROM skill_feedback WHERE feedback_id = ?",
-            [&id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(!payload.contains("SECRET-CANARY"));
-    let audit: i64 = store
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM skill_feedback_audit WHERE feedback_id = ?",
-            [&id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(audit, 2);
-    std::fs::remove_dir_all(root).unwrap();
+    type AuditRow = (Option<String>, String, String, String, i64, i64);
+
+    fn snapshot(store: &SkillStore, id: &str, skill_id: &str) -> serde_json::Value {
+        let row: (String, i64, i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT state, version, updated_at, COALESCE(reason_text, '')
+                 FROM skill_feedback WHERE feedback_id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let audit: Vec<AuditRow> = store
+            .conn()
+            .prepare(
+                "SELECT from_state, to_state, actor_id, reason_code, version, created_at
+                 FROM skill_feedback_audit WHERE feedback_id = ? ORDER BY version",
+            )
+            .unwrap()
+            .query_map([id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let counts: (i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT user_negative_count, user_positive_count FROM skill_stats WHERE skill_id = ?",
+                [skill_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        serde_json::json!({"row": row, "audit": audit, "counts": counts})
+    }
+
+    // This exercises the existing test-only state machine. The production
+    // correction operator remains unimplemented under mini-agent-1bt82.
+    for (next, token) in [
+        (FeedbackState::Resolved, "resolved"),
+        (FeedbackState::Retracted, "retracted"),
+    ] {
+        let (root, mut store, skill, invocation) = fixture();
+        let actor = owner(&skill.id);
+        let command = FeedbackCommand {
+            idempotency_key: "feedback-1".into(),
+            skill_id: skill.id.clone(),
+            invocation_id: Some(invocation),
+            kind: FeedbackKind::Negative,
+            reason_code: "incorrect_result".into(),
+            reason_text: Some("token=SECRET-CANARY".into()),
+        };
+        let redactor = || Redactor::new(vec!["SECRET-CANARY".into()], 512);
+        let id = FeedbackService::new(&mut store, redactor())
+            .submit(&actor, &command, 2)
+            .unwrap();
+        let active = snapshot(&store, &id, &skill.id);
+        assert_eq!(
+            id,
+            FeedbackService::new(&mut store, redactor())
+                .submit(&actor, &command, 3)
+                .unwrap()
+        );
+        let mut changed = command.clone();
+        changed.reason_text = Some("different explanation".into());
+        assert!(matches!(
+            FeedbackService::new(&mut store, redactor()).submit(&actor, &changed, 3),
+            Err(FeedbackError::IdempotencyConflict)
+        ));
+        assert_eq!(snapshot(&store, &id, &skill.id), active);
+
+        for denied in [
+            AuthenticatedActor {
+                kind: ActorKind::Model,
+                ..actor.clone()
+            },
+            AuthenticatedActor {
+                allowed_skill_ids: Some(BTreeSet::new()),
+                ..actor.clone()
+            },
+        ] {
+            assert!(matches!(
+                FeedbackService::new(&mut store, redactor())
+                    .change_state(&denied, &id, 1, next, "fixed", 4),
+                Err(FeedbackError::Unauthorized)
+            ));
+            assert_eq!(snapshot(&store, &id, &skill.id), active);
+        }
+        for (version, target) in [(0, next), (1, FeedbackState::Active)] {
+            assert!(matches!(
+                FeedbackService::new(&mut store, redactor())
+                    .change_state(&actor, &id, version, target, "fixed", 4),
+                Err(FeedbackError::InvalidStateTransition)
+            ));
+            assert_eq!(snapshot(&store, &id, &skill.id), active);
+        }
+        FeedbackService::new(&mut store, redactor())
+            .change_state(&actor, &id, 1, next, "fixed", 4)
+            .unwrap();
+        let terminal = serde_json::json!({
+            "row": [token, 2, 4, "token=[REDACTED]"],
+            "audit": [
+                [null, "active", "owner", "incorrect_result", 1, 2],
+                ["active", token, "owner", "fixed", 2, 4]
+            ],
+            "counts": [1, 0]
+        });
+        assert_eq!(snapshot(&store, &id, &skill.id), terminal);
+        for retry in [FeedbackState::Resolved, FeedbackState::Retracted] {
+            assert!(matches!(
+                FeedbackService::new(&mut store, redactor())
+                    .change_state(&actor, &id, 2, retry, "again", 5),
+                Err(FeedbackError::InvalidStateTransition)
+            ));
+            assert_eq!(snapshot(&store, &id, &skill.id), terminal);
+        }
+        assert_eq!(
+            id,
+            FeedbackService::new(&mut store, redactor())
+                .submit(&actor, &command, 6)
+                .unwrap()
+        );
+        assert_eq!(snapshot(&store, &id, &skill.id), terminal);
+        drop(store);
+        let path = root.path().to_path_buf();
+        drop(root);
+        assert!(!path.exists());
+    }
 }
 
 #[test]
@@ -209,7 +299,9 @@ fn feedback_authorization_and_unknown_targets_leave_no_records_or_counters() {
         "unknown skill must not create orphan records"
     );
     drop(store);
-    std::fs::remove_dir_all(root).unwrap();
+    let path = root.path().to_path_buf();
+    drop(root);
+    assert!(!path.exists());
 }
 
 /// The exact-secret list is only the last line of defence: operators paste
@@ -788,7 +880,8 @@ fn a_rejected_quarantine_transition_leaves_no_evidence_behind() {
         QuarantinePolicy, QuarantineReason,
     };
 
-    let root = std::env::temp_dir().join(format!("quarantine-rollback-{}", uuid::Uuid::new_v4()));
+    let directory = super::TestTempDir::new("quarantine-rollback");
+    let root = directory.path().to_path_buf();
     let paths = AppPaths::resolve(&PathEnvironment {
         platform: if cfg!(target_os = "macos") {
             PathPlatform::MacOs
@@ -874,5 +967,8 @@ fn a_rejected_quarantine_transition_leaves_no_evidence_behind() {
         )
         .unwrap();
     assert_ne!(status, "quarantined");
-    let _ = std::fs::remove_dir_all(root);
+    drop(store);
+    drop(coordinator);
+    drop(directory);
+    assert!(!root.exists());
 }

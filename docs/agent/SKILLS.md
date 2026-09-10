@@ -606,6 +606,11 @@ Attribute feedback while the invocation is still inside that window, or omit the
 **`reason_text`** is a separate 512-byte free-text field on the underlying record. The CLI does not
 set it — feedback submitted from the command line always stores it empty.
 
+**Corrections.** The shipped binary has no command to resolve or retract a report.
+Those transitions currently exist only in the test-only state machine; the authenticated
+operator is tracked in `mini-agent-1bt82`. An active negative report continues to hold
+replacement promotion while that operator gap remains.
+
 **Effect.** Every accepted report increments the revision's cumulative `user_positive` or
 `user_negative` counter (`severe` counts as negative); resolving or retracting a report later never
 decrements them. A `severe` report additionally attempts containment through the normal coordinated

@@ -27,6 +27,11 @@ changes the lockfile.
   consume `matrix.features`, so optional JS, skill, embedding, MCP, ACP, and LSP
   dependencies cannot leak into disabled rows and required CI rows cannot
   silently disappear or become disconnected from their commands.
+- All nine Clippy feature configurations run `--all-targets -- -D warnings`,
+  including dead-code checks in production and tests. Three retained feedback
+  actor variants have individual production-only `expect(dead_code)` attributes
+  tied to `mini-agent-kv9me`; a new production consumer makes its expectation
+  unfulfilled and requires removing it. No feature row disables dead-code checks.
 
 The Monday scheduled CI run executes the dependency gate even when no source
 or lockfile changed. Pull requests and pushes run it as part of normal CI.

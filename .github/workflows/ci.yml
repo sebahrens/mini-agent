@@ -247,19 +247,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Run Clippy (${{ matrix.features }})
-        # Default, minimal, memory, sandbox, ACP, and optional adapters are strict.
-        # Skill feature rows still compile APIs used only by other consumers,
-        # and some learned-skill contracts have no shipped operator yet. Gate
-        # each actual consumer; retain documented contract APIs deliberately.
-        # A clean rich row does not establish that the isolated rows are clean.
-        # Remove their exception under mini-agent-66u0 as each becomes clean.
-        run: |
-          lint_args=(-D warnings)
-          case "${{ matrix.features }}" in
-            ""|"--no-default-features"|"--no-default-features --features memory"|"--no-default-features --features sandbox"|"--no-default-features --features acp"|"--no-default-features --features hooks,advisor,lsp,multimodal,pdf") ;;
-            *) lint_args+=(-A dead-code) ;;
-          esac
-          cargo clippy --locked --all-targets ${{ matrix.features }} -- "${lint_args[@]}"
+        # Every supported row is strict, including tests. Deliberately retained
+        # feedback actor variants have individual, conditional lint expectations
+        # in feedback.rs; these expire when their production consumers appear.
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')

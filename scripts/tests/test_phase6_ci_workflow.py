@@ -294,16 +294,6 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                         )
                         self.assertEqual(result.returncode, exit_code, result.stderr)
                         expected = ["clippy", "--locked", "--all-targets", *shlex.split(features), "--", "-D", "warnings"]
-                        strict_features = {
-                            "",
-                            "--no-default-features",
-                            "--no-default-features --features memory",
-                            "--no-default-features --features sandbox",
-                            "--no-default-features --features acp",
-                            "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
-                        }
-                        if features not in strict_features:
-                            expected += ["-A", "dead-code"]
                         self.assertEqual(json.loads(recorded.read_text()), expected)
 
     def test_phase6_adversarial_suites_use_isolated_serialized_processes(self) -> None:
