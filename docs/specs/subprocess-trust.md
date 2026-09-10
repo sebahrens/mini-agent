@@ -181,14 +181,20 @@ setup verifies that every sibling disappears before rescue. Both preserve the
 original error. The create rollback fixture uses the same exclusive directory
 owner and keeps its existing supervisor rendezvous before directory removal.
 
-Exact-stash interference tests share a directly owned restore future under an
-`AgentWorkScope`. The post-apply gate holds restoration while each case changes
+Exact-stash interference and rollback branch-switch tests share `HeldGitMutation`,
+which owns the operation future under an `AgentWorkScope`. The post-apply gate
+holds restoration while each stash case changes
 the stash stack, tracked contents, or untracked contents. Assertions compare the
 exact retained stash OIDs and preserved bytes. Every exit releases the gate,
 settles or drops the retained future, drains native output workers, and verifies
 repository admission before removing the fixture root. Failure controls cover
 readiness, interference, completed results, and a panic inside the restore future;
 the original panic and successful cleanup are checked independently.
+The rollback case additionally proves that `HEAD` actually switched to the unrelated
+branch while rollback was held, then checks all captured branch OIDs and the exact
+retained conflict index and file bytes. Its failure control interrupts that concrete
+interference point and reuses the shared settlement path; common lifecycle failures
+remain covered once by the stash fixture matrix.
 
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a

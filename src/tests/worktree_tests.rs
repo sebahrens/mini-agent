@@ -3202,9 +3202,90 @@ wait
         assert!(!worktree.exists(), "cancelled worktree was not cleaned up");
     }
 
-    #[tokio::test]
-    async fn rollback_boundary_branch_switch_never_resets_the_unrelated_ref() {
-        let repo = TempRepo::new("rollback boundary branch switch");
+    type GitMutationResult = Result<Result<(), String>, Box<dyn std::any::Any + Send>>;
+
+    struct HeldGitMutation<'a> {
+        command:
+            Option<std::pin::Pin<Box<dyn std::future::Future<Output = GitMutationResult> + 'a>>>,
+        gate: std::sync::Arc<TestMutationGate>,
+        scope: &'a std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+    }
+
+    impl<'a> HeldGitMutation<'a> {
+        fn new(
+            scope: &'a std::sync::Arc<crate::agent::runner::AgentWorkScope>,
+            gate: std::sync::Arc<TestMutationGate>,
+            operation: impl std::future::Future<Output = Result<(), String>> + 'a,
+        ) -> Self {
+            use futures::FutureExt;
+            Self {
+                command: Some(Box::pin(
+                    scope.run(std::panic::AssertUnwindSafe(operation).catch_unwind()),
+                )),
+                gate,
+                scope,
+            }
+        }
+
+        async fn wait_ready(&mut self) {
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
+                tokio::select! {
+                    result = self.command.as_mut().unwrap() => {
+                        drop(self.command.take());
+                        let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        panic!("Git mutation stopped before its gate: {result:?}");
+                    }
+                    _ = self.gate.wait_until_reached() => {}
+                }
+            }).await.expect("Git mutation did not reach its fixture gate");
+        }
+
+        async fn finish(&mut self) -> Result<(), String> {
+            self.gate.resume();
+            let result = tokio::time::timeout(
+                TEST_MUTATION_ADMISSION_TIMEOUT,
+                self.command.as_mut().unwrap(),
+            )
+            .await
+            .expect("Git mutation did not finish after gate release");
+            drop(self.command.take());
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }
+
+        async fn settle(&mut self, repo: &Path) -> bool {
+            use futures::FutureExt;
+            // A timeout borrows the future; only this owner drops it. Never
+            // repoll a completed future, including one that returned a panic.
+            self.gate.resume();
+            let settled = if let Some(command) = self.command.as_mut() {
+                tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, command)
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+            } else {
+                true
+            };
+            drop(self.command.take());
+            self.scope.cancellation_handle().cancel();
+            let drained =
+                tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, self.scope.wait_idle()).await;
+            let admission = std::panic::AssertUnwindSafe(acquire_released_mutation_lock(
+                repo,
+                "held Git mutation fixture cleanup",
+            ))
+            .catch_unwind()
+            .await;
+            settled && drained.is_ok() && admission.is_ok() && self.scope.active_children() == 0
+        }
+    }
+
+    async fn exercise_rollback_branch_switch(
+        fail_after_switch: bool,
+        root: &Path,
+        cleanup_ok: &mut bool,
+    ) {
+        use futures::FutureExt;
+
+        let repo = TempRepo::uninitialized(OwnedDirectory::create(root.to_path_buf())).initialize();
         let remote = repo.path().with_extension("rollback boundary remote");
         let worktree = repo.path().with_extension("rollback boundary worktree");
         std::fs::create_dir_all(&remote).unwrap();
@@ -3246,31 +3327,112 @@ wait
         };
         let (mut state, outcome) = try_merge(&info, "main").await;
         assert!(matches!(outcome, MergeOutcome::Conflicts(_)));
+        let feature = git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]);
+        let index = git_stdout(repo.path(), ["ls-files", "--stage"]);
+        let contents = std::fs::read(repo.path().join("tracked.txt")).unwrap();
+        assert!(has_merge_conflict(repo.path()).await);
         let gate = TestMutationGate::new();
         state.set_rollback_test_gate(gate.clone());
-        let task = tokio::spawn(async move {
-            let result = cancel_merge(&mut state).await;
-            (state, result)
-        });
-        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_reached())
-            .await
-            .expect("target repository must reach the stash publication gate");
-        git(
-            repo.path(),
-            ["symbolic-ref", "HEAD", "refs/heads/unrelated"],
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        let mut mutation =
+            HeldGitMutation::new(&scope, gate, async move { cancel_merge(&mut state).await });
+        let outcome = std::panic::AssertUnwindSafe(async {
+            mutation.wait_ready().await;
+            assert_eq!(git_stdout(repo.path(), ["ls-files", "--stage"]), index);
+            assert_eq!(
+                std::fs::read(repo.path().join("tracked.txt")).unwrap(),
+                contents
+            );
+            git(
+                repo.path(),
+                ["symbolic-ref", "HEAD", "refs/heads/unrelated"],
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["symbolic-ref", "HEAD"]),
+                "refs/heads/unrelated"
+            );
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), unrelated);
+            if fail_after_switch {
+                panic!("injected after rollback branch interference");
+            }
+            let error = mutation
+                .finish()
+                .await
+                .expect_err("unsafe index recovery must be retained");
+            assert!(
+                error.contains("index/tree state was retained"),
+                "unexpected rollback error: {error}"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/heads/unrelated"]),
+                unrelated,
+                "rollback changed the unrelated branch"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/heads/main"]),
+                main
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]),
+                feature
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["ls-files", "--stage"]),
+                index,
+                "rollback changed the retained conflict index"
+            );
+            assert_eq!(
+                std::fs::read(repo.path().join("tracked.txt")).unwrap(),
+                contents
+            );
+            assert!(worktree.exists(), "rollback removed the source worktree");
+        })
+        .catch_unwind()
+        .await;
+        *cleanup_ok = mutation.settle(repo.path()).await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            *cleanup_ok,
+            "rollback fixture did not settle before directory removal"
         );
-        gate.resume();
-        let (_state, result) = task.await.unwrap();
+    }
 
-        assert!(result.is_err(), "unsafe index recovery must be retained");
+    #[tokio::test]
+    async fn rollback_boundary_branch_switch_never_resets_the_unrelated_ref() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-rollback-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cleanup_ok = false;
+        exercise_rollback_branch_switch(false, &root, &mut cleanup_ok).await;
+        assert!(cleanup_ok);
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_branch_switch_fixture_settles_failure_after_interference() {
+        use futures::FutureExt;
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-rollback-fixture-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cleanup_ok = false;
+        let panic = std::panic::AssertUnwindSafe(exercise_rollback_branch_switch(
+            true,
+            &root,
+            &mut cleanup_ok,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("rollback fixture failure must propagate");
         assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/heads/unrelated"]),
-            unrelated
+            panic.downcast_ref::<&str>(),
+            Some(&"injected after rollback branch interference")
         );
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/heads/main"]),
-            main
-        );
+        assert!(cleanup_ok, "rollback failure skipped fixture settlement");
+        assert!(!root.exists());
     }
 
     #[derive(Clone, Copy)]
@@ -3305,45 +3467,23 @@ wait
         let captured = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
         let gate = TestMutationGate::new();
         let scope = crate::agent::runner::AgentWorkScope::new();
-        // Own the future directly; the scope retains any native output worker
-        // if a bounded fixture wait drops its response receiver during cleanup.
-        let mut command = Some(Box::pin(
-            scope.run(
-                std::panic::AssertUnwindSafe(async {
-                    if matches!(failure, StashFixtureFailure::BeforeRestorePanic) {
-                        panic!("injected before stash restore started");
-                    }
-                    let result = restore_stash_with_gate_for_test(
-                        repo.path(),
-                        None,
-                        captured.clone(),
-                        gate.clone(),
-                    )
+        let mut mutation = HeldGitMutation::new(&scope, gate.clone(), async {
+            if matches!(failure, StashFixtureFailure::BeforeRestorePanic) {
+                panic!("injected before stash restore started");
+            }
+            let result =
+                restore_stash_with_gate_for_test(repo.path(), None, captured.clone(), gate.clone())
                     .await;
-                    if matches!(failure, StashFixtureFailure::RestorePanic) {
-                        panic!("injected inside stash restore future");
-                    }
-                    result
-                })
-                .catch_unwind(),
-            ),
-        ));
+            if matches!(failure, StashFixtureFailure::RestorePanic) {
+                panic!("injected inside stash restore future");
+            }
+            result
+        });
         let outcome = std::panic::AssertUnwindSafe(async {
             if matches!(failure, StashFixtureFailure::BeforeReadiness) {
                 panic!("injected before stash readiness");
             }
-            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
-                tokio::select! {
-                    result = command.as_mut().unwrap() => {
-                        drop(command.take());
-                        let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                        panic!("stash restore stopped before its mutation gate: {result:?}");
-                    }
-                    _ = gate.wait_until_reached() => {}
-                }
-            })
-            .await
-            .expect("exact stash restore did not reach its post-apply gate");
+            mutation.wait_ready().await;
             assert_eq!(
                 std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
                 "captured\n"
@@ -3382,13 +3522,7 @@ wait
             if matches!(failure, StashFixtureFailure::AfterInterference) {
                 panic!("injected after stash interference");
             }
-            gate.resume();
-            let result =
-                tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, command.as_mut().unwrap())
-                    .await
-                    .expect("exact stash restore did not finish after release");
-            drop(command.take());
-            let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let result = mutation.finish().await;
             if matches!(failure, StashFixtureFailure::AfterCompletion) {
                 panic!("injected after stash restore completion");
             }
@@ -3424,29 +3558,7 @@ wait
         .catch_unwind()
         .await;
 
-        // Release even if readiness or interference assertions failed. Never
-        // poll a completed/panicked future again; its slot was cleared above.
-        gate.resume();
-        let settled = if let Some(command) = command.as_mut() {
-            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, command)
-                .await
-                .is_ok_and(|result| result.is_ok())
-        } else {
-            true
-        };
-        drop(command.take());
-        scope.cancellation_handle().cancel();
-        let drained =
-            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, scope.wait_idle()).await;
-        let admission = std::panic::AssertUnwindSafe(acquire_released_mutation_lock(
-            repo.path(),
-            "stash fixture cleanup",
-        ))
-        .catch_unwind()
-        .await;
-        *cleanup_ok =
-            settled && drained.is_ok() && admission.is_ok() && scope.active_children() == 0;
-        drop(admission);
+        *cleanup_ok = mutation.settle(repo.path()).await;
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
