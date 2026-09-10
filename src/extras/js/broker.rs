@@ -36,11 +36,10 @@ use super::protocol::{
     MAX_SKILL_CAPABILITY_GRANTS_PER_STEP, SkillCallRequest, SkillCallResponse,
     SkillCapabilityGrant, SkillInvocationGrant,
 };
+#[cfg(all(feature = "skills", any(test, feature = "sandbox")))]
+use super::skills::HttpMethod as SkillHttpMethod;
 #[cfg(feature = "skills")]
-use super::skills::{
-    CapabilityManifest, CapabilityScope, HostCapability as SkillHostCapability,
-    HttpMethod as SkillHttpMethod,
-};
+use super::skills::{CapabilityManifest, CapabilityScope, HostCapability as SkillHostCapability};
 use super::supervisor::{EffectFuture, InvocationEffectHandler};
 use super::types::EffectServiceError;
 use super::types::PermCancellation;
@@ -809,8 +808,9 @@ impl From<EffectServiceError> for HostEffectError {
             | EffectServiceError::InvalidBody => Self::InvalidTarget,
             EffectServiceError::NotFound => Self::NotFound,
             EffectServiceError::IsDirectory => Self::IsDirectory,
-            EffectServiceError::TargetDenied
-            | EffectServiceError::FileNoConfiguredRoots
+            #[cfg(any(test, feature = "sandbox"))]
+            EffectServiceError::TargetDenied => Self::TargetDenied,
+            EffectServiceError::FileNoConfiguredRoots
             | EffectServiceError::FileInvalidConfiguration
             | EffectServiceError::FileOutsideConfiguredRoots => Self::TargetDenied,
             EffectServiceError::PermissionDenied | EffectServiceError::DoomLoopDenied => {
@@ -819,7 +819,9 @@ impl From<EffectServiceError> for HostEffectError {
             EffectServiceError::PermissionTimedOut => Self::AskTimedOut,
             EffectServiceError::Cancelled => Self::InvocationCancelled,
             EffectServiceError::TimedOut => Self::EffectTimedOut,
-            EffectServiceError::OutputLimit | EffectServiceError::BodyLimit => Self::OutputLimit,
+            EffectServiceError::OutputLimit => Self::OutputLimit,
+            #[cfg(any(test, feature = "sandbox", feature = "skills"))]
+            EffectServiceError::BodyLimit => Self::OutputLimit,
             EffectServiceError::BackendFailure => Self::BackendFailure,
             EffectServiceError::OutcomeUnknown => Self::OutcomeUnknown,
         }
@@ -848,6 +850,7 @@ pub(crate) enum AuthorizedTarget {
     WriteFile {
         canonical_path: String,
     },
+    #[cfg(any(test, feature = "sandbox"))]
     Fetch {
         normalized_url: String,
         method: String,
@@ -876,6 +879,7 @@ pub(crate) enum NormalizedTarget {
     WriteFile {
         workspace_relative: Option<String>,
     },
+    #[cfg(any(test, feature = "sandbox"))]
     Fetch {
         origin: String,
         method: String,
@@ -1623,6 +1627,7 @@ fn enforce_manifest_scope(
                     .is_some_and(|target| path_scope_contains(prefix, target))
             })
         }),
+        #[cfg(any(test, feature = "sandbox"))]
         (
             Some(CapabilityScope::Fetch { origins, methods }),
             NormalizedTarget::Fetch { origin, method },
@@ -1877,6 +1882,7 @@ fn sanitize_target(
         (HostCapability::WriteFile, AuthorizedTarget::WriteFile { canonical_path }) => {
             Ok(audit.write_file_target(&canonical_path))
         }
+        #[cfg(any(test, feature = "sandbox"))]
         (
             HostCapability::Fetch,
             AuthorizedTarget::Fetch {

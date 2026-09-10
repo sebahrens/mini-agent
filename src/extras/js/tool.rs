@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::atomic::AtomicU64;
 #[cfg(feature = "skills")]
 use std::sync::atomic::Ordering;
+#[cfg(any(test, feature = "sandbox"))]
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -61,6 +62,7 @@ use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
 use crate::sandbox::Sandbox;
 
+#[cfg(any(test, feature = "sandbox"))]
 const PERMISSION_WAIT_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
@@ -72,6 +74,7 @@ enum PermissionCheckKind {
 }
 
 enum PermissionReply {
+    #[cfg(any(test, feature = "sandbox"))]
     Sync(mpsc::SyncSender<PermResponse>),
     Async(oneshot::Sender<PermResponse>),
 }
@@ -79,6 +82,7 @@ enum PermissionReply {
 impl PermissionReply {
     fn send(self, response: PermResponse) {
         match self {
+            #[cfg(any(test, feature = "sandbox"))]
             Self::Sync(reply) => {
                 let _ = reply.send(response);
             }
@@ -140,10 +144,12 @@ impl PermissionBridge {
         }
     }
 
+    #[cfg(any(test, feature = "sandbox"))]
     pub(crate) fn check(&self, tool: &str, key: &str) -> Result<(), PermissionBridgeError> {
         self.check_sync(PermissionCheckKind::Input, tool, key)
     }
 
+    #[cfg(any(test, feature = "sandbox"))]
     fn check_sync(
         &self,
         kind: PermissionCheckKind,
@@ -1936,17 +1942,6 @@ mod js_permission_bridge {
     }
 
     #[tokio::test]
-    async fn js_permission_bridge_dropped_request_sender_stops_receiver() {
-        let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(1));
-        drop(bridge);
-
-        assert!(
-            rx.recv().await.is_none(),
-            "request receiver should close when its final sender drops"
-        );
-    }
-
-    #[tokio::test]
     async fn js_permission_bridge_dropped_response_sender_is_deterministic() {
         let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(1));
         let check =
@@ -1958,19 +1953,6 @@ mod js_permission_bridge {
             check.await.expect("permission task should not panic"),
             Err(PermissionBridgeError::ResponseChannelClosed)
         );
-    }
-
-    #[tokio::test]
-    async fn js_permission_bridge_dropped_response_receiver_discards_late_reply() {
-        let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(30));
-        let check = tokio::task::spawn_blocking(move || bridge.check("bash", "printf late"));
-        let envelope = rx.recv().await.expect("permission request should arrive");
-        assert_eq!(
-            check.await.expect("permission task should not panic"),
-            Err(PermissionBridgeError::TimedOut)
-        );
-
-        reply(envelope, PermOutcome::Allowed);
     }
 
     #[tokio::test]
@@ -1989,49 +1971,126 @@ mod js_permission_bridge {
         );
     }
 
+    fn start_check(
+        bridge: PermissionBridge,
+        synchronous: bool,
+    ) -> tokio::task::JoinHandle<Result<(), PermissionBridgeError>> {
+        if synchronous {
+            tokio::task::spawn_blocking(move || bridge.check("read", "same-file.txt"))
+        } else {
+            tokio::spawn(async move { bridge.check_async("read", "same-file.txt").await })
+        }
+    }
+
+    async fn next_request(
+        receiver: &mut tokio_mpsc::UnboundedReceiver<PermissionEnvelope>,
+    ) -> PermissionEnvelope {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("permission request should arrive within the deadline")
+            .expect("permission request channel should remain open")
+    }
+
+    async fn check_result(
+        check: tokio::task::JoinHandle<Result<(), PermissionBridgeError>>,
+    ) -> Result<(), PermissionBridgeError> {
+        tokio::time::timeout(Duration::from_secs(1), check)
+            .await
+            .expect("permission check should settle within the deadline")
+            .expect("permission check should not panic")
+    }
+
     #[tokio::test]
     async fn js_permission_bridge_late_reply_cannot_satisfy_repeated_call() {
-        let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(40));
-        let first_bridge = bridge.clone();
-        let first = tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
-        let first_envelope = rx.recv().await.expect("first request should arrive");
-        let first_id = first_envelope.request.id();
-        assert_eq!(
-            first.await.expect("first request should not panic"),
-            Err(PermissionBridgeError::TimedOut)
-        );
+        for synchronous in [true, false] {
+            let (mut bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(30));
+            let first = start_check(bridge.clone(), synchronous);
+            let first_envelope = next_request(&mut rx).await;
+            let first_id = first_envelope.request.id();
+            assert_eq!(
+                check_result(first).await,
+                Err(PermissionBridgeError::TimedOut)
+            );
 
-        let second = tokio::task::spawn_blocking(move || bridge.check("bash", "second"));
-        let second_envelope = rx.recv().await.expect("second request should arrive");
-        let second_id = second_envelope.request.id();
-        assert_ne!(first_id, second_id);
-        reply(first_envelope, PermOutcome::Allowed);
-        reply(second_envelope, PermOutcome::Allowed);
-
-        assert_eq!(
-            second.await.expect("second request should not panic"),
-            Ok(())
-        );
+            // The retry has its own generous deadline; the first timed-out
+            // request must not authorize the exact same permission subject.
+            bridge.timeout = Duration::from_secs(2);
+            let mut second = start_check(bridge, synchronous);
+            let second_envelope = next_request(&mut rx).await;
+            assert_ne!(first_id, second_envelope.request.id());
+            reply(first_envelope, PermOutcome::Allowed);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut second)
+                    .await
+                    .is_err(),
+                "late approval must leave the retry waiting for its own response"
+            );
+            reply(second_envelope, PermOutcome::Denied(PermissionDenial::User));
+            assert_eq!(
+                check_result(second).await,
+                Err(PermissionBridgeError::Denied(PermissionDenial::User))
+            );
+        }
     }
 
     #[tokio::test]
     async fn js_permission_bridge_out_of_order_replies_remain_correlated() {
-        let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(1));
-        let first_bridge = bridge.clone();
-        let first = tokio::task::spawn_blocking(move || first_bridge.check("bash", "first"));
-        let second = tokio::task::spawn_blocking(move || bridge.check("bash", "second"));
-        let first_envelope = rx.recv().await.expect("first request should arrive");
-        let second_envelope = rx.recv().await.expect("second request should arrive");
-        assert_ne!(first_envelope.request.id(), second_envelope.request.id());
+        for synchronous in [true, false] {
+            let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(2));
+            let first = start_check(bridge.clone(), synchronous);
+            let first_envelope = next_request(&mut rx).await;
+            let second = start_check(bridge, synchronous);
+            let second_envelope = next_request(&mut rx).await;
+            assert_ne!(first_envelope.request.id(), second_envelope.request.id());
 
-        reply(second_envelope, PermOutcome::Allowed);
-        reply(first_envelope, PermOutcome::Allowed);
+            reply(second_envelope, PermOutcome::Allowed);
+            reply(first_envelope, PermOutcome::Denied(PermissionDenial::User));
 
-        assert_eq!(first.await.expect("first request should not panic"), Ok(()));
-        assert_eq!(
-            second.await.expect("second request should not panic"),
-            Ok(())
-        );
+            assert_eq!(
+                check_result(first).await,
+                Err(PermissionBridgeError::Denied(PermissionDenial::User))
+            );
+            assert_eq!(check_result(second).await, Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn js_permission_bridge_rejects_crossed_response_identities() {
+        for synchronous in [true, false] {
+            let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_secs(2));
+            let first = start_check(bridge.clone(), synchronous);
+            let first_envelope = next_request(&mut rx).await;
+            let first_id = first_envelope.request.id();
+            let second = start_check(bridge, synchronous);
+            let second_envelope = next_request(&mut rx).await;
+            let second_id = second_envelope.request.id();
+
+            second_envelope
+                .reply
+                .send(PermResponse::new(first_id, PermOutcome::Allowed));
+            first_envelope
+                .reply
+                .send(PermResponse::new(second_id, PermOutcome::Allowed));
+
+            assert_eq!(
+                check_result(first).await,
+                Err(PermissionBridgeError::RejectedResponse(
+                    PermResponseRejection::MismatchedRequestId {
+                        expected: first_id,
+                        actual: second_id
+                    }
+                ))
+            );
+            assert_eq!(
+                check_result(second).await,
+                Err(PermissionBridgeError::RejectedResponse(
+                    PermResponseRejection::MismatchedRequestId {
+                        expected: second_id,
+                        actual: first_id
+                    }
+                ))
+            );
+        }
     }
 
     #[cfg(feature = "skills")]

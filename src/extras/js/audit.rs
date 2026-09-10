@@ -152,6 +152,7 @@ impl SanitizedTarget {
         }
     }
 
+    #[cfg(any(test, feature = "sandbox"))]
     fn fetch(key: &[u8; TARGET_KEY_BYTES], url: &str, method: &str) -> Result<Self, AuditError> {
         let (scheme, remainder) = url.split_once("://").ok_or(AuditError::InvalidMetadata)?;
         let scheme = scheme.to_ascii_lowercase();
@@ -702,6 +703,7 @@ impl EffectAudit {
         SanitizedTarget::file(&self.target_key, "write_file", canonical_path)
     }
 
+    #[cfg(any(test, feature = "sandbox"))]
     pub(crate) fn fetch_target(
         &self,
         normalized_url: &str,
@@ -1721,6 +1723,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     crate::hex::encode_lower(Sha256::digest(bytes))
 }
 
+#[cfg(any(test, feature = "sandbox"))]
 fn split_host_port(authority: &str) -> Result<(String, Option<u16>), AuditError> {
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let close = bracketed.find(']').ok_or(AuditError::InvalidMetadata)?;

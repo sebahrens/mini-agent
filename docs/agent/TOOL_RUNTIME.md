@@ -100,6 +100,12 @@ remains available without worktrees. Read-only JS constructors follow subagent
 callers, while standalone skills tests retain child discovery and turn-isolation
 coverage. The test-only task oracle adapter follows the sandboxed subagent
 harness; production completion-verification evidence is unchanged.
+Fetch target construction, audit construction, and synchronous permission waits
+follow the sandbox-enabled fetch service, with standalone broker and permission
+tests retaining those contracts. Persisted fetch audit records remain readable
+without that feature. Proposal body-limit errors also remain available to skills.
+Permission correlation tests exercise synchronous and asynchronous replies,
+including different decisions, crossed identities, and retries of the same key.
 ACP permission correlation claims a lifecycle ID when each registered tool
 invocation enters the concurrency boundary, before waiting for its lease.
 The ID stays local to that invocation through delayed and repeated approval

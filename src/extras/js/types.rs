@@ -39,6 +39,7 @@ pub(crate) enum EffectServiceError {
     FinalSymlink,
     #[error("Path changed after permission check")]
     TargetChanged,
+    #[cfg(any(test, feature = "sandbox"))]
     #[error("effect target is outside the configured policy")]
     TargetDenied,
     #[error("no roots are configured; unrestricted access requires an explicit opt-in")]
@@ -59,6 +60,7 @@ pub(crate) enum EffectServiceError {
     TimedOut,
     #[error("resource limit: effect output exceeded its limit")]
     OutputLimit,
+    #[cfg(any(test, feature = "sandbox", feature = "skills"))]
     #[error("resource limit: effect body exceeded its limit")]
     BodyLimit,
     #[error("invalid encoding: effect body is invalid")]
