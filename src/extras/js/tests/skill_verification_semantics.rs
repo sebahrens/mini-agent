@@ -12,7 +12,7 @@
 #[cfg(test)]
 mod tests {
     use crate::extras::js::skills::verify::{
-        MutationOutcome, TestResult, VerificationError, verify_skill, worker_error,
+        TestResult, VerificationError, verify_skill, worker_error,
     };
     use crate::extras::js::skills::{
         CapabilityManifest, CapabilityTier, HostCapability, SkillArtifact, SkillExport,
@@ -45,33 +45,6 @@ mod tests {
             capability,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn verification_report_binds_results_metadata_and_pure_transcript() {
-        use crate::extras::js::skills::fakes::FAKES_VERSION;
-        use crate::extras::js::skills::verify::VERIFIER_VERSION;
-        use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
-
-        let s = skill(
-            "function foo() { return true; } function bar() { return true; }",
-            vec!["foo()", "bar()", "foo() && bar()"],
-            vec![("foo", "(): boolean"), ("bar", "(): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.skill_id, s.id);
-        assert_eq!(report.identity_version, s.identity_version);
-        assert_eq!(report.capability, s.capability);
-        assert_eq!(report.verifier_version, VERIFIER_VERSION);
-        assert_eq!(report.fakes_version, FAKES_VERSION);
-        assert_eq!(report.memory_limit, MEMORY_LIMIT);
-        assert_eq!(report.stack_limit, STACK_LIMIT);
-        assert_eq!(report.timeout, std::time::Duration::from_secs(30));
-        assert_eq!(report.test_results, vec![TestResult::Passed; 3]);
-        assert_eq!(report.mutation_outcomes, vec![MutationOutcome::Detected; 2]);
-        assert!(report.transcript.is_empty());
     }
 
     #[test]
@@ -113,9 +86,7 @@ mod tests {
                 tier,
                 hosts,
             );
-            let report = verify_skill(&s).expect(name);
-            assert_eq!(report.test_results, vec![TestResult::Passed], "{name}");
-            assert_eq!(report.capability, s.capability, "{name}");
+            verify_skill(&s).expect(name);
         }
     }
 
@@ -289,9 +260,7 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 3);
-        assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
+        verify_skill(&s).expect("all embedded tests pass before injecting failures");
         for failed_index in 0..s.tests.len() {
             let mut expressions = s.tests.clone();
             // Make the suffix fail too: verification must identify the first
@@ -328,8 +297,7 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        let report = verify_skill(&s).expect("hardened deterministic globals verify");
-        assert_eq!(report.test_results, vec![TestResult::Passed]);
+        verify_skill(&s).expect("hardened deterministic globals verify");
     }
 
     #[test]
@@ -341,13 +309,8 @@ mod tests {
             CapabilityTier::Pure,
             vec![],
         );
-        for request in 0..2 {
-            let report = verify_skill(&s).expect("each request starts with fresh state");
-            assert_eq!(
-                report.test_results,
-                vec![TestResult::Passed, TestResult::Passed],
-                "request {request}"
-            );
+        for _ in 0..2 {
+            verify_skill(&s).expect("each case and request starts with fresh state");
         }
     }
 
@@ -418,11 +381,7 @@ mod tests {
             vec![],
         );
 
-        let report = verify_skill(&s).expect("indirectly called export should be covered");
-        assert_eq!(
-            report.mutation_outcomes,
-            vec![MutationOutcome::Detected, MutationOutcome::Detected]
-        );
+        verify_skill(&s).expect("indirectly called export should be covered");
     }
 
     #[test]
@@ -457,35 +416,6 @@ mod tests {
             verify_skill(&s),
             Err(VerificationError::MutationPassFailed { export, .. }) if export == "unused"
         ));
-    }
-
-    #[test]
-    fn test_export_with_complex_logic() {
-        let s = skill(
-            r#"
-            function isPrime(_cap, n) {
-                if (n < 2) return false;
-                for (let i = 2; i * i <= n; i++) {
-                    if (n % i === 0) return false;
-                }
-                return true;
-            }
-            "#,
-            vec![
-                "isPrime(2)",
-                "isPrime(3)",
-                "isPrime(4) === false",
-                "isPrime(5)",
-            ],
-            vec![("isPrime", "(n: number): boolean")],
-            CapabilityTier::Pure,
-            vec![],
-        );
-        let report = verify_skill(&s).unwrap();
-        assert_eq!(report.test_results.len(), 4);
-        assert!(report.test_results.iter().all(|r| *r == TestResult::Passed));
-        assert_eq!(report.mutation_outcomes.len(), 1);
-        assert_eq!(report.mutation_outcomes[0], MutationOutcome::Detected);
     }
 
     #[test]
@@ -639,21 +569,6 @@ mod fake_integrity_probes {
         assert!(
             result.is_ok(),
             "fakes must maintain virtual state across calls, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn probe_fake_calls_are_recorded_in_the_transcript() {
-        let skill = artifact(
-            "function f(cap) { cap.write_file('virtual/b.txt', 'x'); return true; }",
-            vec!["f() === true"],
-            vec![HostCapability::WriteFile],
-        );
-        let report = verify_skill(&skill).expect("should verify");
-        assert!(
-            !report.transcript.writes.is_empty(),
-            "a declared write_file call must be recorded in the transcript, got {:?}",
-            report.transcript
         );
     }
 

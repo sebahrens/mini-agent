@@ -531,8 +531,10 @@ fn held_out_fixture_import_requires_unique_request_keys_within_each_case() {
 fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
     let (root, paths) = paths();
     let mut store = SkillStore::open_at(&paths).expect("store");
+    let virtual_output = PathBuf::from(format!("virtual/verifier-{}.txt", uuid::Uuid::new_v4()));
+    let output_literal = serde_json::to_string(&virtual_output.to_string_lossy()).unwrap();
     let artifact = SkillArtifact::new(
-        "function fakeIsPresent(cap, path) { return path === undefined ? typeof cap.read_file === 'function' : cap.read_file(path); }".to_string(),
+        format!("function fakeIsPresent(cap, path) {{ if (path === undefined) return typeof cap.read_file === 'function' && typeof cap.write_file === 'function'; const value = cap.read_file(path); cap.write_file({output_literal}, value); return cap.read_file({output_literal}); }}"),
         "Prove the declared read fake is present.".to_string(),
         vec!["fake".to_string()],
         vec![SkillExport {
@@ -540,7 +542,10 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
             signature: "fakeIsPresent(): boolean".to_string(),
         }],
         vec!["fakeIsPresent() === true".to_string()],
-        test_manifest(CapabilityTier::ReadOnly, vec![HostCapability::ReadFile]).expect("manifest"),
+        CapabilityManifest::new(CapabilityTier::SideEffecting, vec![
+            crate::extras::js::skills::CapabilityScope::ReadFile { workspace_prefixes: vec!["fixtures".into(), "virtual".into()] },
+            crate::extras::js::skills::CapabilityScope::WriteFile { workspace_prefixes: vec!["virtual".into()] },
+        ]).expect("manifest"),
     )
     .expect("artifact");
     let mut fake_files = BTreeMap::new();
@@ -552,7 +557,7 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
         selector: HeldOutSelector {
             tags: vec!["fake".to_string()],
             exports: vec![],
-            capability_tier: Some("read_only".to_string()),
+            capability_tier: Some("side_effecting".to_string()),
         },
         cases: vec![HeldOutCase {
             expression: "fakeIsPresent('fixtures/hidden/input')".to_string(),
@@ -561,19 +566,73 @@ fn skill_no_effect_fakes_use_hidden_virtual_data_and_match_transcript() {
             fake_spawns: vec![],
             fake_fetches: vec![],
             transcript: TranscriptExpectation {
-                reads: 1,
-                read_paths: vec!["fixtures/hidden/input".to_string()],
+                reads: 2,
+                writes: 1,
+                read_paths: vec![
+                    "fixtures/hidden/input".to_string(),
+                    virtual_output.to_string_lossy().into_owned(),
+                ],
                 ..TranscriptExpectation::default()
             },
         }],
     };
     let admin = AdminIdentity::authenticated("reviewer").unwrap();
-    suite.import(&mut store, &admin, 10).expect("import");
+    suite
+        .clone()
+        .import(&mut store, &admin, 10)
+        .expect("import");
     let report = evaluate(&store, &artifact, None).expect("evaluate");
     let serialized = serde_json::to_string(&report).unwrap();
     assert!(!serialized.contains("held-out-secret"));
     assert!(!serialized.contains("fixtures/hidden/input"));
-    let _ = std::fs::remove_dir_all(root);
+    assert!(!serialized.contains(virtual_output.to_str().unwrap()));
+    assert!(
+        !virtual_output.exists(),
+        "the verifier must never write to the host"
+    );
+
+    // Exercise the consumer of the transcript, not a parent report that merely
+    // copies worker fields. Every invalid expectation has a valid content hash
+    // and passes suite import; only the observed effect contract can reject it.
+    for mismatch in [
+        "reads",
+        "writes",
+        "spawns",
+        "fetches",
+        "read-path",
+        "read-order",
+        "spawn-program",
+        "fetch-url",
+    ] {
+        let mut incorrect = suite.clone();
+        let expected = &mut incorrect.cases[0].transcript;
+        match mismatch {
+            "reads" => expected.reads = 1,
+            "writes" => expected.writes = 0,
+            "spawns" => expected.spawns = 1,
+            "fetches" => expected.fetches = 1,
+            "read-path" => expected.read_paths[0] = "unobserved-input".into(),
+            "read-order" => expected.read_paths.reverse(),
+            "spawn-program" => expected.spawn_programs.push("unobserved-program".into()),
+            "fetch-url" => expected
+                .fetch_urls
+                .push("https://unobserved.invalid/".into()),
+            _ => unreachable!(),
+        }
+        let id = incorrect.import(&mut store, &admin, 20).expect(mismatch);
+        assert!(
+            matches!(evaluate(&store, &artifact, None), Err(HeldOutError::TranscriptMismatch { suite_id, case_index: 0 }) if suite_id == id),
+            "{mismatch}"
+        );
+        assert!(
+            !virtual_output.exists(),
+            "failed evaluation must have no real effects"
+        );
+        assert!(store.disable_held_out_suite(Some(&admin), &id).unwrap());
+    }
+    assert_eq!(evaluate(&store, &artifact, None).unwrap(), report);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

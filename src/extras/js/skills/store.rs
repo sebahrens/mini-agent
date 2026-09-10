@@ -404,30 +404,7 @@ impl SkillStore {
     #[cfg(test)]
     pub fn insert_verified(&mut self, artifact: &SkillArtifact) -> Result<(), StoreError> {
         artifact.verify_identity()?;
-        let verification = super::verify::verify_skill(artifact)?;
-        if verification.skill_id != artifact.id
-            || verification.identity_version != artifact.identity_version
-            || verification.capability != artifact.capability
-        {
-            return Err(StoreError::Constraint(
-                "verification report is not bound to the inserted artifact".to_string(),
-            ));
-        }
-        tracing::debug!(
-            skill_id = %artifact.id,
-            verifier_version = verification.verifier_version,
-            fakes_version = verification.fakes_version,
-            memory_limit = verification.memory_limit,
-            stack_limit = verification.stack_limit,
-            timeout_ms = verification.timeout.as_millis(),
-            tests = verification.test_results.len(),
-            mutations = verification.mutation_outcomes.len(),
-            fake_reads = verification.transcript.reads.len(),
-            fake_writes = verification.transcript.writes.len(),
-            fake_spawns = verification.transcript.spawns.len(),
-            fake_fetches = verification.transcript.fetches.len(),
-            "verified immutable learned-JS artifact before insertion"
-        );
+        super::verify::verify_skill(artifact)?;
 
         let tags_json = serde_json::to_string(&artifact.tags)?;
         let exports_json = serialize_exports(&artifact.exports)?;

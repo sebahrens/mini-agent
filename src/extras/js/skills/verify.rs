@@ -1,11 +1,10 @@
 //! Parent adapter for worker-owned production-loader verification.
 //!
-//! This module owns report construction only. QuickJS runtime, realm loading, capability-object
+//! This module classifies worker outcomes. QuickJS runtime, realm loading, capability-object
 //! construction, deterministic fake execution, and source evaluation all live in the contained
 //! worker and use the same loader as production execution.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use crate::extras::js::protocol::{
     Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole, VerificationCase,
@@ -13,47 +12,22 @@ use crate::extras::js::protocol::{
     VerifyArtifact,
 };
 use crate::extras::js::supervisor::{JsWorkerSupervisor, WorkerError};
-use crate::extras::js::types::{MEMORY_LIMIT, STACK_LIMIT};
 
-use super::fakes::{FAKES_VERSION, FakeFetchFixture, FakeSpawnFixture, FakeTranscript};
+use super::SkillArtifact;
+use super::fakes::{FakeFetchFixture, FakeSpawnFixture, FakeTranscript};
 use super::held_out::ExpectedJsValue;
-use super::{CapabilityManifest, SkillArtifact};
 
 /// Version of the verification algorithm. Bumping this invalidates existing reports.
 /// Version 6 compares held-out integer expectations across QuickJS numeric
 /// representations without rounding, coercion, or narrowing to an i32.
 pub const VERIFIER_VERSION: u32 = 6;
 
-/// Timeout for one whole worker verification request.
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestResult {
-    Passed,
     ReturnedFalse,
     Threw(String),
     ResourceLimit,
     JobLimitExceeded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MutationOutcome {
-    Detected,
-}
-
-#[derive(Debug, Clone)]
-pub struct VerificationReport {
-    pub skill_id: String,
-    pub identity_version: u32,
-    pub capability: CapabilityManifest,
-    pub verifier_version: u32,
-    pub fakes_version: u32,
-    pub memory_limit: usize,
-    pub stack_limit: usize,
-    pub timeout: Duration,
-    pub test_results: Vec<TestResult>,
-    pub mutation_outcomes: Vec<MutationOutcome>,
-    pub transcript: FakeTranscript,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,7 +140,13 @@ impl VerificationError {
     }
 }
 
-pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
+/// Verify every embedded test and both mutation passes for every export.
+///
+/// Success carries no copied metadata: the worker request owns the artifact,
+/// and the supervisor binds the reply to its exact ordered cases and loader.
+/// Admission constructs its durable evidence from the validated artifact and
+/// current verifier/fake versions after the held-out gates also succeed.
+pub fn verify_skill(skill: &SkillArtifact) -> Result<(), VerificationError> {
     if skill.tests.is_empty() {
         return Err(VerificationError::NoTests);
     }
@@ -223,22 +203,15 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
         ));
     }
 
-    let mut transcript = FakeTranscript::default();
-    let mut test_results = Vec::with_capacity(embedded_count);
     for (index, case) in result.cases[..embedded_count].iter().enumerate() {
-        transcript.append(case.transcript.clone());
-        let outcome = if case.passed {
-            TestResult::Passed
-        } else {
-            test_result(case.diagnostic.as_ref())?
-        };
-        if outcome != TestResult::Passed {
-            return Err(VerificationError::TestFailed { index, outcome });
+        if !case.passed {
+            return Err(VerificationError::TestFailed {
+                index,
+                outcome: test_result(case.diagnostic.as_ref())?,
+            });
         }
-        test_results.push(outcome);
     }
 
-    let mut mutation_outcomes = Vec::with_capacity(skill.exports.len());
     for (export, cases) in skill
         .exports
         .iter()
@@ -258,22 +231,9 @@ pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, Verific
                 diagnostic: case.diagnostic.clone(),
             });
         }
-        mutation_outcomes.push(MutationOutcome::Detected);
     }
 
-    Ok(VerificationReport {
-        skill_id: skill.id.clone(),
-        identity_version: skill.identity_version,
-        capability: skill.capability.clone(),
-        verifier_version: VERIFIER_VERSION,
-        fakes_version: FAKES_VERSION,
-        memory_limit: MEMORY_LIMIT,
-        stack_limit: STACK_LIMIT,
-        timeout: VERIFY_TIMEOUT,
-        test_results,
-        mutation_outcomes,
-        transcript,
-    })
+    Ok(())
 }
 
 pub(crate) fn verify_inherited_cases(
@@ -371,7 +331,7 @@ fn verify_in_worker(request: VerifyArtifact) -> Result<VerificationResult, Verif
             .get_or_init(|| {
                 std::sync::Arc::new(JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
                     crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
-                    VERIFY_TIMEOUT,
+                    crate::extras::js::types::STEP_TIMEOUT,
                 ))
             })
             .clone()

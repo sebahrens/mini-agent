@@ -207,13 +207,6 @@ impl FakeTranscript {
             && self.fetches.is_empty()
     }
 
-    pub(crate) fn append(&mut self, mut other: Self) {
-        self.reads.append(&mut other.reads);
-        self.writes.append(&mut other.writes);
-        self.spawns.append(&mut other.spawns);
-        self.fetches.append(&mut other.fetches);
-    }
-
     /// Return a wire-safe transcript. Callers must separately reject a transcript whose
     /// operation counts exceed `VERIFICATION_TRANSCRIPT_MAX_CALLS` so truncation cannot turn
     /// an over-limit transcript into an apparent expectation match.

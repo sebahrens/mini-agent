@@ -497,7 +497,7 @@ superseded by Phase 6 `Verification parity`, which requires the contained worker
 private-realm loader/ABI path.
 
 ```rust
-pub fn verify_skill(skill: &SkillArtifact) -> Result<VerificationReport, VerificationError> {
+pub fn verify_skill(skill: &SkillArtifact) -> Result<(), VerificationError> {
     // Send the complete bounded artifact and cases to the contained JS worker.
     // The worker uses the production realm loader and hidden capability ABI for every case.
     // Require at least one test and exact JavaScript boolean true for every embedded test.
@@ -559,9 +559,19 @@ expected reason. This proves that every public export is exercised, not that its
 correct. Mutation runs use fresh contexts and the same resource bounds. An empty, always-true, or
 unrelated suite cannot verify an artifact.
 
-Manual Phase 3 insertion calls the verifier before identity-validating persistence. Store APIs do
-not accept an “already verified” caller assertion without a corresponding trusted verification
-report tied to the full artifact ID.
+`verify_skill` returns success only after every embedded case and both mutation passes for every
+export succeed. It does not reconstruct a second report containing copies of the artifact identity,
+resource constants, or vectors of successful outcomes. The supervisor binds the worker response to
+the exact ordered request cases, loader version, and consistent verdict. The contained runtime
+owns resource enforcement; verification tests exercise actual heap, stack, and job exhaustion.
+Held-out evaluation consumes each case's fake transcript directly and rejects mismatched effect
+counts, paths, programs, or URLs. It never publishes hidden fixture contents or transcripts.
+
+Production admission validates the content-addressed artifact, runs embedded and held-out gates,
+and persists an evaluation report binding the full artifact ID, verifier/fake versions, predecessor,
+and suite hashes. Approval validates that report and reruns the current gates before publication.
+Direct `insert_verified` is a test fixture only; it checks identity and runs the verifier before
+insertion. Neither path accepts an “already verified” caller assertion.
 
 ---
 
