@@ -76,6 +76,14 @@ validation, or another turn. Successful response data is committed before that
 wait, and normal settlement preserves the cached agent. A timeout retains the
 channel and abort handle so error teardown can still cancel and settle the work.
 
+Paused runners share one start barrier. The interactive path enables compaction
+before releasing it; ACP can publish cancellation before release. Cancelling or
+dropping a runner before start prevents provider work. ACP-only accessors and
+feature-specific test adapters compile only with their consumers. The shared
+bounded validation executor remains available without `loop`; loop defaults,
+command display, and explicit validator cancellation are gated to loop callers
+and their native tests.
+
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher
 closes its temporary workspace-authority descriptor inside the namespace before the model's shell

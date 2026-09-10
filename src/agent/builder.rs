@@ -129,7 +129,7 @@ pub(crate) fn read_extra_file_bounded(path: &std::path::Path, cap: usize) -> Opt
 /// `SYSTEM_PROMPT`, context files (AGENTS.md, ARCHITECTURE.md, active mode
 /// prompt), working directory, `/add`ed files, memory, and the user `SUFFIX.md`.
 /// [`build_registered_preamble`] adds guidance for the final registered tools.
-#[cfg(test)]
+#[cfg(all(test, feature = "git-worktree"))]
 pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
     build_preamble_for_workspace(
         context,

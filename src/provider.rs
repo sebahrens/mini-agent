@@ -1141,6 +1141,7 @@ fn spawn_blocked_runner(
     runner::PausedAgentRunner::new(
         AgentRunner::without_compaction(event_rx, join.abort_handle()),
         start_tx,
+        #[cfg(any(test, feature = "acp"))]
         work_scope,
     )
 }

@@ -604,7 +604,7 @@ pub struct AgentRunner {
 }
 
 impl AgentRunner {
-    #[cfg(any(test, feature = "hooks"))]
+    #[cfg(any(feature = "hooks", all(test, feature = "acp")))]
     pub(crate) fn without_compaction(
         event_rx: mpsc::Receiver<AgentEvent>,
         abort_handle: tokio::task::AbortHandle,
@@ -753,7 +753,7 @@ impl AgentWorkCancellation {
         self.scope.cancel();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "acp"))]
     pub(crate) fn is_cancelled(&self) -> bool {
         self.scope.is_cancelled()
     }
@@ -946,7 +946,8 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 
 pub(crate) struct PausedAgentRunner {
     runner: AgentRunner,
-    start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    start_tx: tokio::sync::oneshot::Sender<()>,
+    #[cfg(any(test, feature = "acp"))]
     work_scope: Arc<AgentWorkScope>,
 }
 
@@ -954,35 +955,32 @@ impl PausedAgentRunner {
     pub(crate) fn new(
         runner: AgentRunner,
         start_tx: tokio::sync::oneshot::Sender<()>,
-        work_scope: Arc<AgentWorkScope>,
+        #[cfg(any(test, feature = "acp"))] work_scope: Arc<AgentWorkScope>,
     ) -> Self {
         Self {
             runner,
-            start_tx: Some(start_tx),
+            start_tx,
+            #[cfg(any(test, feature = "acp"))]
             work_scope,
         }
     }
 
     /// The caller publishes this handle before releasing the start barrier.
+    #[cfg(any(test, feature = "acp"))]
     pub(crate) fn cancellation_handle(&self) -> AgentWorkCancellation {
         self.work_scope.cancellation_handle()
     }
 
-    pub(crate) fn start(mut self) -> AgentRunner {
-        if let Some(start_tx) = self.start_tx.take() {
-            let _ = start_tx.send(());
-        }
+    pub(crate) fn start(self) -> AgentRunner {
+        let _ = self.start_tx.send(());
         self.runner
     }
 
-    pub(crate) fn start_interactive(mut self) -> AgentRunner {
+    pub(crate) fn start_interactive(self) -> AgentRunner {
         self.runner
             .compaction_enabled
             .store(true, Ordering::Release);
-        if let Some(start_tx) = self.start_tx.take() {
-            let _ = start_tx.send(());
-        }
-        self.runner
+        self.start()
     }
 }
 
@@ -2377,6 +2375,7 @@ where
     PausedAgentRunner::new(
         runner,
         start_tx.expect("paused agent runner must have a start sender"),
+        #[cfg(any(test, feature = "acp"))]
         work_scope,
     )
 }
@@ -3903,36 +3902,70 @@ mod tests {
     struct RetryInvalidTool;
 
     #[tokio::test]
-    async fn paused_runner_publishes_abort_before_model_work_can_start() {
-        let model = MockCompletionModel::from_stream_turns(vec![vec![
-            MockStreamEvent::text("done"),
-            MockStreamEvent::final_response_with_default_usage(),
-        ]]);
-        let paused = super::spawn_agent_paused(
-            AgentBuilder::new(model.clone()).build(),
-            "start only after publication".to_owned(),
-            Vec::new(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
-            #[cfg(feature = "hooks")]
-            None,
-        );
-        tokio::task::yield_now().await;
-        assert!(
-            model.requests().is_empty(),
-            "the model must remain unreachable behind the start barrier"
-        );
+    async fn paused_runner_start_cancel_and_drop_preserve_start_barrier() {
+        for mode in ["start", "cancel", "drop"] {
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            let paused = super::spawn_agent_paused(
+                AgentBuilder::new(model.clone()).build(),
+                "start only after publication".to_owned(),
+                Vec::new(),
+                crate::retry::RetryConfig::default(),
+                None,
+                #[cfg(feature = "skills")]
+                None,
+                #[cfg(feature = "hooks")]
+                None,
+            );
+            tokio::task::yield_now().await;
+            assert!(model.requests().is_empty(), "model reached before {mode}");
 
-        let cancellation = paused.cancellation_handle();
-        cancellation.cancel();
-        let mut runner = paused.start();
-        assert!(runner.event_rx.recv().await.is_none());
-        assert!(
-            model.requests().is_empty(),
-            "aborting before start must never enter provider work"
-        );
+            if mode == "drop" {
+                let task = paused.runner.abort_handle.clone();
+                drop(paused);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !task.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dropping the start owner must retire the parked task");
+                assert!(
+                    model.requests().is_empty(),
+                    "dropping a paused runner started model work"
+                );
+                continue;
+            }
+            if mode == "cancel" {
+                paused.cancellation_handle().cancel();
+            }
+            let mut runner = paused.start();
+            let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut events = Vec::new();
+                while let Some(event) = runner.event_rx.recv().await {
+                    events.push(event);
+                }
+                events
+            })
+            .await
+            .expect("started or cancelled runner must settle");
+            if mode == "cancel" {
+                assert!(events.is_empty());
+                assert!(
+                    model.requests().is_empty(),
+                    "cancellation before start entered model work"
+                );
+            } else {
+                assert_eq!(model.requests().len(), 1);
+                assert!(
+                    events.iter().any(|event| matches!(event,
+                    crate::event::AgentEvent::Done { response, .. } if response == "done")),
+                    "ordinary start lost the completion: {events:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -8438,6 +8471,7 @@ mod replay_and_gate_attribution_tests {
 
     /// `(call_id, name, arguments)` of the first tool call in an assistant
     /// message, or `None` when the message is not a structured call.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
     fn tool_call_parts(message: &Message) -> Option<(String, String, serde_json::Value)> {
         let Message::Assistant { content, .. } = message else {
             return None;
@@ -8453,6 +8487,7 @@ mod replay_and_gate_attribution_tests {
     }
 
     /// The `call_id` a user message's first tool result answers.
+    #[cfg(any(feature = "subagents", feature = "acp"))]
     fn tool_result_call_id(message: &Message) -> Option<String> {
         let Message::User { content } = message else {
             return None;
