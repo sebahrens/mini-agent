@@ -3273,123 +3273,265 @@ wait
         );
     }
 
-    #[tokio::test]
-    async fn concurrent_stash_push_after_exact_apply_retains_both_stashes() {
-        let repo = TempRepo::new("concurrent exact stash");
+    #[derive(Clone, Copy)]
+    enum StashInterference {
+        ConcurrentPush,
+        EditorOverwrite,
+        UntrackedFile,
+    }
+
+    #[derive(Clone, Copy)]
+    enum StashFixtureFailure {
+        None,
+        BeforeReadiness,
+        AfterReadiness,
+        AfterInterference,
+        AfterCompletion,
+        BeforeRestorePanic,
+        RestorePanic,
+    }
+
+    async fn exercise_stash_interference(
+        interference: StashInterference,
+        failure: StashFixtureFailure,
+        root: &Path,
+        cleanup_ok: &mut bool,
+    ) {
+        use futures::FutureExt;
+
+        let repo = TempRepo::uninitialized(OwnedDirectory::create(root.to_path_buf())).initialize();
         std::fs::write(repo.path().join("tracked.txt"), "captured\n").unwrap();
         git(repo.path(), ["stash", "push", "-m", "captured"]);
         let captured = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
         let gate = TestMutationGate::new();
-        let repo_path = repo.path().to_path_buf();
-        let task = tokio::spawn({
-            let gate = gate.clone();
-            let captured = captured.clone();
-            async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
-        });
-        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
+        let scope = crate::agent::runner::AgentWorkScope::new();
+        // Own the future directly; the scope retains any native output worker
+        // if a bounded fixture wait drops its response receiver during cleanup.
+        let mut command = Some(Box::pin(
+            scope.run(
+                std::panic::AssertUnwindSafe(async {
+                    if matches!(failure, StashFixtureFailure::BeforeRestorePanic) {
+                        panic!("injected before stash restore started");
+                    }
+                    let result = restore_stash_with_gate_for_test(
+                        repo.path(),
+                        None,
+                        captured.clone(),
+                        gate.clone(),
+                    )
+                    .await;
+                    if matches!(failure, StashFixtureFailure::RestorePanic) {
+                        panic!("injected inside stash restore future");
+                    }
+                    result
+                })
+                .catch_unwind(),
+            ),
+        ));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            if matches!(failure, StashFixtureFailure::BeforeReadiness) {
+                panic!("injected before stash readiness");
+            }
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
+                tokio::select! {
+                    result = command.as_mut().unwrap() => {
+                        drop(command.take());
+                        let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                        panic!("stash restore stopped before its mutation gate: {result:?}");
+                    }
+                    _ = gate.wait_until_reached() => {}
+                }
+            })
             .await
-            .expect("exact stash restore must reach the post-apply mutation gate");
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "captured\n"
-        );
-        git(repo.path(), ["stash", "push", "-m", "concurrent"]);
-        let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
-        gate.resume();
+            .expect("exact stash restore did not reach its post-apply gate");
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+                "captured\n"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["rev-parse", "refs/stash"]),
+                captured
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["write-tree"]),
+                git_stdout(
+                    repo.path(),
+                    ["rev-parse", &format!("{captured}^2^{{tree}}")]
+                )
+            );
+            if matches!(failure, StashFixtureFailure::AfterReadiness) {
+                panic!("injected after stash readiness");
+            }
+            let (expected_stashes, expected_error) = match interference {
+                StashInterference::ConcurrentPush => {
+                    git(repo.path(), ["stash", "push", "-m", "concurrent"]);
+                    let concurrent = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
+                    assert_ne!(concurrent, captured);
+                    (format!("{concurrent}\n{captured}"), "changed concurrently")
+                }
+                StashInterference::EditorOverwrite => {
+                    std::fs::write(repo.path().join("tracked.txt"), "editor wins\n").unwrap();
+                    (captured.clone(), "workspace content changed")
+                }
+                StashInterference::UntrackedFile => {
+                    std::fs::write(repo.path().join("editor-note.txt"), b"editor bytes\0\xff")
+                        .unwrap();
+                    (captured.clone(), "untracked or ignored workspace content")
+                }
+            };
+            if matches!(failure, StashFixtureFailure::AfterInterference) {
+                panic!("injected after stash interference");
+            }
+            gate.resume();
+            let result =
+                tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, command.as_mut().unwrap())
+                    .await
+                    .expect("exact stash restore did not finish after release");
+            drop(command.take());
+            let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if matches!(failure, StashFixtureFailure::AfterCompletion) {
+                panic!("injected after stash restore completion");
+            }
+            let error = result.expect_err("interference must retain the durable stash");
+            assert!(
+                error.contains(expected_error),
+                "unexpected stash result: {error}"
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["stash", "list", "--format=%H"]),
+                expected_stashes
+            );
+            assert_eq!(
+                git_stdout(repo.path(), ["show", &format!("{captured}:tracked.txt")]),
+                "captured"
+            );
+            let expected_worktree = match interference {
+                StashInterference::ConcurrentPush => "initial\n",
+                StashInterference::EditorOverwrite => "editor wins\n",
+                StashInterference::UntrackedFile => "captured\n",
+            };
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+                expected_worktree
+            );
+            if matches!(interference, StashInterference::UntrackedFile) {
+                assert_eq!(
+                    std::fs::read(repo.path().join("editor-note.txt")).unwrap(),
+                    b"editor bytes\0\xff"
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
 
-        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
-            .await
-            .expect("exact stash restore must finish after the mutation gate resumes")
-            .unwrap()
-            .expect_err("changed stash stack must be retained");
+        // Release even if readiness or interference assertions failed. Never
+        // poll a completed/panicked future again; its slot was cleared above.
+        gate.resume();
+        let settled = if let Some(command) = command.as_mut() {
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, command)
+                .await
+                .is_ok_and(|result| result.is_ok())
+        } else {
+            true
+        };
+        drop(command.take());
+        scope.cancellation_handle().cancel();
+        let drained =
+            tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, scope.wait_idle()).await;
+        let admission = std::panic::AssertUnwindSafe(acquire_released_mutation_lock(
+            repo.path(),
+            "stash fixture cleanup",
+        ))
+        .catch_unwind()
+        .await;
+        *cleanup_ok =
+            settled && drained.is_ok() && admission.is_ok() && scope.active_children() == 0;
+        drop(admission);
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
         assert!(
-            error.contains("changed concurrently"),
-            "unexpected: {error}"
+            *cleanup_ok,
+            "stash fixture did not settle before directory removal"
         );
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/stash"]),
-            concurrent
-        );
-        git(repo.path(), ["cat-file", "-e", captured.as_str()]);
-        let stash_list = git_stdout(repo.path(), ["stash", "list"]);
-        assert!(stash_list.contains("concurrent"));
-        assert!(stash_list.contains("captured"));
+    }
+
+    async fn run_stash_interference(interference: StashInterference) {
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-stash-fixture-{}", uuid::Uuid::new_v4()));
+        let mut cleanup_ok = false;
+        exercise_stash_interference(
+            interference,
+            StashFixtureFailure::None,
+            &root,
+            &mut cleanup_ok,
+        )
+        .await;
+        assert!(cleanup_ok);
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_stash_push_after_exact_apply_retains_both_stashes() {
+        run_stash_interference(StashInterference::ConcurrentPush).await;
     }
 
     #[tokio::test]
     async fn editor_overwrite_after_exact_apply_retains_the_durable_stash() {
-        let repo = TempRepo::new("post apply editor overwrite");
-        std::fs::write(repo.path().join("tracked.txt"), "captured\n").unwrap();
-        git(repo.path(), ["stash", "push", "-m", "captured"]);
-        let captured = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
-        let gate = TestMutationGate::new();
-        let repo_path = repo.path().to_path_buf();
-        let task = tokio::spawn({
-            let gate = gate.clone();
-            let captured = captured.clone();
-            async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
-        });
-        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
-            .await
-            .expect("exact stash restore must reach the post-apply mutation gate");
-        std::fs::write(repo.path().join("tracked.txt"), "editor wins\n").unwrap();
-        gate.resume();
-
-        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
-            .await
-            .expect("exact stash restore must finish after the mutation gate resumes")
-            .unwrap()
-            .expect_err("changed content must retain stash");
-        assert!(
-            error.contains("workspace content changed"),
-            "unexpected: {error}"
-        );
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/stash"]),
-            captured
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "editor wins\n"
-        );
+        run_stash_interference(StashInterference::EditorOverwrite).await;
     }
 
     #[tokio::test]
     async fn untracked_file_after_exact_apply_retains_the_durable_stash() {
-        let repo = TempRepo::new("post apply untracked file");
-        std::fs::write(repo.path().join("tracked.txt"), "captured\n").unwrap();
-        git(repo.path(), ["stash", "push", "-m", "captured"]);
-        let captured = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
-        let gate = TestMutationGate::new();
-        let repo_path = repo.path().to_path_buf();
-        let task = tokio::spawn({
-            let gate = gate.clone();
-            let captured = captured.clone();
-            async move { restore_stash_with_gate_for_test(&repo_path, None, captured, gate).await }
-        });
-        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, gate.wait_until_reached())
-            .await
-            .expect("exact stash restore must reach the post-apply mutation gate");
-        std::fs::write(repo.path().join("editor-note.txt"), b"editor bytes\0\xff").unwrap();
-        gate.resume();
+        run_stash_interference(StashInterference::UntrackedFile).await;
+    }
 
-        let error = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, task)
+    #[tokio::test]
+    async fn stash_interference_fixture_settles_failures_before_removing_repository() {
+        use futures::FutureExt;
+
+        for (failure, expected) in [
+            (
+                StashFixtureFailure::BeforeReadiness,
+                "injected before stash readiness",
+            ),
+            (
+                StashFixtureFailure::AfterReadiness,
+                "injected after stash readiness",
+            ),
+            (
+                StashFixtureFailure::AfterInterference,
+                "injected after stash interference",
+            ),
+            (
+                StashFixtureFailure::AfterCompletion,
+                "injected after stash restore completion",
+            ),
+            (
+                StashFixtureFailure::BeforeRestorePanic,
+                "injected before stash restore started",
+            ),
+            (
+                StashFixtureFailure::RestorePanic,
+                "injected inside stash restore future",
+            ),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("mini-agent-stash-fixture-{}", uuid::Uuid::new_v4()));
+            let mut cleanup_ok = false;
+            let panic = std::panic::AssertUnwindSafe(exercise_stash_interference(
+                StashInterference::ConcurrentPush,
+                failure,
+                &root,
+                &mut cleanup_ok,
+            ))
+            .catch_unwind()
             .await
-            .expect("exact stash restore must finish after the mutation gate resumes")
-            .unwrap()
-            .expect_err("untracked content must retain stash");
-        assert!(
-            error.contains("untracked or ignored workspace content"),
-            "unexpected: {error}"
-        );
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "refs/stash"]),
-            captured
-        );
-        assert_eq!(
-            std::fs::read(repo.path().join("editor-note.txt")).unwrap(),
-            b"editor bytes\0\xff"
-        );
+            .expect_err("fixture failure must propagate");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+            assert!(cleanup_ok, "stash failure skipped fixture settlement");
+            assert!(!root.exists());
+        }
     }
 
     #[tokio::test]
