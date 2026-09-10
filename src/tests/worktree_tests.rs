@@ -62,29 +62,42 @@ mod tests {
         }
     }
 
-    struct TempRepo(OwnedDirectory);
+    struct TempRepo {
+        _directory: OwnedDirectory,
+        path: PathBuf,
+    }
 
     impl TempRepo {
         fn new(label: &str) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("mini-agent-8tbo-{label}-{}", uuid::Uuid::new_v4()));
-            Self::initialize(OwnedDirectory::create(path))
+            Self::uninitialized(OwnedDirectory::create(path)).initialize()
         }
 
-        fn initialize(directory: OwnedDirectory) -> Self {
-            let repo = Self(directory);
-            let path = repo.path();
+        fn uninitialized(directory: OwnedDirectory) -> Self {
+            // Keep sibling paths derived with with_extension inside the same
+            // owned root, including paths created by Git itself.
+            let path = directory.path().join("repository");
+            std::fs::create_dir(&path).expect("create repository directory");
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn initialize(self) -> Self {
+            let path = self.path();
             git(path, ["init", "-b", "main"]);
             git(path, ["config", "user.email", "mini-agent@example.invalid"]);
             git(path, ["config", "user.name", "Mini Agent Test"]);
             std::fs::write(path.join("tracked.txt"), "initial\n").expect("write tracked fixture");
             git(path, ["add", "tracked.txt"]);
             git(path, ["commit", "-m", "initial"]);
-            repo
+            self
         }
 
         fn path(&self) -> &Path {
-            self.0.path()
+            &self.path
         }
     }
 
@@ -92,11 +105,11 @@ mod tests {
     fn temporary_repository_owns_failed_git_initialization() {
         let path =
             std::env::temp_dir().join(format!("mini-agent-failed-init-{}", uuid::Uuid::new_v4()));
-        let directory = OwnedDirectory::create(path.clone());
+        let repo = TempRepo::uninitialized(OwnedDirectory::create(path.clone()));
         // A malformed Git file makes the real git init fail after directory
         // creation, without changing process environment or global Git config.
-        std::fs::write(path.join(".git"), "invalid gitfile\n").unwrap();
-        let result = std::panic::catch_unwind(|| TempRepo::initialize(directory));
+        std::fs::write(repo.path().join(".git"), "invalid gitfile\n").unwrap();
+        let result = std::panic::catch_unwind(|| repo.initialize());
         let remained = path.exists();
         // Rescue only after taking the acceptance snapshot, including mutants
         // that deliberately discard the directory owner.
@@ -112,6 +125,51 @@ mod tests {
         assert!(
             !remained,
             "failed Git initialization leaked its fixture directory"
+        );
+    }
+
+    #[test]
+    fn temporary_repository_owns_siblings_on_failed_setup() {
+        let repo = TempRepo::new("failed sibling setup");
+        let worktree = repo.path().with_extension("linked worktree");
+        let remote = repo.path().with_extension("bare remote");
+        let paths = [
+            repo._directory.path().to_path_buf(),
+            repo.path().to_path_buf(),
+            worktree.clone(),
+            remote.clone(),
+        ];
+        let result = std::panic::catch_unwind(move || {
+            std::fs::create_dir(&remote).unwrap();
+            git(&remote, ["init", "--bare"]);
+            git(
+                repo.path(),
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("-b"),
+                    OsStr::new("feature"),
+                    worktree.as_os_str(),
+                ],
+            );
+            assert!(worktree.join(".git").is_file());
+            assert!(remote.join("HEAD").is_file());
+            panic!("injected after sibling Git setup");
+        });
+        // Snapshot every path before rescue, including the old layout where
+        // worktree and remote escaped the owner's root entirely.
+        let remaining: Vec<_> = paths.iter().filter(|path| path.exists()).collect();
+        for path in &paths {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        let panic = result.expect_err("setup failure must propagate");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"injected after sibling Git setup")
+        );
+        assert!(
+            remaining.is_empty(),
+            "failed setup leaked paths: {remaining:?}"
         );
     }
 
@@ -1136,7 +1194,6 @@ mod tests {
         cleanup_worktree(&worktree, "topic;echo-not-a-shell", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -1615,7 +1672,6 @@ mod tests {
             !git_stdout(repo.path(), ["worktree", "list", "--porcelain"])
                 .contains(&target.to_string_lossy().into_owned())
         );
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -1656,7 +1712,6 @@ mod tests {
         cleanup_worktree(&target, "dirty-create", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -1707,7 +1762,6 @@ mod tests {
             repo.path(),
             ["update-ref", "-d", "refs/heads/definite-race"],
         );
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -1746,18 +1800,10 @@ mod tests {
     ) {
         use futures::FutureExt;
 
-        struct WorktreeBase<'a>(&'a Path);
-        impl Drop for WorktreeBase<'_> {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(self.0);
-            }
-        }
-
         let repo = TempRepo::new("held create 'rollback'");
         // Own the sibling directory before setup can fail, through the final
         // rollback rendezvous. TempRepo owns the hook and FIFO separately.
-        let _base = WorktreeBase(base);
-        std::fs::create_dir_all(base).unwrap();
+        let _base = OwnedDirectory::create(base.to_path_buf());
         let target = base.canonicalize().unwrap().join("create-held");
         let mut rollback_gate = concurrency::CommandGate::new(repo.path(), "rollback-gate");
         let mut gate = concurrency::CommandGate::new(repo.path(), "create-gate");
@@ -2239,8 +2285,8 @@ wait
         // The fixture owns every repository, remote, hook and marker before
         // starting the caller, and keeps them until rollback has settled.
         let directory = OwnedDirectory::create(path.to_path_buf());
-        let repo =
-            TempRepo::initialize(OwnedDirectory::create(directory.path().join("repository")));
+        let repo = TempRepo::uninitialized(OwnedDirectory::create(directory.path().join("repo")))
+            .initialize();
         let remote = directory.path().join("bare remote");
         std::fs::create_dir(&remote).unwrap();
         git(&remote, ["init", "--bare"]);
@@ -2596,7 +2642,6 @@ wait
             .output()
             .unwrap();
         assert!(!branch.status.success(), "feature branch was not deleted");
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -2652,7 +2697,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -2727,7 +2771,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -2817,7 +2860,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[cfg(unix)]
@@ -2892,7 +2934,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -2960,7 +3001,6 @@ wait
         cleanup_worktree(&worktree, "actual-feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3031,7 +3071,6 @@ wait
         assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), original);
         complete_merge(&mut state).await.unwrap();
         assert!(!worktree.exists());
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3093,7 +3132,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3162,7 +3200,6 @@ wait
             .expect("cleanup test worktree");
         assert_eq!(std::env::current_dir().unwrap(), original_cwd);
         assert!(!worktree.exists(), "cancelled worktree was not cleaned up");
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3234,8 +3271,6 @@ wait
             git_stdout(repo.path(), ["rev-parse", "refs/heads/main"]),
             main
         );
-        let _ = std::fs::remove_dir_all(worktree);
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3466,7 +3501,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3536,7 +3570,6 @@ wait
         cleanup_worktree(&worktree, "feature", repo.path(), true)
             .await
             .unwrap();
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3573,7 +3606,6 @@ wait
         );
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
         assert_eq!(std::env::current_dir().unwrap(), original_cwd);
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[tokio::test]
@@ -3632,8 +3664,6 @@ wait
         assert!(retained_conflict.contains("remote\n"));
         assert!(has_merge_conflict(repo.path()).await);
         assert_eq!(std::env::current_dir().unwrap(), original_cwd);
-        let _ = std::fs::remove_dir_all(peer);
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[cfg(unix)]
@@ -3698,8 +3728,6 @@ wait
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
         assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), pre_pull);
         assert!(repo.path().join("remote.txt").exists());
-        let _ = std::fs::remove_dir_all(peer);
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[cfg(unix)]
@@ -3770,8 +3798,6 @@ wait
         );
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
         assert!(!repo.path().join("remote.txt").exists());
-        let _ = std::fs::remove_dir_all(peer);
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[cfg(unix)]
@@ -3820,7 +3846,6 @@ wait
             "initial\n"
         );
         assert!(!git_stdout(repo.path(), ["stash", "list"]).is_empty());
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[cfg(unix)]
@@ -3872,7 +3897,6 @@ wait
             "dirty\n"
         );
         assert!(git_stdout(repo.path(), ["stash", "list"]).is_empty());
-        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[test]

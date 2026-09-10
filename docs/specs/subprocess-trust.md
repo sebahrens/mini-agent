@@ -173,10 +173,13 @@ unowned target-ref change. Caller joins, hook release, lock settlement, and all
 fixture-path cleanup complete before an original failure is propagated.
 
 The test directory owner is established before fallible Git initialization.
-A malformed Git-file control verifies that initialization failure removes its
-repository and preserves the Git error. Merge fixture repositories, bare remotes,
-hooks, and markers all live under owned directories; the remaining sibling-directory
-migration is tracked separately.
+Each temporary repository lives in a child of its owned root, so sibling paths
+for linked worktrees, bare remotes, peers, and create bases share that owner even
+when Git creates the directory. A malformed Git-file control verifies cleanup
+after initialization failure; a failure after native bare-remote and linked-worktree
+setup verifies that every sibling disappears before rescue. Both preserve the
+original error. The create rollback fixture uses the same exclusive directory
+owner and keeps its existing supervisor rendezvous before directory removal.
 
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
