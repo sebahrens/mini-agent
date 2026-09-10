@@ -55,6 +55,12 @@ fn snapshot(pid: u32) -> io::Result<Option<Snapshot>> {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => parse_stat(pid, &stat).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        // read_to_string opens and then reads. A task that exits in between
+        // fails the read with ESRCH rather than ENOENT, so the entry vanishing
+        // mid-read is the same observation as it never being there. Only this
+        // race is folded in; every other read failure still propagates, so an
+        // unreadable /proc never becomes termination evidence.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
         Err(error) => Err(error),
     }
 }
