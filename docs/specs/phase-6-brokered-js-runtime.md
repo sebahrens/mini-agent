@@ -1247,6 +1247,12 @@ change the worker's canonical containment checklist.
 
 ## Acceptance matrix
 
+The executable-preparation regression holds a real blocking `Read` behind an
+owned release gate. Cancellation and a controlled async deadline must return
+while that read remains held; fixture drop releases the read and waits for
+snapshot cleanup, including during assertion unwinding. Readiness and cleanup
+have emergency hang guards, with no elapsed-latency acceptance threshold.
+
 The matrix defines required evidence. Phase 6 is delivered under the index exit rule using the
 dedicated containment gates. CI run 31319107422 and commit `9c6f164` retain historical v1.7
 resource records; the checked-in v1.8 manifest currently records `pending_external_runs` and no

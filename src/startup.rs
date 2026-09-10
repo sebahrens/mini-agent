@@ -2185,6 +2185,11 @@ mod tests {
                         stream
                             .set_write_timeout(Some(std::time::Duration::from_secs(2)))
                             .unwrap();
+                        // Configure the read bound before teardown: macOS may
+                        // reject socket options once the peer has closed.
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
                         stream.write_all(request.as_bytes()).unwrap();
                         client = Some(stream);
                         server
@@ -2221,18 +2226,6 @@ mod tests {
                     "pricing listener survived fixture drop"
                 );
                 if let Some(mut stream) = client {
-                    // The listener is already gone by this point, and macOS can
-                    // reject SO_RCVTIMEO with EINVAL on a socket whose peer has
-                    // died where Linux still accepts it. A socket too dead to
-                    // take a read timeout has already proven what this block
-                    // asserts, so treat that as the closed outcome rather than
-                    // unwrapping it into a panic.
-                    if stream
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                        .is_err()
-                    {
-                        continue;
-                    }
                     match stream.read(&mut [0; 1]) {
                         Ok(0) => {}
                         Err(error)

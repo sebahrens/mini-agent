@@ -1254,22 +1254,35 @@ fn executable_snapshot_copy_is_bounded_and_reports_destination_failure() {
     );
 }
 
+// Rescue bounds for a broken test, not acceptance criteria for copy latency.
+const COPY_FIXTURE_HANG_GUARD: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct CopyGateState {
+    released: bool,
+    rescued: bool,
+}
+
+type CopyGate = Arc<(Mutex<CopyGateState>, Condvar)>;
+
 struct ControllablyBlockingExecutableSource {
-    gate: Arc<(Mutex<bool>, Condvar)>,
-    started: Arc<tokio::sync::Semaphore>,
-    announced: bool,
+    gate: CopyGate,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Read for ControllablyBlockingExecutableSource {
     fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-        if !self.announced {
-            self.announced = true;
-            self.started.add_permits(1);
+        let (state, wake) = &*self.gate;
+        let state = state.lock().unwrap();
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
         }
-        let (released, wake) = &*self.gate;
-        let mut released = released.lock().unwrap();
-        while !*released {
-            released = wake.wait(released).unwrap();
+        let (mut state, _) = wake
+            .wait_timeout_while(state, COPY_FIXTURE_HANG_GUARD, |state| !state.released)
+            .unwrap();
+        if !state.released {
+            state.rescued = true;
+            return Err(std::io::ErrorKind::TimedOut.into());
         }
         Ok(0)
     }
@@ -1295,82 +1308,182 @@ impl Drop for TrackedSnapshotResource {
     }
 }
 
-async fn assert_blocked_executable_preparation_returns_promptly(cancel: bool) {
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let started = Arc::new(tokio::sync::Semaphore::new(0));
-    let dropped = Arc::new(AtomicBool::new(false));
-    let cancellation = PermCancellation::new();
-    let deadline = Instant::now()
-        + if cancel {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(75)
-        };
-    let task_gate = gate.clone();
-    let task_started = started.clone();
-    let task_dropped = dropped.clone();
-    let task_cancellation = cancellation.clone();
-    let task = tokio::spawn(async move {
-        run_executable_preparation(deadline, task_cancellation, move |control| {
-            let mut source = ControllablyBlockingExecutableSource {
-                gate: task_gate,
-                started: task_started,
-                announced: false,
-            };
-            let mut snapshot = TrackedSnapshotResource {
-                dropped: task_dropped,
-            };
-            copy_and_hash_executable_controlled(&mut source, &mut snapshot, &control)
-        })
-        .await
-    });
+struct CopyCompletion(std::sync::mpsc::Sender<()>);
 
-    started.acquire().await.unwrap().forget();
-    let return_started = Instant::now();
-    if cancel {
-        cancellation.cancel();
+impl Drop for CopyCompletion {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
-    let result = tokio::time::timeout(Duration::from_millis(300), task)
-        .await
-        .expect("blocked executable preparation did not return promptly")
-        .unwrap();
+}
+
+struct BlockedCopyWork {
+    source: ControllablyBlockingExecutableSource,
+    snapshot: TrackedSnapshotResource,
+    // Struct fields drop in declaration order: signal only after both resources.
+    _completion: CopyCompletion,
+}
+
+impl BlockedCopyWork {
+    fn run(
+        mut self,
+        control: &crate::extras::js::broker::ExecutablePreparationControl,
+    ) -> Result<crate::extras::js::broker::ExecutableContent, ExecutableCopyError> {
+        copy_and_hash_executable_controlled(&mut self.source, &mut self.snapshot, control)
+    }
+}
+
+struct BlockedCopyFixture {
+    gate: CopyGate,
+    started: tokio::sync::oneshot::Receiver<()>,
+    completed: std::sync::mpsc::Receiver<()>,
+}
+
+impl BlockedCopyFixture {
+    fn new(gate: CopyGate, dropped: Arc<AtomicBool>) -> (Self, BlockedCopyWork) {
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed) = std::sync::mpsc::channel();
+        let work = BlockedCopyWork {
+            source: ControllablyBlockingExecutableSource {
+                gate: gate.clone(),
+                started: Some(started_tx),
+            },
+            snapshot: TrackedSnapshotResource { dropped },
+            _completion: CopyCompletion(completed_tx),
+        };
+        (
+            Self {
+                gate,
+                started,
+                completed,
+            },
+            work,
+        )
+    }
+}
+
+impl Drop for BlockedCopyFixture {
+    fn drop(&mut self) {
+        let (state, wake) = &*self.gate;
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .released = true;
+        wake.notify_all();
+        let completed = self.completed.recv_timeout(COPY_FIXTURE_HANG_GUARD);
+        let rescued = state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .rescued;
+        if !std::thread::panicking() {
+            completed.expect("copy resources must settle after fixture release");
+            assert!(!rescued, "blocked copy needed the fixture rescue");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyStop {
+    Cancel,
+    Deadline,
+    Panic,
+}
+
+async fn exercise_blocked_executable_preparation(
+    stop: CopyStop,
+    gate: CopyGate,
+    dropped: Arc<AtomicBool>,
+) {
+    let (mut fixture, work) = BlockedCopyFixture::new(gate, dropped.clone());
+    let cancellation = PermCancellation::new();
+    // Real setup has a generous budget. Advance the async deadline only once
+    // the source is held, so scheduling before Read cannot choose the outcome.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let request = run_executable_preparation(deadline, cancellation.clone(), move |control| {
+        work.run(&control)
+    });
+    tokio::pin!(request);
+    tokio::time::timeout(COPY_FIXTURE_HANG_GUARD, async {
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("copy returned before source readiness: {result:?}"),
+            started = &mut fixture.started => started.expect("copy must enter the blocked read"),
+        }
+    })
+    .await
+    .expect("blocked source must announce readiness");
+    assert!(!dropped.load(AtomicOrdering::Acquire));
+
+    match stop {
+        CopyStop::Cancel => cancellation.cancel(),
+        CopyStop::Deadline => {
+            tokio::time::pause();
+            // Cross the timer-wheel tick as well as the absolute deadline.
+            tokio::time::advance(Duration::from_secs(61)).await;
+        }
+        CopyStop::Panic => panic!("injected before blocked-source release"),
+    }
+    let result = tokio::time::timeout(COPY_FIXTURE_HANG_GUARD, &mut request).await;
+    if stop == CopyStop::Deadline {
+        tokio::time::resume();
+    }
     assert_eq!(
-        result,
-        Err(if cancel {
+        result.expect("preparation must return while its source is held"),
+        Err(if stop == CopyStop::Cancel {
             ExecutablePreparationWaitError::Cancelled
         } else {
             ExecutablePreparationWaitError::TimedOut
         })
     );
     assert!(
-        return_started.elapsed() < Duration::from_millis(300),
-        "cancellation/deadline waited for a blocked source"
-    );
-    assert!(
         !dropped.load(AtomicOrdering::Acquire),
-        "the source should still control when its worker unwinds"
+        "return must not depend on the source unwinding"
     );
+    drop(fixture);
+    assert!(dropped.load(AtomicOrdering::Acquire));
+}
 
-    let (released, wake) = &*gate;
-    *released.lock().unwrap() = true;
-    wake.notify_all();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !dropped.load(AtomicOrdering::Acquire) {
-            tokio::task::yield_now().await;
+#[test]
+fn executable_preparation_returns_before_blocked_source_and_closes_snapshot() {
+    for stop in [CopyStop::Cancel, CopyStop::Deadline, CopyStop::Panic] {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let gate = Arc::new((Mutex::new(CopyGateState::default()), Condvar::new()));
+        let observed_gate = gate.clone();
+        let result = std::panic::catch_unwind(move || {
+            // Keep the advanced Tokio clock local to its case. Include runtime
+            // teardown in the unwind check so a stranded copy cannot hide.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(exercise_blocked_executable_preparation(
+                stop,
+                observed_gate,
+                observed,
+            ));
+        });
+        match result {
+            Ok(()) => assert_ne!(stop, CopyStop::Panic),
+            Err(error) => {
+                if stop != CopyStop::Panic {
+                    std::panic::resume_unwind(error);
+                }
+                assert_eq!(
+                    error.downcast_ref::<&str>(),
+                    Some(&"injected before blocked-source release"),
+                    "cleanup must exercise the intended panic after source readiness"
+                );
+            }
         }
-    })
-    .await
-    .expect("late snapshot resource was not closed after the source unwound");
-}
-
-#[tokio::test]
-async fn executable_preparation_cancellation_returns_before_blocked_source_and_closes_snapshot() {
-    assert_blocked_executable_preparation_returns_promptly(true).await;
-}
-
-#[tokio::test]
-async fn executable_preparation_deadline_returns_before_blocked_source_and_closes_snapshot() {
-    assert_blocked_executable_preparation_returns_promptly(false).await;
+        assert!(
+            dropped.load(AtomicOrdering::Acquire),
+            "{stop:?}: leaked snapshot"
+        );
+        assert!(
+            !gate.0.lock().unwrap().rescued,
+            "{stop:?}: cleanup needed rescue"
+        );
+    }
 }
 
 #[cfg(unix)]
