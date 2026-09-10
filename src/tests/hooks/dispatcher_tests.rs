@@ -186,24 +186,66 @@ async fn dispatch_returns_continue_without_running_anything_when_no_handler_matc
 }
 
 #[tokio::test]
-async fn brokered_js_spawn_is_visible_to_pre_tool_use_guards() {
-    let config = config_with(
-        "PreToolUse",
-        Some("js_spawn"),
-        vec![handler(
-            r#"echo '{"permissionDecision":"deny","reason":"blocked spawn"}'"#,
-        )],
-    );
-    let dispatcher = HookDispatcher::from_config(&config).unwrap();
-    let result = gate_brokered_pre_tool_use_with(
-        &dispatcher,
-        &ctx(),
-        "js_spawn",
-        serde_json::json!({"program": "rm", "arguments": ["-rf", "target"]}),
-    )
-    .await;
-
-    assert_eq!(result, Err("blocked spawn".to_string()));
+async fn brokered_pre_tool_use_enforces_denial_and_rewrite_contract() {
+    let original = serde_json::json!({"program":"printf", "arguments":["before"]});
+    let rewritten = serde_json::json!({"program":"printf", "arguments":["after"]});
+    for (name, reply, expected) in [
+        ("no hooks", None, Ok(original.clone())),
+        ("defer", Some(serde_json::json!({})), Ok(original.clone())),
+        (
+            "allow",
+            Some(serde_json::json!({"permissionDecision":"allow"})),
+            Ok(original.clone()),
+        ),
+        (
+            "allow rewrite",
+            Some(serde_json::json!({"permissionDecision":"allow", "updatedInput":rewritten})),
+            Ok(rewritten.clone()),
+        ),
+        (
+            "defer rewrite",
+            Some(serde_json::json!({"updatedInput":rewritten})),
+            Ok(rewritten.clone()),
+        ),
+        (
+            "deny",
+            Some(serde_json::json!({"permissionDecision":"deny", "reason":"blocked spawn"})),
+            Err("blocked spawn"),
+        ),
+        (
+            "deny fallback",
+            Some(serde_json::json!({"permissionDecision":"deny"})),
+            Err("denied by hook"),
+        ),
+        (
+            "ask",
+            Some(serde_json::json!({"permissionDecision":"ask", "reason":"approval required"})),
+            Err("approval required"),
+        ),
+        (
+            "ask fallback",
+            Some(serde_json::json!({"permissionDecision":"ask"})),
+            Err("hook requires explicit approval"),
+        ),
+        (
+            "deny rewrite",
+            Some(
+                serde_json::json!({"permissionDecision":"deny", "reason":"blocked rewrite", "updatedInput":rewritten}),
+            ),
+            Err("blocked rewrite"),
+        ),
+    ] {
+        let handlers = reply
+            .into_iter()
+            .map(|reply| handler(&format!("printf '%s' '{reply}'")))
+            .collect();
+        let config = config_with("PreToolUse", Some("js_spawn"), handlers);
+        let dispatcher = HookDispatcher::from_config(&config).unwrap();
+        let actual =
+            gate_brokered_pre_tool_use_with(&dispatcher, &ctx(), "js_spawn", original.clone())
+                .await;
+        assert_eq!(actual, expected.map_err(str::to_string), "{name}");
+    }
 }
 
 #[tokio::test]

@@ -102,6 +102,17 @@ checks; an already-allowed sibling cannot donate its ID to another prompt.
 Direct calls without runner context and independently brokered JS effects
 retain ACP's synthetic-call fallback. Correlation state compiles only with ACP;
 the approval reply channels remain available to every interactive frontend.
+
+Live nested tool-call events compile with `subagents`, their only production
+producer. ACP ignores those display-only events when subagents are enabled;
+the outer tool call and result remain canonical. Persisted nested records stay
+readable in all builds, including historical replay without subagents.
+Brokered PreToolUse entry points compile with `js`, and subagent lifecycle
+hook entry points compile with `subagents`. Their explicit-dispatcher cores
+also compile for hook tests. The broker adapter rejects both Deny and Ask,
+returns Allow/Defer input rewrites, and leaves grant-target validation to the
+parent effect broker.
+
 Loop caller regressions exercise real CLI output and transcript persistence,
 and TUI completion handling with output limits, unavailable sandboxing, scoped
 cancellation, and a stale result arriving during a replacement validation.

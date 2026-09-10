@@ -247,8 +247,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Run Clippy (${{ matrix.features }})
-        # Default, minimal, memory, and sandbox are strict, including dead code.
-        # Other feature rows still compile APIs used only by other consumers,
+        # Default, minimal, memory, sandbox, ACP, and optional adapters are strict.
+        # Skill feature rows still compile APIs used only by other consumers,
         # and some learned-skill contracts have no shipped operator yet. Gate
         # each actual consumer; retain documented contract APIs deliberately.
         # A clean rich row does not establish that the isolated rows are clean.
@@ -256,7 +256,7 @@ jobs:
         run: |
           lint_args=(-D warnings)
           case "${{ matrix.features }}" in
-            ""|"--no-default-features"|"--no-default-features --features memory"|"--no-default-features --features sandbox") ;;
+            ""|"--no-default-features"|"--no-default-features --features memory"|"--no-default-features --features sandbox"|"--no-default-features --features acp"|"--no-default-features --features hooks,advisor,lsp,multimodal,pdf") ;;
             *) lint_args+=(-A dead-code) ;;
           esac
           cargo clippy --locked --all-targets ${{ matrix.features }} -- "${lint_args[@]}"

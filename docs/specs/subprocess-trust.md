@@ -234,6 +234,8 @@ updates this normative table when needed, and adds the required site or single-c
 reference. Removing a site also fails until the stale inventory, ownership rule, and any unused
 macro-context exemption are removed. The creation-boundary audit checks exemption occurrences
 against the macro terminals it actually inspects, so obsolete digest entries cannot accumulate.
+The ACP protocol fixture’s tool-result `output` fields are data, with their
+exact macro context audited including the optional subagent event guard.
 
 The audit currently resolves as follows:
 

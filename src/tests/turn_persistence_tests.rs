@@ -151,6 +151,11 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     name: "read".into(),
                     output: "fn main() {}".into(),
                 },
+                #[cfg(feature = "subagents")]
+                AgentEvent::SubagentToolCall {
+                    name: "grep".into(),
+                    args: serde_json::json!({"pattern":"needle", "path":"src", "nested":{"keep":"raw"}}),
+                },
                 AgentEvent::Token("done".into()),
                 terminal,
             ] {
@@ -174,10 +179,12 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     MessageRole::User,
                     MessageRole::ToolCall,
                     MessageRole::ToolResult,
+                    #[cfg(feature = "subagents")]
+                    MessageRole::SubagentToolCall,
                     MessageRole::Assistant
                 ]
             );
-            assert_eq!(session.messages[3].content, "done");
+            assert_eq!(session.messages.last().unwrap().content, "done");
             let identifier = if native_identity {
                 "call_provider_1"
             } else {
@@ -211,6 +218,49 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
             let saved = serde_json::to_vec(session).unwrap();
             let loaded: Session = serde_json::from_slice(&saved).unwrap();
             let history = crate::agent::runner::convert_history(&loaded);
+            #[cfg(feature = "subagents")]
+            {
+                let record = &loaded.messages[3];
+                let expected =
+                    serde_json::json!({"pattern":"needle", "path":"src", "nested":{"keep":"raw"}});
+                assert_eq!(
+                    record.tool,
+                    Some(PersistedToolMessage::Call {
+                        name: "grep".into(),
+                        arguments: expected.clone()
+                    })
+                );
+                let id = record
+                    .tool_call_id
+                    .as_deref()
+                    .expect("nested call identity");
+                assert!(id.starts_with(crate::session::SUBAGENT_TOOL_CALL_ID_PREFIX));
+                let replayed: Vec<_> = history
+                    .iter()
+                    .flat_map(|message| match message {
+                        Message::Assistant { content, .. } => content
+                            .iter()
+                            .filter_map(|part| match part {
+                                AssistantContent::ToolCall(call)
+                                    if call.function.name == "grep" =>
+                                {
+                                    Some(call)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                assert_eq!(
+                    replayed.len(),
+                    1,
+                    "nested call is neither dropped nor duplicated"
+                );
+                assert_eq!(replayed[0].function.arguments, expected);
+                assert_eq!(replayed[0].call_id.as_deref(), Some(id));
+            }
+
             let Message::Assistant { content, .. } = &history[1] else {
                 panic!("missing replay call")
             };

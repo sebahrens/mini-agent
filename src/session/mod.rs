@@ -1172,7 +1172,7 @@ impl Session {
     /// tool-result event reaches this session — so no result record is written
     /// here. Replay closes the pair itself; see
     /// `runner::convert_history_uncached`.
-    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[cfg(any(feature = "subagents", all(test, feature = "acp")))]
     pub fn add_subagent_tool_call(&mut self, name: &str, args: &serde_json::Value) {
         let id = self.next_subagent_tool_call_id();
         self.add_message_with_tool_data(
@@ -1193,7 +1193,7 @@ impl Session {
     /// rig's `internal_<uuid>` lifecycle id, so the prefix alone separates
     /// them. The position suffix keeps live records distinct from one another,
     /// which is what replay needs to refuse a duplicated identity.
-    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[cfg(any(feature = "subagents", all(test, feature = "acp")))]
     fn next_subagent_tool_call_id(&self) -> String {
         format!("{SUBAGENT_TOOL_CALL_ID_PREFIX}{}", self.messages.len())
     }

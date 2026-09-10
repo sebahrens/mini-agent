@@ -48,7 +48,7 @@ pub enum AgentEvent {
         name: CompactString,
         message: CompactString,
     },
-    #[cfg(any(feature = "subagents", feature = "acp"))]
+    #[cfg(feature = "subagents")]
     SubagentToolCall {
         name: CompactString,
         args: serde_json::Value,

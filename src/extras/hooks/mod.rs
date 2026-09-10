@@ -127,6 +127,7 @@ pub(crate) fn session_context() -> (String, String) {
 /// Runs a brokered host effect through the same process-wide PreToolUse guard
 /// rail as ordinary rig tools. `Ask` fails closed because the broker's normal
 /// permission check remains the only owner of interactive approval state.
+#[cfg(feature = "js")]
 pub(crate) async fn gate_brokered_pre_tool_use(
     tool_name: &str,
     input: serde_json::Value,
@@ -137,6 +138,7 @@ pub(crate) async fn gate_brokered_pre_tool_use(
     gate_brokered_pre_tool_use_with(&dispatcher, &best_effort_ctx(), tool_name, input).await
 }
 
+#[cfg(any(feature = "js", test))]
 pub(crate) async fn gate_brokered_pre_tool_use_with(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
@@ -367,6 +369,7 @@ pub(crate) async fn dispatch_session_end(reason: &str) {
 /// Testable core: dispatches `SubagentStart`, matching on the normalized agent
 /// type. Returns hook-injected context to prepend to the child's prompt, if
 /// any.
+#[cfg(any(feature = "subagents", test))]
 pub(crate) async fn gate_subagent_start(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
@@ -394,6 +397,7 @@ pub(crate) async fn gate_subagent_start(
 /// Production entry point: reads the process-wide dispatcher and gates
 /// subagent start for `agent_type`. Returns `None` when no dispatcher is
 /// installed.
+#[cfg(feature = "subagents")]
 pub(crate) async fn dispatch_subagent_start(
     agent_type: &str,
     agent_source: &str,
@@ -404,6 +408,7 @@ pub(crate) async fn dispatch_subagent_start(
 
 /// Outcome of dispatching `SubagentStop`: release the child's result, or
 /// force it to continue with the hook's reason as the next instruction.
+#[cfg(any(feature = "subagents", test))]
 pub(crate) enum SubagentStopGate {
     Release,
     Continue { reason: String },
@@ -411,6 +416,7 @@ pub(crate) enum SubagentStopGate {
 
 /// Testable core: dispatches `SubagentStop`, matching on the normalized agent
 /// type.
+#[cfg(any(feature = "subagents", test))]
 pub(crate) async fn gate_subagent_stop(
     dispatcher: &dispatcher::HookDispatcher,
     ctx: &HookCtx,
@@ -440,6 +446,7 @@ pub(crate) async fn gate_subagent_stop(
 /// Production entry point: reads the process-wide dispatcher and gates
 /// subagent completion for `agent_type`. Releases immediately when no
 /// dispatcher is installed.
+#[cfg(feature = "subagents")]
 pub(crate) async fn dispatch_subagent_stop(
     agent_type: &str,
     agent_source: &str,

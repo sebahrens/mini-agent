@@ -1765,6 +1765,7 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send tool call notification: {}", e);
                 }
             }
+            #[cfg(feature = "subagents")]
             AgentEvent::SubagentToolCall { .. } => {
                 // This is a display-only event from inside a task tool. The outer
                 // provider tool call/result is canonical and will arrive with a
@@ -2879,6 +2880,7 @@ mod protocol_tests {
                                 name: "read".into(),
                                 args: serde_json::json!({"path": "b"}),
                             },
+                            #[cfg(feature = "subagents")]
                             AgentEvent::SubagentToolCall {
                                 name: "nested-display-only".into(),
                                 args: serde_json::json!({"not": "canonical"}),

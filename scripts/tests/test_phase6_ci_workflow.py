@@ -299,6 +299,8 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                             "--no-default-features",
                             "--no-default-features --features memory",
                             "--no-default-features --features sandbox",
+                            "--no-default-features --features acp",
+                            "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
                         }
                         if features not in strict_features:
                             expected += ["-A", "dead-code"]

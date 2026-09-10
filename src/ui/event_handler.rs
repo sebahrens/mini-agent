@@ -132,7 +132,7 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
-        #[cfg(any(feature = "subagents", feature = "acp"))]
+        #[cfg(feature = "subagents")]
         AgentEvent::SubagentToolCall { name, args } => {
             // The raw `args` go to the session, never the rendered summary
             // below: they are persisted as the structured payload
@@ -658,44 +658,6 @@ mod tests {
     use super::{apply_usage_delta, should_auto_compact_between_turns};
     use crate::event::UsageDelta;
     use crate::session::Session;
-
-    /// mcja: the `SubagentToolCall` arm forwards the event's raw `args` to the
-    /// session, not just the rendered summary line, because that payload is
-    /// what `convert_history` replays as a structured tool call. Flattening it
-    /// here would put the nested call back in assistant prose.
-    #[cfg(any(feature = "subagents", feature = "acp"))]
-    #[test]
-    fn the_subagent_tool_call_arm_forwards_raw_arguments_to_the_session() {
-        use crate::session::PersistedToolMessage;
-
-        let event = crate::event::AgentEvent::SubagentToolCall {
-            name: "grep".into(),
-            args: serde_json::json!({"pattern": "needle", "path": "src"}),
-        };
-        let crate::event::AgentEvent::SubagentToolCall { name, args } = event else {
-            panic!("constructed a SubagentToolCall event")
-        };
-
-        let mut session = Session::new("anthropic", "claude", 200_000, "");
-        session.add_subagent_tool_call(&name, &args);
-
-        let Some(PersistedToolMessage::Call {
-            name: recorded_name,
-            arguments,
-        }) = &session.messages[0].tool
-        else {
-            panic!(
-                "the handler's record must carry a structured call: {:?}",
-                session.messages[0].tool
-            )
-        };
-        assert_eq!(recorded_name.as_str(), "grep");
-        assert_eq!(
-            arguments,
-            &serde_json::json!({"pattern": "needle", "path": "src"})
-        );
-        assert!(session.messages[0].tool_call_id.is_some());
-    }
 
     #[test]
     fn loop_iterations_allow_between_turn_compaction() {
