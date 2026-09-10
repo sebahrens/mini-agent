@@ -48,6 +48,12 @@ const VERIFICATION_QUEUE_CAPACITY: usize = 16;
 const MAX_PROCESS_AGE: Duration = Duration::from_secs(15 * 60);
 const MAX_PROCESS_INVOCATIONS: u64 = 256;
 
+#[cfg(test)]
+tokio::task_local! {
+    /// First poll of the actual interactive transport lease (true means acquired).
+    pub(crate) static TRANSPORT_LOCK_OBSERVER: tokio::sync::mpsc::UnboundedSender<bool>;
+}
+
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
 
 /// Per-invocation callback for one already protocol-validated effect request.
@@ -673,7 +679,24 @@ impl JsWorkerSupervisor {
         let deadline = deadline_override.unwrap_or_else(|| Instant::now() + self.0.watchdog);
         #[cfg(any(test, feature = "skills"))]
         let waiter = self.0.priority.register_interactive();
-        let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
+        let lock = self.0.transport.lock();
+        #[cfg(test)]
+        let lock = async {
+            tokio::pin!(lock);
+            let mut observed = false;
+            std::future::poll_fn(|cx| {
+                let result = lock.as_mut().poll(cx);
+                if !observed {
+                    observed = true;
+                    let _ = TRANSPORT_LOCK_OBSERVER.try_with(|observer| {
+                        let _ = observer.send(result.is_ready());
+                    });
+                }
+                result
+            })
+            .await
+        };
+        let mut state = await_controlled(lock, &cancellation, deadline).await?;
         #[cfg(any(test, feature = "skills"))]
         let _active_interactive = waiter.activate();
         self.invoke_with_state(

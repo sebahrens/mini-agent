@@ -1283,3 +1283,13 @@ never generalized into unmeasured host guarantees.
 | Resource baseline | The three historical v1.7 platform records from CI run 31319107422 were independently aggregated and schema-validated at commit `9c6f164`. The current v1.8 [`js-worker-baseline.json`](../benchmarks/results/js-worker-baseline.json) is a pending target/schema manifest with no platform records; it must not be cited as current measured evidence. Timing and memory target booleans remain informational unless a matched-host repeat is explicitly promoted; enforced native ceilings are verified separately. |
 | Failure semantics | Crash, OOM, timeout, cancellation, audit failure, backend absence, parent death, ambiguous-effect, and secret-in-thrown-value tests all fail closed with only stable class/code and source-free location metadata. |
 | Corpus consistency | The exact Phase 1–6 documentation scan shows all surviving in-process/thread claims as historical or superseded, removes stale platform and path claims from current documentation, and records delivered status consistently. Superseded dated blueprints and implementation plans remain explicitly historical. |
+
+The transport exclusion regression holds the first invocation at an effect gate,
+then polls the second invocation through the actual transport-lock admission
+point. A test-only task-local observer records whether that first lock poll was
+pending; elapsed time and an unfinished task are not exclusion evidence. Releasing
+the gate must produce ordered effects and both results using one worker. The
+fixture owns both invocation futures directly and reuses the launch fixture's
+process tracking, so injected failures at the effect, admission, and release
+boundaries settle native work before propagating. Verification scheduler tests
+separately cover priority and queue policy.

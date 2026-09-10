@@ -3138,45 +3138,119 @@ fn verification_with_embedded_test(script: &str) -> VerifyArtifact {
         cases: vec![],
     }
 }
-#[tokio::test]
-async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_effects() {
-    let supervisor = scripted_supervisor(0);
-    let gated = GatedEffects::new();
-    let first_effects = gated.clone();
-    let first_supervisor = supervisor.clone();
-    let first = tokio::spawn(async move {
-        first_supervisor
-            .execute(
-                RunStep::new("two-effects".into()),
-                first_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    gated.wait_started().await;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportFault {
+    FirstEffect,
+    SecondAdmission,
+    Released,
+}
 
-    let second_supervisor = supervisor.clone();
-    let second = tokio::spawn(async move {
-        second_supervisor
-            .execute(
+async fn exercise_transport_exclusion(fault: Option<TransportFault>) {
+    use crate::extras::js::supervisor::TRANSPORT_LOCK_OBSERVER;
+    use futures::FutureExt;
+
+    let trace = Arc::new(LaunchTrace::default());
+    let launch = LaunchFixtureOwner(trace.clone());
+    launch.release();
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        BlockedFirstLaunchLauncher(trace.clone()),
+        LAUNCH_TEST_WATCHDOG,
+    );
+    let gated = GatedEffects::new();
+    let inject = |at| {
+        if fault == Some(at) {
+            std::panic::panic_any(at);
+        }
+    };
+    let result = std::panic::AssertUnwindSafe(async {
+        // These futures stay owned by the scenario. Unwinding drops both before
+        // shutdown, so no detached invocation can retain the effect/transport.
+        let first = supervisor.execute(
+            RunStep::new("two-effects".into()),
+            gated.clone(),
+            PermCancellation::new(),
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            result = &mut first => panic!("first invocation settled before its effect gate: {result:?}"),
+            () = gated.wait_started() => {}
+        }
+        inject(TransportFault::FirstEffect);
+
+        let (observed, mut admission) = tokio::sync::mpsc::unbounded_channel();
+        let second = TRANSPORT_LOCK_OBSERVER.scope(
+            observed,
+            supervisor.execute(
                 RunStep::new("success".into()),
                 RecordingEffects::default(),
                 PermCancellation::new(),
-            )
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !second.is_finished(),
-        "second caller bypassed transport owner"
-    );
+            ),
+        );
+        tokio::pin!(second);
+        let acquired = tokio::time::timeout(LAUNCH_FIXTURE_GUARD, async {
+            tokio::select! {
+                biased;
+                acquired = admission.recv() => acquired.expect("transport observation was dropped"),
+                result = &mut second => panic!("second invocation settled while the first effect was held: {result:?}"),
+            }
+        })
+        .await
+        .expect("second caller did not poll transport admission");
+        assert!(
+            !acquired,
+            "second caller acquired transport while the first effect was held"
+        );
+        assert_eq!(*gated.ordinals.lock().unwrap(), vec![0]);
+        assert_eq!(trace.launches.load(Ordering::Acquire), 1);
+        assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
+        inject(TransportFault::SecondAdmission);
 
+        gated.release();
+        inject(TransportFault::Released);
+        let (first, second) = tokio::time::timeout(LAUNCH_FIXTURE_GUARD, async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("released transport callers did not settle");
+        assert_eq!(first.unwrap().outcome, StepOutcome::Value("effects-complete".into()));
+        assert_eq!(second.unwrap().outcome, StepOutcome::Value("success".into()));
+        assert_eq!(*gated.ordinals.lock().unwrap(), vec![0, 1]);
+        assert_eq!(trace.launches.load(Ordering::Acquire), 1, "callers must reuse one worker");
+        assert_eq!(trace.max_live_processes.load(Ordering::Acquire), 1);
+        assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
+    })
+    .catch_unwind()
+    .await;
     gated.release();
-    let first = first.await.unwrap().unwrap();
-    let second = second.await.unwrap().unwrap();
-    assert_eq!(first.outcome, StepOutcome::Value("effects-complete".into()));
-    assert_eq!(second.outcome, StepOutcome::Value("success".into()));
-    assert_eq!(*gated.ordinals.lock().unwrap(), vec![0, 1]);
+    let shutdown = supervisor.shutdown().await;
+    let quiescent = launch.wait_for_quiescence();
+    shutdown.unwrap();
+    assert!(quiescent, "transport fixture left a launch or worker live");
+    assert!(!trace.gate.lock().unwrap().rescued);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_serializes_concurrent_callers_and_orders_effects() {
+    exercise_transport_exclusion(None).await;
+}
+
+#[tokio::test]
+async fn worker_supervisor_transport_fixture_settles_after_failures() {
+    use futures::FutureExt;
+    for fault in [
+        TransportFault::FirstEffect,
+        TransportFault::SecondAdmission,
+        TransportFault::Released,
+    ] {
+        let result = std::panic::AssertUnwindSafe(exercise_transport_exclusion(Some(fault)))
+            .catch_unwind()
+            .await
+            .expect_err("injected transport failure must propagate after cleanup");
+        assert_eq!(result.downcast_ref::<TransportFault>(), Some(&fault));
+    }
 }
 
 #[test]
