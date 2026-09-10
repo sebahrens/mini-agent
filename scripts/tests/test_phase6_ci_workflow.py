@@ -294,7 +294,13 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                         )
                         self.assertEqual(result.returncode, exit_code, result.stderr)
                         expected = ["clippy", "--locked", "--all-targets", *shlex.split(features), "--", "-D", "warnings"]
-                        if features:
+                        strict_features = {
+                            "",
+                            "--no-default-features",
+                            "--no-default-features --features memory",
+                            "--no-default-features --features sandbox",
+                        }
+                        if features not in strict_features:
                             expected += ["-A", "dead-code"]
                         self.assertEqual(json.loads(recorded.read_text()), expected)
 
