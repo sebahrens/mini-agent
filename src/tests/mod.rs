@@ -136,7 +136,10 @@ mod picker_tests;
 mod platform_paths_tests;
 #[cfg(test)]
 mod portable_filename_tests;
-#[cfg(all(feature = "acp", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    any(feature = "acp", feature = "git-worktree"),
+    any(target_os = "linux", target_os = "macos")
+))]
 pub(crate) mod process_state;
 #[cfg(test)]
 mod prompt_mode_tests;

@@ -1115,18 +1115,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn configure_delay_alias(repo: &Path, name: &str, seconds: &str) {
-        git(
-            repo,
-            [
-                OsStr::new("config"),
-                OsStr::new(&format!("alias.{name}")),
-                OsStr::new(&format!("!sleep {seconds}")),
-            ],
-        );
-    }
-
-    #[cfg(unix)]
     mod concurrency {
         use super::*;
         use std::io::Write;
@@ -1860,68 +1848,177 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn git_runner_timeout_kills_delayed_alias_tree() {
-        let repo = TempRepo::new("timeout");
-        configure_delay_alias(repo.path(), "delay", "30");
-        let error = match run_git_with_limits_for_test(
-            repo.path(),
-            &["delay"],
-            test_limits(Duration::from_millis(100)),
-        )
-        .await
-        {
-            Ok(_) => panic!("slow Git alias must time out"),
-            Err(error) => error,
-        };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod process_tree {
+        use super::*;
+        use crate::agent::runner::AgentWorkScope;
+        use crate::tests::process_state::{ProcessGate, ProcessIdentity, ProcessState};
+        use futures::FutureExt;
 
-        assert!(error.contains("timed out"), "unexpected error: {error}");
-    }
+        const FIXTURE_GUARD: Duration = Duration::from_secs(15);
+        const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_git_caller_cancels_owned_process_tree() {
-        let repo = TempRepo::new("caller drop");
-        let started = repo.path().join("started");
-        let leaked = repo.path().join("leaked");
-        let alias = format!(
-            "!sh -c 'echo started > \"{}\"; sleep 2; echo leaked > \"{}\"'",
-            started.display(),
-            leaked.display()
-        );
-        git(
-            repo.path(),
-            [
-                OsStr::new("config"),
-                OsStr::new("alias.delayed-write"),
-                OsStr::new(&alias),
-            ],
-        );
-        let repo_path = repo.path().to_path_buf();
-        let task = tokio::spawn(async move {
-            run_git_with_limits_for_test(
-                &repo_path,
-                &["delayed-write"],
-                test_limits(Duration::from_secs(10)),
-            )
-            .await
-        });
-
-        for _ in 0..100 {
-            if started.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        enum Stop {
+            Timeout,
+            CallerDrop,
         }
-        assert!(started.exists(), "Git alias did not start");
-        task.abort();
-        let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(2300)).await;
-        assert!(
-            !leaked.exists(),
-            "cancelled Git descendant survived caller drop"
-        );
+
+        fn quote(path: &Path) -> String {
+            format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+        }
+
+        async fn pid_record(path: &Path) -> u32 {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && text.ends_with('\n')
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid > 0
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn exercise(stop: Stop, fail_after_readiness: bool) {
+            let repo = TempRepo::new("process tree 'repo'");
+            let script = repo.path().join(".git/held-alias");
+            let alias_pid_file = repo.path().join(".git/alias.pid");
+            let descendant_pid_file = repo.path().join(".git/descendant.pid");
+            let release = repo.path().join(".git/release");
+            let mut gate = ProcessGate::new(&release).unwrap();
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+set -eu
+printf '%s\n' "$$" > "$1"
+/bin/sh -c 'printf "%s\n" "$$" > "$1"; IFS= read -r release < "$2"' held-descendant "$2" "$3" &
+wait
+"#,
+            )
+            .unwrap();
+            let alias = format!(
+                "!/bin/sh {} {} {} {}",
+                quote(&script),
+                quote(&alias_pid_file),
+                quote(&descendant_pid_file),
+                quote(&release),
+            );
+            git(repo.path(), ["config", "alias.held-tree", &alias]);
+            let scope = AgentWorkScope::new();
+            // Dropping this future drops the real GitRunner response receiver.
+            // The scope retains the production output worker until native cleanup.
+            let mut command = Some(Box::pin(scope.run(run_git_with_limits_for_test(
+                repo.path(),
+                &["held-tree"],
+                test_limits(COMMAND_TIMEOUT),
+            ))));
+            let mut observed_tree = None;
+            let result = std::panic::AssertUnwindSafe(async {
+                let (alias_pid, descendant_pid) = tokio::time::timeout(FIXTURE_GUARD, async {
+                    tokio::select! {
+                        _ = command.as_mut().unwrap() => panic!("Git stopped before publishing its process tree"),
+                        pids = async { (pid_record(&alias_pid_file).await, pid_record(&descendant_pid_file).await) } => pids,
+                    }
+                }).await.expect("Git alias did not publish its complete process tree");
+                let alias = ProcessIdentity::capture(alias_pid).unwrap();
+                let descendant = ProcessIdentity::capture(descendant_pid).unwrap();
+                let ProcessState::Live { group, .. } = alias.state().unwrap() else {
+                    panic!("Git alias exited before cancellation readiness");
+                };
+                // GitRunner configures process_group(0), so this group's leader
+                // is the direct Git child rather than an inferred shell parent.
+                assert_ne!(group, std::process::id());
+                let git = ProcessIdentity::capture(group).unwrap();
+                assert!(matches!(descendant.state().unwrap(), ProcessState::Live { group: descendant_group, .. } if descendant_group == group));
+                observed_tree = Some([git, alias, descendant]);
+                assert!(scope.active_children() > 0);
+                if fail_after_readiness {
+                    panic!("injected after Git process-tree readiness");
+                }
+
+                match stop {
+                    Stop::Timeout => {
+                        // Start-up uses real native progress. Only the already
+                        // armed command deadline advances under the test clock.
+                        tokio::time::pause();
+                        tokio::time::advance(COMMAND_TIMEOUT + Duration::from_secs(1)).await;
+                        tokio::time::resume();
+                        let response = tokio::time::timeout(FIXTURE_GUARD, command.as_mut().unwrap())
+                            .await.expect("Git deadline did not settle");
+                        drop(command.take());
+                        let error = match response {
+                            Ok(_) => panic!("held Git alias must time out"),
+                            Err(error) => error,
+                        };
+                        assert!(error.contains("timed out"), "unexpected Git result: {error}");
+                    }
+                    Stop::CallerDrop => {
+                        drop(command.take());
+                        tokio::time::timeout(FIXTURE_GUARD, scope.wait_idle())
+                            .await.expect("dropped Git caller did not settle owned work");
+                    }
+                }
+                // Take the acceptance snapshot before releasing fixture gates.
+                let [git, alias, descendant] = observed_tree.unwrap().map(|process| process.state().unwrap());
+                assert!(matches!(git, ProcessState::Gone | ProcessState::Replaced), "direct Git child was not reaped: {git:?}");
+                for (label, state) in [("alias", alias), ("descendant", descendant)] {
+                    assert!(matches!(state, ProcessState::Exited | ProcessState::Gone | ProcessState::Replaced), "Git {label} remained live at settlement: {state:?}");
+                }
+                assert_eq!(scope.active_children(), 0);
+            }).catch_unwind().await;
+
+            drop(command.take());
+            let released = gate.release();
+            scope.cancellation_handle().cancel();
+            tokio::time::timeout(FIXTURE_GUARD, scope.wait_idle())
+                .await
+                .expect("Git fixture output worker did not settle");
+            released.unwrap();
+            if let Some(tree) = observed_tree {
+                // This is cleanup only; it cannot change the earlier acceptance
+                // snapshot or turn a live-survivor assertion into success.
+                tokio::time::timeout(FIXTURE_GUARD, async {
+                    loop {
+                        let states = tree.map(|process| process.state().unwrap());
+                        if states
+                            .iter()
+                            .all(|state| !matches!(state, ProcessState::Live { .. }))
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("Git fixture process survived its release gate");
+            }
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        #[tokio::test]
+        async fn git_runner_timeout_kills_delayed_alias_tree() {
+            exercise(Stop::Timeout, false).await;
+        }
+
+        #[tokio::test]
+        async fn dropping_git_caller_cancels_owned_process_tree() {
+            exercise(Stop::CallerDrop, false).await;
+        }
+
+        #[tokio::test]
+        async fn git_process_tree_fixture_settles_after_readiness_failure() {
+            let panic = std::panic::AssertUnwindSafe(exercise(Stop::CallerDrop, true))
+                .catch_unwind()
+                .await
+                .expect_err("fixture failure must propagate after cleanup");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"injected after Git process-tree readiness")
+            );
+        }
     }
 
     #[cfg(unix)]

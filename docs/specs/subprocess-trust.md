@@ -109,6 +109,16 @@ FIFO permits fixture cleanup after a failed assertion, and cleanup drains the
 prompt work scope before propagating the failure. Native controls cover live,
 unreaped-zombie, reaped, and mismatched-identity observations.
 
+Git timeout and caller-drop tests reuse this process-state helper and an owned
+FIFO alias/descendant fixture. They capture the group-leading Git child and both
+shell identities while live. The timeout case advances its test clock only after
+native readiness; the caller-drop case drops the actual response future and
+awaits its owning work scope. Both require the direct child reaped and descendants
+exited before releasing the fixture. A failed assertion releases the FIFO and
+drains scoped work before propagating; cleanup polling cannot satisfy the earlier
+acceptance snapshot. These tests cover GitRunner's integration with the general
+subprocess lifecycle, alongside the sandbox's backend-specific tree tests.
+
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.
