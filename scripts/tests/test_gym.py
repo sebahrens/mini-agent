@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
@@ -396,22 +397,22 @@ else:
                 self.assertEqual(failed.exception.filename, str(executable))
 
 
-    @unittest.skipUnless(sys.platform == "linux", "Linux ownership pipes")
-    def test_partial_owner_startup_closes_pipes_without_launching_a_command(self) -> None:
-        real_pipe = os.pipe
-        for stage in ("second-pipe", "configure", "spawn", "interrupt"):
-            descriptors = []
+    @unittest.skipUnless(sys.platform == "linux", "Linux ownership endpoints")
+    def test_partial_owner_startup_closes_endpoints_without_launching_a_command(self) -> None:
+        real_pair = CAPTURE.socket.socketpair
+        for stage in ("second-pair", "configure", "spawn", "interrupt"):
+            endpoints = []
 
-            def pipe():
-                if stage == "second-pipe" and descriptors:
-                    raise OSError("injected pipe exhaustion")
-                pair = real_pipe()
-                descriptors.extend(pair)
+            def socketpair():
+                if stage == "second-pair" and endpoints:
+                    raise OSError("injected endpoint exhaustion")
+                pair = real_pair()
+                endpoints.extend(pair)
                 return pair
 
             with self.subTest(stage=stage):
                 try:
-                    with mock.patch.object(CAPTURE.os, "pipe", side_effect=pipe), \
+                    with mock.patch.object(CAPTURE.socket, "socketpair", side_effect=socketpair), \
                          mock.patch.object(CAPTURE.os, "set_blocking",
                                            side_effect=OSError("injected configuration failure") if stage == "configure" else None), \
                          mock.patch.object(CAPTURE.subprocess, "Popen",
@@ -421,15 +422,106 @@ else:
                     self.assertIsInstance(failed.exception, CAPTURE.ProcessCleanupError if stage == "interrupt" else OSError)
                     if stage not in ("spawn", "interrupt"):
                         spawn.assert_not_called()
-                    for descriptor in descriptors:
-                        with self.assertRaises(OSError, msg="startup leaked an ownership pipe"):
-                            os.fstat(descriptor)
+                    self.assertTrue(endpoints)
+                    self.assertTrue(all(endpoint.fileno() == -1 for endpoint in endpoints),
+                                    "startup leaked an ownership endpoint")
                 finally:
-                    for descriptor in descriptors:
+                    for endpoint in endpoints:
+                        endpoint.close()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper and pidfd ownership")
+    def test_interrupted_handoff_settles_live_tree_without_closing_reused_descriptors(self) -> None:
+        # The detached leaf announces both identities in one atomic pipe write.
+        # Both processes stay live until capture closes its control endpoint.
+        leaf = ("import json,os,signal; "
+                "os.write(1,json.dumps([os.getppid(),os.getpid()]).encode()+b'\\n'); signal.pause()")
+        command = ("import subprocess,sys,signal; "
+                   f"subprocess.Popen([sys.executable,'-c',{leaf!r}],start_new_session=True); signal.pause()")
+        real_pair = CAPTURE.socket.socketpair
+        real_close = CAPTURE.socket.socket.close
+        real_spawn = subprocess.Popen
+        cases = [(index, after, error, wait_fails)
+                 for index in (0, 3) for after in (False, True)
+                 for error in (KeyboardInterrupt, SystemExit, OSError) for wait_fails in (False, True)]
+        cases.extend((None, False, error, False) for error in (KeyboardInterrupt, SystemExit))
+        for endpoint_index, after_close, error_type, wait_fails in cases:
+            with self.subTest(endpoint=endpoint_index, after_close=after_close,
+                              error=error_type.__name__, wait_fails=wait_fails), \
+                 tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as cleanup:
+                endpoints, owners, pidfds, reused = [], [], [], []
+                injected = error_type("injected handoff interruption")
+                fired = False
+
+                def settle():
+                    # Also owns cleanup when readiness or assertions fail.
+                    # Close the control endpoints; never kill the reaper.
+                    for endpoint in endpoints:
+                        real_close(endpoint)
+                    for owner, wait in owners:
                         try:
-                            os.close(descriptor)
-                        except OSError:
-                            pass
+                            wait(timeout=10)
+                        finally:
+                            owner.stdout.close()
+                            owner.stderr.close()
+
+                cleanup.callback(settle)
+
+                def socketpair():
+                    pair = real_pair()
+                    endpoints.extend(pair)
+                    return pair
+
+                def spawn(argv, **kwargs):
+                    nonlocal fired
+                    owner = real_spawn(argv, **kwargs)
+                    owners.append((owner, owner.wait))
+                    self.assertTrue(select.select([owner.stdout], [], [], 10)[0], "tree did not start")
+                    identities = json.loads(os.read(owner.stdout.fileno(), 4096))
+                    self.assertEqual(len(identities), 2)
+                    for pid in identities:
+                        pidfd = os.pidfd_open(pid)
+                        pidfds.append(pidfd)
+                        cleanup.callback(os.close, pidfd)
+                    self.assertEqual(select.select(pidfds, [], [], 0)[0], [], "tree exited before handoff")
+                    if endpoint_index is None:
+                        fired = True
+                        raise injected  # Popen created a child but never returned its handle.
+                    if wait_fails:
+                        owner.wait = mock.Mock(side_effect=OSError("injected cleanup wait failure"))
+                    return owner
+
+                def close(endpoint):
+                    nonlocal fired
+                    if owners and endpoint_index is not None and endpoint is endpoints[endpoint_index] and not fired:
+                        fired = True
+                        if after_close:
+                            descriptor = endpoint.fileno()
+                            real_close(endpoint)
+                            replacement = os.open(os.devnull, os.O_RDONLY)
+                            if replacement != descriptor:
+                                os.dup2(replacement, descriptor)
+                                os.close(replacement)
+                            reused.append(descriptor)
+                            cleanup.callback(os.close, descriptor)
+                        raise injected
+                    real_close(endpoint)
+
+                with mock.patch.object(CAPTURE.socket, "socketpair", side_effect=socketpair), \
+                     mock.patch.object(CAPTURE.socket.socket, "close", close), \
+                     mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn):
+                    with self.assertRaises(BaseException) as failed:
+                        CAPTURE.run_bounded([sys.executable, "-c", command], Path(directory), dict(os.environ), 20)
+                self.assertTrue(fired)
+                if wait_fails or endpoint_index is None:
+                    self.assertIsInstance(failed.exception, CAPTURE.ProcessCleanupError)
+                    self.assertIn("retain workspace", str(failed.exception))
+                else:
+                    self.assertIs(failed.exception, injected)
+                    self.assertEqual(owners[0][0].returncode, 0, "supervisor was not successfully reaped")
+                    self.assertEqual(select.select(pidfds, [], [], 0)[0], pidfds, "a command survived handoff failure")
+                self.assertTrue(all(endpoint.fileno() == -1 for endpoint in endpoints))
+                for descriptor in reused:
+                    os.fstat(descriptor)  # A repeated close must not close this unrelated file.
 
     @unittest.skipUnless(sys.platform == "linux", "Linux owner acknowledgement")
     def test_unconfirmed_owner_stops_capture_and_is_not_killed_after_cleanup_deadline(self) -> None:
@@ -439,6 +531,8 @@ else:
             real_spawn = subprocess.Popen
             owners = []
             wait_failure = None
+            close_failures = None
+            wait_timeouts = []
 
             def spawn(argv, **kwargs):
                 # Inject a failed ownership service at the process boundary;
@@ -449,11 +543,22 @@ else:
                 real_wait = owner.wait
 
                 def wait(timeout=None):
+                    wait_timeouts.append(timeout)
                     if wait_failure is not None and timeout == .05:
                         raise wait_failure
                     return real_wait(timeout=timeout)
 
                 owner.wait = wait
+                if close_failures is not None:
+                    for stream in (owner.stdout, owner.stderr):
+                        real_stream_close = stream.close
+
+                        def close_stream(close=real_stream_close):
+                            close()
+                            close_failures.append(True)
+                            raise OSError("injected stream close failure")
+
+                        stream.close = close_stream
                 return owner
 
             for report in (b"", b'{"returncode":true}', b'{"returncode":0,"errno":1}', b'x' * 1025):
@@ -466,23 +571,29 @@ else:
             helper.write_text("""
 import os, select, sys, time
 from pathlib import Path
-select.select([int(sys.argv[1])], [], [], 5)
+os.write(1, b'overflow')
+select.select([int(sys.argv[1])], [], [])
 while not Path('release-owner').exists(): time.sleep(.005)
 os.write(int(sys.argv[2]), b'{"returncode":0}')
 """)
-            for wait_failure in (None, KeyboardInterrupt(), OSError("injected wait failure")):
-                with self.subTest(wait_failure=type(wait_failure).__name__):
+            for wait_failure, close_failures in (
+                (None, None), (KeyboardInterrupt(), None), (OSError("injected wait failure"), None),
+                (OSError("injected wait failure"), []),
+            ):
+                with self.subTest(wait_failure=type(wait_failure).__name__, close_failure=close_failures is not None):
                     (root / "release-owner").unlink(missing_ok=True)
+                    wait_timeouts.clear()
                     try:
-                        started = time.monotonic()
                         with mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn), \
                              mock.patch.object(CAPTURE, "PROCESS_REAP_TIMEOUT_SECS", .05):
                             with self.assertRaises(BaseException) as failed:
-                                CAPTURE.run_bounded(["/bin/true"], root, dict(os.environ), 1)
+                                CAPTURE.run_bounded(["/bin/true"], root, dict(os.environ), 20, stdout_limit=0)
                         self.assertIsInstance(failed.exception, CAPTURE.ProcessCleanupError)
                         self.assertIn("retain workspace", str(failed.exception))
-                        self.assertLess(time.monotonic() - started, 2)
+                        self.assertEqual(wait_timeouts, [.05], "overflow did not reach the bounded cleanup wait")
                         self.assertIsNone(owners[-1].poll(), "failed cleanup must not kill the surviving owner")
+                        if close_failures is not None:
+                            self.assertEqual(len(close_failures), 2, "cleanup skipped a stream after another close failed")
                     finally:
                         (root / "release-owner").touch()
                         owners[-1].wait(timeout=5)

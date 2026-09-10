@@ -6,10 +6,12 @@ capture with an overflow sentinel for callers such as the miner's Git blob reade
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import selectors
+import socket
 import subprocess
 import sys
 import time
@@ -24,48 +26,56 @@ class ProcessCleanupError(RuntimeError):
 
 
 class _OwnedProcess:
-    def __init__(self, argv: list[str], cwd: Path, env: dict[str, str]) -> None:
+    def __init__(self, argv: list[str], cwd: Path) -> None:
         self.argv = argv
         self.cwd = cwd
-        self.control: int | None = None
-        self.report: int | None = None
+        self.process: subprocess.Popen | None = None
+        self.control: socket.socket | None = None
+        self.report: socket.socket | None = None
+        self.endpoints: list[tuple[socket.socket, socket.socket]] = []
         self.result: dict[str, int] | None = None
         self.cleanup_started = False
-        if sys.platform != "linux":
-            self.process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return
-        descriptors: list[int] = []
+
+    def start(self, env: dict[str, str]) -> None:
+        # The caller already owns this object and will close it even when
+        # launch or the parent-side endpoint handoff is interrupted.
         try:
-            control_read, control_write = os.pipe()
-            descriptors.extend((control_read, control_write))
-            report_read, report_write = os.pipe()
-            descriptors.extend((report_read, report_write))
-            # Complete fallible pipe setup before a command can start.
-            os.set_blocking(report_read, False)
+            if sys.platform != "linux":
+                self.process = subprocess.Popen(
+                    self.argv, cwd=self.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                return
+            self.endpoints.append(socket.socketpair())
+            control_read, self.control = self.endpoints[-1]
+            self.endpoints.append(socket.socketpair())
+            self.report, report_write = self.endpoints[-1]
+            # Complete fallible endpoint setup before a command can start.
+            os.set_blocking(self.report.fileno(), False)
             supervisor = str(Path(__file__).with_name("_process_supervisor.py").resolve())
             self.process = subprocess.Popen(
-                [sys.executable, "-I", "-S", supervisor, str(control_read), str(report_write), *argv],
-                cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                pass_fds=(control_read, report_write),
+                [sys.executable, "-I", "-S", supervisor,
+                 str(control_read.fileno()), str(report_write.fileno()), *self.argv],
+                cwd=self.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(control_read.fileno(), report_write.fileno()),
             )
-        except BaseException as error:
-            for descriptor in descriptors:
-                os.close(descriptor)
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            # Socket objects invalidate their descriptor on close, so cleanup
+            # can safely close them again after an interrupted handoff.
+            control_read.close()
+            report_write.close()
+        except (KeyboardInterrupt, SystemExit) as error:
+            if self.process is None:
                 # Popen can be interrupted after creating the supervisor.
-                # Closing the control pipe requests cleanup, but we have no
-                # returned process handle with which to confirm completion.
+                # Endpoint cleanup requests cancellation, but without the
+                # returned handle we cannot confirm that it completed.
                 raise ProcessCleanupError(
-                    f"Gym owner startup interrupted; stop the run and retain workspace {cwd}"
+                    f"Gym owner startup interrupted; stop the run and retain workspace {self.cwd}"
                 ) from error
             raise
-        os.close(control_read)
-        os.close(report_write)
-        self.control, self.report = control_write, report_read
 
     def _unconfirmed(self) -> ProcessCleanupError:
+        owner = f"for owner {self.process.pid}" if self.process is not None else "during startup"
         return ProcessCleanupError(
-            f"Gym process cleanup unconfirmed for owner {self.process.pid}; "
+            f"Gym process cleanup unconfirmed {owner}; "
             f"stop the run and retain workspace {self.cwd}"
         )
 
@@ -75,7 +85,7 @@ class _OwnedProcess:
             return code
         if self.result is None:
             try:
-                raw = os.read(self.report, 1025)
+                raw = os.read(self.report.fileno(), 1025)
                 result = json.loads(raw)
                 if code != 0 or len(raw) > 1024 or not isinstance(result, dict):
                     raise ValueError("invalid supervisor acknowledgement")
@@ -95,8 +105,7 @@ class _OwnedProcess:
         self.cleanup_started = True
         try:
             if self.control is not None:
-                os.close(self.control)
-                self.control = None
+                self.control.close()
             elif self.report is None and self.process.poll() is None:
                 self.process.kill()
             return self.wait(PROCESS_REAP_TIMEOUT_SECS)
@@ -106,15 +115,24 @@ class _OwnedProcess:
             raise self._unconfirmed() from error
 
     def close(self) -> None:
+        # Attempt every resource close even if another close or the cleanup
+        # acknowledgement fails. Keep the Linux reaper alive on failure.
         try:
-            if self.result is None and not self.cleanup_started:
-                self.terminate()
-        finally:
-            for name in ("control", "report"):
-                descriptor = getattr(self, name)
-                if descriptor is not None:
-                    os.close(descriptor)
-                    setattr(self, name, None)
+            with contextlib.ExitStack() as cleanup:
+                for pair in self.endpoints:
+                    for endpoint in pair:
+                        cleanup.callback(endpoint.close)
+                if self.process is not None:
+                    cleanup.callback(self.process.stdout.close)
+                    cleanup.callback(self.process.stderr.close)
+                    if self.result is None and not self.cleanup_started:
+                        self.terminate()
+        except ProcessCleanupError:
+            raise
+        except BaseException as error:
+            # A finalizer must not turn unconfirmed process cleanup into a
+            # recoverable I/O error that allows workspace deletion.
+            raise self._unconfirmed() from error
 
 
 def validate_timeout(timeout: int) -> int:
@@ -141,9 +159,10 @@ def run_bounded(
     deadline = time.monotonic() + validate_timeout(timeout)
     tails = [bytearray(), bytearray()]
     with selectors.DefaultSelector() as selector:
-        owned = _OwnedProcess(argv, cwd, env)
-        process = owned.process
+        owned = _OwnedProcess(argv, cwd)
         try:
+            owned.start(env)
+            process = owned.process
             for stream, tail in zip((process.stdout, process.stderr), tails):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, tail)
@@ -177,6 +196,4 @@ def run_bounded(
                 argv, timeout, output=bytes(tails[0]), stderr=bytes(tails[1])
             ) from None
         finally:
-            process.stdout.close()
-            process.stderr.close()
             owned.close()

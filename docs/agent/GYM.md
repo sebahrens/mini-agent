@@ -235,9 +235,14 @@ It kills and reaps the entire owned tree on command exit, timeout, stdout overfl
 the calling trainer/miner, including descendants that create new sessions or double-fork.
 The command's exit status and bounded output remain the result; unrelated children are untouched.
 This is lifecycle management, not a security boundary against hostile commands.
+The caller establishes cleanup ownership before launch and retains it through interrupted
+startup handoffs. Control and acknowledgement use local socket pairs whose objects can be
+closed again safely, even if a descriptor was reused after an interrupted close.
 The caller allows up to five additional seconds to confirm cleanup. Missing acknowledgement,
 an interrupted cleanup wait, or an expired cleanup deadline raises a fatal runner error, stops further episodes/mining,
-and preserves remaining workspace and AppPaths files. A surviving supervisor keeps ownership
+and preserves remaining workspace and AppPaths files. Resource finalization attempts every
+stream and endpoint close; a close failure also remains fatal instead of masking an unconfirmed
+cleanup result with a recoverable I/O error. A surviving supervisor keeps ownership
 and continues cleanup; it is not killed merely because that wait expired. After such a failure,
 confirm that the reported owner and its descendants have exited before retrying the run or
 removing retained directories. On macOS, only the immediate child is terminated and reaped;

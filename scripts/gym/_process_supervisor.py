@@ -63,7 +63,7 @@ def supervise(control: int, report: int, argv: list[str]) -> None:
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, request_stop)
 
-    # The control pipe, not a kill of this reaper, requests cancellation.
+    # The control socket, not a kill of this reaper, requests cancellation.
     # Closing its parent endpoint also cancels when the trainer exits.
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
