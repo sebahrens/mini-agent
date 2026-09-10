@@ -198,7 +198,6 @@ impl ToolDyn for McpTool {
         let peer = self.peer.clone();
         let permission = self.permission.clone();
         let ask_tx = self.ask_tx.clone();
-        let registered_name = self.registered_name.clone();
         let call_timeout = self.call_timeout;
         let spill_scope = self.spill_scope.clone();
 
@@ -210,7 +209,6 @@ impl ToolDyn for McpTool {
                 &perm_key,
                 trusted_identity,
                 &tool_name,
-                &registered_name,
             )
             .await
             .map_err(|e| {

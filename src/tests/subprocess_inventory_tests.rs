@@ -1445,6 +1445,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "src/permission/ask.rs",
+        "Some(crate::event::AgentEvent::ToolResult { id, output, .. }) => {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/permission/ask.rs",
+        "results.insert(id.to_string(), output.to_string());",
+        1,
+        "NON-PROCESS",
+    ),
     // Distiller test fixtures: `output` is a persisted tool-result field, not a
     // process output.
     (
@@ -2295,6 +2307,17 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/permission/ask.rs",
+        &[
+            // Approval regression: select! matches ToolResult.output and
+            // records its text; it neither constructs nor launches a process.
+            (
+                "a3a0a96b7dec31cf2b96758c38bebbbbebf90bb7b2543532aa394a7df144856f",
+                1,
+            ),
+        ],
+    ),
     (
         "src/agent/runner.rs",
         &[

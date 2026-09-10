@@ -2647,6 +2647,7 @@ where
                                 response.clear();
                                 response_len_at_stream_start = 0;
                                 append_tool_call(&mut interactions, &tool_call);
+                                #[cfg(feature = "acp")]
                                 crate::permission::ask::record_tool_call(
                                     &tool_call.function.name,
                                     &internal_call_id,
@@ -2733,6 +2734,7 @@ where
                             tool_name,
                             output.len(),
                         );
+                        #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
                         let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
                         let _ = event_tx
@@ -3146,6 +3148,7 @@ where
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
 
+    #[cfg(feature = "acp")]
     let agent_future = crate::permission::ask::scope_tool_call_context(agent_future);
 
     let join = tokio::spawn(agent_future);
@@ -3477,6 +3480,7 @@ where
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                     append_tool_call(&mut interactions, &tool_call);
+                    #[cfg(feature = "acp")]
                     crate::permission::ask::record_tool_call(name, &internal_call_id);
                 }
                 Ok(MultiTurnStreamItem::ToolExecutionStart { .. }) => {
@@ -3501,6 +3505,7 @@ where
                     ) else {
                         continue;
                     };
+                    #[cfg(feature = "acp")]
                     crate::permission::ask::finish_tool_call(&name, &internal_call_id);
                     if pure_stdout && !output.is_empty() {
                         println!("◈ {} result:", name);

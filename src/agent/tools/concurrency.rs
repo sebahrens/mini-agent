@@ -59,7 +59,7 @@ impl ToolDyn for ConcurrencyBoundTool {
     }
 
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
+        let future = async move {
             match self.access {
                 ToolAccess::Read => {
                     let _lease = self.lane.read().await;
@@ -70,7 +70,10 @@ impl ToolDyn for ConcurrencyBoundTool {
                     self.inner.call(args).await
                 }
             }
-        })
+        };
+        #[cfg(feature = "acp")]
+        let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
+        Box::pin(future)
     }
 
     fn call_with_extensions<'a>(
@@ -78,7 +81,7 @@ impl ToolDyn for ConcurrencyBoundTool {
         args: String,
         extensions: &'a ToolCallExtensions,
     ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
+        let future = async move {
             match self.access {
                 ToolAccess::Read => {
                     let _lease = self.lane.read().await;
@@ -89,7 +92,10 @@ impl ToolDyn for ConcurrencyBoundTool {
                     self.inner.call_with_extensions(args, extensions).await
                 }
             }
-        })
+        };
+        #[cfg(feature = "acp")]
+        let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
+        Box::pin(future)
     }
 
     fn call_structured<'a>(
@@ -97,7 +103,7 @@ impl ToolDyn for ConcurrencyBoundTool {
         args: String,
         extensions: &'a ToolCallExtensions,
     ) -> WasmBoxedFuture<'a, ToolExecutionResult> {
-        Box::pin(async move {
+        let future = async move {
             match self.access {
                 ToolAccess::Read => {
                     let _lease = self.lane.read().await;
@@ -108,7 +114,10 @@ impl ToolDyn for ConcurrencyBoundTool {
                     self.inner.call_structured(args, extensions).await
                 }
             }
-        })
+        };
+        #[cfg(feature = "acp")]
+        let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
+        Box::pin(future)
     }
 }
 

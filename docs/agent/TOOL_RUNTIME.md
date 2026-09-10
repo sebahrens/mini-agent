@@ -83,6 +83,13 @@ feature-specific test adapters compile only with their consumers. The shared
 bounded validation executor remains available without `loop`; loop defaults,
 command display, and explicit validator cancellation are gated to loop callers
 and their native tests.
+ACP permission correlation claims a lifecycle ID when each registered tool
+invocation enters the concurrency boundary, before waiting for its lease.
+The ID stays local to that invocation through delayed and repeated approval
+checks; an already-allowed sibling cannot donate its ID to another prompt.
+Direct calls without runner context and independently brokered JS effects
+retain ACP's synthetic-call fallback. Correlation state compiles only with ACP;
+the approval reply channels remain available to every interactive frontend.
 Loop caller regressions exercise real CLI output and transcript persistence,
 and TUI completion handling with output limits, unavailable sandboxing, scoped
 cancellation, and a stale result arriving during a replacement validation.
