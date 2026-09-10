@@ -2009,6 +2009,8 @@ struct LaunchTrace {
     created: AtomicUsize,
     live_processes: Arc<AtomicUsize>,
     max_live_processes: AtomicUsize,
+    capture_crash_input: bool,
+    crash_input: Mutex<Option<std::fs::File>>,
 }
 
 struct ActiveTestLaunch(Arc<LaunchTrace>);
@@ -2057,6 +2059,14 @@ impl WorkerLauncher for BlockedFirstLaunchLauncher {
         }
         let mut process = TestWorkerLauncher::scripted_internal_worker(0).launch()?;
         process.observe_reap_for_test(self.0.live_processes.clone());
+        if first && self.0.capture_crash_input {
+            *self.0.crash_input.lock().unwrap() = Some(
+                process
+                    .input
+                    .try_clone()
+                    .expect("clone owned crash trigger input"),
+            );
+        }
         self.0.created.fetch_add(1, Ordering::Release);
         self.0.max_live_processes.fetch_max(
             self.0.live_processes.load(Ordering::Acquire),
@@ -2096,6 +2106,7 @@ impl Drop for LaunchFixtureOwner {
         // after the owner has finished cleaning up.
         self.0.gate.lock().unwrap().closing = true;
         self.release();
+        drop(self.0.crash_input.lock().unwrap().take());
         let settled = self.wait_for_quiescence();
         if !std::thread::panicking() {
             assert!(settled, "launch callback or late worker did not settle");
@@ -2482,47 +2493,9 @@ async fn worker_supervisor_finalization_failure_is_launch_terminal_and_reaps() {
     .expect("finalization failure did not reap the worker tree");
 }
 
-#[tokio::test]
-async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler() {
-    let (supervisor, launcher) =
-        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(2));
-    let gated = GatedEffects::new();
-    let task_supervisor = supervisor.clone();
-    let task_effects = gated.clone();
-    let task = tokio::spawn(async move {
-        task_supervisor
-            .execute(
-                RunStep::new("crash-pending-effect".into()),
-                task_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    gated.wait_started().await;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("worker crash waited for the whole-call watchdog")
-            .unwrap(),
-        Err(WorkerError::Transport)
-    );
-    assert!(gated.dropped.load(Ordering::Acquire));
-    assert!(
-        gated
-            .cancellation
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .is_cancelled()
-    );
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-    launcher.wait_for_live_processes(1).await;
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
+#[test]
+fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler() {
+    exercise_invocation_interruption(InvocationStop::WorkerCrash, None);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2530,6 +2503,7 @@ enum InvocationStop {
     PermissionDeadline,
     ReadDeadline,
     CallerDrop,
+    WorkerCrash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2537,13 +2511,17 @@ enum InterruptionFault {
     Pending,
     Cancelling,
     Dropped,
+    CrashTriggered,
     Recovered,
 }
 
 fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<InterruptionFault>) {
-    use crate::extras::js::supervisor::WORKER_READ_OBSERVER;
+    use crate::extras::js::supervisor::{WORKER_EXIT_OBSERVER, WORKER_READ_OBSERVER};
 
-    let trace = Arc::new(LaunchTrace::default());
+    let trace = Arc::new(LaunchTrace {
+        capture_crash_input: stop == InvocationStop::WorkerCrash,
+        ..Default::default()
+    });
     let launch = LaunchFixtureOwner(trace.clone());
     launch.release();
     let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
@@ -2562,20 +2540,20 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
             let _permission_prompt = (stop == InvocationStop::PermissionDeadline)
                 .then(|| cancellation.begin_permission_prompt());
             let (observed, mut reads) = tokio::sync::mpsc::unbounded_channel();
+            let (exit_observed, mut exits) = tokio::sync::mpsc::unbounded_channel();
             // Own the allocation, so drop(request) drops the actual invocation,
             // not just a reference to a stack-pinned future.
-            let mut request = Box::pin(WORKER_READ_OBSERVER.scope(
-                observed,
-                supervisor.execute(
-                    RunStep::new(if stop == InvocationStop::ReadDeadline {
-                        "deadline".into()
-                    } else {
-                        "effect-pending".into()
-                    }),
-                    gated.clone(),
-                    cancellation,
-                ),
-            ));
+            let request = supervisor.execute(
+                RunStep::new(match stop {
+                    InvocationStop::ReadDeadline => "deadline",
+                    InvocationStop::WorkerCrash => "crash-pending-effect",
+                    _ => "effect-pending",
+                }.into()),
+                gated.clone(),
+                cancellation,
+            );
+            let request = WORKER_READ_OBSERVER.scope(observed, request);
+            let mut request = Box::pin(WORKER_EXIT_OBSERVER.scope(exit_observed, request));
             if stop == InvocationStop::ReadDeadline {
                 tokio::time::timeout(LAUNCH_FIXTURE_GUARD, async {
                     tokio::select! {
@@ -2600,6 +2578,24 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                 assert!(gated.dropped.load(Ordering::Acquire), "caller drop retained the effect future");
                 assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "caller drop did not cancel the effect");
                 inject(InterruptionFault::Dropped);
+            } else if stop == InvocationStop::WorkerCrash {
+                // Only this libtest script accepts the trigger byte. Its parent
+                // cannot write a protocol response while the effect stays held.
+                let mut input = trace.crash_input.lock().unwrap().take()
+                    .expect("owned crash trigger input");
+                input.write_all(&[0xa5]).expect("trigger the scripted worker crash");
+                input.flush().unwrap();
+                drop(input);
+                inject(InterruptionFault::CrashTriggered);
+                assert_eq!(
+                    tokio::time::timeout(LAUNCH_FIXTURE_GUARD, request).await
+                        .expect("worker crash did not settle the pending invocation"),
+                    Err(WorkerError::Transport)
+                );
+                assert_eq!(exits.try_recv().expect("supervisor must observe the crashed worker").code(), Some(75),
+                    "cleanup or a different exit must not satisfy the scripted crash");
+                assert!(gated.dropped.load(Ordering::Acquire), "worker crash retained the effect future");
+                assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "worker crash did not cancel the effect");
             } else {
                 // Cross the actual timer only after native handshake/write and
                 // read/effect readiness. Native settlement uses a running clock.
@@ -2645,6 +2641,7 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
         });
     }));
     gated.release();
+    drop(trace.crash_input.lock().unwrap().take());
     let shutdown = launch_test_runtime().block_on(supervisor.shutdown());
     let quiescent = launch.wait_for_quiescence();
     shutdown.unwrap();
@@ -2653,6 +2650,10 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
         "interruption fixture left a launch or worker live"
     );
     assert!(!trace.gate.lock().unwrap().rescued);
+    assert!(
+        trace.crash_input.lock().unwrap().is_none(),
+        "crash trigger input was retained"
+    );
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
@@ -2666,7 +2667,8 @@ fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
 #[test]
 fn worker_supervisor_interruption_fixture_settles_after_failures() {
     // Shared effect startup, cancellation drain, and recovered-worker cleanup
-    // are covered once. Add only the distinct blocked-read and explicit-drop exits.
+    // are covered once. Add only the distinct blocked-read, explicit-drop,
+    // and before/after crash-trigger exits.
     for (stop, fault) in [
         (
             InvocationStop::PermissionDeadline,
@@ -2682,6 +2684,11 @@ fn worker_supervisor_interruption_fixture_settles_after_failures() {
         ),
         (InvocationStop::ReadDeadline, InterruptionFault::Pending),
         (InvocationStop::CallerDrop, InterruptionFault::Dropped),
+        (InvocationStop::WorkerCrash, InterruptionFault::Pending),
+        (
+            InvocationStop::WorkerCrash,
+            InterruptionFault::CrashTriggered,
+        ),
     ] {
         let result =
             std::panic::catch_unwind(|| exercise_invocation_interruption(stop, Some(fault)))
@@ -3982,7 +3989,11 @@ fn run_scripted_supervisor_worker() -> ! {
                         std::process::exit(0);
                     }
                     if step.code == "crash-pending-effect" {
-                        std::thread::sleep(Duration::from_millis(30));
+                        // A libtest-only trigger, sent after the parent has
+                        // entered the held effect; no timed readiness assumption.
+                        let mut trigger = [0];
+                        input.read_exact(&mut trigger).unwrap();
+                        assert_eq!(trigger, [0xa5]);
                         std::process::exit(75);
                     }
                     let response: ParentWireFrame = read_frame(&mut input).unwrap();

@@ -54,6 +54,8 @@ tokio::task_local! {
     pub(crate) static TRANSPORT_LOCK_OBSERVER: tokio::sync::mpsc::UnboundedSender<bool>;
     /// First poll of an invocation protocol read after its parent frame was written.
     pub(crate) static WORKER_READ_OBSERVER: tokio::sync::mpsc::UnboundedSender<()>;
+    /// Actual native status being classified, before invocation cleanup.
+    pub(crate) static WORKER_EXIT_OBSERVER: tokio::sync::mpsc::UnboundedSender<ExitStatus>;
 }
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
@@ -2266,6 +2268,7 @@ fn reconciliation_poll_delay(now: Instant, deadline: Instant) -> Duration {
 fn classify_worker_exit(status: ExitStatus) -> WorkerError {
     #[cfg(test)]
     {
+        let _ = WORKER_EXIT_OBSERVER.try_with(|observer| observer.send(status));
         let class = test_worker_exit_class(status);
         eprintln!("JS_TEST_WORKER_EXIT class={class}");
     }
