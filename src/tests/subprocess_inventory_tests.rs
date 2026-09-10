@@ -1024,6 +1024,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    (
+        "src/extras/js/tool.rs",
+        "let check = scope.spawn(move || {",
+        1,
+        "NON-PROCESS",
+    ),
     ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/sandbox/worker/macos.rs",
@@ -3467,6 +3473,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/js/tool.rs",
         "requests.spawn(async move {",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/js/tool.rs",
+        "let check = scope.spawn(move || {",
         1,
         "NON-PROCESS",
     ),

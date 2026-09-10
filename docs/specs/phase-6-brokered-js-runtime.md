@@ -995,6 +995,14 @@ general-command sandbox, whose own native gate passed independently in the same 
 
 ## Failure semantics
 
+The synchronous permission-bridge timeout control retains an unanswered request
+and advances a per-bridge, test-only clock past that request's actual deadline.
+It requires `TimedOut`, request cancellation, and closure of the response receiver.
+A scoped thread is cancelled and joined even when readiness or outcome assertions
+fail. A separate generous hang guard detects a lost timeout path; elapsed host
+time is not an acceptance criterion. Production waits still use `Instant::now()`
+and the existing cancellation polling interval.
+
 Protocol-read timeout, pending-permission timeout, explicit cancellation, caller-drop, and crash regressions
 share one owned interruption fixture. The read case observes the actual parent
 reader after the invocation frame is written, then advances its timer and

@@ -107,6 +107,8 @@ pub(crate) struct PermissionBridge {
     invocation_cancellation: Option<PermCancellation>,
     host_call_cancellation: Option<PermCancellation>,
     timeout: Duration,
+    #[cfg(test)]
+    sync_wait_clock: Option<Arc<std::sync::Mutex<Instant>>>,
 }
 
 impl PermissionBridge {
@@ -121,6 +123,8 @@ impl PermissionBridge {
             invocation_cancellation: None,
             host_call_cancellation: None,
             timeout,
+            #[cfg(test)]
+            sync_wait_clock: None,
         }
     }
 
@@ -178,7 +182,13 @@ impl PermissionBridge {
             if self.is_cancelled() {
                 return Err(PermissionBridgeError::Cancelled);
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let now = Instant::now();
+            #[cfg(test)]
+            let now = self
+                .sync_wait_clock
+                .as_ref()
+                .map_or(now, |clock| *clock.lock().unwrap());
+            let Some(remaining) = deadline.checked_duration_since(now) else {
                 self.mark_permission_prompt_timed_out();
                 return Err(PermissionBridgeError::TimedOut);
             };
@@ -1874,18 +1884,69 @@ mod js_permission_bridge {
         );
     }
 
-    #[tokio::test]
-    async fn js_permission_bridge_timeout_is_bounded() {
-        let (bridge, mut rx, _shutdown) = raw_bridge(Duration::from_millis(30));
-        let started = Instant::now();
-        let check = tokio::task::spawn_blocking(move || bridge.check("bash", "sleep forever"));
-        let _request = rx.recv().await.expect("permission request should arrive");
+    #[test]
+    fn js_permission_bridge_timeout_is_bounded() {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-        assert_eq!(
-            check.await.expect("permission task should not panic"),
-            Err(PermissionBridgeError::TimedOut)
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let (mut bridge, mut rx, shutdown) = raw_bridge(Duration::from_secs(60));
+        let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
+        bridge.sync_wait_clock = Some(clock.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // This guards a broken wait path, not the duration of a correct check.
+        let hang_guard = Duration::from_secs(15);
+
+        std::thread::scope(|scope| {
+            let (result_tx, mut result_rx) = oneshot::channel();
+            let check = scope.spawn(move || {
+                let _ = result_tx.send(bridge.check("bash", "sleep forever"));
+            });
+            let scenario = catch_unwind(AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    let envelope = tokio::time::timeout(hang_guard, rx.recv())
+                        .await
+                        .expect("permission request readiness stalled")
+                        .expect("permission request channel closed");
+                    assert!(!envelope.request.cancellation().is_cancelled());
+                    assert!(matches!(
+                        result_rx.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                    // Advance only after the actual unanswered request exists.
+                    *clock.lock().unwrap() = envelope.request.deadline() + Duration::from_millis(1);
+                    assert_eq!(
+                        tokio::time::timeout(hang_guard, &mut result_rx)
+                            .await
+                            .expect("permission timeout path stalled")
+                            .expect("permission check thread panicked"),
+                        Err(PermissionBridgeError::TimedOut)
+                    );
+                    assert!(envelope.request.cancellation().is_cancelled());
+                    let PermissionReply::Sync(reply) = envelope.reply else {
+                        panic!("sync permission check used an async reply channel");
+                    };
+                    assert!(
+                        reply
+                            .send(PermResponse::new(
+                                envelope.request.id(),
+                                PermOutcome::Allowed
+                            ))
+                            .is_err(),
+                        "timed-out check retained its response receiver"
+                    );
+                });
+            }));
+            // Release the blocking check on every failure before joining it.
+            shutdown.cancel();
+            drop(rx);
+            let joined = check.join();
+            if let Err(payload) = scenario {
+                resume_unwind(payload);
+            }
+            joined.expect("permission check thread panicked during cleanup");
+        });
     }
 
     #[tokio::test]
