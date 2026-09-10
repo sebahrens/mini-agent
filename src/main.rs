@@ -84,7 +84,8 @@ fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let result = run_inner().await;
+    // Keep the large startup state out of this wrapper's future as CLI grows.
+    let result = Box::pin(run_inner()).await;
     #[cfg(feature = "js")]
     {
         let shutdown = extras::js::supervisor::JsWorkerSupervisor::shutdown_shared().await;
