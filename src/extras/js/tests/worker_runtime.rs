@@ -2526,13 +2526,23 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PermissionDeadlineFault {
+enum InvocationStop {
+    PermissionDeadline,
+    ReadDeadline,
+    CallerDrop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptionFault {
     Pending,
     Cancelling,
+    Dropped,
     Recovered,
 }
 
-fn exercise_permission_deadline(fault: Option<PermissionDeadlineFault>) {
+fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<InterruptionFault>) {
+    use crate::extras::js::supervisor::WORKER_READ_OBSERVER;
+
     let trace = Arc::new(LaunchTrace::default());
     let launch = LaunchFixtureOwner(trace.clone());
     launch.release();
@@ -2549,57 +2559,89 @@ fn exercise_permission_deadline(fault: Option<PermissionDeadlineFault>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         launch_test_runtime().block_on(async {
             let cancellation = PermCancellation::new();
-            let _permission_prompt = cancellation.begin_permission_prompt();
-            // Direct ownership drops the invocation on every failed assertion,
-            // before unconditional shutdown settles native launch/worker work.
-            let request = supervisor.execute(
-                RunStep::new("effect-pending".into()),
-                gated.clone(),
-                cancellation,
-            );
-            tokio::pin!(request);
-            tokio::select! {
-                result = &mut request => panic!("invocation settled before pending permission readiness: {result:?}"),
-                () = gated.wait_started() => {}
+            let _permission_prompt = (stop == InvocationStop::PermissionDeadline)
+                .then(|| cancellation.begin_permission_prompt());
+            let (observed, mut reads) = tokio::sync::mpsc::unbounded_channel();
+            // Own the allocation, so drop(request) drops the actual invocation,
+            // not just a reference to a stack-pinned future.
+            let mut request = Box::pin(WORKER_READ_OBSERVER.scope(
+                observed,
+                supervisor.execute(
+                    RunStep::new(if stop == InvocationStop::ReadDeadline {
+                        "deadline".into()
+                    } else {
+                        "effect-pending".into()
+                    }),
+                    gated.clone(),
+                    cancellation,
+                ),
+            ));
+            if stop == InvocationStop::ReadDeadline {
+                tokio::time::timeout(LAUNCH_FIXTURE_GUARD, async {
+                    tokio::select! {
+                        result = &mut request => panic!("invocation settled before its protocol read: {result:?}"),
+                        read = reads.recv() => read.expect("protocol read observer dropped"),
+                    }
+                }).await.expect("invocation never entered its protocol read");
+                assert!(gated.ordinals.lock().unwrap().is_empty());
+            } else {
+                tokio::select! {
+                    result = &mut request => panic!("invocation settled before its pending effect: {result:?}"),
+                    () = gated.wait_started() => {}
+                }
+                assert_eq!(*gated.ordinals.lock().unwrap(), vec![0]);
+                assert!(!gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled());
             }
-            let effect_cancellation = gated.cancellation.lock().unwrap().clone().unwrap();
-            assert!(!effect_cancellation.is_cancelled());
-            assert_eq!(*gated.ordinals.lock().unwrap(), vec![0]);
             assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
-            inject(PermissionDeadlineFault::Pending);
+            inject(InterruptionFault::Pending);
 
-            // Native startup is complete. Cross the invocation's actual Tokio
-            // deadline, then poll its cancellation/drain path with the effect
-            // still held. Resume time before any native process settlement.
-            tokio::time::pause();
-            tokio::time::advance(LAUNCH_TEST_WATCHDOG + Duration::from_secs(1)).await;
-            let pending = futures::poll!(&mut request).is_pending();
-            tokio::time::resume();
-            assert!(pending, "deadline must first drain the held effect");
-            assert!(effect_cancellation.is_cancelled(), "deadline did not cancel the pending effect");
-            assert!(!gated.dropped.load(Ordering::Acquire), "effect was dropped before its cancellation drain");
-            inject(PermissionDeadlineFault::Cancelling);
-            gated.release();
-            assert_eq!(
-                tokio::time::timeout(LAUNCH_FIXTURE_GUARD, request)
-                    .await
-                    .expect("permission wait escaped the invocation deadline"),
-                Err(WorkerError::PermissionPromptTimedOut)
-            );
-            assert!(!gated.dropped.load(Ordering::Acquire));
-            assert_eq!(trace.live_processes.load(Ordering::Acquire), 0);
+            if stop == InvocationStop::CallerDrop {
+                drop(request);
+                assert!(gated.dropped.load(Ordering::Acquire), "caller drop retained the effect future");
+                assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "caller drop did not cancel the effect");
+                inject(InterruptionFault::Dropped);
+            } else {
+                // Cross the actual timer only after native handshake/write and
+                // read/effect readiness. Native settlement uses a running clock.
+                tokio::time::pause();
+                tokio::time::advance(LAUNCH_TEST_WATCHDOG + Duration::from_secs(1)).await;
+                let polled = futures::poll!(&mut request);
+                tokio::time::resume();
+                if stop == InvocationStop::PermissionDeadline {
+                    assert!(polled.is_pending(), "deadline must first drain the held effect");
+                    assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "deadline did not cancel the pending effect");
+                    assert!(!gated.dropped.load(Ordering::Acquire), "effect was dropped before its cancellation drain");
+                    inject(InterruptionFault::Cancelling);
+                    gated.release();
+                }
+                let result = match polled {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => tokio::time::timeout(LAUNCH_FIXTURE_GUARD, request)
+                        .await.expect("invocation escaped its deadline"),
+                };
+                assert_eq!(result, Err(if stop == InvocationStop::PermissionDeadline {
+                    WorkerError::PermissionPromptTimedOut
+                } else {
+                    WorkerError::TimedOut
+                }));
+                assert!(!gated.dropped.load(Ordering::Acquire));
+            }
         });
-        // A fresh clock gives recovery its own whole-call deadline; the prior
-        // runtime's virtual time must not expire a newly launched native child.
+        assert!(
+            launch.wait_for_quiescence(),
+            "interrupted worker was not reaped before recovery"
+        );
+        // A fresh clock gives native recovery its own whole-call deadline.
         launch_test_runtime().block_on(async {
-            assert_eq!(
-                execute_success(&supervisor).await.outcome,
-                StepOutcome::Value("success".into())
-            );
+            let recovered =
+                tokio::time::timeout(LAUNCH_FIXTURE_GUARD, execute_success(&supervisor))
+                    .await
+                    .expect("interrupted caller retained transport ownership");
+            assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
             assert_eq!(trace.launches.load(Ordering::Acquire), 2);
             assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
             assert_eq!(trace.max_live_processes.load(Ordering::Acquire), 1);
-            inject(PermissionDeadlineFault::Recovered);
+            inject(InterruptionFault::Recovered);
         });
     }));
     gated.release();
@@ -2608,7 +2650,7 @@ fn exercise_permission_deadline(fault: Option<PermissionDeadlineFault>) {
     shutdown.unwrap();
     assert!(
         quiescent,
-        "permission deadline fixture left a launch or worker live"
+        "interruption fixture left a launch or worker live"
     );
     assert!(!trace.gate.lock().unwrap().rescued);
     if let Err(panic) = result {
@@ -2618,69 +2660,39 @@ fn exercise_permission_deadline(fault: Option<PermissionDeadlineFault>) {
 
 #[test]
 fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
-    exercise_permission_deadline(None);
+    exercise_invocation_interruption(InvocationStop::PermissionDeadline, None);
 }
 
 #[test]
-fn worker_supervisor_permission_deadline_fixture_settles_after_failures() {
-    for fault in [
-        PermissionDeadlineFault::Pending,
-        PermissionDeadlineFault::Cancelling,
-        PermissionDeadlineFault::Recovered,
+fn worker_supervisor_interruption_fixture_settles_after_failures() {
+    // Shared effect startup, cancellation drain, and recovered-worker cleanup
+    // are covered once. Add only the distinct blocked-read and explicit-drop exits.
+    for (stop, fault) in [
+        (
+            InvocationStop::PermissionDeadline,
+            InterruptionFault::Pending,
+        ),
+        (
+            InvocationStop::PermissionDeadline,
+            InterruptionFault::Cancelling,
+        ),
+        (
+            InvocationStop::PermissionDeadline,
+            InterruptionFault::Recovered,
+        ),
+        (InvocationStop::ReadDeadline, InterruptionFault::Pending),
+        (InvocationStop::CallerDrop, InterruptionFault::Dropped),
     ] {
-        let result = std::panic::catch_unwind(|| exercise_permission_deadline(Some(fault)))
-            .expect_err("injected permission deadline failure must propagate after cleanup");
-        assert_eq!(
-            result.downcast_ref::<PermissionDeadlineFault>(),
-            Some(&fault)
-        );
+        let result =
+            std::panic::catch_unwind(|| exercise_invocation_interruption(stop, Some(fault)))
+                .expect_err("injected interruption failure must propagate after cleanup");
+        assert_eq!(result.downcast_ref::<InterruptionFault>(), Some(&fault));
     }
 }
 
-#[tokio::test]
-async fn worker_supervisor_recovery_watchdog_and_caller_drop() {
-    // One second remains far below the scripted 30-second stall while leaving enough scheduling
-    // margin for the replacement child to authenticate during a fully parallel test run.
-    let (supervisor, launcher) =
-        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(1));
-    assert_eq!(
-        supervisor
-            .execute(
-                RunStep::new("deadline".into()),
-                RecordingEffects::default(),
-                PermCancellation::new(),
-            )
-            .await,
-        Err(WorkerError::TimedOut)
-    );
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-
-    let gated = GatedEffects::new();
-    let task_supervisor = supervisor.clone();
-    let task_effects = gated.clone();
-    let dropped = tokio::spawn(async move {
-        task_supervisor
-            .execute(
-                RunStep::new("effect-pending".into()),
-                task_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    gated.wait_started().await;
-    dropped.abort();
-    assert!(dropped.await.unwrap_err().is_cancelled());
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-
-    launcher.wait_for_live_processes(1).await;
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
+#[test]
+fn worker_supervisor_protocol_read_deadline_reaps_and_recovers() {
+    exercise_invocation_interruption(InvocationStop::ReadDeadline, None);
 }
 
 #[cfg(unix)]
@@ -3629,38 +3641,9 @@ async fn worker_supervisor_transport_cancellation_marks_started_effect_unknown_a
     assert!(supervisor.generation_for_test().await.unwrap() > first_generation);
 }
 
-#[tokio::test]
-async fn worker_supervisor_transport_dropped_caller_releases_owner_and_cancels_handler() {
-    let supervisor = scripted_supervisor(0);
-    let gated = GatedEffects::new();
-    let task_supervisor = supervisor.clone();
-    let task_effects = gated.clone();
-    let task = tokio::spawn(async move {
-        task_supervisor
-            .execute(
-                RunStep::new("effect-pending".into()),
-                task_effects,
-                PermCancellation::new(),
-            )
-            .await
-    });
-    gated.wait_started().await;
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-
-    let recovered = tokio::time::timeout(
-        Duration::from_secs(5),
-        supervisor.execute(
-            RunStep::new("success".into()),
-            RecordingEffects::default(),
-            PermCancellation::new(),
-        ),
-    )
-    .await
-    .expect("dropped caller retained transport ownership")
-    .unwrap();
-    assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
-    assert!(gated.dropped.load(Ordering::Acquire));
+#[test]
+fn worker_supervisor_transport_dropped_caller_releases_owner_and_cancels_handler() {
+    exercise_invocation_interruption(InvocationStop::CallerDrop, None);
 }
 
 #[tokio::test]

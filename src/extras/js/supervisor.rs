@@ -52,6 +52,8 @@ const MAX_PROCESS_INVOCATIONS: u64 = 256;
 tokio::task_local! {
     /// First poll of the actual interactive transport lease (true means acquired).
     pub(crate) static TRANSPORT_LOCK_OBSERVER: tokio::sync::mpsc::UnboundedSender<bool>;
+    /// First poll of an invocation protocol read after its parent frame was written.
+    pub(crate) static WORKER_READ_OBSERVER: tokio::sync::mpsc::UnboundedSender<()>;
 }
 
 pub(crate) type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectResult> + Send + 'a>>;
@@ -1904,7 +1906,22 @@ async fn run_invocation<H: InvocationEffectHandler>(
     connection.sequence = advance(connection.sequence)?;
 
     loop {
-        let frame = read_worker(connection, false, cancellation, deadline).await?;
+        let frame = read_worker(connection, false, cancellation, deadline);
+        #[cfg(test)]
+        let frame = async {
+            tokio::pin!(frame);
+            let mut observed = false;
+            std::future::poll_fn(|cx| {
+                let result = frame.as_mut().poll(cx);
+                if !observed {
+                    observed = true;
+                    let _ = WORKER_READ_OBSERVER.try_with(|observer| observer.send(()));
+                }
+                result
+            })
+            .await
+        };
+        let frame = frame.await?;
         connection
             .protocol
             .on_receive(&frame)

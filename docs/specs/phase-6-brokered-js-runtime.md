@@ -995,14 +995,18 @@ general-command sandbox, whose own native gate passed independently in the same 
 
 ## Failure semantics
 
-The pending-permission deadline regression waits for a native worker's held
-effect before advancing the invocation timer. It observes cancellation while
-the effect remains held, releases the effect to finish its drain, and requires
-`PermissionPromptTimedOut`. Recovery runs on a fresh clock and must launch one
-replacement worker. The fixture directly owns its invocation future and settles
-the supervisor and native launch owner on every exit; failure controls cover the
-pending effect, cancellation drain, and recovered worker. It reuses the shared
-launch owner rather than duplicating launch lifecycle controls.
+Protocol-read timeout, pending-permission timeout, and caller-drop regressions
+share one owned interruption fixture. The read case observes the actual parent
+reader after the invocation frame is written, then advances its timer and
+requires `TimedOut`. The permission case waits for a held effect, observes
+cancellation after advancing the timer, releases the effect to finish its drain,
+and requires `PermissionPromptTimedOut`. The caller-drop case drops the actual
+invocation future and checks effect destruction and cancellation. Each case
+reaps the old worker before fresh-clock recovery launches one replacement.
+Unconditional cleanup settles the supervisor and shared native launch owner;
+failure controls cover common pending-effect, cancellation-drain, and recovered
+states once, plus the distinct blocked-read and explicit-drop exits. The read
+observer exists only in tests and does not alter the worker protocol.
 
 Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,
 `javascript_exception`, `promise_rejection`, `host`, `permission`, `validation`, `timeout`,
