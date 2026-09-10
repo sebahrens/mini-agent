@@ -1141,20 +1141,20 @@ mod tests {
             }
         }
 
-        struct CommandGate {
-            script: PathBuf,
+        pub(super) struct CommandGate {
+            pub(super) script: PathBuf,
             ready: PathBuf,
             finished: PathBuf,
             release: Arc<(Mutex<ReleaseState>, Condvar)>,
             rescuer: Option<std::thread::JoinHandle<()>>,
         }
 
-        fn quote(path: &Path) -> String {
+        pub(super) fn quote(path: &Path) -> String {
             format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"))
         }
 
         impl CommandGate {
-            fn new(repo: &Path, name: &str) -> Self {
+            pub(super) fn new(repo: &Path, name: &str) -> Self {
                 let dir = repo.join(".git").join(name);
                 std::fs::create_dir(&dir).unwrap();
                 let fifo = dir.join("release");
@@ -1207,13 +1207,33 @@ mod tests {
                 }
             }
 
-            fn release(&self) {
+            pub(super) fn release(&self) {
                 let (state, wake) = &*self.release;
                 state.lock().unwrap().release();
                 wake.notify_all();
             }
 
-            async fn wait_started(&self, task: &GitTask, expected_cwd: &Path) {
+            pub(super) fn settle(&mut self) -> Result<(), &'static str> {
+                self.release();
+                let joined = self.rescuer.take().map(|rescuer| rescuer.join());
+                if joined.is_some_and(|result| result.is_err()) {
+                    return Err("command rescue thread panicked");
+                }
+                let state = self.release.0.lock().unwrap();
+                if state.rescued {
+                    return Err("command needed fixture rescue");
+                }
+                if state.write_failed {
+                    return Err("command gate release failed");
+                }
+                Ok(())
+            }
+
+            pub(super) async fn wait_started(&self, task: &GitTask, expected_cwd: &Path) {
+                self.wait_ready(|| task.is_finished(), expected_cwd).await;
+            }
+
+            pub(super) async fn wait_ready(&self, stopped: impl Fn() -> bool, expected_cwd: &Path) {
                 let cwd = tokio::time::timeout(FIXTURE_GUARD, async {
                     loop {
                         // Opening the marker precedes printf's write. Wait for
@@ -1223,14 +1243,14 @@ mod tests {
                         {
                             break cwd;
                         }
-                        assert!(!task.is_finished(), "Git command stopped before readiness");
+                        assert!(!stopped(), "Git command stopped before readiness");
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
                 .await
                 .expect("Git command did not announce readiness");
                 assert_eq!(cwd.strip_suffix('\n'), expected_cwd.to_str());
-                assert!(!task.is_finished(), "held Git command already finished");
+                assert!(!stopped(), "held Git command already finished");
                 assert!(
                     !self.finished.exists(),
                     "Git command bypassed its release gate"
@@ -1308,24 +1328,13 @@ mod tests {
                         results.push(task.await);
                     }
                 }
-                let joins: Vec<_> = self
-                    .gates
-                    .iter_mut()
-                    .filter_map(|gate| gate.rescuer.take())
-                    .map(|rescuer| rescuer.join())
-                    .collect();
+                let settled: Vec<_> = self.gates.iter_mut().map(CommandGate::settle).collect();
                 // Validate only after every command and rescue thread is joined.
                 for result in results {
                     result.unwrap().unwrap();
                 }
-                assert!(joins.iter().all(Result::is_ok));
-                for gate in &self.gates {
-                    let (rescued, write_failed) = {
-                        let state = gate.release.0.lock().unwrap();
-                        (state.rescued, state.write_failed)
-                    };
-                    assert!(!rescued, "command needed fixture rescue");
-                    assert!(!write_failed, "command gate release failed");
+                for result in settled {
+                    result.unwrap();
                 }
             }
         }
@@ -1786,66 +1795,207 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum CreateFixtureFailure {
+        None,
+        BeforeReadiness,
+        AfterReadiness,
+        DuringRollback,
+        Rollback,
+    }
+
+    #[cfg(unix)]
+    async fn exercise_create_cancellation(
+        failure: CreateFixtureFailure,
+        base: &Path,
+        cleanup_ok: &mut bool,
+    ) {
+        use futures::FutureExt;
+
+        struct WorktreeBase<'a>(&'a Path);
+        impl Drop for WorktreeBase<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+
+        let repo = TempRepo::new("dropped create 'rollback'");
+        // Own the sibling directory before setup can fail, through the final
+        // rollback rendezvous. TempRepo owns the hook and FIFO separately.
+        let _base = WorktreeBase(base);
+        std::fs::create_dir_all(base).unwrap();
+        let target = base.canonicalize().unwrap().join("create-dropped");
+        let mut rollback_gate = concurrency::CommandGate::new(repo.path(), "rollback-gate");
+        let mut gate = concurrency::CommandGate::new(repo.path(), "create-gate");
+        std::fs::copy(&gate.script, repo.path().join(".git/hooks/post-checkout")).unwrap();
+        let repo_path = repo.path().to_path_buf();
+        let base_path = base.to_path_buf();
+        let mut task = Some(tokio::spawn(async move {
+            create(&repo_path, "create-dropped", Some(&base_path))
+                .await
+                .map(|_| ())
+        }));
+
+        let outcome = std::panic::AssertUnwindSafe(async {
+            if matches!(failure, CreateFixtureFailure::BeforeReadiness) {
+                panic!("injected before create readiness");
+            }
+            gate.wait_started(task.as_ref().unwrap(), &target).await;
+            if matches!(failure, CreateFixtureFailure::AfterReadiness) {
+                panic!("injected after create readiness");
+            }
+            // Reservation has committed. Hold the later ref-deletion
+            // transaction to observe admission during actual rollback.
+            let hook = repo.path().join(".git/hooks/reference-transaction");
+            std::fs::copy(&gate.script, &hook).unwrap();
+            std::fs::write(&hook, format!(
+                "#!/bin/sh\nif [ \"$1\" = prepared ]; then\n. {}\nexit {}\nfi\nexit 0\n",
+                concurrency::quote(&rollback_gate.script),
+                u8::from(matches!(failure, CreateFixtureFailure::Rollback)),
+            )).unwrap();
+            task.as_ref().unwrap().abort();
+            let joined = task.take().unwrap().await;
+            assert!(joined.unwrap_err().is_cancelled());
+            rollback_gate.wait_ready(|| false, &repo.path().canonicalize().unwrap()).await;
+            if matches!(failure, CreateFixtureFailure::DuringRollback) {
+                panic!("injected during create rollback");
+            }
+            let (observer, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let runner = crate::git::runner::GitRunner::default();
+            let mut admission = Box::pin(crate::git::runner::MUTATION_LOCK_OBSERVER.scope(
+                observer, runner.acquire_mutation(repo.path()),
+            ));
+            let (key, ready) = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
+                tokio::select! {
+                    _ = &mut admission => panic!("repository admission escaped unfinished create rollback"),
+                    event = events.recv() => event.expect("repository admission was not observed"),
+                }
+            }).await.expect("repository admission did not reach its lock");
+            assert_eq!(key, repo.path().join(".git").canonicalize().unwrap());
+            assert!(!ready, "repository admission escaped unfinished create rollback");
+            rollback_gate.release();
+            let _admission = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, admission)
+                .await.expect("create rollback did not release repository admission").unwrap();
+
+            // Inspect rollback while owning repository admission and before
+            // the fixture releases its hook. Release/rescue cannot make these
+            // assertions pass after a broken production cancellation path.
+            assert!(
+                !target.exists(),
+                "dropped create left its worktree directory"
+            );
+            assert!(
+                !optional_test_ref_exists(repo.path(), "refs/heads/create-dropped"),
+                "dropped create left its branch ref"
+            );
+            assert!(
+                !git_stdout(repo.path(), ["worktree", "list", "--porcelain"])
+                    .contains(&target.to_string_lossy().into_owned()),
+                "dropped create left its worktree registration"
+            );
+            assert!(
+                git_stdout(
+                    repo.path(),
+                    [
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "refs/mini-agent/worktree-create/"
+                    ]
+                )
+                .is_empty(),
+                "dropped create left its ownership ref"
+            );
+        })
+        .catch_unwind()
+        .await;
+
+        // Always cancel/join the caller, release the native hook, and await
+        // the transaction supervisor's lock release, including readiness and
+        // rollback assertion failures. Keep its repository alive until then.
+        let joined = if let Some(task) = task.take() {
+            task.abort();
+            Some(task.await)
+        } else {
+            None
+        };
+        gate.release();
+        rollback_gate.release();
+        let cleanup = std::panic::AssertUnwindSafe(async {
+            drop(acquire_released_mutation_lock(repo.path(), "create fixture cleanup").await);
+        })
+        .catch_unwind()
+        .await;
+        let settled = [gate.settle(), rollback_gate.settle()];
+        *cleanup_ok = cleanup.is_ok()
+            && settled.iter().all(Result::is_ok)
+            && joined
+                .as_ref()
+                .is_none_or(|result| result.as_ref().is_err_and(|error| error.is_cancelled()));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        if let Some(joined) = joined {
+            assert!(joined.unwrap_err().is_cancelled());
+        }
+        for result in settled {
+            result.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_worktree_create_rolls_back_before_releasing_the_repository() {
-        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("mini-agent-create-base-{}", uuid::Uuid::new_v4()));
+        let mut cleanup_ok = false;
+        exercise_create_cancellation(CreateFixtureFailure::None, &base, &mut cleanup_ok).await;
+        assert!(cleanup_ok, "create fixture cleanup did not settle");
+        assert!(!base.exists(), "create fixture left its sibling base");
+    }
 
-        let repo = TempRepo::new("dropped create rollback");
-        let base = repo.path().with_extension("dropped create base");
-        std::fs::create_dir_all(&base).unwrap();
-        let target = base.join("create-dropped");
-        let started = repo.path().join("create-hook-started");
-        let hook = repo.path().join(".git/hooks/post-checkout");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 30\n",
-                started.display()
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_cancellation_fixture_cleans_up_readiness_and_rollback_failures() {
+        use futures::FutureExt;
+        for (failure, expected) in [
+            (
+                CreateFixtureFailure::BeforeReadiness,
+                "injected before create readiness",
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
-        let repo_path = repo.path().to_path_buf();
-        let base_path = base.clone();
-        let task =
-            tokio::spawn(
-                async move { create(&repo_path, "create-dropped", Some(&base_path)).await },
+            (
+                CreateFixtureFailure::AfterReadiness,
+                "injected after create readiness",
+            ),
+            (
+                CreateFixtureFailure::DuringRollback,
+                "injected during create rollback",
+            ),
+            (
+                CreateFixtureFailure::Rollback,
+                "dropped create left its branch ref",
+            ),
+        ] {
+            let base = std::env::temp_dir()
+                .join(format!("mini-agent-create-base-{}", uuid::Uuid::new_v4()));
+            let mut cleanup_ok = false;
+            let panic = std::panic::AssertUnwindSafe(exercise_create_cancellation(
+                failure,
+                &base,
+                &mut cleanup_ok,
+            ))
+            .catch_unwind()
+            .await
+            .expect_err("fixture failure must propagate after cleanup");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+            assert!(cleanup_ok, "failed create fixture cleanup did not settle");
+            assert!(
+                !base.exists(),
+                "failed create fixture left its sibling base"
             );
-
-        for _ in 0..200 {
-            if started.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(started.exists(), "post-checkout hook did not start");
-        task.abort();
-        let _ = task.await;
-        let admission =
-            acquire_released_mutation_lock(repo.path(), "dropped worktree create").await;
-        run_git_with_limits_for_test(
-            repo.path(),
-            &["status", "--porcelain"],
-            test_limits(Duration::from_secs(2)),
-        )
-        .await
-        .expect("status after dropped create");
-        drop(admission);
-
-        assert!(
-            !target.exists(),
-            "dropped create left its worktree directory"
-        );
-        let ref_status = Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(["show-ref", "--verify", "refs/heads/create-dropped"])
-            .status()
-            .unwrap();
-        assert!(!ref_status.success(), "dropped create left its branch ref");
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

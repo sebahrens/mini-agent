@@ -124,6 +124,18 @@ drains scoped work before propagating; cleanup polling cannot satisfy the earlie
 acceptance snapshot. These tests cover GitRunner's integration with the general
 subprocess lifecycle, alongside the sandbox's backend-specific tree tests.
 
+Worktree-create caller-drop coverage reuses the Git concurrency fixture's owned
+command gates. A held post-checkout hook establishes native readiness; a second
+hook holds the rollback ref transaction while another caller attempts repository
+admission. That caller must wait until rollback releases the repository lock.
+Before releasing the checkout fixture, the test verifies removal of the worktree,
+registration, branch, and private ownership ref. Failure controls cover setup
+before readiness, failure after readiness, failure during held rollback, and real
+Git rejection of rollback's ref transaction. Every path aborts and joins the caller,
+releases both hooks, awaits the supervisor's repository-lock release, and removes
+the sibling worktree base. The original panic and successful cleanup are checked
+independently, so a secondary cleanup failure cannot pass a failure-control test.
+
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.
