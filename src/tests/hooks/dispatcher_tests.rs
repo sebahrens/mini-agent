@@ -461,14 +461,23 @@ async fn cancelling_owning_work_scope_terminates_async_hook_descendants() {
         .await;
 
     let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !pid_file.exists() && tokio::time::Instant::now() < ready_deadline {
+    // The hook's `echo $$ > file` redirection creates the pid file before the
+    // shell writes into it, so waiting for existence alone can read it empty
+    // and fail parsing. Wait for a parsable pid, which is the readiness this
+    // test actually depends on.
+    let descendant_pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid != 0
+        {
+            break pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "async descendant should start before dispatch cancellation"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
-        .expect("async descendant should start before dispatch cancellation")
-        .trim()
-        .parse()
-        .unwrap();
+    };
     work_scope.cancellation_handle().cancel();
     tokio::time::timeout(std::time::Duration::from_secs(2), work_scope.wait_idle())
         .await
