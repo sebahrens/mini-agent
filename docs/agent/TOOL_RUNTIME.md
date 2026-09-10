@@ -41,7 +41,14 @@ UTF-8 files are accepted; symlinks, special files, and oversized content are ref
 The read itself stays bounded even if the file grows after its size check. Atomic
 replacement saves are supported. Valid edits survive an editor failure; rejected
 readback leaves the original input intact, and combined exit/read failures report
-both causes.
+both causes. The private editor directory is bound to a retained handle; replacing
+that directory makes readback and cleanup fail without accepting or deleting the
+replacement's contents. Successful readback cleans up at most 128 sibling artifacts
+(including backups), without following links or traversing subdirectories. Rejected
+readback, excessive artifacts, or subdirectories retain recovery files and report
+their location. If the directory moved, the notice identifies its original path
+without claiming the original files are still there. Cleanup failures are surfaced
+after terminal restoration; valid edits remain in the input buffer.
 `src/ui/prebuild.rs` owns background agent construction and its work scope. It
 lets cancelled MCP initialization finish process cleanup, explicitly closes MCP
 managers in rejected or queued prebuild results, and waits for scoped children.

@@ -21,10 +21,45 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 const MAX_EDITOR_BYTES: u64 = 4 * 1024 * 1024;
 
 #[cfg(not(windows))]
+const MAX_EDITOR_ARTIFACTS: usize = 128;
+
+#[cfg(not(windows))]
 struct EditorTemp {
     path: std::path::PathBuf,
     directory: std::path::PathBuf,
+    handle: cap_std::fs::Dir,
+    identity: crate::fs::CheckedMetadata,
+    cleanup_attempted: bool,
 }
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct EditorFilesRetained {
+    directory: std::path::PathBuf,
+    directory_is_current: bool,
+}
+
+#[cfg(not(windows))]
+impl std::fmt::Display for EditorFilesRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.directory_is_current {
+            write!(
+                f,
+                "editor files retained for recovery in {}",
+                self.directory.display()
+            )
+        } else {
+            write!(
+                f,
+                "editor directory changed; files left untouched (original path: {})",
+                self.directory.display()
+            )
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl std::error::Error for EditorFilesRetained {}
 
 #[cfg(not(windows))]
 impl EditorTemp {
@@ -36,32 +71,65 @@ impl EditorTemp {
             std::env::temp_dir().join(format!("zerostack-editor-{}", uuid::Uuid::new_v4()));
         crate::fs::ensure_private_directory(&directory)?;
         let path = directory.join("message.md");
-        if let Err(error) = crate::fs::private_atomic_create_sync(&path, contents) {
-            let _ = std::fs::remove_dir(&directory);
-            return Err(error);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
-        Ok(Self { path, directory })
+        let file = options.open(&directory)?;
+        let identity = crate::fs::checked_file_metadata(&file)?;
+        let temp = Self {
+            path,
+            directory,
+            handle: cap_std::fs::Dir::from_std_file(file),
+            identity,
+            cleanup_attempted: false,
+        };
+        temp.validate_directory()?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        temp.handle
+            .open_with("message.md", &options)?
+            .write_all(contents)?;
+        Ok(temp)
+    }
+
+    fn validate_directory(&self) -> std::io::Result<()> {
+        crate::fs::ensure_same_file(
+            &self.directory,
+            &self.identity,
+            &crate::fs::checked_path_metadata(&self.directory)?,
+        )
     }
 
     fn read_contents(&self) -> std::io::Result<String> {
+        self.validate_directory()?;
         let not_regular = || {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "edited draft must be a regular file, not a symlink or special file",
             )
         };
-        if !std::fs::symlink_metadata(&self.path)?.is_file() {
+        if !self.handle.symlink_metadata("message.md")?.is_file() {
             return Err(not_regular());
         }
-        let mut options = std::fs::OpenOptions::new();
+        let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use cap_std::fs::OpenOptionsExt;
             // A regular file may be replaced between metadata and open.
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let file = options.open(&self.path)?;
+        let file = self.handle.open_with("message.md", &options)?.into_std();
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(not_regular());
@@ -69,15 +137,53 @@ impl EditorTemp {
         if metadata.len() > MAX_EDITOR_BYTES {
             return Err(editor_draft_too_large());
         }
-        read_editor_text(file)
+        let contents = read_editor_text(file)?;
+        self.validate_directory()?;
+        Ok(contents)
+    }
+
+    fn retain(&mut self) -> EditorFilesRetained {
+        self.cleanup_attempted = true;
+        EditorFilesRetained {
+            directory: self.directory.clone(),
+            directory_is_current: self.validate_directory().is_ok(),
+        }
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        // One attempt only: a reported failure must not trigger a second,
+        // unreported deletion when Drop runs.
+        self.cleanup_attempted = true;
+        self.validate_directory()?;
+        let mut names = Vec::new();
+        // Preflight the complete bounded set before removing any recovery data.
+        // Never descend into editor-created directories or follow backup links.
+        for entry in self.handle.entries()?.take(MAX_EDITOR_ARTIFACTS + 1) {
+            let entry = entry?;
+            if names.len() == MAX_EDITOR_ARTIFACTS || entry.file_type()?.is_dir() {
+                return Err(std::io::Error::other(
+                    "editor cleanup requires at most 128 artifacts and no subdirectories",
+                ));
+            }
+            names.push(entry.file_name());
+        }
+        self.validate_directory()?;
+        for name in names {
+            self.handle.remove_file(name)?;
+        }
+        self.validate_directory()?;
+        std::fs::remove_dir(&self.directory)
     }
 }
 
 #[cfg(not(windows))]
 impl Drop for EditorTemp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_dir(&self.directory);
+        if !self.cleanup_attempted
+            && let Err(error) = self.cleanup()
+        {
+            tracing::warn!(directory = %self.directory.display(), %error, "editor cleanup incomplete");
+        }
     }
 }
 
@@ -349,7 +455,7 @@ impl InputEditor {
             .or_else(|| std::env::var("EDITOR").ok())
             .unwrap_or_else(|| "editor".to_string());
 
-        let tmp = EditorTemp::create(self.buffer.as_bytes())?;
+        let mut tmp = EditorTemp::create(self.buffer.as_bytes())?;
 
         let result = std::process::Command::new("sh")
             .arg("-c")
@@ -375,11 +481,23 @@ impl InputEditor {
                 );
                 Ok(())
             });
-        match (command, contents) {
+        let read_failed = contents.is_err();
+        let result = match (command, contents) {
             (Err(error), Err(read_error)) => Err(error.context(format!("{read_error:#}"))),
             (Err(error), _) => Err(error),
             (Ok(()), contents) => contents.map(|_| ()),
+        };
+        if read_failed {
+            return result.context(tmp.retain());
         }
+        if let Err(cleanup_error) = tmp.cleanup() {
+            return match result {
+                Ok(()) => Err(anyhow::Error::from(cleanup_error)),
+                Err(error) => Err(error.context(format!("editor cleanup failed: {cleanup_error}"))),
+            }
+            .context(tmp.retain());
+        }
+        result
     }
 
     pub fn handle_paste(&mut self, data: String) {
@@ -979,12 +1097,63 @@ mod editor_temp_tests {
                 "original draft  \n",
                 &["4194304-byte limit"],
             ),
+            (
+                "sh -c 'printf edited > \"$1\"; mkdir \"$1.d\"' sh",
+                "edited",
+                &["no subdirectories", "retained for recovery"],
+            ),
+            (
+                "sh -c 'printf edited > \"$1\"; mkdir \"$1.d\"; exit 7' sh",
+                "edited",
+                &[
+                    "no subdirectories",
+                    "retained for recovery",
+                    "exited with",
+                    "7",
+                ],
+            ),
         ];
         for &(command, expected, errors) in cases {
+            let record = std::env::temp_dir().join(format!("editor-test-{}", uuid::Uuid::new_v4()));
             let mut input = super::InputEditor::new();
             input.load_text("original draft  \n");
-            input.set_editor(command.to_string());
+            // Every real editor invocation writes a sibling backup. Record its
+            // directory independently so success also proves full cleanup.
+            input.set_editor(format!(
+                "printf '%s' \"$1\" > '{}'; cp \"$1\" \"$1~\"; {command}",
+                record.to_str().unwrap().replace('\'', "'\\''")
+            ));
             let result = input.edit_buffer();
+            let draft = std::path::PathBuf::from(std::fs::read_to_string(&record).unwrap());
+            std::fs::remove_file(record).unwrap();
+            let directory = draft.parent().unwrap();
+            let retained = result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<super::EditorFilesRetained>());
+            let backup = std::fs::read(draft.with_file_name("message.md~"));
+            let directory_exists = directory.exists();
+            // Only fixture-owned paths; remove retained data even if a later
+            // assertion fails while testing a deliberately broken version.
+            if directory_exists {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+            let should_retain = errors.iter().any(|e| {
+                matches!(
+                    *e,
+                    "could not read edited draft"
+                        | "regular file"
+                        | "4194304-byte limit"
+                        | "retained for recovery"
+                )
+            });
+            assert_eq!(retained.is_some(), should_retain, "{command}: {result:?}");
+            assert_eq!(directory_exists, should_retain, "{command}");
+            if let Some(retained) = retained {
+                assert!(retained.directory_is_current);
+                assert_eq!(retained.directory, directory);
+                assert_eq!(backup.unwrap(), b"original draft  \n");
+            }
             assert_eq!(input.buffer.as_str(), expected, "{command}");
             if errors.is_empty() {
                 result.unwrap();
@@ -1026,9 +1195,13 @@ mod editor_temp_tests {
 
     #[test]
     fn editor_temp_is_private_and_removed_on_drop() {
+        let target = std::env::temp_dir().join(format!("editor-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&target, b"foreign data").unwrap();
         let temp = EditorTemp::create(b"secret draft").unwrap();
         let path = temp.path.clone();
         let directory = temp.directory.clone();
+        std::fs::write(directory.join("message.md~"), b"editor backup").unwrap();
+        std::os::unix::fs::symlink(&target, directory.join("linked-backup")).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1038,7 +1211,71 @@ mod editor_temp_tests {
             0o700
         );
         drop(temp);
+        let foreign_contents = std::fs::read(&target);
+        std::fs::remove_file(target).unwrap();
         assert!(!path.exists());
         assert!(!directory.exists());
+        assert_eq!(foreign_contents.unwrap(), b"foreign data");
+    }
+
+    #[test]
+    fn cleanup_budget_preflights_before_deleting_recovery_data() {
+        for count in [super::MAX_EDITOR_ARTIFACTS, super::MAX_EDITOR_ARTIFACTS + 1] {
+            let mut temp = EditorTemp::create(b"original draft").unwrap();
+            let directory = temp.directory.clone();
+            for i in 1..count {
+                std::fs::write(directory.join(format!("backup-{i}")), b"backup").unwrap();
+            }
+            let result = temp.cleanup();
+            drop(temp);
+            if count == super::MAX_EDITOR_ARTIFACTS {
+                result.unwrap();
+                assert!(!directory.exists());
+            } else {
+                let remaining = std::fs::read_dir(&directory).unwrap().count();
+                let draft = std::fs::read(directory.join("message.md")).unwrap();
+                std::fs::remove_dir_all(directory).unwrap();
+                assert!(result.is_err());
+                assert_eq!(
+                    remaining, count,
+                    "preflight refusal must preserve all artifacts"
+                );
+                assert_eq!(draft, b"original draft");
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_editor_root_is_neither_read_nor_cleaned() {
+        for symlink in [false, true] {
+            let temp = EditorTemp::create(b"owned draft").unwrap();
+            let directory = temp.directory.clone();
+            let saved = directory.with_extension("saved");
+            let foreign = directory.with_extension("foreign");
+            std::fs::rename(&directory, &saved).unwrap();
+            std::fs::create_dir(&foreign).unwrap();
+            std::fs::write(foreign.join("message.md"), b"foreign draft").unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&foreign, &directory).unwrap();
+            } else {
+                std::fs::rename(&foreign, &directory).unwrap();
+            }
+            let read_result = temp.read_contents();
+            drop(temp);
+            let foreign_contents = std::fs::read(if symlink {
+                foreign.join("message.md")
+            } else {
+                directory.join("message.md")
+            });
+            let owned_contents = std::fs::read(saved.join("message.md"));
+            // Clean fixture-owned paths before assertions, including on the
+            // intentionally broken implementation used by the negative control.
+            let _ = std::fs::remove_dir_all(&directory);
+            let _ = std::fs::remove_dir_all(&foreign);
+            std::fs::remove_dir_all(&saved).unwrap();
+            assert!(read_result.is_err(), "replacement must not become input");
+            assert_eq!(foreign_contents.unwrap(), b"foreign draft");
+            assert_eq!(owned_contents.unwrap(), b"owned draft");
+        }
     }
 }
