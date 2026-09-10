@@ -426,80 +426,265 @@ async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisi
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn cancelling_owning_work_scope_terminates_async_hook_descendants() {
-    let pid_file = std::env::temp_dir().join(format!(
-        "zerostack-hooks-async-cancel-descendant-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&pid_file);
-    let command = format!(
-        "sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & wait",
-        pid_file.display()
-    );
-    let config = config_with("Stop", None, vec![async_handler(&command)]);
-    let dispatcher = std::sync::Arc::new(HookDispatcher::from_config(&config).unwrap());
-    let work_scope = crate::agent::runner::AgentWorkScope::new();
-    work_scope
-        .run({
-            let dispatcher = std::sync::Arc::clone(&dispatcher);
-            async move {
-                dispatcher
-                    .dispatch(
-                        "Stop",
-                        None,
-                        &ctx(),
-                        EventFields::Stop {
-                            stop_hook_active: false,
-                            loop_iteration: None,
-                            loop_active: None,
-                        },
-                    )
-                    .await
-            }
-        })
-        .await;
-
-    let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    // The hook's `echo $$ > file` redirection creates the pid file before the
-    // shell writes into it, so waiting for existence alone can read it empty
-    // and fail parsing. Wait for a parsable pid, which is the readiness this
-    // test actually depends on.
-    let descendant_pid: u32 = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file)
-            && let Ok(pid) = text.trim().parse::<u32>()
-            && pid != 0
-        {
-            break pid;
-        }
-        assert!(
-            tokio::time::Instant::now() < ready_deadline,
-            "async descendant should start before dispatch cancellation"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
-    work_scope.cancellation_handle().cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(2), work_scope.wait_idle())
-        .await
-        .expect("owned async hook should settle after cancellation");
-
-    let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while process_is_alive(descendant_pid) && tokio::time::Instant::now() < cleanup_deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(!process_is_alive(descendant_pid));
-    let _ = std::fs::remove_file(pid_file);
+#[derive(Clone, Copy)]
+enum HookFixtureFailure {
+    None,
+    BeforeReadiness,
+    AfterRoot,
+    AfterTree,
 }
 
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+async fn exercise_async_hook_cancellation(
+    failure: HookFixtureFailure,
+    directory: &std::path::Path,
+    cleanup_ok: &mut bool,
+) {
+    use crate::tests::process_gate::ProcessGate;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::tests::process_state::{ProcessIdentity, ProcessState};
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    const GUARD: Duration = Duration::from_secs(15);
+    struct Directory<'a>(&'a std::path::Path);
+    impl Drop for Directory<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+    let _directory = Directory(directory);
+    std::fs::create_dir(directory).unwrap();
+    let root_record = directory.join("root.pid");
+    let descendant_record = directory.join("descendant.pid");
+    let release = directory.join("release");
+    let mut gate = ProcessGate::new(&release).unwrap();
+    let quote =
+        |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let command = format!(
+        "printf '%s\\n' \"$$\" > {}; sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; IFS= read -r release < \"$2\"' held-descendant {} {} & wait",
+        quote(&root_record),
+        quote(&descendant_record),
+        quote(&release),
+    );
+    let config = config_with(
+        "Stop",
+        None,
+        vec![HookHandler {
+            // The fixture owns native readiness/release. The production timeout
+            // must not compete with its readiness and cleanup guards.
+            timeout: Some(60),
+            ..async_handler(&command)
+        }],
+    );
+    let dispatcher = HookDispatcher::from_config(&config).unwrap();
+    let work_scope = crate::agent::runner::AgentWorkScope::new();
+    let mut pids = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut identities = Vec::new();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(
+            GUARD,
+            work_scope.run(dispatcher.dispatch(
+                "Stop",
+                None,
+                &ctx(),
+                EventFields::Stop {
+                    stop_hook_active: false,
+                    loop_iteration: None,
+                    loop_active: None,
+                },
+            )),
+        )
+        .await
+        .expect("async hook dispatch did not return");
+        assert!(
+            work_scope.active_children() > 0,
+            "async hook was not owned by its scope"
+        );
+        if matches!(failure, HookFixtureFailure::BeforeReadiness) {
+            panic!("injected before async hook readiness");
+        }
+        for path in [&root_record, &descendant_record] {
+            let pid = tokio::time::timeout(GUARD, async {
+                loop {
+                    // Keep c1930bd's empty-file race correction, and require
+                    // the complete line rather than accepting a partial PID.
+                    if let Ok(text) = std::fs::read_to_string(path)
+                        && text.ends_with('\n')
+                        && let Ok(pid) = text.trim().parse::<u32>()
+                        && (1..=i32::MAX as u32).contains(&pid)
+                    {
+                        break pid;
+                    }
+                    assert!(
+                        work_scope.active_children() > 0,
+                        "async hook stopped before complete readiness"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("async hook did not publish its process tree");
+            pids.push(pid);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            identities.push(ProcessIdentity::capture(pid).unwrap());
+            if pids.len() == 1 && matches!(failure, HookFixtureFailure::AfterRoot) {
+                panic!("injected after async hook root readiness");
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                matches!(identities[0].state().unwrap(), ProcessState::Live { parent, group, .. }
+                if parent == std::process::id() && group == pids[0])
+            );
+            assert!(
+                matches!(identities[1].state().unwrap(), ProcessState::Live { parent, group, .. }
+                if parent == pids[0] && group == pids[0])
+            );
+        }
+        if matches!(failure, HookFixtureFailure::AfterTree) {
+            panic!("injected after async hook process-tree readiness");
+        }
+        work_scope.cancellation_handle().cancel();
+        tokio::time::timeout(GUARD, work_scope.wait_idle())
+            .await
+            .expect("owned async hook did not settle after cancellation");
+        // Capture acceptance once at scope settlement, before releasing the
+        // fixture. Cleanup polling below cannot rescue these assertions.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let states: Vec<_> = identities
+                .iter()
+                .map(|identity| identity.state().unwrap())
+                .collect();
+            assert!(
+                matches!(states[0], ProcessState::Gone | ProcessState::Replaced),
+                "direct hook child was not reaped: {:?}",
+                states[0]
+            );
+            assert!(
+                matches!(
+                    states[1],
+                    ProcessState::Exited | ProcessState::Gone | ProcessState::Replaced
+                ),
+                "hook descendant remained live at settlement: {:?}",
+                states[1]
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        for &pid in &pids {
+            assert!(
+                other_unix_process_is_gone(pid).unwrap(),
+                "hook process remained present at settlement"
+            );
+        }
+        assert_eq!(work_scope.active_children(), 0);
+    })
+    .catch_unwind()
+    .await;
+
+    let released = gate.release();
+    work_scope.cancellation_handle().cancel();
+    let drained = tokio::time::timeout(GUARD, work_scope.wait_idle()).await;
+    let observed = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(GUARD, async {
+            loop {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let settled = identities.iter().all(|identity| {
+                    !matches!(identity.state().unwrap(), ProcessState::Live { .. })
+                });
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let settled = pids
+                    .iter()
+                    .all(|&pid| other_unix_process_is_gone(pid).unwrap());
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("async hook fixture survived release");
+    })
+    .catch_unwind()
+    .await;
+    *cleanup_ok = released.is_ok()
+        && drained.is_ok()
+        && observed.is_ok()
+        && work_scope.active_children() == 0;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    released.unwrap();
+    drained.expect("async hook fixture scope did not drain");
+    if let Err(panic) = observed {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+// Retain the existing test on other Unix targets. Without a native identity
+// observer there, require ESRCH; permission and observation errors must fail.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn other_unix_process_is_gone(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: readiness validated a positive PID representable by pid_t;
+    // signal zero only queries process existence and delivers no signal.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_owning_work_scope_terminates_async_hook_descendants() {
+    let directory =
+        std::env::temp_dir().join(format!("mini-agent-hook 'cancel'-{}", uuid::Uuid::new_v4()));
+    let mut cleanup_ok = false;
+    exercise_async_hook_cancellation(HookFixtureFailure::None, &directory, &mut cleanup_ok).await;
+    assert!(cleanup_ok);
+    assert!(!directory.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn async_hook_cancellation_fixture_settles_readiness_failures() {
+    use futures::FutureExt;
+    for (failure, expected) in [
+        (
+            HookFixtureFailure::BeforeReadiness,
+            "injected before async hook readiness",
+        ),
+        (
+            HookFixtureFailure::AfterRoot,
+            "injected after async hook root readiness",
+        ),
+        (
+            HookFixtureFailure::AfterTree,
+            "injected after async hook process-tree readiness",
+        ),
+    ] {
+        let directory =
+            std::env::temp_dir().join(format!("mini-agent-hook 'cancel'-{}", uuid::Uuid::new_v4()));
+        let mut cleanup_ok = false;
+        let panic = std::panic::AssertUnwindSafe(exercise_async_hook_cancellation(
+            failure,
+            &directory,
+            &mut cleanup_ok,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("readiness failure must propagate after cleanup");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+        assert!(cleanup_ok, "readiness failure skipped fixture cleanup");
+        assert!(!directory.exists());
+    }
 }
 
 #[tokio::test]

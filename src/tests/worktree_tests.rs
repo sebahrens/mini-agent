@@ -2015,7 +2015,8 @@ mod tests {
     mod process_tree {
         use super::*;
         use crate::agent::runner::AgentWorkScope;
-        use crate::tests::process_state::{ProcessGate, ProcessIdentity, ProcessState};
+        use crate::tests::process_gate::ProcessGate;
+        use crate::tests::process_state::{ProcessIdentity, ProcessState};
         use futures::FutureExt;
 
         const FIXTURE_GUARD: Duration = Duration::from_secs(15);

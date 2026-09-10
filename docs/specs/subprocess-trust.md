@@ -114,6 +114,20 @@ I/O, interrupted-read, and invalid-data errors remain observation failures. The
 same read-result classifier handles real proc reads and the retained parser/error
 matrix, so the race check does not duplicate or bypass the classification logic.
 
+Async-hook scope cancellation reuses the same Linux/macOS process-identity
+observer. The dispatcher fixture captures a complete newline-terminated PID
+record for the direct hook and its descendant, verifies their live parent/group
+relationships, and snapshots both states once after scope settlement. The direct
+child must be reaped; the descendant may be exited but unreaped. Other Unix targets
+retain disappearance checks using signal zero, accepting only `ESRCH` and propagating
+other probe errors. Those targets do not claim native identity or zombie classification.
+An owned FIFO replaces the descendant's unbounded sleep loop. Failure controls cover
+pre-readiness, partial readiness, and complete readiness; every path releases the gate
+and drains scoped work before propagating its original failure. Cleanup success is
+checked independently of that failure. `src/tests/process_gate.rs` owns the shared
+Unix FIFO implementation used by hook, ACP, and Git fixtures; feature gates keep it
+available to each independent consumer without enabling unrelated integrations.
+
 Git timeout and caller-drop tests reuse this process-state helper and an owned
 FIFO alias/descendant fixture. They capture the group-leading Git child and both
 shell identities while live. The timeout case advances its test clock only after

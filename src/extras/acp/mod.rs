@@ -3253,7 +3253,8 @@ mod protocol_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn exercise_cancellation_process_tree(fail_after_readiness: bool) {
-        use crate::tests::process_state::{ProcessGate, ProcessIdentity, ProcessState};
+        use crate::tests::process_gate::ProcessGate;
+        use crate::tests::process_state::{ProcessIdentity, ProcessState};
         use futures::FutureExt;
         let files = ProtocolTempDir::new();
         let shell_pid_file = files.path().join("shell.pid");
