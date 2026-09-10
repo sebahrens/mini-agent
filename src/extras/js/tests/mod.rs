@@ -395,10 +395,11 @@ async fn test_fetch_options_fail_closed_before_network_io() {
 #[tokio::test]
 async fn test_read_write_roundtrip() {
     let audit_dirs = TestTempDir::new("js-test-audits");
+    let files = TestTempDir::new("js-roundtrip-files");
     use rig::tool::Tool;
     let tool = make_test_tool(&audit_dirs);
 
-    let path = std::env::temp_dir().join(format!("zs-test-roundtrip-{}.txt", uuid::Uuid::new_v4()));
+    let path = files.path().join("roundtrip.txt");
     let path_str = path.to_string_lossy().to_string();
 
     let write_code = format!(

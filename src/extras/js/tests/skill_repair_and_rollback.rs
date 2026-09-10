@@ -13,8 +13,8 @@ use crate::extras::js::skills::{
 };
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 
-fn fixture() -> (AppPaths, SkillStore, SkillArtifact, SkillArtifact) {
-    let root = std::env::temp_dir().join(format!("replacement-{}", uuid::Uuid::new_v4()));
+fn fixture(directory: &super::TestTempDir) -> (AppPaths, SkillStore, SkillArtifact, SkillArtifact) {
+    let root = directory.path().to_path_buf();
     let env = PathEnvironment {
         platform: if cfg!(target_os = "macos") {
             PathPlatform::MacOs
@@ -114,7 +114,8 @@ fn insert_successful_invocations(store: &mut SkillStore, skill_id: &str, prefix:
 
 #[test]
 fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
-    let (paths, mut store, predecessor, candidate) = fixture();
+    let directory = super::TestTempDir::new("replacement");
+    let (paths, mut store, predecessor, candidate) = fixture(&directory);
     let mut policy = PromotionPolicy::conservative("v1", 0, 100);
     policy.min_verified_task_passes = Some(1);
     {
@@ -311,7 +312,6 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
         .unwrap();
     assert_eq!(predecessor_successor, None);
     drop(store);
-    std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 
 #[test]
@@ -320,7 +320,8 @@ fn invocation_promotion_excludes_a_turn_after_async_ingestion_failure() {
         EventBatch, SkillEvent, SkillEventKind, TelemetryIngestor,
         behavioral_window_counts_for_test,
     };
-    let (paths, mut store, predecessor, candidate) = fixture();
+    let directory = super::TestTempDir::new("replacement");
+    let (paths, mut store, predecessor, candidate) = fixture(&directory);
     let now = 2_000_000_000;
     let policy = PromotionPolicy::conservative("v1", now, now + 100);
     LifecycleService::new(&mut store)
@@ -415,12 +416,12 @@ fn invocation_promotion_excludes_a_turn_after_async_ingestion_failure() {
         .promote_replacement(&request(&predecessor, &candidate), now + 1)
         .unwrap();
     drop(store);
-    std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 
 #[test]
 fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
-    let (paths, store, predecessor, candidate) = fixture();
+    let directory = super::TestTempDir::new("replacement");
+    let (paths, store, predecessor, candidate) = fixture(&directory);
     let embedder = std::sync::Arc::new(Embedder::new().unwrap());
     drop(store);
     let coordinator = IndexCoordinator::open(&paths, embedder).unwrap();
@@ -485,12 +486,12 @@ fn skill_transition_failure_injection_excludes_removals_from_new_turns() {
     assert!(!frozen.contains_id(&candidate.id));
     assert!(!frozen.contains_id(&predecessor.id));
     drop(coordinator);
-    std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
 
 #[test]
 fn skill_root_activation_requires_two_authenticated_human_actions() {
-    let (paths, mut store, predecessor, _candidate) = fixture();
+    let directory = super::TestTempDir::new("replacement");
+    let (_paths, mut store, predecessor, _candidate) = fixture(&directory);
     store
         .conn_mut()
         .execute(
@@ -567,5 +568,4 @@ fn skill_root_activation_requires_two_authenticated_human_actions() {
             .replayed
     );
     drop(store);
-    std::fs::remove_dir_all(paths.data_dir).unwrap();
 }
