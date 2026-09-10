@@ -331,6 +331,7 @@ pub(crate) struct Startup {
 type OpenRouterPricingMap = std::collections::HashMap<String, provider::OpenRouterModelInfo>;
 const OPENROUTER_PRICING_ABORT_JOIN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
+#[cfg(test)]
 static ACTIVE_OPENROUTER_PRICING_REAPERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -488,15 +489,22 @@ where
 fn reap_aborted_openrouter_pricing_refresh(
     handle: tokio::task::JoinHandle<anyhow::Result<OpenRouterPricingMap>>,
 ) {
-    ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    tokio::spawn(async move {
-        struct ReaperPermit;
-        impl Drop for ReaperPermit {
-            fn drop(&mut self) {
-                ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            }
+    #[cfg(test)]
+    struct ReaperPermit;
+    #[cfg(test)]
+    impl Drop for ReaperPermit {
+        fn drop(&mut self) {
+            ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
-        let _permit = ReaperPermit;
+    }
+    #[cfg(test)]
+    let permit = {
+        ACTIVE_OPENROUTER_PRICING_REAPERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ReaperPermit
+    };
+    tokio::spawn(async move {
+        #[cfg(test)]
+        let _permit = permit;
         let _ = handle.await;
     });
 }
@@ -1772,7 +1780,6 @@ pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "multithread")]
     use super::ACTIVE_OPENROUTER_PRICING_REAPERS;
     use super::{
         OpenRouterPricingRefresh, ResumeProviderDecision, apply_openrouter_pricing_refresh_result,
@@ -2134,27 +2141,71 @@ mod tests {
         replacement_server.thread.join().unwrap();
     }
 
+    #[test]
+    fn unpolled_pricing_reaper_releases_its_accounting() {
+        let before = ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let handle = tokio::spawn(std::future::pending::<
+                anyhow::Result<super::OpenRouterPricingMap>,
+            >());
+            handle.abort();
+            super::reap_aborted_openrouter_pricing_refresh(handle);
+            assert_eq!(
+                ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire),
+                before + 1
+            );
+            // Do not yield: neither spawned future may be polled before shutdown.
+        });
+        drop(runtime);
+        assert_eq!(
+            ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+    }
+
     #[cfg(feature = "multithread")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_non_cooperative_pricing_refresh_has_a_bounded_join() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut refresh =
             OpenRouterPricingRefresh::start("test/model".into(), true, true, 128_000, async move {
                 let _ = started_tx.send(());
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Dropping the sender also releases this poll if an assertion
+                // fails, so runtime shutdown cannot strand a blocked worker.
+                let _ = release_rx.recv();
                 let _ = finished_tx.send(());
                 Ok(std::collections::HashMap::new())
             });
-        started_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("pricing task did not start")
+            .unwrap();
 
-        let started = std::time::Instant::now();
-        assert!(refresh.finish_without_wait().await.is_none());
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "aborted pricing join exceeded its readiness budget"
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                refresh.finish_without_wait()
+            )
+            .await
+            .expect("readiness joined the unreleased pricing task")
+            .is_none()
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            ACTIVE_OPENROUTER_PRICING_REAPERS.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "unreleased pricing task lost its reaper"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), finished_rx)
             .await
             .expect("aborted pricing work did not finish under its reaper")
             .expect("aborted pricing work dropped its completion signal");
