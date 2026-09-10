@@ -20,7 +20,6 @@ use crate::extras::js::supervisor::WorkerError;
 use crate::paths::{AppPaths, PathEnvironment, PathPlatform};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1388,14 +1387,19 @@ fn authenticated_approval_authorization_two_connections_consume_exactly_once() {
         .unwrap();
     drop(evaluator);
 
-    let barrier = Arc::new(Barrier::new(2));
+    // Each peer owns the sender the other waits on. A setup panic drops it,
+    // waking the survivor; a stalled peer is bounded by the receive timeout.
+    let (a_ready, a_ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (b_ready, b_ready_rx) = std::sync::mpsc::sync_channel(1);
     let mut joins = Vec::new();
-    for worker in ["concurrent-a", "concurrent-b"] {
+    for (worker, ready, peer_ready) in [
+        ("concurrent-a", a_ready, b_ready_rx),
+        ("concurrent-b", b_ready, a_ready_rx),
+    ] {
         let paths = paths.clone();
         let artifact_id = artifact.id.clone();
         let report_id = report_id.clone();
         let authorization = authorization.clone();
-        let barrier = Arc::clone(&barrier);
         joins.push(std::thread::spawn(move || {
             let store = SkillStore::open_at(&paths).unwrap();
             let mut evaluator = AdmissionEvaluator::new(
@@ -1404,7 +1408,12 @@ fn authenticated_approval_authorization_two_connections_consume_exactly_once() {
                 worker,
             )
             .unwrap();
-            barrier.wait();
+            ready
+                .send(())
+                .expect("peer must remain available during setup");
+            peer_ready
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("both consumers must finish setup before consuming");
             evaluator.consume_canary_for_test(
                 &artifact_id,
                 &artifact_id,
@@ -1416,9 +1425,14 @@ fn authenticated_approval_authorization_two_connections_consume_exactly_once() {
             )
         }));
     }
-    let outcomes = joins
+    // Join every consumer before propagating a panic from either peer.
+    let joined = joins
         .into_iter()
-        .map(|join| join.join().expect("consumer thread"))
+        .map(|join| join.join())
+        .collect::<Vec<_>>();
+    let outcomes = joined
+        .into_iter()
+        .map(|result| result.expect("consumer thread"))
         .collect::<Vec<_>>();
     assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
     assert_eq!(
