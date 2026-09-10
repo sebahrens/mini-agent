@@ -773,14 +773,4 @@ mod tests {
         assert!(displayed.contains("command display truncated"));
         assert!(displayed.len() <= COMMAND_DISPLAY_BYTES + 32);
     }
-
-    #[test]
-    fn loop_validation_process_limits_headless_and_interactive_use_one_runner() {
-        let headless = include_str!("headless.rs");
-        let interactive = include_str!("../../ui/event_handler.rs");
-        assert!(headless.contains("loop_mod::validation::start(sandbox, cmd)"));
-        assert!(interactive.contains("loop::validation::start(&ui.sandbox, &cmd)"));
-        assert!(!headless.contains("tokio::process::Command::new"));
-        assert!(!interactive.contains("tokio::process::Command::new"));
-    }
 }

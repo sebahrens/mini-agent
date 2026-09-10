@@ -510,6 +510,8 @@ mod validation_generation_tests {
         assert!(!run.validation_active());
     }
 
+    // Unix exercises this through both real event handlers and live commands.
+    #[cfg(not(unix))]
     #[test]
     fn cancelled_validation_then_new_loop_preserves_new_generation() {
         let mut run = AgentRunState::default();

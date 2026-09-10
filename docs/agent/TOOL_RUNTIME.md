@@ -83,6 +83,10 @@ feature-specific test adapters compile only with their consumers. The shared
 bounded validation executor remains available without `loop`; loop defaults,
 command display, and explicit validator cancellation are gated to loop callers
 and their native tests.
+Loop caller regressions exercise real CLI output and transcript persistence,
+and TUI completion handling with output limits, unavailable sandboxing, scoped
+cancellation, and a stale result arriving during a replacement validation.
+Headless signal cleanup remains covered by the existing CLI interrupt matrix.
 
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher

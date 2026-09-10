@@ -1080,18 +1080,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/loop/validation.rs",
-        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
-        1,
-        "TEST-ONLY",
-    ),
-    (
-        "src/extras/loop/validation.rs",
-        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
-        1,
-        "TEST-ONLY",
-    ),
-    (
-        "src/extras/loop/validation.rs",
         "std::process::Command::new(\"/bin/kill\")",
         1,
         "TEST-ONLY",
@@ -3364,18 +3352,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     ("src/extras/loop/validation.rs", ".status()", 1, "TEST-ONLY"),
-    (
-        "src/extras/loop/validation.rs",
-        "assert!(!headless.contains(\"tokio::process::Command::new\"));",
-        1,
-        "TEST-ONLY",
-    ),
-    (
-        "src/extras/loop/validation.rs",
-        "assert!(!interactive.contains(\"tokio::process::Command::new\"));",
-        1,
-        "TEST-ONLY",
-    ),
     (
         "src/extras/loop/validation.rs",
         "std::process::Command::new(\"/bin/kill\")",

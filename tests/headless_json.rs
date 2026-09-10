@@ -224,6 +224,31 @@ fn bounded_output(mut command: Command) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain while the child runs: waiting first deadlocks on a full pipe.
+    // Retain a bounded diagnostic while continuing to consume excess bytes.
+    fn drain(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> std::thread::JoinHandle<(Vec<u8>, bool)> {
+        std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut truncated = false;
+            let mut buffer = [0; 8192];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => return (captured, truncated),
+                    Ok(count) => {
+                        let keep = count.min((4 * 1024 * 1024usize).saturating_sub(captured.len()));
+                        captured.extend_from_slice(&buffer[..keep]);
+                        truncated |= keep < count;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("read child output: {error}"),
+                }
+            }
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     let completed = loop {
         if child.try_wait().unwrap().is_some() {
@@ -235,7 +260,18 @@ fn bounded_output(mut command: Command) -> std::process::Output {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let output = child.wait_with_output().unwrap();
+    let status = child.wait().unwrap();
+    let (stdout, stdout_truncated) = stdout.join().unwrap();
+    let (stderr, stderr_truncated) = stderr.join().unwrap();
+    assert!(
+        !stdout_truncated && !stderr_truncated,
+        "fixture output exceeded 4 MiB per stream"
+    );
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     assert!(
         completed,
         "headless fixture stalled: {}",
@@ -843,6 +879,70 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
                     }
                 );
             }
+        }
+    }
+}
+
+// Signal cleanup is covered by headless_interrupt_preserves_progress_and_settles_owned_work.
+// Here the real CLI must execute --loop-run and persist its bounded diagnostic.
+#[cfg(all(unix, feature = "loop"))]
+#[test]
+fn loop_validation_cli_preserves_command_results_and_output_limits() {
+    for (command, status, detail) in [
+        (
+            "printf caller-stdout; printf caller-stderr >&2; exit 7",
+            "nonzero_exit",
+            "exit_code=7",
+        ),
+        ("yes loop-output", "output_truncated", "limit=stdout"),
+    ] {
+        let root = TempRoot::new();
+        let server = root.local_provider("completed");
+        let mut cli = root.provider_command("shell");
+        cli.args([
+            "--shell",
+            "/bin/sh",
+            "--loop",
+            "--loop-prompt",
+            "finish",
+            "--loop-max",
+            "1",
+            "--loop-run",
+            command,
+        ]);
+        let output = bounded_output(cli);
+        server.join().unwrap().unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        let directories: Vec<_> = std::fs::read_dir(root.0.join("loops"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(directories.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directories[0].join("iter-0001.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["response"], "finished");
+        let diagnostic = record["validation_output"].as_str().unwrap();
+        assert!(
+            diagnostic.starts_with(&format!("[validation status={status}")),
+            "{}",
+            &diagnostic[..diagnostic.len().min(256)]
+        );
+        assert!(diagnostic.contains(detail));
+        assert!(
+            stderr.contains(diagnostic),
+            "displayed and persisted results must agree"
+        );
+        assert!(diagnostic.len() <= 1024 * 1024 + 512);
+        if status == "nonzero_exit" {
+            assert!(diagnostic.contains("[stdout]\ncaller-stdout"));
+            assert!(diagnostic.contains("[stderr]\ncaller-stderr"));
+        } else {
+            assert!(
+                diagnostic.len() > 512 * 1024,
+                "must exercise capture beyond pipe capacity"
+            );
         }
     }
 }
