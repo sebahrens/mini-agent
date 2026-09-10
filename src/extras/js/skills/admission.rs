@@ -354,12 +354,12 @@ impl AdmissionEvaluator {
         self.store.has_policy_duplicate(artifact, predecessor_id)
     }
 
-    pub(crate) fn review_and_admit<R: HumanReviewer>(
+    pub(crate) fn review_and_admit<R: HumanApprover>(
         &mut self,
         proposal_id: &str,
-        reviewer: &R,
+        approver: &R,
         now: i64,
-    ) -> Result<ReviewOutcome, AdmissionError> {
+    ) -> Result<CanaryApprovalResult, AdmissionError> {
         let proposal = self
             .store
             .get_proposal(proposal_id)?
@@ -367,7 +367,7 @@ impl AdmissionEvaluator {
         if proposal.status == ProposalStatus::Approved
             && let Some(result) = self.store.canary_approval_result(proposal_id)?
         {
-            return Ok(ReviewOutcome::Canary(result));
+            return Ok(result);
         }
         if proposal.status != ProposalStatus::AwaitingApproval {
             return Err(AdmissionError::NotAwaitingApproval);
@@ -384,10 +384,9 @@ impl AdmissionEvaluator {
             .store
             .get(&proposal.skill_id)?
             .ok_or_else(|| AdmissionError::NotFound(proposal.skill_id.clone()))?;
-        // The contained held-out gate is expensive and is re-run exactly once,
-        // on the approval path only, after the reviewed record is confirmed
-        // unchanged. Running it here as well doubled the cost of every approval
-        // and made a denial impossible while the worker was unavailable.
+        // Re-run the expensive contained held-out gate exactly once, after
+        // authentication and after confirming the reviewed record is unchanged.
+        // Rejection remains a separate database-only operation.
         let artifact_version = self
             .store
             .revision_row_version(&artifact.id)?
@@ -410,86 +409,63 @@ impl AdmissionEvaluator {
             embedding_model_revision: report.embedding_model_revision.clone(),
         };
 
-        match reviewer.review(&packet) {
-            ReviewDecision::Approve(decision) => {
-                if decision.authenticated_at > now
-                    || now.saturating_sub(decision.authenticated_at) > MAX_AUTH_AGE_SECONDS
-                {
-                    return Err(AdmissionError::UnauthenticatedApproval);
-                }
-                let current_proposal = self
-                    .store
-                    .get_proposal(proposal_id)?
-                    .ok_or(AdmissionError::StaleReview)?;
-                let current_report = self
-                    .store
-                    .get_evaluation_report(&report_id)?
-                    .ok_or(AdmissionError::StaleReview)?;
-                let current_artifact = self
-                    .store
-                    .get(&artifact.id)?
-                    .ok_or(AdmissionError::StaleReview)?;
-                let current_artifact_version = self
-                    .store
-                    .revision_row_version(&artifact.id)?
-                    .ok_or(AdmissionError::StaleReview)?;
-                if current_proposal != proposal
-                    || current_report != report
-                    || current_artifact != artifact
-                    || current_artifact_version != artifact_version
-                {
-                    return Err(AdmissionError::StaleReview);
-                }
-                // Semantic equality above proves the reviewed record is intact;
-                // this single contained re-run additionally proves the gates
-                // still pass against the current store (for example after a
-                // held-out suite was disabled mid-review).
-                #[cfg(test)]
-                if let Some(error) = self.review_gate_failure.take() {
-                    return Err(review_gate_verification_error(&error));
-                }
-                self.revalidate_review_gates(
-                    &current_proposal,
-                    &current_report,
-                    &current_artifact,
-                )?;
-                let expires_at = now
-                    .checked_add(MAX_AUTH_AGE_SECONDS)
-                    .ok_or(AdmissionError::UnauthenticatedApproval)?;
-                let mut admission = AdmissionStore::new(&mut self.store);
-                let authorization = admission.authorize_canary(
-                    &decision,
-                    &artifact,
-                    &report.report_id,
-                    now,
-                    expires_at,
-                )?;
-                let result = admission.approve_canary(
-                    &proposal.proposal_id,
-                    &artifact.id,
-                    &report.report_id,
-                    artifact_version,
-                    proposal.row_version,
-                    &authorization,
-                    now,
-                )?;
-                if self.store.is_retrievable(&artifact.id)? {
-                    return Err(AdmissionError::CanaryBecameRetrievable);
-                }
-                Ok(ReviewOutcome::Canary(result))
-            }
-            ReviewDecision::Deny { reason_code } => {
-                AdmissionStore::new(&mut self.store).deny(
-                    &proposal.proposal_id,
-                    proposal.row_version,
-                    &reason_code,
-                    now,
-                )?;
-                Ok(ReviewOutcome::Denied)
-            }
-            ReviewDecision::Cancelled => Ok(ReviewOutcome::Cancelled),
-            ReviewDecision::TimedOut => Ok(ReviewOutcome::TimedOut),
+        let decision = approver.approve(&packet);
+        if decision.authenticated_at > now
+            || now.saturating_sub(decision.authenticated_at) > MAX_AUTH_AGE_SECONDS
+        {
+            return Err(AdmissionError::UnauthenticatedApproval);
         }
+        let current_proposal = self
+            .store
+            .get_proposal(proposal_id)?
+            .ok_or(AdmissionError::StaleReview)?;
+        let current_report = self
+            .store
+            .get_evaluation_report(&report_id)?
+            .ok_or(AdmissionError::StaleReview)?;
+        let current_artifact = self
+            .store
+            .get(&artifact.id)?
+            .ok_or(AdmissionError::StaleReview)?;
+        let current_artifact_version = self
+            .store
+            .revision_row_version(&artifact.id)?
+            .ok_or(AdmissionError::StaleReview)?;
+        if current_proposal != proposal
+            || current_report != report
+            || current_artifact != artifact
+            || current_artifact_version != artifact_version
+        {
+            return Err(AdmissionError::StaleReview);
+        }
+        // Semantic equality above proves the reviewed record is intact;
+        // this single contained re-run additionally proves the gates
+        // still pass against the current store (for example after a
+        // held-out suite was disabled mid-review).
+        #[cfg(test)]
+        if let Some(error) = self.review_gate_failure.take() {
+            return Err(review_gate_verification_error(&error));
+        }
+        self.revalidate_review_gates(&current_proposal, &current_report, &current_artifact)?;
+        let expires_at = now
+            .checked_add(MAX_AUTH_AGE_SECONDS)
+            .ok_or(AdmissionError::UnauthenticatedApproval)?;
+        let mut admission = AdmissionStore::new(&mut self.store);
+        let authorization =
+            admission.authorize_canary(&decision, &artifact, &report.report_id, now, expires_at)?;
+        let result = admission.approve_canary(
+            &proposal.proposal_id,
+            &artifact.id,
+            &report.report_id,
+            artifact_version,
+            proposal.row_version,
+            &authorization,
+            now,
+        )?;
+        if self.store.is_retrievable(&artifact.id)? {
+            return Err(AdmissionError::CanaryBecameRetrievable);
+        }
+        Ok(result)
     }
 
     pub(crate) fn request_reevaluation(
@@ -1016,8 +992,11 @@ enum EvaluationFailure {
     },
 }
 
-pub(crate) trait HumanReviewer {
-    fn review(&self, packet: &ReviewPacket) -> ReviewDecision;
+/// Synchronous authenticated approval boundary. Called only after an explicit
+/// approval request; rejection uses `reject_proposal` without an evaluator.
+/// A caller that cancels or times out before approval does not invoke this path.
+pub(crate) trait HumanApprover {
+    fn approve(&self, packet: &ReviewPacket) -> AuthenticatedHumanDecision;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1060,13 +1039,6 @@ impl fmt::Debug for ReviewPacket {
             .field("held_out_suite_hashes", &self.held_out_suite_hashes)
             .finish()
     }
-}
-
-pub(crate) enum ReviewDecision {
-    Approve(AuthenticatedHumanDecision),
-    Deny { reason_code: String },
-    Cancelled,
-    TimedOut,
 }
 
 pub(crate) struct AuthenticatedHumanDecision {
@@ -1113,14 +1085,6 @@ impl AuthenticatedHumanDecision {
     pub(super) fn principal(&self) -> &str {
         &self.principal
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReviewOutcome {
-    Canary(CanaryApprovalResult),
-    Denied,
-    Cancelled,
-    TimedOut,
 }
 
 #[derive(Debug, thiserror::Error)]

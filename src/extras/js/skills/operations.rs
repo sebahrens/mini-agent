@@ -14,9 +14,7 @@ use std::time::Duration;
 use anyhow::Context;
 use rusqlite::OptionalExtension;
 
-use super::admission::{
-    AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision, ReviewOutcome,
-};
+use super::admission::{AdmissionEvaluator, AuthenticatedHumanDecision, HumanApprover};
 use super::coordinator::IndexCoordinator;
 use super::embed::Embedder;
 use super::feedback::{
@@ -1368,13 +1366,13 @@ fn sleep_until_due(
     wait.min(remaining)
 }
 
-struct LocalOwnerReviewer {
+struct LocalOwnerApprover {
     now: i64,
 }
 
-impl HumanReviewer for LocalOwnerReviewer {
-    fn review(&self, _packet: &super::admission::ReviewPacket) -> ReviewDecision {
-        ReviewDecision::Approve(AuthenticatedHumanDecision::local_owner(self.now))
+impl HumanApprover for LocalOwnerApprover {
+    fn approve(&self, _packet: &super::admission::ReviewPacket) -> AuthenticatedHumanDecision {
+        AuthenticatedHumanDecision::local_owner(self.now)
     }
 }
 
@@ -1406,29 +1404,21 @@ fn review_proposal(
         std::sync::Arc::new(Embedder::from_config(embedding)?),
         format!("local-review-{}", uuid::Uuid::new_v4()),
     )?;
-    let outcome = evaluator
-        .review_and_admit(proposal_id, &LocalOwnerReviewer { now }, now)
+    let result = evaluator
+        .review_and_admit(proposal_id, &LocalOwnerApprover { now }, now)
         .context("learned-skill review failed")?;
-    match outcome {
-        ReviewOutcome::Canary(result) => {
-            // Admission advances the durable desired generation. The operator
-            // command is not complete until that generation is published.
-            drop(evaluator);
-            let coordinator =
-                IndexCoordinator::open(paths, Arc::new(Embedder::from_config(embedding)?))?;
-            let generation = coordinator
-                .rebuild_and_publish()
-                .context("failed to publish approved learned-skill canary")?;
-            // A replayed approval returns the *original* approval generation,
-            // and the revision may have moved on since. Report what the store
-            // holds now rather than restating the first decision.
-            let status = live_revision_status(paths, &result.skill_id)?;
-            approve_report(&result, generation, &status).emit();
-        }
-        ReviewOutcome::Denied | ReviewOutcome::Cancelled | ReviewOutcome::TimedOut => {
-            anyhow::bail!("local-owner learned-skill review did not complete")
-        }
-    }
+    // Admission advances the durable desired generation. The operator
+    // command is not complete until that generation is published.
+    drop(evaluator);
+    let coordinator = IndexCoordinator::open(paths, Arc::new(Embedder::from_config(embedding)?))?;
+    let generation = coordinator
+        .rebuild_and_publish()
+        .context("failed to publish approved learned-skill canary")?;
+    // A replayed approval returns the *original* approval generation,
+    // and the revision may have moved on since. Report what the store
+    // holds now rather than restating the first decision.
+    let status = live_revision_status(paths, &result.skill_id)?;
+    approve_report(&result, generation, &status).emit();
     Ok(())
 }
 
@@ -3152,7 +3142,7 @@ mod tests {
             .id;
         import_package(package, &paths, None, "queue-listing").unwrap();
 
-        let store = SkillStore::open_at(&paths).unwrap();
+        let mut store = SkillStore::open_at(&paths).unwrap();
         let rows = load_proposal_queue(&store).unwrap();
         let listed = rows
             .iter()
@@ -3168,6 +3158,19 @@ mod tests {
         // An absent reason code renders as the documented placeholder.
         assert!(line.contains("\t-\t"), "{line}");
         assert!(line.ends_with(&format!("\t{}\t{}", listed.created_at, listed.updated_at)));
+        let proposal_before = store.get_proposal(&skill_id).unwrap().unwrap();
+        let generation_before = store.desired_generation().unwrap();
+        assert!(matches!(
+            super::super::admission::reject_proposal(&mut store, None, &skill_id, 21),
+            Err(super::super::admission::AdmissionError::Store(
+                super::super::store::StoreError::Unauthorized
+            ))
+        ));
+        assert_eq!(
+            store.get_proposal(&skill_id).unwrap(),
+            Some(proposal_before.clone())
+        );
+        assert_eq!(store.desired_generation().unwrap(), generation_before);
         drop(store);
 
         let unavailable = unavailable_embedding_config();
@@ -3184,8 +3187,23 @@ mod tests {
                 .status,
             ProposalStatus::AwaitingApproval
         );
+        // Rejection must still work when review metadata and verification
+        // infrastructure cannot be used. The proposal itself remains intact.
+        let store = SkillStore::open_at(&paths).unwrap();
+        store
+            .conn()
+            .execute("UPDATE held_out_suites SET enabled = 0", [])
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE evaluation_reports SET summary_json = '{}' WHERE report_id = ?1",
+                [proposal_before.report_id.as_deref().unwrap()],
+            )
+            .unwrap();
+        drop(store);
         review_proposal(&skill_id, false, &paths, Some(&unavailable))
-            .expect("human rejection must not require embedding credentials");
+            .expect("human rejection must not require embeddings, valid reports or held-out gates");
         let store = SkillStore::open_at(&paths).unwrap();
         assert!(
             load_proposal_queue(&store)
@@ -3201,6 +3219,16 @@ mod tests {
             .expect("a rejected proposal must remain queryable by id");
         assert_eq!(rejected.status, "rejected");
         assert_eq!(rejected.skill_id, skill_id);
+        assert_eq!(store.desired_generation().unwrap(), generation_before);
+        assert_eq!(
+            store.revision_status(&skill_id).unwrap().as_deref(),
+            Some("rejected")
+        );
+        let approvals: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_approvals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(approvals, 0);
         assert!(load_proposal(&store, &"e".repeat(64)).unwrap().is_none());
         drop(store);
         let _ = std::fs::remove_dir_all(root);

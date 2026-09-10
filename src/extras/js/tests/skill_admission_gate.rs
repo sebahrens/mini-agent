@@ -1,7 +1,6 @@
 use crate::extras::js::protocol::{Diagnostic, DiagnosticClass, DiagnosticStage, ScriptRole};
 use crate::extras::js::skills::admission::{
-    AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision,
-    ReviewOutcome, ReviewPacket,
+    AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanApprover, ReviewPacket,
 };
 use crate::extras::js::skills::embed::{Embedder, EmbeddingBackend, EmbeddingError};
 use crate::extras::js::skills::held_out::{
@@ -507,32 +506,10 @@ struct Approver {
     packet: Mutex<Option<ReviewPacket>>,
 }
 
-impl HumanReviewer for Approver {
-    fn review(&self, packet: &ReviewPacket) -> ReviewDecision {
+impl HumanApprover for Approver {
+    fn approve(&self, packet: &ReviewPacket) -> AuthenticatedHumanDecision {
         *self.packet.lock().unwrap() = Some(packet.clone());
-        ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
-            "decision-1",
-            "human-reviewer",
-            self.now,
-        ))
-    }
-}
-
-struct Denier;
-
-impl HumanReviewer for Denier {
-    fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-        ReviewDecision::Deny {
-            reason_code: "human_denied".to_string(),
-        }
-    }
-}
-
-struct Cancelled;
-
-impl HumanReviewer for Cancelled {
-    fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-        ReviewDecision::Cancelled
+        AuthenticatedHumanDecision::verified("decision-1", "human-reviewer", self.now)
     }
 }
 
@@ -551,16 +528,45 @@ fn skill_admission_gate_evaluates_then_human_approves_exactly_one_canary() {
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::AwaitingApproval);
 
+    // Authentication must fail before a contained gate or durable mutation.
+    for authenticated_at in [22, -280] {
+        let invalid = Approver {
+            now: authenticated_at,
+            packet: Mutex::new(None),
+        };
+        assert!(matches!(
+            evaluator.review_and_admit(&artifact.id, &invalid, 21),
+            Err(AdmissionError::UnauthenticatedApproval)
+        ));
+        assert_eq!(evaluator.review_gate_runs_for_test(), 0);
+        assert_eq!(
+            evaluator.store().get_proposal(&artifact.id).unwrap(),
+            Some(proposal.clone())
+        );
+        assert_eq!(
+            evaluator
+                .store()
+                .revision_status(&artifact.id)
+                .unwrap()
+                .as_deref(),
+            Some("verified")
+        );
+        assert_eq!(evaluator.store().desired_generation().unwrap(), 0);
+        let approvals: i64 = evaluator
+            .store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM skill_approvals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(approvals, 0);
+    }
     let approver = Approver {
-        now: 21,
+        // Exactly five minutes old remains valid; older decisions failed above.
+        now: -279,
         packet: Mutex::new(None),
     };
-    let outcome = evaluator
+    let result = evaluator
         .review_and_admit(&artifact.id, &approver, 21)
         .expect("approval");
-    let ReviewOutcome::Canary(result) = outcome else {
-        panic!("expected canary");
-    };
     assert_eq!(result.skill_id, artifact.id);
     assert_eq!(result.generation, 1);
     assert!(!result.idempotent);
@@ -633,7 +639,7 @@ fn replacement_with_unchanged_contract_is_admitted_with_lineage() {
             21,
         )
         .expect("approval");
-    assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+    assert_eq!(outcome.skill_id, replacement.id);
 
     let (status, supersedes_id, lineage_root_id, evaluation_report_id): (
         String,
@@ -739,82 +745,10 @@ fn skill_admission_concurrency_duplicate_approval_is_idempotent() {
     let second = evaluator
         .review_and_admit(&artifact.id, &approver, 22)
         .expect("idempotent retry");
-    let ReviewOutcome::Canary(second) = second else {
-        panic!("expected canary");
-    };
     assert!(second.idempotent);
     assert_eq!(second.generation, 1);
     assert_eq!(evaluator.store().desired_generation().unwrap(), 1);
     let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn skill_admission_review_deny_cancel_and_timeout_never_create_canary() {
-    let (root, _paths, mut denied, denied_artifact) = evaluator(true);
-    denied.evaluate_next(20).unwrap().unwrap();
-    assert!(matches!(
-        crate::extras::js::skills::admission::reject_proposal(
-            denied.store_mut(),
-            None,
-            &denied_artifact.id,
-            21,
-        ),
-        Err(AdmissionError::Store(
-            crate::extras::js::skills::store::StoreError::Unauthorized
-        ))
-    ));
-    assert_eq!(
-        denied
-            .store()
-            .get_proposal(&denied_artifact.id)
-            .unwrap()
-            .unwrap()
-            .status,
-        ProposalStatus::AwaitingApproval
-    );
-    assert_eq!(
-        denied
-            .review_and_admit(&denied_artifact.id, &Denier, 21)
-            .unwrap(),
-        ReviewOutcome::Denied
-    );
-    assert_eq!(
-        denied.store().revision_status(&denied_artifact.id).unwrap(),
-        Some("rejected".to_string())
-    );
-    assert_eq!(denied.store().desired_generation().unwrap(), 0);
-
-    let (cancelled_root, _other_paths, mut cancelled, cancelled_artifact) = evaluator(true);
-    cancelled.evaluate_next(20).unwrap().unwrap();
-    assert_eq!(
-        cancelled
-            .review_and_admit(&cancelled_artifact.id, &Cancelled, 21)
-            .unwrap(),
-        ReviewOutcome::Cancelled
-    );
-    assert_eq!(
-        cancelled
-            .store()
-            .revision_status(&cancelled_artifact.id)
-            .unwrap(),
-        Some("verified".to_string())
-    );
-    assert_eq!(cancelled.store().desired_generation().unwrap(), 0);
-
-    struct TimedOut;
-    impl HumanReviewer for TimedOut {
-        fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-            ReviewDecision::TimedOut
-        }
-    }
-    assert_eq!(
-        cancelled
-            .review_and_admit(&cancelled_artifact.id, &TimedOut, 22)
-            .unwrap(),
-        ReviewOutcome::TimedOut
-    );
-    let _ = std::fs::remove_dir_all(root);
-    let _ = std::fs::remove_dir_all(cancelled_root);
 }
 
 struct TamperingApprover {
@@ -822,8 +756,8 @@ struct TamperingApprover {
     now: i64,
 }
 
-impl HumanReviewer for TamperingApprover {
-    fn review(&self, packet: &ReviewPacket) -> ReviewDecision {
+impl HumanApprover for TamperingApprover {
+    fn approve(&self, packet: &ReviewPacket) -> AuthenticatedHumanDecision {
         let mut other = SkillStore::open_at(&self.paths).expect("second connection");
         other
             .conn_mut()
@@ -832,11 +766,7 @@ impl HumanReviewer for TamperingApprover {
                 [&packet.artifact_id],
             )
             .expect("tamper version");
-        ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
-            "decision-stale",
-            "human-reviewer",
-            self.now,
-        ))
+        AuthenticatedHumanDecision::verified("decision-stale", "human-reviewer", self.now)
     }
 }
 
@@ -847,8 +777,8 @@ struct SuiteChangingApprover {
     corruption: Option<SuiteCorruption>,
 }
 
-impl HumanReviewer for SuiteChangingApprover {
-    fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
+impl HumanApprover for SuiteChangingApprover {
+    fn approve(&self, _packet: &ReviewPacket) -> AuthenticatedHumanDecision {
         let mut store = SkillStore::open_at(&self.paths).expect("second connection");
         if let Some(corruption) = self.corruption {
             import_corrupt_suite(&mut store, corruption, self.now);
@@ -865,11 +795,7 @@ impl HumanReviewer for SuiteChangingApprover {
                 .execute("UPDATE held_out_suites SET enabled = 0", [])
                 .expect("disable suite");
         }
-        ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
-            "decision-stale-suite",
-            "human-reviewer",
-            self.now,
-        ))
+        AuthenticatedHumanDecision::verified("decision-stale-suite", "human-reviewer", self.now)
     }
 }
 
@@ -967,7 +893,7 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
                     22,
                 )
                 .unwrap();
-            assert!(matches!(recovered, ReviewOutcome::Canary(_)));
+            assert_eq!(recovered.skill_id, artifact.id);
         }
         drop(suite_evaluator);
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -991,7 +917,14 @@ fn skill_admission_transaction_failures_and_review_staleness_roll_back() {
         )
         .expect("tamper report");
     assert!(matches!(
-        evaluator.review_and_admit(&artifact.id, &Cancelled, 21),
+        evaluator.review_and_admit(
+            &artifact.id,
+            &Approver {
+                now: 21,
+                packet: Mutex::new(None)
+            },
+            21
+        ),
         Err(AdmissionError::Store(
             crate::extras::js::skills::store::StoreError::CorruptRow(_)
         ))
@@ -1041,7 +974,14 @@ fn skill_store_pending_lifecycle_missing_suite_is_verified_but_not_approvable() 
             .unwrap();
         assert_eq!(proposal.status, ProposalStatus::Verified);
         assert!(matches!(
-            evaluator.review_and_admit(&artifact.id, &Cancelled, now + 1),
+            evaluator.review_and_admit(
+                &artifact.id,
+                &Approver {
+                    now: now + 1,
+                    packet: Mutex::new(None)
+                },
+                now + 1
+            ),
             Err(AdmissionError::NotAwaitingApproval)
         ));
         assert_eq!(evaluator.store().desired_generation().unwrap(), 0);

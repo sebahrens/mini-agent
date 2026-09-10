@@ -1,8 +1,7 @@
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::skills::SkillExport;
 use crate::extras::js::skills::admission::{
-    AdmissionEvaluator, AdmissionWorker, AuthenticatedHumanDecision, HumanReviewer, ReviewDecision,
-    ReviewOutcome, ReviewPacket,
+    AdmissionEvaluator, AdmissionWorker, AuthenticatedHumanDecision, HumanApprover, ReviewPacket,
 };
 use crate::extras::js::skills::embed::Embedder;
 use crate::extras::js::skills::held_out::{
@@ -89,15 +88,11 @@ fn import_suite(store: &mut SkillStore) {
 
 struct Approver;
 
-impl HumanReviewer for Approver {
-    fn review(&self, packet: &ReviewPacket) -> ReviewDecision {
+impl HumanApprover for Approver {
+    fn approve(&self, packet: &ReviewPacket) -> AuthenticatedHumanDecision {
         assert_eq!(packet.held_out_suite_hashes.len(), 1);
         assert!(!format!("{packet:?}").contains("\\tvalue"));
-        ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
-            "e2e-decision",
-            "authenticated-human",
-            30,
-        ))
+        AuthenticatedHumanDecision::verified("e2e-decision", "authenticated-human", 30)
     }
 }
 
@@ -220,12 +215,9 @@ async fn auto_admission_end_to_end_proposal_to_non_retrievable_canary() {
         "review-worker",
     )
     .unwrap();
-    let outcome = evaluator
+    let canary = evaluator
         .review_and_admit(&skill_id, &Approver, 30)
         .expect("human approval");
-    let ReviewOutcome::Canary(canary) = outcome else {
-        panic!("expected canary");
-    };
     assert_eq!(canary.generation, 1);
     assert_eq!(
         evaluator.store().revision_status(&skill_id).unwrap(),

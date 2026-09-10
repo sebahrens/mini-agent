@@ -439,6 +439,15 @@ The reviewer receives artifact ID, description/tags, exports/signatures, capabil
 embedded test summary, inherited regression summary, held-out suite IDs/results, duplicate report,
 and verifier version. Approval is an explicit authenticated action, not an LLM response.
 
+The synchronous approval callback returns an authenticated human decision and
+the admission service returns the canary transaction result directly. Rejection
+uses the separate authenticated database-only operation, so damaged evaluation
+reports, unavailable embeddings, or disabled held-out suites cannot prevent it.
+Cancelling or abandoning a review before explicit approval leaves the proposal
+awaiting approval; it does not invoke the approval callback. Authentication
+freshness is checked before verification or publication, and the reviewed
+artifact/report versions are checked again before the contained gate runs.
+
 ```sql
 BEGIN IMMEDIATE;
 -- Recheck artifact/report identity and optimistic versions.

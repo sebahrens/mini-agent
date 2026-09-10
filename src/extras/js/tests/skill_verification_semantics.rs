@@ -612,8 +612,7 @@ mod fake_integrity_probes {
 #[cfg(test)]
 mod failure_attribution {
     use crate::extras::js::skills::admission::{
-        AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanReviewer,
-        ReviewDecision, ReviewOutcome, ReviewPacket,
+        AdmissionError, AdmissionEvaluator, AuthenticatedHumanDecision, HumanApprover, ReviewPacket,
     };
     use crate::extras::js::skills::embed::Embedder;
     use crate::extras::js::skills::held_out::{
@@ -718,23 +717,13 @@ mod failure_attribution {
         now: i64,
     }
 
-    impl HumanReviewer for Approver {
-        fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-            ReviewDecision::Approve(AuthenticatedHumanDecision::verified(
+    impl HumanApprover for Approver {
+        fn approve(&self, _packet: &ReviewPacket) -> AuthenticatedHumanDecision {
+            AuthenticatedHumanDecision::verified(
                 format!("decision-{}", self.now),
                 "human-reviewer",
                 self.now,
-            ))
-        }
-    }
-
-    struct Denier;
-
-    impl HumanReviewer for Denier {
-        fn review(&self, _packet: &ReviewPacket) -> ReviewDecision {
-            ReviewDecision::Deny {
-                reason_code: "local_owner_rejected".to_string(),
-            }
+            )
         }
     }
 
@@ -838,7 +827,7 @@ mod failure_attribution {
         let outcome = evaluator
             .review_and_admit(&artifact.id, &Approver { now: 22 }, 22)
             .expect("approval must succeed once the worker is back");
-        assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+        assert_eq!(outcome.skill_id, artifact.id);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -851,40 +840,11 @@ mod failure_attribution {
         let outcome = evaluator
             .review_and_admit(&artifact.id, &Approver { now: 21 }, 21)
             .expect("approval");
-        assert!(matches!(outcome, ReviewOutcome::Canary(_)));
+        assert_eq!(outcome.skill_id, artifact.id);
         assert_eq!(
             evaluator.review_gate_runs_for_test(),
             1,
             "the contained held-out gate must run exactly once per approval"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn denial_does_not_require_a_passing_approval_gate() {
-        let (root, mut evaluator, artifact) = evaluator();
-        evaluator.evaluate_next(20).unwrap().unwrap();
-        // Break the gate: no held-out suite is selectable any more.
-        evaluator
-            .store()
-            .conn()
-            .execute("UPDATE held_out_suites SET enabled = 0", [])
-            .expect("disable suites");
-
-        assert_eq!(
-            evaluator
-                .review_and_admit(&artifact.id, &Denier, 21)
-                .expect("a rejection must not depend on the verification worker"),
-            ReviewOutcome::Denied
-        );
-        assert_eq!(
-            evaluator.store().revision_status(&artifact.id).unwrap(),
-            Some("rejected".to_string())
-        );
-        assert_eq!(
-            evaluator.review_gate_runs_for_test(),
-            0,
-            "a denial must never run the contained gate"
         );
         let _ = std::fs::remove_dir_all(root);
     }
