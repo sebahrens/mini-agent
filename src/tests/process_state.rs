@@ -58,7 +58,22 @@ fn snapshot(pid: u32) -> io::Result<Option<Snapshot>> {
 #[cfg(target_os = "linux")]
 fn snapshot_from_stat(pid: u32, read: io::Result<String>) -> io::Result<Option<Snapshot>> {
     match read {
-        Ok(stat) => parse_stat(pid, &stat).map(Some),
+        Ok(stat) => match parse_stat(pid, &stat) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            // The same exit race can land as a short read instead of a failed
+            // one, leaving an empty or truncated buffer that parse_stat rightly
+            // calls malformed. Re-classify it only once the entry is positively
+            // gone, which is evidence of exit rather than an unavailable
+            // observation; a malformed stat for a process that still exists
+            // stays an error.
+            Err(error) => {
+                if std::fs::metadata(format!("/proc/{pid}")).is_err() {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         // read_to_string opens and then reads. A task that exits in between
         // fails the read with ESRCH rather than ENOENT, so the entry vanishing
