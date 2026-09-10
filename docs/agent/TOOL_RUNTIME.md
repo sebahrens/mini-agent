@@ -26,6 +26,11 @@ commands use the same shell, workspace, sandbox, and permission decision as
 foreground commands, and all are cancelled on turn cancellation or session
 shutdown.
 
+The TUI records tool calls and results as they stream. Both successful and failed
+turns adopt provider call IDs and reasoning metadata from the runner's canonical
+transcript before terminal presentation or cleanup. This preserves continuation
+history after a provider failure without duplicating the live tool records.
+
 Interactive teardown runs after both normal exit and event-loop errors. It stops
 and joins the input reader, cancels the main runner and side questions, and waits
 for their owned work before closing shared services. Reader shutdown drains queued

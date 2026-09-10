@@ -286,7 +286,15 @@ pub async fn handle_agent_event(
             renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
         }
         AgentEvent::CompactionBoundary { .. } => {}
-        AgentEvent::Error { message: e, .. } => {
+        AgentEvent::Error {
+            message: e,
+            interactions,
+        } => {
+            // Live tool events carry lifecycle IDs only. Even a failed turn
+            // needs the canonical provider IDs and reasoning for continuation.
+            // Adopt before fallible presentation or settlement so App unwind
+            // preserves the same replay metadata as a successful turn.
+            ui.session.adopt_provider_tool_identity(&interactions);
             run.was_reasoning = false;
             run.is_running = false;
             run.pending_compaction_pressure = None;
