@@ -18,7 +18,7 @@ deadlines use bounded selector waits so they do not overflow native timeout fiel
 
 - Linux or macOS. `scripts/gym/setup.sh` exits 2 on any other host, and the runner shells out to
   `/bin/sh` and `git worktree`.
-- `cargo` and `rustc` matching `rust-toolchain.toml` (setup compares the exact version), `git` 2.40
+- `cargo` and `rustc` matching `rust-toolchain.toml` (setup compares the exact version from the target repository directory), `git` 2.40
   or newer (checked independently of vendor build suffixes), Python 3.11 or newer, and `jq`.
 - `bd` (beads) only for `scripts/gym/mine_tasks.py`; the miner falls back to an exported
   `.beads/issues.jsonl` or an explicit `--beads-json` file when `bd` is missing or fails.
@@ -38,6 +38,16 @@ all existing symlink ancestors, including above multiple missing directories, be
 under `/tmp` or `/private/tmp` and before creating any directories. Episode worktrees and per-episode
 AppPaths trees are created under that root, so ignore it in Git or point `MINI_AGENT_GYM_ROOT` outside
 the repository.
+
+Setup rejects unsupported hosts before creating directories or invoking Cargo. Its
+[setup_checks.py](../../scripts/gym/setup_checks.py) helper reads `toolchain.channel` as TOML,
+ignoring comments and unrelated tables. The configuration must be a regular file of at most
+64 KiB; symlinks to regular files are supported, while FIFOs and directories are refused.
+Rust and Git version probes run from the resolved target repository, so a directory-selected
+Rust toolchain agrees with the subsequent build. Each version or installed-help probe has a
+30-second deadline through the shared process capture helper. Complete stdout is capped at
+16 KiB for versions and 1 MiB for help, with bounded stderr diagnostics. Timeout, overflow,
+invalid metadata, nonzero exit, or unconfirmed process cleanup stops setup before its next phase.
 
 Setup checks the prerequisites, creates `<gym root>/worktrees` and `<gym root>/runs`, then runs:
 

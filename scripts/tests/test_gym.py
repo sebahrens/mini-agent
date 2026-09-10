@@ -20,6 +20,7 @@ from unittest import mock
 
 from scripts.gym import mine_tasks as MINE
 from scripts.gym import process_capture as CAPTURE
+from scripts.gym import setup_checks as CHECKS
 from scripts.gym import train as TRAIN_MODULE
 from scripts.gym import worktrees as WORKTREES
 
@@ -2056,7 +2057,8 @@ class GymEntrypointTests(unittest.TestCase):
 
     def test_python_entrypoints_load_shared_capture_outside_repository(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            for script, option in [(TRAIN, "--tasks"), (ROOT / "scripts/gym/mine_tasks.py", "--oracle-map")]:
+            for script, option in [(TRAIN, "--tasks"), (ROOT / "scripts/gym/mine_tasks.py", "--oracle-map"),
+                                   (ROOT / "scripts/gym/setup_checks.py", "prerequisites")]:
                 with self.subTest(script=script.name):
                     completed = subprocess.run(
                         [sys.executable, str(script), "--help"], cwd=directory,
@@ -2071,6 +2073,13 @@ class GymEntrypointTests(unittest.TestCase):
         with scratch_outside_tmp() as directory:
             root = Path(directory)
             repo, gym_root, env = make_setup_host(root)
+            # A rustup-style wrapper selects its toolchain from cwd. The
+            # caller directory deliberately advertises a different version.
+            rustc = root / "bin/rustc"
+            rustc.write_text("#!/bin/sh\nif [ -f rust-toolchain.toml ]; then\n"
+                             + RUSTC_STUB.split("\n", 1)[1]
+                             + "else echo 'rustc 0.0.0 (wrong checkout)'; fi\n")
+            rustc.chmod(0o755)
             # Resolve a nested relative destination before setup changes cwd;
             # Cargo must install into the same root the directory step created.
             env["MINI_AGENT_GYM_ROOT"] = "nested/gym"
@@ -2140,6 +2149,146 @@ class GymEntrypointTests(unittest.TestCase):
                     self.assertIn("system temp root", completed.stderr)
                     self.assertFalse(Path(env["CARGO_LOG"]).exists(), "the guard must run before cargo")
                     self.assertFalse((root / refused).exists(), "the refused gym root must not be created")
+
+    def test_setup_metadata_probes_reject_overflow_and_bound_failure_diagnostics(self) -> None:
+        for tool in ("rustc", "git", "help"):
+            for mode in (("overflow", "failure", "missing-flag") if tool == "help" else ("overflow", "failure")):
+                with self.subTest(tool=tool, mode=mode), scratch_outside_tmp() as directory:
+                    root = Path(directory)
+                    repo, _, env = make_setup_host(root)
+                    # The prefix would pass the old setup checks if the rest
+                    # of this complete-output overflow were silently accepted.
+                    prefix = {"rustc": b"rustc 1.90.0 (stub)\n", "git": b"git version 2.40.0\n",
+                              "help": b"--install-learned-skill-seeds\n"}[tool]
+                    code = (f"import os,sys; os.write(1,{prefix!r})\n"
+                            + ("for _ in range(32): os.write(1,b'x'*65536)\n" if mode == "overflow"
+                               else "for _ in range(32): os.write(2,b'x'*65536)\nos.write(2,b'probe-tail'); sys.exit(7)\n"))
+                    if mode == "missing-flag":
+                        code = "print('usage: mini-agent')"
+                    command = "exec " + shlex.join([sys.executable, "-c", code])
+                    if tool == "help":
+                        original = 'echo "usage: mini-agent [--install-learned-skill-seeds] [--import-learned-skill <path>]"'
+                        self.assertIn(original, CARGO_STUB)
+                        (root / "bin/cargo").write_text(CARGO_STUB.replace(original, command))
+                    else:
+                        stub = root / "bin" / tool
+                        stub.write_text("#!/bin/sh\n" + command + "\n")
+                        stub.chmod(0o755)
+                    completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
+                                               capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertLess(len(completed.stderr), 3000, "setup retained unbounded probe diagnostics")
+                    self.assertNotIn("Traceback", completed.stderr)
+                    self.assertIn({"overflow": "stdout bytes", "failure": "probe-tail",
+                                   "missing-flag": "does not advertise"}[mode], completed.stderr)
+                    log = Path(env["CARGO_LOG"])
+                    if tool == "help":
+                        self.assertEqual(len(log.read_text().splitlines()), 1, "failed help must prevent the containment test")
+                    else:
+                        self.assertFalse(log.exists(), "failed prerequisites must prevent installation")
+
+    def test_setup_probe_timeout_and_cleanup_errors_stop_checks_without_tracebacks(self) -> None:
+        with scratch_outside_tmp() as directory:
+            root = Path(directory)
+            repo, _, env = make_setup_host(root)
+            code = "import os,time; os.write(2,b'x'*4000+b'timeout-tail'); time.sleep(3)"
+            (root / "bin/rustc").write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-c", code]) + "\n")
+            # Run the actual shell entrypoint and helper; only shorten the
+            # helper's deadline so this regression does not cost thirty seconds.
+            bootstrap = (
+                "import runpy,sys; from pathlib import Path; path=sys.argv[1]; "
+                "sys.path.insert(0,str(Path(path).parent)); state=runpy.run_path(path); "
+                "state['probe'].__globals__['PROBE_TIMEOUT_SECS']=1; "
+                "sys.argv=[path,*sys.argv[2:]]; raise SystemExit(state['main']())"
+            )
+            python_stub = root / "bin/python3"
+            python_stub.write_text(
+                '#!/bin/sh\ncase "$1" in\n*/setup_checks.py) exec '
+                + shlex.join([sys.executable, "-c", bootstrap]) + ' "$@" ;;\n*) exec '
+                + shlex.quote(sys.executable) + ' "$@" ;;\nesac\n'
+            )
+            python_stub.chmod(0o755)
+            completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
+                                       capture_output=True, text=True, timeout=5)
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("timed out after 1s", completed.stderr)
+            self.assertIn("timeout-tail", completed.stderr)
+            self.assertIn("failed during prerequisites", completed.stderr)
+            self.assertLess(len(completed.stderr), 2200)
+            self.assertNotIn("Traceback", completed.stderr)
+            self.assertFalse(Path(env["CARGO_LOG"]).exists(), "timed-out prerequisite must prevent Cargo")
+            (root / "bin/rustc").write_text(RUSTC_STUB)
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(CHECKS.main(["prerequisites", str(repo)]), 0)
+            for error in (FileNotFoundError("tool unavailable"), CAPTURE.ProcessCleanupError("retain workspace")):
+                with self.subTest(error=type(error).__name__), \
+                     mock.patch.object(CHECKS, "run_bounded", side_effect=error), \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(CHECKS.main(["prerequisites", str(repo)]), 2)
+                    self.assertIn(str(error), stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_setup_rejects_unsupported_host_before_mutating_or_building(self) -> None:
+        with scratch_outside_tmp() as directory:
+            root = Path(directory)
+            repo, gym_root, env = make_setup_host(root)
+            uname = root / "bin/uname"
+            uname.write_text("#!/bin/sh\necho FreeBSD\n")
+            uname.chmod(0o755)
+            completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
+                                       capture_output=True, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("Linux and macOS hosts only", completed.stderr)
+            self.assertFalse(Path(env["CARGO_LOG"]).exists(), "unsupported host ran Cargo")
+            self.assertFalse(gym_root.exists(), "unsupported host created Gym state")
+
+    def test_setup_parses_toolchain_table_and_rejects_malformed_requirements_and_versions(self) -> None:
+        valid = '[toolchain]\nchannel = "1.90.0"\n'
+        cases = [
+            ("comments", '# channel = "0.0.0"\n[unrelated]\nchannel = "0.1.0"\n' + valid, RUSTC_STUB, True),
+            ("size-limit", valid + "#" + "x" * (CHECKS.TOOLCHAIN_BYTES - len(valid) - 1), RUSTC_STUB, True),
+            ("oversized", valid + "#" + "x" * CHECKS.TOOLCHAIN_BYTES, RUSTC_STUB, False),
+            ("symlink", valid, RUSTC_STUB, True),
+            ("fifo", None, RUSTC_STUB, False),
+            ("directory", None, RUSTC_STUB, False),
+            ("missing", '[toolchain]\ncomponents = []\n', RUSTC_STUB, False),
+            ("wrong-type", '[toolchain]\nchannel = ["1.90.0"]\n', RUSTC_STUB, False),
+            ("bad-table", 'toolchain = "1.90.0"\n', RUSTC_STUB, False),
+            ("invalid-toml", '[toolchain\n', RUSTC_STUB, False),
+            ("empty-version", valid, NOOP_STUB, False),
+            ("non-utf8", valid, "#!/bin/sh\nprintf '\\377'\n", False),
+            ("wrong-program", valid, '#!/bin/sh\necho "unrelated 1.90.0"\n', False),
+            ("mismatch", valid, '#!/bin/sh\necho "rustc 1.89.0 (old)"\n', False),
+        ]
+        for case, config, rustc, supported in cases:
+            with self.subTest(case=case), scratch_outside_tmp() as directory:
+                root = Path(directory)
+                repo, _, env = make_setup_host(root)
+                config_path = repo / "rust-toolchain.toml"
+                if case in ("fifo", "directory", "symlink"):
+                    config_path.unlink()
+                    if case == "fifo":
+                        os.mkfifo(config_path)
+                    elif case == "directory":
+                        config_path.mkdir()
+                    else:
+                        target = root / "shared-toolchain.toml"
+                        target.write_text(config)
+                        config_path.symlink_to(target)
+                else:
+                    config_path.write_text(config)
+                (root / "bin/rustc").write_text(rustc)
+                completed = subprocess.run(["bash", str(SETUP), str(repo)], env=env,
+                                           capture_output=True, text=True, timeout=10)
+                self.assertEqual(completed.returncode == 0, supported, completed.stderr)
+                self.assertEqual(Path(env["CARGO_LOG"]).exists(), supported)
+                if not supported:
+                    self.assertIn("gym setup failed during prerequisites", completed.stderr)
+                    self.assertNotIn("Traceback", completed.stderr)
+                    if case in ("fifo", "directory"):
+                        self.assertIn("must be a regular file", completed.stderr)
+                    if case == "oversized":
+                        self.assertIn("exceeds 65536 bytes", completed.stderr)
 
     def test_setup_requires_supported_git_versions_with_vendor_suffixes(self) -> None:
         cases = [("git version 2.39.5 (Apple Git-155)", False), ("git version 2.39.9", False),

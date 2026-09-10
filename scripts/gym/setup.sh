@@ -42,31 +42,26 @@ for candidate in "$repo" "$gym_root"; do
 done
 
 step=prerequisites
+case "$(uname -s)" in
+  Linux) containment_test=linux_js_worker_containment ;;
+  Darwin) containment_test=macos_js_worker_containment ;;
+  *)
+    printf 'gym setup supports Linux and macOS hosts only\n' >&2
+    exit 2
+    ;;
+esac
 command -v cargo >/dev/null
 command -v rustc >/dev/null
 command -v git >/dev/null
 command -v jq >/dev/null
-python3 - "$repo" <<'PY'
-import re
-import subprocess
+python3 - <<'PY'
 import sys
-from pathlib import Path
 
 if sys.version_info < (3, 11):
     raise SystemExit("Python 3.11 or newer is required for descriptor-relative workspace cleanup")
-repo = Path(sys.argv[1])
-required = re.search(r'channel\s*=\s*"([^"]+)"', (repo / "rust-toolchain.toml").read_text()).group(1)
-actual = subprocess.check_output(["rustc", "--version"], text=True).split()[1]
-if actual != required:
-    raise SystemExit(f"rustc {actual} does not match rust-toolchain.toml {required}")
-git_version = subprocess.check_output(["git", "version"], text=True).strip()
-match = re.match(r"git version (\d+)\.(\d+)(?:[.\s]|$)", git_version)
-if match is None:
-    raise SystemExit(f"cannot parse {git_version!r}; required 2.40 or newer")
-parts = tuple(int(part) for part in match.groups())
-if parts < (2, 40):
-    raise SystemExit(f"{git_version} is older than required 2.40")
 PY
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python3 "$script_dir/setup_checks.py" prerequisites "$repo"
 
 step=isolated_directories
 # train.py materializes each episode's worktree under worktrees/ and its AppPaths
@@ -83,34 +78,13 @@ step=debug_install
 cargo install --path . --debug --locked --features skills --root "$gym_root"
 binary="$gym_root/bin/mini-agent"
 test -x "$binary"
-# No pipeline here: `grep -q` can SIGPIPE the writer, which `set -o pipefail`
-# would report as an install failure.
-help=$("$binary" --help 2>&1)
-case "$help" in
-  *--install-learned-skill-seeds*) ;;
-  *)
-    printf 'installed binary does not advertise --install-learned-skill-seeds: the gym install lost the skills feature\n' >&2
-    exit 2
-    ;;
-esac
+python3 "$script_dir/setup_checks.py" installed-binary "$repo" "$binary"
 
 step=worker_containment_preflight
 # Same feature set as the install above, so the preflight exercises the build
 # the episodes actually run.
-case "$(uname -s)" in
-  Linux)
-    cargo test --locked --features skills \
-      linux_js_worker_containment -- --ignored --nocapture
-    ;;
-  Darwin)
-    cargo test --locked --features skills \
-      macos_js_worker_containment -- --ignored --nocapture
-    ;;
-  *)
-    printf 'gym setup supports Linux and macOS hosts only\n' >&2
-    exit 2
-    ;;
-esac
+cargo test --locked --features skills \
+  "$containment_test" -- --ignored --nocapture
 
 trap - ERR
 printf 'gym host ready: %s\n' "$gym_root"
