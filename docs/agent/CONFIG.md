@@ -1206,7 +1206,10 @@ Requires the `status-signals` feature (included in the default build). Pass
 `--status-socket <path>` to have zerostack emit `start`, `stop`, and
 `git-conflict` events over a Unix domain socket at `<path>`, for external
 status bars or tooling to watch. This is separate from the in-TUI status bar
-above.
+above. Each connection carries one newline-terminated event. Delivery is
+best-effort: connections and writes are nonblocking, and an unavailable or busy
+listener may miss a notification. Status delivery never waits for the listener
+to accept or read, including during turn interruption and shutdown.
 
 ## Colors
 
