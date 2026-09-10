@@ -52,7 +52,12 @@ impl ProcessIdentity {
 
 #[cfg(target_os = "linux")]
 fn snapshot(pid: u32) -> io::Result<Option<Snapshot>> {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    snapshot_from_stat(pid, std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_from_stat(pid: u32, read: io::Result<String>) -> io::Result<Option<Snapshot>> {
+    match read {
         Ok(stat) => parse_stat(pid, &stat).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         // read_to_string opens and then reads. A task that exits in between
@@ -240,6 +245,10 @@ fn owned_process_observation_distinguishes_live_zombie_reaped_and_replaced() {
         ..identity
     };
     assert_eq!(replaced.state().unwrap(), ProcessState::Replaced);
+    // Hold the proc inode while its task is still live. Reading this same
+    // descriptor after reaping reproduces the open/read race deterministically.
+    #[cfg(target_os = "linux")]
+    let mut opened_stat = std::fs::File::open(format!("/proc/{}/stat", child.0.id())).unwrap();
     child.0.kill().unwrap();
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
     // SAFETY: this is our unreaped child. WNOWAIT establishes its exit without
@@ -260,21 +269,29 @@ fn owned_process_observation_distinguishes_live_zombie_reaped_and_replaced() {
     // The original kill-zero assertion rejects this dead, unreaped process.
     assert_eq!(unsafe { libc::kill(child.0.id() as i32, 0) }, 0);
     child.0.wait().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let mut stat = String::new();
+        let read = opened_stat.read_to_string(&mut stat).map(|_| stat);
+        assert_eq!(read.as_ref().unwrap_err().raw_os_error(), Some(libc::ESRCH));
+        assert!(snapshot_from_stat(child.0.id(), read).unwrap().is_none());
+    }
     assert_eq!(identity.state().unwrap(), ProcessState::Gone);
     assert!(ProcessIdentity::capture(child.0.id()).is_err());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn process_stat_parser_keeps_identity_and_stopped_processes_live() {
+fn process_stat_reads_preserve_identity_and_observation_errors() {
     let stat = |state: &str| {
         format!(
             "41 (name with ) spaces) {state} 12 41 {} 987 0",
             "0 ".repeat(16)
         )
     };
-    for state in ["R", "S", "D", "T", "t", "I"] {
-        let snapshot = parse_stat(41, &stat(state)).unwrap();
+    for state in ["R", "S", "D", "T", "t", "W", "K", "P", "I"] {
+        let snapshot = snapshot_from_stat(41, Ok(stat(state))).unwrap().unwrap();
         assert_eq!(snapshot.started, Some((987, 0)));
         assert!(matches!(
             snapshot.state,
@@ -287,7 +304,10 @@ fn process_stat_parser_keeps_identity_and_stopped_processes_live() {
     }
     for state in ["Z", "X", "x"] {
         assert_eq!(
-            parse_stat(41, &stat(state)).unwrap().state,
+            snapshot_from_stat(41, Ok(stat(state)))
+                .unwrap()
+                .unwrap()
+                .state,
             ProcessState::Exited
         );
     }
@@ -296,7 +316,21 @@ fn process_stat_parser_keeps_identity_and_stopped_processes_live() {
         stat("S").replace("987", "bad"),
         "41 (short) S".into(),
     ] {
-        assert!(parse_stat(41, &invalid).is_err());
+        assert!(snapshot_from_stat(41, Ok(invalid)).is_err());
     }
-    assert!(parse_stat(42, &stat("S")).is_err());
+    assert!(snapshot_from_stat(42, Ok(stat("S"))).is_err());
+    for number in [libc::EACCES, libc::EIO, libc::EINTR] {
+        let error = snapshot_from_stat(41, Err(io::Error::from_raw_os_error(number)))
+            .err()
+            .expect("an unavailable observation became process disappearance");
+        assert_eq!(error.raw_os_error(), Some(number));
+    }
+    let error = snapshot_from_stat(
+        41,
+        Err(io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 stat")),
+    )
+    .err()
+    .expect("invalid stat data became process disappearance");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "non-UTF-8 stat");
 }

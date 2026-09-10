@@ -107,7 +107,12 @@ but is not reaped; failed observations never count as termination. The acceptanc
 snapshot is taken immediately after the ACP response and is not retried. An owned
 FIFO permits fixture cleanup after a failed assertion, and cleanup drains the
 prompt work scope before propagating the failure. Native controls cover live,
-unreaped-zombie, reaped, and mismatched-identity observations.
+unreaped-zombie, reaped, and mismatched-identity observations. The Linux control
+also holds an open proc stat file through task reaping to reproduce the real `ESRCH`
+read failure. Missing paths and this vanished-task read become `Gone`; permission,
+I/O, interrupted-read, and invalid-data errors remain observation failures. The
+same read-result classifier handles real proc reads and the retained parser/error
+matrix, so the race check does not duplicate or bypass the classification logic.
 
 Git timeout and caller-drop tests reuse this process-state helper and an owned
 FIFO alias/descendant fixture. They capture the group-leading Git child and both
