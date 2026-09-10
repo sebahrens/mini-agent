@@ -1002,6 +1002,10 @@ async fn execute_tasks(
         && next_index < task_count
         && in_flight.len() < limits.max_concurrency
     {
+        if Instant::now() >= deadline {
+            stop_reason = Some(StopReason::Deadline);
+            break;
+        }
         let index = next_index;
         next_index += 1;
         started[index] = true;
@@ -1011,7 +1015,7 @@ async fn execute_tasks(
         in_flight.push(indexed_child_future(index, prompt, child.future));
     }
 
-    while !in_flight.is_empty() {
+    while stop_reason.is_none() && !in_flight.is_empty() {
         let next = tokio::time::timeout_at(deadline, in_flight.next()).await;
         let next_result = match next {
             Ok(result) => result,
@@ -1086,6 +1090,12 @@ async fn execute_tasks(
             && next_index < task_count
             && in_flight.len() < limits.max_concurrency
         {
+            // timeout_at can return an already-ready result after expiry.
+            // Retain the result, but do not let it admit another child.
+            if Instant::now() >= deadline {
+                stop_reason = Some(StopReason::Deadline);
+                break;
+            }
             let index = next_index;
             next_index += 1;
             started[index] = true;
@@ -1431,6 +1441,8 @@ mod tests {
         }
     }
 
+    // Fake-only scheduler tests run with paused Tokio time. Their delays specify
+    // logical completion order, not a performance budget for the CI host.
     fn fake_executor(steps: Vec<FakeStep>, counters: Arc<FakeCounters>) -> TaskExecutor {
         Arc::new(move |index, _prompt| {
             let step = steps[index].clone();
@@ -1634,7 +1646,7 @@ mod tests {
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn project_override_notice_is_host_rendered_before_subagent_output() {
         let counters = Arc::new(FakeCounters::default());
         let step = FakeStep {
@@ -1821,7 +1833,7 @@ mod tests {
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn project_override_notice_and_near_limit_results_share_one_output_bound() {
         let counters = Arc::new(FakeCounters::default());
         let notice = "[specialist source: project override .zerostack/agents/review.md]";
@@ -1853,7 +1865,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn turn_budget_partial_does_not_cancel_sibling_tasks() {
         let counters = Arc::new(FakeCounters::default());
         let partial = FakeStep {
@@ -1883,7 +1895,7 @@ mod tests {
         assert!(!rendered.contains("[cancelled:"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn task_tool_limits_bound_peak_concurrency() {
         let counters = Arc::new(FakeCounters::default());
         let steps = (0..5)
@@ -1908,106 +1920,77 @@ mod tests {
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn task_tool_limits_cancel_in_flight_and_queued_work_after_failure() {
-        let counters = Arc::new(FakeCounters::default());
-        let steps = vec![
-            FakeStep {
-                delay: Duration::from_millis(200),
-                output: Ok("late success".into()),
-                cost_units: 1,
-            },
-            FakeStep {
-                delay: Duration::from_millis(10),
-                output: Err("boom".into()),
-                cost_units: 7,
-            },
-            FakeStep {
-                delay: Duration::ZERO,
-                output: Ok("must not start".into()),
-                cost_units: 1,
-            },
-            FakeStep {
-                delay: Duration::ZERO,
-                output: Ok("must not start".into()),
-                cost_units: 1,
-            },
-        ];
-
-        let report = execute_tasks(
-            prompts(4),
-            limits(),
-            fake_executor(steps, Arc::clone(&counters)),
-            None,
-        )
-        .await;
-        let rendered = report.render();
-
-        assert_eq!(report.started, 2);
-        assert_eq!(report.completed, 1);
-        assert_eq!(report.cost_units, 8);
-        assert_eq!(counters.started.load(Ordering::SeqCst), 2);
-        assert_eq!(counters.live.load(Ordering::SeqCst), 0);
-        assert!(rendered.starts_with("[partial: task 2 failed"));
-        assert!(rendered.contains("## Task 1:"));
-        assert!(rendered.contains("[cancelled: task 2 failed]"));
-        assert!(rendered.contains("## Task 2:"));
-        assert!(rendered.contains("[failed: boom]"));
-        assert!(rendered.contains("[not started: task 2 failed]"));
-        let task_1 = rendered.find("## Task 1:").unwrap();
-        let task_2 = rendered.find("## Task 2:").unwrap();
-        let task_3 = rendered.find("## Task 3:").unwrap();
-        assert!(task_1 < task_2 && task_2 < task_3);
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn task_tool_limits_mixed_results_keep_order_and_accounting() {
-        let counters = Arc::new(FakeCounters::default());
-        let steps = vec![
-            FakeStep {
-                delay: Duration::from_millis(5),
-                output: Ok("completed first".into()),
-                cost_units: 3,
-            },
-            FakeStep {
-                delay: Duration::from_millis(20),
-                output: Err("second failed".into()),
-                cost_units: 7,
-            },
-            FakeStep {
-                delay: Duration::from_millis(200),
-                output: Ok("must be cancelled".into()),
-                cost_units: 11,
-            },
-            FakeStep {
-                delay: Duration::ZERO,
-                output: Ok("must not start".into()),
-                cost_units: 13,
-            },
-        ];
-
-        let report = execute_tasks(
-            prompts(4),
-            limits(),
-            fake_executor(steps, Arc::clone(&counters)),
-            None,
-        )
-        .await;
-        let rendered = report.render();
-
-        assert_eq!(report.started, 3);
-        assert_eq!(report.completed, 2);
-        assert_eq!(report.cost_units, 21);
-        assert_eq!(counters.started.load(Ordering::SeqCst), 3);
-        assert_eq!(counters.live.load(Ordering::SeqCst), 0);
-        let success = rendered.find("completed first").unwrap();
-        let failure = rendered.find("[failed: second failed]").unwrap();
-        let cancelled = rendered.find("[cancelled: task 2 failed]").unwrap();
-        let queued = rendered.find("[not started: task 2 failed]").unwrap();
-        assert!(success < failure && failure < cancelled && cancelled < queued);
+        for completed_first in [false, true] {
+            let counters = Arc::new(FakeCounters::default());
+            let steps = vec![
+                FakeStep {
+                    delay: Duration::from_millis(if completed_first { 5 } else { 200 }),
+                    output: Ok("first result".into()),
+                    cost_units: if completed_first { 3 } else { 1 },
+                },
+                FakeStep {
+                    delay: Duration::from_millis(20),
+                    output: Err("second failed".into()),
+                    cost_units: 7,
+                },
+                FakeStep {
+                    delay: Duration::from_millis(200),
+                    output: Ok("must be cancelled or queued".into()),
+                    cost_units: 11,
+                },
+                FakeStep {
+                    delay: Duration::ZERO,
+                    output: Ok("must not start".into()),
+                    cost_units: 13,
+                },
+            ];
+            let report = execute_tasks(
+                prompts(4),
+                limits(),
+                fake_executor(steps, Arc::clone(&counters)),
+                None,
+            )
+            .await;
+            let rendered = report.render();
+            let expected_started = if completed_first { 3 } else { 2 };
+            assert_eq!(report.started, expected_started);
+            assert_eq!(report.completed, if completed_first { 2 } else { 1 });
+            assert_eq!(report.cost_units, if completed_first { 21 } else { 8 });
+            assert_eq!(counters.started.load(Ordering::SeqCst), expected_started);
+            assert_eq!(counters.live.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                report.stop_reason,
+                Some(StopReason::ChildFailure(1))
+            ));
+            assert!(rendered.starts_with("[partial: task 2 failed"));
+            if completed_first {
+                assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+                assert!(matches!(report.outcomes[2], TaskOutcome::Cancelled(_)));
+                let success = rendered.find("first result").unwrap();
+                let failure = rendered.find("[failed: second failed]").unwrap();
+                let cancelled = rendered.find("[cancelled: task 2 failed]").unwrap();
+                let queued = rendered.find("[not started: task 2 failed]").unwrap();
+                assert!(success < failure && failure < cancelled && cancelled < queued);
+            } else {
+                assert!(matches!(report.outcomes[0], TaskOutcome::Cancelled(_)));
+                assert!(matches!(report.outcomes[2], TaskOutcome::NotStarted(_)));
+                assert!(!rendered.contains("first result"));
+                assert!(rendered.contains("[cancelled: task 2 failed]"));
+                assert!(rendered.contains("[failed: second failed]"));
+                assert!(rendered.contains("[not started: task 2 failed]"));
+            }
+            assert!(matches!(report.outcomes[1], TaskOutcome::Failed(_)));
+            assert!(matches!(report.outcomes[3], TaskOutcome::NotStarted(_)));
+            let headings: Vec<_> = (1..=4)
+                .map(|index| rendered.find(&format!("## Task {index}:")).unwrap())
+                .collect();
+            assert!(headings.windows(2).all(|pair| pair[0] < pair[1]));
+        }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn task_tool_limits_stop_at_aggregate_output_bound() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![
@@ -2051,7 +2034,7 @@ mod tests {
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn quoted_output_exhaustion_prevents_queued_children_from_starting() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![
@@ -2086,7 +2069,7 @@ mod tests {
         assert!(report.render().len() <= limits.max_output_bytes);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn notice_and_exact_rendered_boundary_control_child_admission() {
         let notice = "[specialist source: fixture]";
         // Heading, empty quoted output, host markers, and notice occupy exactly
@@ -2128,7 +2111,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn single_task_rendering_preserves_unicode_and_normalizes_trailing_newlines() {
         for (response, quoted) in [("", "> \n"), ("記憶", "> 記憶\n"), ("記憶\n", "> 記憶\n")]
         {
@@ -2151,7 +2134,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn task_tool_limits_stop_launching_after_cost_exhaustion() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![
@@ -2197,7 +2180,106 @@ mod tests {
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn task_tool_deadline_stops_admission_when_a_child_is_already_ready() {
+        // Exercise an already-expired admission boundary directly. Configuration
+        // validation separately rejects a zero timeout supplied by a user.
+        let never_start: TaskExecutor =
+            Arc::new(|_, _| panic!("an expired call must not construct a child"));
+        let expired = execute_tasks(
+            prompts(3),
+            TaskLimits {
+                timeout: Duration::ZERO,
+                ..limits()
+            },
+            never_start,
+            None,
+        )
+        .await;
+        assert_eq!(expired.started, 0);
+        assert_eq!(expired.completed, 0);
+        assert_eq!(expired.cost_units, 0);
+        assert!(matches!(expired.stop_reason, Some(StopReason::Deadline)));
+        assert!(
+            expired
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, TaskOutcome::NotStarted(_)))
+        );
+
+        for elapsed_ms in [999, 1_000, 1_001] {
+            let counters = Arc::new(FakeCounters::default());
+            let (release, ready) = tokio::sync::oneshot::channel();
+            let ready = std::sync::Mutex::new(Some(ready));
+            let observed = counters.clone();
+            let executor: TaskExecutor = Arc::new(move |index, _prompt| {
+                let ready = if index == 0 {
+                    ready.lock().unwrap().take()
+                } else {
+                    None
+                };
+                let counters = observed.clone();
+                ScheduledChild {
+                    future: Box::pin(async move {
+                        counters.started.fetch_add(1, Ordering::SeqCst);
+                        counters.live.fetch_add(1, Ordering::SeqCst);
+                        let _guard = LiveGuard(counters);
+                        if let Some(ready) = ready {
+                            ready.await.unwrap();
+                        }
+                        ChildExecution {
+                            output: Ok(format!("result {index}")),
+                            cost_units: 1,
+                        }
+                    }),
+                    cancellation_cost: Arc::new(|| 1),
+                }
+            });
+            let call = execute_tasks(
+                prompts(3),
+                TaskLimits {
+                    max_concurrency: 1,
+                    ..limits()
+                },
+                executor,
+                None,
+            );
+            tokio::pin!(call);
+            assert!(call.as_mut().now_or_never().is_none());
+            assert_eq!(counters.started.load(Ordering::SeqCst), 1);
+            // The call is deliberately unpolled while its clock reaches the
+            // boundary, then the child is ready when timeout_at is polled again.
+            tokio::time::advance(Duration::from_millis(elapsed_ms)).await;
+            release.send(()).unwrap();
+            let report = call.await;
+            let expired = elapsed_ms >= 1_000;
+            let expected = if expired { 1 } else { 3 };
+            assert_eq!(report.started, expected, "elapsed={elapsed_ms}");
+            assert_eq!(report.completed, expected, "elapsed={elapsed_ms}");
+            assert_eq!(report.cost_units, expected as u64, "elapsed={elapsed_ms}");
+            assert_eq!(counters.started.load(Ordering::SeqCst), expected);
+            assert_eq!(counters.live.load(Ordering::SeqCst), 0);
+            assert!(matches!(report.outcomes[0], TaskOutcome::Success(_)));
+            if expired {
+                assert!(matches!(report.stop_reason, Some(StopReason::Deadline)));
+                assert!(
+                    report.outcomes[1..]
+                        .iter()
+                        .all(|outcome| matches!(outcome, TaskOutcome::NotStarted(_)))
+                );
+            } else {
+                assert!(report.stop_reason.is_none());
+                assert!(
+                    report
+                        .outcomes
+                        .iter()
+                        .all(|outcome| matches!(outcome, TaskOutcome::Success(_)))
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn task_tool_deadline_preserves_completed_output_and_cancels_remaining_work() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![
@@ -2247,7 +2329,7 @@ mod tests {
         assert_eq!(counters.live.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn task_tool_limits_render_successes_in_prompt_order() {
         let counters = Arc::new(FakeCounters::default());
         let steps = vec![

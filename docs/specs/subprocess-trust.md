@@ -206,6 +206,10 @@ syntactically proven task/thread or local associated `spawn` calls are excluded;
 unrecognized terminals fail closed. The learned-skill reevaluation branch
 `matches!(status.as_str(), "verified" | "awaiting_approval")` compares a database status string;
 its exact source expression and full macro-context digest are classified `NON-PROCESS`.
+The pricing metadata assertions in `startup.rs` compare numeric `output` values,
+and the task scheduler's `FakeStep` vectors contain response data fields named
+`output`. Their exact expressions and macro-context digests are also classified
+`NON-PROCESS`. The ACP hook test's reused `kill -0` probe is `TEST-ONLY`.
 The `CommandWrap` creation adapter compiles with its LSP caller; MCP uses the separate RMCP
 creation adapter. Spawn/status helpers hold the Windows creation mutex only through
 synchronous spawn. The output helper delegates to `std::process::Command::output` under the mutex so

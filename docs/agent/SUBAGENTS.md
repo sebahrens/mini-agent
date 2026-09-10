@@ -473,6 +473,10 @@ original prompt order:
 - started siblings contain `[cancelled: ...]`;
 - queued prompts contain `[not started: ...]`.
 
+The scheduler checks the absolute deadline before admitting each child.
+A result already ready when the scheduler resumes is
+retained, but it cannot cause queued work to start at or after the deadline.
+
 Exhausting `task_max_turns` is not a child failure. The child returns all text
 accumulated so far followed by `[partial: turn budget exhausted]`; its queued
 and in-flight siblings continue normally (mini-agent-ddno).

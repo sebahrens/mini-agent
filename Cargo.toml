@@ -177,6 +177,7 @@ security-framework = "3.7"
 security-framework-sys = "2.17"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rig = { package = "rig-core", version = "0.40", features = ["test-utils"] }
 syn = { version = "2", features = ["full", "visit"] }

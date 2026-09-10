@@ -824,13 +824,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        "!std::process::Command::new(\"kill\")",
-        1,
+        2,
         "TEST-ONLY",
     ),
     ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),
@@ -1447,6 +1441,36 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"first result\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/subagents/task_tool.rs",
+        "output: Ok(\"must be cancelled or queued\".into()),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/startup.rs",
+        "assert_eq!(info.output_cost, output, \"{model} output\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/startup.rs",
+        "assert_eq!(session.output_token_cost, output, \"{model}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/startup.rs",
+        "assert_eq!(restored.output_token_cost, output, \"{model}\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/permission/ask.rs",
         "Some(crate::event::AgentEvent::ToolResult { id, output, .. }) => {",
         1,
@@ -1706,12 +1730,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         "output: \"a-result\".into(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        ".is_ok_and(|status| status.success()),",
         1,
         "NON-PROCESS",
     ),
@@ -2107,19 +2125,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/subagents/task_tool.rs",
-        "output: Err(\"boom\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
         "output: Err(\"second failed\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"completed first\".into()),",
         1,
         "NON-PROCESS",
     ),
@@ -2131,20 +2137,14 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/subagents/task_tool.rs",
-        "output: Ok(\"late success\".into()),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/subagents/task_tool.rs",
         "output: Ok(\"must be cancelled\".into()),",
-        3,
+        2,
         "NON-PROCESS",
     ),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"must not start\".into()),",
-        6,
+        4,
         "NON-PROCESS",
     ),
     (
@@ -2308,6 +2308,23 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    (
+        "src/startup.rs",
+        &[
+            (
+                "bfb649801945731a3401da523cb736f42d1932c761cff088e24a3a1c15bfeea9",
+                1,
+            ),
+            (
+                "0ae11b241928081bfb8db123dffe1b53471dad319b8f52d56fd8ea4ff1332289",
+                1,
+            ),
+            (
+                "4736207eeb0e55e37222f1373542a05ee9ae4a12a6adce3b4ab5d164513899aa",
+                1,
+            ),
+        ],
+    ),
     (
         "src/permission/ask.rs",
         &[
@@ -2623,10 +2640,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 "295618629907043194c80029881ca6c0c7fd6c758a98c278f3d845cdf7e45f7f",
                 1,
             ),
-            (
-                "458562ae8615a7b8f5df26c3c5b4fb1f20bd7bb2c54191d9011ed73396156315",
-                1,
-            ),
         ],
     ),
     (
@@ -2832,6 +2845,10 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/subagents/task_tool.rs",
         &[
             (
+                "f6cbad0c5a42805120dccf0d39a9e20f819fec851a04f3e989ac7c7a754508e5",
+                1,
+            ),
+            (
                 "e56ebbde3b87e7449cf7d734dabaddf4963dbf3c2548ae0a7c393bf165a29b14",
                 1,
             ),
@@ -2844,19 +2861,11 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "5b355171d273f77d7a74c57959ccae1ff1c7f4e15189cc8f15c170bf3be44c3b",
-                1,
-            ),
-            (
                 "6884bc264c3021e29f258708b6c9047a22a2d755048dd069b549824131e86d7a",
                 1,
             ),
             (
                 "7308fdc8eff948ba4a55b0e6e5bc4490cd09ba72db71d7553393f8ec71aa2da4",
-                1,
-            ),
-            (
-                "e43f6b1a9e960b4dbeb45d38462dcdee2075a1a7dbb5bee387bf5fc8ad238280",
                 1,
             ),
             (
@@ -3280,13 +3289,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        "!std::process::Command::new(\"kill\")",
-        1,
+        2,
         "TEST-ONLY",
     ),
     ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),

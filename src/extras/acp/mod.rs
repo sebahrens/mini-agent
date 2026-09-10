@@ -3623,39 +3623,58 @@ mod protocol_tests {
             permission_mode: "deny".to_owned(),
         };
         let work_scope = crate::agent::runner::AgentWorkScope::new();
-        let started = std::time::Instant::now();
-        let gate = work_scope
-            .run(crate::extras::hooks::gate_user_prompt(
-                &dispatcher,
-                &ctx,
-                "configured hook prompt".to_owned(),
-            ))
-            .await;
-        assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
-        assert!(
-            started.elapsed() < Duration::from_millis(150),
-            "async:true prompt hooks must not delay prompt dispatch"
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pid_file.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the configured UserPromptSubmit hook should start");
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
-
-        work_scope.cancellation_handle().cancel();
-        tokio::time::timeout(Duration::from_secs(5), work_scope.wait_idle())
-            .await
-            .expect("hook cancellation must kill and reap the configured subprocess");
-        assert!(
-            !std::process::Command::new("kill")
-                .args(["-0", pid.trim()])
+        let is_live = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|status| status.success()),
+                .is_ok_and(|status| status.success())
+        };
+        // These bounds are hang guards. The assertions below inspect live work
+        // before cancellation and settled work afterward, not elapsed latency.
+        let gate = tokio::time::timeout(
+            Duration::from_secs(15),
+            work_scope.run(crate::extras::hooks::gate_user_prompt(
+                &dispatcher,
+                &ctx,
+                "configured hook prompt".to_owned(),
+            )),
+        )
+        .await;
+        let observed = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                    && pid > 0
+                {
+                    break pid.to_string();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let had_active_work = work_scope.active_children() > 0;
+        let was_live = observed.as_ref().is_ok_and(|pid| is_live(pid));
+
+        // Settle the fixture before reporting dispatch/readiness failures.
+        work_scope.cancellation_handle().cancel();
+        let settled = tokio::time::timeout(Duration::from_secs(15), work_scope.wait_idle()).await;
+        settled.expect("hook cancellation must kill and reap the configured subprocess");
+        let gate = gate.expect("async prompt dispatch waited for its still-running hook");
+        let pid = observed.expect("the configured UserPromptSubmit hook should start");
+        assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
+        assert!(
+            had_active_work,
+            "dispatch must return while hook work is owned"
+        );
+        assert!(
+            was_live,
+            "dispatch must return while the configured hook is live"
+        );
+        assert_eq!(work_scope.active_children(), 0);
+        assert!(
+            !is_live(&pid),
             "Cancelled must not return while the configured hook process is live"
         );
     }
