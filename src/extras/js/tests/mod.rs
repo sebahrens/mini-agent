@@ -99,20 +99,24 @@ impl Drop for TestTempDir {
     }
 }
 
-fn make_test_tool() -> JsTool {
-    make_test_tool_with_sandbox(Sandbox::new(false, "bwrap"))
+// Declare the audit guard before the tools and await their calls before leaving
+// its scope. Each tool gets independent audit storage outside the workspace.
+fn make_test_tool(audits: &TestTempDir) -> JsTool {
+    make_test_tool_with_sandbox(audits, Sandbox::new(false, "bwrap"))
 }
 
-fn make_test_tool_with_sandbox(sandbox: Sandbox) -> JsTool {
-    make_test_tool_with_permissions(sandbox, None, None)
+fn make_test_tool_with_sandbox(audits: &TestTempDir, sandbox: Sandbox) -> JsTool {
+    make_test_tool_with_permissions(audits, sandbox, None, None)
 }
 
 fn make_test_tool_with_permissions(
+    audits: &TestTempDir,
     sandbox: Sandbox,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
     make_test_tool_with_permissions_and_process_tree(
+        audits,
         sandbox.with_complete_process_tree_for_test(),
         permission,
         ask_tx,
@@ -120,12 +124,12 @@ fn make_test_tool_with_permissions(
 }
 
 fn make_test_tool_with_permissions_and_process_tree(
+    audits: &TestTempDir,
     sandbox: Sandbox,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) -> JsTool {
-    let root =
-        std::env::temp_dir().join(format!("mini-agent-js-test-audit-{}", uuid::Uuid::new_v4()));
+    let root = audits.path().join(format!("tool-{}", uuid::Uuid::new_v4()));
     let paths = crate::paths::AppPaths {
         config_dir: root.join("config"),
         data_dir: root.join("data"),
@@ -219,8 +223,9 @@ fn restrictive_permission_denying_js_entrypoint() -> PermCheck {
 
 #[tokio::test]
 async fn test_return_value() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
             code: "1 + 1".to_string(),
@@ -232,8 +237,9 @@ async fn test_return_value() {
 
 #[tokio::test]
 async fn test_fetch_global_matches_sandbox_feature() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
             code: "typeof fetch".to_string(),
@@ -252,8 +258,9 @@ async fn test_fetch_global_matches_sandbox_feature() {
 
 #[tokio::test]
 async fn tool_description_prefers_javascript_for_computation() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let description = make_test_tool().description();
+    let description = make_test_tool(&audit_dirs).description();
 
     assert!(description.contains("Prefer this tool for computation"));
     assert!(description.contains("instead of invoking Python through a shell"));
@@ -265,8 +272,9 @@ async fn tool_description_prefers_javascript_for_computation() {
 
 #[tokio::test]
 async fn tool_result_contract_guides_explicit_json_stringification() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let rejected = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -291,9 +299,14 @@ async fn tool_result_contract_guides_explicit_json_stringification() {
 
 #[tokio::test]
 async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool =
-        make_test_tool_with_permissions_and_process_tree(Sandbox::new(false, "bwrap"), None, None);
+    let tool = make_test_tool_with_permissions_and_process_tree(
+        &audit_dirs,
+        Sandbox::new(false, "bwrap"),
+        None,
+        None,
+    );
 
     assert!(
         !tool
@@ -311,8 +324,9 @@ async fn tool_description_only_advertises_spawn_with_process_tree_ownership() {
 
 #[tokio::test]
 async fn worker_installs_spawn_when_process_tree_ownership_is_available() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -326,8 +340,9 @@ async fn worker_installs_spawn_when_process_tree_ownership_is_available() {
 #[cfg(feature = "skills")]
 #[tokio::test]
 async fn shipped_tool_omits_unserviceable_proposal_global() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     assert!(!tool.description().contains("propose_skill"));
     let result = tool
@@ -342,8 +357,9 @@ async fn shipped_tool_omits_unserviceable_proposal_global() {
 #[cfg(feature = "sandbox")]
 #[tokio::test]
 async fn test_fetch_options_fail_closed_before_network_io() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     for (code, expected) in [
         (
@@ -378,8 +394,9 @@ async fn test_fetch_options_fail_closed_before_network_io() {
 
 #[tokio::test]
 async fn test_read_write_roundtrip() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let path = std::env::temp_dir().join(format!("zs-test-roundtrip-{}.txt", uuid::Uuid::new_v4()));
     let path_str = path.to_string_lossy().to_string();
@@ -441,8 +458,9 @@ async fn windows_workspace_authority_js_tool_relative_gold_eiffel() {
 
 #[tokio::test]
 async fn test_spawn_captures_output_and_exit_code() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -461,9 +479,10 @@ async fn test_spawn_captures_output_and_exit_code() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_spawn_uses_configured_sandbox_wrapper() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
     let sandbox = Sandbox::new(false, "bwrap").with_shell("false");
-    let tool = make_test_tool_with_sandbox(sandbox);
+    let tool = make_test_tool_with_sandbox(&audit_dirs, sandbox);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -480,11 +499,16 @@ async fn test_spawn_uses_configured_sandbox_wrapper() {
 
 #[tokio::test]
 async fn test_host_globals_enforce_restrictive_permissions() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
 
     let permission = restrictive_permission_allowing_js_entrypoint();
-    let tool =
-        make_test_tool_with_permissions(Sandbox::new(false, "bwrap"), Some(permission), None);
+    let tool = make_test_tool_with_permissions(
+        &audit_dirs,
+        Sandbox::new(false, "bwrap"),
+        Some(permission),
+        None,
+    );
     let path = std::env::temp_dir().join(format!(
         "zs_js_permission_{}_{}.txt",
         std::process::id(),
@@ -537,8 +561,9 @@ async fn test_host_globals_enforce_restrictive_permissions() {
 
 #[tokio::test]
 async fn test_timeout() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -552,8 +577,9 @@ async fn test_timeout() {
 
 #[tokio::test]
 async fn test_exception_is_a_source_free_closed_error() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -571,10 +597,15 @@ async fn test_exception_is_a_source_free_closed_error() {
 
 #[tokio::test]
 async fn test_permission_denied() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
     let permission = restrictive_permission_denying_js_entrypoint();
-    let tool =
-        make_test_tool_with_permissions(Sandbox::new(false, "bwrap"), Some(permission), None);
+    let tool = make_test_tool_with_permissions(
+        &audit_dirs,
+        Sandbox::new(false, "bwrap"),
+        Some(permission),
+        None,
+    );
 
     let error = tool
         .call(crate::extras::js::tool::JsArgs {
@@ -591,8 +622,9 @@ async fn test_permission_denied() {
 
 #[tokio::test]
 async fn test_oom() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
     use rig::tool::Tool;
-    let tool = make_test_tool();
+    let tool = make_test_tool(&audit_dirs);
 
     let result = tool
         .call(crate::extras::js::tool::JsArgs {

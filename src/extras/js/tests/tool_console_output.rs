@@ -9,12 +9,13 @@ use super::make_test_tool;
 use crate::extras::js::tool::JsArgs;
 
 async fn run(code: &str) -> String {
-    make_test_tool()
-        .call(JsArgs {
-            code: code.to_string(),
-        })
-        .await
-        .expect("contained worker call")
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
+    let tool = make_test_tool(&audit_dirs);
+    tool.call(JsArgs {
+        code: code.to_string(),
+    })
+    .await
+    .expect("contained worker call")
 }
 
 #[tokio::test]

@@ -65,13 +65,14 @@ fn context(skills: Vec<ResolvedSkill>) -> Arc<SkillTurnContext> {
 }
 
 async fn call_pure_skill(artifact: &SkillArtifact, code: &str) -> String {
-    make_test_tool()
-        .with_skill_turn_context(context(vec![resolved(artifact, 0)]))
-        .call(JsArgs {
-            code: code.to_string(),
-        })
-        .await
-        .expect("skill runtime binding call must succeed without transport retries")
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(artifact, 0)]));
+    tool.call(JsArgs {
+        code: code.to_string(),
+    })
+    .await
+    .expect("skill runtime binding call must succeed without transport retries")
 }
 
 fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
@@ -91,12 +92,14 @@ fn differential_artifact(source: &str, test: &str) -> SkillArtifact {
 
 #[tokio::test]
 async fn repeated_turn_calls_reuse_compiled_skill_but_not_runtime_state() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let artifact = artifact(
         "let calls = 0; function cached_next() { return ++calls; }",
         &["cached_next"],
         CapabilityManifest::pure(),
     );
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&artifact, 0)]));
 
     for _ in 0..2 {
         assert_eq!(
@@ -419,12 +422,14 @@ fn all_active_invocations_share_one_effect_ordinal_budget() {
 
 #[tokio::test]
 async fn selected_skill_exports_are_installed_before_agent_code() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let selected = artifact(
         "function increment(_cap, value) { return value + 1; }",
         &["increment"],
         CapabilityManifest::pure(),
     );
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&selected, 0)]));
 
     let result = tool
         .call(JsArgs {
@@ -438,6 +443,7 @@ async fn selected_skill_exports_are_installed_before_agent_code() {
 
 #[tokio::test]
 async fn selected_skill_export_is_reusable_with_distinct_parent_issued_call_authority() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
 
     let selected = artifact(
@@ -452,7 +458,7 @@ async fn selected_skill_export_is_reusable_with_distinct_parent_issued_call_auth
         .unwrap(),
     );
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
-    let tool = make_test_tool()
+    let tool = make_test_tool(&audit_dirs)
         .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
         .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
 
@@ -487,6 +493,7 @@ async fn selected_skill_export_is_reusable_with_distinct_parent_issued_call_auth
 
 #[tokio::test]
 async fn production_runner_emits_parent_bound_invocation_evidence() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     use crate::extras::js::skills::telemetry::{SkillEventKind, TelemetryDispatcher};
 
     let selected = artifact(
@@ -495,7 +502,7 @@ async fn production_runner_emits_parent_bound_invocation_evidence() {
         CapabilityManifest::pure(),
     );
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
-    let tool = make_test_tool()
+    let tool = make_test_tool(&audit_dirs)
         .with_skill_turn_context(context(vec![resolved(&selected, 0)]))
         .with_skill_production(true)
         .with_telemetry(TelemetryDispatcher::from_sender_for_test(tx));
@@ -603,6 +610,7 @@ async fn hidden_capability_abi_mismatch_fails_before_export_source_runs() {
 
 #[tokio::test]
 async fn duplicate_and_existing_global_exports_fail_closed() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let first = artifact(
         "function same() { return 1; }",
         &["same"],
@@ -613,7 +621,7 @@ async fn duplicate_and_existing_global_exports_fail_closed() {
         &["same"],
         CapabilityManifest::pure(),
     );
-    let duplicate_tool = make_test_tool()
+    let duplicate_tool = make_test_tool(&audit_dirs)
         .with_skill_turn_context(context(vec![resolved(&first, 0), resolved(&second, 1)]));
     let duplicate = duplicate_tool
         .call(JsArgs {
@@ -632,7 +640,7 @@ async fn duplicate_and_existing_global_exports_fail_closed() {
         CapabilityManifest::pure(),
     );
     let collision_tool =
-        make_test_tool().with_skill_turn_context(context(vec![resolved(&collision, 0)]));
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&collision, 0)]));
     let collision_result = collision_tool
         .call(JsArgs {
             code: "spawn()".to_string(),
@@ -647,12 +655,14 @@ async fn duplicate_and_existing_global_exports_fail_closed() {
 
 #[tokio::test]
 async fn source_and_agent_failures_are_source_free_closed_errors() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let broken = artifact(
         "throw new Error('broken selected source')",
         &[],
         CapabilityManifest::pure(),
     );
-    let source_tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&broken, 0)]));
+    let source_tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&broken, 0)]));
     let source_error = source_tool
         .call(JsArgs {
             code: "1".to_string(),
@@ -665,7 +675,7 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
     );
     assert!(!source_error.contains(&broken.id));
 
-    let agent_tool = make_test_tool();
+    let agent_tool = make_test_tool(&audit_dirs);
     let agent_error = agent_tool
         .call(JsArgs {
             code: "throw new Error('broken agent source')".to_string(),
@@ -682,12 +692,14 @@ async fn source_and_agent_failures_are_source_free_closed_errors() {
 
 #[tokio::test]
 async fn selected_skill_host_calls_require_declared_capabilities() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let pure = artifact(
         "function forbidden() { return spawn('printf', ['must-not-run']); }",
         &["forbidden"],
         CapabilityManifest::pure(),
     );
-    let pure_tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&pure, 0)]));
+    let pure_tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&pure, 0)]));
     let denied = pure_tool
         .call(JsArgs {
             code: "forbidden()".to_string(),
@@ -709,7 +721,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         allowed_manifest,
     );
     let allowed_tool =
-        make_test_tool().with_skill_turn_context(context(vec![resolved(&allowed, 0)]));
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&allowed, 0)]));
     let result = allowed_tool
         .call(JsArgs {
             code: "permitted()".to_string(),
@@ -718,7 +730,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
         .unwrap();
     assert_eq!(result, "allowed");
 
-    let ordinary_agent = make_test_tool()
+    let ordinary_agent = make_test_tool(&audit_dirs)
         .call(JsArgs {
             code: "typeof spawn".to_string(),
         })
@@ -729,6 +741,7 @@ async fn selected_skill_host_calls_require_declared_capabilities() {
 
 #[tokio::test]
 async fn production_skill_binding_accepts_distinct_multi_capability_authority_without_effects() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let manifest = CapabilityManifest::new(
         CapabilityTier::SideEffecting,
         vec![
@@ -746,7 +759,8 @@ async fn production_skill_binding_accepts_distinct_multi_capability_authority_wi
         &["no_effect"],
         manifest,
     );
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&selected, 0)]));
 
     let result = tool
         .call(JsArgs {
@@ -760,6 +774,7 @@ async fn production_skill_binding_accepts_distinct_multi_capability_authority_wi
 
 #[tokio::test]
 async fn pure_and_read_only_skill_preparation_bypasses_saturated_executable_slots() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let permits = saturate_executable_preparation_slots_for_test().await;
     let pure = artifact(
         "function pure_value() { return 20; }",
@@ -777,7 +792,7 @@ async fn pure_and_read_only_skill_preparation_bypasses_saturated_executable_slot
         )
         .unwrap(),
     );
-    let tool = make_test_tool()
+    let tool = make_test_tool(&audit_dirs)
         .with_skill_turn_context(context(vec![resolved(&pure, 0), resolved(&read_only, 1)]));
 
     let result = tokio::time::timeout(
@@ -799,6 +814,7 @@ async fn pure_and_read_only_skill_preparation_bypasses_saturated_executable_slot
 
 #[tokio::test]
 async fn oversized_bundle_is_rejected_before_executable_preparation() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let permits = saturate_executable_preparation_slots_for_test().await;
     let names = (0..MAX_SKILL_EXPORTS_PER_ARTIFACT)
         .map(|index| format!("export_{index}"))
@@ -818,7 +834,7 @@ async fn oversized_bundle_is_rejected_before_executable_preparation() {
     let oversized_bundle = (0..33)
         .map(|rank| resolved(&oversized, rank))
         .collect::<Vec<_>>();
-    let tool = make_test_tool().with_skill_turn_context(context(oversized_bundle));
+    let tool = make_test_tool(&audit_dirs).with_skill_turn_context(context(oversized_bundle));
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -838,6 +854,7 @@ async fn oversized_bundle_is_rejected_before_executable_preparation() {
 
 #[tokio::test]
 async fn selected_skills_have_private_bindings_and_cannot_export_executable_values() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let first = artifact(
         "const helper = 40; function first() { return helper + 1; }",
         &["first"],
@@ -848,7 +865,7 @@ async fn selected_skills_have_private_bindings_and_cannot_export_executable_valu
         &["second"],
         CapabilityManifest::pure(),
     );
-    let tool = make_test_tool()
+    let tool = make_test_tool(&audit_dirs)
         .with_skill_turn_context(context(vec![resolved(&first, 0), resolved(&second, 1)]));
     let result = tool
         .call(JsArgs {
@@ -864,7 +881,7 @@ async fn selected_skills_have_private_bindings_and_cannot_export_executable_valu
         CapabilityManifest::pure(),
     );
     let escaped_tool =
-        make_test_tool().with_skill_turn_context(context(vec![resolved(&escaped, 0)]));
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&escaped, 0)]));
     let denied = escaped_tool
         .call(JsArgs {
             code: "escaped()".to_string(),
@@ -876,12 +893,14 @@ async fn selected_skills_have_private_bindings_and_cannot_export_executable_valu
 
 #[tokio::test]
 async fn selected_skill_source_cannot_replace_protected_host_globals() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let selected = artifact(
         "globalThis.spawn = () => 'seized'; function safe() { return 1; }",
         &["safe"],
         CapabilityManifest::pure(),
     );
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&selected, 0)]));
     let result = tool
         .call(JsArgs {
             code: "safe()".to_string(),
@@ -890,7 +909,7 @@ async fn selected_skill_source_cannot_replace_protected_host_globals() {
         .unwrap();
     assert_eq!(result, "1");
     assert_eq!(
-        make_test_tool()
+        make_test_tool(&audit_dirs)
             .call(JsArgs {
                 code: "typeof spawn".to_string(),
             })
@@ -902,6 +921,7 @@ async fn selected_skill_source_cannot_replace_protected_host_globals() {
 
 #[tokio::test]
 async fn selected_skill_cannot_recover_the_ambient_realm_or_poison_intrinsics() {
+    let audit_dirs = super::TestTempDir::new("js-test-audits");
     let selected = artifact(
         "const roots = [];\n\
          try { roots.push((0, eval)('this')); } catch (_) {}\n\
@@ -914,7 +934,8 @@ async fn selected_skill_cannot_recover_the_ambient_realm_or_poison_intrinsics() 
         &["recoveredAmbientRealm"],
         CapabilityManifest::pure(),
     );
-    let tool = make_test_tool().with_skill_turn_context(context(vec![resolved(&selected, 0)]));
+    let tool =
+        make_test_tool(&audit_dirs).with_skill_turn_context(context(vec![resolved(&selected, 0)]));
 
     let result = tool
         .call(JsArgs {
