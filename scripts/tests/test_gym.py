@@ -24,6 +24,7 @@ from scripts.gym import process_capture as CAPTURE
 from scripts.gym import setup_checks as CHECKS
 from scripts.gym import train as TRAIN_MODULE
 from scripts.gym import worktrees as WORKTREES
+from scripts.tests.gym_process_fixture import GymTree, held_sibling, require_reaped
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -347,122 +348,78 @@ class GymSubprocessTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
     def test_process_trees_are_reaped_on_exit_timeout_and_overflow_without_touching_siblings(self) -> None:
-        tree = """
-import os, signal, subprocess, sys, time
-from pathlib import Path
-topology, outcome, role = sys.argv[1:]
-Path(role + '.pid').write_text(str(os.getpid()))
-if role == 'leaf':
-    time.sleep(30)
-    Path('late-write').write_text('escaped')
-elif role == 'middle':
-    subprocess.Popen([sys.executable, __file__, topology, outcome, 'leaf'], start_new_session=True)
-else:
-    subprocess.Popen([sys.executable, __file__, topology, outcome,
-                      'middle' if topology == 'double-fork' else 'leaf'],
-                     start_new_session=topology == 'detached')
-    deadline = time.monotonic() + 2
-    while not Path('leaf.pid').exists() or not Path('leaf.pid').read_text().isdigit():
-        if time.monotonic() > deadline: raise RuntimeError('leaf did not start')
-        time.sleep(.005)
-    os.write(1, b'OUT'); os.write(2, b'ERR')
-    if outcome == 'success': sys.exit(0)
-    if outcome == 'failure': sys.exit(7)
-    if outcome == 'signal': os.kill(os.getpid(), signal.SIGTERM)
-    if outcome == 'overflow': os.write(1, b'x' * 65536)
-    time.sleep(30)
-"""
-        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"]) as sibling:
-            try:
-                for topology in ("ordinary", "detached", "double-fork"):
-                    for outcome in ("success", "failure", "signal", "timeout", "overflow"):
-                        with self.subTest(topology=topology, outcome=outcome), tempfile.TemporaryDirectory() as directory:
-                            root = Path(directory)
-                            script = root / "tree.py"
-                            script.write_text(tree)
-                            argv = [sys.executable, str(script), topology, outcome, "root"]
-                            try:
-                                if outcome == "timeout":
-                                    with self.assertRaises(subprocess.TimeoutExpired) as expired:
-                                        CAPTURE.run_bounded(argv, root, dict(os.environ), 1)
-                                    self.assertEqual((expired.exception.cmd, expired.exception.timeout,
-                                                      expired.exception.output, expired.exception.stderr),
-                                                     (argv, 1, b"OUT", b"ERR"))
-                                else:
-                                    result = CAPTURE.run_bounded(
-                                        argv, root, dict(os.environ), 3,
-                                        stdout_limit=16 if outcome == "overflow" else None,
-                                    )
-                                    self.assertEqual(result.args, argv)
-                                    if outcome == "overflow":
-                                        self.assertEqual(result.stdout, b"OUT" + b"x" * 14)
-                                    else:
-                                        self.assertEqual((result.returncode, result.stdout, result.stderr),
-                                                         ({"success": 0, "failure": 7, "signal": -signal.SIGTERM}[outcome],
-                                                          b"OUT", b"ERR"))
-                                roles = ["root", "leaf"] + (["middle"] if topology == "double-fork" else [])
-                                for role in roles:
-                                    pid = int((root / f"{role}.pid").read_text())
-                                    with self.assertRaises(ProcessLookupError, msg=f"{role} survived {outcome}"):
-                                        os.kill(pid, 0)
-                                self.assertFalse((root / "late-write").exists())
-                                self.assertIsNone(sibling.poll(), "cleanup killed an unrelated child")
-                                recovered = CAPTURE.run_bounded(["/bin/echo", "recovered"], root, dict(os.environ), 2)
-                                self.assertEqual((recovered.returncode, recovered.stdout), (0, b"recovered\n"))
-                            finally:
-                                # Keep fault-injected versions from leaving test descendants alive.
-                                for pid_file in root.glob("*.pid"):
-                                    try:
-                                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
-                                    except ProcessLookupError:
-                                        pass
-            finally:
-                sibling.kill()
-                sibling.wait(timeout=5)
+        with held_sibling() as sibling:
+            for topology in ("ordinary", "detached", "double-fork"):
+                for outcome in ("success", "failure", "signal", "timeout", "overflow"):
+                    with self.subTest(topology=topology, outcome=outcome), tempfile.TemporaryDirectory() as directory, \
+                         GymTree(Path(directory), topology, outcome) as tree:
+                        tree.start()
+                        result = tree.run()  # Inspects every identity before fixture cleanup.
+                        self.assertEqual(result["args"], tree.argv)
+                        if outcome == "timeout":
+                            self.assertEqual((result["timeout"], result["stdout"], result["stderr"]), (1, "OUT", "ERR"))
+                        elif outcome == "overflow":
+                            self.assertEqual(result["stdout"], "OUT" + "x" * 14)
+                        else:
+                            self.assertEqual((result["returncode"], result["stdout"], result["stderr"]),
+                                             ({"success": 0, "failure": 7, "signal": -signal.SIGTERM}[outcome], "OUT", "ERR"))
+                        self.assertIsNone(sibling.poll(), "cleanup killed an unrelated child")
 
     @unittest.skipUnless(sys.platform == "linux", "Linux parent-death ownership")
     def test_parent_death_cancels_detached_descendants(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            leaf = "import os,time; from pathlib import Path; Path('leaf.pid').write_text(str(os.getpid())); time.sleep(30)"
-            command = ("import os,subprocess,sys,time; from pathlib import Path; "
-                       "Path('root.pid').write_text(str(os.getpid())); "
-                       f"subprocess.Popen([sys.executable, '-c', {leaf!r}], start_new_session=True); time.sleep(30)")
-            caller = ("import os,sys; from pathlib import Path; "
-                      "from scripts.gym.process_capture import run_bounded; "
-                      f"run_bounded([sys.executable, '-c', {command!r}], Path({str(root)!r}), dict(os.environ), 60)")
-            with subprocess.Popen([sys.executable, "-c", caller], cwd=ROOT,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as parent:
-                try:
-                    deadline = time.monotonic() + 3
-                    leaf_pid = root / "leaf.pid"
-                    while not leaf_pid.exists() or not leaf_pid.read_text().isdigit():
-                        self.assertIsNone(parent.poll(), "capture caller exited before starting the tree")
-                        if time.monotonic() > deadline:
-                            self.fail("descendant did not start")
-                        time.sleep(.01)
-                    pids = [int((root / f"{role}.pid").read_text()) for role in ("root", "leaf")]
-                    parent.kill()
-                    parent.wait(timeout=3)
-                    deadline = time.monotonic() + 3
-                    for pid in pids:
-                        while True:
-                            try:
-                                os.kill(pid, 0)
-                            except ProcessLookupError:
-                                break
-                            if time.monotonic() > deadline:
-                                self.fail(f"descendant {pid} survived its caller")
-                            time.sleep(.01)
-                finally:
-                    if parent.poll() is None:
-                        parent.kill()
-                    parent.wait(timeout=3)
-                    for pid_file in root.glob("*.pid"):
-                        try:
-                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+        with tempfile.TemporaryDirectory() as directory, GymTree(Path(directory), "detached", "parent-death") as tree:
+            tree.start()
+            self.assertIsNone(tree.run())  # Kills and joins the actual capture caller.
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux pidfd reaping evidence")
+    def test_tree_fixture_reaping_check_rejects_live_processes_and_zombies(self) -> None:
+        with held_sibling() as child, contextlib.ExitStack() as cleanup:
+            descriptor = os.pidfd_open(child.pid)
+            cleanup.callback(os.close, descriptor)
+            with self.assertRaisesRegex(AssertionError, "was not reaped"):
+                require_reaped(descriptor, "live child")
+            child.stdin.write(b"exit")
+            child.stdin.flush()
+            ready = select.select([descriptor], [], [], 10)[0]
+            self.assertTrue(ready, "owned child did not exit")
+            # Observe without reaping; Popen.poll/wait must not run yet.
+            status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            self.assertEqual(status.si_pid, child.pid)
+            with self.assertRaisesRegex(AssertionError, "was not reaped"):
+                require_reaped(descriptor, "zombie child")
+            self.assertEqual(child.wait(timeout=10), 0)
+            require_reaped(descriptor, "reaped child")
+            invalid = os.dup(descriptor)
+            os.close(invalid)
+            with self.assertRaisesRegex(AssertionError, "invalid pidfd"):
+                require_reaped(invalid, "closed identity")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux fixture failure ownership")
+    def test_tree_fixture_preserves_readiness_failures_and_reaps_retained_identities(self) -> None:
+        for role in ("caller", "owner", "root", "middle", "leaf"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as cleanup:
+                tree = GymTree(Path(directory), "double-fork", "timeout")
+                identities = []
+                real_track = tree._track
+                failure = RuntimeError("injected readiness failure")
+
+                def track(name, pid):
+                    real_track(name, pid)
+                    descriptor = os.dup(tree.pidfds[name])
+                    identities.append(descriptor)
+                    cleanup.callback(os.close, descriptor)
+                    if name == role:
+                        raise failure
+
+                with self.assertRaises(RuntimeError) as failed:
+                    with tree, mock.patch.object(tree, "_track", side_effect=track):
+                        tree.start()
+                self.assertIs(failed.exception, failure)
+                self.assertFalse(getattr(failure, "__notes__", []), "fixture cleanup also failed")
+                self.assertIsNotNone(tree.caller.returncode)
+                self.assertTrue(identities)
+                for descriptor in identities:
+                    require_reaped(descriptor, "identity retained across readiness failure")
 
     @unittest.skipUnless(sys.platform == "linux", "isolated Linux supervisor")
     def test_supervisor_ignores_workspace_imports_and_preserves_launch_errors(self) -> None:

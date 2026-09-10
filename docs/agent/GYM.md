@@ -266,6 +266,16 @@ it does not allow a later episode to reuse that state. The shared filesystem rem
 Each row is appended and flushed as it is produced, so an interrupted run keeps everything already
 finished.
 
+The Linux lifecycle regressions share
+[`gym_process_fixture.py`](../../scripts/tests/gym_process_fixture.py). A separate capture
+caller and gated commands exchange complete readiness packets before the test retains their
+pidfds and triggers exit, timeout, overflow, or abrupt caller death. Tests verify detached
+sessions and double-fork adoption, and require the pidfd hangup event that distinguishes
+reaping from zombie exit ([pidfd semantics](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)).
+Acceptance precedes fixture release and rescue; failure cleanup
+uses retained identities instead of signalling PID-file numbers. A held unrelated child
+checks ownership boundaries, and readiness failures exercise the same fixture cleanup.
+
 ### Isolation
 
 Episodes never read the operator's configuration. `ZS_CONFIG_DIR` and `ZS_CREDENTIALS_DIR` point at
