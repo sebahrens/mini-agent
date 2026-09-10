@@ -199,7 +199,7 @@ For each task and each arm the runner:
    external targets and symlinked workspace roots are refused. Resolved paths are reopened through
    retained directory descriptors without following replacement links. POSIX FIFO opens are nonblocking;
 7. removes the worktree, runs `git worktree prune`, and deletes the run tree in a `finally`, so
-   these cleanup steps also run after a timeout or install failure.
+   these cleanup steps also run after a timeout or install failure once process cleanup is confirmed.
 
 Workspace overlays traverse directories through retained descriptors and reject symlinked
 ancestors. Initial files replace the destination entry without writing through a symlink or
@@ -219,17 +219,28 @@ or overflowing `bd list` falls back to the exported JSONL source; its version di
 the same bounds. Invalid tracker metadata is reported as unreadable without blocking fallback.
 Explicit JSON/JSONL source files are read directly. Timeout diagnostics use
 those same tails. The exit deadline still applies if a process closes its output pipes early.
-Timeout cleanup currently terminates and reaps the immediate child; descendants in other process
-groups can survive. Complete descendant cleanup is tracked in `mini-agent-m7bs`.
+On Linux, each command runs under an isolated Python supervisor
+([_process_supervisor.py](../../scripts/gym/_process_supervisor.py)) configured as a child subreaper.
+It kills and reaps the entire owned tree on command exit, timeout, stdout overflow, or loss of
+the calling trainer/miner, including descendants that create new sessions or double-fork.
+The command's exit status and bounded output remain the result; unrelated children are untouched.
+This is lifecycle management, not a security boundary against hostile commands.
+The caller allows up to five additional seconds to confirm cleanup. Missing acknowledgement,
+an interrupted cleanup wait, or an expired cleanup deadline raises a fatal runner error, stops further episodes/mining,
+and preserves remaining workspace and AppPaths files. A surviving supervisor keeps ownership
+and continues cleanup; it is not killed merely because that wait expired. After such a failure,
+confirm that the reported owner and its descendants have exited before retrying the run or
+removing retained directories. On macOS, only the immediate child is terminated and reaped;
+complete descendant cleanup remains tracked in `mini-agent-m7bs`.
 Git worktree administration is shared through [worktrees.py](../../scripts/gym/worktrees.py).
 Checkout has a 300-second deadline; removal and pruning each have a 30-second deadline. Cleanup
 first removes the filesystem entry without following root symlinks, then removes its Git
 registration. Filesystem failures are reported and preserve the registration for a later retry;
-pruning still runs if the subsequent Git removal command times out. Administrative
+pruning still runs if the subsequent Git removal command times out and its process cleanup is confirmed. Administrative
 timeouts and launch failures are separate from oracle verdicts: training records a setup failure
 before launching the agent, and mining skips the candidate. A cleanup command timeout, launch
 failure, filesystem cleanup failure, or nonzero prune exit stops training with a runner error and makes mining skip the
-candidate. These command bounds do not establish complete descendant ownership.
+candidate. Unconfirmed process cleanup stops the entire run and skips further cleanup commands.
 
 The trainer attempts both worktree and AppPaths cleanup even when either fails and reports
 all cleanup errors as a runner failure. Incomplete AppPaths removal prevents the next episode

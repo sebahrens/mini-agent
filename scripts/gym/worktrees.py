@@ -64,13 +64,12 @@ def remove_workspace(repo: Path, workspace: Path) -> None:
         run_worktree(repo, "remove", "--force", "--force", str(workspace))
     except WorktreeError as error:
         errors.append(error)
-    finally:
-        try:
-            pruned = run_worktree(repo, "prune")
-            if pruned.returncode:
-                detail = pruned.stderr.decode("utf-8", errors="replace").strip()
-                raise WorktreeError(f"git worktree prune exited {pruned.returncode}: {detail}")
-        except WorktreeError as error:
-            errors.append(error)
+    try:
+        pruned = run_worktree(repo, "prune")
+        if pruned.returncode:
+            detail = pruned.stderr.decode("utf-8", errors="replace").strip()
+            raise WorktreeError(f"git worktree prune exited {pruned.returncode}: {detail}")
+    except WorktreeError as error:
+        errors.append(error)
     if errors:
         raise WorktreeError("; ".join(str(error) for error in errors)) from errors[0]

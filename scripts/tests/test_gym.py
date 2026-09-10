@@ -259,7 +259,280 @@ class GymSubprocessTests(unittest.TestCase):
                 self.assertEqual((recovered.returncode, recovered.stdout, recovered.stderr), (0, b"recovered\n", b""))
 
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_process_trees_are_reaped_on_exit_timeout_and_overflow_without_touching_siblings(self) -> None:
+        tree = """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+topology, outcome, role = sys.argv[1:]
+Path(role + '.pid').write_text(str(os.getpid()))
+if role == 'leaf':
+    time.sleep(30)
+    Path('late-write').write_text('escaped')
+elif role == 'middle':
+    subprocess.Popen([sys.executable, __file__, topology, outcome, 'leaf'], start_new_session=True)
+else:
+    subprocess.Popen([sys.executable, __file__, topology, outcome,
+                      'middle' if topology == 'double-fork' else 'leaf'],
+                     start_new_session=topology == 'detached')
+    deadline = time.monotonic() + 2
+    while not Path('leaf.pid').exists() or not Path('leaf.pid').read_text().isdigit():
+        if time.monotonic() > deadline: raise RuntimeError('leaf did not start')
+        time.sleep(.005)
+    os.write(1, b'OUT'); os.write(2, b'ERR')
+    if outcome == 'success': sys.exit(0)
+    if outcome == 'failure': sys.exit(7)
+    if outcome == 'signal': os.kill(os.getpid(), signal.SIGTERM)
+    if outcome == 'overflow': os.write(1, b'x' * 65536)
+    time.sleep(30)
+"""
+        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"]) as sibling:
+            try:
+                for topology in ("ordinary", "detached", "double-fork"):
+                    for outcome in ("success", "failure", "signal", "timeout", "overflow"):
+                        with self.subTest(topology=topology, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                            root = Path(directory)
+                            script = root / "tree.py"
+                            script.write_text(tree)
+                            argv = [sys.executable, str(script), topology, outcome, "root"]
+                            try:
+                                if outcome == "timeout":
+                                    with self.assertRaises(subprocess.TimeoutExpired) as expired:
+                                        CAPTURE.run_bounded(argv, root, dict(os.environ), 1)
+                                    self.assertEqual((expired.exception.cmd, expired.exception.timeout,
+                                                      expired.exception.output, expired.exception.stderr),
+                                                     (argv, 1, b"OUT", b"ERR"))
+                                else:
+                                    result = CAPTURE.run_bounded(
+                                        argv, root, dict(os.environ), 3,
+                                        stdout_limit=16 if outcome == "overflow" else None,
+                                    )
+                                    self.assertEqual(result.args, argv)
+                                    if outcome == "overflow":
+                                        self.assertEqual(result.stdout, b"OUT" + b"x" * 14)
+                                    else:
+                                        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                                         ({"success": 0, "failure": 7, "signal": -signal.SIGTERM}[outcome],
+                                                          b"OUT", b"ERR"))
+                                roles = ["root", "leaf"] + (["middle"] if topology == "double-fork" else [])
+                                for role in roles:
+                                    pid = int((root / f"{role}.pid").read_text())
+                                    with self.assertRaises(ProcessLookupError, msg=f"{role} survived {outcome}"):
+                                        os.kill(pid, 0)
+                                self.assertFalse((root / "late-write").exists())
+                                self.assertIsNone(sibling.poll(), "cleanup killed an unrelated child")
+                                recovered = CAPTURE.run_bounded(["/bin/echo", "recovered"], root, dict(os.environ), 2)
+                                self.assertEqual((recovered.returncode, recovered.stdout), (0, b"recovered\n"))
+                            finally:
+                                # Keep fault-injected versions from leaving test descendants alive.
+                                for pid_file in root.glob("*.pid"):
+                                    try:
+                                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                                    except ProcessLookupError:
+                                        pass
+            finally:
+                sibling.kill()
+                sibling.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux parent-death ownership")
+    def test_parent_death_cancels_detached_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            leaf = "import os,time; from pathlib import Path; Path('leaf.pid').write_text(str(os.getpid())); time.sleep(30)"
+            command = ("import os,subprocess,sys,time; from pathlib import Path; "
+                       "Path('root.pid').write_text(str(os.getpid())); "
+                       f"subprocess.Popen([sys.executable, '-c', {leaf!r}], start_new_session=True); time.sleep(30)")
+            caller = ("import os,sys; from pathlib import Path; "
+                      "from scripts.gym.process_capture import run_bounded; "
+                      f"run_bounded([sys.executable, '-c', {command!r}], Path({str(root)!r}), dict(os.environ), 60)")
+            with subprocess.Popen([sys.executable, "-c", caller], cwd=ROOT,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as parent:
+                try:
+                    deadline = time.monotonic() + 3
+                    leaf_pid = root / "leaf.pid"
+                    while not leaf_pid.exists() or not leaf_pid.read_text().isdigit():
+                        self.assertIsNone(parent.poll(), "capture caller exited before starting the tree")
+                        if time.monotonic() > deadline:
+                            self.fail("descendant did not start")
+                        time.sleep(.01)
+                    pids = [int((root / f"{role}.pid").read_text()) for role in ("root", "leaf")]
+                    parent.kill()
+                    parent.wait(timeout=3)
+                    deadline = time.monotonic() + 3
+                    for pid in pids:
+                        while True:
+                            try:
+                                os.kill(pid, 0)
+                            except ProcessLookupError:
+                                break
+                            if time.monotonic() > deadline:
+                                self.fail(f"descendant {pid} survived its caller")
+                            time.sleep(.01)
+                finally:
+                    if parent.poll() is None:
+                        parent.kill()
+                    parent.wait(timeout=3)
+                    for pid_file in root.glob("*.pid"):
+                        try:
+                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    @unittest.skipUnless(sys.platform == "linux", "isolated Linux supervisor")
+    def test_supervisor_ignores_workspace_imports_and_preserves_launch_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            poison = "from pathlib import Path; Path('poisoned').write_text('imported'); raise RuntimeError('poison')"
+            for name in ("subprocess.py", "sitecustomize.py"):
+                (root / name).write_text(poison)
+            env = {**os.environ, "PYTHONPATH": str(root)}
+            result = CAPTURE.run_bounded(["/bin/true"], root, env, 3)
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse((root / "poisoned").exists())
+            for executable, error_type in [(root / "missing", FileNotFoundError), (root / "subprocess.py", PermissionError)]:
+                with self.subTest(executable=executable), self.assertRaises(error_type) as failed:
+                    CAPTURE.run_bounded([str(executable)], root, env, 3)
+                self.assertEqual(failed.exception.filename, str(executable))
+
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux ownership pipes")
+    def test_partial_owner_startup_closes_pipes_without_launching_a_command(self) -> None:
+        real_pipe = os.pipe
+        for stage in ("second-pipe", "configure", "spawn", "interrupt"):
+            descriptors = []
+
+            def pipe():
+                if stage == "second-pipe" and descriptors:
+                    raise OSError("injected pipe exhaustion")
+                pair = real_pipe()
+                descriptors.extend(pair)
+                return pair
+
+            with self.subTest(stage=stage):
+                try:
+                    with mock.patch.object(CAPTURE.os, "pipe", side_effect=pipe), \
+                         mock.patch.object(CAPTURE.os, "set_blocking",
+                                           side_effect=OSError("injected configuration failure") if stage == "configure" else None), \
+                         mock.patch.object(CAPTURE.subprocess, "Popen",
+                                           side_effect=KeyboardInterrupt() if stage == "interrupt" else OSError("injected launch failure")) as spawn:
+                        with self.assertRaises(BaseException) as failed:
+                            CAPTURE.run_bounded(["/bin/true"], ROOT, dict(os.environ), 2)
+                    self.assertIsInstance(failed.exception, CAPTURE.ProcessCleanupError if stage == "interrupt" else OSError)
+                    if stage not in ("spawn", "interrupt"):
+                        spawn.assert_not_called()
+                    for descriptor in descriptors:
+                        with self.assertRaises(OSError, msg="startup leaked an ownership pipe"):
+                            os.fstat(descriptor)
+                finally:
+                    for descriptor in descriptors:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux owner acknowledgement")
+    def test_unconfirmed_owner_stops_capture_and_is_not_killed_after_cleanup_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "owner.py"
+            real_spawn = subprocess.Popen
+            owners = []
+            wait_failure = None
+
+            def spawn(argv, **kwargs):
+                # Inject a failed ownership service at the process boundary;
+                # capture, its deadline, and all pipe handling remain real.
+                argv = [*argv[:3], str(helper), *argv[4:]]
+                owner = real_spawn(argv, **kwargs)
+                owners.append(owner)
+                real_wait = owner.wait
+
+                def wait(timeout=None):
+                    if wait_failure is not None and timeout == .05:
+                        raise wait_failure
+                    return real_wait(timeout=timeout)
+
+                owner.wait = wait
+                return owner
+
+            for report in (b"", b'{"returncode":true}', b'{"returncode":0,"errno":1}', b'x' * 1025):
+                helper.write_text("import os,sys\nos.write(int(sys.argv[2]), " + repr(report) + ")\n")
+                with self.subTest(report=report[:80]), mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn):
+                    with self.assertRaisesRegex(CAPTURE.ProcessCleanupError, "retain workspace"):
+                        CAPTURE.run_bounded(["/bin/true"], root, dict(os.environ), 2)
+                self.assertEqual(owners[-1].poll(), 0)
+
+            helper.write_text("""
+import os, select, sys, time
+from pathlib import Path
+select.select([int(sys.argv[1])], [], [], 5)
+while not Path('release-owner').exists(): time.sleep(.005)
+os.write(int(sys.argv[2]), b'{"returncode":0}')
+""")
+            for wait_failure in (None, KeyboardInterrupt(), OSError("injected wait failure")):
+                with self.subTest(wait_failure=type(wait_failure).__name__):
+                    (root / "release-owner").unlink(missing_ok=True)
+                    try:
+                        started = time.monotonic()
+                        with mock.patch.object(CAPTURE.subprocess, "Popen", side_effect=spawn), \
+                             mock.patch.object(CAPTURE, "PROCESS_REAP_TIMEOUT_SECS", .05):
+                            with self.assertRaises(BaseException) as failed:
+                                CAPTURE.run_bounded(["/bin/true"], root, dict(os.environ), 1)
+                        self.assertIsInstance(failed.exception, CAPTURE.ProcessCleanupError)
+                        self.assertIn("retain workspace", str(failed.exception))
+                        self.assertLess(time.monotonic() - started, 2)
+                        self.assertIsNone(owners[-1].poll(), "failed cleanup must not kill the surviving owner")
+                    finally:
+                        (root / "release-owner").touch()
+                        owners[-1].wait(timeout=5)
+
+
 class GymWorktreeCommandTests(unittest.TestCase):
+    def test_unconfirmed_cleanup_preserves_episode_and_miner_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_repo(root)
+            gym_root = root / "gym"
+            task_file = root / "tasks.json"
+            document = task_document([{"name": "preserve"}])
+            document["defaults"]["oracle"] = {"id": "files", "expected_files": {"fixed.txt": "fixed"}}
+            task_file.write_text(json.dumps(document))
+            task = TRAIN_MODULE.load_tasks(task_file, 5)[0]
+            args = mock.Mock(binary="agent", provider=None, model=None, forward_env=[], agent_arg=[],
+                             allow_empty_workspace=False, keep_run_dirs=False)
+            fatal = CAPTURE.ProcessCleanupError("owner still cleaning; retain workspace")
+            with mock.patch.object(TRAIN_MODULE, "run", side_effect=fatal):
+                with self.assertRaises(CAPTURE.ProcessCleanupError):
+                    TRAIN_MODULE.run_episode(task, "none", args, repo, gym_root)
+            workspace = gym_root / "worktrees/preserve-none"
+            self.assertTrue((workspace / "value.txt").is_file())
+            self.assertTrue((gym_root / "runs/preserve-none/config/config.toml").is_file())
+            self.assertIn(str(workspace.resolve()), git(repo, "worktree", "list"))
+            WORKTREES.remove_workspace(repo, workspace)
+
+            mining_root = root / "miner"
+            mining_root.mkdir()
+            with mock.patch.object(MINE.tempfile, "mkdtemp", return_value=str(mining_root)), \
+                 mock.patch.object(MINE, "run_bounded", side_effect=fatal):
+                with self.assertRaises(CAPTURE.ProcessCleanupError):
+                    MINE.oracle_at(repo, "HEAD", "true")
+            workspace = mining_root / "worktree"
+            self.assertTrue((workspace / "value.txt").is_file())
+            self.assertIn(str(workspace.resolve()), git(repo, "worktree", "list"))
+            WORKTREES.remove_workspace(repo, workspace)
+
+            # Fatal ownership failure cannot launch more administrative work
+            # or quietly fall back to stale tracker metadata.
+            with mock.patch.object(WORKTREES, "run_bounded", side_effect=fatal) as commands:
+                with self.assertRaises(CAPTURE.ProcessCleanupError):
+                    WORKTREES.remove_workspace(repo, workspace)
+            self.assertEqual([call.args[0][2] for call in commands.call_args_list], ["remove"])
+            with mock.patch.object(MINE, "run_bounded", side_effect=fatal), \
+                 mock.patch.object(MINE, "beads_hint") as hint:
+                with self.assertRaises(CAPTURE.ProcessCleanupError):
+                    MINE.collect_beads(repo, None)
+                hint.assert_not_called()
+
     def test_cleanup_unlinks_replaced_roots_and_preserves_other_worktrees(self) -> None:
         for registered in [False, True]:
             with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory:
@@ -345,10 +618,13 @@ class GymWorktreeCommandTests(unittest.TestCase):
                     self.assertLess(peak, 1024 * 1024, "checkout diagnostics retained the flood")
                     self.assertFalse(marker.exists(), "an unavailable checkout cannot produce oracle evidence")
                     self.assertTrue(pid_file.exists(), "the checkout hook must actually start")
+                    if sys.platform == "linux":
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(int(pid_file.read_text()), 0)
                 finally:
                     tracemalloc.stop()
-                    # Full descendant ownership remains m7bs. Explicitly terminate
-                    # this fixture's surviving hook after the Git root is killed.
+                    # macOS descendant ownership remains m7bs. Also clean up
+                    # after assertions fail against a regressed Linux owner.
                     if pid_file.exists():
                         try:
                             os.kill(int(pid_file.read_text()), signal.SIGKILL)
@@ -1746,6 +2022,34 @@ def make_setup_host(root: Path) -> tuple[Path, Path, dict[str, str]]:
 
 
 class GymEntrypointTests(unittest.TestCase):
+    def test_unconfirmed_cleanup_stops_entrypoints_without_publishing_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = root / "tasks.json"
+            tasks.write_text(json.dumps(task_document([{"name": "first"}, {"name": "later"}])))
+            output = root / "outcomes.jsonl"
+            argv = [str(TRAIN), "--repo", str(root), "--tasks", str(tasks), "--output", str(output)]
+            fatal = CAPTURE.ProcessCleanupError("owner still cleaning; retain workspace")
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(TRAIN_MODULE, "run_episode", side_effect=fatal) as episode, \
+                 contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(TRAIN_MODULE.main(), 2)
+            self.assertEqual(episode.call_count, 1, "a fatal cleanup must prevent later arms and tasks")
+            self.assertEqual(output.read_text(), "")
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("retain workspace", stderr.getvalue())
+
+            oracle_map = root / "map.json"
+            oracle_map.write_text("{}")
+            output.write_text("existing artifact\n")
+            argv = ["mine_tasks.py", "--repo", str(root), "--oracle-map", str(oracle_map), "--output", str(output)]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(MINE, "mine", side_effect=fatal), \
+                 contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(MINE.main(), 2)
+            self.assertEqual(output.read_text(), "existing artifact\n")
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("retain workspace", stderr.getvalue())
+
     def test_shell_entrypoints_are_syntax_valid(self) -> None:
         for script in (SETUP, ROOT / "scripts/gym/train.sh"):
             subprocess.run(["bash", "-n", str(script)], check=True)

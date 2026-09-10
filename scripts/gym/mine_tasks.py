@@ -11,16 +11,17 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 if __package__:
-    from .process_capture import OUTPUT_TAIL_BYTES, run_bounded
+    from .process_capture import OUTPUT_TAIL_BYTES, ProcessCleanupError, run_bounded
     from .worktrees import WorktreeError, remove_workspace, run_worktree
 else:
-    from process_capture import OUTPUT_TAIL_BYTES, run_bounded
+    from process_capture import OUTPUT_TAIL_BYTES, ProcessCleanupError, run_bounded
     from worktrees import WorktreeError, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
@@ -169,8 +170,8 @@ def changed_text_files(repo: Path, parent: str, commit: str) -> tuple[dict[str, 
 
 
 def oracle_at(repo: Path, revision: str, command: str) -> bool:
-    with tempfile.TemporaryDirectory(prefix="mini-agent-gym-mine-") as directory:
-        root = Path(directory)
+    root = Path(tempfile.mkdtemp(prefix="mini-agent-gym-mine-"))
+    try:
         worktree = root / "worktree"
         try:
             try:
@@ -189,16 +190,21 @@ def oracle_at(repo: Path, revision: str, command: str) -> bool:
             print(f"gym mine: oracle timed out after {ORACLE_TIMEOUT_SECS}s at {revision[:12]}", file=sys.stderr)
             return False
         finally:
-            try:
-                remove_workspace(repo, worktree)
-            except WorktreeError as error:
-                raise OracleSetupError(str(error)) from error
+            if not isinstance(sys.exception(), ProcessCleanupError):
+                try:
+                    remove_workspace(repo, worktree)
+                except WorktreeError as error:
+                    raise OracleSetupError(str(error)) from error
         if result.returncode:
             print(
                 f"gym mine: oracle exited {result.returncode} at {revision[:12]}: {tail_text(result.stderr)}",
                 file=sys.stderr,
             )
         return result.returncode == 0
+
+    finally:
+        if not isinstance(sys.exception(), ProcessCleanupError):
+            shutil.rmtree(root)
 
 
 def beads_hint(repo: Path) -> str:
@@ -443,7 +449,7 @@ def main() -> int:
         raise SystemExit("gym mine: --oracle-map must be a JSON object keyed by bead id")
     try:
         tasks, skipped = mine(repo, oracle_map, not args.no_validate, max(1, args.limit), args.main_ref, args.beads_json)
-    except OSError as error:
+    except (OSError, ProcessCleanupError) as error:
         print(f"gym mine: {error}", file=sys.stderr)
         return 2
     except subprocess.CalledProcessError as error:

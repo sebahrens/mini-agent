@@ -26,10 +26,10 @@ import uuid
 from pathlib import Path
 
 if __package__:
-    from .process_capture import OUTPUT_TAIL_BYTES, run_bounded as run, validate_timeout
+    from .process_capture import OUTPUT_TAIL_BYTES, ProcessCleanupError, run_bounded as run, validate_timeout
     from .worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 else:
-    from process_capture import OUTPUT_TAIL_BYTES, run_bounded as run, validate_timeout
+    from process_capture import OUTPUT_TAIL_BYTES, ProcessCleanupError, run_bounded as run, validate_timeout
     from worktrees import WorktreeError, remove_tree, remove_workspace, run_worktree
 
 SCHEMA_VERSION = 1
@@ -533,7 +533,8 @@ def run_episode(task: dict[str, object], arm: str, args: argparse.Namespace, rep
         record["failure_reason"] = failure.reason
         record["failure_detail"] = failure.detail
     finally:
-        cleanup_episode(repo, workspace, root, args.keep_run_dirs)
+        if not isinstance(sys.exception(), ProcessCleanupError):
+            cleanup_episode(repo, workspace, root, args.keep_run_dirs)
         record["oracle_ms"] = oracle_ms
         # Everything the episode cost, so the library arm's seed-import and
         # workspace setup overhead stays visible instead of hiding inside the
@@ -589,7 +590,7 @@ def main() -> int:
                     handle.flush()
                     print("GYM_OUTCOME " + json.dumps(record, sort_keys=True))
                     summary[arm]["passed" if record["success"] else "failed"] += 1
-    except OSError as error:
+    except (OSError, ProcessCleanupError) as error:
         print(f"gym train: {error}", file=sys.stderr)
         return 2
     print("GYM_SUMMARY " + json.dumps({"tasks": len(tasks), "arms": summary}, sort_keys=True))
