@@ -995,21 +995,25 @@ general-command sandbox, whose own native gate passed independently in the same 
 
 ## Failure semantics
 
-Protocol-read timeout, pending-permission timeout, caller-drop, and crash regressions
+Protocol-read timeout, pending-permission timeout, explicit cancellation, caller-drop, and crash regressions
 share one owned interruption fixture. The read case observes the actual parent
 reader after the invocation frame is written, then advances its timer and
 requires `TimedOut`. The permission case waits for a held effect, observes
 cancellation after advancing the timer, releases the effect to finish its drain,
 and requires `PermissionPromptTimedOut`. The caller-drop case drops the actual
-invocation future and checks effect destruction and cancellation. Each case
-reaps the old worker before fresh-clock recovery launches one replacement.
+invocation future and checks effect destruction and cancellation. The explicit
+cancellation case keeps its effect uncooperative, verifies cancellation before
+destruction, then advances past the two-second service drain while the invocation
+deadline remains unexpired. It requires `EffectOutcomeUnknown` from reconciliation
+without releasing the effect. Each case reaps the old worker before fresh-clock
+recovery launches one replacement with a greater generation identifier.
 The crash case sends a libtest-only trigger through an owned input clone only
 after the held effect starts. The scripted worker exits with code 75; a test-only
 observer captures the native status during classification, so a protocol error
 or cleanup-induced exit cannot satisfy the crash assertion. The parent requires
 `Transport`, effect destruction, and cancellation without releasing the effect.
 Unconditional cleanup settles the supervisor and shared native launch owner;
-failure controls cover common pending-effect, cancellation-drain, and recovered
+failure controls cover common pending-effect, uncooperative cancellation-drain, and recovered
 states once, plus distinct blocked-read, explicit-drop, and pre/post-crash-trigger
 exits. Cleanup closes any retained trigger input before acceptance; the launch
 owner also closes it on unwinding. The read and exit observers and crash trigger

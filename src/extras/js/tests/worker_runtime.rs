@@ -2504,6 +2504,7 @@ enum InvocationStop {
     ReadDeadline,
     CallerDrop,
     WorkerCrash,
+    UncooperativeCancellation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2535,7 +2536,7 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
         }
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        launch_test_runtime().block_on(async {
+        let first_generation = launch_test_runtime().block_on(async {
             let cancellation = PermCancellation::new();
             let _permission_prompt = (stop == InvocationStop::PermissionDeadline)
                 .then(|| cancellation.begin_permission_prompt());
@@ -2550,7 +2551,7 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                     _ => "effect-pending",
                 }.into()),
                 gated.clone(),
-                cancellation,
+                cancellation.clone(),
             );
             let request = WORKER_READ_OBSERVER.scope(observed, request);
             let mut request = Box::pin(WORKER_EXIT_OBSERVER.scope(exit_observed, request));
@@ -2571,9 +2572,26 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                 assert!(!gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled());
             }
             assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
+            let first_generation = supervisor.active_generation_for_test().await
+                .expect("ready invocation must own a generation");
             inject(InterruptionFault::Pending);
 
-            if stop == InvocationStop::CallerDrop {
+            if stop == InvocationStop::UncooperativeCancellation {
+                cancellation.cancel();
+                assert!(futures::poll!(&mut request).is_pending(), "cancellation must first drain the held effect");
+                assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "caller cancellation did not reach the effect");
+                assert!(!gated.dropped.load(Ordering::Acquire), "effect was dropped before its cancellation drain");
+                inject(InterruptionFault::Cancelling);
+                // Cross the two-second service drain while the sixty-second
+                // invocation deadline remains unexpired. Never release the effect.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(3)).await;
+                let polled = futures::poll!(&mut request);
+                tokio::time::resume();
+                assert_eq!(polled, std::task::Poll::Ready(Err(WorkerError::EffectOutcomeUnknown)),
+                    "uncooperative cancellation must reconcile at the bounded drain");
+                assert!(gated.dropped.load(Ordering::Acquire), "expired cancellation drain retained the effect");
+            } else if stop == InvocationStop::CallerDrop {
                 drop(request);
                 assert!(gated.dropped.load(Ordering::Acquire), "caller drop retained the effect future");
                 assert!(gated.cancellation.lock().unwrap().as_ref().unwrap().is_cancelled(), "caller drop did not cancel the effect");
@@ -2622,6 +2640,7 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                 }));
                 assert!(!gated.dropped.load(Ordering::Acquire));
             }
+            first_generation
         });
         assert!(
             launch.wait_for_quiescence(),
@@ -2634,6 +2653,14 @@ fn exercise_invocation_interruption(stop: InvocationStop, fault: Option<Interrup
                     .await
                     .expect("interrupted caller retained transport ownership");
             assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
+            assert!(
+                supervisor
+                    .generation_for_test()
+                    .await
+                    .expect("recovered generation")
+                    > first_generation,
+                "recovery must replace the interrupted generation"
+            );
             assert_eq!(trace.launches.load(Ordering::Acquire), 2);
             assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
             assert_eq!(trace.max_live_processes.load(Ordering::Acquire), 1);
@@ -2666,7 +2693,7 @@ fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
 
 #[test]
 fn worker_supervisor_interruption_fixture_settles_after_failures() {
-    // Shared effect startup, cancellation drain, and recovered-worker cleanup
+    // Shared effect startup, uncooperative cancellation drain, and recovered-worker cleanup
     // are covered once. Add only the distinct blocked-read, explicit-drop,
     // and before/after crash-trigger exits.
     for (stop, fault) in [
@@ -2675,7 +2702,7 @@ fn worker_supervisor_interruption_fixture_settles_after_failures() {
             InterruptionFault::Pending,
         ),
         (
-            InvocationStop::PermissionDeadline,
+            InvocationStop::UncooperativeCancellation,
             InterruptionFault::Cancelling,
         ),
         (
@@ -3604,48 +3631,9 @@ fn worker_supervisor_rejects_verifier_source_positions_and_recovers() {
     runtime.block_on(supervisor.shutdown_for_test()).unwrap();
 }
 
-#[tokio::test]
-async fn worker_supervisor_transport_cancellation_marks_started_effect_unknown_and_recovers() {
-    let supervisor = scripted_supervisor(0);
-    let gated = GatedEffects::new();
-    let cancellation = PermCancellation::new();
-    let task_supervisor = supervisor.clone();
-    let task_effects = gated.clone();
-    let task_cancellation = cancellation.clone();
-    let task = tokio::spawn(async move {
-        task_supervisor
-            .execute(
-                RunStep::new("effect-pending".into()),
-                task_effects,
-                task_cancellation,
-            )
-            .await
-    });
-    gated.wait_started().await;
-    let first_generation = supervisor.active_generation_for_test().await.unwrap();
-    cancellation.cancel();
-    assert_eq!(task.await.unwrap(), Err(WorkerError::EffectOutcomeUnknown));
-    assert!(gated.dropped.load(Ordering::Acquire));
-    assert!(
-        gated
-            .cancellation
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .is_cancelled()
-    );
-
-    let recovered = supervisor
-        .execute(
-            RunStep::new("success".into()),
-            RecordingEffects::default(),
-            PermCancellation::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(recovered.outcome, StepOutcome::Value("success".into()));
-    assert!(supervisor.generation_for_test().await.unwrap() > first_generation);
+#[test]
+fn worker_supervisor_transport_cancellation_marks_started_effect_unknown_and_recovers() {
+    exercise_invocation_interruption(InvocationStop::UncooperativeCancellation, None);
 }
 
 #[test]
