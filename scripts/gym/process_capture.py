@@ -35,12 +35,13 @@ class _OwnedProcess:
         self.endpoints: list[tuple[socket.socket, socket.socket]] = []
         self.result: dict[str, int] | None = None
         self.cleanup_started = False
+        self.stderr_tail = bytearray()
 
     def start(self, env: dict[str, str]) -> None:
         # The caller already owns this object and will close it even when
         # launch or the parent-side endpoint handoff is interrupted.
         try:
-            if sys.platform != "linux":
+            if sys.platform not in {"linux", "darwin"}:
                 self.process = subprocess.Popen(
                     self.argv, cwd=self.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
@@ -51,7 +52,8 @@ class _OwnedProcess:
             self.report, report_write = self.endpoints[-1]
             # Complete fallible endpoint setup before a command can start.
             os.set_blocking(self.report.fileno(), False)
-            supervisor = str(Path(__file__).with_name("_process_supervisor.py").resolve())
+            supervisor_name = "_macos_supervisor.py" if sys.platform == "darwin" else "_process_supervisor.py"
+            supervisor = str(Path(__file__).with_name(supervisor_name).resolve())
             self.process = subprocess.Popen(
                 [sys.executable, "-I", "-S", supervisor,
                  str(control_read.fileno()), str(report_write.fileno()), *self.argv],
@@ -76,7 +78,8 @@ class _OwnedProcess:
         owner = f"for owner {self.process.pid}" if self.process is not None else "during startup"
         return ProcessCleanupError(
             f"Gym process cleanup unconfirmed {owner}; "
-            f"stop the run and retain workspace {self.cwd}"
+            f"stop the run and retain workspace {self.cwd}; "
+            f"supervisor stderr: {bytes(self.stderr_tail).decode(errors='replace')}"
         )
 
     def wait(self, timeout: float) -> int:
@@ -110,13 +113,13 @@ class _OwnedProcess:
                 self.process.kill()
             return self.wait(PROCESS_REAP_TIMEOUT_SECS)
         except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt, SystemExit) as error:
-            # Do not kill the Linux reaper: it must retain descendants until
+            # Do not kill the process owner: it must retain descendants until
             # they actually exit. Its control endpoint is already closed.
             raise self._unconfirmed() from error
 
     def close(self) -> None:
         # Attempt every resource close even if another close or the cleanup
-        # acknowledgement fails. Keep the Linux reaper alive on failure.
+        # acknowledgement fails. Keep the process owner alive on failure.
         try:
             with contextlib.ExitStack() as cleanup:
                 for pair in self.endpoints:
@@ -160,6 +163,7 @@ def run_bounded(
     tails = [bytearray(), bytearray()]
     with selectors.DefaultSelector() as selector:
         owned = _OwnedProcess(argv, cwd)
+        owned.stderr_tail = tails[1]
         try:
             owned.start(env)
             process = owned.process

@@ -827,20 +827,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
-        "src/agent/runner.rs",
-        "let hook_is_live = std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    ("src/agent/runner.rs", ".status()", 1, "TEST-ONLY"),
-    (
-        "src/extras/acp/mod.rs",
-        "std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
-    (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",
         1,
@@ -3309,20 +3295,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    (
-        "src/agent/runner.rs",
-        "let hook_is_live = std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    ("src/agent/runner.rs", ".status()", 1, "TEST-ONLY"),
-    (
-        "src/extras/acp/mod.rs",
-        "std::process::Command::new(\"kill\")",
-        1,
-        "TEST-ONLY",
-    ),
-    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",

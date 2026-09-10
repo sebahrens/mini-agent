@@ -118,8 +118,7 @@ fn skill_feedback_authorization_is_idempotent_redacted_and_audited() {
         serde_json::json!({"row": row, "audit": audit, "counts": counts})
     }
 
-    // This exercises the existing test-only state machine. The production
-    // correction operator remains unimplemented under mini-agent-1bt82.
+    // Exercise the production state machine for both legal terminal states.
     for (next, token) in [
         (FeedbackState::Resolved, "resolved"),
         (FeedbackState::Retracted, "retracted"),
@@ -170,7 +169,7 @@ fn skill_feedback_authorization_is_idempotent_redacted_and_audited() {
             ));
             assert_eq!(snapshot(&store, &id, &skill.id), active);
         }
-        for (version, target) in [(0, next), (1, FeedbackState::Active)] {
+        for (version, target) in [(0, next), (2, next), (1, FeedbackState::Active)] {
             assert!(matches!(
                 FeedbackService::new(&mut store, redactor())
                     .change_state(&actor, &id, version, target, "fixed", 4),
@@ -178,6 +177,55 @@ fn skill_feedback_authorization_is_idempotent_redacted_and_audited() {
             ));
             assert_eq!(snapshot(&store, &id, &skill.id), active);
         }
+        for (bad_id, reason) in [
+            ("invalid".to_owned(), "fixed"),
+            ("0".repeat(64), "fixed"),
+            (id.clone(), "invalid reason"),
+        ] {
+            assert!(
+                FeedbackService::new(&mut store, redactor())
+                    .change_state(&actor, &bad_id, 1, next, reason, 4)
+                    .is_err()
+            );
+            assert_eq!(snapshot(&store, &id, &skill.id), active);
+        }
+        store.conn().execute_batch("CREATE TRIGGER fail_feedback_audit BEFORE INSERT ON skill_feedback_audit BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;").unwrap();
+        assert!(
+            FeedbackService::new(&mut store, redactor())
+                .change_state(&actor, &id, 1, next, "fixed", 4)
+                .is_err()
+        );
+        assert_eq!(snapshot(&store, &id, &skill.id), active);
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_feedback_audit")
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE skill_feedback SET version = ? WHERE feedback_id = ?",
+                rusqlite::params![i64::MAX, id],
+            )
+            .unwrap();
+        assert!(matches!(
+            FeedbackService::new(&mut store, redactor()).change_state(
+                &actor,
+                &id,
+                i64::MAX,
+                next,
+                "fixed",
+                4
+            ),
+            Err(FeedbackError::InvalidStateTransition)
+        ));
+        store
+            .conn()
+            .execute(
+                "UPDATE skill_feedback SET version = 1 WHERE feedback_id = ?",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(snapshot(&store, &id, &skill.id), active);
         FeedbackService::new(&mut store, redactor())
             .change_state(&actor, &id, 1, next, "fixed", 4)
             .unwrap();
@@ -971,4 +1019,79 @@ fn a_rejected_quarantine_transition_leaves_no_evidence_behind() {
     drop(coordinator);
     drop(directory);
     assert!(!root.exists());
+}
+
+#[test]
+fn feedback_metadata_is_scoped_paginated_and_omits_submission_text() {
+    let (_root, mut store, skill, _) = fixture();
+    let actor = owner(&skill.id);
+    let mut ids = Vec::new();
+    for index in 0..101 {
+        ids.push(
+            FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512))
+                .submit(
+                    &actor,
+                    &FeedbackCommand {
+                        idempotency_key: format!("page-{index}"),
+                        skill_id: skill.id.clone(),
+                        invocation_id: None,
+                        kind: FeedbackKind::Negative,
+                        reason_code: "incorrect_result".into(),
+                        reason_text: Some("private prose".into()),
+                    },
+                    2,
+                )
+                .unwrap(),
+        );
+    }
+    ids.sort();
+    let service = FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512));
+    let first = service.list(&actor, &skill.id, None).unwrap();
+    assert_eq!(
+        first
+            .records
+            .iter()
+            .map(|r| &r.feedback_id)
+            .collect::<Vec<_>>(),
+        ids[..100].iter().collect::<Vec<_>>()
+    );
+    assert_eq!(first.next_after.as_deref(), Some(ids[99].as_str()));
+    let second = service
+        .list(&actor, &skill.id, first.next_after.as_deref())
+        .unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].feedback_id, ids[100]);
+    assert_eq!(second.next_after, None);
+    let record = service.inspect(&actor, &ids[0]).unwrap();
+    assert_eq!(record, first.records[0]);
+    let serialized = serde_json::to_value(&record).unwrap();
+    assert!(serialized.get("reason_text").is_none());
+    assert!(!serialized.to_string().contains("private prose"));
+    assert!(service.list(&actor, &skill.id, Some("bad cursor")).is_err());
+    for kind in [ActorKind::Model, ActorKind::Anonymous] {
+        let denied = AuthenticatedActor {
+            kind,
+            ..actor.clone()
+        };
+        assert!(matches!(
+            service.inspect(&denied, &ids[0]),
+            Err(FeedbackError::Unauthorized)
+        ));
+        assert!(matches!(
+            service.list(&denied, &skill.id, None),
+            Err(FeedbackError::Unauthorized)
+        ));
+    }
+    let scoped = AuthenticatedActor {
+        allowed_skill_ids: Some(BTreeSet::new()),
+        ..actor
+    };
+    assert!(matches!(
+        service.inspect(&scoped, &ids[0]),
+        Err(FeedbackError::Unauthorized)
+    ));
+    assert!(matches!(
+        service.list(&scoped, &skill.id, None),
+        Err(FeedbackError::Unauthorized)
+    ));
 }

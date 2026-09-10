@@ -42,7 +42,7 @@ pub enum ActorKind {
         not(test),
         expect(
             dead_code,
-            reason = "Retain scoped reviewer authority while operator integration is audited in mini-agent-kv9me"
+            reason = "Scoped reviewer authority is a supported service contract; the CLI authenticates only the local owner"
         )
     )]
     Reviewer,
@@ -50,7 +50,7 @@ pub enum ActorKind {
         not(test),
         expect(
             dead_code,
-            reason = "Retain the explicitly unauthorized model actor; production constructs only the local owner (mini-agent-kv9me)"
+            reason = "Model identity is explicitly denied at the service boundary; the CLI constructs only the local owner"
         )
     )]
     Model,
@@ -58,7 +58,7 @@ pub enum ActorKind {
         not(test),
         expect(
             dead_code,
-            reason = "Retain the explicitly unauthorized anonymous actor; production constructs only the local owner (mini-agent-kv9me)"
+            reason = "Anonymous identity is explicitly denied at the service boundary; the CLI constructs only the local owner"
         )
     )]
     Anonymous,
@@ -109,8 +109,6 @@ pub struct FeedbackCommand {
     pub reason_text: Option<String>,
 }
 
-// Test-only: only [`FeedbackService::change_state`] consumes this, and that is cfg(test).
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackState {
     Active,
@@ -118,7 +116,6 @@ pub enum FeedbackState {
     Retracted,
 }
 
-#[cfg(test)]
 impl FeedbackState {
     fn token(self) -> &'static str {
         match self {
@@ -156,7 +153,6 @@ pub enum FeedbackError {
         skill_id: String,
     },
     #[error("feedback record `{feedback_id}` does not exist")]
-    #[cfg(test)]
     UnknownFeedback { feedback_id: String },
     #[error("feedback field `{field}` is invalid: {rule}")]
     InvalidFeedback {
@@ -177,8 +173,45 @@ pub enum FeedbackError {
     #[error("idempotency key was reused for different feedback")]
     IdempotencyConflict,
     #[error("feedback state transition is stale or illegal")]
-    #[cfg(test)]
     InvalidStateTransition,
+}
+
+/// Bounded metadata only: submission text and invocation payloads never leave this surface.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FeedbackRecord {
+    pub feedback_id: String,
+    pub skill_id: String,
+    pub invocation_id: Option<String>,
+    pub actor_id: String,
+    pub kind: String,
+    pub reason_code: String,
+    pub state: String,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl FeedbackRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            feedback_id: row.get(0)?,
+            skill_id: row.get(1)?,
+            invocation_id: row.get(2)?,
+            actor_id: row.get(3)?,
+            kind: row.get(4)?,
+            reason_code: row.get(5)?,
+            state: row.get(6)?,
+            version: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FeedbackPage {
+    pub records: Vec<FeedbackRecord>,
+    pub next_after: Option<String>,
 }
 
 pub struct FeedbackService<'a> {
@@ -343,9 +376,74 @@ impl<'a> FeedbackService<'a> {
         Ok(feedback_id)
     }
 
-    // Test-only: there is no operator surface that resolves or retracts feedback, so
-    // nothing in production drives this transition. Kept for the state-machine test.
-    #[cfg(test)]
+    pub fn inspect(
+        &self,
+        actor: &AuthenticatedActor,
+        feedback_id: &str,
+    ) -> Result<FeedbackRecord, FeedbackError> {
+        validate_hex_id("feedback_id", feedback_id)?;
+        let record = self.store.connection().query_row(
+            "SELECT feedback_id, skill_id, invocation_id, actor_id, feedback_kind, reason_code,
+                    state, version, created_at, updated_at FROM skill_feedback WHERE feedback_id = ?",
+            [feedback_id], FeedbackRecord::from_row,
+        ).optional()?.ok_or_else(|| FeedbackError::UnknownFeedback { feedback_id: feedback_id.to_owned() })?;
+        if !actor.may_target(&record.skill_id) {
+            return Err(FeedbackError::Unauthorized);
+        }
+        Ok(record)
+    }
+
+    pub fn list(
+        &self,
+        actor: &AuthenticatedActor,
+        skill_id: &str,
+        after: Option<&str>,
+    ) -> Result<FeedbackPage, FeedbackError> {
+        if !actor.may_target(skill_id) {
+            return Err(FeedbackError::Unauthorized);
+        }
+        validate_hex_id("skill_id", skill_id)?;
+        if let Some(after) = after {
+            validate_hex_id("after", after)?;
+        }
+        if self
+            .store
+            .connection()
+            .query_row(
+                "SELECT 1 FROM skill_revisions WHERE id = ?",
+                [skill_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+        {
+            return Err(FeedbackError::UnknownSkill {
+                skill_id: skill_id.to_owned(),
+            });
+        }
+        let mut statement = self.store.connection().prepare(
+            "SELECT feedback_id, skill_id, invocation_id, actor_id, feedback_kind, reason_code,
+                    state, version, created_at, updated_at FROM skill_feedback
+             WHERE skill_id = ? AND feedback_id > ? ORDER BY feedback_id LIMIT 101",
+        )?;
+        let mut records = statement
+            .query_map(
+                params![skill_id, after.unwrap_or("")],
+                FeedbackRecord::from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_after = if records.len() > 100 {
+            records.truncate(100);
+            records.last().map(|record| record.feedback_id.clone())
+        } else {
+            None
+        };
+        Ok(FeedbackPage {
+            records,
+            next_after,
+        })
+    }
+
     pub fn change_state(
         &mut self,
         actor: &AuthenticatedActor,
@@ -355,11 +453,9 @@ impl<'a> FeedbackService<'a> {
         reason_code: &str,
         created_at: i64,
     ) -> Result<(), FeedbackError> {
-        if feedback_id.is_empty() {
-            return Err(FeedbackError::InvalidFeedback {
-                field: "feedback_id",
-                rule: "must not be empty",
-            });
+        validate_hex_id("feedback_id", feedback_id)?;
+        if expected_version <= 0 {
+            return Err(FeedbackError::InvalidStateTransition);
         }
         validate_reason_code(reason_code)?;
         validate_timestamp(created_at)?;
@@ -384,7 +480,9 @@ impl<'a> FeedbackService<'a> {
         if current != "active" || version != expected_version || next == FeedbackState::Active {
             return Err(FeedbackError::InvalidStateTransition);
         }
-        let next_version = version + 1;
+        let next_version = version
+            .checked_add(1)
+            .ok_or(FeedbackError::InvalidStateTransition)?;
         let changed = tx.execute(
             "UPDATE skill_feedback SET state = ?, version = ?, updated_at = ?
              WHERE feedback_id = ? AND state = 'active' AND version = ?",

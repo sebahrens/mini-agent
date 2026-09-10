@@ -601,6 +601,16 @@ Targeted local-owner feedback is available without model initialization through
 `--learned-skill-feedback-invocation`. The idempotency key makes retries exact. Severe feedback is
 restricted to the enumerated safety reason codes and immediately enters the coordinator-backed
 quarantine transition for an active or canary revision.
+The local owner can inspect a report with `--learned-skill-feedback-record` or
+page through `--list-learned-skill-feedback` (100 records, `next_after` cursor).
+`--correct-learned-skill-feedback ID VERSION resolved|retracted REASON` performs
+an audited active-to-terminal transition with optimistic version checking.
+Original reports and cumulative counters remain; source and submission prose are
+excluded from inspection. Correction removes only the active-feedback hold in
+the evidence-threshold policy. It does not activate a revision, release quarantine,
+or change the separate explicit-owner promotion policy. Scoped reviewer service
+authority remains supported; model and anonymous actors are explicitly denied.
+
 
 The learned-skill proposal pipeline now ships, opt-in and off by default. Trusted
 `enable_skill_proposals = true` configuration registers the `propose_skill` global and starts the

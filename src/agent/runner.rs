@@ -5368,145 +5368,166 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "hooks", unix))]
+    #[cfg(all(feature = "hooks", any(target_os = "linux", target_os = "macos")))]
     #[tokio::test]
     async fn abort_handle_reaps_configured_async_hook_before_channel_close() {
         use crate::extras::hooks::dispatcher::HookDispatcher;
         use crate::extras::hooks::settings::{HookGroup, HookHandler, HooksConfig};
+        use crate::tests::process_state::{ProcessIdentity, ProcessState};
+        use futures::FutureExt;
 
         let directory =
             std::env::temp_dir().join(format!("mini-agent-abort-hook-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let pid_file = directory.join("hook.pid");
-        let mut config = HooksConfig::new();
-        config.insert(
-            "UserPromptSubmit".to_owned(),
-            vec![HookGroup {
-                matcher: None,
-                hooks: vec![HookHandler {
-                    kind: "command".to_owned(),
-                    command: Some("/bin/sh".to_owned()),
-                    args: Some(vec![
-                        "-c".to_owned(),
-                        "printf '%s' \"$$\" > \"$1\"; while :; do sleep 1; done".to_owned(),
-                        "abort-hook".to_owned(),
-                        pid_file.display().to_string(),
-                    ]),
-                    timeout: Some(60),
-                    is_async: true,
-                    condition: None,
-                    once: false,
-                    // This test isolates scoped async-child ownership. Sandbox
-                    // launch policy has separate integration coverage and must
-                    // not make this lifecycle regression depend on host bwrap.
-                    trust: crate::extras::hooks::settings::HookTrust::Trusted,
-                    env: Default::default(),
-                }],
-            }],
-        );
-        let dispatcher = HookDispatcher::from_config(&config).unwrap();
-        let ctx = crate::extras::hooks::HookCtx {
-            session_id: "abort-handle-test".to_owned(),
-            session_path: String::new(),
-            cwd: directory.display().to_string(),
-            permission_mode: "deny".to_owned(),
-        };
         let (work_scope, started_rx, release) =
             super::AgentWorkScope::new_with_blocking_test_gate();
-        let gate = work_scope
-            .run(crate::extras::hooks::gate_user_prompt(
-                &dispatcher,
-                &ctx,
-                "run blocking tool".to_owned(),
-            ))
-            .await;
-        assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
-        let hook_started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while !pid_file.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        if hook_started.is_err() {
-            // A failed start assertion must not strand the long-lived hook process on the test
-            // runner. Cancel and drain the same owned scope before reporting the failure.
-            work_scope.cancellation_handle().cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), work_scope.wait_idle())
+        let mut runner = None;
+        let scenario = std::panic::AssertUnwindSafe(async {
+            let mut config = HooksConfig::new();
+            config.insert(
+                "UserPromptSubmit".to_owned(),
+                vec![HookGroup {
+                    matcher: None,
+                    hooks: vec![HookHandler {
+                        kind: "command".to_owned(),
+                        command: Some("/bin/sh".to_owned()),
+                        args: Some(vec![
+                            "-c".to_owned(),
+                            "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done".to_owned(),
+                            "abort-hook".to_owned(),
+                            pid_file.display().to_string(),
+                        ]),
+                        timeout: Some(60),
+                        is_async: true,
+                        condition: None,
+                        once: false,
+                        // This test isolates scoped async-child ownership. Sandbox
+                        // launch policy has separate integration coverage and must
+                        // not make this lifecycle regression depend on host bwrap.
+                        trust: crate::extras::hooks::settings::HookTrust::Trusted,
+                        env: Default::default(),
+                    }],
+                }],
+            );
+            let dispatcher = HookDispatcher::from_config(&config).unwrap();
+            let ctx = crate::extras::hooks::HookCtx {
+                session_id: "abort-handle-test".to_owned(),
+                session_path: String::new(),
+                cwd: directory.display().to_string(),
+                permission_mode: "deny".to_owned(),
+            };
+            let gate = work_scope
+                .run(crate::extras::hooks::gate_user_prompt(
+                    &dispatcher,
+                    &ctx,
+                    "run blocking tool".to_owned(),
+                ))
                 .await;
-            let _ = std::fs::remove_dir_all(&directory);
-            panic!("configured async hook should start within 30 seconds");
-        }
-        let hook_pid = std::fs::read_to_string(&pid_file).unwrap();
-
-        let model = MockCompletionModel::from_stream_turns(vec![vec![
-            MockStreamEvent::tool_call(
-                "blocking-call",
-                ScopedBlockingTool::NAME,
-                serde_json::json!({}),
-            ),
-            MockStreamEvent::final_response_with_default_usage(),
-        ]]);
-        let agent = AgentBuilder::new(model)
-            .tool(ScopedBlockingTool)
-            .default_max_turns(2)
-            .build();
-        let paused = super::spawn_agent_paused_in_scope(
-            agent,
-            "invoke blocking tool".to_owned(),
-            Vec::new().into(),
-            crate::retry::RetryConfig::default(),
-            None,
-            #[cfg(feature = "skills")]
-            None,
-            #[cfg(feature = "hooks")]
-            None,
-            None,
-            Arc::clone(&work_scope),
-        );
-        let mut runner = paused.start();
-        tokio::task::spawn_blocking(move || {
-            started_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("runner should enter scoped blocking tool work");
-        })
-        .await
-        .unwrap();
-
-        runner.abort_handle.abort();
-        let closed_early = tokio::time::timeout(std::time::Duration::from_millis(50), async {
-            while runner.event_rx.recv().await.is_some() {}
-        })
-        .await
-        .is_ok();
-        release.release();
-        if closed_early {
-            // Keep the regression failure hygienic under the old behavior.
-            work_scope.cancellation_handle().cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), work_scope.wait_idle())
-                .await;
-        } else {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while runner.event_rx.recv().await.is_some() {}
+            assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
+            let identity = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                        && contents.ends_with('\n')
+                        && let Ok(pid) = contents.trim().parse::<u32>()
+                        && pid > 0
+                    {
+                        break ProcessIdentity::capture(pid).expect("capture live configured hook");
+                    }
+                    tokio::task::yield_now().await;
+                }
             })
             .await
-            .expect("event channel should close after hard-abort cleanup");
-        }
+            .expect("configured hook readiness stalled");
 
-        let hook_is_live = std::process::Command::new("kill")
-            .args(["-0", hook_pid.trim()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        let _ = std::fs::remove_dir_all(directory);
-        assert!(
-            !closed_early,
-            "AbortHandle must keep the event channel open through owned cleanup"
-        );
-        assert!(
-            !hook_is_live,
-            "hard-abort settlement left the hook process live"
-        );
+            let model = MockCompletionModel::from_stream_turns(vec![vec![
+                MockStreamEvent::tool_call(
+                    "blocking-call",
+                    ScopedBlockingTool::NAME,
+                    serde_json::json!({}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ]]);
+            let agent = AgentBuilder::new(model)
+                .tool(ScopedBlockingTool)
+                .default_max_turns(2)
+                .build();
+            let paused = super::spawn_agent_paused_in_scope(
+                agent,
+                "invoke blocking tool".to_owned(),
+                Vec::new().into(),
+                crate::retry::RetryConfig::default(),
+                None,
+                #[cfg(feature = "skills")]
+                None,
+                #[cfg(feature = "hooks")]
+                None,
+                None,
+                Arc::clone(&work_scope),
+            );
+            runner = Some(paused.start());
+            let active = runner.as_mut().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    match started_rx.try_recv() {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                        Err(error) => panic!("blocking tool readiness failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("runner did not enter blocking tool");
+            active.abort_handle.abort();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while !active.abort_handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("aborted runner did not finish");
+            // Finished means the aborted future has dropped its cleanup guard.
+            // Inspect the channel at that actual cleanup boundary.
+            assert!(work_scope.is_cancelled());
+            assert!(work_scope.active_children() > 0);
+            loop {
+                match active.event_rx.try_recv() {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("event channel closed before owned cleanup")
+                    }
+                }
+            }
+            release.release();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while active.event_rx.recv().await.is_some() {}
+            })
+            .await
+            .expect("event channel did not close after cleanup");
+            assert!(matches!(
+                identity.state().expect("observe configured hook"),
+                ProcessState::Gone | ProcessState::Replaced
+            ));
+        })
+        .catch_unwind()
+        .await;
+        work_scope.cancellation_handle().cancel();
+        release.release();
+        if let Some(runner) = runner {
+            runner.abort_handle.abort();
+            while !runner.abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        let settled =
+            tokio::time::timeout(std::time::Duration::from_secs(15), work_scope.wait_idle()).await;
+        let removed = std::fs::remove_dir_all(&directory);
+        if let Err(payload) = scenario {
+            std::panic::resume_unwind(payload);
+        }
+        settled.expect("hook scope cleanup stalled");
+        removed.expect("remove hook fixture");
     }
 
     #[test]

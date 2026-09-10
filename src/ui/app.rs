@@ -3005,8 +3005,17 @@ impl<'a> App<'a> {
                     &info.main_repo_path,
                     self.ui.cli.resolve_no_context_files(self.ui.cfg),
                 )?;
-                self.retire_workspace_owners_before_cleanup().await?;
-                let merge_result = crate::extras::git_worktree::complete_merge(&mut state).await;
+                let merge_result = retire_workspace_owners_and_complete_merge(
+                    &mut self.run,
+                    &mut self.btw_abort,
+                    &mut self.btw_inflight,
+                    &mut self.prebuild,
+                    #[cfg(feature = "mcp")]
+                    &mut self.ui.mcp_manager,
+                    &mut state,
+                    std::time::Duration::from_secs(5),
+                )
+                .await?;
                 if refresh_ui {
                     self.refresh_worktree_workspace_context().await?;
                 }
@@ -3125,29 +3134,42 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    #[cfg(feature = "git-worktree")]
-    async fn retire_workspace_owners_before_cleanup(&mut self) -> anyhow::Result<()> {
-        const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        self.run.retire(RETIRE_TIMEOUT).await?;
-        for (_, _, task, scope) in self.btw_abort.drain(..) {
-            retire_scoped_task(task, scope, "side-question", RETIRE_TIMEOUT).await?;
-        }
-        self.btw_inflight = 0;
-        if let Some(prebuild) = self.prebuild.take() {
-            prebuild.retire(RETIRE_TIMEOUT).await?;
-        }
-        #[cfg(feature = "mcp")]
-        if let Some(manager) = self.ui.mcp_manager.take() {
-            manager.shutdown().await;
-        }
-        Ok(())
-    }
-
     #[cfg(not(feature = "git-worktree"))]
     async fn handle_worktree_auto_merge(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// The production merge cleanup boundary: every UI workspace owner settles before deletion.
+#[cfg(feature = "git-worktree")]
+#[allow(clippy::type_complexity)]
+pub(crate) async fn retire_workspace_owners_and_complete_merge(
+    run: &mut AgentRunState,
+    btw_abort: &mut Vec<(
+        u32,
+        tokio::task::AbortHandle,
+        tokio::task::JoinHandle<()>,
+        Arc<crate::agent::runner::AgentWorkScope>,
+    )>,
+    btw_inflight: &mut usize,
+    prebuild: &mut Option<super::prebuild::AgentPrebuild>,
+    #[cfg(feature = "mcp")] mcp_manager: &mut Option<crate::extras::mcp::McpClientManager>,
+    state: &mut crate::extras::git_worktree::MergeState,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Result<(), String>> {
+    run.retire(timeout).await?;
+    for (_, _, task, scope) in btw_abort.drain(..) {
+        retire_scoped_task(task, scope, "side-question", timeout).await?;
+    }
+    *btw_inflight = 0;
+    if let Some(prebuild) = prebuild.take() {
+        prebuild.retire(timeout).await?;
+    }
+    #[cfg(feature = "mcp")]
+    if let Some(manager) = mcp_manager.take() {
+        manager.shutdown().await;
+    }
+    Ok(crate::extras::git_worktree::complete_merge(state).await)
 }
 
 pub(crate) async fn retire_scoped_task(

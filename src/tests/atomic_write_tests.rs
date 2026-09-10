@@ -398,14 +398,25 @@ fn windows_open_without_delete_sharing(path: &Path) -> std::fs::File {
         .unwrap()
 }
 
-#[cfg(windows)]
 #[test]
 fn windows_lock_retry_classifies_errors_cancellation_and_deadline() {
+    fn controlled<T>(
+        operation: impl FnMut() -> std::io::Result<T>,
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<T> {
+        let clock = std::cell::Cell::new(std::time::Instant::now());
+        crate::fs::retry_windows_lock_violation_with(
+            operation,
+            cancelled,
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        )
+    }
     use std::sync::atomic::AtomicUsize;
 
     for code in [32, 33] {
         let attempts = AtomicUsize::new(0);
-        crate::fs::retry_windows_lock_violation(
+        controlled(
             || {
                 if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                     Err(std::io::Error::from_raw_os_error(code))
@@ -420,7 +431,7 @@ fn windows_lock_retry_classifies_errors_cancellation_and_deadline() {
     }
 
     let attempts = AtomicUsize::new(0);
-    let error = crate::fs::retry_windows_lock_violation(
+    let error = controlled(
         || {
             attempts.fetch_add(1, Ordering::Relaxed);
             Err::<(), _>(std::io::Error::from_raw_os_error(5))
@@ -432,7 +443,7 @@ fn windows_lock_retry_classifies_errors_cancellation_and_deadline() {
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
     let attempts = AtomicUsize::new(0);
-    let error = crate::fs::retry_windows_lock_violation(
+    let error = controlled(
         || {
             attempts.fetch_add(1, Ordering::Relaxed);
             Err::<(), _>(std::io::Error::from_raw_os_error(32))
@@ -444,8 +455,7 @@ fn windows_lock_retry_classifies_errors_cancellation_and_deadline() {
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
     let attempts = AtomicUsize::new(0);
-    let started = std::time::Instant::now();
-    let error = crate::fs::retry_windows_lock_violation(
+    let error = controlled(
         || {
             attempts.fetch_add(1, Ordering::Relaxed);
             Err::<(), _>(std::io::Error::from_raw_os_error(33))
@@ -455,26 +465,100 @@ fn windows_lock_retry_classifies_errors_cancellation_and_deadline() {
     .unwrap_err();
     assert_eq!(error.raw_os_error(), Some(33));
     assert!(attempts.load(Ordering::Relaxed) > 1);
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    let cancelled = std::cell::Cell::new(false);
+    let clock = std::cell::Cell::new(std::time::Instant::now());
+    let attempts = std::cell::Cell::new(0);
+    let error = crate::fs::retry_windows_lock_violation_with(
+        || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(std::io::Error::from_raw_os_error(32))
+        },
+        || cancelled.get(),
+        || clock.get(),
+        |delay| {
+            clock.set(clock.get() + delay);
+            cancelled.set(true);
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(
+        attempts.get(),
+        1,
+        "cancellation during backoff must prevent another native attempt"
+    );
 }
 
 #[cfg(windows)]
-#[test]
-fn windows_atomic_replace_retries_a_transient_target_lock() {
-    let directory = TempDir::new("windows_transient_replace_lock");
+async fn exercise_windows_publication_retry(cancel: bool) {
+    use futures::FutureExt;
+    let directory = TempDir::new("windows_retry_boundary");
     let target = directory.join("target.txt");
-    std::fs::write(&target, b"old").unwrap();
-    let locked = windows_open_without_delete_sharing(&target);
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        drop(locked);
-    });
+    std::fs::write(&target, b"old-complete").unwrap();
+    let mut locked = Some(windows_open_without_delete_sharing(&target));
+    let parent = crate::fs::checked_path_metadata(directory.path()).unwrap();
+    let (cancellation, probe) = AtomicWriteCancellation::with_retry_probe_for_test();
+    let writer_cancellation = cancellation.clone();
+    let writer_target = target.clone();
+    let mut writer = Some(tokio::spawn(async move {
+        atomic_write_resolved_checked_cancellable(
+            writer_target,
+            b"new-complete",
+            parent,
+            writer_cancellation,
+        )
+        .await
+    }));
+    let reached = probe.clone();
+    let readiness = tokio::task::spawn_blocking(move || reached.wait_until_reached());
+    let readiness = readiness.await;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        readiness.expect("writer never reached actual sharing violation");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-complete");
+        if cancel {
+            cancellation.cancel();
+        } else {
+            drop(locked.take());
+        }
+        probe.resume();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(15), writer.as_mut().unwrap())
+                .await
+                .expect("writer stalled after retry release");
+        writer.take();
+        let result = result.unwrap();
+        if cancel {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            if cancel {
+                b"old-complete"
+            } else {
+                b"new-complete"
+            }
+        );
+        assert_eq!(temp_residue(directory.path()), 0);
+    })
+    .catch_unwind()
+    .await;
+    cancellation.cancel();
+    drop(locked);
+    probe.resume();
+    if let Some(writer) = writer {
+        let _ = writer.await;
+    }
+    if let Err(payload) = scenario {
+        std::panic::resume_unwind(payload);
+    }
+}
 
-    atomic_write_within_sync(directory.path(), &target, b"new").unwrap();
-    release.join().unwrap();
-
-    assert_eq!(std::fs::read(&target).unwrap(), b"new");
-    assert_eq!(temp_residue(directory.path()), 0);
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_atomic_replace_retries_a_transient_target_lock() {
+    exercise_windows_publication_retry(false).await;
 }
 
 #[cfg(windows)]
@@ -495,33 +579,7 @@ fn windows_atomic_replace_persistent_lock_preserves_old_content_and_cleans_temp(
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_atomic_replace_cancellation_interrupts_lock_retry() {
-    let directory = TempDir::new("windows_cancel_replace_retry");
-    let target = directory.join("target.txt");
-    std::fs::write(&target, b"old-complete").unwrap();
-    let approved_parent = crate::fs::checked_path_metadata(directory.path()).unwrap();
-    let cancellation = AtomicWriteCancellation::default();
-    let writer_cancellation = cancellation.clone();
-    let writer_target = target.clone();
-    let _locked = windows_open_without_delete_sharing(&target);
-    let writer = tokio::spawn(async move {
-        atomic_write_resolved_checked_cancellable(
-            writer_target,
-            b"new-complete",
-            approved_parent,
-            writer_cancellation,
-        )
-        .await
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let cancelled_at = std::time::Instant::now();
-    cancellation.cancel();
-    let error = writer.await.unwrap().unwrap_err();
-
-    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-    assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(500));
-    assert_eq!(std::fs::read(&target).unwrap(), b"old-complete");
-    assert_eq!(temp_residue(directory.path()), 0);
+    exercise_windows_publication_retry(true).await;
 }
 
 #[cfg(windows)]

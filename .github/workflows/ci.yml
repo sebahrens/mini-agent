@@ -830,6 +830,14 @@ jobs:
           process_creation::tests::poisoned_creation_lock_recovers_without_losing_serialization
           -- --exact --nocapture
 
+  macos-gym-ownership:
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Verify native Gym descendant ownership
+        run: python3 -m unittest scripts.tests.test_gym_macos -v
+
   windows-general-sandbox-policy:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
     runs-on: windows-latest
@@ -887,18 +895,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Native general-sandbox regressions failed with exit code $LASTEXITCODE"
           }
+          cargo test --locked atomic_write_tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native Windows atomic publication regressions failed with exit code $LASTEXITCODE"
+          }
 
       - name: Attest write, authority, desktop, and parent-owned Job boundaries
         shell: pwsh
         run: |
-          $output = & $env:WINDOWS_GENERAL_SANDBOX_EXE --mini-agent-windows-sandbox-runtime-check 2>&1
-          $output | Write-Output
-          if ($LASTEXITCODE -ne 0) {
-            throw "Windows AppContainer runtime probe failed with exit code $LASTEXITCODE"
-          }
-          $expected = 'WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
-          if (-not (($output -join "`n").Contains($expected))) {
-            throw 'Windows AppContainer runtime probe emitted no exact fixed pass evidence'
+          foreach ($attempt in 1..3) {
+            Write-Output "Native Windows installed-binary probe $attempt of 3"
+            $output = & $env:WINDOWS_GENERAL_SANDBOX_EXE --mini-agent-windows-sandbox-runtime-check 2>&1
+            $output | Write-Output
+            if ($LASTEXITCODE -ne 0) {
+              throw "Windows AppContainer runtime probe failed with exit code $LASTEXITCODE"
+            }
+            $expected = 'WINDOWS_GENERAL_SANDBOX_PASS appcontainer=regular explicit_reads=pass configured_tool=pass workspace_write=pass outside_read=denied outside_write=denied hardlink=denied unique_profile_crash=pass authority_escape=denied omitted_handle=denied descendant=contained breakaway=denied control_journal=denied bounded_pipe=pass acl_serialization=pass parent_death_job=pass private_desktop=pass ui_job=restricted network=denied registry=not_isolated'
+            if (-not (($output -join "`n").Contains($expected))) {
+              throw 'Windows AppContainer runtime probe emitted no exact fixed pass evidence'
+            }
           }
 
   windows-worker-containment-gate:

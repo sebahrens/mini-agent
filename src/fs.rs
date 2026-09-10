@@ -25,12 +25,12 @@ pub(crate) use private::{
     ensure_export_directory as ensure_export_parent_directory,
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const WINDOWS_LOCK_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const WINDOWS_LOCK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn is_windows_lock_violation(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
 }
@@ -40,10 +40,25 @@ fn is_windows_lock_violation(error: &std::io::Error) -> bool {
 /// only subsequent attempts after a confirmed sharing/lock violation.
 #[cfg(windows)]
 pub(crate) fn retry_windows_lock_violation<T>(
-    mut operation: impl FnMut() -> std::io::Result<T>,
+    operation: impl FnMut() -> std::io::Result<T>,
     cancellation_requested: impl Fn() -> bool,
 ) -> std::io::Result<T> {
-    let deadline = std::time::Instant::now() + WINDOWS_LOCK_RETRY_TIMEOUT;
+    retry_windows_lock_violation_with(
+        operation,
+        cancellation_requested,
+        std::time::Instant::now,
+        std::thread::sleep,
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn retry_windows_lock_violation_with<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+    cancellation_requested: impl Fn() -> bool,
+    now: impl Fn() -> std::time::Instant,
+    sleep: impl Fn(std::time::Duration),
+) -> std::io::Result<T> {
+    let deadline = now() + WINDOWS_LOCK_RETRY_TIMEOUT;
     let mut retry_error = None;
     loop {
         if let Some(error) = retry_error.take() {
@@ -53,13 +68,13 @@ pub(crate) fn retry_windows_lock_violation<T>(
                     "atomic write cancelled during publication retry",
                 ));
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(now());
             if remaining.is_zero() {
                 return Err(error);
             }
-            std::thread::sleep(WINDOWS_LOCK_RETRY_BACKOFF.min(remaining));
+            sleep(WINDOWS_LOCK_RETRY_BACKOFF.min(remaining));
             let cancelled = cancellation_requested();
-            if cancelled || std::time::Instant::now() >= deadline {
+            if cancelled || now() >= deadline {
                 return if cancelled {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
@@ -857,6 +872,8 @@ struct AtomicWriteProbeState {
 enum AtomicWriteProbePoint {
     #[cfg(windows)]
     BeforeTempCreation,
+    #[cfg(windows)]
+    AfterRetry,
     BeforeDecision,
     AfterDecision,
 }
@@ -985,6 +1002,22 @@ impl AtomicWriteCancellation {
             .publication
             .store(ATOMIC_WRITE_FINISHED, Ordering::Release);
         result
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn with_retry_probe_for_test() -> (Self, AtomicWritePublicationProbe) {
+        let probe = AtomicWritePublicationProbe {
+            state: Default::default(),
+            point: AtomicWriteProbePoint::AfterRetry,
+        };
+        (
+            Self(Arc::new(AtomicWriteCancellationState {
+                publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+                cancel_requested: AtomicBool::new(false),
+                publication_probe: Some(probe.clone()),
+            })),
+            probe,
+        )
     }
 
     #[cfg(all(test, windows))]
@@ -2065,35 +2098,55 @@ fn atomic_write_platform(
                 name.len(),
             );
         }
-        retry_windows_lock_violation(
-            || {
-                let mut io_status = IO_STATUS_BLOCK::default();
-                // SAFETY: the retained file and directory handles, initialized
-                // rename buffer, and writable status block are valid for this
-                // synchronous call.
-                let status = unsafe {
-                    NtSetInformationFile(
-                        file.as_raw_handle().cast(),
-                        &mut io_status,
-                        information.cast(),
-                        required as u32,
-                        if replace {
-                            FileRenameInformationEx
-                        } else {
-                            FileRenameInformation
-                        },
-                    )
-                };
-                if status >= 0 {
-                    return Ok(());
-                }
-                // SAFETY: the conversion accepts any NTSTATUS returned by
-                // NtSetInformationFile.
-                let code = unsafe { RtlNtStatusToDosError(status) } as i32;
-                Err(std::io::Error::from_raw_os_error(code))
-            },
-            || cancellation.cancellation_requested(),
-        )
+        let operation = || {
+            let mut io_status = IO_STATUS_BLOCK::default();
+            // SAFETY: the retained file and directory handles, initialized
+            // rename buffer, and writable status block are valid for this
+            // synchronous call.
+            let status = unsafe {
+                NtSetInformationFile(
+                    file.as_raw_handle().cast(),
+                    &mut io_status,
+                    information.cast(),
+                    required as u32,
+                    if replace {
+                        FileRenameInformationEx
+                    } else {
+                        FileRenameInformation
+                    },
+                )
+            };
+            if status >= 0 {
+                return Ok(());
+            }
+            // SAFETY: the conversion accepts any NTSTATUS returned by
+            // NtSetInformationFile.
+            let code = unsafe { RtlNtStatusToDosError(status) } as i32;
+            #[cfg(test)]
+            if matches!(code, 32 | 33)
+                && let Some(probe) = &cancellation.0.publication_probe
+                && probe.point == AtomicWriteProbePoint::AfterRetry
+            {
+                probe.pause();
+            }
+            Err(std::io::Error::from_raw_os_error(code))
+        };
+        #[cfg(test)]
+        if cancellation
+            .0
+            .publication_probe
+            .as_ref()
+            .is_some_and(|probe| probe.point == AtomicWriteProbePoint::AfterRetry)
+        {
+            let clock = std::cell::Cell::new(std::time::Instant::now());
+            return retry_windows_lock_violation_with(
+                operation,
+                || cancellation.cancellation_requested(),
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            );
+        }
+        retry_windows_lock_violation(operation, || cancellation.cancellation_requested())
     }
 
     fn open_verified_directory(

@@ -255,9 +255,8 @@ class GymSubprocessTests(unittest.TestCase):
                 argv = [sys.executable, "-c", code, "close" if close_pipes else "open"]
                 owners, captured, pidfds, wait_timeouts, returncodes = [], [], [], [], []
                 now = 100.0
-                # Linux's supervisor retains its output copies until exit.
-                # Closing the command's copies reaches early EOF on macOS.
-                early_eof = close_pipes and sys.platform != "linux"
+                # Native supervisors retain output copies until cleanup completes.
+                early_eof = close_pipes and sys.platform not in {"linux", "darwin"}
                 expected_waits = [0, CAPTURE.PROCESS_REAP_TIMEOUT_SECS] if early_eof else [CAPTURE.PROCESS_REAP_TIMEOUT_SECS]
 
                 def settle():
@@ -287,6 +286,10 @@ class GymSubprocessTests(unittest.TestCase):
                         pidfds.append(pidfd)
                         cleanup.callback(os.close, pidfd)
                         self.assertEqual(select.select(pidfds, [], [], 0)[0], [], "command exited before expiry")
+                    elif sys.platform == "darwin":
+                        from scripts.gym._macos_supervisor import Processes
+                        Processes().identity(pid)  # Actual command is still alive.
+                        self.assertNotEqual(pid, owners[0].pid)
                     else:
                         self.assertEqual(pid, owners[0].pid)
                     now = 101.0

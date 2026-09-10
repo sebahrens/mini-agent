@@ -255,20 +255,34 @@ fn proposal_host_shutdown_is_bounded_with_live_sender_clones() {
     let worker =
         ProposalQueue::start_store_worker(store, 4, Duration::from_secs(1)).expect("worker");
     let sender = worker.sender();
-
-    let started = Instant::now();
-    drop(worker);
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "worker shutdown must not wait for cloned senders"
-    );
-
-    let artifact = proposal("").validate_and_canonicalize().unwrap();
-    assert!(matches!(
-        sender.enqueue(artifact, None),
-        Err(ProposalError::QueueClosed)
-    ));
-    let _ = std::fs::remove_dir_all(root);
+    let scenario = std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown = scope.spawn(move || {
+            drop(worker);
+            let _ = done_tx.send(());
+        });
+        let scenario = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            done_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("worker shutdown waited for live sender clones");
+            let artifact = proposal("").validate_and_canonicalize().unwrap();
+            assert!(matches!(
+                sender.enqueue(artifact, None),
+                Err(ProposalError::QueueClosed)
+            ));
+        }));
+        // Release clones even if shutdown regresses to waiting for channel closure.
+        drop(sender);
+        let joined = shutdown.join();
+        if scenario.is_ok() {
+            joined.expect("shutdown thread panicked");
+        }
+        scenario
+    });
+    std::fs::remove_dir_all(root).expect("remove settled proposal fixture");
+    if let Err(payload) = scenario {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 #[test]

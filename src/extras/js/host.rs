@@ -6827,7 +6827,28 @@ mod tests {
     #[cfg(feature = "sandbox")]
     #[tokio::test]
     async fn js_fetch_host_call_bounds_dispatched_request_and_leaves_js_context_usable() {
-        let outer_timeout = Duration::from_millis(25);
+        use futures::FutureExt;
+        let outer_timeout = Duration::from_secs(60);
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        struct OwnedSender {
+            sender: BlockingFetchSender,
+            settled: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+        impl FetchSender for OwnedSender {
+            fn send(
+                &self,
+                url: Url,
+                request: &FetchRequest,
+                addresses: &[SocketAddr],
+                bridge: &PermissionBridge,
+            ) -> Result<FetchTransportOutcome, FetchError> {
+                let result = self.sender.send(url, request, addresses, bridge);
+                if let Some(done) = self.settled.lock().unwrap().take() {
+                    let _ = done.send(());
+                }
+                result
+            }
+        }
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let owner =
@@ -6835,9 +6856,12 @@ mod tests {
         let executor = Arc::new(FetchExecutor {
             policy: FetchPolicy::from_settings(None, false),
             resolver: Arc::new(FakeFetchResolver::new(vec![Ok(vec![public_address()])])),
-            sender: Arc::new(BlockingFetchSender {
-                started: started.clone(),
-                release: release.clone(),
+            sender: Arc::new(OwnedSender {
+                sender: BlockingFetchSender {
+                    started: started.clone(),
+                    release: release.clone(),
+                },
+                settled: Mutex::new(Some(settled_tx)),
             }),
             permission_bridge: owner.bridge(),
         });
@@ -6848,7 +6872,7 @@ mod tests {
             outer_timeout,
         );
 
-        let host_call = tokio::task::spawn_blocking(move || {
+        let mut host_call = Some(tokio::task::spawn_blocking(move || {
             let _owner = owner;
             let runtime = rquickjs::Runtime::new().expect("create QuickJS runtime");
             let context = Context::full(&runtime).expect("create QuickJS context");
@@ -6871,31 +6895,45 @@ mod tests {
                     .expect("subsequent JS evaluation must remain usable");
                 (error, recovery)
             })
-        });
+        }));
 
-        tokio::time::timeout(Duration::from_secs(1), started.notified())
-            .await
-            .expect("blocked sender must start");
-        let started_at = Instant::now();
-        let completed = tokio::time::timeout(Duration::from_secs(1), host_call).await;
-
-        let (released, wake) = &*release;
-        *released.lock().unwrap() = true;
-        wake.notify_one();
-
-        let (error, recovery) = completed
-            .expect("outer fetch timeout must bound the host call")
-            .expect("fetch host-call task panicked");
-        assert!(
-            started_at.elapsed() < Duration::from_millis(500),
-            "outer fetch timeout exceeded the host-call bound"
-        );
-
-        assert!(
-            error.contains(&FetchError::OutcomeUnknown.to_string()),
-            "unexpected dispatched-fetch timeout error: {error}"
-        );
-        assert_eq!(recovery, 42);
+        let scenario = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(15), started.notified())
+                .await
+                .expect("blocked sender must start");
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(61)).await;
+            tokio::time::resume();
+            let completed =
+                tokio::time::timeout(Duration::from_secs(15), host_call.as_mut().unwrap())
+                    .await
+                    .expect("outer fetch timeout must settle while sender is held");
+            host_call.take();
+            let (error, recovery) = completed.expect("fetch host-call task panicked");
+            assert!(
+                !*release.0.lock().unwrap(),
+                "sender must remain held through recovery"
+            );
+            assert!(
+                error.contains(&FetchError::OutcomeUnknown.to_string()),
+                "unexpected dispatched-fetch timeout error: {error}"
+            );
+            assert_eq!(recovery, 42);
+        })
+        .catch_unwind()
+        .await;
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        if let Some(call) = host_call {
+            let _ = call.await;
+        }
+        let settled = tokio::time::timeout(Duration::from_secs(15), settled_rx).await;
+        if let Err(payload) = scenario {
+            std::panic::resume_unwind(payload);
+        }
+        settled
+            .expect("released sender did not settle")
+            .expect("sender disappeared before settlement");
     }
 
     #[cfg(feature = "sandbox")]

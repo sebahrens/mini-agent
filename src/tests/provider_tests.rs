@@ -1248,122 +1248,98 @@ async fn provider_redirects_preserve_origin_headers_and_hop_limit() {
     }
 }
 
-/// Serve one connection with `handler`, returning the bound address.
-async fn stalling_server<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
-where
-    F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
-{
+/// Exercise the real HTTP client with controlled time and an explicitly commanded peer.
+async fn exercise_provider_idle_timeout(mode: &str) {
+    use futures::FutureExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            handler(stream).await;
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<&'static [u8]>(1);
+    let mut server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        ready_tx.send(()).unwrap();
+        while let Some(bytes) = write_rx.recv().await {
+            stream.write_all(bytes).await.unwrap();
         }
     });
-    (format!("http://{address}/"), handle)
+    tokio::time::pause();
+    let scenario = std::panic::AssertUnwindSafe(async {
+        // Keep this task runnable to prevent Tokio auto-advancing while real sockets
+        // are awaiting OS readiness. Only the explicit advances below move time.
+        let hang_guard = async {
+            let start = Instant::now();
+            loop {
+                assert!(start.elapsed() < Duration::from_secs(15), "HTTP fixture stalled");
+                tokio::task::yield_now().await;
+            }
+        };
+        let body = async {
+            let config = timeout_cfg(5, 60);
+            let client = crate::provider::build_http_client("controlled-idle", false, Some(&config), None).unwrap();
+            let response = client.get(&url).send();
+            tokio::pin!(response);
+            tokio::select! {
+                ready = ready_rx => ready.expect("peer closed before request readiness"),
+                result = &mut response => panic!("request settled before peer readiness: {result:?}"),
+            }
+            if mode == "headers" {
+                tokio::time::advance(Duration::from_secs(61)).await;
+                assert!(response.await.unwrap_err().is_timeout());
+                return;
+            }
+            write_tx.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n").await.unwrap();
+            let mut response = response.await.unwrap();
+            assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), b"ping");
+            if mode == "body" {
+                // Poll once to arm the next read's idle deadline before advancing.
+                let chunk = response.chunk();
+                tokio::pin!(chunk);
+                assert!(futures::poll!(&mut chunk).is_pending());
+                tokio::time::advance(Duration::from_secs(61)).await;
+                assert!(chunk.await.unwrap_err().is_timeout());
+            } else {
+                for _ in 0..5 {
+                    let chunk = response.chunk();
+                    tokio::pin!(chunk);
+                    assert!(futures::poll!(&mut chunk).is_pending());
+                    tokio::time::advance(Duration::from_secs(40)).await;
+                    write_tx.send(b"4\r\nping\r\n").await.unwrap();
+                    assert_eq!(chunk.await.unwrap().unwrap().as_ref(), b"ping");
+                }
+                write_tx.send(b"0\r\n\r\n").await.unwrap();
+                assert!(response.chunk().await.unwrap().is_none());
+            }
+        };
+        tokio::select! { _ = hang_guard => unreachable!(), _ = body => {} }
+    }).catch_unwind().await;
+    tokio::time::resume();
+    drop(write_tx);
+    server.abort();
+    let settled = (&mut server).await;
+    if let Err(payload) = scenario {
+        std::panic::resume_unwind(payload);
+    }
+    if let Err(error) = settled {
+        assert!(error.is_cancelled(), "peer panicked: {error}");
+    }
 }
 
 #[tokio::test]
 async fn a_peer_that_stalls_before_headers_fails_within_the_idle_bound() {
-    let (url, server) = stalling_server(|mut stream| async move {
-        use tokio::io::AsyncReadExt;
-        // Accept and read the request, then never send a response.
-        let mut request = [0u8; 1024];
-        let _ = stream.read(&mut request).await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    })
-    .await;
-
-    let custom = timeout_cfg(5, 1);
-    let client =
-        crate::provider::build_http_client("stalling", false, Some(&custom), None).unwrap();
-    let started = Instant::now();
-    let result = client.get(&url).send().await;
-    let elapsed = started.elapsed();
-
-    assert!(result.is_err(), "a stalled peer must not hang the turn");
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "the idle bound must fire promptly, took {elapsed:?}"
-    );
-    server.abort();
+    exercise_provider_idle_timeout("headers").await;
 }
 
 #[tokio::test]
 async fn a_peer_that_stalls_between_events_fails_within_the_idle_bound() {
-    let (url, server) = stalling_server(|mut stream| async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut request = [0u8; 1024];
-        let _ = stream.read(&mut request).await;
-        let _ = stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n\
-                  5\r\ndata:\r\n",
-            )
-            .await;
-        let _ = stream.flush().await;
-        // Then stall forever mid-stream.
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    })
-    .await;
-
-    let custom = timeout_cfg(5, 1);
-    let client =
-        crate::provider::build_http_client("stalling", false, Some(&custom), None).unwrap();
-    let started = Instant::now();
-    let result = async {
-        let response = client.get(&url).send().await?;
-        response.bytes().await
-    }
-    .await;
-    let elapsed = started.elapsed();
-
-    assert!(
-        result.is_err(),
-        "a stream that stalls after one event must not hang the turn"
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "the idle bound must fire promptly, took {elapsed:?}"
-    );
-    server.abort();
+    exercise_provider_idle_timeout("body").await;
 }
 
 #[tokio::test]
 async fn a_slow_but_healthy_stream_is_not_interrupted() {
-    let (url, server) = stalling_server(|mut stream| async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Drain the request; unread bytes make a close send RST and discard the
-        // response the client is still reading.
-        let mut request = [0u8; 1024];
-        let _ = stream.read(&mut request).await;
-        let _ = stream
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-            .await;
-        let _ = stream.flush().await;
-        // Six chunks, each well inside the deadline but together past it: the
-        // bound must reset on every read.
-        for _ in 0..6 {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let _ = stream.write_all(b"4\r\nping\r\n").await;
-            let _ = stream.flush().await;
-        }
-        let _ = stream.write_all(b"0\r\n\r\n").await;
-        let _ = stream.flush().await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    })
-    .await;
-
-    let custom = timeout_cfg(5, 2);
-    let client = crate::provider::build_http_client("slow", false, Some(&custom), None).unwrap();
-    let body = async {
-        let response = client.get(&url).send().await?;
-        response.bytes().await
-    }
-    .await
-    .expect("a slow healthy stream must complete");
-
-    assert_eq!(body.len(), 24, "expected six 4-byte chunks");
-    server.abort();
+    exercise_provider_idle_timeout("reset").await;
 }

@@ -196,6 +196,33 @@ pub struct Cli {
     pub learned_skill_feedback: Option<String>,
 
     #[cfg(feature = "skills")]
+    #[arg(long = "learned-skill-feedback-record", value_name = "SHA256",
+        conflicts_with_all = ["learned_skill_stats", "list_learned_skill_proposals", "learned_skill_proposal", "purge_learned_skill", "compact_learned_skill_events", "learned_skill_feedback", "import_learned_skill", "install_learned_skill_seeds", "approve_learned_skill", "reject_learned_skill", "activate_learned_skill", "promote_learned_skill", "retire_learned_skill", "reevaluate_learned_skill", "list_learned_skill_suites", "disable_learned_skill_suite", "distill_learned_skill", "list_learned_skill_feedback", "correct_learned_skill_feedback"],
+        help = "Inspect one feedback report without source or reason text")]
+    pub learned_skill_feedback_record: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(long = "list-learned-skill-feedback", value_name = "SHA256",
+        conflicts_with_all = ["learned_skill_stats", "list_learned_skill_proposals", "learned_skill_proposal", "purge_learned_skill", "compact_learned_skill_events", "learned_skill_feedback", "import_learned_skill", "install_learned_skill_seeds", "approve_learned_skill", "reject_learned_skill", "activate_learned_skill", "promote_learned_skill", "retire_learned_skill", "reevaluate_learned_skill", "list_learned_skill_suites", "disable_learned_skill_suite", "distill_learned_skill", "learned_skill_feedback_record", "correct_learned_skill_feedback"],
+        help = "List up to 100 feedback reports for a skill with a continuation cursor")]
+    pub list_learned_skill_feedback: Option<String>,
+
+    #[cfg(feature = "skills")]
+    #[arg(long = "correct-learned-skill-feedback", num_args = 4, value_names = ["FEEDBACK_ID", "VERSION", "STATE", "REASON"],
+        conflicts_with_all = ["learned_skill_stats", "list_learned_skill_proposals", "learned_skill_proposal", "purge_learned_skill", "compact_learned_skill_events", "learned_skill_feedback", "import_learned_skill", "install_learned_skill_seeds", "approve_learned_skill", "reject_learned_skill", "activate_learned_skill", "promote_learned_skill", "retire_learned_skill", "reevaluate_learned_skill", "list_learned_skill_suites", "disable_learned_skill_suite", "distill_learned_skill", "learned_skill_feedback_record", "list_learned_skill_feedback"],
+        help = "Resolve or retract an active feedback report as the local owner; does not promote or release quarantine")]
+    pub correct_learned_skill_feedback: Option<Vec<String>>,
+
+    #[cfg(feature = "skills")]
+    #[arg(
+        long = "learned-skill-feedback-after",
+        value_name = "FEEDBACK_ID",
+        requires = "list_learned_skill_feedback",
+        help = "Continue after the previous page's next_after cursor"
+    )]
+    pub learned_skill_feedback_after: Option<String>,
+
+    #[cfg(feature = "skills")]
     #[arg(
         long = "learned-skill-feedback-kind",
         value_name = "KIND",
@@ -1357,6 +1384,60 @@ mod tests {
             ..Cli::default()
         };
         assert!(!refused.sandbox_explicitly_requested(&cfg));
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn feedback_management_flags_require_complete_exclusive_actions() {
+        let id = "a".repeat(64);
+        for action in [
+            vec!["--learned-skill-feedback-record", &id],
+            vec!["--list-learned-skill-feedback", &id],
+            vec![
+                "--correct-learned-skill-feedback",
+                &id,
+                "1",
+                "resolved",
+                "mistaken_report",
+            ],
+        ] {
+            let mut args = vec!["mini-agent"];
+            args.extend(action);
+            assert!(Cli::try_parse_from(&args).is_ok());
+            for other in [
+                vec!["--learned-skill-stats"],
+                vec!["--promote-learned-skill", &id],
+                vec!["--list-learned-skill-suites"],
+                vec!["--distill-learned-skill", "session", "call"],
+            ] {
+                let mut conflicting = args.clone();
+                conflicting.extend(other);
+                assert!(Cli::try_parse_from(conflicting).is_err());
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--correct-learned-skill-feedback",
+                &id,
+                "1",
+                "resolved"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["mini-agent", "--learned-skill-feedback-after", &id]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--list-learned-skill-feedback",
+                &id,
+                "--learned-skill-feedback-after",
+                &id
+            ])
+            .is_ok()
+        );
     }
 
     #[cfg(feature = "skills")]

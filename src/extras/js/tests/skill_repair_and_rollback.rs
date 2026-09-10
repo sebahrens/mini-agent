@@ -202,6 +202,49 @@ fn promotion_and_exact_rollback_are_atomic_and_idempotent() {
         LifecycleService::new(&mut store).promote_replacement(&forged_request, 1),
         Err(LifecycleError::UnknownEvidence)
     ));
+    // The correction operator clears only active feedback, preserving the independent
+    // evidence hold checked immediately below. Explicit owner promotion is a distinct policy.
+    {
+        use crate::extras::js::skills::feedback::{
+            ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackKind, FeedbackService,
+        };
+        use crate::extras::js::skills::privacy::Redactor;
+        let actor = AuthenticatedActor {
+            actor_id: "local-owner".into(),
+            kind: ActorKind::Owner,
+            allowed_skill_ids: None,
+        };
+        for state in ["resolved", "retracted"] {
+            let id = FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512))
+                .submit(
+                    &actor,
+                    &FeedbackCommand {
+                        idempotency_key: state.into(),
+                        skill_id: candidate.id.clone(),
+                        invocation_id: None,
+                        kind: FeedbackKind::Negative,
+                        reason_code: "incorrect_result".into(),
+                        reason_text: None,
+                    },
+                    1,
+                )
+                .unwrap();
+            let held = LifecycleService::new(&mut store).promote_replacement(&promote_request, 1);
+            assert!(
+                matches!(&held, Err(LifecycleError::PromotionHeld(reason)) if reason.contains("negative_feedback")),
+                "{held:?}"
+            );
+            let correction = [id, "1".into(), state.into(), "mistaken_report".into()];
+            crate::extras::js::skills::operations::run_feedback_management(
+                None,
+                None,
+                None,
+                Some(&correction),
+                &paths,
+            )
+            .unwrap();
+        }
+    }
     let incomplete = LifecycleService::new(&mut store).promote_replacement(&promote_request, 1);
     assert!(
         matches!(&incomplete, Err(LifecycleError::PromotionHeld(reason))

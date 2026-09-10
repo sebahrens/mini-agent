@@ -333,7 +333,9 @@ The pricing metadata assertions in `startup.rs` compare numeric `output` values,
 and the task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
 `NON-PROCESS`. The ACP cancellation test uses the state-aware process helper;
-its system `ps` fallback and owned control process are `TEST-ONLY`.
+its system `ps` fallback and owned control process are `TEST-ONLY`. Configured-hook
+tests now use that same identity observer; their obsolete external `kill -0`
+terminals and inventory entries have been removed.
 The SQLite contention tests in `skills/session.rs` and `skills/coordinator.rs`
 construct `HeldTestLock` fixtures that own standard-library threads. Their two
 exact `HeldTestLock::spawn` expressions are classified `NON-PROCESS`.

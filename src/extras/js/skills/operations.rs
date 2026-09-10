@@ -18,7 +18,7 @@ use super::admission::{AdmissionEvaluator, AuthenticatedHumanDecision, HumanAppr
 use super::coordinator::IndexCoordinator;
 use super::embed::Embedder;
 use super::feedback::{
-    ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackKind, FeedbackService,
+    ActorKind, AuthenticatedActor, FeedbackCommand, FeedbackKind, FeedbackService, FeedbackState,
 };
 use super::held_out::HeldOutSuiteDraft;
 use super::lifecycle::LifecycleStatus;
@@ -1722,6 +1722,65 @@ fn proposal_status(status: ProposalStatus) -> &'static str {
     }
 }
 
+/// Store-only operations authenticated by the same OS-account boundary as feedback submission.
+pub(crate) fn run_feedback_management(
+    inspect: Option<&str>,
+    list: Option<&str>,
+    after: Option<&str>,
+    correction: Option<&[String]>,
+    paths: &AppPaths,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        usize::from(inspect.is_some())
+            + usize::from(list.is_some())
+            + usize::from(correction.is_some())
+            == 1,
+        "select exactly one feedback action"
+    );
+    anyhow::ensure!(
+        after.is_none() || list.is_some(),
+        "feedback cursor requires listing"
+    );
+    let actor = AuthenticatedActor {
+        actor_id: "local-owner".to_owned(),
+        kind: ActorKind::Owner,
+        allowed_skill_ids: None,
+    };
+    let mut store = SkillStore::open_at(paths).context("failed to open learned-skill store")?;
+    let mut service = FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512));
+    let report = if let Some(id) = inspect {
+        OperatorReport::new("feedback-record").with(
+            "record",
+            serde_json::to_value(service.inspect(&actor, id)?)?,
+        )
+    } else if let Some(id) = list {
+        let page = service.list(&actor, id, after)?;
+        OperatorReport::new("feedback-list")
+            .with("id", id)
+            .with("records", serde_json::to_value(page.records)?)
+            .with("next_after", page.next_after)
+    } else {
+        let [id, version, state, reason] = correction.context("missing correction")? else {
+            anyhow::bail!("feedback correction requires ID VERSION STATE REASON");
+        };
+        let version: i64 = version
+            .parse()
+            .context("feedback version must be a positive integer")?;
+        let next = match state.as_str() {
+            "resolved" => FeedbackState::Resolved,
+            "retracted" => FeedbackState::Retracted,
+            _ => anyhow::bail!("feedback correction state must be resolved or retracted"),
+        };
+        service.change_state(&actor, id, version, next, reason, current_timestamp()?)?;
+        OperatorReport::new("feedback-correct")
+            .with("feedback_id", id.as_str())
+            .with("state", state.as_str())
+            .with("version", version + 1)
+    };
+    report.emit();
+    Ok(())
+}
+
 fn submit_feedback(
     operation: FeedbackOperation<'_>,
     paths: &AppPaths,
@@ -2936,6 +2995,98 @@ mod tests {
         LifecycleService::new(&mut store)
             .revision(skill_id)
             .unwrap()
+    }
+
+    #[test]
+    fn feedback_correction_operator_preserves_lifecycle_until_explicit_action() {
+        for terminal in ["resolved", "retracted"] {
+            let (_root, paths, _) = fixture();
+            let predecessor = import_active_root(&paths);
+            let candidate = approved_replacement(&paths, terminal, &predecessor);
+            for key in ["first", "second"] {
+                submit_feedback(
+                    FeedbackOperation {
+                        skill_id: &candidate,
+                        invocation_id: None,
+                        kind: "negative",
+                        reason_code: "incorrect_result",
+                        idempotency_key: key,
+                    },
+                    &paths,
+                    None,
+                )
+                .unwrap();
+            }
+            let actor = AuthenticatedActor {
+                actor_id: "local-owner".into(),
+                kind: ActorKind::Owner,
+                allowed_skill_ids: None,
+            };
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let records = FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512))
+                .list(&actor, &candidate, None)
+                .unwrap()
+                .records;
+            drop(store);
+            run_feedback_management(None, Some(&candidate), None, None, &paths).unwrap();
+            for record in &records {
+                run_feedback_management(Some(&record.feedback_id), None, None, None, &paths)
+                    .unwrap();
+                let correction = [
+                    record.feedback_id.clone(),
+                    "1".into(),
+                    terminal.into(),
+                    "mistaken_report".into(),
+                ];
+                run_feedback_management(None, None, None, Some(&correction), &paths).unwrap();
+                assert!(
+                    run_feedback_management(None, None, None, Some(&correction), &paths).is_err()
+                );
+                assert_eq!(
+                    revision_state(&paths, &candidate).status,
+                    LifecycleStatus::Canary
+                );
+            }
+            promote_replacement_skill(&candidate, &paths, None).unwrap();
+            assert_eq!(
+                revision_state(&paths, &candidate).status,
+                LifecycleStatus::Active
+            );
+            // Correction never releases severe-feedback quarantine.
+            submit_feedback(
+                FeedbackOperation {
+                    skill_id: &candidate,
+                    invocation_id: None,
+                    kind: "severe",
+                    reason_code: "integrity",
+                    idempotency_key: "severe",
+                },
+                &paths,
+                None,
+            )
+            .unwrap();
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let records = FeedbackService::new(&mut store, Redactor::new(Vec::new(), 512))
+                .list(&actor, &candidate, None)
+                .unwrap()
+                .records;
+            let severe = records
+                .iter()
+                .find(|record| record.kind == "severe")
+                .unwrap();
+            let correction = [
+                severe.feedback_id.clone(),
+                "1".into(),
+                terminal.into(),
+                "mistaken_report".into(),
+            ];
+            drop(store);
+            run_feedback_management(None, None, None, Some(&correction), &paths).unwrap();
+            assert_eq!(
+                revision_state(&paths, &candidate).status,
+                LifecycleStatus::Quarantined
+            );
+        }
     }
 
     #[test]

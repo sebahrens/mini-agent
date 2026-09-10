@@ -245,8 +245,23 @@ stream and endpoint close; a close failure also remains fatal instead of masking
 cleanup result with a recoverable I/O error. A surviving supervisor keeps ownership
 and continues cleanup; it is not killed merely because that wait expired. After such a failure,
 confirm that the reported owner and its descendants have exited before retrying the run or
-removing retained directories. On macOS, only the immediate child is terminated and reaped;
-complete descendant cleanup remains tracked in `mini-agent-m7bs`.
+removing retained directories.
+
+On macOS, [_macos_supervisor.py](../../scripts/gym/_macos_supervisor.py) creates a
+uniquely named, temporary launchd job with an exclusive resource coalition. The
+job receives the exact command, environment, working directory and output/control
+descriptors over a private local socket. Forks, execs, new sessions and reparented
+double forks remain in that coalition. On command exit, timeout, overflow or
+caller death, the job signals its remaining members using kernel-checked PID
+versions, reaps the direct child and acknowledges only once no live descendants
+remain. The broker removes the job and private socket after acknowledgement;
+unconfirmed cleanup retains ownership and preserves workspaces. Native macOS
+support requires a functioning per-user launchd domain; it never falls back to
+immediate-child-only cleanup. The API layouts and signalling semantics follow
+Apple's [libproc](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c)
+and [process information definitions](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h).
+Run `python3 -m unittest scripts.tests.test_gym_macos` for native ordinary,
+detached, double-fork, exit/timeout/overflow and caller-death coverage.
 Git worktree administration is shared through [worktrees.py](../../scripts/gym/worktrees.py).
 Checkout has a 300-second deadline; removal and pruning each have a 30-second deadline. Cleanup
 first removes the filesystem entry without following root symlinks, then removes its Git

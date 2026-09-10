@@ -3664,11 +3664,12 @@ mod protocol_tests {
         assert_eq!(work_scope.active_children(), 0);
     }
 
-    #[cfg(all(feature = "hooks", unix))]
+    #[cfg(all(feature = "hooks", any(target_os = "linux", target_os = "macos")))]
     #[tokio::test]
     async fn cancellation_reaps_configured_async_user_prompt_hook() {
         use crate::extras::hooks::dispatcher::HookDispatcher;
         use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+        use crate::tests::process_state::{ProcessIdentity, ProcessState};
 
         let workspace = ProtocolTempDir::new();
         let pid_file = workspace.path().join("hook.pid");
@@ -3682,7 +3683,7 @@ mod protocol_tests {
                     command: Some("/bin/sh".to_owned()),
                     args: Some(vec![
                         "-c".to_owned(),
-                        "printf '%s' \"$$\" > \"$1\"; while :; do sleep 1; done".to_owned(),
+                        "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done".to_owned(),
                         "configured-user-prompt-hook".to_owned(),
                         pid_file.display().to_string(),
                     ]),
@@ -3703,14 +3704,6 @@ mod protocol_tests {
             permission_mode: "deny".to_owned(),
         };
         let work_scope = crate::agent::runner::AgentWorkScope::new();
-        let is_live = |pid: &str| {
-            std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        };
         // These bounds are hang guards. The assertions below inspect live work
         // before cancellation and settled work afterward, not elapsed latency.
         let gate = tokio::time::timeout(
@@ -3725,36 +3718,39 @@ mod protocol_tests {
         let observed = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && contents.ends_with('\n')
                     && let Ok(pid) = contents.trim().parse::<u32>()
                     && pid > 0
                 {
-                    break pid.to_string();
+                    break ProcessIdentity::capture(pid);
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await;
         let had_active_work = work_scope.active_children() > 0;
-        let was_live = observed.as_ref().is_ok_and(|pid| is_live(pid));
 
         // Settle the fixture before reporting dispatch/readiness failures.
         work_scope.cancellation_handle().cancel();
         let settled = tokio::time::timeout(Duration::from_secs(15), work_scope.wait_idle()).await;
         settled.expect("hook cancellation must kill and reap the configured subprocess");
         let gate = gate.expect("async prompt dispatch waited for its still-running hook");
-        let pid = observed.expect("the configured UserPromptSubmit hook should start");
+        let identity = observed
+            .expect("the configured UserPromptSubmit hook should start")
+            .expect("capture live hook identity");
         assert!(matches!(gate, crate::extras::hooks::PromptGate::Proceed(_)));
         assert!(
             had_active_work,
             "dispatch must return while hook work is owned"
         );
-        assert!(
-            was_live,
-            "dispatch must return while the configured hook is live"
-        );
         assert_eq!(work_scope.active_children(), 0);
         assert!(
-            !is_live(&pid),
+            matches!(
+                identity
+                    .state()
+                    .expect("observe configured hook after cleanup"),
+                ProcessState::Gone | ProcessState::Replaced
+            ),
             "Cancelled must not return while the configured hook process is live"
         );
     }

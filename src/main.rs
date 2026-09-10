@@ -222,6 +222,21 @@ async fn run_inner() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "skills")]
+    if cli.learned_skill_feedback_record.is_some()
+        || cli.list_learned_skill_feedback.is_some()
+        || cli.correct_learned_skill_feedback.is_some()
+    {
+        extras::js::skills::operations::run_feedback_management(
+            cli.learned_skill_feedback_record.as_deref(),
+            cli.list_learned_skill_feedback.as_deref(),
+            cli.learned_skill_feedback_after.as_deref(),
+            cli.correct_learned_skill_feedback.as_deref(),
+            &app_paths,
+        )?;
+        return Ok(());
+    }
+
     // Distillation is the only learned-skill command that reaches a provider,
     // so it sits apart from the store-only operator funnel below. It still
     // writes nothing to the library: its output is a package file the operator

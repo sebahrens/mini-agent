@@ -1,6 +1,8 @@
 mod app;
 #[cfg(test)]
 pub(crate) use app::retire_scoped_task;
+#[cfg(all(test, feature = "git-worktree"))]
+pub(crate) use app::retire_workspace_owners_and_complete_merge;
 #[cfg(test)]
 pub(crate) use app::{ClipboardShortcut, InterruptTarget, clipboard_shortcut, interrupt_target};
 pub(crate) mod event_handler;

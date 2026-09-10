@@ -689,25 +689,144 @@ mod tests {
         assert!(direct.contains(".validate()"));
         assert!(direct.contains("self.working_dir()"));
         assert!(!direct.contains("std::env::current_dir()"));
-
-        let app = include_str!("../ui/app.rs");
-        let success = app
-            .split("MergeOutcome::Success")
-            .nth(1)
-            .unwrap()
-            .split("MergeOutcome::Conflicts")
-            .next()
-            .unwrap();
-        let retire = success
-            .find("retire_workspace_owners_before_cleanup")
-            .unwrap();
-        let cleanup = success.find("complete_merge(&mut state)").unwrap();
-        assert!(
-            retire < cleanup,
-            "workspace owners must retire before deletion"
-        );
     }
 
+    #[tokio::test]
+    async fn ui_merge_cleanup_waits_for_workspace_owner_and_preserves_worktree_on_timeout() {
+        use futures::FutureExt;
+        for expire in [false, true] {
+            let repo = TempRepo::new("merge main");
+            let remote = repo.path().with_extension("bare remote");
+            let worktree = repo.path().with_extension("linked worktree");
+            std::fs::create_dir_all(&remote).unwrap();
+            git(&remote, ["init", "--bare"]);
+            git(
+                repo.path(),
+                vec![
+                    OsString::from("remote"),
+                    OsString::from("add"),
+                    OsString::from("origin"),
+                    remote.as_os_str().to_os_string(),
+                ],
+            );
+            git(repo.path(), ["push", "-u", "origin", "main"]);
+            git(
+                repo.path(),
+                vec![
+                    OsString::from("worktree"),
+                    OsString::from("add"),
+                    OsString::from("-b"),
+                    OsString::from("feature"),
+                    worktree.as_os_str().to_os_string(),
+                ],
+            );
+            std::fs::write(worktree.join("tracked.txt"), "feature\n").unwrap();
+            git(&worktree, ["add", "tracked.txt"]);
+            git(&worktree, ["commit", "-m", "feature"]);
+            let original_cwd = std::env::current_dir().unwrap();
+            let info = WorktreeInfo {
+                branch: "feature".into(),
+                worktree_path: worktree.clone(),
+                main_repo_path: repo.path().to_path_buf(),
+            };
+
+            let (mut state, outcome) = try_merge(&info, "main").await;
+            assert_eq!(outcome, MergeOutcome::Success);
+
+            let (scope, started, release) =
+                crate::agent::runner::AgentWorkScope::new_with_blocking_test_gate();
+            let mut child = None;
+            scope
+                .run(async {
+                    child = Some(crate::agent::runner::spawn_blocking_scoped(|| ()));
+                })
+                .await;
+            let child = child.unwrap();
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let guard = crate::agent::runner::AgentRunCleanupGuard::new(scope.clone(), tx);
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            let mut run = crate::ui::state::AgentRunState::default();
+            run.agent_rx = Some(rx);
+            run.main_abort = Some(task.abort_handle());
+            let mut btw = Vec::new();
+            let mut inflight = 0;
+            let mut prebuild = None;
+            #[cfg(feature = "mcp")]
+            let mut mcp = None;
+            let scenario = std::panic::AssertUnwindSafe(async {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match started.try_recv() {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                tokio::task::yield_now().await
+                            }
+                            Err(error) => panic!("owner readiness failed: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("workspace owner did not start");
+                tokio::time::pause();
+                let cleanup = crate::ui::retire_workspace_owners_and_complete_merge(
+                    &mut run,
+                    &mut btw,
+                    &mut inflight,
+                    &mut prebuild,
+                    #[cfg(feature = "mcp")]
+                    &mut mcp,
+                    &mut state,
+                    Duration::from_secs(5),
+                );
+                tokio::pin!(cleanup);
+                assert!(futures::poll!(&mut cleanup).is_pending());
+                let retirement_started = std::time::Instant::now();
+                while !scope.is_cancelled() {
+                    assert!(
+                        retirement_started.elapsed() < Duration::from_secs(15),
+                        "cleanup skipped owner retirement"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert!(futures::poll!(&mut cleanup).is_pending());
+                assert!(worktree.exists());
+                if expire {
+                    tokio::time::advance(Duration::from_secs(6)).await;
+                    assert!(
+                        cleanup
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settling the active agent workspace")
+                    );
+                    assert!(worktree.exists(), "retirement failure deleted the worktree");
+                } else {
+                    release.release();
+                    tokio::time::resume();
+                    cleanup.await.unwrap().unwrap();
+                    assert!(!worktree.exists());
+                }
+            })
+            .catch_unwind()
+            .await;
+            if expire {
+                tokio::time::resume();
+            }
+            scope.cancellation_handle().cancel();
+            release.release();
+            task.abort();
+            let _ = task.await;
+            child.await.unwrap();
+            scope.wait_idle().await;
+            if let Err(payload) = scenario {
+                std::panic::resume_unwind(payload);
+            }
+            assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+        }
+    }
     #[test]
     fn worktree_rebind_preserves_no_context_files() {
         let repo = TempRepo::new("no context rebind");

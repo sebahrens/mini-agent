@@ -414,3 +414,24 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Escape` | Close active picker / cancel. |
 | Mouse drag | Select text and copy it on release. |
 | Mouse scroll | Scroll chat history. |
+
+Learned-skill feedback can be inspected and corrected by the authenticated local
+OS-account owner (requires `skills`):
+
+```sh
+mini-agent --list-learned-skill-feedback SKILL_ID --learned-skill-json
+mini-agent --list-learned-skill-feedback SKILL_ID --learned-skill-feedback-after FEEDBACK_ID
+mini-agent --learned-skill-feedback-record FEEDBACK_ID --learned-skill-json
+mini-agent --correct-learned-skill-feedback FEEDBACK_ID VERSION resolved mistaken_report
+mini-agent --correct-learned-skill-feedback FEEDBACK_ID VERSION retracted mistaken_report
+```
+
+Listing returns at most 100 records and a `next_after` cursor. Inspection excludes
+submission prose, skill source, and invocation payloads. Correction requires the
+current positive version, an active report, and a reason code of 1–64 lowercase
+ASCII letters/underscores. It retains the original report and cumulative counters,
+increments the version, and atomically appends an audit entry. Stale requests and
+audit failures leave the report unchanged. Correction does not promote a skill or
+release quarantine. The evidence-threshold promotion policy stops treating a
+corrected report as active negative feedback; all its other gates remain intact.
+Explicit local-owner promotion remains its existing, separate authorization path.
