@@ -158,6 +158,26 @@ supervisor's repository-lock release, and removes the sibling worktree base. Ori
 panics and successful cleanup are checked independently, so secondary cleanup failures
 cannot pass the failure controls.
 
+Merge-fetch and merge-commit cancellation tests share the owned command-gate
+fixture. Both first prove the captured stash OID and contents; the commit case
+also proves the squash index tree before cancellation. During fetch rollback,
+a reference-transaction hook holds deletion of that exact `refs/stash` value
+after its contents have been restored. During commit rollback, a post-checkout
+hook holds branch restoration. A second caller must remain blocked on repository
+admission until these operations settle. Acceptance precedes release of the
+interrupted command: fetch restores the original dirty file and removes its
+stash, while commit deliberately retains the squash tree and exact owned stash
+for recovery, with the original branch HEAD unchanged. Failure controls cover
+shared startup, each readiness/rollback stage, rejected stash deletion, and an
+unowned target-ref change. Caller joins, hook release, lock settlement, and all
+fixture-path cleanup complete before an original failure is propagated.
+
+The test directory owner is established before fallible Git initialization.
+A malformed Git-file control verifies that initialization failure removes its
+repository and preserves the Git error. Merge fixture repositories, bare remotes,
+hooks, and markers all live under owned directories; the remaining sibling-directory
+migration is tracked separately.
+
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.

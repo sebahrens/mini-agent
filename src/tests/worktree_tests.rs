@@ -41,22 +41,13 @@ mod tests {
         }
     }
 
-    struct TempRepo(PathBuf);
+    struct OwnedDirectory(PathBuf);
 
-    impl TempRepo {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("mini-agent-8tbo-{label}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&path).expect("create temporary repository directory");
-            git(&path, ["init", "-b", "main"]);
-            git(
-                &path,
-                ["config", "user.email", "mini-agent@example.invalid"],
-            );
-            git(&path, ["config", "user.name", "Mini Agent Test"]);
-            std::fs::write(path.join("tracked.txt"), "initial\n").expect("write tracked fixture");
-            git(&path, ["add", "tracked.txt"]);
-            git(&path, ["commit", "-m", "initial"]);
+    impl OwnedDirectory {
+        fn create(path: PathBuf) -> Self {
+            // Exclusive creation: a failed setup must not delete a path that
+            // was already present before this fixture acquired ownership.
+            std::fs::create_dir(&path).expect("create fixture directory");
             Self(path)
         }
 
@@ -65,10 +56,63 @@ mod tests {
         }
     }
 
-    impl Drop for TempRepo {
+    impl Drop for OwnedDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct TempRepo(OwnedDirectory);
+
+    impl TempRepo {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mini-agent-8tbo-{label}-{}", uuid::Uuid::new_v4()));
+            Self::initialize(OwnedDirectory::create(path))
+        }
+
+        fn initialize(directory: OwnedDirectory) -> Self {
+            let repo = Self(directory);
+            let path = repo.path();
+            git(path, ["init", "-b", "main"]);
+            git(path, ["config", "user.email", "mini-agent@example.invalid"]);
+            git(path, ["config", "user.name", "Mini Agent Test"]);
+            std::fs::write(path.join("tracked.txt"), "initial\n").expect("write tracked fixture");
+            git(path, ["add", "tracked.txt"]);
+            git(path, ["commit", "-m", "initial"]);
+            repo
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    #[test]
+    fn temporary_repository_owns_failed_git_initialization() {
+        let path =
+            std::env::temp_dir().join(format!("mini-agent-failed-init-{}", uuid::Uuid::new_v4()));
+        let directory = OwnedDirectory::create(path.clone());
+        // A malformed Git file makes the real git init fail after directory
+        // creation, without changing process environment or global Git config.
+        std::fs::write(path.join(".git"), "invalid gitfile\n").unwrap();
+        let result = std::panic::catch_unwind(|| TempRepo::initialize(directory));
+        let remained = path.exists();
+        // Rescue only after taking the acceptance snapshot, including mutants
+        // that deliberately discard the directory owner.
+        let _ = std::fs::remove_dir_all(&path);
+        let panic = result
+            .err()
+            .expect("malformed Git file must fail initialization");
+        assert!(
+            panic
+                .downcast_ref::<String>()
+                .is_some_and(|text| text.starts_with("fixture git failed:"))
+        );
+        assert!(
+            !remained,
+            "failed Git initialization leaked its fixture directory"
+        );
     }
 
     fn install_relative_shell(workspace: &Path) -> PathBuf {
@@ -145,25 +189,6 @@ mod tests {
     }
 
     const TEST_MUTATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
-
-    async fn wait_for_mutation_marker(path: &Path, task_finished: impl Fn() -> bool, label: &str) {
-        tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
-            while !path.exists() {
-                assert!(
-                    !task_finished(),
-                    "{label} stopped before its marker was written"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "{label} did not acquire the process Git mutation lock within {:?}",
-                TEST_MUTATION_ADMISSION_TIMEOUT
-            )
-        });
-    }
 
     async fn acquire_released_mutation_lock(
         repo_path: &Path,
@@ -2186,154 +2211,281 @@ wait
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_merge_during_fetch_restores_stash_and_releases_lock() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = TempRepo::new("drop during fetch");
-        let remote = repo.path().with_extension("drop fetch bare remote");
-        std::fs::create_dir_all(&remote).unwrap();
-        git(&remote, ["init", "--bare"]);
-        git(
-            repo.path(),
-            vec![
-                OsString::from("remote"),
-                OsString::from("add"),
-                OsString::from("origin"),
-                remote.as_os_str().to_os_string(),
-            ],
-        );
-        git(repo.path(), ["push", "-u", "origin", "main"]);
-        git(repo.path(), ["branch", "feature"]);
-        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
-        let fixture_id = uuid::Uuid::new_v4();
-        let started = std::env::temp_dir().join(format!("mini-agent-8tbo-fetch-{fixture_id}"));
-        let upload_pack =
-            std::env::temp_dir().join(format!("mini-agent-8tbo-uploadpack-{fixture_id}"));
-        std::fs::write(
-            &upload_pack,
-            format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 30\nexit 1\n",
-                started.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&upload_pack).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&upload_pack, permissions).unwrap();
-        git(
-            repo.path(),
-            vec![
-                OsString::from("config"),
-                OsString::from("remote.origin.uploadpack"),
-                upload_pack.as_os_str().to_os_string(),
-            ],
-        );
-        let info = WorktreeInfo {
-            branch: "feature".into(),
-            worktree_path: repo.path().with_extension("unused fetch worktree"),
-            main_repo_path: repo.path().to_path_buf(),
-        };
-        let task = tokio::spawn(async move { try_merge(&info, "main").await });
-
-        wait_for_mutation_marker(&started, || task.is_finished(), "delayed merge fetch").await;
-        task.abort();
-        let _ = task.await;
-        let admission = acquire_released_mutation_lock(repo.path(), "caller-drop rollback").await;
-        run_git_with_limits_for_test(
-            repo.path(),
-            &["status", "--porcelain"],
-            test_limits(Duration::from_secs(2)),
-        )
-        .await
-        .expect("status after caller-drop rollback");
-        drop(admission);
-
-        assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "dirty\n"
-        );
-        assert!(git_stdout(repo.path(), ["stash", "list"]).is_empty());
-        assert!(!has_merge_conflict(repo.path()).await);
-        let _ = std::fs::remove_file(started);
-        let _ = std::fs::remove_file(upload_pack);
-        let _ = std::fs::remove_dir_all(remote);
+    #[derive(Clone, Copy)]
+    enum MergeStop {
+        Fetch,
+        Commit,
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_merge_during_commit_rolls_back_squash_and_stash() {
-        use std::os::unix::fs::PermissionsExt;
+    #[derive(Clone, Copy)]
+    enum MergeFixtureFailure {
+        None,
+        BeforeReadiness,
+        AfterReadiness,
+        DuringRollback,
+        Verification,
+    }
 
-        let repo = TempRepo::new("drop during commit");
-        let remote = repo.path().with_extension("drop commit bare remote");
-        std::fs::create_dir_all(&remote).unwrap();
+    #[cfg(unix)]
+    async fn exercise_merge_cancellation(
+        stop: MergeStop,
+        failure: MergeFixtureFailure,
+        path: &Path,
+        cleanup_ok: &mut bool,
+    ) {
+        use futures::FutureExt;
+
+        // The fixture owns every repository, remote, hook and marker before
+        // starting the caller, and keeps them until rollback has settled.
+        let directory = OwnedDirectory::create(path.to_path_buf());
+        let repo =
+            TempRepo::initialize(OwnedDirectory::create(directory.path().join("repository")));
+        let remote = directory.path().join("bare remote");
+        std::fs::create_dir(&remote).unwrap();
         git(&remote, ["init", "--bare"]);
         git(
             repo.path(),
-            vec![
-                OsString::from("remote"),
-                OsString::from("add"),
-                OsString::from("origin"),
-                remote.as_os_str().to_os_string(),
+            [
+                OsStr::new("remote"),
+                OsStr::new("add"),
+                OsStr::new("origin"),
+                remote.as_os_str(),
             ],
         );
         git(repo.path(), ["push", "-u", "origin", "main"]);
         let original_head = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
+        let original_tree = git_stdout(repo.path(), ["rev-parse", "HEAD^{tree}"]);
         git(repo.path(), ["switch", "-c", "feature"]);
         std::fs::write(repo.path().join("tracked.txt"), "feature\n").unwrap();
         git(repo.path(), ["add", "tracked.txt"]);
         git(repo.path(), ["commit", "-m", "feature"]);
+        let feature_head = git_stdout(repo.path(), ["rev-parse", "HEAD"]);
+        let feature_tree = git_stdout(repo.path(), ["rev-parse", "HEAD^{tree}"]);
         git(repo.path(), ["switch", "main"]);
         std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
-        let started = repo.path().join("commit-started");
-        let hook = repo.path().join(".git/hooks/pre-commit");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\nprintf started > '{}'\nsleep 30\n",
-                started.display()
+        let mut gate = concurrency::CommandGate::new(repo.path(), "merge-gate");
+        let mut rollback_gate = concurrency::CommandGate::new(repo.path(), "rollback-gate");
+        match stop {
+            MergeStop::Fetch => git(
+                repo.path(),
+                [
+                    OsStr::new("config"),
+                    OsStr::new("remote.origin.uploadpack"),
+                    OsStr::new(&concurrency::quote(&gate.script)),
+                ],
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
+            MergeStop::Commit => {
+                std::fs::copy(&gate.script, repo.path().join(".git/hooks/pre-commit")).unwrap();
+            }
+        }
         let info = WorktreeInfo {
             branch: "feature".into(),
-            worktree_path: repo.path().with_extension("unused commit worktree"),
+            worktree_path: directory.path().join("unused worktree"),
             main_repo_path: repo.path().to_path_buf(),
         };
-        let task = tokio::spawn(async move { try_merge(&info, "main").await });
+        let mut task = Some(tokio::spawn(async move {
+            let (_, outcome) = try_merge(&info, "main").await;
+            Err::<(), _>(format!("merge returned before cancellation: {outcome:?}"))
+        }));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            if matches!(failure, MergeFixtureFailure::BeforeReadiness) {
+                panic!("injected before merge readiness");
+            }
+            // Both the custom local upload-pack command and the commit hook
+            // start from the working repository selected by GitRunner.
+            gate.wait_started(task.as_ref().unwrap(), &repo.path().canonicalize().unwrap()).await;
+            let stash = git_stdout(repo.path(), ["rev-parse", "refs/stash"]);
+            assert_eq!(git_stdout(repo.path(), ["show", &format!("{stash}:tracked.txt")]), "dirty");
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", &format!("{stash}^1")]), original_head);
+            assert_eq!(git_stdout(repo.path(), ["stash", "list", "--format=%H"]), stash);
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), original_head);
+            let expected_tree = match stop { MergeStop::Fetch => &original_tree, MergeStop::Commit => &feature_tree };
+            assert_eq!(git_stdout(repo.path(), ["write-tree"]), *expected_tree);
+            assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), match stop {
+                MergeStop::Fetch => "initial\n", MergeStop::Commit => "feature\n",
+            });
+            if matches!(failure, MergeFixtureFailure::AfterReadiness) {
+                panic!("injected after merge readiness");
+            }
+            let rollback_hook = repo.path().join(match stop {
+                MergeStop::Fetch => ".git/hooks/reference-transaction",
+                MergeStop::Commit => ".git/hooks/post-checkout",
+            });
+            std::fs::copy(&rollback_gate.script, &rollback_hook).unwrap();
+            if matches!(stop, MergeStop::Fetch) {
+                std::fs::write(&rollback_hook, format!(
+                    "#!/bin/sh\nif [ \"$1\" = prepared ]; then\nwhile read -r old new reference; do\nif [ \"$reference\" = refs/stash ] && [ \"$old\" = {stash} ] && [ \"$new\" = 0000000000000000000000000000000000000000 ]; then\n. {}\nexit {}\nfi\ndone\nfi\nexit 0\n",
+                    concurrency::quote(&rollback_gate.script),
+                    u8::from(matches!(failure, MergeFixtureFailure::Verification)),
+                )).unwrap();
+            } else if matches!(failure, MergeFixtureFailure::Verification) {
+                // Make rollback encounter an unowned target ref. Its failure
+                // must not skip fixture settlement or erase the original panic.
+                git(repo.path(), ["update-ref", "refs/heads/main", &feature_head]);
+            }
+            task.as_ref().unwrap().abort();
+            let joined = task.take().unwrap().await;
+            assert!(joined.unwrap_err().is_cancelled());
+            rollback_gate.wait_ready(|| false, &repo.path().canonicalize().unwrap()).await;
+            if matches!(stop, MergeStop::Fetch) {
+                assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "dirty\n");
+                assert_eq!(git_stdout(repo.path(), ["rev-parse", "refs/stash"]), stash);
+            }
+            if matches!(failure, MergeFixtureFailure::DuringRollback) {
+                panic!("injected during merge rollback");
+            }
+            let runner = crate::git::runner::GitRunner::default();
+            let (observer, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let mut admission = Box::pin(crate::git::runner::MUTATION_LOCK_OBSERVER.scope(
+                observer, runner.acquire_mutation(repo.path()),
+            ));
+            let (key, ready) = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, async {
+                tokio::select! {
+                    _ = &mut admission => panic!("repository admission escaped unfinished merge rollback"),
+                    event = events.recv() => event.expect("merge admission was not observed"),
+                }
+            }).await.expect("merge admission did not reach its lock");
+            assert_eq!(key, repo.path().join(".git").canonicalize().unwrap());
+            assert!(!ready, "repository admission escaped unfinished merge rollback");
+            rollback_gate.release();
+            let _admission = tokio::time::timeout(TEST_MUTATION_ADMISSION_TIMEOUT, admission)
+                .await.expect("merge rollback did not release repository admission").unwrap();
+            // Take acceptance evidence while holding admission and before any
+            // release/rescue of the interrupted fetch or commit fixture.
+            assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", "HEAD"]), original_head, "merge cancellation changed HEAD");
+            assert_eq!(git_stdout(repo.path(), ["rev-parse", "refs/heads/feature"]), feature_head);
+            assert_eq!(git_stdout(repo.path(), ["write-tree"]), *expected_tree, "merge cancellation changed the retained index tree");
+            assert!(!has_merge_conflict(repo.path()).await);
+            match stop {
+                MergeStop::Fetch => {
+                    assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "dirty\n");
+                    assert!(git_stdout(repo.path(), ["stash", "list"]).is_empty(), "fetch cancellation retained its restored stash");
+                }
+                MergeStop::Commit => {
+                    assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "feature\n");
+                    assert_eq!(git_stdout(repo.path(), ["stash", "list", "--format=%H"]), stash);
+                    assert_eq!(git_stdout(repo.path(), ["show", &format!("{stash}:tracked.txt")]), "dirty");
+                }
+            }
+        }).catch_unwind().await;
 
-        wait_for_mutation_marker(&started, || task.is_finished(), "delayed merge commit hook")
-            .await;
-        task.abort();
-        let _ = task.await;
-        let admission =
-            acquire_released_mutation_lock(repo.path(), "commit cancellation rollback").await;
-        run_git_with_limits_for_test(
-            repo.path(),
-            &["status", "--porcelain"],
-            test_limits(Duration::from_secs(2)),
-        )
-        .await
-        .expect("status after commit cancellation");
-        drop(admission);
+        let joined = if let Some(task) = task.take() {
+            task.abort();
+            Some(task.await)
+        } else {
+            None
+        };
+        gate.release();
+        rollback_gate.release();
+        let cleanup = std::panic::AssertUnwindSafe(async {
+            drop(acquire_released_mutation_lock(repo.path(), "merge fixture cleanup").await);
+        })
+        .catch_unwind()
+        .await;
+        let settled = [gate.settle(), rollback_gate.settle()];
+        let caller_settled = joined.as_ref().is_none_or(|result| {
+            result.is_ok() || result.as_ref().is_err_and(|error| error.is_cancelled())
+        });
+        *cleanup_ok = caller_settled && cleanup.is_ok() && settled.iter().all(Result::is_ok);
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = cleanup {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            caller_settled,
+            "merge fixture caller panicked during cleanup"
+        );
+        for result in settled {
+            result.unwrap();
+        }
+    }
 
-        assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
-        assert_eq!(
-            git_stdout(repo.path(), ["rev-parse", "HEAD"]),
-            original_head
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "feature\n"
-        );
-        assert!(!git_stdout(repo.path(), ["stash", "list"]).is_empty());
-        assert!(!has_merge_conflict(repo.path()).await);
-        let _ = std::fs::remove_dir_all(remote);
+    #[cfg(unix)]
+    async fn run_merge_cancellation(stop: MergeStop) {
+        let path = std::env::temp_dir().join(format!(
+            "mini-agent-merge 'cancel'-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut cleanup_ok = false;
+        exercise_merge_cancellation(stop, MergeFixtureFailure::None, &path, &mut cleanup_ok).await;
+        assert!(cleanup_ok);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_merge_during_fetch_restores_stash_and_releases_lock() {
+        run_merge_cancellation(MergeStop::Fetch).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_merge_during_commit_retains_squash_and_owned_stash() {
+        run_merge_cancellation(MergeStop::Commit).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_cancellation_fixture_settles_readiness_and_rollback_failures() {
+        use MergeStop::{Commit, Fetch};
+        use futures::FutureExt;
+        let cases: &[(MergeFixtureFailure, &[MergeStop], &str)] = &[
+            (
+                MergeFixtureFailure::BeforeReadiness,
+                &[Fetch],
+                "injected before merge readiness",
+            ),
+            (
+                MergeFixtureFailure::AfterReadiness,
+                &[Fetch, Commit],
+                "injected after merge readiness",
+            ),
+            (
+                MergeFixtureFailure::DuringRollback,
+                &[Fetch, Commit],
+                "injected during merge rollback",
+            ),
+            (
+                MergeFixtureFailure::Verification,
+                &[Fetch],
+                "fetch cancellation retained its restored stash",
+            ),
+            (
+                MergeFixtureFailure::Verification,
+                &[Commit],
+                "merge cancellation changed HEAD",
+            ),
+        ];
+        for &(failure, stops, expected) in cases {
+            for &stop in stops {
+                let path = std::env::temp_dir().join(format!(
+                    "mini-agent-merge 'cancel'-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                let mut cleanup_ok = false;
+                let panic = std::panic::AssertUnwindSafe(exercise_merge_cancellation(
+                    stop,
+                    failure,
+                    &path,
+                    &mut cleanup_ok,
+                ))
+                .catch_unwind()
+                .await
+                .expect_err("merge fixture failure must propagate");
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap();
+                assert!(message.contains(expected), "unexpected failure: {message}");
+                assert!(cleanup_ok, "merge failure skipped fixture cleanup");
+                assert!(!path.exists());
+            }
+        }
     }
 
     #[cfg(unix)]
