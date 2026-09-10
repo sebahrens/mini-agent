@@ -2004,66 +2004,296 @@ mod tests {
 
     struct LocalPricingServer {
         url: String,
+        accepted: std::sync::mpsc::Receiver<()>,
         started: std::sync::mpsc::Receiver<()>,
         closed: std::sync::mpsc::Receiver<bool>,
-        thread: std::thread::JoinHandle<()>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl LocalPricingServer {
+        fn finish(mut self) -> std::io::Result<()> {
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("pricing fixture panicked")
+        }
+    }
+
+    impl Drop for LocalPricingServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result
+                        .expect("pricing fixture panicked")
+                        .expect("pricing fixture failed");
+                }
+            }
+        }
+    }
+
+    fn pricing_fixture_io<T>(
+        stop: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        mut operation: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<Option<T>> {
+        loop {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(None);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "pricing fixture phase deadline",
+                ));
+            }
+            match operation() {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn spawn_local_pricing_server(response: Option<(u16, &'static str)>) -> LocalPricingServer {
         use std::io::{Read, Write};
+        const PHASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        const MAX_HEADERS: usize = 16 * 1024;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
         let (started_tx, started) = std::sync::mpsc::channel();
         let (closed_tx, closed) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
         let thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
+            let stop = &worker_stop;
+            let Some((mut stream, _)) =
+                pricing_fixture_io(stop, std::time::Instant::now() + PHASE_BUDGET, || {
+                    listener.accept()
+                })?
+            else {
+                return Ok(());
+            };
+            stream.set_nonblocking(true)?;
+            let _ = accepted_tx.send(());
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
+            let deadline = std::time::Instant::now() + PHASE_BUDGET;
             loop {
-                let count = stream.read(&mut buffer).unwrap();
-                assert!(count > 0, "pricing client closed before sending headers");
+                let remaining = MAX_HEADERS - request.len();
+                if remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "pricing fixture headers exceed limit",
+                    ));
+                }
+                let capacity = remaining.min(buffer.len());
+                let Some(count) =
+                    pricing_fixture_io(stop, deadline, || stream.read(&mut buffer[..capacity]))?
+                else {
+                    return Ok(());
+                };
+                if count == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "pricing client closed before sending headers",
+                    ));
+                }
                 request.extend_from_slice(&buffer[..count]);
                 if request.windows(4).any(|window| window == b"\r\n\r\n") {
                     break;
                 }
             }
-            started_tx.send(()).unwrap();
+            let _ = started_tx.send(());
             if let Some((status, body)) = response {
                 let reason = if status == 200 { "OK" } else { "Failure" };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).unwrap();
-                return;
+                let mut pending = response.as_bytes();
+                let deadline = std::time::Instant::now() + PHASE_BUDGET;
+                while !pending.is_empty() {
+                    let Some(count) = pricing_fixture_io(stop, deadline, || stream.write(pending))?
+                    else {
+                        return Ok(());
+                    };
+                    if count == 0 {
+                        return Err(std::io::ErrorKind::WriteZero.into());
+                    }
+                    pending = &pending[count..];
+                }
+                return Ok(());
             }
 
+            let deadline = std::time::Instant::now() + PHASE_BUDGET;
             let closed_cleanly = loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break true,
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        break false;
-                    }
+                match pricing_fixture_io(stop, deadline, || stream.read(&mut buffer)) {
+                    Ok(Some(0)) => break true,
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break false,
                     Err(_) => break true,
                 }
             };
-            closed_tx.send(closed_cleanly).unwrap();
+            let _ = closed_tx.send(closed_cleanly);
+            Ok(())
         });
         LocalPricingServer {
             url: format!("http://{address}/models"),
+            accepted,
             started,
             closed,
-            thread,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn pricing_server_drop_closes_idle_partial_and_active_connections() {
+        use std::io::{Read, Write};
+        for request in [
+            None,
+            Some("GET /models HTTP/1.1\r\n"),
+            Some("GET /models HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        ] {
+            for unwind in [false, true] {
+                let mut address = None;
+                let mut client = None;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let server = spawn_local_pricing_server(None);
+                    let endpoint: std::net::SocketAddr = server
+                        .url
+                        .strip_prefix("http://")
+                        .unwrap()
+                        .strip_suffix("/models")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    address = Some(endpoint);
+                    if let Some(request) = request {
+                        let mut stream = std::net::TcpStream::connect(endpoint).unwrap();
+                        stream
+                            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        stream.write_all(request.as_bytes()).unwrap();
+                        client = Some(stream);
+                        server
+                            .accepted
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        if request.ends_with("\r\n\r\n") {
+                            server
+                                .started
+                                .recv_timeout(std::time::Duration::from_secs(2))
+                                .unwrap();
+                        }
+                    }
+                    if unwind {
+                        panic!("injected pricing fixture failure");
+                    }
+                    drop(server);
+                }));
+                if unwind {
+                    let panic = result.expect_err("fixture did not unwind");
+                    assert_eq!(
+                        panic.downcast_ref::<&str>(),
+                        Some(&"injected pricing fixture failure")
+                    );
+                } else {
+                    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                }
+                assert!(
+                    std::net::TcpStream::connect_timeout(
+                        &address.unwrap(),
+                        std::time::Duration::from_secs(1)
+                    )
+                    .is_err(),
+                    "pricing listener survived fixture drop"
+                );
+                if let Some(mut stream) = client {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    match stream.read(&mut [0; 1]) {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) => {}
+                        result => panic!("pricing stream survived fixture drop: {result:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pricing_server_bounds_headers_and_rejects_incomplete_requests() {
+        use std::io::Write;
+        for size in [16 * 1024 - 1, 16 * 1024, 16 * 1024 + 1] {
+            let server = spawn_local_pricing_server(Some((200, "{}")));
+            let endpoint = server
+                .url
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/models")
+                .unwrap();
+            let mut client = std::net::TcpStream::connect(endpoint).unwrap();
+            client
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = b"GET /models HTTP/1.1\r\nX-Padding: ".to_vec();
+            request.resize(size - 4, b'x');
+            request.extend_from_slice(b"\r\n\r\n");
+            let _ = client.write_all(&request);
+            let result = server.finish();
+            if size <= 16 * 1024 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+        }
+        for disconnect in [true, false] {
+            let server = spawn_local_pricing_server(None);
+            let endpoint = server
+                .url
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/models")
+                .unwrap();
+            let mut client = std::net::TcpStream::connect(endpoint).unwrap();
+            client
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(b"GET /models HTTP/1.1\r\n").unwrap();
+            server
+                .accepted
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            if disconnect {
+                client.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let error = server.finish().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if disconnect {
+                    std::io::ErrorKind::UnexpectedEof
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            );
         }
     }
 
@@ -2104,26 +2334,32 @@ mod tests {
 
     #[tokio::test]
     async fn pending_pricing_refresh_never_blocks_readiness_and_allows_relaunch() {
-        let server = spawn_local_pricing_server(None);
-        let mut refresh = local_pricing_refresh(server.url.clone());
-        recv_channel(
-            &server.started,
-            "pricing request did not reach delayed server",
-        )
-        .await;
+        for abandon in [false, true] {
+            let server = spawn_local_pricing_server(None);
+            let mut refresh = local_pricing_refresh(server.url.clone());
+            recv_channel(
+                &server.started,
+                "pricing request did not reach delayed server",
+            )
+            .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            refresh.finish_without_wait(),
-        )
-        .await
-        .expect("readiness waited for the delayed pricing response");
-        assert!(result.is_none(), "pending refresh returned a result");
-        assert!(
-            recv_channel(&server.closed, "cancelled pricing connection stayed open").await,
-            "cancelled pricing connection was not closed"
-        );
-        server.thread.join().unwrap();
+            if abandon {
+                drop(refresh);
+            } else {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    refresh.finish_without_wait(),
+                )
+                .await
+                .expect("readiness waited for the delayed pricing response");
+                assert!(result.is_none(), "pending refresh returned a result");
+            }
+            assert!(
+                recv_channel(&server.closed, "cancelled pricing connection stayed open").await,
+                "cancelled pricing connection was not closed"
+            );
+            server.finish().unwrap();
+        }
 
         const BODY: &str = r#"{"data":[{"id":"test/model","pricing":{"prompt":"0.000001","completion":"0.000002"}}]}"#;
         let replacement_server = spawn_local_pricing_server(Some((200, BODY)));
@@ -2138,7 +2374,7 @@ mod tests {
             replacement.finish_without_wait().await,
             Some(Ok(_))
         ));
-        replacement_server.thread.join().unwrap();
+        replacement_server.finish().unwrap();
     }
 
     #[test]
@@ -2241,7 +2477,7 @@ mod tests {
         assert_eq!(session.input_token_cost, 1.0);
         assert_eq!(session.output_token_cost, 2.0);
         assert_eq!(session.context_window, 64_000);
-        server.thread.join().unwrap();
+        server.finish().unwrap();
     }
 
     #[test]
@@ -2330,15 +2566,11 @@ mod tests {
             recv_channel(&server.closed, "timed-out pricing connection stayed open").await,
             "timed-out pricing connection was not closed"
         );
-        server.thread.join().unwrap();
+        server.finish().unwrap();
     }
 
     #[test]
-    fn startup_pricing_refresh_is_owned_across_prompt_resolution() {
-        let startup = include_str!("startup.rs");
-        assert!(startup.contains("impl Drop for OpenRouterPricingRefresh"));
-        assert!(startup.contains("handle.abort();"));
-
+    fn startup_pricing_refresh_settles_before_prompt_error_propagation() {
         let main = include_str!("main.rs");
         let start = main
             .find("startup.start_openrouter_pricing_refresh();")
