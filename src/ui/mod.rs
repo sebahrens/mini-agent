@@ -421,7 +421,7 @@ pub(crate) async fn ensure_mcp_manager<'a>(
     mcp.as_ref()
 }
 
-#[cfg(feature = "mcp")]
+#[cfg(all(feature = "mcp", feature = "git-worktree"))]
 pub(crate) async fn rebind_mcp_manager(
     mcp: &mut Option<McpClientManager>,
     cfg: &Config,

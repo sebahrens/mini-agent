@@ -95,6 +95,11 @@ feature-specific test adapters compile only with their consumers. The shared
 bounded validation executor remains available without `loop`; loop defaults,
 command display, and explicit validator cancellation are gated to loop callers
 and their native tests.
+MCP manager rebinding follows worktree transitions; ordinary MCP initialization
+remains available without worktrees. Read-only JS constructors follow subagent
+callers, while standalone skills tests retain child discovery and turn-isolation
+coverage. The test-only task oracle adapter follows the sandboxed subagent
+harness; production completion-verification evidence is unchanged.
 ACP permission correlation claims a lifecycle ID when each registered tool
 invocation enters the concurrency boundary, before waiting for its lease.
 The ID stays local to that invocation through delayed and repeated approval

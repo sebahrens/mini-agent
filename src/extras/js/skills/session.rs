@@ -1384,6 +1384,7 @@ impl SkillSessionServices {
         Ok(discovery)
     }
 
+    #[cfg(any(feature = "subagents", test))]
     pub(crate) fn fork_for_read_only_child(&self) -> Arc<Self> {
         Arc::new(Self {
             runtime: Arc::new(self.runtime.fork_for_read_only_child()),

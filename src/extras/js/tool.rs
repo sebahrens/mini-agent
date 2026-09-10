@@ -658,6 +658,7 @@ impl JsTool {
     /// Construct the code-as-tool surface used by read-only exploration
     /// subagents. The worker installs only `read_file`, `list_dir`, and `grep`,
     /// while the parent broker issues only `read_file` authority.
+    #[cfg(feature = "subagents")]
     pub(crate) fn new_read_only(
         sandbox: Sandbox,
         permission: Option<PermCheck>,

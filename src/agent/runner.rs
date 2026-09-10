@@ -427,7 +427,7 @@ impl TaskOutcomeRecorder {
     /// Record a deterministic eval/gym oracle without treating it as
     /// production evidence. Callers choose the production bit when building
     /// the recorder; ordinary harnesses must pass `false`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "subagents", feature = "sandbox"))]
     pub(crate) fn record_oracle(&self, oracle_id: &str, passed: bool, attempt: u32) {
         self.record(
             passed,

@@ -437,6 +437,7 @@ impl SkillRuntime {
     /// Give a read-only child independent turn state while sharing immutable
     /// discovery indexes. Only active, pure learned JavaScript can enter the
     /// child's bundle; effectful skills and canary replacements are excluded.
+    #[cfg(any(feature = "subagents", test))]
     pub(crate) fn fork_for_read_only_child(&self) -> Self {
         let revision = self.embedder.model_metadata().model_revision.clone();
         Self {
