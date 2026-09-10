@@ -1,4 +1,6 @@
-use crate::extras::js::skills::scheduler::{PolicyScheduler, RetryOutcome, SchedulerError};
+use crate::extras::js::skills::scheduler::{
+    DecisionLease, PolicyScheduler, RetryOutcome, SchedulerError,
+};
 use crate::extras::js::skills::{
     CapabilityManifest, SkillArtifact, SkillExport, store::SkillStore,
 };
@@ -57,7 +59,7 @@ fn scheduler_fixture(directory: &super::TestTempDir) -> (AppPaths, SkillStore, S
 #[test]
 fn run_one_leases_dispatches_and_settles_exactly_one_due_decision() {
     let directory = super::TestTempDir::new("scheduler-run-one");
-    let (_paths, mut store, skill_id) = scheduler_fixture(&directory);
+    let (paths, mut store, skill_id) = scheduler_fixture(&directory);
     let mut scheduler = PolicyScheduler::new(&mut store);
     scheduler
         .enqueue("decision-a", &skill_id, "v1", 10)
@@ -109,56 +111,197 @@ fn run_one_leases_dispatches_and_settles_exactly_one_due_decision() {
         "a completed decision must never be dispatched again"
     );
 
+    for fails in [false, true] {
+        let id = if fails {
+            "raced-retry"
+        } else {
+            "raced-complete"
+        };
+        scheduler.enqueue(id, &skill_id, "v1", 200).unwrap();
+        let mut reclaimed = None;
+        let result = scheduler.run_one("reused-worker", 200, 5, 1, 60, |_| {
+            let mut other_store = SkillStore::open_at(&paths).unwrap();
+            reclaimed = PolicyScheduler::new(&mut other_store)
+                .lease_due("reused-worker", 205, 5)
+                .unwrap();
+            if fails { Err("transient") } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(SchedulerError::StaleLease)));
+        let lease = reclaimed.expect("second connection reclaimed the expired lease");
+        assert_eq!(lease.decision_id, id);
+        assert_eq!(lease.attempts, 2);
+        scheduler.complete(&lease, "reused-worker", 206).unwrap();
+    }
+
     drop(store);
 }
 
-#[test]
-fn decision_leases_are_restart_safe_and_stale_workers_cannot_complete() {
-    let directory = super::TestTempDir::new("scheduler-leases");
-    let (paths, mut store, skill_id) = scheduler_fixture(&directory);
-    let mut scheduler = PolicyScheduler::new(&mut store);
-    scheduler.enqueue("decision", &skill_id, "v1", 10).unwrap();
-    scheduler.enqueue("decision", &skill_id, "v1", 10).unwrap();
-    assert!(matches!(
-        scheduler.enqueue("decision", &skill_id, "v1", 11),
-        Err(SchedulerError::InvalidLease)
-    ));
-    let first = scheduler.lease_due("worker-a", 10, 5).unwrap().unwrap();
-    assert_eq!(first.decision_id, "decision");
-    assert_eq!(first.skill_id, skill_id);
-    assert_eq!(first.policy_version, "v1");
-    assert_eq!((first.attempts, first.lease_expires_at), (1, 15));
-    drop(store);
-
-    let mut store = SkillStore::open_at(&paths).unwrap();
-    let mut scheduler = PolicyScheduler::new(&mut store);
-    assert!(scheduler.lease_due("worker-b", 12, 5).unwrap().is_none());
-    let second = scheduler.lease_due("worker-b", 15, 5).unwrap().unwrap();
-    assert_eq!((second.attempts, second.lease_expires_at), (2, 20));
-    assert!(matches!(
-        scheduler.complete("decision", "worker-a", 16),
-        Err(SchedulerError::StaleLease)
-    ));
-    scheduler.complete("decision", "worker-b", 16).unwrap();
-    drop(store);
-
-    let mut store = SkillStore::open_at(&paths).unwrap();
-    let completion: (i64, Option<i64>, Option<String>, Option<i64>) = store
+fn decision_state(store: &SkillStore, id: &str) -> Vec<rusqlite::types::Value> {
+    store
         .conn()
         .query_row(
-            "SELECT attempts, completed_at, lease_owner, lease_expires_at
-             FROM skill_decision_jobs WHERE decision_id = 'decision'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            "SELECT due_at, lease_owner, lease_expires_at, attempts, last_error_code, completed_at
+         FROM skill_decision_jobs WHERE decision_id = ?",
+            [id],
+            |row| (0..6).map(|column| row.get(column)).collect(),
+        )
+        .unwrap()
+}
+
+fn assert_stale_settlement(store: &mut SkillStore, lease: &DecisionLease, owner: &str, now: i64) {
+    let before = decision_state(store, &lease.decision_id);
+    assert!(matches!(
+        PolicyScheduler::new(store).complete(lease, owner, now),
+        Err(SchedulerError::StaleLease)
+    ));
+    assert_eq!(decision_state(store, &lease.decision_id), before);
+    assert!(matches!(
+        PolicyScheduler::new(store).retry(lease, owner, now, 1, 60, "stale"),
+        Err(SchedulerError::StaleLease)
+    ));
+    assert_eq!(decision_state(store, &lease.decision_id), before);
+}
+
+#[test]
+fn decision_leases_are_restart_safe_and_stale_workers_cannot_settle() {
+    for owner in ["worker-a", "worker-b"] {
+        for retry in [false, true] {
+            let directory = super::TestTempDir::new("scheduler-leases");
+            let (paths, mut store, skill_id) = scheduler_fixture(&directory);
+            let mut scheduler = PolicyScheduler::new(&mut store);
+            scheduler.enqueue("decision", &skill_id, "v1", 10).unwrap();
+            scheduler.enqueue("decision", &skill_id, "v1", 10).unwrap();
+            assert!(matches!(
+                scheduler.enqueue("decision", &skill_id, "v1", 11),
+                Err(SchedulerError::InvalidLease)
+            ));
+            let first = scheduler.lease_due("worker-a", 10, 5).unwrap().unwrap();
+            assert_eq!(first.decision_id, "decision");
+            assert_eq!(first.skill_id, skill_id);
+            assert_eq!(first.policy_version, "v1");
+            assert_eq!((first.attempts, first.lease_expires_at), (1, 15));
+            drop(store);
+
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let mut scheduler = PolicyScheduler::new(&mut store);
+            assert!(scheduler.lease_due(owner, 12, 5).unwrap().is_none());
+            let second = scheduler.lease_due(owner, 15, 5).unwrap().unwrap();
+            assert_eq!((second.attempts, second.lease_expires_at), (2, 20));
+            assert_stale_settlement(&mut store, &first, "worker-a", 16);
+            assert_stale_settlement(&mut store, &second, "wrong-worker", 16);
+            let mut wrong_expiry = second.clone();
+            wrong_expiry.lease_expires_at += 1;
+            assert_stale_settlement(&mut store, &wrong_expiry, owner, 16);
+            let (attempts, completed_at) = if retry {
+                assert_eq!(
+                    PolicyScheduler::new(&mut store)
+                        .retry(&second, owner, 16, 1, 60, "transient")
+                        .unwrap(),
+                    RetryOutcome::Scheduled(18)
+                );
+                drop(store);
+                store = SkillStore::open_at(&paths).unwrap();
+                let mut scheduler = PolicyScheduler::new(&mut store);
+                assert!(scheduler.lease_due(owner, 17, 2).unwrap().is_none());
+                let third = scheduler.lease_due(owner, 18, 2).unwrap().unwrap();
+                // Same owner and expiry as the old token: only the attempt
+                // generation distinguishes these two live-looking leases.
+                assert_eq!(
+                    (third.attempts, third.lease_expires_at),
+                    (3, second.lease_expires_at)
+                );
+                assert_stale_settlement(&mut store, &second, owner, 19);
+                PolicyScheduler::new(&mut store)
+                    .complete(&third, owner, 19)
+                    .unwrap();
+                (3, 19)
+            } else {
+                PolicyScheduler::new(&mut store)
+                    .complete(&second, owner, 16)
+                    .unwrap();
+                (2, 16)
+            };
+            drop(store);
+
+            let mut store = SkillStore::open_at(&paths).unwrap();
+            let completion: (i64, Option<i64>, Option<String>, Option<i64>) = store
+                .conn()
+                .query_row(
+                    "SELECT attempts, completed_at, lease_owner, lease_expires_at
+                     FROM skill_decision_jobs WHERE decision_id = 'decision'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(completion, (attempts, Some(completed_at), None, None));
+            assert!(
+                PolicyScheduler::new(&mut store)
+                    .lease_due("worker-c", 30, 5)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_attempt_counters_do_not_commit_a_lease() {
+    for attempts in [i64::from(u32::MAX), -1, i64::MAX] {
+        let directory = super::TestTempDir::new("scheduler-counter");
+        let (_paths, mut store, skill_id) = scheduler_fixture(&directory);
+        PolicyScheduler::new(&mut store)
+            .enqueue("decision", &skill_id, "v1", 10)
+            .unwrap();
+        store
+            .conn()
+            .execute("UPDATE skill_decision_jobs SET attempts = ?", [attempts])
+            .unwrap();
+        let before = decision_state(&store, "decision");
+        assert!(matches!(
+            PolicyScheduler::new(&mut store).lease_due("owner", 10, 5),
+            Err(SchedulerError::InvalidLease)
+        ));
+        assert_eq!(decision_state(&store, "decision"), before);
+    }
+    let directory = super::TestTempDir::new("scheduler-counter-boundary");
+    let (_paths, mut store, skill_id) = scheduler_fixture(&directory);
+    PolicyScheduler::new(&mut store)
+        .enqueue("decision", &skill_id, "v1", 10)
+        .unwrap();
+    store
+        .conn()
+        .execute(
+            "UPDATE skill_decision_jobs SET attempts = ?",
+            [i64::from(u32::MAX) - 2],
         )
         .unwrap();
-    assert_eq!(completion, (2, Some(16), None, None));
-    assert!(
-        PolicyScheduler::new(&mut store)
-            .lease_due("worker-c", 30, 5)
-            .unwrap()
-            .is_none()
-    );
+    let previous = PolicyScheduler::new(&mut store)
+        .lease_due("owner", 10, 5)
+        .unwrap()
+        .unwrap();
+    let lease = PolicyScheduler::new(&mut store)
+        .lease_due("owner", 15, 5)
+        .unwrap()
+        .unwrap();
+    assert_eq!((lease.attempts, lease.lease_expires_at), (u32::MAX, 20));
+    // Both tokens select retry's dead-letter branch, which must fence stale
+    // generations just like normal retry and successful completion.
+    assert_stale_settlement(&mut store, &previous, "owner", 16);
+    let before = decision_state(&store, "decision");
+    let mut zero_attempt = lease.clone();
+    zero_attempt.attempts = 0;
+    assert!(matches!(
+        PolicyScheduler::new(&mut store).complete(&zero_attempt, "owner", 16),
+        Err(SchedulerError::InvalidLease)
+    ));
+    assert!(matches!(
+        PolicyScheduler::new(&mut store).retry(&zero_attempt, "owner", 16, 1, 60, "invalid"),
+        Err(SchedulerError::InvalidLease)
+    ));
+    assert_eq!(decision_state(&store, "decision"), before);
+    PolicyScheduler::new(&mut store)
+        .complete(&lease, "owner", 16)
+        .unwrap();
 }
 
 #[test]
@@ -173,8 +316,14 @@ fn permanently_failing_decision_is_dead_lettered_after_eight_attempts() {
         for attempt in 1..=8 {
             let lease = scheduler.lease_due("worker", now, 5).unwrap().unwrap();
             assert_eq!(lease.attempts, attempt);
+            if attempt == 8 {
+                assert!(matches!(
+                    scheduler.retry(&lease, "wrong-worker", now, 1, 60, "stale"),
+                    Err(SchedulerError::StaleLease)
+                ));
+            }
             match scheduler
-                .retry("dead", "worker", now, 1, 60, "backend_down")
+                .retry(&lease, "worker", now, 1, 60, "backend_down")
                 .unwrap()
             {
                 RetryOutcome::Scheduled(due) if attempt < 8 => now = due,

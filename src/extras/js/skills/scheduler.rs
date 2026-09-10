@@ -1,10 +1,13 @@
 //! Restart-safe, bounded leases for evidence-policy decisions.
+//!
+//! Settlement binds the owner, attempt generation and issued expiry so a stale
+//! callback cannot complete or retry a later lease that reuses its owner name.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::store::SkillStore;
 
-const MAX_POLICY_ATTEMPTS: i64 = 8;
+const MAX_POLICY_ATTEMPTS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionLease {
@@ -105,19 +108,21 @@ impl<'a> PolicyScheduler<'a> {
             tx.commit()?;
             return Ok(None);
         };
-        let next_attempt = attempts + 1;
+        let attempts = u32::try_from(attempts)
+            .ok()
+            .and_then(|attempt| attempt.checked_add(1))
+            .ok_or(SchedulerError::InvalidLease)?;
         let changed = tx.execute(
             "UPDATE skill_decision_jobs
              SET lease_owner = ?, lease_expires_at = ?, attempts = ?
              WHERE decision_id = ? AND completed_at IS NULL
                AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
-            params![owner, expires, next_attempt, decision_id, now],
+            params![owner, expires, attempts, decision_id, now],
         )?;
         if changed != 1 {
             return Err(SchedulerError::StaleLease);
         }
         tx.commit()?;
-        let attempts = u32::try_from(next_attempt).map_err(|_| SchedulerError::InvalidLease)?;
         Ok(Some(DecisionLease {
             decision_id,
             skill_id,
@@ -129,19 +134,27 @@ impl<'a> PolicyScheduler<'a> {
 
     pub fn complete(
         &mut self,
-        decision_id: &str,
+        lease: &DecisionLease,
         owner: &str,
         now: i64,
     ) -> Result<(), SchedulerError> {
-        if decision_id.is_empty() || owner.is_empty() || now < 0 {
+        if lease.decision_id.is_empty() || lease.attempts == 0 || owner.is_empty() || now < 0 {
             return Err(SchedulerError::InvalidLease);
         }
         let changed = self.store.connection_mut().execute(
             "UPDATE skill_decision_jobs
              SET completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
              WHERE decision_id = ? AND lease_owner = ?
+               AND attempts = ? AND lease_expires_at = ?
                AND completed_at IS NULL AND lease_expires_at > ?",
-            params![now, decision_id, owner, now],
+            params![
+                now,
+                lease.decision_id,
+                owner,
+                lease.attempts,
+                lease.lease_expires_at,
+                now
+            ],
         )?;
         if changed == 1 {
             Ok(())
@@ -152,14 +165,15 @@ impl<'a> PolicyScheduler<'a> {
 
     pub fn retry(
         &mut self,
-        decision_id: &str,
+        lease: &DecisionLease,
         owner: &str,
         now: i64,
         base_backoff_seconds: i64,
         max_backoff_seconds: i64,
         error_code: &str,
     ) -> Result<RetryOutcome, SchedulerError> {
-        if decision_id.is_empty()
+        if lease.decision_id.is_empty()
+            || lease.attempts == 0
             || owner.is_empty()
             || error_code.is_empty()
             || now < 0
@@ -168,26 +182,23 @@ impl<'a> PolicyScheduler<'a> {
         {
             return Err(SchedulerError::InvalidLease);
         }
-        let attempts: i64 = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT attempts FROM skill_decision_jobs
-                 WHERE decision_id = ? AND lease_owner = ?
-                   AND lease_expires_at > ?",
-                params![decision_id, owner, now],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(SchedulerError::StaleLease)?;
-        if attempts >= MAX_POLICY_ATTEMPTS {
+        if lease.attempts >= MAX_POLICY_ATTEMPTS {
             let changed = self.store.connection_mut().execute(
                 "UPDATE skill_decision_jobs
                  SET completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
                      last_error_code = ?
                  WHERE decision_id = ? AND lease_owner = ?
+                   AND attempts = ? AND lease_expires_at = ?
                    AND completed_at IS NULL AND lease_expires_at > ?",
-                params![now, error_code, decision_id, owner, now],
+                params![
+                    now,
+                    error_code,
+                    lease.decision_id,
+                    owner,
+                    lease.attempts,
+                    lease.lease_expires_at,
+                    now
+                ],
             )?;
             return if changed == 1 {
                 Ok(RetryOutcome::DeadLettered)
@@ -195,8 +206,7 @@ impl<'a> PolicyScheduler<'a> {
                 Err(SchedulerError::StaleLease)
             };
         }
-        let exponent = u32::try_from(attempts.saturating_sub(1).min(30))
-            .map_err(|_| SchedulerError::InvalidLease)?;
+        let exponent = lease.attempts.saturating_sub(1).min(30);
         let delay = base_backoff_seconds
             .saturating_mul(2i64.saturating_pow(exponent))
             .min(max_backoff_seconds);
@@ -206,8 +216,17 @@ impl<'a> PolicyScheduler<'a> {
              SET due_at = ?, lease_owner = NULL, lease_expires_at = NULL,
                  last_error_code = ?
              WHERE decision_id = ? AND lease_owner = ?
+               AND attempts = ? AND lease_expires_at = ?
                AND completed_at IS NULL AND lease_expires_at > ?",
-            params![due_at, error_code, decision_id, owner, now],
+            params![
+                due_at,
+                error_code,
+                lease.decision_id,
+                owner,
+                lease.attempts,
+                lease.lease_expires_at,
+                now
+            ],
         )?;
         if changed == 1 {
             Ok(RetryOutcome::Scheduled(due_at))
@@ -231,10 +250,10 @@ impl<'a> PolicyScheduler<'a> {
             return Ok(false);
         };
         match dispatch(&lease) {
-            Ok(()) => self.complete(&lease.decision_id, owner, now)?,
+            Ok(()) => self.complete(&lease, owner, now)?,
             Err(error_code) => {
                 self.retry(
-                    &lease.decision_id,
+                    &lease,
                     owner,
                     now,
                     base_backoff_seconds,

@@ -39,6 +39,10 @@ document as a description of running behaviour requires the following correction
   production build. The `skill_decision_jobs` table it leases is still created by the schema
   migrations and stays empty; a held automatic quarantine is logged and dropped rather than
   queued.
+  Its tested lease contract binds completion and retry (including dead-lettering) to the
+  decision, owner, attempt generation, and issued expiry. Reusing an owner name cannot let an
+  older callback settle a newer lease. Invalid or exhausted attempt counters fail before any
+  durable lease fields change; store reopen preserves outstanding leases and completed decisions.
 - **Automatic quarantine** *is* wired, on the telemetry ingestion path, together with the
   index-rebuild and retention-compaction background work.
 
