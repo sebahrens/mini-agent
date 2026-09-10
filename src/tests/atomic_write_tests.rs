@@ -310,37 +310,59 @@ async fn atomic_write_security_concurrent_writers_publish_only_complete_values()
 }
 
 #[tokio::test]
-async fn atomic_write_cancellation_serializes_with_final_publication() {
-    let dir = TempDir::new("cancel_publication_gate");
-    let target = dir.join("target.txt");
-    let parent = crate::fs::checked_path_metadata(dir.path()).unwrap();
-    let (cancellation, probe) = AtomicWriteCancellation::with_publication_probe_for_test();
-    let writer_cancellation = cancellation.clone();
-    let writer_target = target.clone();
-    let writer = tokio::spawn(async move {
-        atomic_create_resolved_checked_cancellable(
-            writer_target,
-            b"must-not-publish",
-            parent,
-            writer_cancellation,
-        )
-        .await
-    });
-
-    let reached = probe.clone();
-    tokio::task::spawn_blocking(move || reached.wait_until_reached())
-        .await
-        .unwrap();
-    cancellation.cancel();
-    probe.resume();
-
-    let error = writer.await.unwrap().unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-    assert!(
-        !target.exists(),
-        "cancelled writer published after its gate"
-    );
-    assert_eq!(temp_residue(dir.path()), 0);
+async fn atomic_write_cancellation_before_and_after_publication_preserves_the_decision() {
+    for publication_started in [false, true] {
+        let dir = TempDir::new("cancel_publication_gate");
+        let target = dir.join("target.txt");
+        let parent = crate::fs::checked_path_metadata(dir.path()).unwrap();
+        let (cancellation, probe) = if publication_started {
+            AtomicWriteCancellation::with_blocking_publication_probe_for_test()
+        } else {
+            AtomicWriteCancellation::with_publication_probe_for_test()
+        };
+        let writer_cancellation = cancellation.clone();
+        let writer_target = target.clone();
+        let writer = tokio::spawn(async move {
+            atomic_create_resolved_checked_cancellable(
+                writer_target,
+                b"complete publication",
+                parent,
+                writer_cancellation,
+            )
+            .await
+        });
+        let reached = probe.clone();
+        tokio::task::spawn_blocking(move || reached.wait_until_reached())
+            .await
+            .unwrap();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            cancellation.cancel();
+            let _ = cancelled_tx.send(());
+        });
+        let observation = cancelled_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let published_while_paused = target.exists();
+        // Release and settle first, including when testing a blocking cancel
+        // regression. Assertions must never strand a writer at its checkpoint.
+        probe.resume();
+        let result = writer.await;
+        let cancellation_result = cancel.join();
+        observation.expect("cancellation waited for the writer's publication");
+        cancellation_result.unwrap();
+        assert!(!published_while_paused);
+        let result = result.unwrap();
+        if publication_started {
+            result.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"complete publication");
+        } else {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+            assert!(
+                !target.exists(),
+                "cancelled writer published after its gate"
+            );
+        }
+        assert_eq!(temp_residue(dir.path()), 0);
+    }
 }
 
 #[cfg(windows)]
@@ -572,48 +594,6 @@ async fn windows_atomic_creation_ignores_swapped_parent_and_retained_attacker_ha
         std::fs::read(moved_approved_path.join("target.txt")).unwrap(),
         b"approved-directory-only"
     );
-}
-
-#[tokio::test]
-async fn atomic_write_cancellation_does_not_wait_for_approved_publication() {
-    let dir = TempDir::new("cancel_after_publication_decision");
-    let target = dir.join("target.txt");
-    let parent = crate::fs::checked_path_metadata(dir.path()).unwrap();
-    let (cancellation, probe) = AtomicWriteCancellation::with_blocking_publication_probe_for_test();
-    let writer_cancellation = cancellation.clone();
-    let writer_target = target.clone();
-    let writer = tokio::spawn(async move {
-        atomic_create_resolved_checked_cancellable(
-            writer_target,
-            b"approved-before-cancel",
-            parent,
-            writer_cancellation,
-        )
-        .await
-    });
-
-    let reached = probe.clone();
-    tokio::task::spawn_blocking(move || reached.wait_until_reached())
-        .await
-        .unwrap();
-    let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        cancellation.cancel();
-        let _ = cancelled_tx.send(());
-    });
-    cancelled_rx
-        .recv_timeout(std::time::Duration::from_millis(100))
-        .expect("cancellation waited for an already-approved publication");
-    assert!(!target.exists(), "publication probe resumed unexpectedly");
-
-    probe.resume();
-    writer.await.unwrap().unwrap();
-    assert_eq!(
-        std::fs::read(&target).unwrap(),
-        b"approved-before-cancel",
-        "already-approved publication did not finish"
-    );
-    assert_eq!(temp_residue(dir.path()), 0);
 }
 
 /// The core guarantee: while one writer repeatedly replaces a file, a separate

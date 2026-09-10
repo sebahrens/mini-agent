@@ -599,6 +599,7 @@ impl PermissionChecker {
 
     /// Evaluate policy against a compatibility rendering while keeping a
     /// separate, reversible identity for session approval and doom-loop state.
+    #[cfg(feature = "js")]
     pub(crate) fn check_with_identity(
         &mut self,
         tool: &str,

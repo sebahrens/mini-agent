@@ -95,6 +95,15 @@ A shell resolved solely for validation stays unavailable to ordinary commands
 and `!` interactions; only the validator's private sandbox clone may use it.
 Workspace rebinding preserves that restriction and revalidates the shell identity.
 
+JS-only audit ownership and permission-identity adapters compile with their
+consumers; global path-ownership tests retain the audit namespace contract.
+The macOS worker's volume/file identity helpers are separate from the general
+filesystem identity checks, which remain available without JS. Atomic writes
+retain their publication decision on every build; JS cancellation adapters and
+Windows retry signals compile only where used. Publication tests cover both
+sides of the cancellation decision in one matrix, release and join workers
+before assertions, and bound checkpoint observation and release waits.
+
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher
 closes its temporary workspace-authority descriptor inside the namespace before the model's shell

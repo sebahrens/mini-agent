@@ -1267,12 +1267,14 @@ pub struct AppPaths {
 ///
 /// Callers receive only fixed child paths below the resolved state root; effect metadata can never
 /// influence an audit filename or redirect the writer into the workspace.
+#[cfg(any(feature = "js", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectAuditPathOwner {
     state_root: PathBuf,
     directory: PathBuf,
 }
 
+#[cfg(any(feature = "js", test))]
 impl EffectAuditPathOwner {
     pub fn state_root(&self) -> PathBuf {
         self.state_root.clone()
@@ -1294,6 +1296,7 @@ impl EffectAuditPathOwner {
         self.state_root.join("js-effect-audit-v1.initialized")
     }
 
+    #[cfg(feature = "js")]
     pub(crate) fn segment_file(&self, index: u64) -> PathBuf {
         self.directory.join(format!("segment-{index:020}.audit"))
     }
@@ -1581,6 +1584,7 @@ impl AppPaths {
         self.state_dir.join("migrations").join("v1")
     }
 
+    #[cfg(any(feature = "js", test))]
     pub fn effect_audit(&self) -> EffectAuditPathOwner {
         EffectAuditPathOwner {
             state_root: self.state_dir.clone(),

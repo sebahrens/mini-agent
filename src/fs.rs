@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
+
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 
 mod private;
 
@@ -105,7 +108,7 @@ pub(crate) struct WindowsFileIdentity {
     pub(crate) file_id: [u8; 16],
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "js"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MacOsFileIdentity {
     pub(crate) volume_uuid: [u8; 16],
@@ -241,7 +244,7 @@ where
     parse_macos_real_file_identity(&buffer)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "js"))]
 #[allow(unsafe_code)]
 fn macos_common_attribute<T, const N: usize>(
     file: &T,
@@ -297,7 +300,7 @@ where
     Ok(buffer[size_of::<u32>()..].try_into().unwrap())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "js"))]
 #[allow(unsafe_code)]
 fn macos_volume_uuid<T>(file: &T) -> std::io::Result<[u8; 16]>
 where
@@ -370,7 +373,7 @@ where
     Ok(buffer[size_of::<u32>()..].try_into().unwrap())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "js"))]
 pub(crate) fn macos_file_identity<T>(file: &T) -> std::io::Result<MacOsFileIdentity>
 where
     T: std::os::fd::AsRawFd,
@@ -776,6 +779,7 @@ fn path_changed_error(path: &Path) -> std::io::Error {
     )
 }
 
+#[cfg(any(feature = "js", test))]
 pub(crate) fn is_path_changed_error(error: &std::io::Error) -> bool {
     error
         .get_ref()
@@ -825,6 +829,7 @@ const ATOMIC_WRITE_FINISHED: u8 = 3;
 #[derive(Debug, Default)]
 struct AtomicWriteCancellationState {
     publication: AtomicU8,
+    #[cfg(windows)]
     cancel_requested: AtomicBool,
     #[cfg(test)]
     publication_probe: Option<AtomicWritePublicationProbe>,
@@ -836,9 +841,15 @@ pub(crate) struct AtomicWriteCancellation(Arc<AtomicWriteCancellationState>);
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct AtomicWritePublicationProbe {
-    reached: Arc<std::sync::Barrier>,
-    resume: Arc<std::sync::Barrier>,
+    state: Arc<(std::sync::Mutex<AtomicWriteProbeState>, std::sync::Condvar)>,
     point: AtomicWriteProbePoint,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AtomicWriteProbeState {
+    reached: bool,
+    resumed: bool,
 }
 
 #[cfg(test)]
@@ -852,17 +863,56 @@ enum AtomicWriteProbePoint {
 
 #[cfg(test)]
 impl AtomicWritePublicationProbe {
+    const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
     pub(crate) fn wait_until_reached(&self) {
-        self.reached.wait();
+        let (state, changed) = &*self.state;
+        let (mut state, _) = changed
+            .wait_timeout_while(state.lock().unwrap(), Self::WAIT_LIMIT, |state| {
+                !state.reached
+            })
+            .unwrap();
+        let reached = state.reached;
+        if !reached {
+            // If the writer arrives late, it must not become stranded while
+            // the test reports the missing checkpoint.
+            state.resumed = true;
+            changed.notify_all();
+        }
+        drop(state);
+        assert!(
+            reached,
+            "writer did not reach the atomic publication checkpoint"
+        );
     }
 
     pub(crate) fn resume(&self) {
-        self.resume.wait();
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().resumed = true;
+        changed.notify_all();
+    }
+
+    fn pause(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.reached = true;
+        changed.notify_all();
+        let (state, _) = changed
+            .wait_timeout_while(state, Self::WAIT_LIMIT, |state| !state.resumed)
+            .unwrap();
+        let resumed = state.resumed;
+        drop(state);
+        assert!(
+            resumed,
+            "test did not release the atomic publication checkpoint"
+        );
     }
 }
 
 impl AtomicWriteCancellation {
+    #[cfg(any(feature = "js", test))]
     pub(crate) fn cancel(&self) {
+        #[cfg(windows)]
         self.0.cancel_requested.store(true, Ordering::Release);
         let _ = self.0.publication.compare_exchange(
             ATOMIC_WRITE_ACTIVE,
@@ -896,8 +946,7 @@ impl AtomicWriteCancellation {
         if let Some(probe) = &self.0.publication_probe
             && probe.point == AtomicWriteProbePoint::BeforeTempCreation
         {
-            probe.reached.wait();
-            probe.resume.wait();
+            probe.pause();
         }
     }
 
@@ -906,8 +955,7 @@ impl AtomicWriteCancellation {
         if let Some(probe) = &self.0.publication_probe
             && probe.point == AtomicWriteProbePoint::BeforeDecision
         {
-            probe.reached.wait();
-            probe.resume.wait();
+            probe.pause();
         }
         self.0
             .publication
@@ -927,8 +975,7 @@ impl AtomicWriteCancellation {
         if let Some(probe) = &self.0.publication_probe
             && probe.point == AtomicWriteProbePoint::AfterDecision
         {
-            probe.reached.wait();
-            probe.resume.wait();
+            probe.pause();
         }
         // CAS is the publication-start decision. Cancellation never waits for OS I/O: if it wins,
         // this operation cannot begin; if publication wins, the already-approved syscall may
@@ -943,12 +990,12 @@ impl AtomicWriteCancellation {
     #[cfg(all(test, windows))]
     pub(crate) fn with_temp_creation_probe_for_test() -> (Self, AtomicWritePublicationProbe) {
         let probe = AtomicWritePublicationProbe {
-            reached: Arc::new(std::sync::Barrier::new(2)),
-            resume: Arc::new(std::sync::Barrier::new(2)),
+            state: Default::default(),
             point: AtomicWriteProbePoint::BeforeTempCreation,
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            #[cfg(windows)]
             cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
@@ -958,12 +1005,12 @@ impl AtomicWriteCancellation {
     #[cfg(test)]
     pub(crate) fn with_publication_probe_for_test() -> (Self, AtomicWritePublicationProbe) {
         let probe = AtomicWritePublicationProbe {
-            reached: Arc::new(std::sync::Barrier::new(2)),
-            resume: Arc::new(std::sync::Barrier::new(2)),
+            state: Default::default(),
             point: AtomicWriteProbePoint::BeforeDecision,
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            #[cfg(windows)]
             cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
@@ -974,12 +1021,12 @@ impl AtomicWriteCancellation {
     pub(crate) fn with_blocking_publication_probe_for_test() -> (Self, AtomicWritePublicationProbe)
     {
         let probe = AtomicWritePublicationProbe {
-            reached: Arc::new(std::sync::Barrier::new(2)),
-            resume: Arc::new(std::sync::Barrier::new(2)),
+            state: Default::default(),
             point: AtomicWriteProbePoint::AfterDecision,
         };
         let cancellation = Self(Arc::new(AtomicWriteCancellationState {
             publication: AtomicU8::new(ATOMIC_WRITE_ACTIVE),
+            #[cfg(windows)]
             cancel_requested: AtomicBool::new(false),
             publication_probe: Some(probe.clone()),
         }));
@@ -1113,6 +1160,7 @@ pub(crate) async fn atomic_write_resolved_expecting(
     .await
 }
 
+#[cfg(any(feature = "js", all(test, windows)))]
 pub(crate) async fn atomic_write_resolved_checked_cancellable(
     path: impl AsRef<Path>,
     contents: impl AsRef<[u8]>,
