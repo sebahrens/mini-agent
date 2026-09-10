@@ -995,6 +995,15 @@ general-command sandbox, whose own native gate passed independently in the same 
 
 ## Failure semantics
 
+The pending-permission deadline regression waits for a native worker's held
+effect before advancing the invocation timer. It observes cancellation while
+the effect remains held, releases the effect to finish its drain, and requires
+`PermissionPromptTimedOut`. Recovery runs on a fresh clock and must launch one
+replacement worker. The fixture directly owns its invocation future and settles
+the supervisor and native launch owner on every exit; failure controls cover the
+pending effect, cancellation drain, and recovered worker. It reuses the shared
+launch owner rather than duplicating launch lifecycle controls.
+
 Every production failure uses a closed sanitized diagnostic contract. `class` is one of `syntax`,
 `javascript_exception`, `promise_rejection`, `host`, `permission`, `validation`, `timeout`,
 `cancelled`, `out_of_memory`, `pending_job_limit`, `protocol`, `containment`, `audit`, or

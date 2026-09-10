@@ -2525,52 +2525,116 @@ async fn worker_supervisor_recovery_crash_while_effect_pending_cancels_handler()
     launcher.wait_for_live_processes(0).await;
 }
 
-#[tokio::test]
-async fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
-    let (supervisor, launcher) =
-        recovery_supervisor(TestSupervisorStartup::Healthy, Duration::from_secs(1));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionDeadlineFault {
+    Pending,
+    Cancelling,
+    Recovered,
+}
+
+fn exercise_permission_deadline(fault: Option<PermissionDeadlineFault>) {
+    let trace = Arc::new(LaunchTrace::default());
+    let launch = LaunchFixtureOwner(trace.clone());
+    launch.release();
+    let supervisor = JsWorkerSupervisor::with_launcher_and_watchdog_for_test(
+        BlockedFirstLaunchLauncher(trace.clone()),
+        LAUNCH_TEST_WATCHDOG,
+    );
     let gated = GatedEffects::new();
-    let cancellation = PermCancellation::new();
-    let _permission_prompt = cancellation.begin_permission_prompt();
-    let task_supervisor = supervisor.clone();
-    let task_effects = gated.clone();
-    let task = tokio::spawn(async move {
-        task_supervisor
-            .execute(
+    let inject = |at| {
+        if fault == Some(at) {
+            std::panic::panic_any(at);
+        }
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        launch_test_runtime().block_on(async {
+            let cancellation = PermCancellation::new();
+            let _permission_prompt = cancellation.begin_permission_prompt();
+            // Direct ownership drops the invocation on every failed assertion,
+            // before unconditional shutdown settles native launch/worker work.
+            let request = supervisor.execute(
                 RunStep::new("effect-pending".into()),
-                task_effects,
+                gated.clone(),
                 cancellation,
-            )
-            .await
-    });
+            );
+            tokio::pin!(request);
+            tokio::select! {
+                result = &mut request => panic!("invocation settled before pending permission readiness: {result:?}"),
+                () = gated.wait_started() => {}
+            }
+            let effect_cancellation = gated.cancellation.lock().unwrap().clone().unwrap();
+            assert!(!effect_cancellation.is_cancelled());
+            assert_eq!(*gated.ordinals.lock().unwrap(), vec![0]);
+            assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
+            inject(PermissionDeadlineFault::Pending);
 
-    gated.wait_started().await;
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+            // Native startup is complete. Cross the invocation's actual Tokio
+            // deadline, then poll its cancellation/drain path with the effect
+            // still held. Resume time before any native process settlement.
+            tokio::time::pause();
+            tokio::time::advance(LAUNCH_TEST_WATCHDOG + Duration::from_secs(1)).await;
+            let pending = futures::poll!(&mut request).is_pending();
+            tokio::time::resume();
+            assert!(pending, "deadline must first drain the held effect");
+            assert!(effect_cancellation.is_cancelled(), "deadline did not cancel the pending effect");
+            assert!(!gated.dropped.load(Ordering::Acquire), "effect was dropped before its cancellation drain");
+            inject(PermissionDeadlineFault::Cancelling);
+            gated.release();
+            assert_eq!(
+                tokio::time::timeout(LAUNCH_FIXTURE_GUARD, request)
+                    .await
+                    .expect("permission wait escaped the invocation deadline"),
+                Err(WorkerError::PermissionPromptTimedOut)
+            );
+            assert!(!gated.dropped.load(Ordering::Acquire));
+            assert_eq!(trace.live_processes.load(Ordering::Acquire), 0);
+        });
+        // A fresh clock gives recovery its own whole-call deadline; the prior
+        // runtime's virtual time must not expire a newly launched native child.
+        launch_test_runtime().block_on(async {
+            assert_eq!(
+                execute_success(&supervisor).await.outcome,
+                StepOutcome::Value("success".into())
+            );
+            assert_eq!(trace.launches.load(Ordering::Acquire), 2);
+            assert_eq!(trace.live_processes.load(Ordering::Acquire), 1);
+            assert_eq!(trace.max_live_processes.load(Ordering::Acquire), 1);
+            inject(PermissionDeadlineFault::Recovered);
+        });
+    }));
     gated.release();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .expect("permission wait escaped the invocation deadline")
-            .unwrap(),
-        Err(WorkerError::PermissionPromptTimedOut)
-    );
+    let shutdown = launch_test_runtime().block_on(supervisor.shutdown());
+    let quiescent = launch.wait_for_quiescence();
+    shutdown.unwrap();
     assert!(
-        gated
-            .cancellation
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .is_cancelled()
+        quiescent,
+        "permission deadline fixture left a launch or worker live"
     );
+    assert!(!trace.gate.lock().unwrap().rescued);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
 
-    assert_eq!(
-        execute_success(&supervisor).await.outcome,
-        StepOutcome::Value("success".into())
-    );
-    launcher.wait_for_live_processes(1).await;
-    supervisor.shutdown_for_test().await.unwrap();
-    launcher.wait_for_live_processes(0).await;
+#[test]
+fn worker_supervisor_attributes_deadline_to_pending_permission_prompt() {
+    exercise_permission_deadline(None);
+}
+
+#[test]
+fn worker_supervisor_permission_deadline_fixture_settles_after_failures() {
+    for fault in [
+        PermissionDeadlineFault::Pending,
+        PermissionDeadlineFault::Cancelling,
+        PermissionDeadlineFault::Recovered,
+    ] {
+        let result = std::panic::catch_unwind(|| exercise_permission_deadline(Some(fault)))
+            .expect_err("injected permission deadline failure must propagate after cleanup");
+        assert_eq!(
+            result.downcast_ref::<PermissionDeadlineFault>(),
+            Some(&fault)
+        );
+    }
 }
 
 #[tokio::test]
