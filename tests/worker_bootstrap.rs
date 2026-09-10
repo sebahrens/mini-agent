@@ -8,6 +8,21 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::fs::File;
 
+/// Feeds a worker that is expected to reject its stdio and exit immediately.
+///
+/// The rejection races these writes, so a broken pipe here is the behaviour
+/// under test rather than a failure: the worker exited before it drained the
+/// frame. Every other error still fails. Each caller's assertion on the exit
+/// status is what actually decides the test.
+#[cfg(unix)]
+fn write_tolerating_rejection<W: Write>(writer: &mut W, frame: &[u8]) {
+    match writer.write_all(frame) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("unexpected worker stdin failure: {error}"),
+    }
+}
+
 const MARKER: &str = "MINI_AGENT_INTERNAL_JS_WORKER";
 const MARKER_VALUE: &str = "brokered-v1";
 static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -110,7 +125,7 @@ fn worker_bootstrap_production_main_rejects_malformed_hello_without_fallthrough(
     let _serial = serial_worker_test();
     let mut child = worker_command(MARKER_VALUE).spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
-    input.write_all(b"forged-worker-input").unwrap();
+    write_tolerating_rejection(&mut input, b"forged-worker-input");
     drop(input);
 
     let status = wait_bounded(&mut child);
@@ -142,8 +157,8 @@ fn worker_bootstrap_production_main_rejects_regular_file_stdio() {
     let output_path = base.with_extension("stdout");
     let error_path = base.with_extension("stderr");
     let mut input = File::create(&input_path).unwrap();
-    input.write_all(&hello()).unwrap();
-    input.write_all(&shutdown()).unwrap();
+    write_tolerating_rejection(&mut input, &hello());
+    write_tolerating_rejection(&mut input, &shutdown());
     drop(input);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_mini-agent"));
@@ -172,8 +187,8 @@ fn worker_bootstrap_production_main_rejects_null_stdout() {
     command.stdout(File::options().write(true).open("/dev/null").unwrap());
     let mut child = command.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
-    input.write_all(&hello()).unwrap();
-    input.write_all(&shutdown()).unwrap();
+    write_tolerating_rejection(&mut input, &hello());
+    write_tolerating_rejection(&mut input, &shutdown());
     drop(input);
 
     let status = wait_bounded(&mut child);
@@ -190,8 +205,8 @@ fn worker_bootstrap_production_main_rejects_regular_file_stderr() {
     command.stderr(File::create(&error_path).unwrap());
     let mut child = command.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
-    input.write_all(&hello()).unwrap();
-    input.write_all(&shutdown()).unwrap();
+    write_tolerating_rejection(&mut input, &hello());
+    write_tolerating_rejection(&mut input, &shutdown());
     drop(input);
 
     let status = wait_bounded(&mut child);
@@ -221,8 +236,8 @@ fn worker_bootstrap_production_main_rejects_socket_stdio() {
         .stdout(Stdio::from(child_output));
     let mut child = command.spawn().unwrap();
     let mut parent_input = parent_input;
-    parent_input.write_all(&hello()).unwrap();
-    parent_input.write_all(&shutdown()).unwrap();
+    write_tolerating_rejection(&mut parent_input, &hello());
+    write_tolerating_rejection(&mut parent_input, &shutdown());
     drop(parent_input);
 
     let status = wait_bounded(&mut child);
