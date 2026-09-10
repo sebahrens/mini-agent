@@ -57,6 +57,17 @@ fn snapshot(pid: u32) -> io::Result<Option<Snapshot>> {
 
 #[cfg(target_os = "linux")]
 fn snapshot_from_stat(pid: u32, read: io::Result<String>) -> io::Result<Option<Snapshot>> {
+    snapshot_from_stat_with_probe(pid, read, || {
+        std::fs::metadata(format!("/proc/{pid}")).map(|_| ())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_from_stat_with_probe(
+    pid: u32,
+    read: io::Result<String>,
+    probe: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Option<Snapshot>> {
     match read {
         Ok(stat) => match parse_stat(pid, &stat) {
             Ok(snapshot) => Ok(Some(snapshot)),
@@ -66,13 +77,16 @@ fn snapshot_from_stat(pid: u32, read: io::Result<String>) -> io::Result<Option<S
             // gone, which is evidence of exit rather than an unavailable
             // observation; a malformed stat for a process that still exists
             // stays an error.
-            Err(error) => {
-                if std::fs::metadata(format!("/proc/{pid}")).is_err() {
+            Err(error) => match probe() {
+                Ok(()) => Err(error),
+                Err(probe_error)
+                    if probe_error.kind() == io::ErrorKind::NotFound
+                        || probe_error.raw_os_error() == Some(libc::ESRCH) =>
+                {
                     Ok(None)
-                } else {
-                    Err(error)
                 }
-            }
+                Err(probe_error) => Err(probe_error),
+            },
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         // read_to_string opens and then reads. A task that exits in between
@@ -223,6 +237,14 @@ fn owned_process_observation_distinguishes_live_zombie_reaped_and_replaced() {
     // descriptor after reaping reproduces the open/read race deterministically.
     #[cfg(target_os = "linux")]
     let mut opened_stat = std::fs::File::open(format!("/proc/{}/stat", child.0.id())).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        snapshot_from_stat(child.0.id(), Ok(String::new()))
+            .err()
+            .expect("malformed stat for a live child became disappearance")
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
     child.0.kill().unwrap();
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
     // SAFETY: this is our unreaped child. WNOWAIT establishes its exit without
@@ -250,6 +272,12 @@ fn owned_process_observation_distinguishes_live_zombie_reaped_and_replaced() {
         let read = opened_stat.read_to_string(&mut stat).map(|_| stat);
         assert_eq!(read.as_ref().unwrap_err().raw_os_error(), Some(libc::ESRCH));
         assert!(snapshot_from_stat(child.0.id(), read).unwrap().is_none());
+        // Model the short-read variant at the same real, reaped-child boundary.
+        assert!(
+            snapshot_from_stat(child.0.id(), Ok(String::new()))
+                .unwrap()
+                .is_none()
+        );
     }
     assert_eq!(identity.state().unwrap(), ProcessState::Gone);
     assert!(ProcessIdentity::capture(child.0.id()).is_err());
@@ -258,6 +286,8 @@ fn owned_process_observation_distinguishes_live_zombie_reaped_and_replaced() {
 #[cfg(target_os = "linux")]
 #[test]
 fn process_stat_reads_preserve_identity_and_observation_errors() {
+    let no_probe =
+        || -> io::Result<()> { panic!("a valid stat or read error must not probe metadata") };
     let stat = |state: &str| {
         format!(
             "41 (name with ) spaces) {state} 12 41 {} 987 0",
@@ -265,7 +295,9 @@ fn process_stat_reads_preserve_identity_and_observation_errors() {
         )
     };
     for state in ["R", "S", "D", "T", "t", "W", "K", "P", "I"] {
-        let snapshot = snapshot_from_stat(41, Ok(stat(state))).unwrap().unwrap();
+        let snapshot = snapshot_from_stat_with_probe(41, Ok(stat(state)), no_probe)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.started, Some((987, 0)));
         assert!(matches!(
             snapshot.state,
@@ -278,7 +310,7 @@ fn process_stat_reads_preserve_identity_and_observation_errors() {
     }
     for state in ["Z", "X", "x"] {
         assert_eq!(
-            snapshot_from_stat(41, Ok(stat(state)))
+            snapshot_from_stat_with_probe(41, Ok(stat(state)), no_probe)
                 .unwrap()
                 .unwrap()
                 .state,
@@ -290,18 +322,46 @@ fn process_stat_reads_preserve_identity_and_observation_errors() {
         stat("S").replace("987", "bad"),
         "41 (short) S".into(),
     ] {
-        assert!(snapshot_from_stat(41, Ok(invalid)).is_err());
+        assert_eq!(
+            snapshot_from_stat_with_probe(41, Ok(invalid), || Ok(()))
+                .err()
+                .expect("malformed stat for an existing process must fail")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
-    assert!(snapshot_from_stat(42, Ok(stat("S"))).is_err());
+    assert!(snapshot_from_stat_with_probe(42, Ok(stat("S")), || Ok(())).is_err());
     for number in [libc::EACCES, libc::EIO, libc::EINTR] {
-        let error = snapshot_from_stat(41, Err(io::Error::from_raw_os_error(number)))
-            .err()
-            .expect("an unavailable observation became process disappearance");
+        let error =
+            snapshot_from_stat_with_probe(41, Err(io::Error::from_raw_os_error(number)), no_probe)
+                .err()
+                .expect("an unavailable observation became process disappearance");
+        assert_eq!(error.raw_os_error(), Some(number));
+        let error = snapshot_from_stat_with_probe(41, Ok(String::new()), || {
+            Err(io::Error::from_raw_os_error(number))
+        })
+        .err()
+        .expect("an unavailable metadata observation became process disappearance");
         assert_eq!(error.raw_os_error(), Some(number));
     }
-    let error = snapshot_from_stat(
+    for number in [libc::ENOENT, libc::ESRCH] {
+        assert!(
+            snapshot_from_stat_with_probe(41, Ok(String::new()), || {
+                Err(io::Error::from_raw_os_error(number))
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            snapshot_from_stat_with_probe(41, Err(io::Error::from_raw_os_error(number)), no_probe,)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let error = snapshot_from_stat_with_probe(
         41,
         Err(io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 stat")),
+        no_probe,
     )
     .err()
     .expect("invalid stat data became process disappearance");

@@ -109,10 +109,15 @@ FIFO permits fixture cleanup after a failed assertion, and cleanup drains the
 prompt work scope before propagating the failure. Native controls cover live,
 unreaped-zombie, reaped, and mismatched-identity observations. The Linux control
 also holds an open proc stat file through task reaping to reproduce the real `ESRCH`
-read failure. Missing paths and this vanished-task read become `Gone`; permission,
-I/O, interrupted-read, and invalid-data errors remain observation failures. The
-same read-result classifier handles real proc reads and the retained parser/error
-matrix, so the race check does not duplicate or bypass the classification logic.
+read failure. Missing paths and this vanished-task read become `Gone`. A malformed
+stat is classified as `Gone` only when the subsequent metadata probe reports
+`ENOENT` or `ESRCH`; an existing entry preserves the parse error, and permission,
+I/O, or interrupted metadata probes remain observation failures. The native
+control also supplies an empty stat while its owned child is live and after it is
+reaped, exercising both sides of the real metadata boundary. The same read-result
+classifier handles real proc reads and the retained parser/error matrix. That
+matrix supplies explicit metadata outcomes instead of depending on unrelated host
+PIDs, and verifies that valid stats and read failures never invoke the probe.
 
 Async-hook scope cancellation reuses the same Linux/macOS process-identity
 observer. The dispatcher fixture captures a complete newline-terminated PID
