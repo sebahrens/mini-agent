@@ -7,6 +7,7 @@ pub struct StatusSignals {
 }
 
 impl StatusSignals {
+    #[cfg(any(feature = "status-signals", all(test, unix)))]
     pub fn new(path: String) -> Self {
         Self { path }
     }
@@ -27,7 +28,7 @@ impl StatusSignals {
     #[cfg(not(unix))]
     pub fn send_stop(&self) {}
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(feature = "git-worktree", test)))]
     pub fn send_git_conflict(&self) {
         self.send(b"git-conflict\n");
     }
@@ -47,6 +48,6 @@ impl StatusSignals {
         })();
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), feature = "git-worktree"))]
     pub fn send_git_conflict(&self) {}
 }

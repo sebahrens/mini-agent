@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -111,6 +112,7 @@ pub(crate) struct ShellCapability {
     dialect: ShellDialect,
     command_arg: &'static str,
     identity: crate::fs::CheckedMetadata,
+    #[cfg(any(feature = "git-worktree", test))]
     workspace_relative_config: Option<String>,
 }
 
@@ -148,6 +150,7 @@ impl ShellCapability {
         if !identity.is_file() {
             return None;
         }
+        #[cfg(any(feature = "git-worktree", test))]
         let workspace_relative_config = (!configured_path.is_absolute()
             && configured_path.components().count() > 1)
             .then(|| configured.to_string());
@@ -156,6 +159,7 @@ impl ShellCapability {
             dialect,
             command_arg: dialect.command_arg(),
             identity,
+            #[cfg(any(feature = "git-worktree", test))]
             workspace_relative_config,
         })
     }
@@ -164,7 +168,7 @@ impl ShellCapability {
         &self.executable
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "js"))]
     pub(crate) fn for_test(executable: &Path, dialect: ShellDialect) -> Self {
         let executable = executable.canonicalize().unwrap();
         #[cfg(windows)]
@@ -202,6 +206,7 @@ impl ShellCapability {
             .map_err(|_| "configured shell executable identity changed".to_string())
     }
 
+    #[cfg(any(feature = "git-worktree", test))]
     fn rebind_workspace(&self, workspace: &Path) -> Result<Self, String> {
         let Some(configured) = &self.workspace_relative_config else {
             return Ok(self.clone());
@@ -1298,6 +1303,7 @@ impl Sandbox {
 
     /// Whether this sandbox owns the complete descendant lifetime independently of process-group
     /// membership. JS spawn authority is issued only when this stronger boundary is available.
+    #[cfg(any(feature = "js", test))]
     pub(crate) fn owns_complete_process_tree(&self) -> bool {
         #[cfg(test)]
         if self.complete_process_tree_for_test {
@@ -1485,6 +1491,7 @@ impl Sandbox {
     /// Rebind an explicit workspace transition. Workspace-relative shell
     /// configuration is re-resolved before the caller publishes any new
     /// workspace state; absolute and PATH-resolved capabilities stay pinned.
+    #[cfg(any(feature = "git-worktree", test))]
     pub(crate) fn rebind_workspace_binding(
         mut self,
         workspace: Arc<crate::paths::WorkspaceBinding>,
@@ -1904,6 +1911,7 @@ impl Sandbox {
     /// such as MCP stdio or LSP servers, not for the broker-only JS worker
     /// profile.
     /// The supplied environment is the complete delegated environment.
+    #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
     pub(crate) fn wrap_workspace_service(
         &self,
         program: &Path,
@@ -2050,6 +2058,7 @@ impl Sandbox {
     /// service boundary. Windows executes a closed bounded probe because the
     /// AppContainer helper can reject a root during setup; Unix construction
     /// fully validates the selected sandbox profile without launching.
+    #[cfg(feature = "git-worktree")]
     pub(crate) fn verify_workspace_service_capability(
         &self,
         program: &Path,
@@ -2614,6 +2623,7 @@ impl Sandbox {
         })
     }
 
+    #[cfg(any(feature = "git-worktree", test))]
     pub(crate) async fn output_built_command_with_input_and_limits(
         &self,
         cmd: Command,

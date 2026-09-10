@@ -125,6 +125,7 @@ struct HookOneShot {
 impl PermissionChecker {
     /// Rebind relative path authorization to an explicitly selected workspace.
     /// Worktree switching uses this instead of mutating process-global CWD.
+    #[cfg(any(feature = "git-worktree", test))]
     pub(crate) fn rebind_working_dir(&mut self, working_dir: &Path) -> anyhow::Result<()> {
         let (canonical, plan_write_root) = canonical_working_dir(working_dir)?;
         self.working_dir = canonical.to_string_lossy().into_owned();

@@ -215,6 +215,7 @@ impl WorkspaceBinding {
 
     /// Replace a workspace file whose contents the caller does not claim to have
     /// based its replacement on. Only inode identity is enforced.
+    #[cfg(any(feature = "js", test))]
     pub(crate) fn replace_relative_atomic(
         &self,
         path: &Path,

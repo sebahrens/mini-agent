@@ -104,6 +104,14 @@ Windows retry signals compile only where used. Publication tests cover both
 sides of the cancellation decision in one matrix, release and join workers
 before assertions, and bound checkpoint observation and release waits.
 
+Workspace rebinding and its retained relative shell configuration compile for
+`git-worktree` and native tests. The direct workspace service adapter follows
+its MCP, LSP, and Git consumers; the Git capability probe and explicit-stdin
+adapter follow their narrower callers. Complete-descendant authority inspection
+and identity-only file replacement remain available to JS and native tests.
+Status signal construction follows `status-signals`, while conflict messages
+follow `git-worktree`; Unix protocol tests retain both adapters.
+
 Captured/model-authored commands receive null stdin when the caller supplies no explicit input;
 they cannot inherit the TTY. On Unix they start in a fresh session. The Linux `bwrap` launcher
 closes its temporary workspace-authority descriptor inside the namespace before the model's shell
