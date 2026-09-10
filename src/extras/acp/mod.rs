@@ -2576,16 +2576,6 @@ mod protocol_tests {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 
-    #[cfg(unix)]
-    fn process_exists(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
     fn canonical_tool_turn() -> Vec<Message> {
         vec![
             Message::Assistant {
@@ -3261,19 +3251,28 @@ mod protocol_tests {
             .unwrap();
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancellation_reaps_production_bash_process_tree_before_responding() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn exercise_cancellation_process_tree(fail_after_readiness: bool) {
+        use crate::tests::process_state::{ProcessGate, ProcessIdentity, ProcessState};
+        use futures::FutureExt;
         let files = ProtocolTempDir::new();
         let shell_pid_file = files.path().join("shell.pid");
         let descendant_pid_file = files.path().join("descendant.pid");
+        let release_path = files.path().join("release");
+        let mut gate = ProcessGate::new(&release_path).unwrap();
+        let scope = Arc::new(StdMutex::new(
+            None::<crate::agent::runner::AgentWorkCancellation>,
+        ));
+        let fixture_scope = scope.clone();
         let command = format!(
-            "printf '%s' \"$$\" > {}; sh -c 'printf \"%s\" \"$$\" > {}; while :; do sleep 1; done' & wait",
+            "printf '%s\\n' \"$$\" > {}; sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; IFS= read -r release < \"$2\"' sh {} {} & wait",
             shell_quote(&shell_pid_file),
             shell_quote(&descendant_pid_file),
+            shell_quote(&release_path),
         );
         let fixture: RunnerFixture = Arc::new(move |prompt, history| {
             let command = command.clone();
+            let fixture_scope = fixture_scope.clone();
             Box::pin(async move {
                 let model = rig::test_utils::MockCompletionModel::from_stream_turns(vec![vec![
                     rig::test_utils::MockStreamEvent::tool_call(
@@ -3292,7 +3291,7 @@ mod protocol_tests {
                     ))
                     .default_max_turns(2)
                     .build();
-                crate::agent::runner::spawn_agent_paused(
+                let paused = crate::agent::runner::spawn_agent_paused(
                     agent,
                     prompt,
                     history,
@@ -3302,7 +3301,9 @@ mod protocol_tests {
                     None,
                     #[cfg(feature = "hooks")]
                     None,
-                )
+                );
+                *fixture_scope.lock().unwrap() = Some(paused.cancellation_handle());
+                paused
             })
         });
         let state = runner_fixture_state(fixture);
@@ -3326,50 +3327,128 @@ mod protocol_tests {
                     .session_id;
                 let prompt_cx = cx.clone();
                 let prompt_session = session.clone();
-                let blocked = tokio::spawn(async move {
+                let mut blocked = Some(tokio::spawn(async move {
                     prompt_cx
                         .send_request(prompt(prompt_session, "run production bash"))
                         .block_task()
                         .await
-                });
-                // A file can exist before its contents are flushed, so wait for
-                // a parsable pid rather than for the path to appear.
-                let read_pid = |path: std::path::PathBuf| async move {
-                    tokio::time::timeout(Duration::from_secs(5), async {
-                        loop {
-                            if let Ok(text) = std::fs::read_to_string(&path)
-                                && let Ok(pid) = text.trim().parse::<u32>()
-                                && pid != 0
-                            {
-                                return pid;
+                }));
+                let mut observed_tree = None;
+                let result = std::panic::AssertUnwindSafe(async {
+                    // A file can exist before its contents are flushed, so wait for
+                    // a parsable pid rather than for the path to appear.
+                    let read_pid = |path: std::path::PathBuf| async move {
+                        tokio::time::timeout(Duration::from_secs(15), async {
+                            loop {
+                                if let Ok(text) = std::fs::read_to_string(&path)
+                                    && text.ends_with('\n')
+                                    && let Ok(pid) = text.trim().parse::<u32>()
+                                    && pid != 0
+                                {
+                                    return pid;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
                             }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        })
+                        .await
+                        .expect("production BashTool should publish its process tree")
+                    };
+                    let shell_pid = read_pid(shell_pid_file.clone()).await;
+                    let descendant_pid = read_pid(descendant_pid_file.clone()).await;
+
+                    let shell = ProcessIdentity::capture(shell_pid).unwrap();
+                    let descendant = ProcessIdentity::capture(descendant_pid).unwrap();
+                    observed_tree = Some((shell, descendant));
+                    if fail_after_readiness {
+                        panic!("injected after Bash process-tree readiness");
+                    }
+                    cx.send_notification(CancelNotification::new(session.clone()))?;
+                    let joined =
+                        tokio::time::timeout(Duration::from_secs(15), blocked.as_mut().unwrap())
+                            .await
+                            .expect("Bash cancellation should settle the process tree");
+                    blocked.take();
+                    let response = joined.unwrap()?;
+                    assert_eq!(response.stop_reason, StopReason::Cancelled);
+                    let shell_state = shell.state().unwrap();
+                    let descendant_state = descendant.state().unwrap();
+                    assert!(
+                        matches!(shell_state, ProcessState::Gone | ProcessState::Replaced),
+                        "Cancelled before direct Bash child was reaped: {shell_state:?}"
+                    );
+                    assert!(
+                        matches!(
+                            descendant_state,
+                            ProcessState::Exited | ProcessState::Gone | ProcessState::Replaced
+                        ),
+                        "Cancelled while Bash descendant remained live: {descendant_state:?}"
+                    );
+                    Ok::<(), agent_client_protocol::Error>(())
+                })
+                .catch_unwind()
+                .await;
+                // Cleanup follows the observation, including when it failed.
+                // The FIFO also lets a surviving fixture descendant exit without
+                // signalling a PID that may have been recycled after cancellation.
+                let released = gate.release();
+                let _ = cx.send_notification(CancelNotification::new(session));
+                let cancellation = scope.lock().unwrap().clone();
+                if let Some(cancellation) = &cancellation {
+                    cancellation.cancel();
+                }
+                if let Some(task) = blocked.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if let Some(cancellation) = cancellation {
+                    tokio::time::timeout(
+                        Duration::from_secs(15),
+                        cancellation.wait_idle_for_test(),
+                    )
+                    .await
+                    .expect("Bash fixture work did not settle");
+                }
+                released.unwrap();
+                if let Some((shell, descendant)) = observed_tree {
+                    // This wait is only fixture cleanup. The acceptance snapshot
+                    // above was taken before release and is never retried.
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        while matches!(shell.state().unwrap(), ProcessState::Live { .. })
+                            || matches!(descendant.state().unwrap(), ProcessState::Live { .. })
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     })
                     .await
-                    .expect("production BashTool should publish its process tree")
-                };
-                let shell_pid = read_pid(shell_pid_file.clone()).await;
-                let descendant_pid = read_pid(descendant_pid_file.clone()).await;
-
-                cx.send_notification(CancelNotification::new(session))?;
-                let response = tokio::time::timeout(Duration::from_secs(2), blocked)
-                    .await
-                    .expect("Bash cancellation should terminate and reap the process tree")
-                    .unwrap()?;
-                assert_eq!(response.stop_reason, StopReason::Cancelled);
-                assert!(
-                    !process_exists(shell_pid),
-                    "Cancelled was returned before the Bash shell was reaped"
-                );
-                assert!(
-                    !process_exists(descendant_pid),
-                    "Cancelled was returned before the Bash descendant exited"
-                );
-                Ok(())
+                    .expect("fixture process remained live after release");
+                }
+                match result {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
             })
             .await
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cancellation_reaps_production_bash_process_tree_before_responding() {
+        exercise_cancellation_process_tree(false).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cancellation_process_tree_fixture_settles_after_readiness_failure() {
+        use futures::FutureExt;
+        let panic = std::panic::AssertUnwindSafe(exercise_cancellation_process_tree(true))
+            .catch_unwind()
+            .await
+            .expect_err("injected fixture failure must propagate after cleanup");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"injected after Bash process-tree readiness")
+        );
     }
 
     #[tokio::test]

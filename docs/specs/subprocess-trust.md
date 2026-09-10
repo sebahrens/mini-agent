@@ -98,6 +98,17 @@ the session history lock. Early preparation cancellation follows this same
 boundary; cancellation during cleanup can still select `Cancelled` without
 discarding completed progress.
 
+ACP process-tree cancellation evidence distinguishes direct-child reaping from
+descendant exit. The Linux/macOS test helper in `src/tests/process_state.rs`
+captures process identity before cancellation and observes native state afterward.
+Linux uses `/proc` state and start ticks. macOS uses libproc start time and state,
+with a system `ps` fallback for zombies that libproc omits. A zombie has exited
+but is not reaped; failed observations never count as termination. The acceptance
+snapshot is taken immediately after the ACP response and is not retried. An owned
+FIFO permits fixture cleanup after a failed assertion, and cleanup drains the
+prompt work scope before propagating the failure. Native controls cover live,
+unreaped-zombie, reaped, and mismatched-identity observations.
+
 The structured Git row's literal operands are enforced with Git's global
 `--literal-pathspecs` mode. Its diff operation omits binary patch bodies, and a
 successful commit result reports the newly resolved `HEAD` object ID.
@@ -209,7 +220,8 @@ its exact source expression and full macro-context digest are classified `NON-PR
 The pricing metadata assertions in `startup.rs` compare numeric `output` values,
 and the task scheduler's `FakeStep` vectors contain response data fields named
 `output`. Their exact expressions and macro-context digests are also classified
-`NON-PROCESS`. The ACP hook test's reused `kill -0` probe is `TEST-ONLY`.
+`NON-PROCESS`. The ACP cancellation test uses the state-aware process helper;
+its system `ps` fallback and owned control process are `TEST-ONLY`.
 The SQLite contention tests in `skills/session.rs` and `skills/coordinator.rs`
 construct `HeldTestLock` fixtures that own standard-library threads. Their two
 exact `HeldTestLock::spawn` expressions are classified `NON-PROCESS`.

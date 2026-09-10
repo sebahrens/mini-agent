@@ -757,6 +757,11 @@ impl AgentWorkCancellation {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.scope.is_cancelled()
     }
+
+    #[cfg(all(test, feature = "acp", any(target_os = "linux", target_os = "macos")))]
+    pub(crate) async fn wait_idle_for_test(&self) {
+        self.scope.wait_idle().await;
+    }
 }
 
 pub(crate) struct AgentWorkGuard {

@@ -836,10 +836,10 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
-        2,
+        1,
         "TEST-ONLY",
     ),
-    ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),
+    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",
@@ -3313,10 +3313,10 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/acp/mod.rs",
         "std::process::Command::new(\"kill\")",
-        2,
+        1,
         "TEST-ONLY",
     ),
-    ("src/extras/acp/mod.rs", ".status()", 2, "TEST-ONLY"),
+    ("src/extras/acp/mod.rs", ".status()", 1, "TEST-ONLY"),
     (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",
