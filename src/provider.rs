@@ -1629,7 +1629,20 @@ pub(crate) fn build_http_client(
 ) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(resolve_connect_timeout(custom))
-        .read_timeout(resolve_stream_idle_timeout(custom));
+        .read_timeout(resolve_stream_idle_timeout(custom))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // Gateway credentials can live in arbitrary custom headers, which
+            // reqwest's fixed sensitive-header list does not remove on redirect.
+            if attempt
+                .previous()
+                .first()
+                .is_some_and(|initial| initial.origin() != attempt.url().origin())
+            {
+                attempt.error("provider redirect changed origin")
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        }));
     if is_localhost(base_url) {
         // Disable connection pooling for local LLM servers (notably
         // llama.cpp's cpp-httplib) which close idle keep-alive

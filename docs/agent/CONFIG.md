@@ -924,7 +924,11 @@ config file:
 ```
 
 The optional `timeout_secs` field overrides the default HTTP timeout for the
-provider. TLS certificate verification can be disabled with
+provider. Provider HTTP redirects stay within the initial request's origin
+(scheme, host, and effective port), with at most ten redirects. A redirect to
+another origin fails before forwarding credentials or custom headers; configure
+the destination directly as `base_url` if it is the intended provider endpoint.
+TLS certificate verification can be disabled with
 `"danger_accept_invalid_certs": true` (for self-signed or internal-CA
 gateways) — use with care, as it makes the connection vulnerable to MITM.
 

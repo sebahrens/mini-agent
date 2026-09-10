@@ -1151,6 +1151,103 @@ fn provider_timeouts_fall_back_to_documented_defaults() {
     );
 }
 
+#[tokio::test]
+async fn provider_redirects_preserve_origin_headers_and_hop_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request_headers(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut used = 0;
+        loop {
+            assert!(
+                used < buffer.len(),
+                "redirect fixture request exceeded limit"
+            );
+            let count = stream.read(&mut buffer[used..]).await.unwrap();
+            assert!(count > 0, "redirect fixture request ended before headers");
+            used += count;
+            if buffer[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                return String::from_utf8(buffer[..used].to_vec())
+                    .unwrap()
+                    .to_ascii_lowercase();
+            }
+        }
+    }
+
+    for scenario in ["same-origin", "loop", "port", "host", "scheme"] {
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = source.local_addr().unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = match scenario {
+            "port" => format!("http://{}/elsewhere", destination.local_addr().unwrap()),
+            "host" => format!("http://localhost:{}/elsewhere", address.port()),
+            "scheme" => format!("https://{address}/elsewhere"),
+            _ => "/next".into(),
+        };
+        let mut custom = timeout_cfg(2, 2);
+        custom
+            .headers
+            .insert("api-key".into(), "redirect-test-sentinel".into());
+        let client = crate::provider::build_http_client(
+            "redirect-test",
+            false,
+            Some(&custom),
+            Some(&format!("http://{address}")),
+        )
+        .unwrap();
+        let request = client
+            .get(format!("http://{address}/start"))
+            .bearer_auth("redirect-bearer-sentinel");
+
+        // Keep all network futures inside this bounded scope: assertion failures
+        // and timeouts drop their listeners/streams without detached tasks.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let serve = async {
+                let expected_requests = match scenario {
+                    "same-origin" => 2,
+                    "loop" => 11, // Initial request plus reqwest's ten allowed hops.
+                    _ => 1,
+                };
+                for index in 0..expected_requests {
+                    let (mut stream, _) = source.accept().await.unwrap();
+                    let headers = request_headers(&mut stream).await;
+                    assert!(headers.contains("\r\napi-key: redirect-test-sentinel\r\n"));
+                    assert!(headers.contains("\r\nauthorization: bearer redirect-bearer-sentinel\r\n"));
+                    let response = if scenario == "same-origin" && index == 1 {
+                        assert!(headers.starts_with("get /next http/1.1\r\n"));
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into()
+                    } else {
+                        format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            };
+            let receive = async {
+                let unexpected_destination = async {
+                    let (mut stream, _) = destination.accept().await.unwrap();
+                    request_headers(&mut stream).await
+                };
+                let result = tokio::select! {
+                    biased;
+                    headers = unexpected_destination => {
+                        panic!("{scenario}: redirect reached another origin: {headers}");
+                    }
+                    result = request.send() => result,
+                };
+                if scenario == "same-origin" {
+                    let response = result.unwrap();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    assert_eq!(response.text().await.unwrap(), "ok");
+                } else {
+                    let error = result.expect_err("provider followed an unsafe or unbounded redirect");
+                    assert!(error.is_redirect(), "{scenario}: expected redirect refusal, got {error}");
+                }
+            };
+            tokio::join!(serve, receive);
+        }).await.expect("provider redirect test exceeded its hang guard");
+    }
+}
+
 /// Serve one connection with `handler`, returning the bound address.
 async fn stalling_server<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
 where
