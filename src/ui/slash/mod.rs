@@ -16,6 +16,9 @@ mod session;
 pub(crate) use session::is_persistence_restart_required;
 pub(crate) mod settings;
 
+#[cfg(test)]
+mod session_restore_tests;
+
 pub(crate) use providers::warm_model_cache;
 
 use smallvec::SmallVec;
@@ -91,13 +94,7 @@ impl SlashCtx<'_> {
         }
     }
 
-    async fn build_agent_for_client(
-        &self,
-        client: &AnyClient,
-        model_id: &str,
-        read_tracker: &crate::agent::tools::ReadTracker,
-        todo_store: &crate::agent::tools::TodoStore,
-    ) -> AnyAgent {
+    async fn build_agent_for_client(&self, client: &AnyClient, session: &Session) -> AnyAgent {
         AgentBuildCtx {
             prebuild_invalidated: Some(self.prebuild_invalidated),
             cli: self.cli,
@@ -108,18 +105,18 @@ impl SlashCtx<'_> {
             permission: self.permission,
             ask_tx: self.ask_tx,
             sandbox: self.sandbox,
-            read_tracker,
-            todo_store,
-            tool_output_session_id: &self.session.id,
-            tool_result_spills: &self.session.tool_result_spills,
+            read_tracker: &session.read_tracker,
+            todo_store: &session.todos,
+            tool_output_session_id: &session.id,
+            tool_result_spills: &session.tool_result_spills,
             #[cfg(feature = "js")]
-            js_session_state: &self.session.js_session_state,
+            js_session_state: &session.js_session_state,
             #[cfg(feature = "skills")]
             skill_services: self.skill_services,
             #[cfg(feature = "mcp")]
             mcp_manager: self.mcp_manager,
         }
-        .rebuild_agent(model_id, *self.reasoning_enabled)
+        .rebuild_agent(&session.model, *self.reasoning_enabled)
         .await
     }
 
@@ -153,14 +150,7 @@ impl SlashCtx<'_> {
         } else {
             self.client.clone()
         };
-        let next_agent = self
-            .build_agent_for_client(
-                &next_client,
-                &session.model,
-                &session.read_tracker,
-                &session.todos,
-            )
-            .await;
+        let next_agent = self.build_agent_for_client(&next_client, &session).await;
 
         *self.client = next_client;
         *self.agent = Some(next_agent);

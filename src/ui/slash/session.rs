@@ -154,14 +154,7 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             return Ok(());
         }
     };
-    let new_agent = ctx
-        .build_agent_for_client(
-            &new_client,
-            &session.model,
-            &session.read_tracker,
-            &session.todos,
-        )
-        .await;
+    let new_agent = ctx.build_agent_for_client(&new_client, &session).await;
     let msg_count = session.messages.len();
     if let Err(e) = commit_staged_import(
         ctx.session,

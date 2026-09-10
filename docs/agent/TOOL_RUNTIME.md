@@ -15,6 +15,18 @@ with `js`; ordinary `find_files` and `list_dir` retain their shared directory ac
 `/editsys` rebuilds the agent immediately after changing the edit system, so the memoized
 `read`/`edit` definitions and their runtime behavior always switch together.
 
+Session restoration and import prepare every rebuilt tool from the incoming
+session: read tracking, todos, JS scratch, spill registration, and the session ID
+used for spill files. Preparation retains the active workspace and shell binding;
+a serialized working directory cannot redirect tools. Provider setup must succeed
+before publishing the replacement client, agent, or session. Import also saves the
+prepared session before publication. A failed activation leaves the current agent
+and its runtime state usable. `src/ui/slash/session_restore_tests.rs` exercises
+replacement with a local provider through actual tool calls and spill persistence,
+including unchanged and changed providers and failed provider setup. JS assertions
+run when the platform permits JS registration; macOS additionally needs the
+installed-binary path because libtest is not a production worker executable.
+
 Foreground shell commands run under a fixed 30 s deadline that a call can only
 lower; an explicit timeout must be at least one millisecond. A shell call with
 `background = true` instead returns a session-scoped job id immediately and

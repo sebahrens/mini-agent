@@ -266,41 +266,6 @@ mod tests {
             !startup.contains("self.session.working_dir"),
             "startup runtime consumers must use the captured WorkspaceBinding"
         );
-
-        let slash = include_str!("../ui/slash/mod.rs");
-        let replacement = slash
-            .split("pub async fn replace_session")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn rebuild_agent_with_client")
-            .next()
-            .unwrap();
-        let prepare = replacement.find("create_client").unwrap();
-        for commit in ["*self.client =", "*self.agent =", "*self.session ="] {
-            assert!(
-                prepare < replacement.find(commit).unwrap(),
-                "session replacement must prepare fallible provider state before committing {commit}"
-            );
-        }
-        assert!(
-            !replacement.contains("mem::replace"),
-            "session replacement must not expose staged session state before activation succeeds"
-        );
-    }
-
-    #[test]
-    fn session_restore_paths_do_not_rebind_shell_capability() {
-        for path in [
-            "src/startup.rs",
-            "src/ui/slash/mod.rs",
-            "src/ui/slash/session.rs",
-        ] {
-            let source = std::fs::read_to_string(path).unwrap();
-            assert!(
-                !source.contains("rebind_workspace_binding"),
-                "{path} must retain the active shell capability outside explicit worktree switches"
-            );
-        }
     }
 
     #[tokio::test]

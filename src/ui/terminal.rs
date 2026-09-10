@@ -325,6 +325,17 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    #[cfg(test)]
+    pub(crate) fn detached_for_test() -> Self {
+        Self {
+            session: TerminalSession {
+                terminal: SystemTerminal,
+                undo: Vec::new(),
+                attached: false,
+            },
+        }
+    }
+
     pub fn new() -> Result<Self, TerminalLifecycleError> {
         let guard = Self {
             session: TerminalSession::new(SystemTerminal)
