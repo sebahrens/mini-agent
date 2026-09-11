@@ -1444,6 +1444,120 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
 /// a process method. Any unlisted `spawn`, `output`, or `status` identifier in
 /// macro-controlled tokens remains process authority and fails closed.
 const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
+    // `status` in the goal module is a `GoalStatus`, not a process exit
+    // status, and `report_tool`'s is a `ReportStatus`. The identifier scanner
+    // cannot tell them apart inside a macro, so each site is classified here.
+    // The goal module launches nothing: its only commands run through the
+    // shared validation runner (`TC-GOAL-CHECK`).
+    (
+        "src/extras/goal/driver.rs",
+        "assert_eq!(status, GoalStatus::Met);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/driver.rs",
+        "RoundOutcome::Stopped { status, .. } => assert_eq!(status, GoalStatus::Active),",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "status: GoalStatus::Active,",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "status: GoalStatus::BudgetLimited,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::AwaitingUser);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::Blocked);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::Impossible);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::Paused);",
+        3,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "status: GoalStatus::Impossible,",
+        4,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::Met);",
+        2,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "status: GoalStatus::Met,",
+        3,
+        "NON-PROCESS",
+    ),
+    ("src/extras/goal/mod.rs", "status.label()", 1, "NON-PROCESS"),
+    (
+        "src/extras/goal/mod.rs",
+        "status = %self.status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/mod.rs",
+        "assert!(status.is_terminal(), \"{status:?} must be terminal\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/mod.rs",
+        "assert!(!status.is_terminal(), \"{status:?} must be resumable\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/mod.rs",
+        "status: GoalStatus::Active",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/mod.rs",
+        "assert_eq!(status, back, \"{status:?} must survive a round trip\");",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/report_tool.rs",
+        "?status,",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/ui/slash/goal.rs",
+        "Some(status) => write_ok(ctx.renderer, format!(\"goal {}\", status.label())),",
+        1,
+        "NON-PROCESS",
+    ),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"first result\".into()),",
@@ -2312,6 +2426,112 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
 /// Occurrence counts prevent an identical invocation from borrowing an earlier
 /// approval in the same source file.
 const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
+    // Goal records carry a `status` field, so `goal.status` and
+    // `outcome.status` inside an assertion or a format string look like a
+    // process `status()` terminal to the scanner. None of these launch
+    // anything: the goal module builds no process and reaches commands only
+    // through the shared validation runner (`TC-GOAL-CHECK`).
+    (
+        "src/extras/goal/driver.rs",
+        &[
+            (
+                "4df5946458762c388a5a59bfba766e3867c1ac504ddf845f5bd60115dadfa9c8",
+                1,
+            ),
+            (
+                "9616cc3a86ba50ddf5ec520a82165e50da9f169a345f44e31d480d9f8600e411",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        &[
+            (
+                "1c395765e43cd9b6cd43b9a473b7ceffb32e994c1223a3b582b653177a95a9fd",
+                1,
+            ),
+            (
+                "3dcff6b567562c9ae7bef19bfb158463c9a0901e0a0f34331ec808f10919f3d9",
+                1,
+            ),
+            (
+                "585ce007efc55b9749a5329bbe96b5f999e529f85875908cd99fae9259612f5d",
+                1,
+            ),
+            (
+                "5caff534ef1da101b49ed63823ea4d4c649ad26addedd3d7ff20a77c87578f73",
+                1,
+            ),
+            (
+                "7ab08e8c047a60e0c0e6d0333f4e21a779c83bb8d52abed97af6cc8833cb447b",
+                1,
+            ),
+            (
+                "8d75b0cb773e965bfd51463713ca3a6d85ef592e89b0d7de8d512d7076d993ae",
+                1,
+            ),
+            (
+                "8e683c287c05b02ec770d6282642cc2ca52a1a16f7c38fb8abf40adaf4031a8e",
+                2,
+            ),
+            (
+                "c532de8f1745797862d32e6fe009e5387d6fd988a9c36866da808b774d1ca804",
+                3,
+            ),
+            (
+                "d4b5d99d3ff7da25179c36899006e1dab75d5815da30cd759e890d30e33df324",
+                2,
+            ),
+            (
+                "eb05a85e94123023faa2184e3ec47592b9f93e8fa0494014122c0149fc3fc918",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/extras/goal/mod.rs",
+        &[
+            (
+                "07b82e86e9564e070c7ba9117e00c4a75354e3d28e0bba09d5b7e28c864d6f1f",
+                1,
+            ),
+            (
+                "2813a1eb6093b7aba65612133b0e22ead09f2f1f5d01e0a690c3120f25ec704b",
+                1,
+            ),
+            (
+                "28aca723af03db3ea27ec41743e0d06197ee0262e7da888f749863bd785ff761",
+                1,
+            ),
+            (
+                "381913f1df84f9d7a14aa0d5aac698f4a93db4e7bb1051130b2afe4a82b8a0a4",
+                1,
+            ),
+            (
+                "b00a299fed097df3e3098f8ce75ff61dc6b40b3b8acfcd3569dcd258473c9a96",
+                1,
+            ),
+            (
+                "e855b12cda5b2f7dc7de8757f985671c0333030e70b3d474380ecb23697ee1f7",
+                1,
+            ),
+        ],
+    ),
+    (
+        "src/extras/goal/report_tool.rs",
+        &[(
+            "33b815e68968fbbcbcc5152d1232028273f2482dda592282259257b1ab5826fe",
+            1,
+        )],
+    ),
+    (
+        "src/ui/slash/goal.rs",
+        &[(
+            "d478ccc3c3b6804387a50239b4aaa9b27cd77e842bdfe3ff83d27ecaa182cc5d",
+            1,
+        )],
+    ),
     (
         "src/startup.rs",
         &[
