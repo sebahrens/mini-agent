@@ -2221,6 +2221,39 @@ pub async fn build_agent_in_workspace(
     .with_completion_verification(completion_verification)
 }
 
+/// A task-outcome recorder for the goal driver.
+///
+/// The driver settles rounds outside the runner, so it cannot reuse the
+/// recorder the completion gate is given. The skill service owner caches its
+/// per-workspace services, so resolving again here is a cache hit rather than
+/// a second hydration.
+#[cfg(all(feature = "skills", feature = "goal"))]
+pub async fn goal_outcome_recorder(
+    cli: &Cli,
+    cfg: &Config,
+    owner: &std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+) -> Option<runner::TaskOutcomeRecorder> {
+    let services = resolve_skill_services(
+        cli.tool_is_eligible(cfg, "js"),
+        &resolve_js_worker_containment(
+            cli.tool_is_eligible(cfg, "js"),
+            crate::sandbox::worker::containment_status,
+        ),
+        owner,
+        workspace,
+        cfg.embedding.clone(),
+        cfg.enable_skill_proposals.unwrap_or(false),
+    )
+    .await?;
+    let dispatcher = services.telemetry()?;
+    Some(runner::TaskOutcomeRecorder::new(
+        dispatcher,
+        services.turn_context(),
+        crate::extras::js::skills::evidence_is_production_session(),
+    ))
+}
+
 #[cfg(feature = "skills")]
 async fn resolve_skill_services(
     eligible: bool,

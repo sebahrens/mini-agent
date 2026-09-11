@@ -625,6 +625,7 @@ where
     let Some(goal) = store.snapshot() else {
         return RoundOutcome::Inactive;
     };
+    record_outcome(&goal);
     match next_round(&goal, &decision) {
         Some(relaunch) if goal.status.is_running() => RoundOutcome::Relaunch { relaunch, line },
         _ => RoundOutcome::Stopped {
@@ -632,6 +633,62 @@ where
             line,
         },
     }
+}
+
+/// Where a settled verdict is reported as skill evidence.
+///
+/// Installed by the driver once per process. The goal module cannot build a
+/// recorder itself: the skill services live behind the provider, and a goal is
+/// not a skills feature.
+#[cfg(feature = "skills")]
+static OUTCOME_RECORDER: std::sync::Mutex<Option<crate::agent::runner::TaskOutcomeRecorder>> =
+    std::sync::Mutex::new(None);
+
+/// Install the recorder goal verdicts are reported to.
+#[cfg(feature = "skills")]
+pub fn set_outcome_recorder(recorder: Option<crate::agent::runner::TaskOutcomeRecorder>) {
+    if let Ok(mut slot) = OUTCOME_RECORDER.lock() {
+        *slot = recorder;
+    }
+}
+
+/// Report a settled verdict as task-outcome evidence.
+///
+/// Every verdict is recorded; only one a command proved counts toward
+/// promotion, and that exclusion lives with the promotion filter.
+fn record_outcome(goal: &Goal) {
+    #[cfg(feature = "skills")]
+    {
+        let Some(verdict) = goal.last_verdict.as_ref() else {
+            return;
+        };
+        let Ok(slot) = OUTCOME_RECORDER.lock() else {
+            return;
+        };
+        let Some(recorder) = slot.as_ref() else {
+            return;
+        };
+        recorder.record_goal(
+            goal.id.as_str(),
+            verdict.outcome == super::Outcome::Met,
+            goal.progress.rounds,
+            verdict
+                .evidence
+                .iter()
+                .map(|kind| {
+                    match kind {
+                        super::VerificationKind::SelfReport => "self_report",
+                        super::VerificationKind::Checks => "checks",
+                        super::VerificationKind::VerifyCommand => "verify_command",
+                        super::VerificationKind::Judge => "judge",
+                    }
+                    .to_string()
+                })
+                .collect(),
+        );
+    }
+    #[cfg(not(feature = "skills"))]
+    let _ = goal;
 }
 
 /// Verification hook for tests and for surfaces with no tiers wired.
@@ -857,5 +914,71 @@ pub fn summary_from_headless_turn(
         open_todos,
         tokens_used: usage.input_tokens + usage.output_tokens,
         active_secs: active.as_secs(),
+    }
+}
+
+#[cfg(all(test, feature = "skills"))]
+mod outcome_recording_tests {
+    use super::*;
+    use crate::extras::goal::{Goal, GoalStatus, Outcome, VerdictSource, VerificationKind};
+
+    fn met_goal(evidence: Vec<VerificationKind>) -> Goal {
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        goal.progress.rounds = 2;
+        goal.last_verdict = Some(crate::extras::goal::Verdict {
+            outcome: Outcome::Met,
+            reason: "done".into(),
+            source: VerdictSource::Checks,
+            evidence,
+            at: compact_str::CompactString::new("now"),
+        });
+        goal.set_status(GoalStatus::Met, None);
+        goal
+    }
+
+    /// With no recorder installed a settled round must still settle. Reporting
+    /// evidence is a side channel, never a precondition.
+    #[test]
+    fn recording_is_optional() {
+        set_outcome_recorder(None);
+        record_outcome(&met_goal(vec![VerificationKind::Checks]));
+    }
+
+    /// The kinds a verdict carries are what the promotion filter reads, so the
+    /// mapping to its stored spelling is pinned here.
+    #[test]
+    fn verdict_evidence_maps_to_the_stored_kind_names() {
+        let goal = met_goal(vec![
+            VerificationKind::SelfReport,
+            VerificationKind::Checks,
+            VerificationKind::VerifyCommand,
+            VerificationKind::Judge,
+        ]);
+        let names: Vec<_> = goal
+            .last_verdict
+            .as_ref()
+            .unwrap()
+            .evidence
+            .iter()
+            .map(|kind| match kind {
+                VerificationKind::SelfReport => "self_report",
+                VerificationKind::Checks => "checks",
+                VerificationKind::VerifyCommand => "verify_command",
+                VerificationKind::Judge => "judge",
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["self_report", "checks", "verify_command", "judge"]
+        );
+
+        let source = crate::extras::js::skills::policy::TaskOutcomeSource::Goal {
+            goal_id: goal.id.to_string(),
+            verified_by: names.iter().map(|n| n.to_string()).collect(),
+        };
+        assert!(
+            source.counts_toward_promotion(),
+            "a checks-backed verdict is promotion evidence"
+        );
     }
 }

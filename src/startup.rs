@@ -1489,6 +1489,9 @@ impl Startup {
             let todo_store = self.session.todos.clone();
             #[cfg(feature = "goal")]
             let goal_store = self.session.goal_store.clone();
+            #[cfg(feature = "skills")]
+            let skill_service_owner_for_goal =
+                std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
             #[cfg(feature = "mcp")]
             let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
                 None
@@ -1519,7 +1522,7 @@ impl Startup {
                 #[cfg(feature = "js")]
                 self.session.js_session_state.clone(),
                 #[cfg(feature = "skills")]
-                std::sync::Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new()),
+                skill_service_owner_for_goal.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
             )
@@ -1532,6 +1535,18 @@ impl Startup {
             let history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
                 &self.session,
                 self.cfg.resolve_keep_recent_tool_results(),
+            );
+            // Goal verdicts are skill evidence. The recorder lives behind the
+            // provider, so the driver installs it rather than building one.
+            #[cfg(all(feature = "goal", feature = "skills"))]
+            crate::extras::goal::driver::set_outcome_recorder(
+                provider::goal_outcome_recorder(
+                    &self.cli,
+                    &self.cfg,
+                    &skill_service_owner_for_goal,
+                    &self.workspace,
+                )
+                .await,
             );
             let response_result = run_headless_goal_rounds(
                 &agent,

@@ -424,6 +424,29 @@ impl TaskOutcomeRecorder {
         }
     }
 
+    /// Record one goal gate verdict.
+    ///
+    /// `verified_by` names what actually backed the verdict, so the promotion
+    /// filter can exclude one the model merely asserted. Recording happens for
+    /// every verdict; the exclusion is applied where promotion is decided.
+    #[cfg(feature = "goal")]
+    pub(crate) fn record_goal(
+        &self,
+        goal_id: &str,
+        passed: bool,
+        round: u32,
+        verified_by: Vec<String>,
+    ) {
+        self.record(
+            passed,
+            round,
+            crate::extras::js::skills::policy::TaskOutcomeSource::Goal {
+                goal_id: goal_id.to_string(),
+                verified_by,
+            },
+        );
+    }
+
     /// Record a deterministic eval/gym oracle without treating it as
     /// production evidence. Callers choose the production bit when building
     /// the recorder; ordinary harnesses must pass `false`.

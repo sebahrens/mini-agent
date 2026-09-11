@@ -686,6 +686,13 @@ async fn run_goal_round(
         .as_deref()
         .is_some_and(|command| !command.trim().is_empty());
 
+    // Goal verdicts are skill evidence; the recorder lives behind the provider.
+    #[cfg(feature = "skills")]
+    crate::extras::goal::driver::set_outcome_recorder(
+        crate::provider::goal_outcome_recorder(ui.cli, ui.cfg, &ui.skill_services, &ui.workspace)
+            .await,
+    );
+
     // Commands are the only external proof a completion claim can have, so the
     // checks tier runs here whenever the gate asks for it.
     let sandbox = ui.sandbox.clone();
