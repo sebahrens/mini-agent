@@ -216,8 +216,11 @@ reach promotion in production at all today — `evaluate_promotion` passes an em
 which is the same reachability the index already records for automatic evidence-threshold
 promotion.
 
-ACP carries a goal set by `--goal` at process start, and rounds run inside one `session/prompt`;
-`_meta.goal` and session-update reporting are follow-ups (`mini-agent-a1qwa.11`).
+ACP accepts a goal through `_meta.goal` on a prompt request and settles **one round per
+`session/prompt`**, reporting the decision as a thought chunk and as `_meta.goal`. Rounds do not
+relaunch inside a single prompt turn: the client sends the next prompt, which is how an editor
+already works. Relaunching in-turn would re-enter the runner while that turn's cancellation
+ownership and partial-transcript retention are live.
 
 The `goal` Cargo feature being enabled is not a claim that any of this is delivered.
 
