@@ -182,8 +182,8 @@ jobs:
           python3 scripts/check_workspace_boundaries.py
 
   harness-regression:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,8 +233,8 @@ jobs:
           bash scripts/gym/train.sh --help > /dev/null
 
   package-compliance-smoke:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -251,8 +251,8 @@ jobs:
         run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
 
   vscode:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -295,8 +295,8 @@ jobs:
           npm run sbom
 
   clippy:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -333,8 +333,8 @@ jobs:
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -437,8 +437,8 @@ jobs:
   # The local ONNX/BGE embedding backend and the complete feature union run on
   # Linux, where ort-sys publishes a supported runtime artifact.
   all-features:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     env:
       RUST_MIN_STACK: 8388608
@@ -467,8 +467,8 @@ jobs:
           -- --exact --test-threads=1
 
   parallel-test-smoke:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -478,8 +478,8 @@ jobs:
         run: cargo test --locked
 
   windows-default-compile:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -496,8 +496,8 @@ jobs:
         run: cargo test --locked --no-run
 
   linux-sandbox-policy:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -682,8 +682,8 @@ jobs:
           if-no-files-found: error
 
   macos-worker-containment-gate:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -843,8 +843,8 @@ jobs:
           if-no-files-found: error
 
   windows-worker-launcher-unit:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -922,8 +922,8 @@ jobs:
           -- --exact --nocapture
 
   macos-gym-ownership:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -931,8 +931,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gym_macos -v
 
   windows-general-sandbox-policy:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
+    needs: changes
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1010,8 +1010,8 @@ jobs:
           }
 
   windows-worker-containment-gate:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1742,8 +1742,8 @@ jobs:
           if-no-files-found: error
 
   platform-paths:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -1864,8 +1864,8 @@ jobs:
           if-no-files-found: error
 
   platform-path-negative-controls:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1917,8 +1917,8 @@ jobs:
           if-no-files-found: error
 
   platform-path-install-smoke:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -2026,8 +2026,8 @@ jobs:
           if-no-files-found: error
 
   mcp-stdio:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -2051,8 +2051,8 @@ jobs:
         run: cargo test --locked --no-default-features --features mcp,acp mcp_http_tests
 
   lsp-lifecycle:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -2072,8 +2072,8 @@ jobs:
         run: cargo test --locked --no-default-features --features lsp lsp_process
 
   install:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -2094,8 +2094,8 @@ jobs:
         run: cargo install --locked --path . --debug
 
   windows-msi:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2149,8 +2149,8 @@ jobs:
           if (Test-Path $installed) { throw 'MSI uninstall left the installed binary behind' }
 
   package:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2186,8 +2186,8 @@ jobs:
             grep -Fxq "JS runtime check: PASS (2)"
 
   dependency-policy:
-    needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

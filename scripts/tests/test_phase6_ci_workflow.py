@@ -72,7 +72,14 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         for job in jobs:
             condition = job_body(self.workflow, job).splitlines()[0].strip()
             with self.subTest(job=job):
-                if job == "windows-general-sandbox-policy":
+                if job == "changes":
+                    # The change detector is infrastructure for every other
+                    # job, including the Windows probe, which reads its output.
+                    # Guarding it by scope would skip it on a probe dispatch and
+                    # take the probe down with it, so it runs unconditionally
+                    # and reports code=true for every dispatch.
+                    self.assertNotIn("inputs.scope", condition)
+                elif job == "windows-general-sandbox-policy":
                     self.assertIn("inputs.scope == 'windows-general-sandbox'", condition)
                 else:
                     self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
