@@ -140,6 +140,10 @@ pub struct GoalConfig {
     pub reinject_every: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_every: Option<u32>,
+    /// Run goal checks after every round as feedback, not only on a completion
+    /// claim. Completion remains gated either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_every_round: Option<bool>,
 }
 
 /// Status-bar statusline layout. Up to 3 lines, each an ordered list of segments.

@@ -134,6 +134,11 @@ pub fn build_prompt(goal: &Goal, transcript: &str, cause: VerifyCause) -> String
             "Work is ongoing. Decide whether it is still aimed at the objective, and if not, say what is off \
              course. Answer `not_yet` unless the objective is genuinely unsatisfiable."
         }
+        // The feedback pass runs commands, not the judge; this arm exists only
+        // so the prompt builder stays total.
+        VerifyCause::RoundFeedback => {
+            "Work is ongoing and its checks have just run. Answer `not_yet` and say what remains."
+        }
     });
     out.push_str("\n\n<transcript untrusted=\"true\">\n");
     out.push_str(transcript);

@@ -49,6 +49,11 @@ Claiming completion starts verification rather than ending the goal.
 3. **A judge model** reviews last. It can withhold completion but can never overturn a command that
    exited zero.
 
+By default checks run only when the agent claims to be finished. With `/goal bounds
+check_every_round=true` (or `[goal] check_every_round = true`) they also run at the end of every
+round and their output goes into the next one, so a broken test is reported while the agent is still
+working on it rather than at the end. Completion is gated by the same checks either way.
+
 With no checks configured the only evidence is the model's own account, and `/goal status` says so:
 
 ```

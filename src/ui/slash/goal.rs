@@ -88,6 +88,16 @@ fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
             goal.bounds.judge_every = parsed;
             Ok(format!("judge_every = {parsed}"))
         }
+        "check_every_round" => {
+            let parsed = matches!(value, "true" | "yes" | "on" | "1");
+            if !parsed && !matches!(value, "false" | "no" | "off" | "0") {
+                return Err(format!(
+                    "check_every_round needs true or false, got {value:?}"
+                ));
+            }
+            goal.bounds.check_every_round = parsed;
+            Ok(format!("check_every_round = {parsed}"))
+        }
         "continuation" => match value {
             "continue" => {
                 goal.continuation = crate::extras::goal::ContinuationMode::Continue;
@@ -135,7 +145,15 @@ pub(crate) fn render_status(goal: &Goal) -> String {
         if goal.checks.is_empty() {
             "self-report only (add /goal check <command> to verify)".to_string()
         } else {
-            format!("{} check(s)", goal.checks.len())
+            format!(
+                "{} check(s){}",
+                goal.checks.len(),
+                if goal.bounds.check_every_round {
+                    ", run every round"
+                } else {
+                    ", run on a completion claim"
+                }
+            )
         }
     ));
     out.push_str(&format!(
@@ -329,6 +347,12 @@ mod tests {
             crate::extras::goal::ContinuationMode::Restart { .. }
         ));
 
+        assert!(parse_bound(&mut goal, "check_every_round=true").is_ok());
+        assert!(goal.bounds.check_every_round);
+        assert!(parse_bound(&mut goal, "check_every_round=false").is_ok());
+        assert!(!goal.bounds.check_every_round);
+        assert!(parse_bound(&mut goal, "check_every_round=maybe").is_err());
+
         assert!(parse_bound(&mut goal, "continuation=sideways").is_err());
         assert!(parse_bound(&mut goal, "max_rounds=many").is_err());
         assert!(parse_bound(&mut goal, "nonsense=1").is_err());
@@ -348,7 +372,14 @@ mod tests {
 
         goal.checks
             .push(crate::extras::goal::GoalCheck::new("cargo test"));
-        assert!(render_status(&goal).contains("1 check(s)"));
+        let with_checks = render_status(&goal);
+        assert!(with_checks.contains("1 check(s)"));
+        assert!(
+            with_checks.contains("on a completion claim"),
+            "the status must say when checks run: {with_checks}"
+        );
+        goal.bounds.check_every_round = true;
+        assert!(render_status(&goal).contains("every round"));
 
         goal.set_status(
             GoalStatus::Paused,

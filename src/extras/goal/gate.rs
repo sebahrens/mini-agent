@@ -126,6 +126,8 @@ pub enum VerifyCause {
     ImpossibleClaim,
     /// Periodic drift check on an otherwise ordinary round.
     DriftCheck,
+    /// Per-round checks run as feedback rather than as a completion gate.
+    RoundFeedback,
 }
 
 /// Outcome of the first phase.
@@ -403,6 +405,17 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
                 cause: VerifyCause::DriftCheck,
             });
         }
+        // Continuous verification: the agent hears about a failing check at the
+        // end of the round that broke it rather than only when it claims to be
+        // finished.
+        if goal.bounds.check_every_round && !goal.checks.is_empty() {
+            return Step::Verify(VerifyRequest {
+                run_verify_command: false,
+                run_checks: true,
+                run_judge: false,
+                cause: VerifyCause::RoundFeedback,
+            });
+        }
         return Step::Decided(GateDecision::cont(instruction, VerdictSource::Structural));
     }
 
@@ -473,6 +486,26 @@ pub fn gate_post(
     judge: Option<&JudgeOutcome>,
 ) -> GateDecision {
     match request.cause {
+        VerifyCause::RoundFeedback => {
+            // Feedback, not a verdict. A failing check here never stops the
+            // goal; it tells the agent what broke while it can still fix it.
+            let instruction = match checks {
+                Some(outcome) if !outcome.all_passed => format!(
+                    "Verification is currently failing. Fix this before continuing:\n{}",
+                    outcome
+                        .failure_tail
+                        .clone()
+                        .unwrap_or_else(|| "a goal check failed".into())
+                ),
+                _ => goal
+                    .last_verdict
+                    .as_ref()
+                    .map(|v| v.reason.clone())
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| KEEP_WORKING_INSTRUCTION.to_string()),
+            };
+            GateDecision::cont(instruction, VerdictSource::Checks)
+        }
         VerifyCause::DriftCheck => {
             // A drift check may only nudge. It never completes or kills a goal.
             let instruction = match judge {
@@ -1678,5 +1711,99 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn per_round_checks_are_feedback_and_never_stop_the_goal() {
+        let mut g = goal();
+        g.checks.push(GoalCheck::new("cargo test"));
+        g.bounds.check_every_round = true;
+        g.judge = JudgePolicy::Off;
+
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Progress)),
+            ..worked()
+        };
+        let request = verification(&g, &round);
+        assert_eq!(request.cause, VerifyCause::RoundFeedback);
+        assert!(request.run_checks);
+        assert!(
+            !request.run_judge,
+            "feedback does not need a second opinion"
+        );
+
+        let failed = CheckOutcome {
+            all_passed: false,
+            failure_tail: Some("test parse::roundtrip ... FAILED".into()),
+            verified: Vec::new(),
+        };
+        let decision = gate_post(&g, &round, &request, Some(&failed), None);
+        match &decision {
+            GateDecision::Continue { instruction, .. } => {
+                assert!(instruction.contains("FAILED"));
+                assert!(instruction.contains("Fix this before continuing"));
+            }
+            other => panic!("a failing per-round check is feedback, got {other:?}"),
+        }
+
+        let mut applied = g.clone();
+        apply(&mut applied, &round, &decision, None);
+        assert_eq!(
+            applied.status,
+            GoalStatus::Active,
+            "feedback must not stop the goal"
+        );
+    }
+
+    /// The feedback mode does not weaken the completion gate: a completion
+    /// claim is still verified by the same checks.
+    #[test]
+    fn per_round_checks_still_gate_a_completion_claim() {
+        let mut g = goal();
+        g.checks.push(GoalCheck::new("cargo test"));
+        g.bounds.check_every_round = true;
+        g.judge = JudgePolicy::Off;
+
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+        let request = verification(&g, &round);
+        assert_eq!(
+            request.cause,
+            VerifyCause::MetClaim,
+            "a completion claim outranks the feedback pass"
+        );
+
+        let decision = gate_post(
+            &g,
+            &round,
+            &request,
+            Some(&CheckOutcome {
+                all_passed: false,
+                failure_tail: Some("still failing".into()),
+                verified: Vec::new(),
+            }),
+            None,
+        );
+        assert!(
+            matches!(decision, GateDecision::Continue { .. }),
+            "a failing check still blocks completion"
+        );
+    }
+
+    #[test]
+    fn without_the_option_checks_run_only_on_a_completion_claim() {
+        let mut g = goal();
+        g.checks.push(GoalCheck::new("cargo test"));
+        g.judge = JudgePolicy::Off;
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Progress)),
+            ..worked()
+        };
+        assert!(
+            matches!(gate_pre(&g, &round), Step::Decided(_)),
+            "an ordinary round must not pay for checks by default"
+        );
     }
 }

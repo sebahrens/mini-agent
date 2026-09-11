@@ -353,6 +353,16 @@ pub struct GoalBounds {
     pub reinject_every: u32,
     /// Rounds between judge drift checks.
     pub judge_every: u32,
+    /// Run the configured checks at the end of every round, not only when the
+    /// agent claims completion.
+    ///
+    /// A failing check is then feedback rather than a verdict: the output goes
+    /// into the next round's instruction and the goal keeps working. An agent
+    /// that learns its tests fail at the end of every round corrects sooner
+    /// than one told only when it claims to be finished. Completion is still
+    /// gated by the same checks either way.
+    #[serde(default)]
+    pub check_every_round: bool,
 }
 
 impl GoalBounds {
@@ -385,6 +395,9 @@ impl GoalBounds {
         if let Some(v) = goal.judge_every {
             self.judge_every = v.min(1_000);
         }
+        if let Some(v) = goal.check_every_round {
+            self.check_every_round = v;
+        }
     }
 }
 
@@ -399,6 +412,7 @@ impl Default for GoalBounds {
             wrap_up_max_agent_turns: 4,
             reinject_every: 6,
             judge_every: 5,
+            check_every_round: false,
         }
     }
 }

@@ -120,6 +120,12 @@ accounts of the work; a command exiting zero is a fact about it.
 
 ### Checks
 
+Checks run in one of two modes. By default they run only on a completion claim and gate it. With
+`check_every_round` they also run at the end of every round as **feedback**: the output goes into
+the next round's instruction and a failure does not stop the goal, because an agent that learns its
+tests fail at the end of the round that broke them corrects sooner than one told only when it claims
+to be finished. Completion is gated by the same checks in either mode.
+
 Checks run through `extras::validation` with the configured verification limits, under
 `TC-GOAL-CHECK`. The goal module builds no process itself and never calls `Sandbox::wrap_command`.
 A non-zero exit, a timeout, cancellation, an output-limit breach, and a launch failure are all
