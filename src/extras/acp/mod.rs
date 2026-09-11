@@ -130,7 +130,12 @@ impl SessionHistory {
     /// Reduce history to its retention bounds, carrying successful summaries
     /// between passes. Cancellation drops the pending summary and returns None;
     /// only completed passes may have changed history at that point.
-    async fn compact_with<F, Fut>(&mut self, control: &TurnControl, mut summarize: F) -> Option<()>
+    async fn compact_with<F, Fut>(
+        &mut self,
+        control: &TurnControl,
+        #[cfg(feature = "goal")] goal_store: Option<&crate::extras::goal::GoalStore>,
+        mut summarize: F,
+    ) -> Option<()>
     where
         F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
         Fut: Future<Output = anyhow::Result<(String, usize)>>,
@@ -211,6 +216,14 @@ impl SessionHistory {
                         self.serialized_bytes.saturating_sub(turn.serialized_bytes);
                 }
             }
+            // A summarizer may drop anything in the turns it replaces, so the
+            // objective is restated from the record rather than hoped for.
+            #[cfg(feature = "goal")]
+            let summary =
+                match goal_store.and_then(crate::extras::goal::GoalStore::critical_context) {
+                    Some(goal_context) => format!("{summary}\n\n{goal_context}"),
+                    None => summary,
+                };
             self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
         }
         Some(())
@@ -990,6 +1003,54 @@ fn acp_session_sandbox(
     .with_workspace_binding(workspace))
 }
 
+/// Apply a `_meta.goal` object from a prompt request.
+///
+/// Shape: `{"goal": {"objective": "...", "criteria": ["..."], "replace": false, "clear": false}}`.
+/// Replacing an unfinished goal is refused unless `replace` is set, for the same
+/// reason `/goal` refuses it: the rounds and verdicts on it are the record of
+/// the work done so far.
+#[cfg(feature = "goal")]
+async fn apply_meta_goal(
+    state: &Arc<AcpState>,
+    session_id: &SessionId,
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(spec) = meta.get("goal") else {
+        return Ok(());
+    };
+    let store = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .ok_or_else(|| "unknown ACP session".to_string())?
+            .goal_store
+            .clone()
+    };
+
+    if spec.get("clear").and_then(serde_json::Value::as_bool) == Some(true) {
+        store.clear();
+        return Ok(());
+    }
+    let Some(objective) = spec.get("objective").and_then(serde_json::Value::as_str) else {
+        return Err("_meta.goal needs an objective".to_string());
+    };
+    let criteria = spec
+        .get("criteria")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let replace = spec.get("replace").and_then(serde_json::Value::as_bool) == Some(true);
+
+    let goal = crate::extras::goal::Goal::new(objective, criteria).map_err(|e| e.to_string())?;
+    store.set(goal, replace).map_err(|e| e.to_string())
+}
+
 async fn handle_prompt(
     req: PromptRequest,
     responder: Responder<PromptResponse>,
@@ -1001,6 +1062,17 @@ async fn handle_prompt(
     tracing::info!("ACP prompt for session {}", session_id);
 
     let prompt_text = render_prompt_blocks(&req.prompt)?;
+
+    // A client sets or clears the session's goal through the request's `_meta`
+    // rather than through prompt text: the objective is a long-lived
+    // instruction channel, and a text directive would let anything that reaches
+    // the prompt install one.
+    #[cfg(feature = "goal")]
+    if let Some(meta) = req.meta.as_ref()
+        && let Err(error) = apply_meta_goal(&state, &session_id, meta).await
+    {
+        return Err(agent_client_protocol::Error::new(-32602, error));
+    }
 
     let snapshot = {
         let sessions = state.sessions.lock().await;
@@ -1356,6 +1428,10 @@ async fn run_prompt(
     let mut mcp_manager = None;
     #[cfg(all(test, feature = "mcp"))]
     let mut mcp_manager = lock_unpoisoned(&state.mcp_fixture).take();
+    #[cfg(feature = "goal")]
+    let goal_store_for_gate = goal_store.clone();
+    #[cfg(feature = "goal")]
+    let todo_snapshot = todo_store.snapshot();
     let result = execute_prompt(
         state,
         prompt_text,
@@ -1388,10 +1464,46 @@ async fn run_prompt(
     if !registration.complete_and_settle() {
         outcome.reason = StopReason::Cancelled;
     }
+    // Settle the goal round this prompt turn was, before the transcript is
+    // committed, so the gate sees the round's own record.
+    #[cfg(feature = "goal")]
+    let goal_line = settle_acp_goal_round(
+        &goal_store_for_gate,
+        outcome.reason,
+        outcome.progress.as_deref().unwrap_or(&[]),
+        &todo_snapshot,
+        &state.cfg,
+    )
+    .await;
+
     if let Some(progress) = outcome.progress
         && (outcome.reason == StopReason::EndTurn || !progress.is_empty())
     {
         history.commit_completed_turn(prompt_text, progress);
+    }
+
+    // Report the decision twice: as a thought chunk a person can read, and as
+    // `_meta` a client can act on without parsing prose. Clients routinely hide
+    // thoughts, and an agent that kept working with no visible reason is the
+    // complaint this exists to prevent.
+    #[cfg(feature = "goal")]
+    if let Some((line, goal)) = goal_line {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "goal".to_string(),
+            serde_json::json!({
+                "id": goal.id.as_str(),
+                "status": goal.status.label(),
+                "round": goal.progress.rounds,
+                "max_rounds": goal.bounds.max_rounds,
+                "reason": line,
+            }),
+        );
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(line.clone())));
+        let mut notification =
+            SessionNotification::new(session_id.clone(), SessionUpdate::AgentThoughtChunk(chunk));
+        notification.meta = Some(meta);
+        let _ = cx.send_notification(notification);
     }
     if outcome.reason == StopReason::Refusal
         && let Some(error) = outcome.error
@@ -1406,6 +1518,56 @@ async fn run_prompt(
     }
     let _ = respond_terminal(registration, responder, outcome.reason);
     Ok(())
+}
+
+/// Judge the goal round this ACP prompt turn was.
+///
+/// ACP runs one round per `session/prompt`: the client drives the next one by
+/// sending another prompt, which is how an editor already works. Relaunching
+/// inside a single turn would mean re-entering the runner while the turn's
+/// cancellation ownership and partial-transcript retention are live, and those
+/// invariants are load-bearing.
+///
+/// Returns the line to report and the goal it describes.
+#[cfg(feature = "goal")]
+async fn settle_acp_goal_round(
+    store: &crate::extras::goal::GoalStore,
+    reason: StopReason,
+    interactions: &[Message],
+    todos: &[crate::agent::tools::todo::TodoItem],
+    cfg: &Config,
+) -> Option<(String, crate::extras::goal::Goal)> {
+    use crate::extras::goal::driver::{self, RoundOutcome};
+    use crate::extras::goal::gate::RoundEnd;
+
+    let goal = store.snapshot().filter(|g| !g.status.is_terminal())?;
+    let open_todos = todos
+        .iter()
+        .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
+        .count();
+    let mut summary = driver::summary_from_headless_turn(
+        &goal,
+        interactions,
+        &rig::completion::Usage::default(),
+        None,
+        open_todos,
+        cfg.verify_command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty()),
+        std::time::Duration::ZERO,
+    );
+    summary.end = match reason {
+        StopReason::EndTurn => RoundEnd::Done,
+        StopReason::Cancelled => RoundEnd::Cancelled,
+        other => RoundEnd::Failed(format!("{other:?}")),
+    };
+
+    let outcome = driver::settle_round(store, summary, |_| async { (None, None) }).await;
+    let line = match outcome {
+        RoundOutcome::Inactive => return None,
+        RoundOutcome::Relaunch { line, .. } | RoundOutcome::Stopped { line, .. } => line,
+    };
+    store.snapshot().map(|goal| (line, goal))
 }
 
 struct PromptOutcome {
@@ -1570,22 +1732,29 @@ async fn execute_prompt(
             .cfg
             .resolve_reserve_tokens(&model_str, &quick_models, context_window);
         let compaction_client = &client;
+        #[cfg(feature = "goal")]
+        let goal_store_for_compaction = goal_store.clone();
         let compaction_model = &model_str;
         let compaction_retry = &state.cfg.retry;
         let compacted = history
-            .compact_with(&control, move |messages, previous_summary| async move {
-                compaction_client
-                    .compress_messages(
-                        compaction_model,
-                        &messages,
-                        previous_summary.as_deref(),
-                        None,
-                        context_window.saturating_sub(reserve),
-                        reserve,
-                        compaction_retry,
-                    )
-                    .await
-            })
+            .compact_with(
+                &control,
+                #[cfg(feature = "goal")]
+                Some(&goal_store_for_compaction),
+                move |messages, previous_summary| async move {
+                    compaction_client
+                        .compress_messages(
+                            compaction_model,
+                            &messages,
+                            previous_summary.as_deref(),
+                            None,
+                            context_window.saturating_sub(reserve),
+                            reserve,
+                            compaction_retry,
+                        )
+                        .await
+                },
+            )
             .await;
         if compacted.is_none() {
             return Ok(PromptOutcome::cancelled(None));
@@ -2176,10 +2345,15 @@ mod history_tests {
         }
         assert!(by_count.needs_compaction());
         by_count
-            .compact_with(&TurnControl::new(), |messages, _| async move {
-                let count = messages.len();
-                Ok(("origin user-0 assistant-0".to_string(), count))
-            })
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move {
+                    let count = messages.len();
+                    Ok(("origin user-0 assistant-0".to_string(), count))
+                },
+            )
             .await
             .unwrap();
         let count_snapshot = by_count.snapshot();
@@ -2197,10 +2371,15 @@ mod history_tests {
             vec![Message::assistant("oversized")],
         );
         by_bytes
-            .compact_with(&TurnControl::new(), |messages, _| async move {
-                let count = messages.len();
-                Ok(("oversized origin retained".to_string(), count))
-            })
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move {
+                    let count = messages.len();
+                    Ok(("oversized origin retained".to_string(), count))
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -2233,12 +2412,17 @@ mod history_tests {
             let retained = history.snapshot_with_tool_result_retention(0)[6..].to_vec();
             let mut prior_summaries = Vec::new();
             history
-                .compact_with(&TurnControl::new(), |messages, previous| {
-                    let index = prior_summaries.len();
-                    assert!(messages[0].content.contains(&format!("user-{index}")));
-                    prior_summaries.push(previous);
-                    async move { Ok((format!("covered through turn {index}"), 2)) }
-                })
+                .compact_with(
+                    &TurnControl::new(),
+                    #[cfg(feature = "goal")]
+                    None,
+                    |messages, previous| {
+                        let index = prior_summaries.len();
+                        assert!(messages[0].content.contains(&format!("user-{index}")));
+                        prior_summaries.push(previous);
+                        async move { Ok((format!("covered through turn {index}"), 2)) }
+                    },
+                )
                 .await
                 .expect("compaction is not cancelled");
             assert!(!history.needs_compaction());
@@ -2294,19 +2478,24 @@ mod history_tests {
                 let mut history = history.lock().await;
                 let mut first = true;
                 history
-                    .compact_with(&control, |_, _| {
-                        let complete_this_pass = completed_first && std::mem::take(&mut first);
-                        let dropped = dropped.clone();
-                        let entered = &entered;
-                        async move {
-                            if complete_this_pass {
-                                return Ok(("first pass recap".into(), 2));
+                    .compact_with(
+                        &control,
+                        #[cfg(feature = "goal")]
+                        None,
+                        |_, _| {
+                            let complete_this_pass = completed_first && std::mem::take(&mut first);
+                            let dropped = dropped.clone();
+                            let entered = &entered;
+                            async move {
+                                if complete_this_pass {
+                                    return Ok(("first pass recap".into(), 2));
+                                }
+                                let _pending = PendingSummary(dropped);
+                                entered.notify_one();
+                                std::future::pending::<anyhow::Result<(String, usize)>>().await
                             }
-                            let _pending = PendingSummary(dropped);
-                            entered.notify_one();
-                            std::future::pending::<anyhow::Result<(String, usize)>>().await
-                        }
-                    })
+                        },
+                    )
                     .await
             };
             let cancel = async {
@@ -2331,6 +2520,8 @@ mod history_tests {
                 history
                     .compact_with(
                         &control,
+                        #[cfg(feature = "goal")]
+                        None,
                         |_, _| -> std::future::Ready<anyhow::Result<(String, usize)>> {
                             panic!("an already-cancelled turn must not start a summary")
                         }
@@ -2339,9 +2530,12 @@ mod history_tests {
                     .is_none()
             );
             history
-                .compact_with(&TurnControl::new(), |messages, _| async move {
-                    Ok(("recovered recap".into(), messages.len()))
-                })
+                .compact_with(
+                    &TurnControl::new(),
+                    #[cfg(feature = "goal")]
+                    None,
+                    |messages, _| async move { Ok(("recovered recap".into(), messages.len())) },
+                )
                 .await
                 .expect("a later turn can compact the unchanged history");
             assert!(!history.needs_compaction());
@@ -2358,13 +2552,18 @@ mod history_tests {
             );
             assert!(history.needs_compaction());
             let result = history
-                .compact_with(&TurnControl::new(), |_, _| async move {
-                    if incomplete {
-                        Ok(("did not cover a turn".to_string(), 0))
-                    } else {
-                        anyhow::bail!("summarizer unavailable")
-                    }
-                })
+                .compact_with(
+                    &TurnControl::new(),
+                    #[cfg(feature = "goal")]
+                    None,
+                    |_, _| async move {
+                        if incomplete {
+                            Ok(("did not cover a turn".to_string(), 0))
+                        } else {
+                            anyhow::bail!("summarizer unavailable")
+                        }
+                    },
+                )
                 .await;
             assert!(result.is_some());
             assert!(!history.needs_compaction());
@@ -5435,6 +5634,115 @@ mod partial_turn_tests {
         assert!(
             interactions.is_empty(),
             "a refusal before any work must retain nothing: {interactions:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_acp_tests {
+    use super::*;
+
+    fn meta(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert("goal".to_string(), value);
+        map
+    }
+
+    fn store_with(objective: &str) -> crate::extras::goal::GoalStore {
+        let store = crate::extras::goal::GoalStore::default();
+        store
+            .set(
+                crate::extras::goal::Goal::new(objective, Vec::new()).unwrap(),
+                false,
+            )
+            .unwrap();
+        store
+    }
+
+    /// The objective arrives as structured metadata, never as prompt text: a
+    /// text directive would let anything that reaches the prompt install a
+    /// long-lived instruction.
+    #[test]
+    fn a_goal_spec_is_read_from_structured_metadata() {
+        let spec = meta(serde_json::json!({
+            "objective": "retire the exporter",
+            "criteria": ["no callers remain"],
+        }));
+        let value = spec.get("goal").unwrap();
+        assert_eq!(
+            value.get("objective").and_then(serde_json::Value::as_str),
+            Some("retire the exporter")
+        );
+        let criteria: Vec<_> = value
+            .get("criteria")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(criteria, vec!["no callers remain"]);
+    }
+
+    #[test]
+    fn replacing_an_unfinished_goal_is_refused_without_permission() {
+        let store = store_with("first");
+        let second = crate::extras::goal::Goal::new("second", Vec::new()).unwrap();
+        assert!(
+            store.set(second.clone(), false).is_err(),
+            "an unfinished goal is the record of work so far"
+        );
+        assert!(store.set(second, true).is_ok(), "replace: true overrides");
+    }
+
+    /// ACP compaction restates the objective for the same reason the session
+    /// path does: the summarizer may drop everything it replaces.
+    #[tokio::test]
+    async fn acp_compaction_restates_the_objective() {
+        let mut history = SessionHistory::default();
+        for index in 0..(MAX_ACP_HISTORY_TURNS + 3) {
+            history.commit_completed_turn(
+                &format!("turn {index}"),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        let store = store_with("finish the migration");
+        let control = TurnControl::new();
+        history
+            .compact_with(&control, Some(&store), |_, _| async {
+                Ok(("a summary that forgot everything".to_string(), 2))
+            })
+            .await;
+
+        let summary = history.summary.clone().expect("history was summarized");
+        assert!(
+            summary.contains("finish the migration"),
+            "the objective must survive ACP compaction: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_goal_is_not_restated_into_an_acp_summary() {
+        let mut history = SessionHistory::default();
+        for index in 0..(MAX_ACP_HISTORY_TURNS + 3) {
+            history.commit_completed_turn(
+                &format!("turn {index}"),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        let store = store_with("already done");
+        store.with_mut(|goal| goal.set_status(crate::extras::goal::GoalStatus::Met, None));
+        let control = TurnControl::new();
+        history
+            .compact_with(&control, Some(&store), |_, _| async {
+                Ok(("summary".to_string(), 2))
+            })
+            .await;
+        assert!(
+            !history
+                .summary
+                .clone()
+                .unwrap_or_default()
+                .contains("already done")
         );
     }
 }
