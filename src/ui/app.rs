@@ -532,12 +532,18 @@ impl<'a> App<'a> {
             todo_tools_enabled: false,
         };
         ui.session.reasoning_enabled = slash.reasoning_enabled;
+        #[cfg(feature = "goal")]
+        let goal_block =
+            crate::extras::goal::prompt::goal_block(ui.session.goal_store.snapshot().as_ref());
+        #[cfg(not(feature = "goal"))]
+        let goal_block: Option<String> = None;
         ui.session.overhead_tokens = crate::agent::builder::estimate_overhead(
             ui.context,
             slash.reasoning_enabled,
             ui.cli,
             ui.cfg,
             &ui.sandbox,
+            goal_block.as_deref(),
         );
 
         render_session(&mut renderer, ui.session, ui.cli, ui.cfg, ui.context)?;

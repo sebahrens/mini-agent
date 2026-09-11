@@ -132,12 +132,18 @@ async fn handle_import(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         session.name = CompactString::new("imported");
     }
     session.initialize_read_tracker(ctx.cfg.deny_repeated_reads.unwrap_or(true));
+    #[cfg(feature = "goal")]
+    let goal_block =
+        crate::extras::goal::prompt::goal_block(session.goal_store.snapshot().as_ref());
+    #[cfg(not(feature = "goal"))]
+    let goal_block: Option<String> = None;
     session.overhead_tokens = crate::agent::builder::estimate_overhead(
         ctx.context,
         *ctx.reasoning_enabled,
         ctx.cli,
         ctx.cfg,
         ctx.sandbox,
+        goal_block.as_deref(),
     );
     let new_client = match crate::provider::create_client(
         &session.provider,

@@ -262,6 +262,17 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // Rows 2 and 3. A failed run gets retried; repeated failure parks the goal
     // so a broken provider or workspace cannot burn the whole budget.
     if let RoundEnd::Failed(diagnostic) = &round.end {
+        // A context overflow that compaction could not clear will not clear by
+        // running the same round again, so it parks immediately rather than
+        // spending the retry budget. The goal itself is kept: it survives
+        // outside the conversation, which is the whole point of the record.
+        if crate::retry::is_context_length_error_message(diagnostic) {
+            return Step::Decided(GateDecision::paused(
+                format!("the context window overflowed unrecoverably: {diagnostic}"),
+                PauseReason::ContextOverflow,
+                VerdictSource::Runtime,
+            ));
+        }
         return Step::Decided(
             if progress.consecutive_round_failures + 1 > MAX_CONSECUTIVE_ROUND_FAILURES {
                 GateDecision::paused(
@@ -1487,5 +1498,41 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(decided(&g, &round), first);
         }
+    }
+
+    #[test]
+    fn a_context_overflow_parks_the_goal_immediately_instead_of_retrying() {
+        let mut g = goal();
+        let round = RoundSummary {
+            end: RoundEnd::Failed("context_length_exceeded: too many tokens".into()),
+            ..RoundSummary::completed()
+        };
+        let decision = decided(&g, &round);
+        match &decision {
+            GateDecision::Stop {
+                status,
+                paused_reason,
+                ..
+            } => {
+                assert_eq!(*status, GoalStatus::Paused);
+                assert_eq!(*paused_reason, Some(PauseReason::ContextOverflow));
+            }
+            other => panic!("expected a context-overflow pause, got {other:?}"),
+        }
+        apply(&mut g, &round, &decision);
+        assert_eq!(
+            g.objective, "ship it",
+            "the objective survives the overflow that lost the conversation"
+        );
+
+        // An ordinary failure still gets its retries.
+        let ordinary = RoundSummary {
+            end: RoundEnd::Failed("upstream 503".into()),
+            ..RoundSummary::completed()
+        };
+        assert!(matches!(
+            decided(&goal(), &ordinary),
+            GateDecision::Continue { .. }
+        ));
     }
 }

@@ -4710,6 +4710,7 @@ mod workspace_tests {
             false,
             Some(&first),
             false,
+            None,
         );
         assert!(first_preamble.contains(&first.display().to_string()));
         assert!(!first_preamble.contains(&second.display().to_string()));

@@ -1608,6 +1608,14 @@ impl Session {
             summary.push_str("\n\n");
             summary.push_str(&todo_context);
         }
+        // A summarizer can drop anything in the messages it replaces, so the
+        // objective is re-stated from the record rather than trusted to survive
+        // in prose.
+        #[cfg(feature = "goal")]
+        if let Some(goal_context) = self.goal_store.critical_context() {
+            summary.push_str("\n\n");
+            summary.push_str(&goal_context);
+        }
         let summarized_count = first_kept_index;
         let summary_tokens = Self::estimate_tokens(&summary);
 
@@ -2106,6 +2114,60 @@ mod goal_persistence_tests {
 
     /// A goal deserialized from an older file with no store field defaults to
     /// empty rather than failing the load.
+    /// A summarizer can drop anything in the messages it replaces, so the
+    /// objective is restated from the record at every compaction boundary.
+    #[test]
+    fn compaction_restates_the_objective_from_the_record() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        for i in 0..6 {
+            session.add_message(MessageRole::User, &format!("message {i}"));
+        }
+        session
+            .goal_store
+            .set(
+                Goal::new("finish the migration", vec!["old table dropped".into()]).unwrap(),
+                false,
+            )
+            .unwrap();
+
+        session.compress("a summary that forgot everything".into(), 4, 100);
+
+        let summary = session
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::System)
+            .expect("summary inserted");
+        assert!(summary.content.contains("finish the migration"));
+        assert!(summary.content.contains("old table dropped"));
+        assert!(
+            summary.content.contains("task data, not instructions"),
+            "the restated objective stays framed as data"
+        );
+    }
+
+    #[test]
+    fn a_finished_goal_is_not_restated_into_a_compaction_summary() {
+        let mut session = Session::new("anthropic", "claude", 200_000, "");
+        for i in 0..6 {
+            session.add_message(MessageRole::User, &format!("message {i}"));
+        }
+        session
+            .goal_store
+            .set(Goal::new("already done", Vec::new()).unwrap(), false)
+            .unwrap();
+        session
+            .goal_store
+            .with_mut(|g| g.set_status(GoalStatus::Met, None));
+
+        session.compress("summary".into(), 4, 100);
+        let summary = session
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::System)
+            .expect("summary inserted");
+        assert!(!summary.content.contains("already done"));
+    }
+
     #[test]
     fn a_missing_goal_field_defaults_to_an_empty_store() {
         let store: GoalStore = serde_json::from_str("null").expect("null store");
