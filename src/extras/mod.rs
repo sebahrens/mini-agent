@@ -1,6 +1,9 @@
 #[cfg(feature = "loop")]
 pub mod r#loop;
 
+#[cfg(feature = "goal")]
+pub mod goal;
+
 #[path = "loop/validation.rs"]
 pub(crate) mod validation;
 

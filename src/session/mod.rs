@@ -537,6 +537,16 @@ pub struct Session {
         skip_serializing_if = "crate::agent::tools::TodoStore::is_empty"
     )]
     pub todos: crate::agent::tools::TodoStore,
+    /// Persistent objective shared by the active agent tools, the driver, and
+    /// every rebuild of this logical session. Held outside `messages` so
+    /// compaction cannot lose it; absent goals serialize away entirely, so a
+    /// session file written before goals existed round-trips unchanged.
+    #[cfg(feature = "goal")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::extras::goal::GoalStore::is_empty"
+    )]
+    pub goal_store: crate::extras::goal::GoalStore,
     /// Process-local repeated-read state for this logical session. It is never
     /// persisted; startup recreates it from the active configuration.
     #[serde(skip)]
@@ -712,6 +722,8 @@ impl Session {
                 .unwrap_or_default(),
             permission_allowlist: Vec::new(),
             todos: crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            goal_store: crate::extras::goal::GoalStore::default(),
             read_tracker: crate::agent::tools::ReadTracker::default(),
             tool_result_spills: ToolResultSpillStore::default(),
             #[cfg(feature = "js")]
@@ -2028,5 +2040,75 @@ mod subagent_tool_record_tests {
             session.trailing_unrecorded_tool_call_indices(2).is_none(),
             "the subagent record must not be counted as a second parent call"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "goal")]
+mod goal_persistence_tests {
+    use super::*;
+    use crate::extras::goal::{Goal, GoalStatus, GoalStore};
+
+    /// A session file written before goals existed must survive a load and
+    /// re-save untouched. `skip_serializing_if` on an absent goal is what makes
+    /// that true, so this guards the compatibility claim rather than the field.
+    #[test]
+    fn a_session_without_a_goal_serializes_exactly_as_it_did_before_goals() {
+        let session = Session::new("anthropic", "claude", 200_000, "");
+        let json = serde_json::to_string_pretty(&session).expect("serialize");
+        assert!(
+            !json.contains("goal_store"),
+            "an absent goal must not appear in the session file:\n{json}"
+        );
+
+        let reloaded: Session = serde_json::from_str(&json).expect("legacy load");
+        let round_tripped = serde_json::to_string_pretty(&reloaded).expect("re-serialize");
+        assert_eq!(
+            json, round_tripped,
+            "loading and re-saving must be byte-identical"
+        );
+        assert!(reloaded.goal_store.is_empty());
+    }
+
+    #[test]
+    fn a_persisted_goal_survives_the_session_round_trip() {
+        let session = Session::new("anthropic", "claude", 200_000, "");
+        let goal = Goal::new("make the suite green", vec!["cargo test passes".into()])
+            .expect("valid goal");
+        session.goal_store.set(goal, false).expect("first goal");
+        session
+            .goal_store
+            .with_mut(|g| g.set_status(GoalStatus::Blocked, None));
+
+        let json = serde_json::to_string(&session).expect("serialize");
+        assert!(json.contains("goal_store"));
+        let reloaded: Session = serde_json::from_str(&json).expect("load");
+        assert_eq!(
+            reloaded.goal_store.snapshot(),
+            session.goal_store.snapshot()
+        );
+    }
+
+    /// Cloning a session hands the clone the same store, so a rebuilt agent and
+    /// the driver never diverge on goal state.
+    #[test]
+    fn cloning_a_session_keeps_one_shared_goal_store() {
+        let session = Session::new("anthropic", "claude", 200_000, "");
+        session
+            .goal_store
+            .set(Goal::new("objective", Vec::new()).unwrap(), false)
+            .unwrap();
+
+        let clone = session.clone();
+        clone.goal_store.with_mut(|g| g.progress.rounds = 9);
+        assert_eq!(session.goal_store.snapshot().unwrap().progress.rounds, 9);
+    }
+
+    /// A goal deserialized from an older file with no store field defaults to
+    /// empty rather than failing the load.
+    #[test]
+    fn a_missing_goal_field_defaults_to_an_empty_store() {
+        let store: GoalStore = serde_json::from_str("null").expect("null store");
+        assert!(store.is_empty());
     }
 }

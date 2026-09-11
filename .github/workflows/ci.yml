@@ -233,6 +233,7 @@ jobs:
           - "--no-default-features --features memory"
           - "--no-default-features --features sandbox"
           - "--no-default-features --features acp"
+          - "--no-default-features --features goal"
           # Opt-in extras that neither the default set nor any focused row
           # compiles. Kept as one row so they get at least one strict lint pass.
           - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
@@ -272,6 +273,10 @@ jobs:
           - "--no-default-features --features js,sandbox"
           - "--no-default-features --features mcp"
           - "--no-default-features --features acp"
+          # Goals gate turn completion and persist on the session, so the
+          # isolated row proves the harness still builds and runs with the
+          # feature off (the `--no-default-features` row above) and on.
+          - "--no-default-features --features goal"
           # Opt-in extras that neither the default set nor any focused row
           # compiles: hooks, advisor, LSP, multimodal, and PDF ingestion.
           - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
