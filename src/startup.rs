@@ -1528,17 +1528,16 @@ impl Startup {
                 &self.session,
                 self.cfg.resolve_keep_recent_tool_results(),
             );
-            let response_result = agent
-                .run_print(
-                    &msg,
-                    self.cli.pure_stdout && !json_output,
-                    !json_output,
-                    &self.cfg.retry,
-                    history,
-                    #[cfg(feature = "hooks")]
-                    None,
-                )
-                .await;
+            let response_result = run_headless_goal_rounds(
+                &agent,
+                &mut self.session,
+                &self.cli,
+                &self.cfg,
+                &msg,
+                history,
+                json_output,
+            )
+            .await;
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
             }
@@ -1784,6 +1783,132 @@ pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec
         (_, Unavailable { reason }) => vec![format!("[!] learned skills unavailable: {reason}")],
         _ => Vec::new(),
     }
+}
+
+/// Run one headless turn, then keep running goal rounds while the gate asks
+/// for them.
+///
+/// Without an active goal this is exactly the single turn `-p` has always run,
+/// so nothing changes for callers that do not use goals. With one, each round
+/// is a fresh agent run with its own turn and token budget, and the decision
+/// that produced it is written to stderr so a CI log shows why the agent kept
+/// going.
+///
+/// The agent is reused between rounds: the goal preamble block is static for
+/// the goal's life, so a rebuild would produce an identical system prompt.
+#[allow(clippy::too_many_arguments)]
+async fn run_headless_goal_rounds(
+    agent: &provider::AnyAgent,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    message: &str,
+    history: std::sync::Arc<[rig::completion::Message]>,
+    json_output: bool,
+) -> crate::agent::runner::HeadlessTurn {
+    let quiet = cli.pure_stdout && !json_output;
+    let stream = !json_output;
+
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
+    let mut turn = agent
+        .run_print(
+            message,
+            quiet,
+            stream,
+            &cfg.retry,
+            history,
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
+
+    #[cfg(feature = "goal")]
+    {
+        use crate::extras::goal::driver::{self, RoundOutcome};
+
+        let verify_configured = cfg
+            .verify_command
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty());
+
+        loop {
+            let Some(goal) = session.goal_store.snapshot() else {
+                break;
+            };
+            if goal.status.is_terminal() {
+                break;
+            }
+
+            let open_todos = session
+                .todos
+                .snapshot()
+                .iter()
+                .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
+                .count();
+            let summary = driver::summary_from_headless_turn(
+                &goal,
+                &turn.interactions,
+                &turn.usage,
+                turn.failure.as_ref(),
+                open_todos,
+                verify_configured,
+                std::time::Duration::ZERO,
+            );
+
+            let outcome =
+                driver::settle_round(&session.goal_store, summary, driver::no_verification).await;
+            let RoundOutcome::Relaunch { relaunch, line } = outcome else {
+                if let RoundOutcome::Stopped { line, .. } = outcome {
+                    eprintln!("{line}");
+                }
+                break;
+            };
+            eprintln!("{line}");
+
+            // The round that just ran is now history for the next one, so it
+            // is persisted before the relaunch rather than at the very end.
+            if !cli.no_session {
+                crate::print::persist_headless_turn(
+                    session,
+                    message,
+                    &turn.response,
+                    &turn.interactions,
+                );
+                let anthropic_native = cfg.is_anthropic_native(&session.provider);
+                session.charge_usage_delta(turn.usage.into(), anthropic_native);
+                if let Err(error) = session::storage::save_session(session) {
+                    eprintln!("warning: failed to save session between goal rounds: {error}");
+                }
+            }
+
+            let next_history: std::sync::Arc<[rig::completion::Message]> = match relaunch.history {
+                driver::HistoryMode::Retained => {
+                    crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                        session,
+                        cfg.resolve_keep_recent_tool_results(),
+                    )
+                }
+                driver::HistoryMode::Empty => std::sync::Arc::from(Vec::new()),
+            };
+
+            let next = agent
+                .run_print(
+                    &relaunch.prompt,
+                    quiet,
+                    stream,
+                    &cfg.retry,
+                    next_history,
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+                .await;
+            // Only the final round's transcript is returned; earlier rounds are
+            // already persisted above.
+            turn = next;
+        }
+    }
+
+    turn
 }
 
 #[cfg(test)]

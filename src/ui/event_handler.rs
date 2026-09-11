@@ -15,7 +15,7 @@ use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
 use crate::ui::state::{AgentRunState, ChainState, SlashState, UiContext};
 
-#[cfg(feature = "loop")]
+#[cfg(any(feature = "loop", feature = "goal"))]
 use super::C_AGENT;
 use super::{C_ERROR, C_TOOL};
 
@@ -64,6 +64,15 @@ pub async fn handle_agent_event(
     chain: &mut ChainState,
     #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
 ) -> anyhow::Result<()> {
+    // Every event contributes to the round the gate will judge, so the goal
+    // sees the run exactly as it happened rather than as the final response
+    // describes it.
+    #[cfg(feature = "goal")]
+    if ui.session.goal_store.is_live() {
+        run.goal_round
+            .get_or_insert_with(crate::extras::goal::driver::RoundCollector::new)
+            .observe(&event);
+    }
     match event {
         AgentEvent::Reasoning(text) => {
             if !slash.show_reasoning {
@@ -474,6 +483,13 @@ async fn handle_agent_done(
         ss.send_stop();
     }
 
+    // A goal round ends where an ordinary turn would: judge it, then either
+    // launch the next round or hand control back with the reason visible.
+    #[cfg(feature = "goal")]
+    if run_goal_round(renderer, run, ui).await? {
+        return Ok(());
+    }
+
     #[cfg(feature = "loop")]
     if let Some(ls) = chain.loop_state.as_mut()
         && ls.active
@@ -634,6 +650,106 @@ async fn finish_loop_iteration(
         C_AGENT,
     )?;
     Ok(())
+}
+
+/// Settle the goal round that just ended, relaunching if the gate says so.
+///
+/// Returns `true` when a new round was launched, so the caller stops treating
+/// this as the end of the user's turn.
+#[cfg(feature = "goal")]
+async fn run_goal_round(
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+) -> anyhow::Result<bool> {
+    use crate::extras::goal::driver::{self, RoundOutcome};
+
+    let Some(collector) = run.goal_round.take() else {
+        return Ok(false);
+    };
+    let goal = ui.session.goal_store.snapshot();
+    let Some(goal) = goal.filter(|g| !g.status.is_terminal()) else {
+        return Ok(false);
+    };
+
+    let mut summary = collector.finish(&goal, crate::extras::goal::gate::RoundEnd::Done, 0);
+    summary.open_todos = ui
+        .session
+        .todos
+        .snapshot()
+        .iter()
+        .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
+        .count();
+    summary.verify_configured = ui
+        .cfg
+        .verify_command
+        .as_deref()
+        .is_some_and(|command| !command.trim().is_empty());
+
+    let outcome =
+        driver::settle_round(&ui.session.goal_store, summary, driver::no_verification).await;
+
+    match outcome {
+        RoundOutcome::Inactive => Ok(false),
+        RoundOutcome::Stopped { line, .. } => {
+            renderer.write_line(&line, C_AGENT)?;
+            if let Err(e) =
+                crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run)
+            {
+                renderer.write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
+            }
+            Ok(false)
+        }
+        RoundOutcome::Relaunch { relaunch, line } => {
+            renderer.write_line(&line, C_AGENT)?;
+            if let Err(e) =
+                crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run)
+            {
+                renderer.write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
+            }
+            let keep_recent = ui.cfg.resolve_keep_recent_tool_results();
+            run.request_tool_results_cleared =
+                ui.session.tool_results_cleared_for_retention(keep_recent);
+            let history: std::sync::Arc<[rig::completion::Message]> = match relaunch.history {
+                driver::HistoryMode::Retained => {
+                    crate::agent::runner::convert_history_shared_with_tool_result_retention(
+                        ui.session,
+                        keep_recent,
+                    )
+                }
+                // A restarted round is deliberately amnesiac: its prompt
+                // carries the objective and a harness-built summary instead.
+                driver::HistoryMode::Empty => std::sync::Arc::from(Vec::new()),
+            };
+            run.agent = Some(
+                ui.agent_build_ctx()
+                    .rebuild_agent(&ui.session.model, true)
+                    .await,
+            );
+            let runner = run
+                .agent
+                .as_ref()
+                .expect("goal agent was rebuilt")
+                .clone()
+                .spawn_runner(
+                    relaunch.prompt,
+                    history,
+                    ui.cfg.retry.clone(),
+                    #[cfg(feature = "hooks")]
+                    None,
+                )
+                .await;
+            run.compaction_decision_tx = runner.compaction_decision_tx;
+            run.agent_rx = Some(runner.event_rx);
+            run.main_abort = Some(runner.abort_handle);
+            run.is_running = true;
+            run.goal_round = Some(driver::RoundCollector::new());
+            if let Some(signals) = ui.status_signals.as_ref() {
+                signals.send_start();
+            }
+            Ok(true)
+        }
+    }
 }
 
 fn finalize_response_segment(

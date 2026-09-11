@@ -403,6 +403,11 @@ pub(crate) struct AgentRunState {
     pub turn_trace: Vec<compact_str::CompactString>,
     pub awaiting_compaction_relief: bool,
     pub pending_compaction_pressure: Option<f64>,
+    /// Facts accumulated for the goal round currently in flight. Present only
+    /// while a goal is running; the gate consumes and clears it when the round
+    /// ends.
+    #[cfg(feature = "goal")]
+    pub goal_round: Option<crate::extras::goal::driver::RoundCollector>,
 }
 
 impl AgentRunState {

@@ -579,7 +579,7 @@ fn skipped_verification_source(
     })
 }
 
-fn tool_may_mutate_workspace(name: &str) -> bool {
+pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
         name,
         "read"

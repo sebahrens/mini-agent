@@ -23,6 +23,7 @@
 // production caller.
 #![allow(dead_code)]
 
+pub mod driver;
 pub mod gate;
 pub mod prompt;
 pub mod report_tool;
