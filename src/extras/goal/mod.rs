@@ -18,6 +18,8 @@ pub mod checks;
 pub mod driver;
 pub mod gate;
 pub mod judge;
+#[cfg(feature = "loop")]
+pub mod preset;
 pub mod prompt;
 pub mod report_tool;
 pub mod transcript;
