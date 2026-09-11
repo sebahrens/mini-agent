@@ -1431,6 +1431,8 @@ async fn run_prompt(
     #[cfg(feature = "goal")]
     let goal_store_for_gate = goal_store.clone();
     #[cfg(feature = "goal")]
+    let sandbox_for_gate = sandbox.clone();
+    #[cfg(feature = "goal")]
     let todo_snapshot = todo_store.snapshot();
     let result = execute_prompt(
         state,
@@ -1473,6 +1475,7 @@ async fn run_prompt(
         outcome.progress.as_deref().unwrap_or(&[]),
         &todo_snapshot,
         &state.cfg,
+        &sandbox_for_gate,
     )
     .await;
 
@@ -1536,6 +1539,7 @@ async fn settle_acp_goal_round(
     interactions: &[Message],
     todos: &[crate::agent::tools::todo::TodoItem],
     cfg: &Config,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> Option<(String, crate::extras::goal::Goal)> {
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
@@ -1562,7 +1566,14 @@ async fn settle_acp_goal_round(
         other => RoundEnd::Failed(format!("{other:?}")),
     };
 
-    let outcome = driver::settle_round(store, summary, |_| async { (None, None) }).await;
+    // The same objective must be gated the same way in an editor as in a
+    // terminal, so the checks tier runs here too. The judge is not wired for
+    // ACP yet; a self-reported completion is still labelled as unverified.
+    let outcome = driver::settle_round(store, summary, |request| async move {
+        let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
+        (checks, None)
+    })
+    .await;
     let line = match outcome {
         RoundOutcome::Inactive => return None,
         RoundOutcome::Relaunch { line, .. } | RoundOutcome::Stopped { line, .. } => line,
