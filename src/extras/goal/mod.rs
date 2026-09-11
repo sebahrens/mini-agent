@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 pub mod gate;
+pub mod report_tool;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};

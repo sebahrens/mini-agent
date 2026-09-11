@@ -723,6 +723,8 @@ impl<'a> App<'a> {
             let sandbox_clone = ui.sandbox.clone();
             let read_tracker_clone = ui.session.read_tracker.clone();
             let todo_store_clone = ui.session.todos.clone();
+            #[cfg(feature = "goal")]
+            let goal_store_clone = ui.session.goal_store.clone();
             #[cfg(feature = "skills")]
             let skill_services_clone = ui.skill_services.clone();
             let reasoning_enabled = slash.reasoning_enabled;
@@ -759,6 +761,8 @@ impl<'a> App<'a> {
                         sandbox: &sandbox_clone,
                         read_tracker: &read_tracker_clone,
                         todo_store: &todo_store_clone,
+                        #[cfg(feature = "goal")]
+                        goal_store: &goal_store_clone,
                         tool_output_session_id: &tool_output_session_id,
                         tool_result_spills: &tool_result_spills,
                         #[cfg(feature = "js")]

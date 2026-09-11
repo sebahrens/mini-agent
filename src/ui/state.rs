@@ -65,6 +65,8 @@ impl<'a> UiContext<'a> {
             sandbox: &self.sandbox,
             read_tracker: &self.session.read_tracker,
             todo_store: &self.session.todos,
+            #[cfg(feature = "goal")]
+            goal_store: &self.session.goal_store,
             tool_output_session_id: &self.session.id,
             tool_result_spills: &self.session.tool_result_spills,
             #[cfg(feature = "js")]
@@ -130,6 +132,8 @@ pub(crate) struct AgentBuildCtx<'a> {
     pub sandbox: &'a Sandbox,
     pub read_tracker: &'a crate::agent::tools::ReadTracker,
     pub todo_store: &'a crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")]
+    pub goal_store: &'a crate::extras::goal::GoalStore,
     pub tool_output_session_id: &'a str,
     pub tool_result_spills: &'a crate::session::ToolResultSpillStore,
     #[cfg(feature = "js")]
@@ -161,6 +165,8 @@ impl AgentBuildCtx<'_> {
             self.sandbox.clone(),
             self.read_tracker.clone(),
             self.todo_store.clone(),
+            #[cfg(feature = "goal")]
+            self.goal_store.clone(),
             self.tool_output_session_id,
             Some(self.tool_result_spills.clone()),
             reasoning_enabled,

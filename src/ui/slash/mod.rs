@@ -83,6 +83,8 @@ impl SlashCtx<'_> {
             sandbox: self.sandbox,
             read_tracker: &self.session.read_tracker,
             todo_store: &self.session.todos,
+            #[cfg(feature = "goal")]
+            goal_store: &self.session.goal_store,
             tool_output_session_id: &self.session.id,
             tool_result_spills: &self.session.tool_result_spills,
             #[cfg(feature = "js")]
@@ -107,6 +109,8 @@ impl SlashCtx<'_> {
             sandbox: self.sandbox,
             read_tracker: &session.read_tracker,
             todo_store: &session.todos,
+            #[cfg(feature = "goal")]
+            goal_store: &session.goal_store,
             tool_output_session_id: &session.id,
             tool_result_spills: &session.tool_result_spills,
             #[cfg(feature = "js")]

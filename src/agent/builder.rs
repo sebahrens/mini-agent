@@ -44,6 +44,7 @@ fn is_reserved_builtin_tool_name(name: &str) -> bool {
             | "list_dir"
             | "todo_write"
             | "todo_read"
+            | "goal_report"
             | "shell"
             | "job_status"
             | "bash"
@@ -451,6 +452,9 @@ pub(crate) fn filter_tools_by_allowlist(
             allowed.contains(name)
                 || (name == "job_status" && allowed.contains("shell"))
                 || (name == "todo_read" && allowed.contains("todo_write"))
+                // A goal's report channel is not a capability the user is
+                // narrowing; without it the gate never hears from the agent.
+                || name == "goal_report"
         })
         .collect()
 }
@@ -571,6 +575,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     sandbox: Sandbox,
     read_tracker: tools::ReadTracker,
     todo_store: tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     tool_output_session_id: &str,
     tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
@@ -671,6 +676,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             todo_store.clone(),
         )));
         base_tools.push(Box::new(tools::ReadTodoList::new(todo_store)));
+        // `goal_report` is a harness control tool, not a capability: it is how
+        // the agent tells the gate what happened. A goal whose agent cannot
+        // report would stall on every round, so registration follows the goal
+        // itself and deliberately ignores `--tools` (see
+        // `filter_tools_by_allowlist`).
+        #[cfg(feature = "goal")]
+        if goal_store.is_live() {
+            base_tools.push(Box::new(crate::extras::goal::report_tool::GoalReport::new(
+                goal_store.clone(),
+            )));
+        }
         // Structured Git is intentionally available only when the git-worktree
         // feature is compiled in; it has no shell/raw-argv escape hatch.
         #[cfg(feature = "git-worktree")]
@@ -1278,10 +1294,12 @@ mod js_tests {
         Sandbox::new(false, "bwrap").with_resolved_shell(Some(capability))
     }
 
-    async fn test_main_agent(
+    #[cfg(feature = "goal")]
+    async fn test_main_agent_with_goal(
         cli: &crate::cli::Cli,
         sandbox: Sandbox,
         workspace: Arc<crate::paths::WorkspaceBinding>,
+        goal_store: crate::extras::goal::GoalStore,
     ) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
         build_agent_inner(
             fake_model("shell-test"),
@@ -1294,6 +1312,49 @@ mod js_tests {
             sandbox,
             crate::agent::tools::ReadTracker::new(true),
             crate::agent::tools::TodoStore::default(),
+            goal_store,
+            "builder-test",
+            None,
+            false,
+            None,
+            None,
+            crate::sandbox::worker::containment_status(),
+            crate::extras::js::session::ScratchStore::default(),
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+        )
+        .await
+    }
+
+    async fn test_main_agent(
+        cli: &crate::cli::Cli,
+        sandbox: Sandbox,
+        workspace: Arc<crate::paths::WorkspaceBinding>,
+    ) -> rig::agent::Agent<rig::test_utils::MockCompletionModel> {
+        #[cfg(feature = "goal")]
+        return test_main_agent_with_goal(
+            cli,
+            sandbox,
+            workspace,
+            crate::extras::goal::GoalStore::default(),
+        )
+        .await;
+        #[cfg(not(feature = "goal"))]
+        build_agent_inner(
+            fake_model("shell-test"),
+            cli,
+            &crate::config::Config::default(),
+            &empty_context(),
+            workspace,
+            None,
+            None,
+            sandbox,
+            crate::agent::tools::ReadTracker::new(true),
+            crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
             "builder-test",
             None,
             false,
@@ -1629,6 +1690,8 @@ mod js_tests {
             Sandbox::new(false, "bwrap"),
             crate::agent::tools::ReadTracker::new(true),
             crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
             "builder-test",
             None,
             false,
@@ -1716,6 +1779,8 @@ mod js_tests {
             Sandbox::new(false, "bwrap"),
             crate::agent::tools::ReadTracker::new(true),
             crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            crate::extras::goal::GoalStore::default(),
             "builder-test",
             None,
             false,
@@ -1775,5 +1840,82 @@ mod js_tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "read"));
         assert!(!names.iter().any(|name| name == "js"), "{names:?}");
+    }
+
+    #[cfg(feature = "goal")]
+    mod goal_report_registration {
+        use super::*;
+        use crate::extras::goal::{Goal, GoalStatus, GoalStore};
+
+        fn live_store() -> GoalStore {
+            let store = GoalStore::default();
+            store
+                .set(Goal::new("ship it", Vec::new()).unwrap(), false)
+                .unwrap();
+            store
+        }
+
+        async fn tool_names(cli: &crate::cli::Cli, store: GoalStore) -> Vec<String> {
+            let agent =
+                test_main_agent_with_goal(cli, shell_sandbox(), workspace_binding(), store).await;
+            agent
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_report_tool_appears_only_while_a_goal_is_unfinished() {
+            let cli = crate::cli::Cli::default();
+
+            let names = tool_names(&cli, GoalStore::default()).await;
+            assert!(
+                !names.iter().any(|n| n == "goal_report"),
+                "no goal, no report tool: {names:?}"
+            );
+
+            let names = tool_names(&cli, live_store()).await;
+            assert!(
+                names.iter().any(|n| n == "goal_report"),
+                "a live goal registers the tool: {names:?}"
+            );
+
+            let finished = live_store();
+            finished.with_mut(|g| g.set_status(GoalStatus::Met, None));
+            let names = tool_names(&cli, finished).await;
+            assert!(
+                !names.iter().any(|n| n == "goal_report"),
+                "a finished goal withdraws it: {names:?}"
+            );
+        }
+
+        /// `--tools` narrows the agent's capabilities. Reporting is not one:
+        /// a goal whose agent cannot report would stall every round, so the
+        /// control channel survives the allowlist.
+        #[tokio::test]
+        async fn a_tool_allowlist_cannot_remove_the_report_channel() {
+            let cli = crate::cli::Cli {
+                tools: vec!["read".to_string()],
+                ..crate::cli::Cli::default()
+            };
+            let names = tool_names(&cli, live_store()).await;
+            assert!(
+                names.iter().any(|n| n == "goal_report"),
+                "goal_report must survive --tools read: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|n| n == "write"),
+                "the allowlist still applies to ordinary tools: {names:?}"
+            );
+        }
+
+        #[test]
+        fn the_report_tool_name_is_reserved_against_shadowing() {
+            assert!(super::super::is_reserved_builtin_tool_name("goal_report"));
+        }
     }
 }

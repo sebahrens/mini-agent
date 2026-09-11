@@ -1882,6 +1882,7 @@ async fn build_openai_agent(
     sandbox: Sandbox,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     tool_output_session_id: &str,
     tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
@@ -1908,6 +1909,8 @@ async fn build_openai_agent(
                 sandbox,
                 read_tracker,
                 todo_store.clone(),
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills.clone(),
                 reasoning_enabled,
@@ -1940,6 +1943,8 @@ async fn build_openai_agent(
                 sandbox,
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,
@@ -1971,6 +1976,7 @@ pub async fn build_agent_in_workspace(
     sandbox: Sandbox,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     tool_output_session_id: &str,
     tool_result_spills: Option<crate::session::ToolResultSpillStore>,
     reasoning_enabled: bool,
@@ -2041,6 +2047,8 @@ pub async fn build_agent_in_workspace(
                 sandbox.clone(),
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,
@@ -2069,6 +2077,8 @@ pub async fn build_agent_in_workspace(
                 sandbox.clone(),
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,
@@ -2097,6 +2107,8 @@ pub async fn build_agent_in_workspace(
                 sandbox.clone(),
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,
@@ -2125,6 +2137,8 @@ pub async fn build_agent_in_workspace(
                 sandbox.clone(),
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,
@@ -2153,6 +2167,8 @@ pub async fn build_agent_in_workspace(
                 sandbox,
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store.clone(),
                 tool_output_session_id,
                 tool_result_spills,
                 reasoning_enabled,

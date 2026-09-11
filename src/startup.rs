@@ -1482,6 +1482,8 @@ impl Startup {
             let completion_model = self.client.completion_model(self.model.to_string());
             let read_tracker = self.session.read_tracker.clone();
             let todo_store = self.session.todos.clone();
+            #[cfg(feature = "goal")]
+            let goal_store = self.session.goal_store.clone();
             #[cfg(feature = "mcp")]
             let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
                 None
@@ -1502,6 +1504,8 @@ impl Startup {
                 self.sandbox.clone(),
                 read_tracker,
                 todo_store,
+                #[cfg(feature = "goal")]
+                goal_store,
                 &self.session.id,
                 Some(self.session.tool_result_spills.clone()),
                 true,
@@ -1634,6 +1638,8 @@ impl Startup {
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
         let read_tracker = self.session.read_tracker.clone();
         let todo_store = self.session.todos.clone();
+        #[cfg(feature = "goal")]
+        let goal_store = self.session.goal_store.clone();
         #[cfg(feature = "mcp")]
         let mut mcp_manager = if !self.cli.mcp_is_eligible(&self.cfg) {
             None
@@ -1653,6 +1659,8 @@ impl Startup {
             self.sandbox.clone(),
             read_tracker,
             todo_store,
+            #[cfg(feature = "goal")]
+            goal_store,
             &self.session.id,
             Some(self.session.tool_result_spills.clone()),
             true,

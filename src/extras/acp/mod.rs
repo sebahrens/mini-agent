@@ -245,6 +245,8 @@ struct SessionState {
     turns: Arc<StdMutex<SessionTurns>>,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")]
+    goal_store: crate::extras::goal::GoalStore,
     sandbox: crate::sandbox::Sandbox,
     #[cfg(feature = "js")]
     js_session_state: crate::extras::js::session::JsSessionStateOwner,
@@ -258,6 +260,8 @@ struct PromptSessionSnapshot {
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")]
+    goal_store: crate::extras::goal::GoalStore,
     sandbox: crate::sandbox::Sandbox,
     #[cfg(feature = "js")]
     js_session_state: crate::extras::js::session::JsSessionStateOwner,
@@ -907,6 +911,8 @@ async fn handle_new_session(
                 state.cfg.deny_repeated_reads.unwrap_or(true),
             ),
             todo_store: crate::agent::tools::TodoStore::default(),
+            #[cfg(feature = "goal")]
+            goal_store: crate::extras::goal::GoalStore::default(),
             sandbox,
             #[cfg(feature = "js")]
             js_session_state: crate::extras::js::session::JsSessionStateOwner::default(),
@@ -1024,6 +1030,8 @@ async fn handle_prompt(
             context: sess.context.clone(),
             read_tracker: sess.read_tracker.clone(),
             todo_store: sess.todo_store.clone(),
+            #[cfg(feature = "goal")]
+            goal_store: sess.goal_store.clone(),
             sandbox: sess.sandbox.clone(),
             #[cfg(feature = "js")]
             js_session_state: sess.js_session_state.clone(),
@@ -1043,6 +1051,8 @@ async fn handle_prompt(
         context,
         read_tracker,
         todo_store,
+        #[cfg(feature = "goal")]
+        goal_store,
         sandbox,
         #[cfg(feature = "js")]
         js_session_state,
@@ -1087,6 +1097,8 @@ async fn handle_prompt(
                     context,
                     read_tracker,
                     todo_store,
+                    #[cfg(feature = "goal")]
+                    goal_store,
                     sandbox,
                     #[cfg(feature = "js")]
                     js_session_state,
@@ -1329,6 +1341,7 @@ async fn run_prompt(
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     sandbox: crate::sandbox::Sandbox,
     #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")] skill_services: Arc<
@@ -1352,6 +1365,8 @@ async fn run_prompt(
         context,
         read_tracker,
         todo_store,
+        #[cfg(feature = "goal")]
+        goal_store,
         sandbox,
         #[cfg(feature = "js")]
         js_session_state,
@@ -1427,6 +1442,7 @@ async fn execute_prompt(
     context: Arc<ContextFiles>,
     read_tracker: crate::agent::tools::ReadTracker,
     todo_store: crate::agent::tools::TodoStore,
+    #[cfg(feature = "goal")] goal_store: crate::extras::goal::GoalStore,
     sandbox: crate::sandbox::Sandbox,
     #[cfg(feature = "js")] js_session_state: crate::extras::js::session::JsSessionStateOwner,
     #[cfg(feature = "skills")] skill_services: Arc<
@@ -1611,6 +1627,8 @@ async fn execute_prompt(
             sandbox,
             read_tracker,
             todo_store,
+            #[cfg(feature = "goal")]
+            goal_store,
             &tool_output_session_id,
             None,
             false,
