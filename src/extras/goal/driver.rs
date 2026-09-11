@@ -651,6 +651,33 @@ mod settle_tests {
     use super::*;
     use crate::extras::goal::{Goal, GoalStore, JudgePolicy, ReportStatus};
 
+    /// Redirect the application data root so a settled round writes its
+    /// transcript into a temporary directory instead of the real one.
+    struct IsolatedPaths {
+        path: std::path::PathBuf,
+        _environment: crate::tests::ScopedProcessEnv,
+    }
+
+    impl Drop for IsolatedPaths {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn isolated_paths() -> IsolatedPaths {
+        let path =
+            std::env::temp_dir().join(format!("zerostack-goal-tests-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        let environment = crate::tests::ScopedProcessEnv::set(&[(
+            "ZS_DATA_DIR",
+            Some(path.as_os_str().to_os_string()),
+        )]);
+        IsolatedPaths {
+            path,
+            _environment: environment,
+        }
+    }
+
     fn store() -> GoalStore {
         let store = GoalStore::default();
         let mut goal = Goal::new("finish the job", Vec::new()).unwrap();
@@ -674,6 +701,7 @@ mod settle_tests {
 
     #[tokio::test]
     async fn a_working_round_relaunches_with_a_visible_reason() {
+        let _paths = isolated_paths();
         let store = store();
         report(&store, ReportStatus::Progress);
         let summary = RoundSummary {
@@ -693,6 +721,7 @@ mod settle_tests {
 
     #[tokio::test]
     async fn a_verified_completion_stops_and_records_the_status() {
+        let _paths = isolated_paths();
         let store = store();
         report(&store, ReportStatus::Met);
         let summary = RoundSummary {
@@ -711,6 +740,7 @@ mod settle_tests {
 
     #[tokio::test]
     async fn with_no_goal_the_surface_behaves_as_if_goals_did_not_exist() {
+        let _paths = isolated_paths();
         let empty = GoalStore::default();
         let outcome = settle_round(&empty, RoundSummary::completed(), no_verification).await;
         assert_eq!(outcome, RoundOutcome::Inactive);
@@ -718,6 +748,7 @@ mod settle_tests {
 
     #[tokio::test]
     async fn an_interrupted_round_stops_without_consuming_the_goal() {
+        let _paths = isolated_paths();
         let store = store();
         let summary = RoundSummary {
             end: RoundEnd::Cancelled,
@@ -736,6 +767,7 @@ mod settle_tests {
     /// ordinary round never pays for checks or a judge.
     #[tokio::test]
     async fn verification_runs_only_on_a_completion_claim() {
+        let _paths = isolated_paths();
         let store = store();
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
