@@ -17,7 +17,7 @@ use crate::sandbox::{
 /// tests supply smaller limits without weakening production bounds.
 #[cfg(feature = "loop")]
 pub(crate) const LOOP_VALIDATION_LIMITS: CommandLimits = DEFAULT_COMMAND_LIMITS;
-#[cfg(any(feature = "loop", all(test, unix)))]
+#[cfg(any(feature = "loop", feature = "goal", all(test, unix)))]
 const COMMAND_DISPLAY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +263,7 @@ pub(crate) fn sanitize_bytes(bytes: &[u8], max_bytes: usize) -> (String, bool) {
     (result, truncated)
 }
 
-#[cfg(any(feature = "loop", all(test, unix)))]
+#[cfg(any(feature = "loop", feature = "goal", all(test, unix)))]
 pub(crate) fn display_command(command: &str) -> String {
     let (mut safe, _) = sanitize_bytes(command.as_bytes(), COMMAND_DISPLAY_BYTES);
     if command.len() > COMMAND_DISPLAY_BYTES {
