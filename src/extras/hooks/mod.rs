@@ -255,6 +255,14 @@ pub(crate) async fn dispatch_user_prompt_submit(prompt: String) -> PromptGate {
     gate_user_prompt(&dispatcher, &best_effort_ctx(), prompt).await
 }
 
+/// The active goal, as a `Stop` hook sees it.
+#[derive(Debug, Clone)]
+pub struct GoalHookInfo {
+    pub id: String,
+    pub status: String,
+    pub round: u64,
+}
+
 /// Outcome of dispatching `Stop`: either release (send the final response) or
 /// force continuation with the hook's reason as the next instruction.
 pub(crate) enum StopGate {
@@ -269,6 +277,7 @@ pub(crate) async fn gate_stop(
     stop_hook_active: bool,
     loop_iteration: Option<u64>,
     loop_active: Option<bool>,
+    goal: Option<GoalHookInfo>,
 ) -> StopGate {
     let decision = dispatcher
         .dispatch(
@@ -279,6 +288,9 @@ pub(crate) async fn gate_stop(
                 stop_hook_active,
                 loop_iteration,
                 loop_active,
+                goal_id: goal.as_ref().map(|g| g.id.clone()),
+                goal_status: goal.as_ref().map(|g| g.status.clone()),
+                goal_round: goal.as_ref().map(|g| g.round),
             },
         )
         .await;
@@ -295,6 +307,7 @@ pub(crate) async fn dispatch_stop(
     stop_hook_active: bool,
     loop_iteration: Option<u64>,
     loop_active: Option<bool>,
+    goal: Option<GoalHookInfo>,
 ) -> StopGate {
     let Some(dispatcher) = get_dispatcher() else {
         return StopGate::Release;
@@ -305,6 +318,7 @@ pub(crate) async fn dispatch_stop(
         stop_hook_active,
         loop_iteration,
         loop_active,
+        goal,
     )
     .await
 }

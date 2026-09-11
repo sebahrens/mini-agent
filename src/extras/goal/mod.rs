@@ -21,6 +21,7 @@ pub mod gate;
 pub mod judge;
 pub mod prompt;
 pub mod report_tool;
+pub mod transcript;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -647,6 +648,41 @@ impl Goal {
     }
 }
 
+/// The active goal as the `Stop` hook sees it, published for the runner.
+///
+/// The runner dispatches `Stop` but holds no session, and hooks already read a
+/// process-wide dispatcher rather than carrying one through every signature.
+/// The driver publishes the current goal the same way, so a hook can see which
+/// goal a turn belongs to without threading the store through eight spawn
+/// signatures that have nothing else to do with goals.
+#[cfg(feature = "hooks")]
+static CURRENT_GOAL: std::sync::Mutex<Option<(CompactString, &'static str, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Publish (or clear) the goal a `Stop` hook should be told about.
+#[cfg(feature = "hooks")]
+pub fn publish_hook_info(goal: Option<&Goal>) {
+    let value = goal
+        .filter(|g| !g.status.is_terminal())
+        .map(|g| (g.id.clone(), g.status.label(), u64::from(g.progress.rounds)));
+    if let Ok(mut slot) = CURRENT_GOAL.lock() {
+        *slot = value;
+    }
+}
+
+/// What to put in the next `Stop` envelope, if a goal is running.
+#[cfg(feature = "hooks")]
+pub fn current_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
+    CURRENT_GOAL.lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .map(|(id, status, round)| crate::extras::hooks::GoalHookInfo {
+                id: id.to_string(),
+                status: (*status).to_string(),
+                round: *round,
+            })
+    })
+}
+
 /// Shared handle to the session's goal.
 ///
 /// Cloning a live session keeps the same store, so a rebuilt agent and the
@@ -1101,5 +1137,31 @@ mod tests {
             same_as_session: false,
         };
         assert_eq!(distinct.describe(), "goal_judge (anthropic/small)");
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod hook_info_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_goal_is_published_and_a_finished_one_is_not() {
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        goal.progress.rounds = 4;
+        publish_hook_info(Some(&goal));
+        let info = current_hook_info().expect("a live goal is visible to hooks");
+        assert_eq!(info.id, goal.id.to_string());
+        assert_eq!(info.status, "active");
+        assert_eq!(info.round, 4);
+
+        goal.set_status(GoalStatus::Met, None);
+        publish_hook_info(Some(&goal));
+        assert!(
+            current_hook_info().is_none(),
+            "a finished goal is not an active goal"
+        );
+
+        publish_hook_info(None);
+        assert!(current_hook_info().is_none());
     }
 }

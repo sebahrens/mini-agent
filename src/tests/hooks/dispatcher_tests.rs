@@ -341,6 +341,9 @@ async fn dispatch_generic_returns_continue_when_no_handler_matches() {
                 stop_hook_active: false,
                 loop_iteration: None,
                 loop_active: None,
+                goal_id: None,
+                goal_status: None,
+                goal_round: None,
             },
         )
         .await;
@@ -366,6 +369,9 @@ async fn dispatch_generic_blocks_on_decision_block_json() {
                 stop_hook_active: false,
                 loop_iteration: None,
                 loop_active: None,
+                goal_id: None,
+                goal_status: None,
+                goal_round: None,
             },
         )
         .await;
@@ -402,6 +408,9 @@ async fn dispatch_starts_async_handlers_without_waiting_and_ignores_their_decisi
                 stop_hook_active: false,
                 loop_iteration: None,
                 loop_active: None,
+                goal_id: None,
+                goal_status: None,
+                goal_round: None,
             },
         )
         .await;
@@ -493,6 +502,9 @@ async fn exercise_async_hook_cancellation(
                     stop_hook_active: false,
                     loop_iteration: None,
                     loop_active: None,
+                    goal_id: None,
+                    goal_status: None,
+                    goal_round: None,
                 },
             )),
         )
@@ -1063,6 +1075,9 @@ async fn once_identity_keeps_distinct_argv_and_environment_bindings_independent(
                     stop_hook_active: false,
                     loop_iteration: None,
                     loop_active: None,
+                    goal_id: None,
+                    goal_status: None,
+                    goal_round: None,
                 },
             )
             .await;

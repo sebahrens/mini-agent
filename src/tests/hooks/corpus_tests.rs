@@ -144,6 +144,9 @@ async fn corpus_cases_match_expected_decisions() {
                             stop_hook_active: false,
                             loop_iteration: None,
                             loop_active: None,
+                            goal_id: None,
+                            goal_status: None,
+                            goal_round: None,
                         },
                     )
                     .await;

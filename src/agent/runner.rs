@@ -579,6 +579,19 @@ fn skipped_verification_source(
     })
 }
 
+/// The active goal, for the `Stop` hook envelope.
+#[cfg(feature = "hooks")]
+fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
+    #[cfg(feature = "goal")]
+    {
+        crate::extras::goal::current_hook_info()
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        None
+    }
+}
+
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
         name,
@@ -2880,6 +2893,7 @@ where
                                     stop_hook_active,
                                     loop_info.map(|info| u64::from(info.iteration)),
                                     loop_info.map(|info| info.active),
+                                    goal_hook_info(),
                                 )
                                 .await
                             {
@@ -3611,6 +3625,7 @@ where
                             stop_hook_active,
                             loop_info.map(|info| u64::from(info.iteration)),
                             loop_info.map(|info| info.active),
+                            goal_hook_info(),
                         ))
                     {
                         consecutive_stop_blocks += 1;

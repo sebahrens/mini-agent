@@ -1537,6 +1537,14 @@ impl AppPaths {
         self.state_dir.join("loops")
     }
 
+    /// Goal round records. Kept apart from `loops` so a goal's history is never
+    /// confused with a `--loop` iteration's; see the artifact ownership table
+    /// in `docs/specs/platform-paths.md`.
+    #[cfg(feature = "goal")]
+    pub fn goals_dir(&self) -> PathBuf {
+        self.state_dir.join("goals")
+    }
+
     #[cfg(test)]
     pub fn turn_telemetry_dir(&self) -> PathBuf {
         self.state_dir.join("telemetry")

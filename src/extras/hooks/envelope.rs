@@ -26,6 +26,11 @@ pub(crate) enum EventFields {
         stop_hook_active: bool,
         loop_iteration: Option<u64>,
         loop_active: Option<bool>,
+        /// Active goal, when one is running. `None` without a goal, so a hook
+        /// written before goals existed sees exactly what it did before.
+        goal_id: Option<String>,
+        goal_status: Option<String>,
+        goal_round: Option<u64>,
     },
     SessionStart {
         source: String,
@@ -86,10 +91,16 @@ pub(crate) fn build_envelope(ctx: &HookCtx, hook_event_name: &str, fields: Event
             stop_hook_active,
             loop_iteration,
             loop_active,
+            goal_id,
+            goal_status,
+            goal_round,
         } => json!({
             "stop_hook_active": stop_hook_active,
             "loop_iteration": loop_iteration,
             "loop_active": loop_active,
+            "goal_id": goal_id,
+            "goal_status": goal_status,
+            "goal_round": goal_round,
         }),
         EventFields::SessionStart { source } => json!({ "source": source }),
         EventFields::SessionEnd { reason } => json!({ "reason": reason }),

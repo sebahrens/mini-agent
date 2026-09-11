@@ -594,19 +594,31 @@ where
         return RoundOutcome::Inactive;
     }
 
-    let (decision, judged) = match super::gate::gate_pre(&goal, &summary) {
-        super::gate::Step::Decided(decision) => (decision, None),
+    let (decision, checked, judged) = match super::gate::gate_pre(&goal, &summary) {
+        super::gate::Step::Decided(decision) => (decision, None, None),
         super::gate::Step::Verify(request) => {
             let (checks, judge) = run_verification(request.clone()).await;
             let decision =
                 super::gate::gate_post(&goal, &summary, &request, checks.as_ref(), judge.as_ref());
-            (decision, judge)
+            (decision, checks, judge)
         }
     };
 
     let line = store
         .with_mut(|goal| {
             super::gate::apply(goal, &summary, &decision, judged.as_ref());
+            // Written after the fold so the record shows the status the round
+            // actually produced.
+            super::transcript::save_round(
+                goal,
+                &summary,
+                &decision,
+                decision.reason(),
+                checked.as_ref(),
+                judged.as_ref(),
+            );
+            #[cfg(feature = "hooks")]
+            super::publish_hook_info(Some(goal));
             decision_line(goal, &decision)
         })
         .unwrap_or_default();

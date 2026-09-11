@@ -59,11 +59,17 @@ fn stop_envelope_in_loop_mode_carries_loop_fields() {
             stop_hook_active: true,
             loop_iteration: Some(3),
             loop_active: Some(true),
+            goal_id: Some("g-1".into()),
+            goal_status: Some("active".into()),
+            goal_round: Some(7),
         },
     );
     assert_eq!(envelope["stop_hook_active"], true);
     assert_eq!(envelope["loop_iteration"], 3);
     assert_eq!(envelope["loop_active"], true);
+    assert_eq!(envelope["goal_id"], "g-1");
+    assert_eq!(envelope["goal_status"], "active");
+    assert_eq!(envelope["goal_round"], 7);
 }
 
 #[test]
@@ -75,10 +81,17 @@ fn stop_envelope_outside_loop_mode_has_null_loop_fields() {
             stop_hook_active: false,
             loop_iteration: None,
             loop_active: None,
+            goal_id: None,
+            goal_status: None,
+            goal_round: None,
         },
     );
     assert!(envelope["loop_iteration"].is_null());
     assert!(envelope["loop_active"].is_null());
+    // A hook written before goals existed sees exactly what it saw before.
+    assert!(envelope["goal_id"].is_null());
+    assert!(envelope["goal_status"].is_null());
+    assert!(envelope["goal_round"].is_null());
 }
 
 #[test]
