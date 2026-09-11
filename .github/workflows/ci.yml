@@ -35,6 +35,81 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Which jobs need to run for this event.
+  #
+  # A documentation-only commit used to trigger the whole matrix: 13 test rows
+  # on two platforms, nine strict Clippy rows, the VS Code extension smoke, and
+  # the packaging smoke. None of that can be affected by editing Markdown, so
+  # the expensive jobs below take `needs: changes` and run only when a code
+  # path moved. `fmt` stays unconditional because it also runs the repository
+  # policy scripts, which guard workflow and documentation policy and finish in
+  # seconds.
+  #
+  # This fails open. Tag pushes, scheduled runs, and any event whose base
+  # revision cannot be resolved (a first push, a force push, a shallow clone)
+  # all report `code=true` and get the full matrix. Skipping work is only ever
+  # the result of a diff we successfully computed.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect whether this change can affect the build
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          run_everything() {
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Running the full matrix: $1"
+            exit 0
+          }
+
+          case "$EVENT" in
+            schedule|workflow_dispatch) run_everything "event is $EVENT" ;;
+          esac
+          case "$GITHUB_REF" in
+            refs/tags/*) run_everything "tag build" ;;
+          esac
+
+          # An all-zero or empty base is a branch creation or an unresolvable
+          # history; either way we cannot trust a diff.
+          case "$BASE_SHA" in
+            ""|0000000000000000000000000000000000000000)
+              run_everything "no resolvable base revision" ;;
+          esac
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+            || run_everything "base revision $BASE_SHA is not present"
+
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 2>/dev/null) \
+            || run_everything "could not diff $BASE_SHA..$HEAD_SHA"
+          if [ -z "$changed" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "No files changed."
+            exit 0
+          fi
+
+          echo "Changed files:"
+          echo "$changed" | sed 's/^/  /'
+
+          # Anything outside this documentation set is treated as code.
+          if echo "$changed" | grep -qvE '^(docs/|\.beads/|[^/]*\.md$|LICENSE|editors/vscode/.*\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Code paths changed; running the full matrix."
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Documentation-only change; skipping build, lint, and test jobs."
+          fi
+
   fmt:
     if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
@@ -107,7 +182,8 @@ jobs:
           python3 scripts/check_workspace_boundaries.py
 
   harness-regression:
-    if: github.event_name == 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,7 +233,8 @@ jobs:
           bash scripts/gym/train.sh --help > /dev/null
 
   package-compliance-smoke:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -174,7 +251,8 @@ jobs:
         run: python3 scripts/smoke-package-compliance.py ${{ matrix.channels }}
 
   vscode:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -217,7 +295,8 @@ jobs:
           npm run sbom
 
   clippy:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -254,7 +333,8 @@ jobs:
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -357,7 +437,8 @@ jobs:
   # The local ONNX/BGE embedding backend and the complete feature union run on
   # Linux, where ort-sys publishes a supported runtime artifact.
   all-features:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     env:
       RUST_MIN_STACK: 8388608
@@ -386,7 +467,8 @@ jobs:
           -- --exact --test-threads=1
 
   parallel-test-smoke:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -396,7 +478,8 @@ jobs:
         run: cargo test --locked
 
   windows-default-compile:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -413,7 +496,8 @@ jobs:
         run: cargo test --locked --no-run
 
   linux-sandbox-policy:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -598,7 +682,8 @@ jobs:
           if-no-files-found: error
 
   macos-worker-containment-gate:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -758,7 +843,8 @@ jobs:
           if-no-files-found: error
 
   windows-worker-launcher-unit:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -836,7 +922,8 @@ jobs:
           -- --exact --nocapture
 
   macos-gym-ownership:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -844,7 +931,8 @@ jobs:
         run: python3 -m unittest scripts.tests.test_gym_macos -v
 
   windows-general-sandbox-policy:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -922,7 +1010,8 @@ jobs:
           }
 
   windows-worker-containment-gate:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1591,8 +1680,9 @@ jobs:
           }
 
   phase6-cross-platform-gate:
-    if: always() && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: always() && needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs:
+      - changes
       - linux-sandbox-policy
       - macos-worker-containment-gate
       - windows-general-sandbox-policy
@@ -1652,7 +1742,8 @@ jobs:
           if-no-files-found: error
 
   platform-paths:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1773,7 +1864,8 @@ jobs:
           if-no-files-found: error
 
   platform-path-negative-controls:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1825,7 +1917,8 @@ jobs:
           if-no-files-found: error
 
   platform-path-install-smoke:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1933,7 +2026,8 @@ jobs:
           if-no-files-found: error
 
   mcp-stdio:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1957,7 +2051,8 @@ jobs:
         run: cargo test --locked --no-default-features --features mcp,acp mcp_http_tests
 
   lsp-lifecycle:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1977,7 +2072,8 @@ jobs:
         run: cargo test --locked --no-default-features --features lsp lsp_process
 
   install:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     strategy:
       fail-fast: false
       matrix:
@@ -1998,7 +2094,8 @@ jobs:
         run: cargo install --locked --path . --debug
 
   windows-msi:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2052,7 +2149,8 @@ jobs:
           if (Test-Path $installed) { throw 'MSI uninstall left the installed binary behind' }
 
   package:
-    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2088,7 +2186,8 @@ jobs:
             grep -Fxq "JS runtime check: PASS (2)"
 
   dependency-policy:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

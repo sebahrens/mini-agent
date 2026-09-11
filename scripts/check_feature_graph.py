@@ -83,6 +83,7 @@ FEATURE_ROWS = (
     row("js-sandbox", "js,sandbox", JS_PACKAGES),
     row("mcp", "mcp", MCP_PACKAGES),
     row("acp", "acp", ACP_PACKAGES),
+    row("goal", "goal", frozenset()),
     row("lsp", "lsp", LSP_PACKAGES),
     # Opt-in extras that neither the default set nor another focused row
     # compiles; `lsp` is the only member that activates optional packages.
@@ -112,6 +113,7 @@ TEST_MATRIX_ROWS = (
     "js-sandbox",
     "mcp",
     "acp",
+    "goal",
     "extras",
     "hooks-js-subagents-skills",
     "js-skills",
@@ -123,6 +125,7 @@ CLIPPY_MATRIX_ROWS = (
     "memory",
     "sandbox",
     "acp",
+    "goal",
     "extras",
     "hooks-js-subagents-skills",
     "js-skills",
