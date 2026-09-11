@@ -677,6 +677,23 @@ Accepted by the [2026-09-05 harness design review](../plans/2026-09-05-001-harne
 5. **Canary embeddings** (mini-agent-c8q6, delivered). Rebuilds backfill canary rows so an embedding model
    change cannot silently un-route them.
 
+## 12c. Goal outcomes (extension, 2026-09-11)
+
+The goal feature (`docs/specs/goals.md`) adds one closed task-outcome source,
+`goal { goal_id, verified_by }`, recorded once per gate evaluation for a turn that ran under an
+active goal.
+
+**Promotion exclusion.** A goal verdict counts toward learned-skill promotion only when its
+`verified_by` set contains `checks` or `verify_command` — that is, only when a command exited zero.
+A verdict backed solely by the model's own `goal_report` call, by a judge model reading the
+transcript, or by both, is retained for utility statistics and excluded from promotion exactly as
+`no_verify_command` and `gate_skipped` are. A transcript judge is not an oracle: it reads what the
+worker wrote, so admitting its agreement as promotion evidence would let a skill be promoted on the
+strength of its own account of itself.
+
+Production derivation is unchanged: the session constructor decides it, `MINI_AGENT_GYM=1` can only
+downgrade it, and Gym evidence remains non-production.
+
 ## 12b. Delivered task-outcome and lifecycle hardening (2026-09-06)
 
 1. **Task outcomes.** Schema version 11 added one bounded outcome row for a completed turn with the

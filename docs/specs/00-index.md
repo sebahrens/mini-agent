@@ -1,10 +1,10 @@
 # Spec Index — mini-agent
 
 - **Document role**: normative authority map
-- **Specification version**: 1.7.0
+- **Specification version**: 1.8.0
 - **Delivery status**: living specification
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-08
+- **Last reconciled**: 2026-09-11
 
 ## Authority and conflict resolution
 
@@ -86,6 +86,28 @@ its original phase.
 | Phase 3, `Runtime binding` and `No-effect skill verification` | Same-context source binding and parent/in-thread verifier runtime ownership | `Capability broker`, `Verification parity` | Frozen turn bundle, declared exports, deterministic fake semantics, exact-true tests |
 | Phase 4, `propose_skill()` and proposal persistence | Identity-v1 flat capability payload, JS-thread host placement, and direct access to durable enqueue | `Capability broker`, `Persistence boundary` | Proposal field bounds, held-out evaluation, human approval gates |
 | Phase 5, `Lifecycle and immutable lineage` and `Automatic quarantine` | Normal lifecycle treatment of identity-v1 artifacts during Phase 6 migration | `Persistence boundary`, `Failure semantics` | Evidence policy, transactional lifecycle/index coordination, repair/rollback for eligible identities, retention |
+
+## Goal feature extensions (2026-09-11)
+
+The goal feature is a harness capability: a persistent objective the agent works toward across
+turns, with tiered verification and bounds enforced in code. Its normative home is
+`docs/specs/goals.md` (promoted in `mini-agent-a1qwa.15`); until then the approved design at
+`docs/superpowers/specs/2026-09-11-goal-feature-design.md` and the review disposition at
+`docs/reviews/2026-09-11-goal-design-devils-advocate.md` carry the contract.
+
+Goals extend three owned concerns and change nothing else. Each extension is recorded in the owning
+file per rule 3 above:
+
+| Owning authority | Extension | Section |
+|------------------|-----------|---------|
+| [subprocess-trust.md](subprocess-trust.md) | `TC-GOAL-CHECK`: goal completion checks run through the shared bounded validation runner, authorized by the human who wrote the check. `TC-LOOP-VALIDATION` and `TC-INTERNAL-VERIFICATION` are unchanged. | `Trust classes and normative contracts`, `Exact launch-site audit` |
+| [platform-paths.md](platform-paths.md) | `state_dir/goals/<goal-id>` owns goal round transcripts, separate from `state_dir/loops`. | Artifact ownership table |
+| [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | A `goal` task-outcome source, excluded from promotion unless a command proved the verdict. | `12c. Goal outcomes` |
+
+A goal never changes the security mode, the permission allowlist, or the sandbox policy. It bounds
+how long the harness keeps working and decides when it may stop; it never widens what may run. The
+`goal` Cargo feature being enabled is not a claim that any of this is delivered, exactly as for
+every other feature in the corpus.
 
 ## Delivered amendments (2026-09-05)
 

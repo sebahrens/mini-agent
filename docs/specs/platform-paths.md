@@ -144,6 +144,7 @@ new config file under the data root merely because no config file exists yet.
 | Imported portable Agent Skill trees | `data_dir/skills` | Portable reviewed skill content |
 | Learned JS `skills.db`, embeddings, held-out suites, lifecycle/evidence DB | `local_data_dir/skills` | SQLite and mutable indexes are machine-local and unsafe to roam concurrently |
 | Sessions, transcripts, tool output, loop state, turn telemetry, crash state, logs | `state_dir` | Durable operational state, not configuration or skill evidence |
+| Goal round transcripts | `state_dir/goals/<goal-id>` | Durable operational state owned by the goal feature. Written with the application's private permissions, one bounded JSON record per gate evaluation, suppressed entirely when artifact writing is disabled. Separate from `state_dir/loops` so a goal's record is never confused with a `--loop` iteration's. No migration: the directory is new and absent installations have nothing to move. |
 | Welcome, hook/config trust, architecture, and migration markers | `state_dir/shown_welcome_msg`, `state_dir/hooks`, `state_dir/config`, `state_dir/archmd`, `state_dir/migrations/v1` | Machine-local operational and migration state |
 | Brokered JavaScript effect audit | `state_dir/audit/js-effects` | Private machine-local security evidence with one exclusive writer and hash-linked segments |
 | Embedding model downloads, query cache, rebuildable dense snapshots, import staging | `cache_dir` | Safe to delete and reconstruct |
