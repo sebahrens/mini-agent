@@ -621,7 +621,8 @@ where
     }
 }
 
-/// Verification hook for surfaces that have no tiers wired yet.
+/// Verification hook for tests and for surfaces with no tiers wired.
+#[cfg(test)]
 pub async fn no_verification(
     _request: super::gate::VerifyRequest,
 ) -> (

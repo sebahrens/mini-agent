@@ -1536,6 +1536,7 @@ impl Startup {
                 &mut self.session,
                 &self.cli,
                 &self.cfg,
+                &self.sandbox,
                 &msg,
                 history,
                 json_output,
@@ -1821,6 +1822,16 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
     }
     goal.bounds.apply_config(cfg);
     goal.judge = cfg.resolve_goal_judge();
+    // Trusted configuration first, then the flags, so a command typed at the
+    // prompt is always additive to whatever the project already required.
+    for command in cfg.goal_checks.iter().flatten() {
+        goal.checks
+            .push(crate::extras::goal::GoalCheck::new(command.as_str()));
+    }
+    for command in &cli.goal_check {
+        goal.checks
+            .push(crate::extras::goal::GoalCheck::new(command.clone()));
+    }
 
     session
         .goal_store
@@ -1845,6 +1856,7 @@ async fn run_headless_goal_rounds(
     #[cfg_attr(not(feature = "goal"), allow(unused_variables))] session: &mut Session,
     cli: &Cli,
     cfg: &config::Config,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] sandbox: &crate::sandbox::Sandbox,
     message: &str,
     history: std::sync::Arc<[rig::completion::Message]>,
     json_output: bool,
@@ -1898,8 +1910,21 @@ async fn run_headless_goal_rounds(
                 std::time::Duration::ZERO,
             );
 
+            let sandbox_for_checks = sandbox.clone();
+            let cfg_for_checks = cfg.clone();
+            let goal_for_checks = goal.clone();
             let outcome =
-                driver::settle_round(&session.goal_store, summary, driver::no_verification).await;
+                driver::settle_round(&session.goal_store, summary, move |request| async move {
+                    let checks = crate::extras::goal::checks::run(
+                        &goal_for_checks,
+                        &request,
+                        &sandbox_for_checks,
+                        &cfg_for_checks,
+                    )
+                    .await;
+                    (checks, None)
+                })
+                .await;
             let RoundOutcome::Relaunch { relaunch, line } = outcome else {
                 if let RoundOutcome::Stopped { line, .. } = outcome {
                     eprintln!("{line}");

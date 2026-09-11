@@ -686,8 +686,18 @@ async fn run_goal_round(
         .as_deref()
         .is_some_and(|command| !command.trim().is_empty());
 
+    // Commands are the only external proof a completion claim can have, so the
+    // checks tier runs here whenever the gate asks for it.
+    let sandbox = ui.sandbox.clone();
+    let cfg = ui.cfg.clone();
+    let goal_for_checks = goal.clone();
     let outcome =
-        driver::settle_round(&ui.session.goal_store, summary, driver::no_verification).await;
+        driver::settle_round(&ui.session.goal_store, summary, move |request| async move {
+            let checks =
+                crate::extras::goal::checks::run(&goal_for_checks, &request, &sandbox, &cfg).await;
+            (checks, None)
+        })
+        .await;
 
     match outcome {
         RoundOutcome::Inactive => Ok(false),

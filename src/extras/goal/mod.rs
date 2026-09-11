@@ -15,6 +15,7 @@
 //! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
 //! §4.1 (record and shared store).
 
+pub mod checks;
 pub mod driver;
 pub mod gate;
 pub mod prompt;

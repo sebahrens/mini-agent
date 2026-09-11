@@ -97,6 +97,15 @@ pub struct Config {
     #[cfg(feature = "goal")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<types::GoalConfig>,
+    /// Commands that must exit zero before a goal may be reported complete.
+    ///
+    /// Sensitive by construction: it is a top-level key outside
+    /// `BENIGN_PROJECT_CONFIG_KEYS`, so an untrusted project configuration
+    /// cannot activate it, exactly as for `verify_command`. It carries the
+    /// authority of whoever configured it (`TC-GOAL-CHECK`).
+    #[cfg(feature = "goal")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_checks: Option<Vec<CompactString>>,
     /// Wall-clock bound for one verification attempt. Default: 300 seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_timeout_secs: Option<u64>,

@@ -758,6 +758,13 @@ pub struct Cli {
 
     #[cfg(feature = "goal")]
     #[arg(
+        long = "goal-check",
+        help = "Command that must exit zero before the goal may be reported complete (repeatable)"
+    )]
+    pub goal_check: Vec<String>,
+
+    #[cfg(feature = "goal")]
+    #[arg(
         long = "goal-max-rounds",
         help = "Maximum goal rounds before wrapping up [default: 50]"
     )]
@@ -968,6 +975,10 @@ impl Cli {
     pub(crate) fn configured_validation_needs_shell(&self, cfg: &config::Config) -> bool {
         #[cfg(feature = "loop")]
         if self.loop_run.is_some() {
+            return true;
+        }
+        #[cfg(feature = "goal")]
+        if !self.goal_check.is_empty() || cfg.goal_checks.as_ref().is_some_and(|c| !c.is_empty()) {
             return true;
         }
         cfg.verify_command
