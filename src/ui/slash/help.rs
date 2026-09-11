@@ -226,6 +226,33 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
             "  /loop [prompt]         start iterative coding loop (req. 'loop' feature)",
         );
     }
+    #[cfg(feature = "goal")]
+    {
+        write_result(
+            ctx.renderer,
+            "  /goal <objective>      set a goal the agent works toward across turns",
+        );
+        write_result(
+            ctx.renderer,
+            "  /goal status           objective, round, verification and last check",
+        );
+        write_result(
+            ctx.renderer,
+            "  /goal check <cmd>      require a command to pass before the goal is met",
+        );
+        write_result(
+            ctx.renderer,
+            "  /goal bounds k=v       change max_rounds, max_tokens, continuation, …",
+        );
+        write_result(ctx.renderer, "  /goal pause|resume|reopen|clear");
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        write_result(
+            ctx.renderer,
+            "  /goal <objective>      persistent objective (req. 'goal' feature)",
+        );
+    }
     write_result(
         ctx.renderer,
         "  /prompt                list available prompts",

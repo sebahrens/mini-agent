@@ -6,6 +6,7 @@ fn ctx() -> StatusContext<'static> {
     StatusContext {
         workspace: std::path::Path::new("/var/lib/zerostack-demo/project"),
         loop_label: None,
+        goal_label: None,
         prompt_name: None,
         perm_mode: None,
         chain_label: None,
@@ -418,4 +419,31 @@ fn session_age_is_short_duration() {
     let session = Session::new("openrouter", "m", 1000, ""); // created_at = now
     let text = line_text(&statusline::build_lines(&spec, &session, &ctx())[0]);
     assert!(text.ends_with('s') || text.ends_with('m'), "got {text:?}");
+}
+
+#[test]
+fn the_goal_item_shows_progress_and_a_parked_status() {
+    let session = Session::new("anthropic", "claude", 200_000, "");
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("goal")],
+        }],
+    };
+
+    // No goal: the segment renders nothing at all.
+    assert_eq!(
+        line_text(&statusline::build_lines(&spec, &session, &ctx())[0]),
+        "",
+        "an absent goal must not occupy the status line"
+    );
+
+    let mut running = ctx();
+    running.goal_label = Some("goal 3/50");
+    assert!(
+        line_text(&statusline::build_lines(&spec, &session, &running)[0]).contains("goal 3/50")
+    );
+
+    let mut parked = ctx();
+    parked.goal_label = Some("goal 7/50 paused");
+    assert!(line_text(&statusline::build_lines(&spec, &session, &parked)[0]).contains("paused"));
 }

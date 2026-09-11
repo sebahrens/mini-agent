@@ -111,6 +111,37 @@ pub struct QuickModelConfig {
     pub context_window: Option<u64>,
 }
 
+/// Defaults for goal bounds and the judge.
+///
+/// Every field here only limits how long a goal keeps working or who reviews a
+/// completion claim. Nothing in this table can widen what the agent may run,
+/// which is why it is a benign project-config key.
+#[cfg(feature = "goal")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GoalConfig {
+    /// `auto` (default), `off`, `session`, or a `quick_models` entry name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_up_max_agent_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reinject_every: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_every: Option<u32>,
+}
+
 /// Status-bar statusline layout. Up to 3 lines, each an ordered list of segments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusLineConfig {

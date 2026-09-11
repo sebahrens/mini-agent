@@ -21,6 +21,10 @@ const PROJECT_CONFIG_TRUST_SCHEMA: u32 = 1;
 /// top-level key, including unknown future keys, requires explicit trust.
 const BENIGN_PROJECT_CONFIG_KEYS: &[&str] = &[
     "always_show_welcome",
+    // Goal bounds only limit how long the harness keeps working and who
+    // reviews a completion claim; nothing here widens what may be executed.
+    // The command-bearing keys are separate and stay sensitive.
+    "goal",
     "chain",
     "chat_left_margin",
     "colors",

@@ -187,9 +187,26 @@ pub(crate) fn refresh_display(
             .mode()
             .to_string()
     });
+    // `round/max`, plus the status word whenever the goal is not simply
+    // running, so a parked or budget-stopped goal is visible at a glance.
+    #[cfg(feature = "goal")]
+    let goal_label = ui.session.goal_store.snapshot().and_then(|goal| {
+        (!goal.status.is_terminal()).then(|| {
+            let progress = format!("goal {}/{}", goal.progress.rounds, goal.bounds.max_rounds);
+            if goal.status == crate::extras::goal::GoalStatus::Active {
+                progress
+            } else {
+                format!("{progress} {}", goal.status.label())
+            }
+        })
+    });
     let statusline_ctx = crate::ui::statusline::StatusContext {
         workspace: ui.workspace.root(),
         loop_label: chain.loop_label.as_deref(),
+        #[cfg(feature = "goal")]
+        goal_label: goal_label.as_deref(),
+        #[cfg(not(feature = "goal"))]
+        goal_label: None,
         prompt_name: ui.context.current_prompt_name.as_deref(),
         perm_mode: perm_mode.as_deref(),
         chain_label: chain.label_msg.as_deref(),

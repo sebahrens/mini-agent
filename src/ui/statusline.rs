@@ -34,6 +34,9 @@ pub enum StatusSpan {
 pub struct StatusContext<'a> {
     pub workspace: &'a std::path::Path,
     pub loop_label: Option<&'a str>,
+    /// Active goal, rendered as `round/max` plus a status word when the goal is
+    /// not simply running.
+    pub goal_label: Option<&'a str>,
     pub prompt_name: Option<&'a str>,
     pub perm_mode: Option<&'a str>,
     pub chain_label: Option<&'a str>,
@@ -349,6 +352,7 @@ fn resolve_item(
             .filter(|m| *m != "standard")
             .map(|m| format!("mode:{m}")),
         "loop" => ctx.loop_label.map(|s| format!("[{s}]")),
+        "goal" => ctx.goal_label.map(|s| format!("[{s}]")),
         "chain" => ctx.chain_label.map(|s| s.to_string()),
         "background_jobs" => {
             (ctx.background_jobs > 0 || always).then(|| format!("jobs:{}", ctx.background_jobs))
@@ -529,6 +533,7 @@ pub fn item_icon(item: &str) -> Option<&'static str> {
         "prompt" => "\u{f120}",                                              //
         "mode" => "\u{f023}",                                                //
         "loop" => "\u{f01e}",                                                //
+        "goal" => "\u{f140}",                                                //
         "btw" => "\u{f075}",                                                 //
         "compaction" => "\u{f066}",                                          //
         _ => return None,

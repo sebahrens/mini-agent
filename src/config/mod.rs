@@ -92,6 +92,11 @@ pub struct Config {
     /// Project-local values require the existing sensitive-config approval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<CompactString>,
+    /// Goal defaults. Benign: these only bound how long the harness keeps
+    /// working, never what it is allowed to run.
+    #[cfg(feature = "goal")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<types::GoalConfig>,
     /// Wall-clock bound for one verification attempt. Default: 300 seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_timeout_secs: Option<u64>,
@@ -497,6 +502,22 @@ impl Config {
 
     pub fn resolve_verify_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.verify_timeout_secs.unwrap_or(300).clamp(1, 3_600))
+    }
+
+    /// Which model judges completion claims.
+    ///
+    /// The judge is whatever the user names: another family, another size, or
+    /// the session's own model. `Auto` falls back to the session model so a
+    /// single-model install still gets a second opinion from a clean context.
+    #[cfg(feature = "goal")]
+    pub fn resolve_goal_judge(&self) -> crate::extras::goal::JudgePolicy {
+        use crate::extras::goal::JudgePolicy;
+        match self.goal.as_ref().and_then(|g| g.judge.as_deref()) {
+            None | Some("auto") => JudgePolicy::Auto,
+            Some("off") => JudgePolicy::Off,
+            Some("session") => JudgePolicy::Session,
+            Some(name) => JudgePolicy::QuickModel(name.to_string()),
+        }
     }
 
     pub fn resolve_verify_max_attempts(&self) -> u32 {

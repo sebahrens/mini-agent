@@ -359,6 +359,39 @@ pub struct GoalBounds {
     pub judge_every: u32,
 }
 
+impl GoalBounds {
+    /// Fold configured defaults in, clamping each to a runnable range.
+    pub fn apply_config(&mut self, cfg: &crate::config::Config) {
+        let Some(goal) = cfg.goal.as_ref() else {
+            return;
+        };
+        if let Some(v) = goal.max_rounds {
+            self.max_rounds = v.clamp(1, 10_000);
+        }
+        if let Some(v) = goal.max_tokens {
+            self.max_tokens = (v > 0).then_some(v);
+        }
+        if let Some(v) = goal.max_active_secs {
+            self.max_active_secs = (v > 0).then_some(v);
+        }
+        if let Some(v) = goal.no_progress_rounds {
+            self.no_progress_rounds = v.clamp(1, 100);
+        }
+        if let Some(v) = goal.blocked_rounds {
+            self.blocked_rounds = v.clamp(1, 100);
+        }
+        if let Some(v) = goal.wrap_up_max_agent_turns {
+            self.wrap_up_max_agent_turns = v.clamp(1, 100);
+        }
+        if let Some(v) = goal.reinject_every {
+            self.reinject_every = v.min(1_000);
+        }
+        if let Some(v) = goal.judge_every {
+            self.judge_every = v.min(1_000);
+        }
+    }
+}
+
 impl Default for GoalBounds {
     fn default() -> Self {
         Self {

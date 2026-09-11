@@ -742,6 +742,42 @@ pub struct Cli {
     )]
     pub loop_run: Option<String>,
 
+    #[cfg(feature = "goal")]
+    #[arg(
+        long = "goal",
+        help = "Persistent objective to work toward across turns"
+    )]
+    pub goal: Option<String>,
+
+    #[cfg(feature = "goal")]
+    #[arg(
+        long = "goal-done",
+        help = "Completion criterion for the goal (repeatable)"
+    )]
+    pub goal_done: Vec<String>,
+
+    #[cfg(feature = "goal")]
+    #[arg(
+        long = "goal-max-rounds",
+        help = "Maximum goal rounds before wrapping up [default: 50]"
+    )]
+    pub goal_max_rounds: Option<u32>,
+
+    #[cfg(feature = "goal")]
+    #[arg(
+        long = "goal-continuation",
+        value_parser = ["continue", "restart"],
+        help = "Whether each goal round keeps the conversation or starts fresh"
+    )]
+    pub goal_continuation: Option<String>,
+
+    #[cfg(feature = "goal")]
+    #[arg(
+        long = "goal-replace",
+        help = "Replace an unfinished goal instead of refusing"
+    )]
+    pub goal_replace: bool,
+
     #[cfg(feature = "git-worktree")]
     #[arg(long = "worktree", help = "Create a git worktree and cd into it")]
     pub worktree: Option<String>,

@@ -16,6 +16,8 @@ mod session;
 pub(crate) use session::is_persistence_restart_required;
 pub(crate) mod settings;
 
+#[cfg(feature = "goal")]
+pub(crate) mod goal;
 #[cfg(test)]
 mod session_restore_tests;
 
@@ -659,6 +661,22 @@ pub async fn handle_slash(
         }
         #[cfg(feature = "hooks")]
         "/hooks" => hooks::handle(&parts, &mut ctx).await,
+        #[cfg(feature = "goal")]
+        "/goal" => {
+            // The body keeps its line breaks so a `done when:` block survives
+            // the three-way split above.
+            let body = text.trim().strip_prefix("/goal").unwrap_or("").trim();
+            goal::handle_goal(&parts, body, &mut ctx).await;
+            Ok(())
+        }
+        #[cfg(not(feature = "goal"))]
+        "/goal" => {
+            write_error(
+                ctx.renderer,
+                "/goal requires the 'goal' feature: cargo install --path . --features goal",
+            );
+            Ok(())
+        }
         _ => {
             write_error(
                 ctx.renderer,

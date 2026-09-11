@@ -776,6 +776,9 @@ impl Startup {
         // configuration rather than any serialized state.
         session.initialize_read_tracker(cfg.deny_repeated_reads.unwrap_or(true));
 
+        #[cfg(feature = "goal")]
+        apply_goal_flags(&cli, &cfg, &session)?;
+
         Ok(Self {
             cli,
             cfg,
@@ -1783,6 +1786,46 @@ pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec
         (_, Unavailable { reason }) => vec![format!("[!] learned skills unavailable: {reason}")],
         _ => Vec::new(),
     }
+}
+
+/// Install the goal named by `--goal`, if any.
+///
+/// Refuses rather than silently discarding an unfinished goal from a resumed
+/// session: its rounds, verdicts and reports are the record of work done so
+/// far. `--goal-replace` is the explicit override.
+#[cfg(feature = "goal")]
+fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyhow::Result<()> {
+    use crate::extras::goal::{ContinuationMode, DEFAULT_RESTART_SUMMARY_CHARS, Goal};
+
+    let Some(objective) = cli.goal.as_deref().map(str::trim).filter(|o| !o.is_empty()) else {
+        return Ok(());
+    };
+    // Without tools the agent can never file a report, so every round would
+    // look like a stall. Say so at startup rather than after three wasted
+    // rounds.
+    if cli.resolve_no_tools(cfg) {
+        anyhow::bail!("a goal needs the goal_report tool; remove --no-tools to use --goal");
+    }
+
+    let mut goal = Goal::new(objective, cli.goal_done.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(max_rounds) = cli.goal_max_rounds {
+        goal.bounds.max_rounds = max_rounds.max(1);
+    }
+    if let Some(mode) = cli.goal_continuation.as_deref() {
+        goal.continuation = match mode {
+            "restart" => ContinuationMode::Restart {
+                summary_chars: DEFAULT_RESTART_SUMMARY_CHARS,
+            },
+            _ => ContinuationMode::Continue,
+        };
+    }
+    goal.bounds.apply_config(cfg);
+    goal.judge = cfg.resolve_goal_judge();
+
+    session
+        .goal_store
+        .set(goal, cli.goal_replace)
+        .map_err(|error| anyhow::anyhow!("{error} (or pass --goal-replace)"))
 }
 
 /// Run one headless turn, then keep running goal rounds while the gate asks
