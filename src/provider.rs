@@ -360,6 +360,32 @@ impl AnyClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// One no-tools completion used to judge a goal's completion claim.
+    ///
+    /// Shares the summarizer's request path: no tool definitions are sent, one
+    /// turn, a bounded response. The judge must not be able to act, only to
+    /// read and answer.
+    #[cfg(feature = "goal")]
+    pub async fn judge_completion(
+        &self,
+        model_name: &str,
+        prompt: String,
+        preamble: String,
+        max_output_tokens: u64,
+        retry_config: &RetryConfig,
+    ) -> anyhow::Result<String> {
+        let model = self.completion_model(model_name.to_string());
+        summarize_with_model(
+            model,
+            prompt,
+            preamble,
+            max_output_tokens,
+            retry_config.clone(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn compress_messages(
         &self,
         model_name: &str,

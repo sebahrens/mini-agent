@@ -533,7 +533,7 @@ mod tests {
                 gate::Step::Decided(d) => d,
                 gate::Step::Verify(r) => gate::gate_post(&g, &summary, &r, None, None),
             };
-            gate::apply(&mut g, &summary, &decision);
+            gate::apply(&mut g, &summary, &decision, None);
             assert!(should_continue(&g), "round {round} should continue");
             assert!(next_round(&g, &decision).is_some());
         }
@@ -549,7 +549,7 @@ mod tests {
             gate::Step::Decided(d) => d,
             gate::Step::Verify(r) => gate::gate_post(&g, &summary, &r, None, None),
         };
-        gate::apply(&mut g, &summary, &decision);
+        gate::apply(&mut g, &summary, &decision, None);
         assert_eq!(g.status, GoalStatus::Met);
         assert!(!should_continue(&g));
         assert_eq!(next_round(&g, &decision), None);
@@ -594,17 +594,19 @@ where
         return RoundOutcome::Inactive;
     }
 
-    let decision = match super::gate::gate_pre(&goal, &summary) {
-        super::gate::Step::Decided(decision) => decision,
+    let (decision, judged) = match super::gate::gate_pre(&goal, &summary) {
+        super::gate::Step::Decided(decision) => (decision, None),
         super::gate::Step::Verify(request) => {
             let (checks, judge) = run_verification(request.clone()).await;
-            super::gate::gate_post(&goal, &summary, &request, checks.as_ref(), judge.as_ref())
+            let decision =
+                super::gate::gate_post(&goal, &summary, &request, checks.as_ref(), judge.as_ref());
+            (decision, judge)
         }
     };
 
     let line = store
         .with_mut(|goal| {
-            super::gate::apply(goal, &summary, &decision);
+            super::gate::apply(goal, &summary, &decision, judged.as_ref());
             decision_line(goal, &decision)
         })
         .unwrap_or_default();

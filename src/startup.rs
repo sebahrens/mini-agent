@@ -1537,6 +1537,7 @@ impl Startup {
                 &self.cli,
                 &self.cfg,
                 &self.sandbox,
+                &self.client,
                 &msg,
                 history,
                 json_output,
@@ -1822,6 +1823,8 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
     }
     goal.bounds.apply_config(cfg);
     goal.judge = cfg.resolve_goal_judge();
+    goal.resolved_judge =
+        crate::extras::goal::judge::resolve(&goal.judge, cfg, &session.provider, &session.model);
     // Trusted configuration first, then the flags, so a command typed at the
     // prompt is always additive to whatever the project already required.
     for command in cfg.goal_checks.iter().flatten() {
@@ -1857,6 +1860,7 @@ async fn run_headless_goal_rounds(
     cli: &Cli,
     cfg: &config::Config,
     #[cfg_attr(not(feature = "goal"), allow(unused_variables))] sandbox: &crate::sandbox::Sandbox,
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))] client: &provider::AnyClient,
     message: &str,
     history: std::sync::Arc<[rig::completion::Message]>,
     json_output: bool,
@@ -1913,6 +1917,24 @@ async fn run_headless_goal_rounds(
             let sandbox_for_checks = sandbox.clone();
             let cfg_for_checks = cfg.clone();
             let goal_for_checks = goal.clone();
+            let judge = crate::extras::goal::judge::resolve(
+                &goal.judge,
+                cfg,
+                &session.provider,
+                &session.model,
+            );
+            // With --no-session the session carries nothing, so the round's
+            // own record is the only account of what happened.
+            let transcript = {
+                let from_session = crate::extras::goal::judge::transcript_tail(session);
+                if from_session.trim().is_empty() {
+                    crate::extras::goal::judge::transcript_from_interactions(&turn.interactions)
+                } else {
+                    from_session
+                }
+            };
+            let client_for_judge = client.clone();
+            let retry = cfg.retry.clone();
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     let checks = crate::extras::goal::checks::run(
@@ -1922,7 +1944,21 @@ async fn run_headless_goal_rounds(
                         &cfg_for_checks,
                     )
                     .await;
-                    (checks, None)
+                    let judged = match judge {
+                        Some(resolved) if request.run_judge => Some(
+                            crate::extras::goal::judge::ask_with_transcript(
+                                &goal_for_checks,
+                                &request,
+                                &resolved,
+                                &client_for_judge,
+                                &transcript,
+                                &retry,
+                            )
+                            .await,
+                        ),
+                        _ => None,
+                    };
+                    (checks, judged)
                 })
                 .await;
             let RoundOutcome::Relaunch { relaunch, line } = outcome else {

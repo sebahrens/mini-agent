@@ -18,6 +18,7 @@
 pub mod checks;
 pub mod driver;
 pub mod gate;
+pub mod judge;
 pub mod prompt;
 pub mod report_tool;
 

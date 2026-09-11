@@ -28,6 +28,12 @@ use super::{
 /// Consecutive failed rounds tolerated before the goal is parked.
 pub const MAX_CONSECUTIVE_ROUND_FAILURES: u32 = 2;
 
+/// Consecutive judge failures on completion claims tolerated before the goal is
+/// parked. Below this the claim is evaluated as if no judge were configured, so
+/// a brief outage costs nothing; at it, the user is told rather than left with
+/// an unverified completion.
+pub const MAX_JUDGE_FAILURES: u32 = 3;
+
 /// How a round ended, from the driver's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundEnd {
@@ -589,6 +595,20 @@ pub fn gate_post(
                     outcome: Outcome::Met,
                     ..
                 }) => evidence.push(VerificationKind::Judge),
+                // An unreachable judge must never complete a goal on its own,
+                // and must never end one either. After repeated failures on
+                // completion claims the goal parks so a silent outage cannot
+                // masquerade as verification.
+                Some(JudgeOutcome::Unavailable { reason })
+                    if !externally_proven
+                        && goal.progress.judge_failures + 1 >= MAX_JUDGE_FAILURES =>
+                {
+                    return GateDecision::paused(
+                        format!("the completion judge was unavailable: {reason}"),
+                        PauseReason::JudgeUnavailable,
+                        VerdictSource::Runtime,
+                    );
+                }
                 Some(JudgeOutcome::Unavailable { .. }) | None => {}
             }
 
@@ -620,7 +640,12 @@ pub fn gate_post(
 ///
 /// The driver calls this exactly once per round. It is the only place goal
 /// progress changes, so the counter rules live in one readable block.
-pub fn apply(goal: &mut Goal, round: &RoundSummary, decision: &GateDecision) {
+pub fn apply(
+    goal: &mut Goal,
+    round: &RoundSummary,
+    decision: &GateDecision,
+    judge: Option<&JudgeOutcome>,
+) {
     // An interrupted round is not counted at all: nothing about it reflects on
     // the goal's progress.
     if round.end == RoundEnd::Cancelled {
@@ -641,6 +666,15 @@ pub fn apply(goal: &mut Goal, round: &RoundSummary, decision: &GateDecision) {
         goal.progress.consecutive_no_progress = 0;
     } else {
         goal.progress.consecutive_no_progress += 1;
+    }
+
+    // Judge failures are counted only on completion claims, because those are
+    // the rounds where a missing judge actually changes the outcome. Any answer
+    // at all clears the streak.
+    match judge {
+        Some(JudgeOutcome::Unavailable { .. }) => goal.progress.judge_failures += 1,
+        Some(JudgeOutcome::Verdict { .. }) => goal.progress.judge_failures = 0,
+        None => {}
     }
 
     if round.report_status() == Some(ReportStatus::Blocked) && round.mutating_tool_calls == 0 {
@@ -742,7 +776,7 @@ mod tests {
                 ..
             }
         ));
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(
             g.progress.rounds, 0,
             "an interrupt does not consume a round"
@@ -766,7 +800,7 @@ mod tests {
                 "failure {expected} should retry"
             );
             assert!(decision.reason().contains("provider exploded"));
-            apply(&mut g, &round, &decision);
+            apply(&mut g, &round, &decision, None);
             assert_eq!(g.progress.consecutive_round_failures, expected);
         }
 
@@ -787,7 +821,7 @@ mod tests {
         g.progress.consecutive_round_failures = 1;
         let round = worked();
         let decision = decided(&g, &round);
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(g.progress.consecutive_round_failures, 0);
     }
 
@@ -811,7 +845,7 @@ mod tests {
             }
             other => panic!("expected a wrap-up continue, got {other:?}"),
         }
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert!(g.progress.wrap_up_issued);
 
         // The next round stops regardless of what the model reports.
@@ -827,7 +861,7 @@ mod tests {
                 ..
             }
         ));
-        apply(&mut g, &claim, &decision);
+        apply(&mut g, &claim, &decision, None);
         assert_eq!(g.status, GoalStatus::BudgetLimited);
     }
 
@@ -839,7 +873,7 @@ mod tests {
         let round = worked();
 
         let first = decided(&g, &round);
-        apply(&mut g, &round, &first);
+        apply(&mut g, &round, &first, None);
         assert!(matches!(
             first,
             GateDecision::Continue { wrap_up: true, .. }
@@ -909,7 +943,7 @@ mod tests {
             }
             other => panic!("expected an awaiting-user stop, got {other:?}"),
         }
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(g.status, GoalStatus::AwaitingUser);
     }
 
@@ -931,7 +965,7 @@ mod tests {
                 }
                 other => panic!("attempt {attempt} should continue, got {other:?}"),
             }
-            apply(&mut g, &round, &decision);
+            apply(&mut g, &round, &decision, None);
         }
 
         let decision = decided(&g, &round);
@@ -964,7 +998,7 @@ mod tests {
             matches!(decision, GateDecision::Continue { .. }),
             "a round that changed something restarts the count"
         );
-        apply(&mut g, &productive, &decision);
+        apply(&mut g, &productive, &decision, None);
         assert_eq!(g.progress.consecutive_blocked, 0);
     }
 
@@ -1053,7 +1087,7 @@ mod tests {
         for _ in 1..g.bounds.no_progress_rounds {
             let decision = decided(&g, &idle);
             assert!(matches!(decision, GateDecision::Continue { .. }));
-            apply(&mut g, &idle, &decision);
+            apply(&mut g, &idle, &decision, None);
         }
 
         let decision = decided(&g, &idle);
@@ -1086,7 +1120,7 @@ mod tests {
             matches!(decision, GateDecision::Continue { .. }),
             "a reported round must not be treated as a stall"
         );
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(g.progress.consecutive_no_progress, 0);
     }
 
@@ -1294,7 +1328,7 @@ mod tests {
         }
 
         let mut applied = g.clone();
-        apply(&mut applied, &round, &decision);
+        apply(&mut applied, &round, &decision, None);
         assert_eq!(applied.status, GoalStatus::Met);
         assert!(!applied.met_unverified());
     }
@@ -1312,7 +1346,7 @@ mod tests {
         assert!(!request.run_checks);
 
         let decision = gate_post(&g, &round, &request, None, None);
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(g.status, GoalStatus::Met);
         assert!(
             g.met_unverified(),
@@ -1466,7 +1500,7 @@ mod tests {
                                         gate_post(&g, &round, &request, None, None)
                                     }
                                 };
-                                apply(&mut g, &round, &decision);
+                                apply(&mut g, &round, &decision, None);
                                 if round.end == RoundEnd::Cancelled {
                                     // An interrupt is not a verdict on
                                     // anything: the goal is left exactly as it
@@ -1524,7 +1558,7 @@ mod tests {
             }
             other => panic!("expected a context-overflow pause, got {other:?}"),
         }
-        apply(&mut g, &round, &decision);
+        apply(&mut g, &round, &decision, None);
         assert_eq!(
             g.objective, "ship it",
             "the objective survives the overflow that lost the conversation"
@@ -1538,6 +1572,112 @@ mod tests {
         assert!(matches!(
             decided(&goal(), &ordinary),
             GateDecision::Continue { .. }
+        ));
+    }
+
+    /// A brief judge outage costs nothing; a sustained one is surfaced rather
+    /// than left looking like a verified completion.
+    #[test]
+    fn repeated_judge_failures_park_the_goal_but_a_single_one_does_not() {
+        let mut g = goal();
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+        let request = verification(&g, &round);
+        let unavailable = JudgeOutcome::Unavailable {
+            reason: "connection refused".into(),
+        };
+
+        for attempt in 1..MAX_JUDGE_FAILURES {
+            let decision = gate_post(&g, &round, &request, None, Some(&unavailable));
+            assert!(
+                matches!(
+                    decision,
+                    GateDecision::Stop {
+                        status: GoalStatus::Met,
+                        ..
+                    }
+                ),
+                "failure {attempt} still lets the claim stand on its other evidence"
+            );
+            if let GateDecision::Stop { evidence, .. } = &decision {
+                assert!(
+                    !evidence.contains(&VerificationKind::Judge),
+                    "an unreachable judge never counts as agreement"
+                );
+            }
+            // Re-open so the next round can be judged.
+            let mut next = g.clone();
+            apply(&mut next, &round, &decision, Some(&unavailable));
+            next.status = GoalStatus::Active;
+            g = next;
+            assert_eq!(g.progress.judge_failures, attempt);
+        }
+
+        let decision = gate_post(&g, &round, &request, None, Some(&unavailable));
+        match &decision {
+            GateDecision::Stop {
+                status,
+                paused_reason,
+                ..
+            } => {
+                assert_eq!(*status, GoalStatus::Paused);
+                assert_eq!(*paused_reason, Some(PauseReason::JudgeUnavailable));
+            }
+            other => panic!("expected a judge-unavailable pause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_working_judge_clears_the_failure_streak() {
+        let mut g = goal();
+        g.progress.judge_failures = 2;
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+        let verdict = JudgeOutcome::Verdict {
+            outcome: Outcome::Met,
+            reason: "confirmed".into(),
+        };
+        let request = verification(&g, &round);
+        let decision = gate_post(&g, &round, &request, None, Some(&verdict));
+        apply(&mut g, &round, &decision, Some(&verdict));
+        assert_eq!(g.progress.judge_failures, 0);
+    }
+
+    /// Commands outrank the judge in both directions: passing checks keep a
+    /// claim alive even when the judge cannot be reached at all.
+    #[test]
+    fn passing_checks_survive_a_judge_outage() {
+        let mut g = goal();
+        g.checks.push(GoalCheck::new("cargo test"));
+        g.progress.judge_failures = MAX_JUDGE_FAILURES;
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+        let request = verification(&g, &round);
+        let decision = gate_post(
+            &g,
+            &round,
+            &request,
+            Some(&CheckOutcome {
+                all_passed: true,
+                failure_tail: None,
+                verified: vec![VerificationKind::Checks],
+            }),
+            Some(&JudgeOutcome::Unavailable {
+                reason: "timeout".into(),
+            }),
+        );
+        assert!(matches!(
+            decision,
+            GateDecision::Stop {
+                status: GoalStatus::Met,
+                ..
+            }
         ));
     }
 }

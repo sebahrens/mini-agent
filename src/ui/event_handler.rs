@@ -691,11 +691,36 @@ async fn run_goal_round(
     let sandbox = ui.sandbox.clone();
     let cfg = ui.cfg.clone();
     let goal_for_checks = goal.clone();
+    // The judge reads a bounded tail of the conversation, never the workspace,
+    // and can only withhold completion — a passing command outranks it.
+    let judge = crate::extras::goal::judge::resolve(
+        &goal.judge,
+        ui.cfg,
+        &ui.session.provider,
+        &ui.session.model,
+    );
+    let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
+    let client = ui.client.clone();
+    let retry = ui.cfg.retry.clone();
     let outcome =
         driver::settle_round(&ui.session.goal_store, summary, move |request| async move {
             let checks =
                 crate::extras::goal::checks::run(&goal_for_checks, &request, &sandbox, &cfg).await;
-            (checks, None)
+            let judged = match judge {
+                Some(resolved) if request.run_judge => Some(
+                    crate::extras::goal::judge::ask_with_transcript(
+                        &goal_for_checks,
+                        &request,
+                        &resolved,
+                        &client,
+                        &transcript,
+                        &retry,
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
+            (checks, judged)
         })
         .await;
 

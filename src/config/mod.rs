@@ -106,6 +106,14 @@ pub struct Config {
     #[cfg(feature = "goal")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_checks: Option<Vec<CompactString>>,
+    /// A `quick_models` entry name to judge goal completion claims.
+    ///
+    /// Sensitive for the same reason as any other model selection reachable
+    /// from project configuration: the judge receives a bounded transcript
+    /// tail, so naming its endpoint decides where that text is sent.
+    #[cfg(feature = "goal")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_judge_model: Option<CompactString>,
     /// Wall-clock bound for one verification attempt. Default: 300 seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_timeout_secs: Option<u64>,
