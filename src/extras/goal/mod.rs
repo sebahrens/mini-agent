@@ -23,6 +23,8 @@
 // production caller.
 #![allow(dead_code)]
 
+pub mod gate;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
