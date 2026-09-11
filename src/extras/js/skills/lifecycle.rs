@@ -1793,6 +1793,14 @@ fn read_invocation_evidence(
 /// than to `NoVerifyCommand`, so promotion and audit keep seeing the reason the
 /// runner actually recorded. `None` means the row is undecodable and promotion
 /// must be held rather than guessing a source.
+#[cfg(all(test, feature = "goal"))]
+pub(crate) fn task_outcome_source_from_columns_for_test(
+    source_kind: &str,
+    source_id: Option<String>,
+) -> Option<TaskOutcomeSource> {
+    task_outcome_source_from_columns(source_kind, source_id)
+}
+
 #[cfg(test)]
 fn task_outcome_source_from_columns(
     source_kind: &str,
@@ -1803,6 +1811,18 @@ fn task_outcome_source_from_columns(
         ("oracle", Some(id)) => Some(TaskOutcomeSource::Oracle(id)),
         ("no_verify_command", None) => Some(TaskOutcomeSource::NoVerifyCommand),
         ("gate_skipped", None) => Some(TaskOutcomeSource::GateSkipped),
+        #[cfg(feature = "goal")]
+        ("goal", Some(id)) => {
+            let (goal_id, verified) = id.split_once(':')?;
+            Some(TaskOutcomeSource::Goal {
+                goal_id: goal_id.to_string(),
+                verified_by: verified
+                    .split('+')
+                    .filter(|kind| !kind.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            })
+        }
         _ => None,
     }
 }
@@ -2087,7 +2107,7 @@ mod tests {
         assert_eq!(kind, "gate_skipped");
         assert_eq!(id, None);
         assert_eq!(
-            task_outcome_source_from_columns(kind, id.map(str::to_string)),
+            task_outcome_source_from_columns(kind, id.map(|id| id.to_string())),
             Some(TaskOutcomeSource::GateSkipped)
         );
         // A source id on a skip reason is not a valid row.

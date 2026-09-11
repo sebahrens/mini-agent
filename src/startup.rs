@@ -1430,6 +1430,8 @@ impl Startup {
                             files_changed,
                             pricing,
                             stop_reason,
+                            #[cfg(feature = "goal")]
+                            None,
                         )?
                     );
                 }
@@ -1575,6 +1577,9 @@ impl Startup {
             } else {
                 None
             };
+            // Snapshot before the session moves into the persistence block.
+            #[cfg(feature = "goal")]
+            let finished_goal = self.session.goal_store.snapshot();
             let mut persistence_failure = None;
             if !self.cli.no_session {
                 let mut session = self.session;
@@ -1596,10 +1601,23 @@ impl Startup {
                 }
             }
             if let Some((files_changed, pricing)) = json_context {
-                let stop_reason = if failure.is_none() && persistence_failure.is_none() {
-                    crate::print::HeadlessStopReason::Completed
-                } else {
+                let stop_reason = if failure.is_some() || persistence_failure.is_some() {
                     crate::print::HeadlessStopReason::Failed
+                } else {
+                    // A goal that stopped for a reason of its own reports that
+                    // reason, so a script can branch on the outcome.
+                    #[cfg(feature = "goal")]
+                    {
+                        finished_goal
+                            .as_ref()
+                            .map_or(crate::print::HeadlessStopReason::Completed, |goal| {
+                                crate::print::HeadlessStopReason::for_goal(goal.status)
+                            })
+                    }
+                    #[cfg(not(feature = "goal"))]
+                    {
+                        crate::print::HeadlessStopReason::Completed
+                    }
                 };
                 println!(
                     "{}",
@@ -1611,8 +1629,16 @@ impl Startup {
                         files_changed,
                         pricing,
                         stop_reason,
+                        #[cfg(feature = "goal")]
+                        finished_goal.as_ref(),
                     )?
                 );
+                #[cfg(feature = "goal")]
+                if stop_reason.exit_code() != 0 && failure.is_none() {
+                    // The turn itself succeeded; only the goal's outcome is
+                    // non-zero, so exit with its code rather than an error.
+                    return Err(crate::print::HeadlessGoalExit(stop_reason).into());
+                }
             }
             // The turn's own failure wins: a partial persistence failure is
             // reported too, but neither is ever presented as success.

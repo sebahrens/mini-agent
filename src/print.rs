@@ -126,6 +126,58 @@ pub(crate) struct HeadlessJsonOutput {
     pub usage: Usage,
     pub cost: f64,
     pub stop_reason: HeadlessStopReason,
+    /// Present only when the run carried a goal, so existing output is
+    /// byte-identical for every run that does not.
+    #[cfg(feature = "goal")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<HeadlessGoal>,
+}
+
+/// A goal's outcome, for a caller deciding what to do next.
+#[cfg(feature = "goal")]
+#[derive(Debug, Serialize)]
+pub(crate) struct HeadlessGoal {
+    pub id: String,
+    pub status: String,
+    pub rounds: u32,
+    pub tokens: u64,
+    /// What actually backed the verdict; empty when no command proved it.
+    pub evidence: Vec<String>,
+    pub last_reason: Option<String>,
+}
+
+#[cfg(feature = "goal")]
+impl HeadlessGoal {
+    pub fn from_goal(goal: &crate::extras::goal::Goal) -> Self {
+        Self {
+            id: goal.id.to_string(),
+            status: goal.status.label().to_string(),
+            rounds: goal.progress.rounds,
+            tokens: goal.progress.tokens_used,
+            evidence: goal
+                .last_verdict
+                .as_ref()
+                .map(|verdict| {
+                    verdict
+                        .evidence
+                        .iter()
+                        .map(|kind| {
+                            match kind {
+                                crate::extras::goal::VerificationKind::SelfReport => "self_report",
+                                crate::extras::goal::VerificationKind::Checks => "checks",
+                                crate::extras::goal::VerificationKind::VerifyCommand => {
+                                    "verify_command"
+                                }
+                                crate::extras::goal::VerificationKind::Judge => "judge",
+                            }
+                            .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            last_reason: goal.last_verdict.as_ref().map(|v| v.reason.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -133,6 +185,61 @@ pub(crate) struct HeadlessJsonOutput {
 pub(crate) enum HeadlessStopReason {
     Completed,
     Failed,
+    /// A goal stopped for a reason of its own. Each maps to a distinct process
+    /// exit code so a script can tell "resume me, I ran out of budget" from
+    /// "stop retrying, this cannot be done".
+    #[cfg(feature = "goal")]
+    GoalMet,
+    #[cfg(feature = "goal")]
+    GoalImpossible,
+    #[cfg(feature = "goal")]
+    GoalBlocked,
+    #[cfg(feature = "goal")]
+    GoalAwaitingUser,
+    #[cfg(feature = "goal")]
+    GoalPaused,
+    #[cfg(feature = "goal")]
+    GoalBudgetLimited,
+}
+
+#[cfg(feature = "goal")]
+impl HeadlessStopReason {
+    /// Process exit code.
+    ///
+    /// 0 means the objective was reached. The goal codes start at 20 to stay
+    /// clear of the generic failure code and of shell conventions for signals.
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Failed => 1,
+            #[cfg(feature = "goal")]
+            Self::GoalMet => 0,
+            #[cfg(feature = "goal")]
+            Self::GoalImpossible => 20,
+            #[cfg(feature = "goal")]
+            Self::GoalBlocked => 21,
+            #[cfg(feature = "goal")]
+            Self::GoalAwaitingUser => 22,
+            #[cfg(feature = "goal")]
+            Self::GoalPaused => 23,
+            #[cfg(feature = "goal")]
+            Self::GoalBudgetLimited => 24,
+        }
+    }
+
+    /// Which stop reason a finished goal implies.
+    #[cfg(feature = "goal")]
+    pub(crate) fn for_goal(status: crate::extras::goal::GoalStatus) -> Self {
+        use crate::extras::goal::GoalStatus;
+        match status {
+            GoalStatus::Met => Self::GoalMet,
+            GoalStatus::Impossible => Self::GoalImpossible,
+            GoalStatus::Blocked => Self::GoalBlocked,
+            GoalStatus::AwaitingUser => Self::GoalAwaitingUser,
+            GoalStatus::BudgetLimited => Self::GoalBudgetLimited,
+            GoalStatus::Paused | GoalStatus::Active => Self::GoalPaused,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +396,7 @@ pub(crate) async fn files_changed_since(
     files.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_headless_json(
     root: &Path,
     result: &str,
@@ -297,6 +405,7 @@ pub(crate) fn render_headless_json(
     files_changed: Vec<String>,
     pricing: HeadlessPricing,
     stop_reason: HeadlessStopReason,
+    #[cfg(feature = "goal")] goal: Option<&crate::extras::goal::Goal>,
 ) -> serde_json::Result<String> {
     let (tool_calls, explicit_files) = interaction_summary(root, interactions);
     let files_changed = files_changed
@@ -325,8 +434,29 @@ pub(crate) fn render_headless_json(
         usage,
         cost,
         stop_reason,
+        #[cfg(feature = "goal")]
+        goal: goal.map(HeadlessGoal::from_goal),
     })
 }
+
+/// A headless run whose turn succeeded but whose goal stopped short.
+///
+/// Carried as an error so the existing failure path reports it, but with the
+/// goal's own exit code rather than the generic one, and without claiming the
+/// turn failed.
+#[cfg(feature = "goal")]
+#[derive(Debug)]
+pub(crate) struct HeadlessGoalExit(pub HeadlessStopReason);
+
+#[cfg(feature = "goal")]
+impl std::fmt::Display for HeadlessGoalExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "goal stopped: {:?}", self.0)
+    }
+}
+
+#[cfg(feature = "goal")]
+impl std::error::Error for HeadlessGoalExit {}
 
 /// Persist one completed headless (`-p`) turn in the same record order the
 /// interactive UI produces while a turn streams: the user prompt, then every
@@ -1047,6 +1177,8 @@ mod tests {
                 output_token_cost: 15.0,
             },
             super::HeadlessStopReason::Completed,
+            #[cfg(feature = "goal")]
+            None,
         )
         .expect("headless JSON should serialize");
         let value: serde_json::Value =

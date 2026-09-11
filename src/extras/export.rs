@@ -40,6 +40,25 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         anyhow::bail!("session header exceeds the JSONL line limit");
     }
     out.push_str(&header);
+    // The objective an export was working toward is part of what happened, so
+    // it travels with the transcript rather than being lost at the boundary.
+    #[cfg(feature = "goal")]
+    if let Some(goal) = session.goal_store.snapshot() {
+        let record = serde_json::json!({
+            "type": "goal",
+            "id": goal.id.as_str(),
+            "objective": goal.objective,
+            "criteria": goal.criteria,
+            "status": goal.status.label(),
+            "rounds": goal.progress.rounds,
+            "last_reason": goal.last_verdict.as_ref().map(|v| v.reason.clone()),
+        })
+        .to_string();
+        if record.len() <= MAX_SESSION_IMPORT_LINE_BYTES {
+            out.push('\n');
+            out.push_str(&record);
+        }
+    }
     for msg in &session.messages {
         let mut line = serde_json::json!({
             "role": msg.role,

@@ -65,9 +65,19 @@ fn main() -> anyhow::Result<ExitCode> {
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
-    runtime
-        .block_on(Box::pin(run()))
-        .map(|()| ExitCode::SUCCESS)
+    match runtime.block_on(Box::pin(run())) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        // A goal that stopped short is an outcome, not a crash: it exits with
+        // its own code so a script can branch on it, and without an error
+        // message claiming the turn failed.
+        #[cfg(feature = "goal")]
+        Err(error) => match error.downcast::<print::HeadlessGoalExit>() {
+            Ok(exit) => Ok(ExitCode::from(exit.0.exit_code() as u8)),
+            Err(error) => Err(error),
+        },
+        #[cfg(not(feature = "goal"))]
+        Err(error) => Err(error),
+    }
 }
 
 fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {

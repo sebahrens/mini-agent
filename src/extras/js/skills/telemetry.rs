@@ -895,20 +895,33 @@ impl TelemetryDispatcher {
 /// `lifecycle.rs` holds the inverse mapping; the two must stay in step.
 fn task_outcome_source_columns(
     source: &super::policy::TaskOutcomeSource,
-) -> (&'static str, Option<&str>) {
+) -> (&'static str, Option<std::borrow::Cow<'_, str>>) {
     use super::policy::TaskOutcomeSource;
+    use std::borrow::Cow;
     match source {
-        TaskOutcomeSource::VerifyCommand(id) => ("verify_command", Some(id.as_str())),
-        TaskOutcomeSource::Oracle(id) => ("oracle", Some(id.as_str())),
+        TaskOutcomeSource::VerifyCommand(id) => {
+            ("verify_command", Some(Cow::Borrowed(id.as_str())))
+        }
+        TaskOutcomeSource::Oracle(id) => ("oracle", Some(Cow::Borrowed(id.as_str()))),
         TaskOutcomeSource::NoVerifyCommand => ("no_verify_command", None),
         TaskOutcomeSource::GateSkipped => ("gate_skipped", None),
+        // The goal id and what proved the verdict travel together, so the
+        // inverse mapping can recover both from one column.
+        #[cfg(feature = "goal")]
+        TaskOutcomeSource::Goal {
+            goal_id,
+            verified_by,
+        } => (
+            "goal",
+            Some(Cow::Owned(format!("{goal_id}:{}", verified_by.join("+")))),
+        ),
     }
 }
 
 #[cfg(test)]
 pub(crate) fn task_outcome_source_columns_for_test(
     source: &super::policy::TaskOutcomeSource,
-) -> (&'static str, Option<&str>) {
+) -> (&'static str, Option<std::borrow::Cow<'_, str>>) {
     task_outcome_source_columns(source)
 }
 

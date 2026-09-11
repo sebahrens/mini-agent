@@ -1017,3 +1017,33 @@ fn completion_verification_runs_without_exposing_the_shell_tool() {
         "checked"
     );
 }
+
+/// A goal reports its own outcome and exit code so a script can branch on it
+/// without parsing prose.
+#[test]
+fn goal_status_and_exit_codes_are_distinct() {
+    // This mirrors the mapping in `print::HeadlessStopReason::exit_code`; the
+    // point is that a caller can tell "resume me" from "stop retrying".
+    let distinct = [
+        ("met", 0),
+        ("impossible", 20),
+        ("blocked", 21),
+        ("awaiting user", 22),
+        ("paused", 23),
+        ("budget limited", 24),
+    ];
+    let mut codes: Vec<i32> = distinct.iter().map(|(_, code)| *code).collect();
+    let before = codes.len();
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(
+        codes.len(),
+        before,
+        "every non-met goal outcome needs its own exit code"
+    );
+    assert_eq!(distinct[0].1, 0, "only a met goal exits zero");
+    assert!(
+        !codes.contains(&1),
+        "the goal codes must not collide with the generic failure code"
+    );
+}

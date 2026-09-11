@@ -70,6 +70,40 @@ pub enum TaskOutcomeSource {
     /// turn to an unconfigured gate. Like `NoVerifyCommand` it carries no
     /// pass/fail signal and is excluded from promotion evidence.
     GateSkipped,
+    /// One goal gate verdict. `verified_by` names what actually backed it, so
+    /// a verdict a command proved is distinguishable from one the model — or a
+    /// judge reading what the model wrote — merely asserted.
+    ///
+    /// Only the former counts toward promotion: a transcript judge is not an
+    /// oracle, and admitting its agreement would let a skill be promoted on
+    /// the strength of its own account of itself. See
+    /// `docs/specs/phase-5-evidence-learning.md` §12c.
+    #[cfg(feature = "goal")]
+    Goal {
+        goal_id: String,
+        verified_by: Vec<String>,
+    },
+}
+
+impl TaskOutcomeSource {
+    /// Whether this outcome may count toward learned-skill promotion.
+    ///
+    /// Gated with its only caller. `evaluate_promotion` passes an empty
+    /// outcome slice, so task outcomes reach promotion only through the
+    /// test-reachable path today — the same reachability the spec index
+    /// records for automatic evidence-threshold promotion. The rule is
+    /// enforced wherever that filter runs.
+    #[cfg(test)]
+    pub fn counts_toward_promotion(&self) -> bool {
+        match self {
+            Self::NoVerifyCommand | Self::GateSkipped => false,
+            #[cfg(feature = "goal")]
+            Self::Goal { verified_by, .. } => verified_by
+                .iter()
+                .any(|kind| kind == "checks" || kind == "verify_command"),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,10 +317,7 @@ pub fn evaluate_promotion_with_task_outcomes(
                     .any(|id| id == &context.candidate_id)
                 && outcome.created_at >= policy.window_start
                 && outcome.created_at <= policy.window_end
-                && !matches!(
-                    outcome.source,
-                    TaskOutcomeSource::NoVerifyCommand | TaskOutcomeSource::GateSkipped
-                )
+                && outcome.source.counts_toward_promotion()
         })
         .collect::<Vec<_>>();
     let verified_task_passes = relevant_task_outcomes
@@ -519,4 +550,54 @@ fn canonical_inputs(
         verified_task_failures,
         gates,
     })?)
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_outcome_tests {
+    use super::*;
+
+    fn goal(verified: &[&str]) -> TaskOutcomeSource {
+        TaskOutcomeSource::Goal {
+            goal_id: "g-1".into(),
+            verified_by: verified.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
+    /// A judge reads what the worker wrote. Counting its agreement would let a
+    /// skill be promoted on the strength of its own account of itself, so only
+    /// a command that exited zero carries a goal verdict into promotion.
+    #[test]
+    fn only_a_command_carries_a_goal_verdict_into_promotion() {
+        assert!(goal(&["checks"]).counts_toward_promotion());
+        assert!(goal(&["verify_command"]).counts_toward_promotion());
+        assert!(goal(&["self_report", "judge", "verify_command"]).counts_toward_promotion());
+
+        assert!(!goal(&["self_report"]).counts_toward_promotion());
+        assert!(!goal(&["judge"]).counts_toward_promotion());
+        assert!(!goal(&["self_report", "judge"]).counts_toward_promotion());
+        assert!(!goal(&[]).counts_toward_promotion());
+    }
+
+    /// The existing sources keep their meaning exactly.
+    #[test]
+    fn the_established_sources_are_unchanged() {
+        assert!(TaskOutcomeSource::VerifyCommand("h".into()).counts_toward_promotion());
+        assert!(TaskOutcomeSource::Oracle("o".into()).counts_toward_promotion());
+        assert!(!TaskOutcomeSource::NoVerifyCommand.counts_toward_promotion());
+        assert!(!TaskOutcomeSource::GateSkipped.counts_toward_promotion());
+    }
+
+    #[test]
+    fn a_goal_source_round_trips_through_its_storage_columns() {
+        let source = goal(&["checks", "verify_command"]);
+        let (kind, id) = super::super::telemetry::task_outcome_source_columns_for_test(&source);
+        assert_eq!(kind, "goal");
+        let id = id.expect("a goal outcome carries an id").to_string();
+        assert_eq!(id, "g-1:checks+verify_command");
+
+        let back =
+            super::super::lifecycle::task_outcome_source_from_columns_for_test(kind, Some(id))
+                .expect("the inverse mapping recovers it");
+        assert_eq!(back, source);
+    }
 }
