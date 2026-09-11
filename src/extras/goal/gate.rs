@@ -67,6 +67,7 @@ pub struct RoundSummary {
 
 impl RoundSummary {
     /// A plain completed round with no activity, for tests and defaults.
+    #[cfg(test)]
     pub fn completed() -> Self {
         Self {
             end: RoundEnd::Done,
@@ -142,6 +143,10 @@ pub struct CheckOutcome {
 }
 
 /// Result of asking the judge.
+///
+/// Constructed by the judge tier in mini-agent-a1qwa.9/.10; the gate already
+/// consumes every variant, and its tests construct them.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JudgeOutcome {
     Verdict {

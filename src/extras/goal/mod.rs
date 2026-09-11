@@ -15,14 +15,6 @@
 //! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
 //! §4.1 (record and shared store).
 
-// The record lands before the code that reads it: the preamble block, the
-// `goal_report` tool, the gate, and the driver arrive in mini-agent-a1qwa.2
-// through .6. Until the `/goal` surface exists every accessor here is
-// unreachable from the binary, which the strict lint rows would reject. This
-// allow is removed by mini-agent-a1qwa.6, at which point each item has a
-// production caller.
-#![allow(dead_code)]
-
 pub mod driver;
 pub mod gate;
 pub mod prompt;
@@ -581,6 +573,7 @@ impl Goal {
     }
 
     /// The newest report, if any.
+    #[cfg(test)]
     pub fn last_report(&self) -> Option<&Report> {
         self.reports.back()
     }
@@ -667,11 +660,6 @@ impl GoalStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Build a store already holding `goal`.
-    pub fn with_goal(goal: Goal) -> Self {
-        Self(Arc::new(Mutex::new(Some(goal))))
-    }
-
     /// Install a goal, refusing to discard an unfinished one unless `replace`.
     pub fn set(&self, goal: Goal, replace: bool) -> Result<(), GoalError> {
         let mut slot = self.lock();
@@ -704,6 +692,7 @@ impl GoalStore {
     }
 
     /// Whether a goal is present and still being worked on.
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.lock().as_ref().is_some_and(|g| g.status.is_running())
     }

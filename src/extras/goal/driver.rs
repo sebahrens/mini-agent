@@ -269,6 +269,7 @@ pub fn decision_line(goal: &Goal, decision: &GateDecision) -> String {
 }
 
 /// Whether the driver should keep running rounds after applying `decision`.
+#[cfg(test)]
 pub fn should_continue(goal: &Goal) -> bool {
     goal.status.is_running()
 }

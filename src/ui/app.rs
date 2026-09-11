@@ -912,6 +912,12 @@ impl<'a> App<'a> {
                     self.handle_agent_event(event).await?;
                 }
                 Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await } => {
+                    // A goal's time budget measures how long the agent worked,
+                    // not how long the user took to answer.
+                    #[cfg(feature = "goal")]
+                    if let Some(collector) = self.run.goal_round.as_mut() {
+                        collector.pause_clock();
+                    }
                     handle_permission_request(
                         ask_req,
                         &mut self.renderer,
@@ -920,6 +926,10 @@ impl<'a> App<'a> {
                         &mut self.user_rx,
                         &mut self.deferred_user_events,
                     ).await?;
+                    #[cfg(feature = "goal")]
+                    if let Some(collector) = self.run.goal_round.as_mut() {
+                        collector.resume_clock();
+                    }
                     self.refresh()?;
                 }
                 Some(bev) = self.btw_rx.recv() => {
