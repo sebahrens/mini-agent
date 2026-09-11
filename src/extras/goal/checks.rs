@@ -11,8 +11,7 @@
 //! builds a process itself and never calls `Sandbox::wrap_command`, so the
 //! existing containment, timeout, and output limits apply unchanged.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.5 (tier 2).
+//! Owning specification: `docs/specs/goals.md` (Verification tiers).
 
 use super::gate::{CheckOutcome, VerifyRequest};
 use super::{Goal, VerificationKind};

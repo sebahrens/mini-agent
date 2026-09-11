@@ -12,8 +12,7 @@
 //! and is deliberately independent of the TUI, headless, and ACP surfaces so
 //! all three agree on what a round was.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.4 (driver evaluation) and §4.8 (continuation modes).
+//! Owning specification: `docs/specs/goals.md` (Round model).
 
 use std::time::Duration;
 

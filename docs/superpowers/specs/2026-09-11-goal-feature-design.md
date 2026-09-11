@@ -1,7 +1,7 @@
 # Goal feature for mini-agent — research and design proposal
 
 - **Date:** 2026-09-11
-- **Status:** Proposed (awaiting maintainer approval; nothing implemented)
+- **Status:** Superseded by `docs/specs/goals.md`. Retained as the research and design record: the survey in Part 1 and the decisions behind the design. Not normative; do not implement from it.
 - **Scope:** A persistent, verifiable objective the agent keeps working toward across turns, with tiered completion checks, bounded continuation, and a stop policy. Covers TUI, headless, and ACP.
 - **Promotion path:** on approval this becomes `docs/specs/goals.md` with a row in `docs/specs/00-index.md`; this file stays as the dated research artifact.
 

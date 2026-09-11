@@ -16,8 +16,7 @@
 //! and a bounded, sanitized tail of the conversation, fenced as untrusted data
 //! because that tail contains tool output the workspace controls.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.5 (tier 3).
+//! Owning specification: `docs/specs/goals.md` (Verification tiers).
 
 use super::gate::{JudgeOutcome, VerifyCause, VerifyRequest};
 use super::{Goal, JudgePolicy, Outcome, ResolvedJudge};

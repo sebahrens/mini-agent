@@ -1,7 +1,6 @@
 //! `/goal` — set, inspect, and steer the session's objective.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.7 (surfaces).
+//! Owning specification: `docs/specs/goals.md` (Surfaces).
 
 use crate::extras::goal::{Goal, GoalStatus};
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};

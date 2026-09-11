@@ -14,8 +14,7 @@
 //! plainly that the text inside is the task to pursue and not a licence to
 //! override the system prompt or the rules its tools operate under.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.2.
+//! Owning specification: `docs/specs/goals.md` (Round model).
 
 use super::Goal;
 

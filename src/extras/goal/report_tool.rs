@@ -8,8 +8,7 @@
 //! A report is evidence for the gate, never a decision. Reporting `met` starts
 //! verification; it does not finish a goal.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.3.
+//! Owning specification: `docs/specs/goals.md` (Record).
 
 use compact_str::CompactString;
 use rig::tool::Tool;

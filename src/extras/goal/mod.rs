@@ -12,8 +12,7 @@
 //! the `goal_report` tool, so the objective, criteria, checks, judge, and
 //! bounds are read-only to it by construction.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.1 (record and shared store).
+//! Owning specification: `docs/specs/goals.md` (Record).
 
 pub mod checks;
 pub mod driver;

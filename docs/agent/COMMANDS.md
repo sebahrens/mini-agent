@@ -266,6 +266,53 @@ and rolls the transcript back.
 | `/loop stop` | Stop the active loop. |
 | `/loop status` | Show current loop status. |
 
+## Goal (feature-gated)
+
+A goal is a persistent objective the agent works toward across turns. It advances in **rounds**: one
+agent run, then one gate evaluation that decides whether to keep going and says why. Every round
+starts with a fresh turn and token budget, so a single runaway round is still bounded by
+`max_agent_turns` while the goal's own bounds cover the objective as a whole.
+
+The objective lives outside the conversation, so compaction cannot lose it, and it is restated into
+every compaction summary.
+
+A completion claim is verified before it is accepted. With `--goal-check` or `/goal check` the
+command must exit zero; the configured `verify_command` also runs when the round did not trigger it.
+A judge model then reviews the claim unless it is switched off. A judge can withhold completion but
+can never overturn a command that exited zero, and `/goal status` labels a completion no command
+proved.
+
+A goal never changes the security mode, the permission allowlist, or the sandbox policy.
+
+| Command | Description |
+| ------- | ----------- |
+| `/goal <objective>` | Set the objective. Lines after a `done when:` line become criteria. |
+| `/goal status` | Objective, criteria, status, round, tokens, verification, judge, last check. |
+| `/goal check <cmd>` | Require a command to exit zero before the goal may be reported complete. |
+| `/goal bounds <k>=<v>` | Change `max_rounds`, `max_tokens`, `continuation`, and the rest. |
+| `/goal pause` / `/goal resume` | Park the goal, or put it back to work. |
+| `/goal reopen` | Reopen a goal that was declared impossible. |
+| `/goal clear` | Discard the goal. Setting a new one over an unfinished goal is refused. |
+
+Headless flags: `--goal`, `--goal-done` (repeatable), `--goal-check` (repeatable),
+`--goal-max-rounds`, `--goal-continuation continue|restart`, `--goal-replace`. A goal with
+`--no-tools` is refused: the agent could never report progress, so every round would look like a
+stall.
+
+In `-p` mode the run continues until the goal stops, and the exit code says why:
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0` | The objective was met. |
+| `20` | Impossible as written. |
+| `21` | Blocked by something the agent cannot remove. |
+| `22` | Waiting for an answer from you. |
+| `23` | Paused: no progress, a judge outage, a context overflow, or repeated run failures. |
+| `24` | Budget limited: rounds, tokens, or time ran out. |
+
+`--output json` adds a `goal` object with the status, rounds, tokens, the evidence that backed the
+verdict, and the last reason. Goal round records are written under `state/goals/<goal-id>`.
+
 ## Shell Commands
 
 Prefix a message with `!` to run it as a shell command instead of sending it to

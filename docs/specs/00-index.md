@@ -39,6 +39,7 @@ planning context only; it cannot override the cited section.
 | 4 | [phase-4-auto-admission.md](phase-4-auto-admission.md) | Delivered | Agent proposals, no-effect evaluation, held-out cases, human-gated canary admission |
 | 5 | [phase-5-evidence-learning.md](phase-5-evidence-learning.md) | Delivered (see reachability note) | Evidence-based promotion, telemetry, quarantine, repair, supersession, rollback |
 | 6 | [phase-6-brokered-js-runtime.md](phase-6-brokered-js-runtime.md) | Delivered | JS worker containment and lifecycle, wire protocol, capability broker, realm/verification parity, effect audit |
+| Feature | [goals.md](goals.md) | Delivered (see its shipped-binary status) | Persistent objectives, the round loop, the completion gate, verification tiers, bounds, and the goal surfaces |
 
 **Phase 5 reachability note.** "Delivered" in the row above means the phase owns those concerns and
 their contracts are implemented and regression-tested. It does not mean every one of them is
@@ -72,6 +73,7 @@ Prior research artifacts superseded by this index:
 
 - `docs/specs/2026-07-27-js-engine-blueprint.md`
 - `docs/superpowers/specs/2026-07-27-js-engine-blueprint.md`
+- `docs/superpowers/specs/2026-09-11-goal-feature-design.md` (superseded by [goals.md](goals.md))
 
 ### Explicit Phase 6 supersession map
 
@@ -91,9 +93,10 @@ its original phase.
 
 The goal feature is a harness capability: a persistent objective the agent works toward across
 turns, with tiered verification and bounds enforced in code. Its normative home is
-`docs/specs/goals.md` (promoted in `mini-agent-a1qwa.15`); until then the approved design at
+[goals.md](goals.md). The approved design at
 `docs/superpowers/specs/2026-09-11-goal-feature-design.md` and the review disposition at
-`docs/reviews/2026-09-11-goal-design-devils-advocate.md` carry the contract.
+`docs/reviews/2026-09-11-goal-design-devils-advocate.md` are superseded research artifacts: they
+record how the design was reached and must not be used for implementation.
 
 Goals extend three owned concerns and change nothing else. Each extension is recorded in the owning
 file per rule 3 above:

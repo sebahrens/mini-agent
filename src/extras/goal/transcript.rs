@@ -8,8 +8,7 @@
 //! Fields are bounded and the whole writer is suppressed when artifact writing
 //! is disabled. Ownership is declared in `docs/specs/platform-paths.md`.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.7.
+//! Owning specification: `docs/specs/goals.md` (Surfaces).
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};

@@ -18,8 +18,7 @@
 //! the bounded wrap-up round), a question to the user outranks stall detection,
 //! and evidence outranks the model's own account of its work.
 //!
-//! Owning specification: `docs/superpowers/specs/2026-09-11-goal-feature-design.md`
-//! §4.4 (gate) and §4.6 (bounds).
+//! Owning specification: `docs/specs/goals.md` (The gate, Bounds).
 
 use super::{
     Goal, GoalStatus, Outcome, PauseReason, Report, ReportStatus, VerdictSource, VerificationKind,
