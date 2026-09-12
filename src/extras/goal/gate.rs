@@ -1847,7 +1847,7 @@ mod tests {
             RoundEnd::Cancelled,
         ];
 
-        for status in statuses {
+        for reported in statuses {
             for end in &ends {
                 for mutating in [0u32, 1] {
                     for todos in [0usize, 1] {
@@ -1859,7 +1859,7 @@ mod tests {
                                 let round = RoundSummary {
                                     end: end.clone(),
                                     mutating_tool_calls: mutating,
-                                    report: status.map(report),
+                                    report: reported.map(report),
                                     open_todos: todos,
                                     ..RoundSummary::completed()
                                 };
@@ -1888,6 +1888,43 @@ mod tests {
                                         "every completed round records a verdict"
                                     );
                                     assert_eq!(g.progress.rounds, rounds + 1);
+
+                                    // Each streak counts the thing it is named
+                                    // after, and nothing else. A counter that
+                                    // drifts here is a stop that arrives early
+                                    // or never.
+                                    let failed = matches!(round.end, RoundEnd::Failed(_));
+                                    assert_eq!(
+                                        g.progress.consecutive_round_failures,
+                                        u32::from(failed),
+                                        "{reported:?}/{end:?} failure streak"
+                                    );
+                                    let progressed = mutating > 0 || reported.is_some();
+                                    assert_eq!(
+                                        g.progress.consecutive_no_progress,
+                                        u32::from(!progressed),
+                                        "{reported:?}/{end:?} stall streak"
+                                    );
+                                    assert_eq!(
+                                        g.progress.consecutive_blocked,
+                                        u32::from(reported == Some(ReportStatus::Blocked)),
+                                        "{reported:?}/{end:?} blocked streak"
+                                    );
+                                    // Nothing here asked a judge, so nothing
+                                    // may have climbed its ladder.
+                                    assert_eq!(g.progress.judge_failures, 0);
+                                    // The wrap-up is armed only by the decision
+                                    // that issues it, and never disarmed by a
+                                    // round.
+                                    let issued_wrap_up = matches!(
+                                        decision,
+                                        GateDecision::Continue { wrap_up: true, .. }
+                                    );
+                                    assert_eq!(
+                                        g.progress.wrap_up_issued,
+                                        wrap_up || issued_wrap_up,
+                                        "{reported:?}/{end:?} wrap-up flag"
+                                    );
                                 }
                             }
                         }

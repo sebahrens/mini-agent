@@ -73,6 +73,8 @@ impl TempRoot {
                     | "second_wait"
                     | "verification"
                     | "verification_without_shell"
+                    // A goal runs its bounded round, then the wrap-up round.
+                    | "goal_rounds"
             ) {
                 2
             } else {
@@ -1043,4 +1045,77 @@ fn completion_verification_runs_without_exposing_the_shell_tool() {
         std::fs::read_to_string(root.0.join("verified.txt")).unwrap(),
         "checked"
     );
+}
+
+/// A goal reports its own outcome, and exits with it.
+///
+/// Nothing ran the binary with `--goal` before this: the exit codes were a
+/// table in a test, the rounds were unit-tested, and the two had never met.
+/// A caller that cannot tell "resume me" from "stop retrying" has to parse
+/// prose, which is the thing the exit codes exist to avoid.
+#[cfg(feature = "goal")]
+#[test]
+fn a_headless_goal_reports_its_outcome_and_exits_with_it() {
+    for json in [false, true] {
+        let root = TempRoot::new();
+        let server = root.local_provider("goal_rounds");
+        let mut cli = root.provider_command("read");
+        if json {
+            cli.args(["--output", "json"]);
+        }
+        cli.args([
+            "--goal",
+            "ship the parser",
+            "--goal-done",
+            "the tests pass",
+            // One round, then the bounded wrap-up round the budget allows.
+            "--goal-max-rounds",
+            "1",
+            "-p",
+            "start",
+        ]);
+
+        let output = bounded_output(cli);
+        server.join().unwrap().unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+
+        // The model never claimed completion, so the budget is what stopped
+        // it, and that is not success.
+        assert_eq!(
+            output.status.code(),
+            Some(24),
+            "a budget-limited goal exits with its own code (json={json}): {stderr}"
+        );
+
+        if json {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("one JSON object on stdout: {error}: {stdout}"));
+            assert_eq!(value["stop_reason"], "goal_budget_limited");
+            assert_eq!(value["goal"]["status"], "budget limited");
+            assert_eq!(value["goal"]["objective"], "ship the parser");
+        }
+
+        // Each round is in the session exactly once, under the prompt it ran
+        // with: the operator's message first, the wrap-up instruction second.
+        let session = root.saved_session();
+        let prompts: Vec<&str> = session["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "one user message per round, written once (json={json}): {prompts:?}"
+        );
+        assert_eq!(prompts[0], "start");
+        assert!(
+            prompts[1].contains("configured budget"),
+            "the second round ran the wrap-up instruction: {}",
+            prompts[1]
+        );
+    }
 }

@@ -256,6 +256,51 @@ mod tests {
         assert!(outcome.failure_tail.is_some());
     }
 
+    /// Everything that is not "exited zero" is a failure.
+    ///
+    /// The specification lists them together for a reason: a launch that never
+    /// happened and an output the harness had to truncate are both silence
+    /// about whether the objective was reached, and silence is not proof.
+    #[tokio::test]
+    async fn a_check_that_cannot_speak_for_itself_is_a_failure() {
+        // A command that does not exist never runs.
+        let goal = goal_with(&["definitely-not-a-real-command-3f9a"]);
+        let outcome = run(
+            &goal,
+            &request(false, true),
+            &sandbox(),
+            &Default::default(),
+        )
+        .await
+        .expect("checks ran");
+        assert!(!outcome.all_passed, "a launch failure proves nothing");
+        assert!(outcome.verified.is_empty());
+
+        // A command that floods its output is cut off, and a cut-off answer is
+        // not an answer.
+        let goal = goal_with(&["yes flooding-output"]);
+        let outcome = run(
+            &goal,
+            &request(false, true),
+            &sandbox(),
+            &Default::default(),
+        )
+        .await
+        .expect("checks ran");
+        assert!(
+            !outcome.all_passed,
+            "an output-limit breach proves nothing either"
+        );
+        let tail = outcome.failure_tail.expect("failure is explained");
+        // A megabyte of output reaches the model as a few thousand characters:
+        // the tail plus the command it came from, not the flood itself.
+        assert!(
+            tail.chars().count() < FAILURE_TAIL_CHARS * 2,
+            "and what the model is shown of it is bounded: {} chars",
+            tail.chars().count()
+        );
+    }
+
     #[tokio::test]
     async fn the_verify_command_runs_before_the_goals_own_checks() {
         let goal = goal_with(&["true"]);

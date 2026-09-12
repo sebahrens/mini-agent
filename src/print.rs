@@ -138,6 +138,9 @@ pub(crate) struct HeadlessJsonOutput {
 #[derive(Debug, Serialize)]
 pub(crate) struct HeadlessGoal {
     pub id: String,
+    /// What the goal was working toward. A caller has the id either way; this
+    /// is what makes the object readable without the session beside it.
+    pub objective: String,
     pub status: String,
     pub rounds: u32,
     pub tokens: u64,
@@ -151,6 +154,7 @@ impl HeadlessGoal {
     pub fn from_goal(goal: &crate::extras::goal::Goal) -> Self {
         Self {
             id: goal.id.to_string(),
+            objective: goal.objective.clone(),
             status: goal.status.label().to_string(),
             rounds: goal.progress.rounds,
             tokens: goal.progress.tokens_used,
@@ -159,19 +163,9 @@ impl HeadlessGoal {
                 .as_ref()
                 .map(|verdict| {
                     verdict
-                        .evidence
-                        .iter()
-                        .map(|kind| {
-                            match kind {
-                                crate::extras::goal::VerificationKind::SelfReport => "self_report",
-                                crate::extras::goal::VerificationKind::Checks => "checks",
-                                crate::extras::goal::VerificationKind::VerifyCommand => {
-                                    "verify_command"
-                                }
-                                crate::extras::goal::VerificationKind::Judge => "judge",
-                            }
-                            .to_string()
-                        })
+                        .evidence_labels()
+                        .into_iter()
+                        .map(str::to_string)
                         .collect()
                 })
                 .unwrap_or_default(),

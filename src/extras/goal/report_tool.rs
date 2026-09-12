@@ -404,6 +404,37 @@ mod tests {
         }
     }
 
+    /// A round is judged on the last thing the agent said about it.
+    ///
+    /// The model can call `goal_report` more than once in a round — changing
+    /// its mind, or reporting progress and then completion — and the gate reads
+    /// one report. It has to be the latest, or a claim withdrawn mid-round
+    /// would still decide the round.
+    #[tokio::test]
+    async fn the_last_report_in_a_round_is_the_one_that_speaks_for_it() {
+        let store = store_with_goal();
+        let tool = GoalReport::new(store.clone());
+
+        tool.call(args("progress")).await.expect("progress filed");
+        tool.call(GoalReportArgs {
+            status: "met".into(),
+            evidence: Some("cargo test passed".into()),
+            ..args("met")
+        })
+        .await
+        .expect("completion filed");
+
+        let goal = store.snapshot().expect("a goal");
+        let round = goal.progress.current_round();
+        let reports: Vec<_> = goal.reports_in_round(round).collect();
+        assert_eq!(reports.len(), 2, "both are kept as history");
+        assert_eq!(
+            reports.last().map(|report| report.status),
+            Some(ReportStatus::Met),
+            "and the last one is what the round claims"
+        );
+    }
+
     /// The schema is the whole guarantee that the model cannot edit what it is
     /// being judged against, so it is asserted rather than assumed.
     #[test]

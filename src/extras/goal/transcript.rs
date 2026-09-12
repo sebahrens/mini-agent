@@ -85,14 +85,25 @@ pub fn save_round(
     };
 
     let record = build_record(goal, summary, decision, instruction, checks, judge);
+    write_record(
+        &paths.goals_dir().join(goal.id.as_str()),
+        goal.progress.rounds,
+        &record,
+    );
+}
 
-    let dir = paths.goals_dir().join(goal.id.as_str());
-    if let Err(error) = std::fs::create_dir_all(&dir) {
+/// Write one round's record, or report why it could not be written.
+///
+/// Split from path resolution so the write itself is testable: the directory
+/// a goal's transcripts live in is decided once, and everything after it is
+/// the same few filesystem calls wherever that directory is.
+fn write_record(dir: &std::path::Path, round: u32, record: &RoundRecord<'_>) {
+    if let Err(error) = std::fs::create_dir_all(dir) {
         tracing::warn!(%error, "goal: could not create the transcript directory");
         return;
     }
-    let path = dir.join(format!("round-{:04}.json", goal.progress.rounds));
-    match serde_json::to_vec_pretty(&record) {
+    let path = dir.join(format!("round-{round:04}.json"));
+    match serde_json::to_vec_pretty(record) {
         Ok(bytes) => {
             if let Err(error) = crate::fs::private_atomic_write_sync(&path, &bytes) {
                 tracing::warn!(%error, "goal: could not write the round transcript");
@@ -228,6 +239,42 @@ mod tests {
         };
         let record = build_record(goal, &summary, &decision, "instruction", checks, judge);
         serde_json::to_string_pretty(&record).unwrap()
+    }
+
+    /// The write path itself: a record lands under this goal's directory, named
+    /// for the round, and a directory that cannot be created is reported and
+    /// dropped rather than turning a decided round into a failed one.
+    #[test]
+    fn a_round_record_is_written_under_the_goals_own_directory() {
+        let root = std::env::temp_dir().join(format!("goal-transcript-{}", uuid::Uuid::new_v4()));
+        let goal = goal();
+        let summary = summary();
+        let decision = GateDecision::Stop {
+            status: GoalStatus::Met,
+            reason: "cargo test passed".into(),
+            paused_reason: None,
+            source: VerdictSource::Checks,
+            evidence: vec![VerificationKind::SelfReport, VerificationKind::Checks],
+        };
+        let record = build_record(&goal, &summary, &decision, "instruction", None, None);
+
+        let dir = root.join(goal.id.as_str());
+        write_record(&dir, goal.progress.rounds, &record);
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("round-0003.json")).expect("a record was written"),
+        )
+        .expect("valid JSON");
+        assert_eq!(written["round"], 3);
+        assert_eq!(written["decision"], "stop");
+        assert_eq!(written["goal_id"], goal.id.as_str());
+
+        // A path that cannot hold a directory is reported and dropped: losing
+        // an audit line must never lose the round it describes.
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("block the path");
+        write_record(&blocked.join("goal"), 1, &record);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
