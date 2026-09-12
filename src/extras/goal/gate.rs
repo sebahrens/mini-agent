@@ -152,10 +152,6 @@ pub struct CheckOutcome {
 }
 
 /// Result of asking the judge.
-///
-/// Constructed by the judge tier in mini-agent-a1qwa.9/.10; the gate already
-/// consumes every variant, and its tests construct them.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JudgeOutcome {
     Verdict {

@@ -62,6 +62,9 @@ pub fn loop_goal(
         summary_chars: super::super::r#loop::SUMMARY_TRUNCATION_CHARS
             .min(DEFAULT_RESTART_SUMMARY_CHARS.max(super::super::r#loop::SUMMARY_TRUNCATION_CHARS)),
     };
+    // `--loop-max 0` means "run nothing", which a goal's minimum of one round
+    // cannot express; the caller answers it before a goal is built. Anything
+    // that reaches here runs at least one iteration.
     if let Some(max) = max_iterations {
         goal.bounds.max_rounds = max.max(1);
     }

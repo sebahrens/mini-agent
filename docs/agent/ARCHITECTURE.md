@@ -149,6 +149,7 @@ reproducing code; focus on structure, relationships, and rationale.
 - `src/config/` — Config parsing, validation, resolution
 - `src/extras/` — Optional features gated behind Cargo features
 - `src/extras/loop/validation.rs` — Shared bounded, sandboxed loop-validator execution, operation-scoped cancellation, and diagnostics
+- `src/extras/goal/` — Persistent objectives: the record, the pure gate, the round driver, the checks and judge tiers, and round transcripts. `--loop` is a preset over it.
 
 ## Key Types
 - `AnyAgent` / `AnyClient` — type-erased agent and LLM client

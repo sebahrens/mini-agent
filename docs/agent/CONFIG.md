@@ -731,6 +731,11 @@ explorer). `UserPromptSubmit` cannot alter the submitted prompt; an
 continue instead of finishing, using `reason` as the next instruction; `Stop`
 gives up after 8 consecutive blocks without progress.
 
+A `Stop` envelope also describes the goal the turn belonged to, when there is
+one: `goal_id`, `goal_status` and `goal_round`, all null when no goal is
+running. `--loop` runs as a goal, and its envelopes still carry
+`loop_iteration` and `loop_active`, derived from the round the goal is on.
+
 Any handler can also signal via **exit code** instead of JSON: exit `0` means
 no objection, exit `2` blocks (for blockable events) with stderr as the
 reason, and any other exit code is a non-blocking error. Exit `2` combined
@@ -1146,7 +1151,7 @@ Each segment has:
 Items with a built-in icon (used by `icon = true`): `git_branch`, `git_changes`,
 `git_status`, `cwd`, `model`, `cost`, `context_used`/`context_max`/
 `context_percentage`, `session_name`/`session_id`, `prompt`, `mode`, `loop`,
-`btw`, `compaction`. Named custom icons for `icon = "<name>"`: `branch`,
+`goal`, `btw`, `compaction`. Named custom icons for `icon = "<name>"`: `branch`,
 `folder`, `chip`, `dollar`, `database`, `hash`, `terminal`, `lock`, `pencil`,
 `sync`. Any other value is used literally, so a raw codepoint works too.
 
@@ -1198,6 +1203,7 @@ Available items:
 | `prompt`              | Active prompt (`prompt:<name>`). |
 | `mode`                | Security mode when not `standard` (`mode:<name>`). |
 | `loop`                | Active loop label. |
+| `goal`                | Active goal: its round and status, in brackets. Hidden when there is no goal or it has finished. |
 | `chain`               | Chain-of-prompts label. |
 | `background_jobs`     | Running background shell jobs (`jobs:<n>`; hidden at zero). |
 | `compaction`          | Number of compactions (`cmp:<n>`). |

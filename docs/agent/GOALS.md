@@ -96,7 +96,7 @@ verification.
 | `active` | Being worked on. |
 | `awaiting user` | The agent asked you something. Answer it and the goal resumes. |
 | `blocked` | The same blocker survived several rounds with no progress. |
-| `paused` | Parked by the harness. `/goal status` says why. |
+| `paused` | Parked, by the harness or by you. `/goal status` says why. |
 | `budget limited` | Rounds, tokens, or time ran out. Raise a bound and resume. |
 | `met` | Reached, and verified as deeply as you configured. |
 | `impossible` | Cannot be satisfied as written. `/goal reopen` to try again. |
@@ -162,4 +162,29 @@ Two differences follow from the fold and are deliberate:
   cap has always meant what it says.
 - A loop can finish early. If the agent reports the objective met and the
   validator passes, the goal is met and the remaining iterations are not run.
-  Nothing weaker ends it: a claim no command proved never shortens a loop.
+  With `--loop-run`, nothing weaker ends it: a claim the validator rejects never
+  shortens a loop. Without one there is nothing to prove the claim, so a
+  self-reported completion does end the loop — and says so, labelled as
+  self-reported.
+- A loop does not call a second model unless you configured one. Set
+  `[goal] judge` or `goal_judge_model` if you want completion claims reviewed.
+
+## In an editor
+
+An ACP client sets a goal through `_meta.goal` on a `session/prompt` request:
+
+```json
+{"goal": {"objective": "retire the legacy exporter",
+          "criteria": ["no callers remain"],
+          "replace": false}}
+```
+
+`{"clear": true}` drops the goal. Those four fields are the whole schema, and
+anything else is refused: checks, the judge and the bounds come from this
+installation's configuration, never from the client, so an editor cannot
+configure a gate and cannot switch one off.
+
+One prompt is one round. The client sends the next prompt to run the next
+round, which is how an editor already works. Each round's decision comes back
+as a thought chunk and as `_meta.goal`, carrying the status, the round, whether
+a command proved the verdict, and what the evidence was.

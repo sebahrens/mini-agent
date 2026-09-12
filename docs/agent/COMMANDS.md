@@ -237,9 +237,12 @@ and the goal driver runs its rounds. An iteration is a goal round in restart
 mode, so each one starts from a clean conversation carrying the objective, the
 plan file and a summary of the round before it. `--loop-max N` runs exactly N
 iterations, and a validator that passes while the agent reports the objective
-met can end the loop before the cap. Interrupting during a validator ends the
-loop cleanly and reports `goal: interrupted during verification`; the round's
-work is saved first. `/goal status` describes a running loop, and round records
+met can end the loop before the cap. `--loop-max 0` runs nothing at all.
+Interrupting during a validator ends the loop cleanly and reports
+`goal: interrupted during verification`; the round's work is saved first, and
+the interrupted round is not counted against the goal. A loop that stops for a
+reason of its own — blocked, waiting on you, or stalled — exits with that
+reason's code rather than reporting success. `/goal status` describes a running loop, and round records
 are written under the goal transcript directory rather than a separate one.
 
 `--loop-plan <path>` selects the plan used for both reading progress and the

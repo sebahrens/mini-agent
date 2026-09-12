@@ -202,6 +202,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--no-color` | Disable colored TUI output. |
 | `--tutor` | Print the getting-started guide through the pager and exit. |
 | `--loop`, `--loop-prompt`, `--loop-plan`, `--loop-max`, `--loop-run` | Configure the bounded headless iterative loop and optional validation command. |
+| `--goal <objective>`, `--goal-done`, `--goal-check`, `--goal-max-rounds`, `--goal-continuation`, `--goal-replace` | Work toward a persistent objective across turns, with completion criteria and commands that must pass before it counts as met. See [GOALS.md](GOALS.md). |
 | `--worktree <name>` | Run the agent inside a new git worktree. |
 | `--parallel` | Run the agent inside a self-managed git worktree (Experimental) |
 | `--wt-auto-merge`, `--wt-base-dir <path>` | Configure worktree merge-on-exit and its base directory. |
