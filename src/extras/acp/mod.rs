@@ -1297,6 +1297,10 @@ async fn drive_permission_bridge(
     session_id: SessionId,
     mut ask_rx: crate::permission::ask::AskReceiver,
     control: Arc<TurnControl>,
+    // Milliseconds this turn spent waiting on the user. A goal's time bound
+    // measures how long the agent worked, not how long the person took to
+    // answer, so the round subtracts this from its wall clock.
+    #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use crate::permission::ask::UserDecision;
 
@@ -1365,12 +1369,19 @@ async fn drive_permission_bridge(
         ];
         let req = RequestPermissionRequest::new(session_id.clone(), tool_call, options);
 
+        #[cfg(feature = "goal")]
+        let waiting_since = std::time::Instant::now();
         let response = tokio::select! {
             biased;
             _ = control.cancelled() => None,
             _ = ask.reply.closed() => None,
             res = cx.send_request(req).block_task() => Some(res),
         };
+        #[cfg(feature = "goal")]
+        blocked_ms.fetch_add(
+            u64::try_from(waiting_since.elapsed().as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let (decision, notice) = match response {
             None => (UserDecision::Deny, "Permission request cancelled"),
@@ -1466,6 +1477,13 @@ async fn run_prompt(
     let sandbox_for_gate = sandbox.clone();
     #[cfg(feature = "goal")]
     let todo_snapshot = todo_store.snapshot();
+    // A goal's time bound measures how long the agent worked, so the turn's
+    // wall clock is taken here and whatever the user spent on a permission
+    // prompt is subtracted from it.
+    #[cfg(feature = "goal")]
+    let blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(feature = "goal")]
+    let round_started = std::time::Instant::now();
     let result = execute_prompt(
         state,
         prompt_text,
@@ -1486,6 +1504,8 @@ async fn run_prompt(
         control,
         #[cfg(feature = "mcp")]
         &mut mcp_manager,
+        #[cfg(feature = "goal")]
+        blocked_ms.clone(),
     )
     .await;
     // Keep the history lock and generation registered until every per-prompt
@@ -1508,6 +1528,16 @@ async fn run_prompt(
         &todo_snapshot,
         &state.cfg,
         &sandbox_for_gate,
+        &crate::extras::goal::driver::RoundCost {
+            usage: outcome.usage,
+            // What the agent worked for, excluding whatever the user spent
+            // deciding on a permission prompt.
+            active: round_started
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_millis(
+                    blocked_ms.load(std::sync::atomic::Ordering::Relaxed),
+                )),
+        },
     )
     .await;
 
@@ -1572,6 +1602,7 @@ async fn settle_acp_goal_round(
     todos: &[crate::agent::tools::todo::TodoItem],
     cfg: &Config,
     sandbox: &crate::sandbox::Sandbox,
+    cost: &crate::extras::goal::driver::RoundCost,
 ) -> Option<(String, crate::extras::goal::Goal)> {
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
@@ -1584,13 +1615,12 @@ async fn settle_acp_goal_round(
     let mut summary = driver::summary_from_headless_turn(
         &goal,
         interactions,
-        &rig::completion::Usage::default(),
+        cost,
         None,
         open_todos,
         cfg.verify_command
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty()),
-        std::time::Duration::ZERO,
     );
     summary.end = match reason {
         StopReason::EndTurn => RoundEnd::Done,
@@ -1617,6 +1647,10 @@ struct PromptOutcome {
     reason: StopReason,
     progress: Option<Vec<Message>>,
     error: Option<String>,
+    /// Tokens this turn spent. A goal's token bound is enforced from here, so
+    /// leaving it at zero would make the bound configurable and inert.
+    #[cfg(feature = "goal")]
+    usage: rig::completion::Usage,
 }
 
 impl PromptOutcome {
@@ -1625,6 +1659,8 @@ impl PromptOutcome {
             reason: StopReason::Cancelled,
             progress,
             error: None,
+            #[cfg(feature = "goal")]
+            usage: rig::completion::Usage::default(),
         }
     }
 
@@ -1633,6 +1669,8 @@ impl PromptOutcome {
             reason: StopReason::Refusal,
             progress: None,
             error: Some(error),
+            #[cfg(feature = "goal")]
+            usage: rig::completion::Usage::default(),
         }
     }
 }
@@ -1656,6 +1694,8 @@ async fn execute_prompt(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     #[cfg(feature = "mcp")] mcp_manager: &mut Option<crate::extras::mcp::McpClientManager>,
+    // Filled by the permission bridge with the time the user held this turn.
+    #[cfg(feature = "goal")] blocked_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<PromptOutcome, agent_client_protocol::Error> {
     if control.is_cancelled() {
         return Ok(PromptOutcome::cancelled(None));
@@ -1733,6 +1773,8 @@ async fn execute_prompt(
             session_id.clone(),
             rx,
             control.clone(),
+            #[cfg(feature = "goal")]
+            blocked_ms,
         ));
     }
     let provider_str = state.cli.resolve_provider(&state.cfg);
@@ -1944,6 +1986,8 @@ async fn relay_prompt_events(
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
 ) -> PromptOutcome {
+    #[cfg(feature = "goal")]
+    let mut usage = rig::completion::Usage::default();
     loop {
         let event = tokio::select! {
             biased;
@@ -1956,6 +2000,8 @@ async fn relay_prompt_events(
             return PromptOutcome {
                 reason: StopReason::Refusal,
                 progress: None,
+                #[cfg(feature = "goal")]
+                usage: rig::completion::Usage::default(),
                 error: None,
             };
         };
@@ -2069,9 +2115,20 @@ async fn relay_prompt_events(
                     tracing::warn!("ACP failed to send verification notification: {}", e);
                 }
             }
-            AgentEvent::UsageDelta { .. } => {
-                // Mid-stream provider usage; ACP has no status bar to update, so
-                // there is nothing to surface for this event.
+            AgentEvent::UsageDelta { usage: delta, .. } => {
+                // ACP has no status bar to update, but a goal's token bound is
+                // enforced from this total, so it is accumulated rather than
+                // dropped.
+                #[cfg(feature = "goal")]
+                {
+                    usage.input_tokens = usage.input_tokens.saturating_add(delta.input_tokens);
+                    usage.output_tokens = usage.output_tokens.saturating_add(delta.output_tokens);
+                    usage.total_tokens = usage
+                        .total_tokens
+                        .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
+                }
+                #[cfg(not(feature = "goal"))]
+                let _ = delta;
             }
             AgentEvent::CompactionBoundary { .. } => {
                 tracing::error!("interactive-only compaction boundary reached ACP");
@@ -2084,6 +2141,8 @@ async fn relay_prompt_events(
                     reason: StopReason::EndTurn,
                     progress: Some(interactions),
                     error: None,
+                    #[cfg(feature = "goal")]
+                    usage,
                 };
             }
             AgentEvent::Error {
@@ -2095,6 +2154,8 @@ async fn relay_prompt_events(
                     reason: StopReason::Refusal,
                     progress: Some(interactions),
                     error: Some(message.to_string()),
+                    #[cfg(feature = "goal")]
+                    usage,
                 };
             }
         }
@@ -2905,6 +2966,8 @@ mod protocol_tests {
                             SessionId::new("permission-test"),
                             ask_rx,
                             bridge_control,
+                            #[cfg(feature = "goal")]
+                            Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         )
                         .await;
                         let _ = done_tx.send(());

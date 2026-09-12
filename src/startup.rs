@@ -1965,6 +1965,11 @@ async fn run_headless_goal_rounds(
     let quiet = cli.pure_stdout && !json_output;
     let stream = !json_output;
 
+    // A goal's time bound measures how long the agent worked. Headless runs
+    // never wait on a permission prompt, so the round's wall clock is its
+    // active time; without this the bound is configurable and inert.
+    #[cfg(feature = "goal")]
+    let mut round_started = std::time::Instant::now();
     #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
     let mut turn = agent
         .run_print(
@@ -1977,6 +1982,8 @@ async fn run_headless_goal_rounds(
             None,
         )
         .await;
+    #[cfg(feature = "goal")]
+    let mut round_elapsed = round_started.elapsed();
 
     #[cfg(feature = "goal")]
     {
@@ -2004,11 +2011,13 @@ async fn run_headless_goal_rounds(
             let summary = driver::summary_from_headless_turn(
                 &goal,
                 &turn.interactions,
-                &turn.usage,
+                &driver::RoundCost {
+                    usage: turn.usage,
+                    active: round_elapsed,
+                },
                 turn.failure.as_ref(),
                 open_todos,
                 verify_configured,
-                std::time::Duration::ZERO,
             );
 
             let sandbox_for_checks = sandbox.clone();
@@ -2112,7 +2121,19 @@ async fn run_headless_goal_rounds(
                 driver::HistoryMode::Empty => std::sync::Arc::from(Vec::new()),
             };
 
-            let next = agent
+            // The wrap-up round is asked to summarize and stop, so it runs on
+            // an agent capped to that budget. Announcing a bound and then
+            // handing the round the full per-run budget is not a bound.
+            let capped;
+            let round_agent = match relaunch.max_agent_turns {
+                Some(max_turns) => {
+                    capped = agent.with_max_agent_turns(max_turns);
+                    &capped
+                }
+                None => agent,
+            };
+            round_started = std::time::Instant::now();
+            let next = round_agent
                 .run_print(
                     &relaunch.prompt,
                     quiet,
@@ -2123,6 +2144,7 @@ async fn run_headless_goal_rounds(
                     None,
                 )
                 .await;
+            round_elapsed = round_started.elapsed();
             // Only the final round's transcript is returned; earlier rounds are
             // already persisted above.
             turn = next;

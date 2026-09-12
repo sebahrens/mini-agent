@@ -66,8 +66,10 @@ pub struct RoundSummary {
     pub verify_configured: bool,
     pub open_todos: usize,
     pub tokens_used: u64,
-    /// Agent-active seconds, excluding time blocked on a permission prompt.
-    pub active_secs: u64,
+    /// Agent-active time, excluding any stretch blocked on a permission
+    /// prompt. Carried at full precision so a test can prove the clock stopped
+    /// without sleeping a whole second to see it.
+    pub active: std::time::Duration,
 }
 
 impl RoundSummary {
@@ -84,7 +86,7 @@ impl RoundSummary {
             verify_configured: false,
             open_todos: 0,
             tokens_used: 0,
-            active_secs: 0,
+            active: std::time::Duration::ZERO,
         }
     }
 
@@ -555,13 +557,13 @@ fn exhausted_bound(goal: &Goal, round: &RoundSummary) -> Option<String> {
         return Some(format!("round {rounds} of {}", bounds.max_rounds));
     }
     if let Some(max) = bounds.max_tokens {
-        let used = progress.tokens_used + round.tokens_used;
+        let used = progress.tokens_used.saturating_add(round.tokens_used);
         if used >= max {
             return Some(format!("{used} of {max} tokens"));
         }
     }
     if let Some(max) = bounds.max_active_secs {
-        let used = progress.active_secs + round.active_secs;
+        let used = progress.active_secs.saturating_add(round.active.as_secs());
         if used >= max {
             return Some(format!("{used}s of {max}s"));
         }
@@ -833,7 +835,10 @@ pub fn apply(
     // panic the process that loaded it.
     goal.progress.rounds = goal.progress.rounds.saturating_add(1);
     goal.progress.tokens_used = goal.progress.tokens_used.saturating_add(round.tokens_used);
-    goal.progress.active_secs = goal.progress.active_secs.saturating_add(round.active_secs);
+    goal.progress.active_secs = goal
+        .progress
+        .active_secs
+        .saturating_add(round.active.as_secs());
 
     match &round.end {
         RoundEnd::Failed(_) => {
@@ -1154,7 +1159,7 @@ mod tests {
         g.bounds.max_active_secs = Some(60);
         g.progress.active_secs = 59;
         let round = RoundSummary {
-            active_secs: 2,
+            active: std::time::Duration::from_secs(2),
             ..worked()
         };
         match decided(&g, &round) {

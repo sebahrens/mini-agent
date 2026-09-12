@@ -124,7 +124,7 @@ impl RoundCollector {
             verify_configured: false,
             open_todos,
             tokens_used: self.input_tokens + self.output_tokens,
-            active_secs: self.active.as_secs(),
+            active: self.active,
         }
     }
 }
@@ -442,16 +442,26 @@ mod tests {
         );
     }
 
+    /// A goal's time budget measures how long the agent worked, not how long
+    /// the user took to answer. A person at lunch must not exhaust it.
     #[test]
     fn time_spent_waiting_on_the_user_does_not_count_against_the_budget() {
         let mut collector = RoundCollector::new();
+        std::thread::sleep(Duration::from_millis(20));
         collector.pause_clock();
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(120));
         collector.resume_clock();
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
-        assert_eq!(
-            summary.active_secs, 0,
-            "a permission prompt is not agent-active time"
+
+        assert!(
+            summary.active >= Duration::from_millis(15),
+            "the work before the prompt is still work: {:?}",
+            summary.active
+        );
+        assert!(
+            summary.active < Duration::from_millis(100),
+            "but the wait for the user is not: {:?}",
+            summary.active
         );
     }
 
@@ -671,31 +681,18 @@ mod tests {
     #[test]
     fn an_interrupted_headless_turn_is_cancelled_not_failed() {
         let goal = Goal::new("ship it", Vec::new()).unwrap();
-        let usage = rig::completion::Usage::default();
+        let cost = RoundCost {
+            active: Duration::from_secs(1),
+            ..RoundCost::default()
+        };
 
         let interrupted = anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED);
-        let summary = summary_from_headless_turn(
-            &goal,
-            &[],
-            &usage,
-            Some(&interrupted),
-            0,
-            false,
-            std::time::Duration::from_secs(1),
-        );
+        let summary = summary_from_headless_turn(&goal, &[], &cost, Some(&interrupted), 0, false);
         assert_eq!(summary.end, RoundEnd::Cancelled);
 
         // An ordinary failure is still a failure and is still retried.
         let failed = anyhow::anyhow!("provider returned 500");
-        let summary = summary_from_headless_turn(
-            &goal,
-            &[],
-            &usage,
-            Some(&failed),
-            0,
-            false,
-            std::time::Duration::from_secs(1),
-        );
+        let summary = summary_from_headless_turn(&goal, &[], &cost, Some(&failed), 0, false);
         assert!(matches!(summary.end, RoundEnd::Failed(_)));
     }
 }
@@ -1098,14 +1095,25 @@ mod settle_tests {
 /// rather than a live event stream, so the same facts are recovered from the
 /// turn's own record. Both paths end up at the identical [`RoundSummary`], which
 /// is what keeps a goal behaving the same way in a terminal and in CI.
+/// What one round cost.
+///
+/// Tokens spent and time the agent was actually working, which is wall time
+/// less any stretch blocked on a permission prompt. The two are always read
+/// together — they are the inputs to the token and time bounds — so they are
+/// one value rather than two arguments every surface has to remember.
+#[derive(Debug, Default, Clone)]
+pub struct RoundCost {
+    pub usage: rig::completion::Usage,
+    pub active: Duration,
+}
+
 pub fn summary_from_headless_turn(
     goal: &Goal,
     interactions: &[rig::completion::Message],
-    usage: &rig::completion::Usage,
+    cost: &RoundCost,
     failure: Option<&anyhow::Error>,
     open_todos: usize,
     verify_configured: bool,
-    active: Duration,
 ) -> RoundSummary {
     use rig::message::{AssistantContent, Message};
 
@@ -1151,8 +1159,11 @@ pub fn summary_from_headless_turn(
         verify_passed: None,
         verify_configured,
         open_todos,
-        tokens_used: usage.input_tokens + usage.output_tokens,
-        active_secs: active.as_secs(),
+        tokens_used: cost
+            .usage
+            .input_tokens
+            .saturating_add(cost.usage.output_tokens),
+        active: cost.active,
     }
 }
 

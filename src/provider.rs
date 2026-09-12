@@ -1181,6 +1181,31 @@ fn spawn_blocked_runner(
 }
 
 impl AnyAgent {
+    /// A copy of this agent whose per-run turn budget is `max_turns`.
+    ///
+    /// The goal driver uses this for the bounded wrap-up round. That round is
+    /// asked to summarize what was finished and stop, not to start work the
+    /// budget has already run out for, and a bound the harness announces but
+    /// does not enforce is not a bound.
+    #[cfg(feature = "goal")]
+    pub fn with_max_agent_turns(&self, max_turns: u32) -> Self {
+        let mut capped = self.clone();
+        let turns = usize::try_from(max_turns).unwrap_or(usize::MAX).max(1);
+        match &mut capped.inner {
+            AnyAgentInner::OpenRouter(agent) => agent.default_max_turns = Some(turns),
+            AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => {
+                agent.default_max_turns = Some(turns)
+            }
+            AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => {
+                agent.default_max_turns = Some(turns)
+            }
+            AnyAgentInner::Anthropic(agent) => agent.default_max_turns = Some(turns),
+            AnyAgentInner::Gemini(agent) => agent.default_max_turns = Some(turns),
+            AnyAgentInner::Ollama(agent) => agent.default_max_turns = Some(turns),
+        }
+        capped
+    }
+
     pub async fn run_print<H>(
         &self,
         prompt: &str,
@@ -2600,6 +2625,49 @@ pub fn build_btw_agent(
         )),
     };
     AnyAgent::without_skills(inner)
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_round_budget_tests {
+    use super::*;
+
+    /// The wrap-up round's cap has to reach the agent that runs it.
+    ///
+    /// The driver computed the cap and every surface dropped it on the floor,
+    /// so the round the harness announced as bounded got the full per-run
+    /// budget. The runner already honours `default_max_turns`; this is the
+    /// step that was missing between the two.
+    #[test]
+    fn a_capped_agent_carries_the_budget_the_wrap_up_round_was_given() {
+        let client =
+            match build_ollama_client("unused", Some("http://127.0.0.1:1"), reqwest::Client::new())
+            {
+                Ok(AnyClient::Ollama(client)) => client,
+                other => panic!("expected an ollama client, got {:?}", other.is_ok()),
+            };
+        let agent =
+            AnyAgent::without_skills(AnyAgentInner::Ollama(client.agent("test-model").build()));
+
+        let capped = agent.with_max_agent_turns(4);
+        match &capped.inner {
+            AnyAgentInner::Ollama(inner) => assert_eq!(inner.default_max_turns, Some(4)),
+            _ => panic!("the capped agent changed provider"),
+        }
+
+        // The original is untouched: only the wrap-up round is bounded, and
+        // the rounds before it keep the budget the user configured.
+        match &agent.inner {
+            AnyAgentInner::Ollama(inner) => assert_eq!(inner.default_max_turns, None),
+            _ => panic!("the original agent changed provider"),
+        }
+
+        // A zero cap would make the round fail before it started, so it is
+        // floored at the one turn a wind-down actually needs.
+        match &agent.with_max_agent_turns(0).inner {
+            AnyAgentInner::Ollama(inner) => assert_eq!(inner.default_max_turns, Some(1)),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[cfg(test)]

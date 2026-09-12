@@ -748,11 +748,15 @@ async fn finish_goal_round(
                     .rebuild_agent(&ui.session.model, true)
                     .await,
             );
-            let runner = run
-                .agent
-                .as_ref()
-                .expect("goal agent was rebuilt")
-                .clone()
+            // The wrap-up round is asked to summarize and stop, so it runs on
+            // an agent capped to that budget. Announcing a bound and then
+            // handing the round the full per-run budget is not a bound.
+            let rebuilt = run.agent.as_ref().expect("goal agent was rebuilt");
+            let round_agent = match relaunch.max_agent_turns {
+                Some(max_turns) => rebuilt.with_max_agent_turns(max_turns),
+                None => rebuilt.clone(),
+            };
+            let runner = round_agent
                 .spawn_runner(
                     relaunch.prompt,
                     history,
