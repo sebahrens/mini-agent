@@ -505,6 +505,14 @@ pub struct Goal {
     pub resolved_judge: Option<ResolvedJudge>,
     #[serde(default)]
     pub continuation: ContinuationMode,
+    /// A file whose current contents are appended to every round instruction.
+    ///
+    /// Read fresh each round rather than captured once, because the point of a
+    /// plan file is that the agent edits it as work proceeds and the next round
+    /// must see those edits. It rides the instruction rather than the static
+    /// preamble for the same reason: the preamble is the cached prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_file: Option<std::path::PathBuf>,
     #[serde(default)]
     pub bounds: GoalBounds,
     #[serde(default)]
@@ -556,6 +564,7 @@ impl Goal {
             judge: JudgePolicy::default(),
             resolved_judge: None,
             continuation: ContinuationMode::default(),
+            context_file: None,
             bounds: GoalBounds::default(),
             progress: GoalProgress::default(),
             reports: VecDeque::new(),
@@ -745,7 +754,6 @@ impl GoalStore {
     }
 
     /// Whether a goal is present and still being worked on.
-    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.lock().as_ref().is_some_and(|g| g.status.is_running())
     }
@@ -817,6 +825,8 @@ struct StoredGoal {
     #[serde(default)]
     continuation: ContinuationMode,
     #[serde(default)]
+    context_file: Option<std::path::PathBuf>,
+    #[serde(default)]
     bounds: GoalBounds,
     #[serde(default)]
     progress: GoalProgress,
@@ -851,6 +861,7 @@ impl StoredGoal {
             judge: self.judge,
             resolved_judge: self.resolved_judge,
             continuation: self.continuation,
+            context_file: self.context_file,
             bounds: self.bounds,
             progress: self.progress,
             reports: self.reports,

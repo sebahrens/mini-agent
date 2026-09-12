@@ -27,48 +27,76 @@ fn handle_compress(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 
 #[cfg(feature = "loop")]
 async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if parts.len() < 2 || (parts.len() >= 2 && parts[1] == "status") {
-        if let Some(ls) = ctx.loop_state {
-            let status = if ls.active { "active" } else { "stopped" };
-            write_ok(
-                ctx.renderer,
-                format!(
-                    "loop {}: {} ({})",
-                    status,
-                    ls.iteration_label(),
-                    ls.plan_file.display()
-                ),
-            );
-        } else {
-            write_ok(ctx.renderer, "no active loop");
-            write_result(ctx.renderer, "usage: /loop <prompt>  |  /loop stop");
+    // `/loop` is a goal preset: an amnesiac round per iteration, the plan file
+    // re-read each round, and the validator run every round as feedback. One
+    // round engine serves both, so they cannot drift on what an iteration is.
+    let store = ctx.session.goal_store.clone();
+    let is_loop = |goal: &crate::extras::goal::Goal| goal.context_file.is_some();
+
+    if parts.len() < 2 || parts[1] == "status" {
+        match store.snapshot().filter(is_loop) {
+            Some(goal) => {
+                write_ok(
+                    ctx.renderer,
+                    format!(
+                        "loop {}: round {}/{} ({})",
+                        goal.status.label(),
+                        goal.progress.rounds,
+                        goal.bounds.max_rounds,
+                        goal.context_file
+                            .as_deref()
+                            .unwrap_or_else(|| std::path::Path::new("?"))
+                            .display()
+                    ),
+                );
+            }
+            None => {
+                write_ok(ctx.renderer, "no active loop");
+                write_result(ctx.renderer, "usage: /loop <prompt>  |  /loop stop");
+            }
         }
-    } else if parts[1] == "stop" {
-        if let Some(ls) = ctx.loop_state {
-            ls.active = false;
-            write_ok(ctx.renderer, "loop stopped");
-        } else {
-            write_ok(ctx.renderer, "no active loop");
+        return Ok(());
+    }
+
+    if parts[1] == "stop" {
+        match store.snapshot().filter(is_loop) {
+            Some(_) => {
+                store.clear();
+                write_ok(ctx.renderer, "loop stopped");
+                ctx.rebuild_agent().await;
+            }
+            None => write_ok(ctx.renderer, "no active loop"),
         }
-    } else {
-        let prompt = parts[1..].join(" ");
-        if prompt.is_empty() {
-            write_error(ctx.renderer, "usage: /loop <prompt>");
+        return Ok(());
+    }
+
+    let prompt = parts[1..].join(" ");
+    if prompt.trim().is_empty() {
+        write_error(ctx.renderer, "usage: /loop <prompt>");
+        return Ok(());
+    }
+    let plan_file = std::path::PathBuf::from(crate::extras::r#loop::DEFAULT_PLAN_FILENAME);
+    let preset = match crate::extras::goal::preset::loop_goal(
+        &prompt,
+        &plan_file,
+        Some(crate::extras::r#loop::DEFAULT_TUI_MAX_ITERATIONS),
+        None,
+    ) {
+        Ok(preset) => preset,
+        Err(error) => {
+            write_error(ctx.renderer, error);
             return Ok(());
         }
-        let plan_file = std::path::PathBuf::from(crate::extras::r#loop::DEFAULT_PLAN_FILENAME);
-        let ls = crate::extras::r#loop::LoopState::new(
-            prompt,
-            plan_file,
-            Some(crate::extras::r#loop::DEFAULT_TUI_MAX_ITERATIONS),
-            None,
-        );
-        *ctx.loop_state = Some(ls);
-        write_ok(
-            ctx.renderer,
-            "loop started — iteration 1 will run after this message",
-        );
+    };
+    if let Err(error) = store.set(preset.goal, false) {
+        write_error(ctx.renderer, error);
+        return Ok(());
     }
+    ctx.rebuild_agent().await;
+    write_ok(
+        ctx.renderer,
+        "loop started — iteration 1 will run after this message",
+    );
     Ok(())
 }
 

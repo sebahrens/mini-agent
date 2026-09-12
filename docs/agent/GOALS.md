@@ -147,3 +147,19 @@ was checked and what was concluded. Exports carry the objective too.
 - Restart mode carries a harness-built summary, not the full conversation. Prefer the default
   `continue` unless you want each round to start clean.
 - One goal per session.
+
+## `--loop` is a goal preset
+
+`--loop` and `/loop` set a goal rather than running their own engine. The loop
+prompt becomes the objective, `--loop-run` becomes a check that runs every round,
+and `--loop-plan` becomes a context file that is re-read into every round so the
+agent's own edits to it are seen.
+
+Two differences follow from the fold and are deliberate:
+
+- `--loop-max N` runs exactly N rounds. A goal set with `/goal` adds one bounded
+  wrap-up round when its budget runs out; a loop does not, because an iteration
+  cap has always meant what it says.
+- A loop can finish early. If the agent reports the objective met and the
+  validator passes, the goal is met and the remaining iterations are not run.
+  Nothing weaker ends it: a claim no command proved never shortens a loop.

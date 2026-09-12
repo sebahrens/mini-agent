@@ -141,17 +141,22 @@ pub enum BtwEvent {
     },
 }
 
-#[cfg(feature = "loop")]
+#[cfg(any(feature = "loop", feature = "goal"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ValidationOperationId(pub(crate) u64);
 
-#[cfg(feature = "loop")]
+/// A goal round's verification finished off the event loop.
+///
+/// Checks and a judge call can each take many seconds. Running them inside the
+/// turn handler would hold the event loop and make the interface unresponsive,
+/// including to an interrupt, so they run on their own task and come back as
+/// an event.
+#[cfg(feature = "goal")]
 #[derive(Debug, Clone)]
-pub(crate) struct LoopValidationEvent {
+pub(crate) struct GoalVerificationEvent {
     pub operation_id: ValidationOperationId,
-    pub response: CompactString,
-    pub summary: String,
-    pub result: crate::extras::r#loop::validation::ValidationResult,
+    pub checks: Option<crate::extras::goal::gate::CheckOutcome>,
+    pub judge: Option<crate::extras::goal::gate::JudgeOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,8 +167,12 @@ pub enum UserEvent {
     Resize,
     Paste(String),
     LinkOpenFailed(String),
-    #[cfg(feature = "loop")]
-    LoopValidationDone(LoopValidationEvent),
+    /// Boxed: this variant carries a whole verification result, and
+    /// `UserEvent` is held in the interactive future the startup path builds on
+    /// the stack. A regression test runs the binary under the 1 MiB Windows
+    /// default stack.
+    #[cfg(feature = "goal")]
+    GoalVerificationDone(Box<GoalVerificationEvent>),
     MouseDown {
         row: u16,
         col: u16,

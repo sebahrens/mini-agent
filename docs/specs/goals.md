@@ -256,3 +256,21 @@ The `goal` Cargo feature being enabled is not a claim that any of this is delive
 Build and verification commands are the repository defaults: `cargo fmt`, `cargo test`,
 `cargo clippy --all-targets -- -D warnings` on the supported feature rows, and
 `cargo install --path . --debug`. Never `cargo build`, `cargo check`, or `--release`.
+
+## `--loop` as a preset
+
+`--loop` and `/loop` construct a goal through `extras::goal::preset::loop_goal`
+and run it on the goal driver. The mapping is: prompt to objective, `--loop-run`
+to a check with `check_every_round` set, `--loop-plan` to `context_file`,
+`--loop-max` to `max_rounds` with `wrap_up_max_agent_turns` zero, and restart
+continuation so each iteration begins from a clean conversation.
+
+A zero wrap-up budget makes a bound exact. When a bound falls due the gate still
+adjudicates a completion claim made in that round, and still runs per-round
+checks so a validator reports on the final iteration; a claim the checks reject
+then ends the goal rather than buying another round.
+
+`LoopState` no longer exists. The loop module keeps only its plan handling, the
+bounded validation runner shared with goal checks, and the workflow-only
+headless verification that `--loop-verification-policy-check` exercises. The
+`loop` Cargo feature therefore depends on `goal`.

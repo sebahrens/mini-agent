@@ -1,8 +1,4 @@
-use std::future::Future;
-use std::io;
 use std::path::PathBuf;
-
-use uuid::Uuid;
 
 use crate::cli::Cli;
 use crate::config::Config;
@@ -18,33 +14,13 @@ fn hook_loop_active(iteration: u32, max_iterations: Option<u32>) -> bool {
     max_iterations.is_none_or(|max| iteration < max)
 }
 
-async fn await_validation_or_interrupt<F>(
-    operation: loop_mod::validation::ValidationOperation,
-    interrupt: F,
-) -> io::Result<(loop_mod::validation::ValidationResult, bool)>
-where
-    F: Future<Output = io::Result<()>>,
-{
-    let cancellation = operation.cancellation();
-    let wait = operation.wait();
-    tokio::pin!(wait);
-    tokio::pin!(interrupt);
-
-    tokio::select! {
-        // Install signal handlers before the validator can launch.
-        biased;
-        signal = &mut interrupt => {
-            cancellation.cancel();
-            // The scoped worker reports only after the validator group is
-            // terminated and its direct child is reaped.
-            let result = wait.await;
-            signal?;
-            Ok((result, true))
-        }
-        result = &mut wait => Ok((result, false)),
-    }
-}
-
+/// Run `--loop` as a goal.
+///
+/// A loop iteration is a goal round in restart mode: a fresh conversation each
+/// time, the plan file re-read into every prompt, and the validator run every
+/// round as feedback. Both features share one round engine so they cannot drift
+/// on what an iteration is or when one stops.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_headless_loop(
     agent: AnyAgent,
     cli: &Cli,
@@ -53,6 +29,7 @@ pub(crate) async fn run_headless_loop(
     session: &Session,
     status_signals: Option<StatusSignals>,
     sandbox: &Sandbox,
+    client: &crate::provider::AnyClient,
 ) -> anyhow::Result<()> {
     let prompt = cli
         .loop_prompt
@@ -67,159 +44,74 @@ pub(crate) async fn run_headless_loop(
         .loop_plan
         .clone()
         .unwrap_or_else(|| PathBuf::from(loop_mod::DEFAULT_PLAN_FILENAME));
-    let max_iterations = cli.loop_max;
-    let run_cmd = cli.loop_run.clone();
-    let session_id = Uuid::new_v4().to_string();
-    // Keep the loop's summary-based prompt strategy, but retain every completed
-    // turn in the durable session for --continue, including failed iterations.
-    let mut saved_session = session.clone();
 
-    let use_existing = loop_mod::plan::handle_startup(&plan_file).await?;
-    if !use_existing {
-        // No plan exists — agent will generate one on first iteration
+    // Honour the existing resume prompt: an operator who declines a stale plan
+    // gets it removed before the first round reads it.
+    let _ = loop_mod::plan::handle_startup(&plan_file).await?;
+
+    // `--loop-max 0` has always meant "run nothing", which a goal's minimum of
+    // one round cannot express. Answer it here rather than silently running an
+    // iteration the operator asked not to have.
+    if cli.loop_max == Some(0) {
+        eprintln!("[loop] max iterations (0) reached, stopping");
+        return Ok(());
     }
 
-    let mut state = loop_mod::LoopState::new(prompt, plan_file, max_iterations, run_cmd);
-
-    loop {
-        state.iteration += 1;
-
-        if state.should_stop() {
-            eprintln!(
-                "[loop] max iterations ({}) reached, stopping",
-                state.max_iterations.unwrap_or(0)
-            );
-            break;
-        }
-
-        let iteration_prompt = state.build_prompt();
-
-        eprintln!("=== {} ===", state.iteration_label());
-        eprintln!();
-
-        if let Some(ss) = status_signals.as_ref() {
-            ss.send_start();
-        }
-        let turn = agent
-            .run_print(
-                &iteration_prompt,
-                cli.pure_stdout,
-                true,
-                &cfg.retry,
-                iteration_history(session, cfg),
-                #[cfg(feature = "hooks")]
-                Some(crate::extras::hooks::LoopInfo {
-                    iteration: state.iteration,
-                    active: hook_loop_active(state.iteration, state.max_iterations),
-                }),
-            )
-            .await;
-        if let Some(ss) = status_signals.as_ref() {
-            ss.send_stop();
-        }
-        let response = settle_iteration(
-            &mut saved_session,
-            &iteration_prompt,
-            turn,
-            cfg,
-            cli.no_session,
-        )?;
-
-        let summary: String = response
-            .chars()
-            .take(loop_mod::SUMMARY_TRUNCATION_CHARS)
-            .collect();
-        state.last_summary = Some(summary.clone());
-
-        let validation_output = if let Some(cmd) = &state.run_cmd {
-            eprintln!(
-                "--- Validation: {} ---",
-                loop_mod::validation::display_command(cmd)
-            );
-            let operation = loop_mod::validation::start(sandbox, cmd);
-            let (result, interrupted) =
-                await_validation_or_interrupt(operation, crate::print::headless_interrupt())
-                    .await?;
-            let diagnostic = result.render();
-            eprintln!("{}", diagnostic);
-            if interrupted {
-                eprintln!("[loop] interrupted during validation");
-                return Ok(());
-            }
-            Some(diagnostic)
-        } else {
-            None
-        };
-        state.last_run_output = validation_output.clone();
-
-        if let Err(e) = loop_mod::transcript::save_iteration(
-            &session_id,
-            state.iteration,
-            &iteration_prompt,
-            &response,
-            validation_output.as_deref(),
-            &summary,
-        ) {
-            eprintln!("[loop] warning: failed to save transcript: {}", e);
-        }
-
-        eprintln!("--- iteration {} complete, looping ---\n", state.iteration);
-    }
-
-    Ok(())
-}
-
-fn settle_iteration(
-    session: &mut Session,
-    prompt: &str,
-    turn: crate::agent::runner::HeadlessTurn,
-    cfg: &Config,
-    no_session: bool,
-) -> anyhow::Result<String> {
-    let crate::agent::runner::HeadlessTurn {
-        response,
-        usage,
-        interactions,
-        failure,
-    } = turn;
-    let persistence = if no_session {
-        Ok(())
-    } else {
-        crate::print::persist_headless_turn(session, prompt, &response, &interactions);
-        session.charge_usage_delta(usage.into(), cfg.is_anthropic_native(&session.provider));
-        crate::session::storage::save_session(session)
-    };
-    if let Some(failure) = failure {
-        return Err(match persistence {
-            Ok(()) => failure,
-            Err(error) => failure.context(format!(
-                "the partial loop iteration could not be persisted either: {error}"
-            )),
-        });
-    }
-    persistence?;
-    Ok(response)
-}
-
-fn iteration_history(
-    session: &Session,
-    cfg: &Config,
-) -> std::sync::Arc<[rig::completion::Message]> {
-    crate::agent::runner::convert_history_shared_with_tool_result_retention(
-        session,
-        cfg.resolve_keep_recent_tool_results(),
+    let preset = crate::extras::goal::preset::loop_goal(
+        &prompt,
+        &plan_file,
+        cli.loop_max,
+        cli.loop_run.as_deref(),
     )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    session
+        .goal_store
+        .set(preset.goal, true)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let mut saved_session = session.clone();
+    if let Some(ss) = status_signals.as_ref() {
+        ss.send_start();
+    }
+    let outcome = crate::startup::run_goal_rounds_for_loop(
+        &agent,
+        &mut saved_session,
+        cli,
+        cfg,
+        sandbox,
+        client,
+        &prompt,
+    )
+    .await;
+    if let Some(ss) = status_signals.as_ref() {
+        ss.send_stop();
+    }
+    outcome
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    /// A resumed session's history reaches the first round. Later rounds are
+    /// restart rounds and deliberately start clean, carrying the objective and
+    /// a harness-built summary instead; the goal driver owns that and is tested
+    /// there.
     #[test]
-    fn resumed_session_history_is_forwarded_to_each_loop_iteration() {
-        let mut session = Session::new("provider", "model", 128_000, "");
-        session.add_message(crate::session::MessageRole::User, "prior turn");
-        assert_eq!(iteration_history(&session, &Config::default()).len(), 1);
+    fn a_loop_preset_starts_each_iteration_from_a_clean_conversation() {
+        let preset = crate::extras::goal::preset::loop_goal(
+            "keep going",
+            std::path::Path::new("LOOP_PLAN.md"),
+            Some(3),
+            Some("cargo test"),
+        )
+        .expect("valid preset");
+        assert!(matches!(
+            preset.goal.continuation,
+            crate::extras::goal::ContinuationMode::Restart { .. }
+        ));
+        assert!(preset.goal.bounds.check_every_round);
+        assert_eq!(preset.goal.bounds.max_rounds, 3);
     }
 
     #[test]
@@ -246,8 +138,8 @@ mod persistence_tests {
 
     impl StateRoot {
         fn new() -> Self {
-            let root =
-                std::env::temp_dir().join(format!("mini-agent-loop-progress-{}", Uuid::new_v4()));
+            let root = std::env::temp_dir()
+                .join(format!("mini-agent-loop-progress-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
             let root = root.canonicalize().unwrap();
             let environment = crate::tests::ScopedProcessEnv::set(&[
@@ -359,16 +251,25 @@ mod persistence_tests {
                     &session,
                     None,
                     &Sandbox::new(false, "bwrap"),
+                    &crate::provider::AnyClient::OpenRouter(
+                        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+                    ),
                 ),
             )
             .await
             .expect("headless loop must terminate after provider failure");
             server.abort();
             let _ = server.await;
+            // The goal engine retries a failed round before giving up, so the
+            // propagated error is from the last attempt rather than the first.
+            // What must not change is that the failure propagates at all and
+            // that the effects and usage from before it are durable.
             let error = result.expect_err("provider failure must propagate");
+            let rendered = format!("{error:#}");
             assert!(
-                format!("{error:#}").contains("loop provider failure"),
-                "{error:#}"
+                rendered.contains("loop provider failure")
+                    || rendered.contains("error sending request"),
+                "{rendered}"
             );
             assert_eq!(
                 std::fs::read_to_string(root.path.join("effect.txt")).unwrap(),
@@ -413,7 +314,7 @@ mod persistence_tests {
             ("first prompt", "first reply"),
             ("next prompt", "next reply"),
         ] {
-            let returned = settle_iteration(
+            let returned = crate::extras::goal::driver::persist_round(
                 &mut session,
                 prompt,
                 HeadlessTurn {
@@ -453,7 +354,7 @@ mod persistence_tests {
         for failure in [None, Some(anyhow::anyhow!("original provider failure"))] {
             let had_failure = failure.is_some();
             let mut session = Session::new("openrouter", "test", 128_000, "");
-            let result = settle_iteration(
+            let result = crate::extras::goal::driver::persist_round(
                 &mut session,
                 "prompt",
                 HeadlessTurn {

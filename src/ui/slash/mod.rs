@@ -64,8 +64,6 @@ pub struct SlashCtx<'a> {
     #[cfg(feature = "skills")]
     pub skill_services: &'a std::sync::Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     pub terminal_guard: &'a mut TerminalGuard,
-    #[cfg(feature = "loop")]
-    pub loop_state: &'a mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")]
     pub mcp_manager: Option<&'a crate::extras::mcp::McpClientManager>,
 }
@@ -588,13 +586,9 @@ pub async fn handle_slash(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
     slash: &mut SlashState,
-    chain: &mut ChainState,
+    _chain: &mut ChainState,
     terminal_guard: &mut TerminalGuard,
 ) -> anyhow::Result<()> {
-    // `chain` only feeds `SlashCtx::loop_state`; without the loop feature it
-    // has no consumer here.
-    #[cfg(not(feature = "loop"))]
-    let _ = &chain;
     let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
     let mut ctx = SlashCtx {
         prebuild_invalidated: &ui.prebuild_invalidated,
@@ -617,8 +611,6 @@ pub async fn handle_slash(
         #[cfg(feature = "skills")]
         skill_services: &ui.skill_services,
         terminal_guard,
-        #[cfg(feature = "loop")]
-        loop_state: &mut chain.loop_state,
         #[cfg(feature = "mcp")]
         mcp_manager: ui.mcp_manager.as_ref(),
     };

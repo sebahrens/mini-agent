@@ -1498,7 +1498,9 @@ impl Startup {
             } else {
                 connect_headless_mcp(&self.cfg, &self.workspace).await
             };
-            let agent = provider::build_agent_in_workspace(
+            // Boxed: building an agent pulls in every provider's setup, and this
+            // future is inlined into the startup frame otherwise.
+            let agent = Box::pin(provider::build_agent_in_workspace(
                 completion_model,
                 &self.cli,
                 &self.cfg,
@@ -1525,7 +1527,7 @@ impl Startup {
                 skill_service_owner_for_goal.clone(),
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
-            )
+            ))
             .await;
             #[cfg(feature = "mcp")]
             report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
@@ -1724,7 +1726,9 @@ impl Startup {
         .await;
         #[cfg(feature = "mcp")]
         report_headless_mcp_notices(mcp_manager.as_mut(), |notice| eprintln!("{notice}"));
-        let result = crate::extras::r#loop::headless::run_headless_loop(
+        // Boxed: dispatch_loop's future is built on the stack before it is
+        // pinned, so anything inlined into it is charged to the startup frame.
+        let result = Box::pin(crate::extras::r#loop::headless::run_headless_loop(
             agent,
             &self.cli,
             &self.cfg,
@@ -1732,7 +1736,8 @@ impl Startup {
             &self.session,
             self.status_signals,
             &self.sandbox,
-        )
+            &self.client,
+        ))
         .await;
         #[cfg(feature = "hooks")]
         crate::extras::hooks::dispatch_session_end("exit").await;
@@ -1893,6 +1898,38 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .map_err(|error| anyhow::anyhow!("{error} (or pass --goal-replace)"))
 }
 
+/// Drive `--loop` rounds through the goal engine.
+///
+/// The loop's own reporting is preserved: each round prints its banner and the
+/// gate's decision on stderr, so a loop log still reads as a loop log.
+#[cfg(all(feature = "goal", feature = "loop"))]
+pub(crate) async fn run_goal_rounds_for_loop(
+    agent: &provider::AnyAgent,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &config::Config,
+    sandbox: &crate::sandbox::Sandbox,
+    client: &provider::AnyClient,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let turn = Box::pin(run_headless_goal_rounds(
+        agent,
+        session,
+        cli,
+        cfg,
+        sandbox,
+        client,
+        prompt,
+        std::sync::Arc::from(Vec::new()),
+        false,
+    ))
+    .await;
+    match turn.failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
 /// Run one headless turn, then keep running goal rounds while the gate asks
 /// for them.
 ///
@@ -1986,15 +2023,27 @@ async fn run_headless_goal_rounds(
             };
             let client_for_judge = client.clone();
             let retry = cfg.retry.clone();
+            // An interrupt during verification ends the goal rather than
+            // feeding a cancelled command back to the agent as a failure it
+            // should fix. The flag survives the closure so the loop can stop.
+            let verification_interrupted =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let interrupt_flag = verification_interrupted.clone();
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
-                    let checks = crate::extras::goal::checks::run(
+                    // An operator who interrupts must not wait for a check;
+                    // a check can run as long as a test suite does.
+                    let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
                         &goal_for_checks,
                         &request,
                         &sandbox_for_checks,
                         &cfg_for_checks,
+                        crate::print::headless_interrupt(),
                     )
                     .await;
+                    if interrupted {
+                        interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let judged = match judge {
                         Some(resolved) if request.run_judge => Some(
                             crate::extras::goal::judge::ask_with_transcript(
@@ -2022,18 +2071,23 @@ async fn run_headless_goal_rounds(
 
             // The round that just ran is now history for the next one, so it
             // is persisted before the relaunch rather than at the very end.
-            if !cli.no_session {
-                crate::print::persist_headless_turn(
-                    session,
-                    message,
-                    &turn.response,
-                    &turn.interactions,
-                );
-                let anthropic_native = cfg.is_anthropic_native(&session.provider);
-                session.charge_usage_delta(turn.usage.into(), anthropic_native);
-                if let Err(error) = session::storage::save_session(session) {
-                    eprintln!("warning: failed to save session between goal rounds: {error}");
-                }
+            if let Err(error) = crate::extras::goal::driver::persist_round(
+                session,
+                message,
+                crate::agent::runner::HeadlessTurn {
+                    response: turn.response.clone(),
+                    usage: turn.usage,
+                    interactions: turn.interactions.clone(),
+                    failure: None,
+                },
+                cfg,
+                cli.no_session,
+            ) {
+                eprintln!("warning: failed to save session between goal rounds: {error}");
+            }
+            if verification_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("goal: interrupted during verification");
+                break;
             }
 
             let next_history: std::sync::Arc<[rig::completion::Message]> = match relaunch.history {

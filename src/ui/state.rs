@@ -186,6 +186,7 @@ impl AgentBuildCtx<'_> {
 /// Transient state of the main agent run: the agent handle, its event
 /// stream and abort handle, queued user input, and streaming-response scratch.
 #[cfg(feature = "loop")]
+#[allow(dead_code)]
 pub(super) struct ActiveValidation {
     id: ValidationOperationId,
     cancellation: crate::extras::r#loop::validation::ValidationCancellation,
@@ -390,9 +391,12 @@ pub(crate) struct AgentRunState {
     /// the currently spawned runner. Provider calibration must use this exact
     /// projection rather than recomputing it after in-turn results are added.
     pub request_tool_results_cleared: usize,
+    /// The pre-goal validation registry, kept for the input-handoff test that
+    /// drives it directly. Production interrupts now retire a goal round's
+    /// verification instead.
     #[cfg(feature = "loop")]
     pub(super) active_validation: Option<ActiveValidation>,
-    #[cfg(feature = "loop")]
+    #[cfg(all(feature = "loop", test))]
     pub(super) validation_generation: u64,
     pub pending_inputs: VecDeque<String>,
     pub agent_line_started: bool,
@@ -408,6 +412,28 @@ pub(crate) struct AgentRunState {
     /// ends.
     #[cfg(feature = "goal")]
     pub goal_round: Option<crate::extras::goal::driver::RoundCollector>,
+    /// A goal round waiting on verification that is running off the event loop.
+    #[cfg(feature = "goal")]
+    pub pending_goal_gate: Option<PendingGoalGate>,
+    /// Generation counter for goal verifications, so a result that arrives
+    /// after its round was replaced is recognised as stale and ignored.
+    #[cfg(feature = "goal")]
+    pub goal_gate_generation: u64,
+}
+
+/// A goal round paused between its two gate phases.
+///
+/// Checks and a judge call are slow enough that running them inside the turn
+/// handler would freeze the interface, so the round's facts are parked here
+/// while they run and the gate finishes when their result arrives.
+#[cfg(feature = "goal")]
+pub(crate) struct PendingGoalGate {
+    pub operation_id: crate::event::ValidationOperationId,
+    /// Aborting this stops the verification task, which drops the running
+    /// command and reaps its process group.
+    pub abort: tokio::task::AbortHandle,
+    pub summary: crate::extras::goal::gate::RoundSummary,
+    pub request: crate::extras::goal::gate::VerifyRequest,
 }
 
 impl AgentRunState {
@@ -434,8 +460,8 @@ impl AgentRunState {
     }
 }
 
-#[cfg(feature = "loop")]
 impl AgentRunState {
+    #[cfg(all(test, feature = "loop"))]
     pub(crate) fn begin_validation(
         &mut self,
         cancellation: crate::extras::r#loop::validation::ValidationCancellation,
@@ -449,22 +475,44 @@ impl AgentRunState {
         id
     }
 
+    /// Whether something is running that an interrupt should stop before the
+    /// turn itself: today that is a goal round's verification.
     pub(crate) fn validation_active(&self) -> bool {
-        self.active_validation.is_some()
+        #[cfg(feature = "goal")]
+        if self.pending_goal_gate.is_some() {
+            return true;
+        }
+        #[cfg(feature = "loop")]
+        if self.active_validation.is_some() {
+            return true;
+        }
+        false
     }
 
     /// Retires the current generation before signalling its worker. Any
     /// completion already queued for that generation is stale immediately.
+    ///
+    /// A goal round's verification is retired the same way: dropping its task
+    /// drops the running command and reaps its process group, and its
+    /// generation no longer matches, so a result already in flight is ignored.
     pub(crate) fn cancel_validation(&mut self) -> bool {
-        let Some(active) = self.active_validation.take() else {
-            return false;
-        };
-        active.cancellation.cancel();
-        true
+        #[allow(unused_mut)]
+        let mut cancelled = false;
+        #[cfg(feature = "goal")]
+        if let Some(pending) = self.pending_goal_gate.take() {
+            pending.abort.abort();
+            cancelled = true;
+        }
+        #[cfg(feature = "loop")]
+        if let Some(active) = self.active_validation.take() {
+            active.cancellation.cancel();
+            cancelled = true;
+        }
+        cancelled
     }
 
     /// Accepts exactly the operation currently registered in this run state.
-    /// A stale completion must not clear or replace a newer validation.
+    #[cfg(all(test, feature = "loop"))]
     pub(crate) fn complete_validation(&mut self, id: ValidationOperationId) -> bool {
         if self.active_validation.as_ref().map(|active| active.id) != Some(id) {
             return false;
@@ -480,8 +528,6 @@ pub(crate) struct ChainState {
     pub label_msg: Option<String>,
     pub dot_prompt_restore: Option<crate::context::ActiveContextSelection>,
     pub loop_label: Option<String>,
-    #[cfg(feature = "loop")]
-    pub loop_state: Option<crate::extras::r#loop::LoopState>,
 }
 
 /// User-facing feature toggles owned by slash commands.
@@ -670,7 +716,7 @@ mod retirement_tests {
                     todo_tools_enabled: false,
                 };
                 let mut chain = super::ChainState::default();
-                #[cfg(feature = "loop")]
+                #[cfg(any(feature = "loop", feature = "goal"))]
                 let (validation_tx, _validation_rx) = mpsc::channel(1);
                 crate::ui::event_handler::handle_agent_event(
                     terminal,
@@ -679,7 +725,7 @@ mod retirement_tests {
                     &mut ui,
                     &slash,
                     &mut chain,
-                    #[cfg(feature = "loop")]
+                    #[cfg(any(feature = "loop", feature = "goal"))]
                     &validation_tx,
                 )
                 .await

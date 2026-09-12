@@ -5,8 +5,8 @@ use rig::completion::Message;
 use crate::cli::Cli;
 use crate::config::ResolvedShowToolDetails;
 use crate::event::AgentEvent;
-#[cfg(feature = "loop")]
-use crate::event::{LoopValidationEvent, UserEvent};
+#[cfg(any(feature = "loop", feature = "goal"))]
+use crate::event::UserEvent;
 use crate::provider::AnyAgent;
 use crate::session::{MessageRole, Session};
 use crate::ui::events::sanitize_output;
@@ -62,7 +62,9 @@ pub async fn handle_agent_event(
     ui: &mut UiContext<'_>,
     slash: &SlashState,
     chain: &mut ChainState,
-    #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
+    #[cfg(any(feature = "loop", feature = "goal"))] validation_tx: &tokio::sync::mpsc::Sender<
+        UserEvent,
+    >,
 ) -> anyhow::Result<()> {
     // Every event contributes to the round the gate will judge, so the goal
     // sees the run exactly as it happened rather than as the final response
@@ -271,7 +273,7 @@ pub async fn handle_agent_event(
                 run,
                 ui,
                 chain,
-                #[cfg(feature = "loop")]
+                #[cfg(any(feature = "loop", feature = "goal"))]
                 validation_tx,
             )
             .await?;
@@ -413,12 +415,11 @@ async fn handle_agent_done(
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
-    chain: &mut ChainState,
-    #[cfg(feature = "loop")] validation_tx: &tokio::sync::mpsc::Sender<UserEvent>,
+    _chain: &mut ChainState,
+    #[cfg(any(feature = "loop", feature = "goal"))] validation_tx: &tokio::sync::mpsc::Sender<
+        UserEvent,
+    >,
 ) -> anyhow::Result<()> {
-    // `chain` is only read by the /loop-respawn path.
-    #[cfg(not(feature = "loop"))]
-    let _ = &chain;
     run.was_reasoning = false;
 
     // Commit the provider's completed response and accounting before any
@@ -441,7 +442,7 @@ async fn handle_agent_done(
     run.response_start_block = None;
 
     #[cfg(feature = "loop")]
-    let loop_running = chain.loop_state.as_ref().is_some_and(|state| state.active);
+    let loop_running = ui.session.goal_store.is_active();
     #[cfg(not(feature = "loop"))]
     let loop_running = false;
 
@@ -486,43 +487,8 @@ async fn handle_agent_done(
     // A goal round ends where an ordinary turn would: judge it, then either
     // launch the next round or hand control back with the reason visible.
     #[cfg(feature = "goal")]
-    if run_goal_round(renderer, run, ui).await? {
+    if Box::pin(run_goal_round(renderer, run, ui, validation_tx)).await? {
         return Ok(());
-    }
-
-    #[cfg(feature = "loop")]
-    if let Some(ls) = chain.loop_state.as_mut()
-        && ls.active
-    {
-        let summary: String = response
-            .chars()
-            .take(crate::extras::r#loop::SUMMARY_TRUNCATION_CHARS)
-            .collect();
-        ls.last_summary = Some(summary.clone());
-
-        if let Some(cmd) = ls.run_cmd.clone() {
-            let operation = crate::extras::r#loop::validation::start(&ui.sandbox, &cmd);
-            let operation_id = run.begin_validation(operation.cancellation());
-            run.main_abort = None;
-            // Keep semantic interrupt routing active while the validator runs,
-            // but let the main event loop continue consuming `/btw` and keys.
-            run.is_running = true;
-            let validation_tx = validation_tx.clone();
-            tokio::spawn(async move {
-                let result = operation.wait().await;
-                let _ = validation_tx
-                    .send(UserEvent::LoopValidationDone(LoopValidationEvent {
-                        operation_id,
-                        response,
-                        summary,
-                        result,
-                    }))
-                    .await;
-            });
-            return Ok(());
-        }
-
-        finish_loop_iteration(response.as_str(), summary, None, renderer, run, ui, chain).await?;
     }
 
     Ok(())
@@ -538,131 +504,23 @@ fn should_auto_compact_between_turns(
     compact_enabled && needs_compaction
 }
 
-#[cfg(feature = "loop")]
-pub(crate) async fn handle_loop_validation_event(
-    event: LoopValidationEvent,
-    renderer: &mut Renderer,
-    run: &mut AgentRunState,
-    ui: &mut UiContext<'_>,
-    chain: &mut ChainState,
-) -> anyhow::Result<bool> {
-    if !run.complete_validation(event.operation_id) {
-        return Ok(false);
-    }
-    if !chain.loop_state.as_ref().is_some_and(|state| state.active) {
-        return Ok(true);
-    }
-
-    run.is_running = false;
-    finish_loop_iteration(
-        event.response.as_str(),
-        event.summary,
-        Some(event.result.render()),
-        renderer,
-        run,
-        ui,
-        chain,
-    )
-    .await?;
-
-    Ok(true)
-}
-
-#[cfg(feature = "loop")]
-async fn finish_loop_iteration(
-    response: &str,
-    summary: String,
-    validation_output: Option<String>,
-    renderer: &mut Renderer,
-    run: &mut AgentRunState,
-    ui: &mut UiContext<'_>,
-    chain: &mut ChainState,
-) -> anyhow::Result<()> {
-    let Some(ls) = chain.loop_state.as_mut() else {
-        return Ok(());
-    };
-    if !ls.active {
-        return Ok(());
-    }
-    ls.last_run_output = validation_output.clone();
-
-    if let Err(error) = crate::extras::r#loop::transcript::save_iteration(
-        &ui.session.id,
-        ls.iteration,
-        &ls.build_prompt(),
-        response,
-        validation_output.as_deref(),
-        &summary,
-    ) {
-        renderer.write_line(
-            &format!("warning: failed to save loop transcript: {error}"),
-            C_ERROR,
-        )?;
-    }
-
-    ls.iteration += 1;
-    if ls.should_stop() {
-        renderer.write_line(
-            &format!(
-                "[loop] max iterations ({}) reached, stopping",
-                ls.iteration - 1
-            ),
-            C_AGENT,
-        )?;
-        ls.active = false;
-        chain.loop_label = None;
-        return Ok(());
-    }
-
-    let prompt = ls.build_prompt();
-    run.agent = Some(
-        ui.agent_build_ctx()
-            .rebuild_agent(&ui.session.model, true)
-            .await,
-    );
-    run.request_tool_results_cleared = 0;
-    let runner = run
-        .agent
-        .as_ref()
-        .expect("loop agent was rebuilt")
-        .clone()
-        .spawn_runner(
-            prompt,
-            Vec::new(),
-            ui.cfg.retry.clone(),
-            #[cfg(feature = "hooks")]
-            Some(crate::extras::hooks::LoopInfo {
-                iteration: ls.iteration,
-                active: ls.active,
-            }),
-        )
-        .await;
-    run.compaction_decision_tx = runner.compaction_decision_tx;
-    run.agent_rx = Some(runner.event_rx);
-    run.main_abort = Some(runner.abort_handle);
-    run.is_running = true;
-    if let Some(signals) = ui.status_signals.as_ref() {
-        signals.send_start();
-    }
-    chain.loop_label = Some(ls.iteration_label());
-    renderer.write_line(
-        &format!("[loop] launching {}", ls.iteration_label()),
-        C_AGENT,
-    )?;
-    Ok(())
-}
-
-/// Settle the goal round that just ended, relaunching if the gate says so.
+/// Settle the goal round that just ended.
 ///
-/// Returns `true` when a new round was launched, so the caller stops treating
-/// this as the end of the user's turn.
+/// Splits at the gate's two phases. Anything the round alone decides is decided
+/// here; a completion claim that needs commands or a judge has its verification
+/// started on its own task, so the interface stays responsive — including to an
+/// interrupt — while a test suite runs.
+///
+/// Returns `true` when the turn is not over: either a new round was launched or
+/// verification is still running.
 #[cfg(feature = "goal")]
 async fn run_goal_round(
     renderer: &mut Renderer,
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
+    verification_tx: &tokio::sync::mpsc::Sender<UserEvent>,
 ) -> anyhow::Result<bool> {
-    use crate::extras::goal::driver::{self, RoundOutcome};
+    use crate::extras::goal::gate;
 
     let Some(collector) = run.goal_round.take() else {
         return Ok(false);
@@ -672,7 +530,7 @@ async fn run_goal_round(
         return Ok(false);
     };
 
-    let mut summary = collector.finish(&goal, crate::extras::goal::gate::RoundEnd::Done, 0);
+    let mut summary = collector.finish(&goal, gate::RoundEnd::Done, 0);
     summary.open_todos = ui
         .session
         .todos
@@ -686,20 +544,42 @@ async fn run_goal_round(
         .as_deref()
         .is_some_and(|command| !command.trim().is_empty());
 
-    // Goal verdicts are skill evidence; the recorder lives behind the provider.
-    #[cfg(feature = "skills")]
-    crate::extras::goal::driver::set_outcome_recorder(
-        crate::provider::goal_outcome_recorder(ui.cli, ui.cfg, &ui.skill_services, &ui.workspace)
-            .await,
-    );
+    match gate::gate_pre(&goal, &summary) {
+        gate::Step::Decided(decision) => {
+            Box::pin(finish_goal_round(
+                renderer, run, ui, summary, decision, None, None,
+            ))
+            .await
+        }
+        gate::Step::Verify(request) => {
+            Box::pin(start_goal_verification(
+                renderer,
+                run,
+                ui,
+                verification_tx,
+                goal,
+                summary,
+                request,
+            ))
+            .await
+        }
+    }
+}
 
-    // Commands are the only external proof a completion claim can have, so the
-    // checks tier runs here whenever the gate asks for it.
+/// Run a round's verification on its own task.
+#[cfg(feature = "goal")]
+#[allow(clippy::too_many_arguments)]
+async fn start_goal_verification(
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    verification_tx: &tokio::sync::mpsc::Sender<UserEvent>,
+    goal: crate::extras::goal::Goal,
+    summary: crate::extras::goal::gate::RoundSummary,
+    request: crate::extras::goal::gate::VerifyRequest,
+) -> anyhow::Result<bool> {
     let sandbox = ui.sandbox.clone();
     let cfg = ui.cfg.clone();
-    let goal_for_checks = goal.clone();
-    // The judge reads a bounded tail of the conversation, never the workspace,
-    // and can only withhold completion — a passing command outranks it.
     let judge = crate::extras::goal::judge::resolve(
         &goal.judge,
         ui.cfg,
@@ -709,27 +589,123 @@ async fn run_goal_round(
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let client = ui.client.clone();
     let retry = ui.cfg.retry.clone();
-    let outcome =
-        driver::settle_round(&ui.session.goal_store, summary, move |request| async move {
-            let checks =
-                crate::extras::goal::checks::run(&goal_for_checks, &request, &sandbox, &cfg).await;
-            let judged = match judge {
-                Some(resolved) if request.run_judge => Some(
-                    crate::extras::goal::judge::ask_with_transcript(
-                        &goal_for_checks,
-                        &request,
-                        &resolved,
-                        &client,
-                        &transcript,
-                        &retry,
-                    )
-                    .await,
-                ),
-                _ => None,
-            };
-            (checks, judged)
-        })
-        .await;
+
+    run.goal_gate_generation = run
+        .goal_gate_generation
+        .checked_add(1)
+        .expect("goal verification generation exhausted");
+    let operation_id = crate::event::ValidationOperationId(run.goal_gate_generation);
+    renderer.write_line("◈ verifying the goal", C_AGENT)?;
+
+    let tx = verification_tx.clone();
+    let pending_request = request.clone();
+    let task = tokio::spawn(async move {
+        let checks = crate::extras::goal::checks::run(&goal, &request, &sandbox, &cfg).await;
+        let judged = match judge {
+            Some(resolved) if request.run_judge => Some(
+                crate::extras::goal::judge::ask_with_transcript(
+                    &goal,
+                    &request,
+                    &resolved,
+                    &client,
+                    &transcript,
+                    &retry,
+                )
+                .await,
+            ),
+            _ => None,
+        };
+        let _ = tx
+            .send(UserEvent::GoalVerificationDone(Box::new(
+                crate::event::GoalVerificationEvent {
+                    operation_id,
+                    checks,
+                    judge: judged,
+                },
+            )))
+            .await;
+    });
+    // Interrupting aborts the task, which drops the running command and reaps
+    // its process group; the command's own timeout bounds it otherwise.
+    run.main_abort = Some(task.abort_handle());
+    run.is_running = true;
+    run.pending_goal_gate = Some(crate::ui::state::PendingGoalGate {
+        operation_id,
+        abort: task.abort_handle(),
+        summary,
+        request: pending_request,
+    });
+    Ok(true)
+}
+
+/// Resume a round whose verification has come back.
+#[cfg(feature = "goal")]
+pub(crate) async fn handle_goal_verification_event(
+    event: Box<crate::event::GoalVerificationEvent>,
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+) -> anyhow::Result<bool> {
+    // A result from a superseded round is ignored: its generation no longer
+    // matches the one in flight.
+    let Some(pending) = run
+        .pending_goal_gate
+        .take_if(|pending| pending.operation_id == event.operation_id)
+    else {
+        return Ok(false);
+    };
+    let _ = &pending.abort;
+    run.is_running = false;
+    let decision = {
+        let Some(goal) = ui.session.goal_store.snapshot() else {
+            return Ok(false);
+        };
+        crate::extras::goal::gate::gate_post(
+            &goal,
+            &pending.summary,
+            &pending.request,
+            event.checks.as_ref(),
+            event.judge.as_ref(),
+        )
+    };
+    Box::pin(finish_goal_round(
+        renderer,
+        run,
+        ui,
+        pending.summary,
+        decision,
+        event.checks,
+        event.judge,
+    ))
+    .await
+}
+
+/// Fold a decided round into the goal and either relaunch or hand back control.
+#[cfg(feature = "goal")]
+async fn finish_goal_round(
+    renderer: &mut Renderer,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    summary: crate::extras::goal::gate::RoundSummary,
+    decision: crate::extras::goal::gate::GateDecision,
+    checks: Option<crate::extras::goal::gate::CheckOutcome>,
+    judge: Option<crate::extras::goal::gate::JudgeOutcome>,
+) -> anyhow::Result<bool> {
+    use crate::extras::goal::driver::{self, RoundOutcome};
+
+    #[cfg(feature = "skills")]
+    crate::extras::goal::driver::set_outcome_recorder(
+        crate::provider::goal_outcome_recorder(ui.cli, ui.cfg, &ui.skill_services, &ui.workspace)
+            .await,
+    );
+
+    let outcome = driver::apply_decision(
+        &ui.session.goal_store,
+        &summary,
+        decision,
+        checks.as_ref(),
+        judge.as_ref(),
+    );
 
     match outcome {
         RoundOutcome::Inactive => Ok(false),

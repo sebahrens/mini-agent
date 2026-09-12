@@ -5,14 +5,6 @@ pub fn plan_exists(plan_file: &Path) -> bool {
     plan_file.exists()
 }
 
-pub fn read_plan(plan_file: &Path) -> Option<String> {
-    if plan_file.exists() {
-        std::fs::read_to_string(plan_file).ok()
-    } else {
-        None
-    }
-}
-
 pub fn delete_plan(plan_file: &Path) {
     if plan_file.exists() {
         let _ = std::fs::remove_file(plan_file);

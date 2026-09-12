@@ -1470,12 +1470,18 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/gate.rs",
         "status: GoalStatus::BudgetLimited,",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
         "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::AwaitingUser);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/goal/gate.rs",
+        "assert_eq!(*status, GoalStatus::BudgetLimited);",
         1,
         "NON-PROCESS",
     ),
@@ -1512,7 +1518,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/gate.rs",
         "status: GoalStatus::Met,",
-        3,
+        4,
         "NON-PROCESS",
     ),
     ("src/extras/goal/mod.rs", "status.label()", 1, "NON-PROCESS"),
@@ -2380,7 +2386,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
-    ("src/ui/slash/features.rs", "status,", 1, "NON-PROCESS"),
     (
         "src/git/runner.rs",
         "&& (matches!(output.status, CommandStatus::OutputLimitExceeded(_))",
@@ -2449,6 +2454,18 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         &[
             (
                 "1c395765e43cd9b6cd43b9a473b7ceffb32e994c1223a3b582b653177a95a9fd",
+                1,
+            ),
+            (
+                "2d4dd6b0880b43f63964a9fafcc049782905712a4ac5a0ac7d070073cb11736c",
+                1,
+            ),
+            (
+                "046648aa713ea8e8f3b4b14eebc5fa7b7d883f09a76ce51f529704f6a6085a80",
+                1,
+            ),
+            (
+                "e23523dc6191a1cd2f1f91d0b489f83772025167f3ca88cebc782d8f786fc83e",
                 1,
             ),
             (
@@ -3231,13 +3248,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/ui/renderer.rs",
         &[(
             "99da3c2607b5ae5cbf0cf0a647827d0338e6fe9a07b83397ef5eee860a43fe20",
-            1,
-        )],
-    ),
-    (
-        "src/ui/slash/features.rs",
-        &[(
-            "e59a3142b34d4535d362822c3bf7afc7f4284fda8c3ceec063a0ddfba3296ea1",
             1,
         )],
     ),

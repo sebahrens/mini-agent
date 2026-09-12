@@ -232,6 +232,16 @@ channel also aborts. Background events are queued for processing after the promp
 
 ## Loop (feature-gated)
 
+`--loop` is a preset over [goals](GOALS.md): it sets a goal from the loop prompt
+and the goal driver runs its rounds. An iteration is a goal round in restart
+mode, so each one starts from a clean conversation carrying the objective, the
+plan file and a summary of the round before it. `--loop-max N` runs exactly N
+iterations, and a validator that passes while the agent reports the objective
+met can end the loop before the cap. Interrupting during a validator ends the
+loop cleanly and reports `goal: interrupted during verification`; the round's
+work is saved first. `/goal status` describes a running loop, and round records
+are written under the goal transcript directory rather than a separate one.
+
 `--loop-plan <path>` selects the plan used for both reading progress and the
 model's update instructions (default: `LOOP_PLAN.md`). When that file exists,
 startup asks whether to resume if stdin is a terminal; unattended runs resume
@@ -240,7 +250,7 @@ before launching or select a new path.
 
 The optional `--loop-run <command>` validator uses the selected process sandbox
 and the same captured shell contract as the model-visible shell tool (`-c` for
-Bash/sh or `-Command` for PowerShell/pwsh). Headless and interactive loops share
+Bash/sh or `-Command` for PowerShell/pwsh). Loops and goals share
 one bounded runner: each validation has a 30-second deadline, 1 MiB caps for stdout
 and stderr, and a 1.5 MiB combined cap. Timeout, cancellation, output-limit,
 launch-failure, and nonzero-exit results are recorded with explicit status and
@@ -248,11 +258,11 @@ separate sanitized stdout/stderr sections. Resource-limit cancellation reaps
 the direct validator everywhere and, on Unix, kills its complete process group
 before the next iteration. Cancellation is operation-scoped: headless Ctrl+C
 or Unix SIGTERM waits for that validator's cleanup before exiting, while interactive
-Ctrl-C/Ctrl-D is routed semantically (`/btw` first, then validation or the main
-run) and never uses validation cancellation to stop unrelated sandbox commands.
-Interactive validators carry generation IDs, so cancelling and starting a new
-run or loop immediately retires the old generation; a late cleanup completion
-cannot advance or respawn the replacement loop.
+Ctrl-C/Ctrl-D is routed semantically (`/btw` first, then verification or the main
+run) and never uses cancellation to stop unrelated sandbox commands.
+Each verification carries a generation ID, so cancelling and starting a new round
+immediately retires the old generation; a late completion cannot advance or
+respawn the replacement round.
 
 When a main run is interrupted after assistant or tool progress, the partial
 transcript is retained so on-disk edits stay explainable on resume. Any tool call

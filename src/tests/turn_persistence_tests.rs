@@ -99,7 +99,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                 todo_tools_enabled: false,
             };
             let mut chain = ChainState::default();
-            #[cfg(feature = "loop")]
+            #[cfg(any(feature = "loop", feature = "goal"))]
             let (validation_tx, _validation_rx) = tokio::sync::mpsc::channel(1);
             let args = serde_json::json!({"path": "src/main.rs"});
             let mut call = ToolCall::new(
@@ -166,7 +166,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     &mut ui,
                     &slash,
                     &mut chain,
-                    #[cfg(feature = "loop")]
+                    #[cfg(any(feature = "loop", feature = "goal"))]
                     &validation_tx,
                 )
                 .await

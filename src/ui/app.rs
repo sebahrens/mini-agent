@@ -1078,9 +1078,9 @@ impl<'a> App<'a> {
             UserEvent::Paste(data) => {
                 self.input.handle_paste(data);
             }
-            #[cfg(feature = "loop")]
-            UserEvent::LoopValidationDone(event) => {
-                self.handle_loop_validation_event(event).await?;
+            #[cfg(feature = "goal")]
+            UserEvent::GoalVerificationDone(event) => {
+                self.handle_goal_verification_event(event).await?;
             }
             #[cfg(feature = "mcp")]
             UserEvent::McpLoginDone { server, error } => {
@@ -1111,10 +1111,7 @@ impl<'a> App<'a> {
                 let is_ctrl_d =
                     key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
                 if is_ctrl_c || is_ctrl_d {
-                    #[cfg(feature = "loop")]
                     let validation_active = self.run.validation_active();
-                    #[cfg(not(feature = "loop"))]
-                    let validation_active = false;
                     match interrupt_target(
                         self.btw_inflight,
                         validation_active,
@@ -1332,12 +1329,6 @@ impl<'a> App<'a> {
 
         if let Some(mut text) = self.input.handle_key(key) {
             #[cfg(feature = "loop")]
-            if self.chain.loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/')
-            {
-                self.renderer
-                    .write_line("loop active: /loop stop to cancel", C_ERROR)?;
-                return Ok(());
-            }
             if self.renderer.is_scrolling() {
                 self.renderer.scroll_to_bottom()?;
             }
@@ -1471,7 +1462,7 @@ impl<'a> App<'a> {
         }
 
         #[cfg(feature = "loop")]
-        let loop_running = self.chain.loop_state.as_ref().is_some_and(|ls| ls.active);
+        let loop_running = self.ui.session.goal_store.is_active();
         #[cfg(not(feature = "loop"))]
         let loop_running = false;
 
@@ -1531,7 +1522,7 @@ impl<'a> App<'a> {
             &mut self.ui,
             &self.slash,
             &mut self.chain,
-            #[cfg(feature = "loop")]
+            #[cfg(any(feature = "loop", feature = "goal"))]
             &self.user_tx,
         )
         .await;
@@ -1544,7 +1535,6 @@ impl<'a> App<'a> {
                 // The completed response/accounting is installed before
                 // fallible presentation. Make that valid success durable even
                 // when rendering or terminal post-processing fails.
-                #[cfg(feature = "loop")]
                 self.run.cancel_validation();
                 if let Some(handle) = self.run.main_abort.take() {
                     handle.abort();
@@ -1651,20 +1641,19 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    #[cfg(feature = "loop")]
-    async fn handle_loop_validation_event(
+    #[cfg(feature = "goal")]
+    async fn handle_goal_verification_event(
         &mut self,
-        event: crate::event::LoopValidationEvent,
+        event: Box<crate::event::GoalVerificationEvent>,
     ) -> anyhow::Result<()> {
-        let current = event_handler::handle_loop_validation_event(
+        let relaunched = event_handler::handle_goal_verification_event(
             event,
             &mut self.renderer,
             &mut self.run,
             &mut self.ui,
-            &mut self.chain,
         )
         .await?;
-        if current {
+        if !relaunched {
             self.finalize_turn().await?;
         }
         Ok(())
@@ -1781,10 +1770,7 @@ impl<'a> App<'a> {
 
     async fn abort_main_run(&mut self) -> anyhow::Result<()> {
         let preserve_progress = preserve_pending_main_turn_progress(&mut self.run, self.ui.session);
-        #[cfg(feature = "loop")]
         let validation_active = self.run.cancel_validation();
-        #[cfg(not(feature = "loop"))]
-        let validation_active = false;
 
         if !validation_active {
             if let Some(handle) = self.run.main_abort.take() {
@@ -1807,9 +1793,13 @@ impl<'a> App<'a> {
         let failed_prompt = (!preserve_progress)
             .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
             .flatten();
-        #[cfg(feature = "loop")]
-        if let Some(ref mut ls) = self.chain.loop_state {
-            ls.active = false;
+        // An interrupt parks the goal rather than discarding it: the user can
+        // resume, and the objective is the record of what was being attempted.
+        #[cfg(feature = "goal")]
+        if self.ui.session.goal_store.is_active() {
+            self.ui.session.goal_store.with_mut(|goal| {
+                goal.set_status(crate::extras::goal::GoalStatus::Paused, None);
+            });
             self.chain.loop_label = None;
         }
         if !self.input.buffer.is_empty() {
@@ -2490,21 +2480,18 @@ impl<'a> App<'a> {
             }
             Ok(()) => {
                 self.save_session()?;
-                #[cfg(feature = "loop")]
-                if self
-                    .chain
-                    .loop_state
-                    .as_ref()
-                    .is_some_and(|ls| ls.active && ls.iteration == 0 && !self.run.is_running)
+                // `/loop` sets a goal and expects its first round to start
+                // without further input; an ordinary `/goal` waits for the
+                // user's next message.
+                #[cfg(feature = "goal")]
+                if !self.run.is_running
+                    && let Some(goal) = self.ui.session.goal_store.snapshot().filter(|g| {
+                        g.context_file.is_some() && g.status.is_running() && g.progress.rounds == 0
+                    })
                 {
-                    #[allow(unused_variables)]
-                    let (prompt, label, active) = {
-                        let ls = self.chain.loop_state.as_mut().unwrap();
-                        ls.iteration = 1;
-                        (ls.build_prompt(), ls.iteration_label(), ls.active)
-                    };
                     self.ensure_agent().await;
                     self.run.request_tool_results_cleared = 0;
+                    let prompt = crate::extras::goal::driver::first_round_prompt(&goal);
                     let runner = self
                         .run
                         .agent
@@ -2516,17 +2503,14 @@ impl<'a> App<'a> {
                             Vec::new(),
                             self.ui.cfg.retry.clone(),
                             #[cfg(feature = "hooks")]
-                            Some(crate::extras::hooks::LoopInfo {
-                                iteration: 1,
-                                active,
-                            }),
+                            None,
                         )
                         .await;
                     self.run.compaction_decision_tx = runner.compaction_decision_tx;
                     self.run.agent_rx = Some(runner.event_rx);
                     self.run.main_abort = Some(runner.abort_handle);
                     self.run.is_running = true;
-                    self.chain.loop_label = Some(label);
+                    self.run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
                 }
             }
         }
@@ -3643,22 +3627,20 @@ mod input_reader_lifecycle_tests {
             let completion = {
                 let result = runtime.block_on(operation.wait());
                 assert!(result.succeeded());
-                UserEvent::LoopValidationDone(crate::event::LoopValidationEvent {
+                UserEvent::GoalVerificationDone(Box::new(crate::event::GoalVerificationEvent {
                     operation_id,
-                    response: "completed".into(),
-                    summary: format!("completion-{round}"),
-                    result,
-                })
+                    checks: Some(crate::extras::goal::gate::CheckOutcome {
+                        all_passed: true,
+                        failure_tail: Some(format!("completion-{round}")),
+                        verified: Vec::new(),
+                    }),
+                    judge: None,
+                }))
             };
             #[cfg(not(feature = "loop"))]
             let completion = UserEvent::LinkOpenFailed(format!("completion-{round}"));
             background.blocking_send(completion).unwrap();
             let completion = receiver.blocking_recv().unwrap();
-            #[cfg(feature = "loop")]
-            if let UserEvent::LoopValidationDone(event) = &completion {
-                assert!(run.complete_validation(event.operation_id));
-                assert!(!run.validation_active());
-            }
             deferred.push_back(completion);
             pause_input_reader(&running, &mut handle, &mut receiver, &mut deferred);
         }
@@ -3666,8 +3648,11 @@ mod input_reader_lifecycle_tests {
             .into_iter()
             .map(|event| match event {
                 UserEvent::Paste(text) | UserEvent::LinkOpenFailed(text) => text,
-                #[cfg(feature = "loop")]
-                UserEvent::LoopValidationDone(event) => event.summary,
+                #[cfg(feature = "goal")]
+                UserEvent::GoalVerificationDone(event) => event
+                    .checks
+                    .and_then(|outcome| outcome.failure_tail)
+                    .unwrap_or_default(),
                 other => panic!("unexpected event: {other:?}"),
             })
             .collect();

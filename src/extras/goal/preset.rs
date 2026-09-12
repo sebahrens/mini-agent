@@ -5,41 +5,32 @@
 //! written down and tested so the two features cannot drift apart on what a
 //! round means.
 //!
-//! One thing does **not** map, and the mapping refuses to pretend otherwise.
-//! `--loop-run` executes after every iteration and its output is fed into the
-//! next prompt as feedback; goal checks run only when the agent claims
-//! completion, and gate it. Those are different contracts, so [`loop_goal`]
-//! carries the validator as a check and reports that the per-iteration
-//! feedback behaviour is not represented. Folding `--loop` onto goals without
-//! closing that gap would silently turn a feedback signal into a completion
-//! gate for everyone already using it.
+//! A loop validator runs after every iteration and feeds the next prompt;
+//! a goal check by default runs only on a completion claim and gates it. Those
+//! were different contracts until goals learned to run checks every round, so
+//! the preset sets `check_every_round` whenever a validator is given. That is
+//! what makes the mapping faithful rather than a silent change of meaning for
+//! everyone already using `--loop-run`.
 //!
 //! Owning specification: `docs/specs/goals.md` (Round model).
 
-#[cfg(test)]
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
 use super::{ContinuationMode, DEFAULT_RESTART_SUMMARY_CHARS, Goal, GoalCheck, GoalError};
 
-/// What a loop configuration becomes, and what it loses on the way.
-///
-/// Not yet consumed by `--loop` itself: the fold is blocked on the unmapped
-/// behaviour this type reports (`mini-agent-a1qwa.17`). It exists now so the
-/// mapping is written down and tested rather than rediscovered later.
-#[cfg(test)]
+/// What a loop configuration becomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopPreset {
     pub goal: Goal,
     /// The plan file the loop reads and asks the agent to maintain.
     pub plan_file: PathBuf,
-    /// Behaviour the goal model cannot express yet. Non-empty means the fold is
-    /// not faithful and must not be performed.
+    /// Behaviour the goal model cannot express. Empty means the mapping is
+    /// faithful; a non-empty entry would mean the fold changes meaning and must
+    /// not be performed.
     pub unmapped: Vec<&'static str>,
 }
 
 /// Build the goal equivalent to a loop configuration.
-#[cfg(test)]
 pub fn loop_goal(
     prompt: &str,
     plan_file: &Path,
@@ -57,14 +48,19 @@ pub fn loop_goal(
     if let Some(max) = max_iterations {
         goal.bounds.max_rounds = max.max(1);
     }
+    // `--loop-max N` runs exactly N iterations; a goal's wind-down round would
+    // silently make it N + 1.
+    goal.bounds.wrap_up_max_agent_turns = 0;
 
-    let mut unmapped = Vec::new();
+    // The plan file travels with the goal and is re-read every round, which is
+    // what the loop's own prompt did.
+    goal.context_file = Some(plan_file.to_path_buf());
+
+    let unmapped = Vec::new();
     if let Some(command) = run_cmd.map(str::trim).filter(|c| !c.is_empty()) {
         goal.checks.push(GoalCheck::new(command));
-        unmapped.push(
-            "--loop-run executes after every iteration and feeds its output into the next \
-             prompt; a goal check runs only on a completion claim and gates it",
-        );
+        // A loop validator is per-iteration feedback, not a completion gate.
+        goal.bounds.check_every_round = true;
     }
 
     Ok(LoopPreset {
@@ -89,6 +85,10 @@ mod tests {
         .expect("valid preset");
         assert_eq!(preset.goal.objective, "keep improving the parser");
         assert_eq!(preset.goal.bounds.max_rounds, 7);
+        assert_eq!(
+            preset.goal.bounds.wrap_up_max_agent_turns, 0,
+            "an iteration cap is exact, not a cap plus a wind-down"
+        );
         assert!(
             matches!(preset.goal.continuation, ContinuationMode::Restart { .. }),
             "a loop iteration starts from a clean conversation"
@@ -100,21 +100,34 @@ mod tests {
         );
     }
 
-    /// The gap that stops the fold. A loop validator is feedback after every
-    /// iteration; a goal check is a completion gate. Silently swapping one for
-    /// the other would change behaviour for everyone already using `--loop-run`.
+    /// A loop validator is feedback after every iteration, so the preset must
+    /// ask for per-round checks rather than a completion gate. Getting this
+    /// wrong would change what --loop-run means for everyone already using it.
     #[test]
-    fn a_loop_validator_does_not_map_onto_a_goal_check() {
+    fn a_loop_validator_becomes_a_per_round_check() {
         let preset = loop_goal("work", Path::new("LOOP_PLAN.md"), None, Some("cargo test"))
             .expect("valid preset");
         assert_eq!(preset.goal.checks.len(), 1);
         assert_eq!(preset.goal.checks[0].command, "cargo test");
-        assert_eq!(
-            preset.unmapped.len(),
-            1,
-            "the per-iteration feedback contract must be reported as unmapped"
+        assert!(
+            preset.goal.bounds.check_every_round,
+            "a loop validator runs every iteration, not only at the end"
         );
-        assert!(preset.unmapped[0].contains("after every iteration"));
+        assert!(
+            preset.unmapped.is_empty(),
+            "with per-round checks the mapping is faithful"
+        );
+    }
+
+    #[test]
+    fn the_plan_file_travels_with_the_goal() {
+        let preset =
+            loop_goal("work", Path::new("LOOP_PLAN.md"), None, None).expect("valid preset");
+        assert_eq!(
+            preset.goal.context_file.as_deref(),
+            Some(Path::new("LOOP_PLAN.md")),
+            "the plan must be re-read every round, as the loop prompt did"
+        );
     }
 
     #[test]
@@ -122,6 +135,7 @@ mod tests {
         let preset =
             loop_goal("work", Path::new("LOOP_PLAN.md"), None, Some("   ")).expect("valid preset");
         assert!(preset.goal.checks.is_empty());
+        assert!(!preset.goal.bounds.check_every_round);
         assert!(preset.unmapped.is_empty());
     }
 

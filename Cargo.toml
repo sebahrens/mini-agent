@@ -25,7 +25,9 @@ canonical-binary = "mini-agent"
 [features]
 default = ['loop', 'goal', 'git-worktree', 'mcp', 'acp', 'subagents', 'archmd', 'status-signals', 'multithread', 'export', 'js', 'sandbox', 'memory']
 status-signals = []
-loop = []
+# `--loop` is a goal preset: it sets a goal and the goal driver runs its
+# rounds, so the loop feature cannot be built without it.
+loop = ["goal"]
 goal = []
 export = []
 git-worktree = []

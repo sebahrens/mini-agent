@@ -271,8 +271,6 @@ async fn exercise_replacement(provider_changed: bool) {
     let mut reasoning_enabled = false;
     let mut is_running = false;
     let mut todo_tools_enabled = true;
-    #[cfg(feature = "loop")]
-    let mut loop_state = None;
     #[cfg(feature = "skills")]
     let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
     let mut ctx = SlashCtx {
@@ -294,8 +292,6 @@ async fn exercise_replacement(provider_changed: bool) {
         todo_tools_enabled: &mut todo_tools_enabled,
         sandbox: &sandbox,
         terminal_guard: &mut terminal_guard,
-        #[cfg(feature = "loop")]
-        loop_state: &mut loop_state,
         #[cfg(feature = "skills")]
         skill_services: &skill_services,
         #[cfg(feature = "mcp")]

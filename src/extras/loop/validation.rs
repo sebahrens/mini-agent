@@ -6,7 +6,7 @@
 
 use std::process::ExitStatus;
 
-#[cfg(feature = "loop")]
+#[cfg(all(test, unix, feature = "loop"))]
 use crate::sandbox::DEFAULT_COMMAND_LIMITS;
 use crate::sandbox::{
     CommandCancellation, CommandLimits, CommandOutput, CommandOutputLimit, CommandStatus, Sandbox,
@@ -15,7 +15,7 @@ use crate::sandbox::{
 /// Loop validators inherit the same hard process budget as the Bash tool.
 /// Keeping this as a distinct constant makes the loop policy explicit and lets
 /// tests supply smaller limits without weakening production bounds.
-#[cfg(feature = "loop")]
+#[cfg(all(test, unix, feature = "loop"))]
 pub(crate) const LOOP_VALIDATION_LIMITS: CommandLimits = DEFAULT_COMMAND_LIMITS;
 #[cfg(any(feature = "loop", feature = "goal", all(test, unix)))]
 const COMMAND_DISPLAY_BYTES: usize = 512;
@@ -49,7 +49,7 @@ pub(crate) struct ValidationCancellation {
 }
 
 impl ValidationCancellation {
-    #[cfg(any(feature = "loop", all(test, unix)))]
+    #[cfg(any(feature = "goal", all(test, unix)))]
     pub(crate) fn cancel(&self) {
         self.command.cancel();
     }
@@ -66,7 +66,7 @@ pub(crate) struct ValidationOperation {
 }
 
 impl ValidationOperation {
-    #[cfg(any(feature = "loop", all(test, unix)))]
+    #[cfg(any(feature = "goal", all(test, unix)))]
     pub(crate) fn cancellation(&self) -> ValidationCancellation {
         self.cancellation.clone()
     }
@@ -285,7 +285,7 @@ fn bound_captured_streams(
     (stdout, stderr, bounded_len < original_len)
 }
 
-#[cfg(feature = "loop")]
+#[cfg(all(test, unix, feature = "loop"))]
 pub(crate) fn start(sandbox: &Sandbox, command: &str) -> ValidationOperation {
     start_with_limits(sandbox, command, LOOP_VALIDATION_LIMITS)
 }

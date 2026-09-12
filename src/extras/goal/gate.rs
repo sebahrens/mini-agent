@@ -255,6 +255,29 @@ fn blocked_instruction(attempt: u32, limit: u32, blocker: &str) -> String {
     )
 }
 
+/// What an exhausted bound means for this goal.
+///
+/// A zero wrap-up budget makes the bound exact: `--loop-max N` has always run N
+/// iterations, and folding it onto goals must not silently add a wind-down one.
+fn bound_decision(goal: &Goal, round: &RoundSummary) -> GateDecision {
+    let exhausted = exhausted_bound(goal, round)
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    if goal.bounds.wrap_up_max_agent_turns == 0 {
+        GateDecision::stop(
+            GoalStatus::BudgetLimited,
+            format!("the goal reached its configured budget{exhausted}"),
+            VerdictSource::Bounds,
+        )
+    } else {
+        GateDecision::Continue {
+            instruction: format!("{WRAP_UP_INSTRUCTION}{exhausted}"),
+            wrap_up: true,
+            source: VerdictSource::Bounds,
+        }
+    }
+}
+
 /// First phase: decide everything that needs no command or model call.
 pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     let bounds = &goal.bounds;
@@ -314,12 +337,28 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
 
     // Row 5. A bound is exhausted. Issue one bounded wrap-up round, ahead of
     // any completion claim, so the claim is still verified on the way out.
-    if let Some(exhausted) = exhausted_bound(goal, round) {
-        return Step::Decided(GateDecision::Continue {
-            instruction: format!("{WRAP_UP_INSTRUCTION} ({exhausted})"),
-            wrap_up: true,
-            source: VerdictSource::Bounds,
-        });
+    //
+    // A zero wrap-up budget means the caller wants the bound to be exact:
+    // `--loop-max N` has always run N iterations, not N plus a wind-down.
+    if exhausted_bound(goal, round).is_some() {
+        // A completion claim made in the final round is still adjudicated. The
+        // bound limits how long the agent may work, not whether work it
+        // finished inside that bound counts.
+        if round.report_status() == Some(ReportStatus::Met) && round.open_todos == 0 {
+            return Step::Verify(met_claim_request(goal, round));
+        }
+        // Per-round checks still run on the round that exhausts the bound. A
+        // loop validator reports after every iteration including the last, and
+        // that record is often the most useful one.
+        if bounds.check_every_round && !goal.checks.is_empty() {
+            return Step::Verify(VerifyRequest {
+                run_verify_command: false,
+                run_checks: true,
+                run_judge: false,
+                cause: VerifyCause::RoundFeedback,
+            });
+        }
+        return Step::Decided(bound_decision(goal, round));
     }
 
     // Row 6. A question outranks stall detection: the agent is not stuck, it
@@ -432,12 +471,17 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // Rows 13 to 15. A completion claim is verified as deeply as configured.
     // A round that never touched the workspace still runs `verify_command`,
     // because the edits it is claiming credit for may have landed earlier.
-    Step::Verify(VerifyRequest {
+    Step::Verify(met_claim_request(goal, round))
+}
+
+/// How deeply a completion claim is verified.
+fn met_claim_request(goal: &Goal, round: &RoundSummary) -> VerifyRequest {
+    VerifyRequest {
         run_verify_command: round.verify_configured && !round.verify_ran,
         run_checks: !goal.checks.is_empty(),
         run_judge: !matches!(goal.judge, super::JudgePolicy::Off),
         cause: VerifyCause::MetClaim,
-    })
+    }
 }
 
 /// Whether a periodic judge drift check is due this round.
@@ -504,6 +548,11 @@ pub fn gate_post(
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or_else(|| KEEP_WORKING_INSTRUCTION.to_string()),
             };
+            // A bound that fell due while this round's checks were running is
+            // still due; the checks ran so their record exists either way.
+            if exhausted_bound(goal, round).is_some() {
+                return bound_decision(goal, round);
+            }
             GateDecision::cont(instruction, VerdictSource::Checks)
         }
         VerifyCause::DriftCheck => {
@@ -575,6 +624,12 @@ pub fn gate_post(
                         .failure_tail
                         .clone()
                         .unwrap_or_else(|| "a goal check failed".into());
+                    // A rejected claim in the final round is still the end of
+                    // the goal: the bound that let it be adjudicated is still
+                    // exhausted.
+                    if exhausted_bound(goal, round).is_some() {
+                        return bound_decision(goal, round);
+                    }
                     return GateDecision::cont(
                         format!("Verification failed, so the goal is not met yet:\n{tail}"),
                         VerdictSource::Checks,
@@ -1805,5 +1860,77 @@ mod tests {
             matches!(gate_pre(&g, &round), Step::Decided(_)),
             "an ordinary round must not pay for checks by default"
         );
+    }
+
+    /// A zero wrap-up budget makes a bound exact. `--loop-max N` has always run
+    /// N iterations, and folding it onto goals must not silently add one.
+    #[test]
+    fn a_zero_wrap_up_budget_stops_exactly_on_the_bound() {
+        let mut g = goal();
+        g.bounds.max_rounds = 1;
+        g.bounds.wrap_up_max_agent_turns = 0;
+        let decision = decided(&g, &worked());
+        match &decision {
+            GateDecision::Stop { status, reason, .. } => {
+                assert_eq!(*status, GoalStatus::BudgetLimited);
+                assert!(reason.contains("round 1 of 1"));
+            }
+            other => panic!("expected an exact budget stop, got {other:?}"),
+        }
+
+        // The default still winds down rather than cutting the agent off.
+        let mut winding = goal();
+        winding.bounds.max_rounds = 1;
+        assert!(matches!(
+            decided(&winding, &worked()),
+            GateDecision::Continue { wrap_up: true, .. }
+        ));
+    }
+
+    /// An exact bound limits how long the agent may work, not whether work it
+    /// finished inside the bound counts. A verified completion in the final
+    /// round is met, not budget-limited.
+    #[test]
+    fn a_verified_completion_in_the_final_round_is_met() {
+        let mut g = goal();
+        g.bounds.max_rounds = 1;
+        g.bounds.wrap_up_max_agent_turns = 0;
+        g.checks.push(crate::extras::goal::GoalCheck::new("true"));
+        let round = RoundSummary {
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+
+        let Step::Verify(request) = gate_pre(&g, &round) else {
+            panic!("a final-round completion claim must still be adjudicated");
+        };
+        assert_eq!(request.cause, VerifyCause::MetClaim);
+
+        let passed = CheckOutcome {
+            all_passed: true,
+            failure_tail: None,
+            verified: vec![VerificationKind::Checks],
+        };
+        assert!(matches!(
+            gate_post(&g, &round, &request, Some(&passed), None),
+            GateDecision::Stop {
+                status: GoalStatus::Met,
+                ..
+            }
+        ));
+
+        // A claim the checks reject still ends the goal: the bound is spent.
+        let failed = CheckOutcome {
+            all_passed: false,
+            failure_tail: Some("check failed".into()),
+            verified: Vec::new(),
+        };
+        assert!(matches!(
+            gate_post(&g, &round, &request, Some(&failed), None),
+            GateDecision::Stop {
+                status: GoalStatus::BudgetLimited,
+                ..
+            }
+        ));
     }
 }

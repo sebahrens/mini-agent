@@ -42,6 +42,28 @@ pub async fn run(
     sandbox: &Sandbox,
     cfg: &crate::config::Config,
 ) -> Option<CheckOutcome> {
+    run_with_interrupt(goal, request, sandbox, cfg, std::future::pending())
+        .await
+        .0
+}
+
+/// Run the checks tier, abandoning it if `interrupt` resolves first.
+///
+/// A check is ordinary workspace work and can run for as long as a test suite
+/// does, so an operator who interrupts must not wait for it. The command is
+/// cancelled rather than merely dropped: cancellation terminates its process
+/// group and reaps it, which dropping the future alone does not do.
+pub async fn run_with_interrupt<F>(
+    goal: &Goal,
+    request: &VerifyRequest,
+    sandbox: &Sandbox,
+    cfg: &crate::config::Config,
+    interrupt: F,
+) -> (Option<CheckOutcome>, Interrupted)
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut interrupted = false;
     let mut commands: Vec<(&str, VerificationKind)> = Vec::new();
     if request.run_verify_command
         && let Some(command) = cfg.verify_command.as_deref()
@@ -57,15 +79,34 @@ pub async fn run(
         );
     }
     if commands.is_empty() {
-        return None;
+        return (None, false);
     }
 
     let limits = limits(cfg);
     let mut verified = Vec::new();
+    tokio::pin!(interrupt);
     for (command, kind) in commands {
-        let result = crate::extras::validation::start_with_limits(sandbox, command, limits)
-            .wait()
-            .await;
+        let operation = crate::extras::validation::start_with_limits(sandbox, command, limits);
+        let cancellation = operation.cancellation();
+        let wait = operation.wait();
+        tokio::pin!(wait);
+        let result = tokio::select! {
+            // Poll the signal first so a handler is installed before the
+            // command can launch.
+            biased;
+            signal = &mut interrupt => {
+                interrupted = true;
+                cancellation.cancel();
+                // The scoped worker reports only once the group is terminated
+                // and its direct child reaped.
+                let result = wait.await;
+                if signal.is_err() {
+                    tracing::warn!("goal check interrupt handler failed");
+                }
+                result
+            }
+            result = &mut wait => result,
+        };
         if !result.succeeded() {
             // Timeout, cancellation, an output-limit breach, a launch failure,
             // and a non-zero exit are all failures. None of them is evidence
@@ -75,27 +116,36 @@ pub async fn run(
                 command = %crate::extras::validation::display_command(command),
                 "goal check failed; the completion claim is rejected"
             );
-            return Some(CheckOutcome {
-                all_passed: false,
-                failure_tail: Some(format!(
-                    "{} failed:\n{}",
-                    crate::extras::validation::display_command(command),
-                    result.render_tail(FAILURE_TAIL_CHARS)
-                )),
-                verified: Vec::new(),
-            });
+            return (
+                Some(CheckOutcome {
+                    all_passed: false,
+                    failure_tail: Some(format!(
+                        "{} failed:\n{}",
+                        crate::extras::validation::display_command(command),
+                        result.render_tail(FAILURE_TAIL_CHARS)
+                    )),
+                    verified: Vec::new(),
+                }),
+                interrupted,
+            );
         }
         if !verified.contains(&kind) {
             verified.push(kind);
         }
     }
 
-    Some(CheckOutcome {
-        all_passed: true,
-        failure_tail: None,
-        verified,
-    })
+    (
+        Some(CheckOutcome {
+            all_passed: true,
+            failure_tail: None,
+            verified,
+        }),
+        interrupted,
+    )
 }
+
+/// Whether the operator interrupted the tier while it was running.
+pub type Interrupted = bool;
 
 #[cfg(test)]
 mod tests {

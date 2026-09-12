@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use super::gate::{GateDecision, RoundEnd, RoundSummary};
+use super::gate::{GateDecision, KEEP_WORKING_INSTRUCTION, RoundEnd, RoundSummary};
 use super::{ContinuationMode, Goal, GoalStatus, ReportStatus};
 use crate::event::AgentEvent;
 
@@ -148,6 +148,30 @@ pub struct Relaunch {
     pub max_agent_turns: Option<u32>,
 }
 
+/// The prompt that opens a goal's first round.
+///
+/// Used where a goal starts itself rather than being carried by a user's
+/// message, which is what `/loop` does. Later rounds are built by
+/// [`next_round`] from the gate's decision.
+pub fn first_round_prompt(goal: &Goal) -> String {
+    let mut prompt = String::with_capacity(goal.objective.len() + 512);
+    prompt.push_str("## Goal\n");
+    prompt.push_str(&goal.objective);
+    if !goal.criteria.is_empty() {
+        prompt.push_str("\n\nDone when:");
+        for criterion in &goal.criteria {
+            prompt.push_str("\n- ");
+            prompt.push_str(criterion);
+        }
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&round_header(goal, 1));
+    push_context_file(&mut prompt, goal);
+    prompt.push_str("\n\n");
+    prompt.push_str(KEEP_WORKING_INSTRUCTION);
+    prompt
+}
+
 /// Build the next round from a `Continue` decision.
 ///
 /// Returns `None` for a `Stop`, which is the driver's signal to hand control
@@ -168,6 +192,7 @@ pub fn next_round(goal: &Goal, decision: &GateDecision) -> Option<Relaunch> {
     match goal.continuation {
         ContinuationMode::Continue => {
             prompt.push_str(&round_header(goal, round));
+            push_context_file(&mut prompt, goal);
             prompt.push_str("\n\n");
             prompt.push_str(instruction);
             Some(Relaunch {
@@ -190,6 +215,7 @@ pub fn next_round(goal: &Goal, decision: &GateDecision) -> Option<Relaunch> {
             }
             prompt.push_str("\n\n");
             prompt.push_str(&round_header(goal, round));
+            push_context_file(&mut prompt, goal);
             if let Some(summary) = carried_summary(goal, summary_chars) {
                 prompt.push_str("\n\nWhat happened so far:\n");
                 prompt.push_str(&summary);
@@ -203,6 +229,27 @@ pub fn next_round(goal: &Goal, decision: &GateDecision) -> Option<Relaunch> {
             })
         }
     }
+}
+
+/// Append the context file's current contents, if the goal has one.
+///
+/// Read every round rather than captured once: a plan file exists so the agent
+/// can edit it as work proceeds, and the next round has to see those edits. A
+/// missing or unreadable file is simply absent, never an error — losing a plan
+/// must not end a goal.
+fn push_context_file(prompt: &mut String, goal: &Goal) {
+    let Some(path) = goal.context_file.as_ref() else {
+        return;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    prompt.push_str(&format!("\n\nCurrent plan ({}):\n", path.display()));
+    prompt.push_str(contents.trim_end());
+    prompt.push_str(&format!(
+        "\n\nKeep {} current: mark finished items, add what you discover.",
+        path.display()
+    ));
 }
 
 fn round_header(goal: &Goal, round: u32) -> String {
@@ -553,6 +600,38 @@ mod tests {
         assert!(!should_continue(&g));
         assert_eq!(next_round(&g, &decision), None);
     }
+
+    #[test]
+    fn a_context_file_is_read_fresh_into_every_round() {
+        let dir = std::env::temp_dir().join(format!("goal-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("PLAN.md");
+        std::fs::write(&plan, "- [ ] first task").unwrap();
+
+        let mut g = goal();
+        g.context_file = Some(plan.clone());
+        let decision = GateDecision::Continue {
+            instruction: "carry on".into(),
+            wrap_up: false,
+            source: crate::extras::goal::VerdictSource::Structural,
+        };
+
+        let first = next_round(&g, &decision).expect("relaunch");
+        assert!(first.prompt.contains("first task"));
+        assert!(first.prompt.contains("Keep"));
+
+        // The agent edits the plan; the next round must see the edit.
+        std::fs::write(&plan, "- [x] first task\n- [ ] second task").unwrap();
+        let second = next_round(&g, &decision).expect("relaunch");
+        assert!(second.prompt.contains("second task"));
+
+        // A plan that disappears is absent, not fatal.
+        std::fs::remove_file(&plan).unwrap();
+        let third = next_round(&g, &decision).expect("relaunch");
+        assert!(!third.prompt.contains("second task"));
+        assert!(third.prompt.contains("carry on"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// What the surface should do once a round has been judged.
@@ -564,6 +643,82 @@ pub enum RoundOutcome {
     Relaunch { relaunch: Relaunch, line: String },
     /// Hand control back to the user.
     Stopped { status: GoalStatus, line: String },
+}
+
+/// Persist one completed round before the next one starts.
+///
+/// The round that just ran is history for the round about to run, so it is
+/// written before the relaunch rather than at the very end. A turn that failed
+/// still persists what it completed first: a write or an edit can land and a
+/// later provider error end the round, and a resumed session must show that
+/// effect rather than repeat it.
+pub fn persist_round(
+    session: &mut crate::session::Session,
+    prompt: &str,
+    turn: crate::agent::runner::HeadlessTurn,
+    cfg: &crate::config::Config,
+    no_session: bool,
+) -> anyhow::Result<String> {
+    let crate::agent::runner::HeadlessTurn {
+        response,
+        usage,
+        interactions,
+        failure,
+    } = turn;
+    let persistence = if no_session {
+        Ok(())
+    } else {
+        crate::print::persist_headless_turn(session, prompt, &response, &interactions);
+        session.charge_usage_delta(usage.into(), cfg.is_anthropic_native(&session.provider));
+        crate::session::storage::save_session(session)
+    };
+    if let Some(failure) = failure {
+        // The round's own failure wins; a persistence failure is reported with
+        // it rather than instead of it.
+        return Err(match persistence {
+            Ok(()) => failure,
+            Err(error) => failure.context(format!(
+                "the partial goal round could not be persisted either: {error}"
+            )),
+        });
+    }
+    persistence?;
+    Ok(response)
+}
+
+/// Fold an already-decided round into the goal.
+///
+/// The shared half of [`settle_round`], split out for surfaces that run
+/// verification off their event loop and come back with the result later.
+pub fn apply_decision(
+    store: &super::GoalStore,
+    summary: &RoundSummary,
+    decision: GateDecision,
+    checks: Option<&super::gate::CheckOutcome>,
+    judge: Option<&super::gate::JudgeOutcome>,
+) -> RoundOutcome {
+    let line = match store.with_mut(|goal| {
+        super::gate::apply(goal, summary, &decision, judge);
+        super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
+        #[cfg(feature = "hooks")]
+        super::publish_hook_info(Some(goal));
+        decision_line(goal, &decision)
+    }) {
+        Some(line) => line,
+        None => return RoundOutcome::Inactive,
+    };
+
+    let Some(goal) = store.snapshot() else {
+        return RoundOutcome::Inactive;
+    };
+    record_outcome(&goal);
+    match next_round(&goal, &decision) {
+        Some(relaunch) if goal.status.is_running() => RoundOutcome::Relaunch { relaunch, line },
+        _ => RoundOutcome::Stopped {
+            status: goal.status,
+            line,
+        },
+    }
 }
 
 /// Judge the round that just ended and record the result.
@@ -603,36 +758,7 @@ where
         }
     };
 
-    let line = store
-        .with_mut(|goal| {
-            super::gate::apply(goal, &summary, &decision, judged.as_ref());
-            // Written after the fold so the record shows the status the round
-            // actually produced.
-            super::transcript::save_round(
-                goal,
-                &summary,
-                &decision,
-                decision.reason(),
-                checked.as_ref(),
-                judged.as_ref(),
-            );
-            #[cfg(feature = "hooks")]
-            super::publish_hook_info(Some(goal));
-            decision_line(goal, &decision)
-        })
-        .unwrap_or_default();
-
-    let Some(goal) = store.snapshot() else {
-        return RoundOutcome::Inactive;
-    };
-    record_outcome(&goal);
-    match next_round(&goal, &decision) {
-        Some(relaunch) if goal.status.is_running() => RoundOutcome::Relaunch { relaunch, line },
-        _ => RoundOutcome::Stopped {
-            status: goal.status,
-            line,
-        },
-    }
+    apply_decision(store, &summary, decision, checked.as_ref(), judged.as_ref())
 }
 
 /// Where a settled verdict is reported as skill evidence.
