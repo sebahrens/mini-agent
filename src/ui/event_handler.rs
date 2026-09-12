@@ -608,14 +608,28 @@ async fn start_goal_verification(
 
     let tx = verification_tx.clone();
     let pending_request = request.clone();
+    // An operator who interrupts must not wait for a check, and the check must
+    // actually stop: cancellation terminates the command's process group and
+    // reaps it, which dropping this task's future would not.
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        let checks = crate::extras::goal::checks::run(&goal, &request, &sandbox, &cfg).await;
+        let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
+            &goal,
+            &request,
+            &sandbox,
+            &cfg,
+            async move {
+                let _ = cancelled.await;
+                Ok(())
+            },
+        )
+        .await;
         // A failing check already decides the claim, and the gate returns
         // before it looks at the judge: asking anyway spends a model call on
         // an answer nobody reads.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected => Some(
+            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => Some(
                 crate::extras::goal::judge::ask_with_transcript(
                     &goal,
                     &request,
@@ -634,17 +648,17 @@ async fn start_goal_verification(
                     operation_id,
                     checks,
                     judge: judged,
+                    interrupted,
                 },
             )))
             .await;
     });
-    // Interrupting aborts the task, which drops the running command and reaps
-    // its process group; the command's own timeout bounds it otherwise.
+    // The command's own timeout bounds the check when nobody interrupts.
     run.main_abort = Some(task.abort_handle());
     run.is_running = true;
     run.pending_goal_gate = Some(crate::ui::state::PendingGoalGate {
         operation_id,
-        abort: task.abort_handle(),
+        cancel,
         summary,
         request: pending_request,
     });
@@ -667,19 +681,25 @@ pub(crate) async fn handle_goal_verification_event(
     else {
         return Ok(false);
     };
-    let _ = &pending.abort;
     run.is_running = false;
     let decision = {
         let Some(goal) = ui.session.goal_store.snapshot() else {
             return Ok(false);
         };
-        crate::extras::goal::gate::gate_post(
-            &goal,
-            &pending.summary,
-            &pending.request,
-            event.checks.as_ref(),
-            event.judge.as_ref(),
-        )
+        // An interrupt is not a verdict on the claim. Settling it through the
+        // gate's interrupt row leaves the goal untouched and uncounted, which
+        // is what the operator asked for.
+        if event.interrupted {
+            crate::extras::goal::gate::gate_interrupted()
+        } else {
+            crate::extras::goal::gate::gate_post(
+                &goal,
+                &pending.summary,
+                &pending.request,
+                event.checks.as_ref(),
+                event.judge.as_ref(),
+            )
+        }
     };
     Box::pin(finish_goal_round(
         renderer,

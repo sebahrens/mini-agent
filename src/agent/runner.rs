@@ -472,16 +472,25 @@ impl CompletionVerification {
         Some(Self {
             command: Some(CompactString::new(command)),
             sandbox,
-            limits: crate::sandbox::CommandLimits {
-                timeout: cfg.resolve_verify_timeout(),
-                stdout_bytes: 1024 * 1024,
-                stderr_bytes: 1024 * 1024,
-                combined_bytes: 1536 * 1024,
-            },
+            limits: Self::limits(cfg),
             max_attempts: cfg.resolve_verify_max_attempts(),
             #[cfg(feature = "skills")]
             task_outcomes: None,
         })
+    }
+
+    /// Bounds for one verification command.
+    ///
+    /// The goal checks tier runs under exactly these: a `verify_command` and a
+    /// goal check are the same kind of thing and must be bounded the same way,
+    /// which three copies of the numbers could not promise.
+    pub(crate) fn limits(cfg: &crate::config::Config) -> crate::sandbox::CommandLimits {
+        crate::sandbox::CommandLimits {
+            timeout: cfg.resolve_verify_timeout(),
+            stdout_bytes: 1024 * 1024,
+            stderr_bytes: 1024 * 1024,
+            combined_bytes: 1536 * 1024,
+        }
     }
 
     #[cfg(feature = "skills")]
@@ -495,12 +504,7 @@ impl CompletionVerification {
             .unwrap_or_else(|| Self {
                 command: None,
                 sandbox,
-                limits: crate::sandbox::CommandLimits {
-                    timeout: cfg.resolve_verify_timeout(),
-                    stdout_bytes: 1024 * 1024,
-                    stderr_bytes: 1024 * 1024,
-                    combined_bytes: 1536 * 1024,
-                },
+                limits: Self::limits(cfg),
                 max_attempts: cfg.resolve_verify_max_attempts(),
                 task_outcomes: None,
             })

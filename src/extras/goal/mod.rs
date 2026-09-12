@@ -33,6 +33,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Maximum objective length. Matches the cap the surveyed harnesses use and
 /// keeps the static preamble block bounded.
 pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
+/// Maximum length of one check command. Long enough for a real test
+/// invocation, short enough that the record stays readable and bounded.
+pub const MAX_CHECK_CHARS: usize = 2_000;
 /// Maximum number of "done when" criteria.
 pub const MAX_CRITERIA: usize = 16;
 /// Maximum length of a single criterion.
@@ -280,10 +283,16 @@ pub struct GoalCheck {
 }
 
 impl GoalCheck {
+    /// A check, with its command bounded.
+    ///
+    /// The command is shown to the model on failure and written into every
+    /// round transcript, so an unbounded one would be unbounded in both.
     pub fn new(command: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
+        let mut command: String = command.into();
+        if command.chars().count() > MAX_CHECK_CHARS {
+            command = command.chars().take(MAX_CHECK_CHARS).collect();
         }
+        Self { command }
     }
 }
 
@@ -937,6 +946,19 @@ impl<'de> Deserialize<'de> for GoalStore {
     }
 }
 
+/// Whether a stored goal id is the plain identifier goals are created with.
+///
+/// Ids are used as a path segment, so this is the difference between writing a
+/// transcript under the state directory and writing it wherever a hand-edited
+/// session file says.
+fn is_safe_goal_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Deserialize a field a newer build may have widened, taking this build's
 /// default rather than failing the whole session load.
 ///
@@ -989,6 +1011,16 @@ struct StoredGoal {
 
 impl StoredGoal {
     fn into_goal(self) -> Goal {
+        // The id names a directory under the state root, so a record from a
+        // hand-edited session file must not be able to point that write
+        // anywhere else. Anything but the uuid shape it is created with gets a
+        // fresh id: the transcripts are an audit trail, not the goal itself.
+        let id = if is_safe_goal_id(&self.id) {
+            self.id
+        } else {
+            tracing::warn!(id = %self.id, "goal: stored id is not a plain identifier; reissuing");
+            CompactString::new(uuid::Uuid::new_v4().to_string())
+        };
         let (status, paused_reason) =
             match serde_json::from_value::<GoalStatus>(self.status.clone()) {
                 Ok(status) => (status, self.paused_reason),
@@ -1001,7 +1033,7 @@ impl StoredGoal {
                 }
             };
         Goal {
-            id: self.id,
+            id,
             objective: self.objective,
             criteria: self.criteria,
             status,
@@ -1306,6 +1338,44 @@ mod tests {
     /// continuation mode or a report status this one has never heard of. None
     /// of those may cost the user the objective: the unreadable detail is
     /// dropped and everything else loads.
+    /// The goal id names a directory under the state root, so a hand-edited
+    /// session must not be able to aim that write somewhere else.
+    #[test]
+    fn a_stored_goal_id_that_is_not_a_plain_identifier_is_reissued() {
+        let store = GoalStore::default();
+        store.set(goal(), false).unwrap();
+        let json = serde_json::to_string(&store).unwrap();
+        let original = store.snapshot().unwrap().id;
+
+        let tampered = json.replace(original.as_str(), "../../../../etc/cron.d");
+        assert_ne!(tampered, json, "the fixture must actually change the id");
+
+        let back: GoalStore = serde_json::from_str(&tampered).expect("the session still loads");
+        let loaded = back.snapshot().expect("goal retained");
+        assert!(
+            is_safe_goal_id(&loaded.id),
+            "a traversing id is replaced, not honoured: {}",
+            loaded.id
+        );
+        assert_eq!(
+            loaded.objective, "ship the feature",
+            "and the objective survives the reissue"
+        );
+
+        // The shape ids are actually created with is left alone.
+        let back: GoalStore = serde_json::from_str(&json).expect("an untampered session loads");
+        assert_eq!(back.snapshot().unwrap().id, original);
+    }
+
+    /// A check command is shown to the model on failure and written into every
+    /// round transcript, so it is bounded in both.
+    #[test]
+    fn a_check_command_is_bounded() {
+        let check = GoalCheck::new("x".repeat(MAX_CHECK_CHARS * 2));
+        assert_eq!(check.command.chars().count(), MAX_CHECK_CHARS);
+        assert_eq!(GoalCheck::new("cargo test").command, "cargo test");
+    }
+
     #[test]
     fn a_record_from_a_newer_build_loads_with_the_objective_intact() {
         let store = GoalStore::default();

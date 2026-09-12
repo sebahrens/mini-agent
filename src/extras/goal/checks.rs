@@ -20,15 +20,13 @@ use crate::sandbox::{CommandLimits, Sandbox};
 /// How much of a failing command's output is fed back to the model.
 const FAILURE_TAIL_CHARS: usize = 4_000;
 
-/// Limits for one check, matching the configured completion-verification gate
-/// so a goal check and a `verify_command` are bounded identically.
+/// Limits for one check.
+///
+/// The completion-verification gate's own bounds, not a copy of them: a goal
+/// check and a `verify_command` are the same kind of thing, and a second set of
+/// numbers would eventually disagree with the first without anyone noticing.
 fn limits(cfg: &crate::config::Config) -> CommandLimits {
-    CommandLimits {
-        timeout: cfg.resolve_verify_timeout(),
-        stdout_bytes: 1024 * 1024,
-        stderr_bytes: 1024 * 1024,
-        combined_bytes: 1536 * 1024,
-    }
+    crate::agent::runner::CompletionVerification::limits(cfg)
 }
 
 /// Run everything the gate asked for, in order.
@@ -36,6 +34,10 @@ fn limits(cfg: &crate::config::Config) -> CommandLimits {
 /// The configured `verify_command` runs first when the round never triggered
 /// it: a completion claim made in a read-only round is usually claiming credit
 /// for edits that landed earlier, and those still have to hold up.
+///
+/// Gated with its only consumer: every other surface can be interrupted while
+/// a check runs and uses [`run_with_interrupt`].
+#[cfg(any(feature = "acp", test))]
 pub async fn run(
     goal: &Goal,
     request: &VerifyRequest,

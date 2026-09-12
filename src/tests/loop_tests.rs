@@ -253,7 +253,9 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
     .await
     .expect("both commands must launch");
 
-    run.pending_goal_gate.as_ref().unwrap().abort.abort();
+    // Cancelling the round's verification stops that command and reaps it,
+    // rather than dropping the task that owns it and leaving it running.
+    run.cancel_validation();
     std::fs::write(&unrelated_release, b"go").unwrap();
     let survivor = tokio::time::timeout(Duration::from_secs(10), unrelated)
         .await
@@ -272,6 +274,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
             verified: vec![crate::extras::goal::VerificationKind::Checks],
         }),
         judge: None,
+        interrupted: false,
     };
     assert!(
         !handle_goal_verification_event(Box::new(superseded), &mut renderer, &mut run, &mut ui)

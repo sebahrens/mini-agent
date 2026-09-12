@@ -3655,6 +3655,7 @@ mod input_reader_lifecycle_tests {
                         verified: Vec::new(),
                     }),
                     judge: None,
+                    interrupted: false,
                 }))
             };
             #[cfg(not(feature = "loop"))]

@@ -248,6 +248,7 @@ fn assemble_tail(newest_first: Vec<String>) -> String {
 /// in a [`crate::session::Session`], so the turn's record is the whole
 /// transcript there. Judging an empty one would make every completion claim
 /// look unsupported.
+#[cfg(feature = "acp")]
 pub fn transcript_from_interactions(interactions: &[rig::completion::Message]) -> String {
     assemble_tail(interaction_blocks(interactions))
 }

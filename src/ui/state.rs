@@ -429,9 +429,11 @@ pub(crate) struct AgentRunState {
 #[cfg(feature = "goal")]
 pub(crate) struct PendingGoalGate {
     pub operation_id: crate::event::ValidationOperationId,
-    /// Aborting this stops the verification task, which drops the running
-    /// command and reaps its process group.
-    pub abort: tokio::task::AbortHandle,
+    /// Cancels the running check, rather than dropping the future that owns
+    /// it. Cancellation terminates the command's process group and reaps it;
+    /// dropping the future alone does not, and would leave a test suite
+    /// running after the operator asked for it to stop.
+    pub cancel: tokio::sync::oneshot::Sender<()>,
     pub summary: crate::extras::goal::gate::RoundSummary,
     pub request: crate::extras::goal::gate::VerifyRequest,
 }
@@ -492,15 +494,18 @@ impl AgentRunState {
     /// Retires the current generation before signalling its worker. Any
     /// completion already queued for that generation is stale immediately.
     ///
-    /// A goal round's verification is retired the same way: dropping its task
-    /// drops the running command and reaps its process group, and its
+    /// A goal round's verification is retired the same way: its command is
+    /// cancelled so the process group is terminated and reaped, and its
     /// generation no longer matches, so a result already in flight is ignored.
     pub(crate) fn cancel_validation(&mut self) -> bool {
         #[allow(unused_mut)]
         let mut cancelled = false;
         #[cfg(feature = "goal")]
         if let Some(pending) = self.pending_goal_gate.take() {
-            pending.abort.abort();
+            // The task is left to wind down rather than aborted: it is the
+            // thing that waits for the group to die, and aborting it here is
+            // what left the command running.
+            let _ = pending.cancel.send(());
             cancelled = true;
         }
         #[cfg(feature = "loop")]
