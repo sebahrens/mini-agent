@@ -1848,6 +1848,11 @@ pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec
 fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyhow::Result<()> {
     use crate::extras::goal::{ContinuationMode, DEFAULT_RESTART_SUMMARY_CHARS, Goal};
 
+    // Without tools the agent can never file a report, so every round would
+    // look like a stall. Say so at startup rather than after three wasted
+    // rounds. This holds for a goal resumed from the session too: `--continue`
+    // can carry a live goal into a run that has no way to advance it.
+    let has_live_goal = session.goal_store.is_live();
     let Some(objective) = cli
         .goal_args
         .goal
@@ -1855,17 +1860,31 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .map(str::trim)
         .filter(|o| !o.is_empty())
     else {
+        if has_live_goal && cli.resolve_no_tools(cfg) {
+            anyhow::bail!(
+                "this session has an unfinished goal, which needs the goal_report tool; \
+                 remove --no-tools, or clear the goal"
+            );
+        }
         return Ok(());
     };
-    // Without tools the agent can never file a report, so every round would
-    // look like a stall. Say so at startup rather than after three wasted
-    // rounds.
     if cli.resolve_no_tools(cfg) {
         anyhow::bail!("a goal needs the goal_report tool; remove --no-tools to use --goal");
     }
 
-    let mut goal =
-        Goal::new(objective, cli.goal_args.goal_done.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    // Configuration first, then the flags: a flag typed on the command line
+    // overrides the file it names, and a check typed there is additive to
+    // whatever the project already required.
+    let mut goal = Goal::configured(
+        objective,
+        cli.goal_args.goal_done.clone(),
+        crate::extras::goal::GoalDefaults {
+            cfg,
+            provider: &session.provider,
+            model: &session.model,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     if let Some(max_rounds) = cli.goal_args.goal_max_rounds {
         goal.bounds.max_rounds = max_rounds.max(1);
     }
@@ -1876,16 +1895,6 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
             },
             _ => ContinuationMode::Continue,
         };
-    }
-    goal.bounds.apply_config(cfg);
-    goal.judge = cfg.resolve_goal_judge();
-    goal.resolved_judge =
-        crate::extras::goal::judge::resolve(&goal.judge, cfg, &session.provider, &session.model);
-    // Trusted configuration first, then the flags, so a command typed at the
-    // prompt is always additive to whatever the project already required.
-    for command in cfg.goal_checks.iter().flatten() {
-        goal.checks
-            .push(crate::extras::goal::GoalCheck::new(command.as_str()));
     }
     for command in &cli.goal_args.goal_check {
         goal.checks

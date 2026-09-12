@@ -526,6 +526,16 @@ impl Config {
     /// The judge is whatever the user names: another family, another size, or
     /// the session's own model. `Auto` falls back to the session model so a
     /// single-model install still gets a second opinion from a clean context.
+    /// Whether the user named a judge at all, rather than taking the default.
+    ///
+    /// A `--loop` preset uses this to keep its historical shape: a loop has
+    /// never called a second model, so it only does so when the installation
+    /// asked for one by name.
+    #[cfg(feature = "goal")]
+    pub fn goal_judge_configured(&self) -> bool {
+        self.goal_judge_model.is_some() || self.goal.as_ref().is_some_and(|g| g.judge.is_some())
+    }
+
     #[cfg(feature = "goal")]
     pub fn resolve_goal_judge(&self) -> crate::extras::goal::JudgePolicy {
         use crate::extras::goal::JudgePolicy;

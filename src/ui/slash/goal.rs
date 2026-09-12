@@ -280,7 +280,19 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 return;
             }
             let (objective, criteria) = parse_objective(body);
-            let goal = match Goal::new(objective, criteria) {
+            // Same factory as `--goal`, so a `[goal]` bound, a project's
+            // `goal_checks` and the configured judge apply here too. A goal
+            // typed at the prompt is the same object as one named on the
+            // command line.
+            let goal = match Goal::configured(
+                objective,
+                criteria,
+                crate::extras::goal::GoalDefaults {
+                    cfg: ctx.cfg,
+                    provider: &ctx.session.provider,
+                    model: &ctx.session.model,
+                },
+            ) {
                 Ok(goal) => goal,
                 Err(error) => {
                     write_error(ctx.renderer, error);

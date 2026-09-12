@@ -1026,6 +1026,26 @@ async fn apply_meta_goal(
             .goal_store
             .clone()
     };
+    let provider = state.cli.resolve_provider(&state.cfg);
+    let model = state.cli.resolve_model(&state.cfg);
+
+    // A closed schema. An editor that sends `checks` or `judge` is asking for
+    // something this channel deliberately cannot grant — those carry the
+    // authority of whoever configured the harness — and silently ignoring the
+    // field would leave the client believing its goal was gated when it is
+    // not. Say so instead.
+    let spec = spec
+        .as_object()
+        .ok_or_else(|| "_meta.goal must be an object".to_string())?;
+    if let Some(unknown) = spec
+        .keys()
+        .find(|key| !matches!(key.as_str(), "objective" | "criteria" | "replace" | "clear"))
+    {
+        return Err(format!(
+            "_meta.goal does not accept `{unknown}`; goal checks and the judge come from this \
+             installation's configuration, not from the client"
+        ));
+    }
 
     if spec.get("clear").and_then(serde_json::Value::as_bool) == Some(true) {
         store.clear();
@@ -1034,20 +1054,32 @@ async fn apply_meta_goal(
     let Some(objective) = spec.get("objective").and_then(serde_json::Value::as_str) else {
         return Err("_meta.goal needs an objective".to_string());
     };
-    let criteria = spec
-        .get("criteria")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let criteria = match spec.get("criteria") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "_meta.goal criteria must be strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("_meta.goal criteria must be an array of strings".to_string()),
+    };
     let replace = spec.get("replace").and_then(serde_json::Value::as_bool) == Some(true);
 
-    let goal = crate::extras::goal::Goal::new(objective, criteria).map_err(|e| e.to_string())?;
+    // The same factory every other surface uses, so the same objective is
+    // bounded, checked and judged the same way in an editor as in a terminal.
+    let goal = crate::extras::goal::Goal::configured(
+        objective,
+        criteria,
+        crate::extras::goal::GoalDefaults {
+            cfg: &state.cfg,
+            provider: &provider,
+            model: &model,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     store.set(goal, replace).map_err(|e| e.to_string())
 }
 

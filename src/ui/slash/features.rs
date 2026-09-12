@@ -81,6 +81,11 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         &plan_file,
         Some(crate::extras::r#loop::DEFAULT_TUI_MAX_ITERATIONS),
         None,
+        crate::extras::goal::GoalDefaults {
+            cfg: ctx.cfg,
+            provider: &ctx.session.provider,
+            model: &ctx.session.model,
+        },
     ) {
         Ok(preset) => preset,
         Err(error) => {

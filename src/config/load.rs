@@ -820,6 +820,16 @@ fn save_project_config_trust(path: &Path, store: &ProjectConfigTrustStore) -> st
     crate::fs::private_atomic_write_sync(path, &content)
 }
 
+/// Fields inside an otherwise benign table that are not themselves benign.
+///
+/// `[goal]` is benign because every bound in it only limits how long the
+/// harness keeps working; none can widen what runs. `judge` is not a bound.
+/// Naming a `quick_models` entry decides which endpoint a bounded slice of the
+/// conversation is sent to, and `off` removes the review of completion claims
+/// altogether, so an untrusted project file gets neither for free — for the
+/// same reason `goal_judge_model` and `goal_checks` are sensitive keys.
+const SENSITIVE_FIELDS_IN_BENIGN_TABLES: &[(&str, &str)] = &[("goal", "judge")];
+
 fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
@@ -832,12 +842,29 @@ fn split_project_override(
     let mut sensitive = toml::map::Map::new();
     let mut sensitive_keys = BTreeSet::new();
     for (key, value) in table {
-        if BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str()) {
-            benign.insert(key.clone(), value.clone());
-        } else {
+        if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str()) {
             sensitive_keys.insert(key.clone());
             sensitive.insert(key.clone(), value.clone());
+            continue;
         }
+
+        // A benign table may still carry one field that is not. Split those
+        // out rather than classifying the whole table as sensitive: the bounds
+        // beside them are exactly what a project should be able to set.
+        let mut value = value.clone();
+        for (table_key, field) in SENSITIVE_FIELDS_IN_BENIGN_TABLES {
+            if key != table_key {
+                continue;
+            }
+            let Some(held) = value.as_table_mut().and_then(|table| table.remove(*field)) else {
+                continue;
+            };
+            let mut carved = toml::map::Map::new();
+            carved.insert((*field).to_string(), held);
+            sensitive_keys.insert(format!("{key}.{field}"));
+            sensitive.insert(key.clone(), toml::Value::Table(carved));
+        }
+        benign.insert(key.clone(), value);
     }
     Ok((
         toml::Value::Table(benign),
@@ -1530,8 +1557,10 @@ mod project_config_trust_tests {
              shell = \"untrusted-shell\"\n\
              verify_command = \"untrusted-verifier\"\n\
              goal_checks = [\"untrusted-goal-check\"]\n\
+             goal_judge_model = \"untrusted-judge\"\n\
              [goal]\n\
              max_rounds = 9\n\
+             judge = \"untrusted-quick-model\"\n\
              [mcp_servers.sentinel]\n\
              command = \"untrusted-mcp-sentinel\"\n\
              [lsp]\n\
@@ -1571,6 +1600,17 @@ mod project_config_trust_tests {
             assert!(
                 cfg.goal_checks.is_none(),
                 "an untrusted project config must not supply a goal check"
+            );
+            assert!(
+                cfg.goal_judge_model.is_none(),
+                "nor name the model that reviews completion claims"
+            );
+            // `[goal].judge` is carved out of its own table: choosing which
+            // configured endpoint sees the transcript, or switching the review
+            // off, is not a bound.
+            assert!(
+                cfg.goal.as_ref().and_then(|g| g.judge.as_deref()).is_none(),
+                "nor choose the judge from inside the bounds table"
             );
             assert_eq!(cfg.goal.as_ref().and_then(|g| g.max_rounds), Some(9));
         }

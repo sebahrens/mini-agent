@@ -850,24 +850,28 @@ pub struct GoalArgs {
 
     #[arg(
         long = "goal-done",
+        requires = "goal",
         help = "Completion criterion for the goal (repeatable)"
     )]
     pub goal_done: Vec<String>,
 
     #[arg(
         long = "goal-check",
+        requires = "goal",
         help = "Command that must exit zero before the goal may be reported complete (repeatable)"
     )]
     pub goal_check: Vec<String>,
 
     #[arg(
         long = "goal-max-rounds",
+        requires = "goal",
         help = "Maximum goal rounds before wrapping up [default: 50]"
     )]
     pub goal_max_rounds: Option<u32>,
 
     #[arg(
         long = "goal-continuation",
+        requires = "goal",
         value_parser = ["continue", "restart"],
         help = "Whether each goal round keeps the conversation or starts fresh"
     )]
@@ -1274,6 +1278,61 @@ mod tests {
         let json = Cli::try_parse_from(["mini-agent", "-p", "--output", "json", "hello"]).unwrap();
         assert_eq!(json.output_format(), OutputFormat::Json);
         assert!(json.is_headless());
+    }
+
+    /// Every goal flag parses, and the ones that only make sense alongside an
+    /// objective say so rather than being accepted and quietly dropped.
+    #[cfg(feature = "goal")]
+    #[test]
+    fn goal_flags_parse_and_the_dependent_ones_require_an_objective() {
+        let cli = Cli::try_parse_from([
+            "mini-agent",
+            "--goal",
+            "ship the parser",
+            "--goal-done",
+            "tests pass",
+            "--goal-done",
+            "docs updated",
+            "--goal-check",
+            "cargo test",
+            "--goal-max-rounds",
+            "12",
+            "--goal-continuation",
+            "restart",
+            "--goal-replace",
+        ])
+        .expect("the full goal flag set parses");
+        assert_eq!(cli.goal_args.goal.as_deref(), Some("ship the parser"));
+        assert_eq!(cli.goal_args.goal_done, ["tests pass", "docs updated"]);
+        assert_eq!(cli.goal_args.goal_check, ["cargo test"]);
+        assert_eq!(cli.goal_args.goal_max_rounds, Some(12));
+        assert_eq!(cli.goal_args.goal_continuation.as_deref(), Some("restart"));
+        assert!(cli.goal_args.goal_replace);
+
+        for orphan in [
+            vec!["--goal-done", "tests pass"],
+            vec!["--goal-check", "cargo test"],
+            vec!["--goal-max-rounds", "12"],
+            vec!["--goal-continuation", "restart"],
+        ] {
+            let args = std::iter::once("mini-agent").chain(orphan.iter().copied());
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "{orphan:?} without --goal must be refused, not ignored"
+            );
+        }
+
+        // Only the documented modes; a typo must not silently mean "continue".
+        assert!(
+            Cli::try_parse_from([
+                "mini-agent",
+                "--goal",
+                "x",
+                "--goal-continuation",
+                "teleport"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -62,12 +62,22 @@ pub(crate) async fn run_headless_loop(
         &plan_file,
         cli.loop_max,
         cli.loop_run.as_deref(),
+        crate::extras::goal::GoalDefaults {
+            cfg,
+            provider: &session.provider,
+            model: &session.model,
+        },
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // A resumed session may already hold an unfinished goal. Replacing it is
+    // the same decision `--goal` makes the operator state explicitly, so the
+    // same flag governs it here.
     session
         .goal_store
-        .set(preset.goal, true)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        .set(preset.goal, cli.goal_args.goal_replace)
+        .map_err(|error| {
+            anyhow::anyhow!("{error} (or pass --goal-replace to start the loop anyway)")
+        })?;
 
     let mut saved_session = session.clone();
     if let Some(ss) = status_signals.as_ref() {
@@ -99,11 +109,17 @@ mod tests {
     /// there.
     #[test]
     fn a_loop_preset_starts_each_iteration_from_a_clean_conversation() {
+        let cfg = crate::config::Config::default();
         let preset = crate::extras::goal::preset::loop_goal(
             "keep going",
             std::path::Path::new("LOOP_PLAN.md"),
             Some(3),
             Some("cargo test"),
+            crate::extras::goal::GoalDefaults {
+                cfg: &cfg,
+                provider: "openrouter",
+                model: "big",
+            },
         )
         .expect("valid preset");
         assert!(matches!(

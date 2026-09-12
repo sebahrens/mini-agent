@@ -393,8 +393,11 @@ impl GoalBounds {
         if let Some(v) = goal.blocked_rounds {
             self.blocked_rounds = v.clamp(1, 100);
         }
+        // Zero is meaningful here: it makes the bound exact, which is what
+        // `--loop-max N` has always meant. Clamping it up to one would add a
+        // wind-down round nobody asked for.
         if let Some(v) = goal.wrap_up_max_agent_turns {
-            self.wrap_up_max_agent_turns = v.clamp(1, 100);
+            self.wrap_up_max_agent_turns = v.min(100);
         }
         if let Some(v) = goal.reinject_every {
             self.reinject_every = v.min(1_000);
@@ -548,7 +551,57 @@ pub struct Goal {
     pub updated_at: CompactString,
 }
 
+/// Where a new goal takes its defaults from.
+///
+/// Bundled rather than passed as three arguments because the three always
+/// travel together, and because every surface that starts a goal has to supply
+/// all of them for the goal to mean the same thing everywhere.
+#[derive(Clone, Copy)]
+pub struct GoalDefaults<'a> {
+    pub cfg: &'a crate::config::Config,
+    /// The session's provider, for resolving a judge that names no provider.
+    pub provider: &'a str,
+    /// The session's model, which an `auto` judge falls back to.
+    pub model: &'a str,
+}
+
 impl Goal {
+    /// Build a goal carrying everything this installation configured.
+    ///
+    /// Every surface that starts a goal comes through here, so a `[goal]`
+    /// bound, a project's `goal_checks`, and the configured judge mean the
+    /// same thing whether the objective arrived from `--goal`, from `/goal`,
+    /// from `/loop`, or from an editor's `_meta.goal`. A surface that also has
+    /// flags applies them *after* this, so a flag typed at the prompt always
+    /// wins over the file it overrides.
+    pub fn configured(
+        objective: impl Into<String>,
+        criteria: Vec<String>,
+        defaults: GoalDefaults<'_>,
+    ) -> Result<Self, GoalError> {
+        let mut goal = Self::new(objective, criteria)?;
+        goal.apply_config(defaults);
+        Ok(goal)
+    }
+
+    /// Fold this installation's goal configuration onto an existing goal.
+    ///
+    /// Checks are appended rather than replaced: configuration is the floor a
+    /// project requires, and a surface may add to it but never quietly drop it.
+    pub fn apply_config(&mut self, defaults: GoalDefaults<'_>) {
+        let GoalDefaults {
+            cfg,
+            provider,
+            model,
+        } = defaults;
+        self.bounds.apply_config(cfg);
+        self.judge = cfg.resolve_goal_judge();
+        self.resolved_judge = judge::resolve(&self.judge, cfg, provider, model);
+        for command in cfg.goal_checks.iter().flatten() {
+            self.checks.push(GoalCheck::new(command.as_str()));
+        }
+    }
+
     /// Build a goal, validating the caps that keep the preamble bounded.
     pub fn new(objective: impl Into<String>, criteria: Vec<String>) -> Result<Self, GoalError> {
         let objective = objective.into();
@@ -1270,6 +1323,63 @@ mod tests {
                 .judge_failures,
             0
         );
+    }
+
+    /// One factory, so a goal means the same thing on every surface.
+    ///
+    /// `/goal`, `--goal`, `/loop` and an editor's `_meta.goal` all come
+    /// through here: a project that requires a check, or an installation that
+    /// sets a bound, must not find that half its surfaces ignore it.
+    #[test]
+    fn a_configured_goal_carries_the_installations_bounds_checks_and_judge() {
+        let cfg = crate::config::Config {
+            goal_checks: Some(vec!["cargo test".into()]),
+            goal: Some(Box::new(crate::config::types::GoalConfig {
+                max_rounds: Some(9),
+                judge: Some("off".to_string()),
+                check_every_round: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let goal = Goal::configured(
+            "ship it",
+            Vec::new(),
+            GoalDefaults {
+                cfg: &cfg,
+                provider: "openrouter",
+                model: "big",
+            },
+        )
+        .expect("valid goal");
+
+        assert_eq!(goal.bounds.max_rounds, 9);
+        assert!(goal.bounds.check_every_round);
+        assert_eq!(goal.judge, JudgePolicy::Off);
+        assert_eq!(
+            goal.checks
+                .iter()
+                .map(|c| c.command.as_str())
+                .collect::<Vec<_>>(),
+            ["cargo test"],
+            "a project's required check reaches every surface"
+        );
+    }
+
+    /// A wrap-up budget of zero is a real choice: it makes a bound exact.
+    /// Clamping it up to one would add a wind-down round nobody asked for.
+    #[test]
+    fn a_zero_wrap_up_budget_survives_configuration() {
+        let cfg = crate::config::Config {
+            goal: Some(Box::new(crate::config::types::GoalConfig {
+                wrap_up_max_agent_turns: Some(0),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut bounds = GoalBounds::default();
+        bounds.apply_config(&cfg);
+        assert_eq!(bounds.wrap_up_max_agent_turns, 0);
     }
 
     #[test]
