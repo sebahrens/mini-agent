@@ -292,6 +292,15 @@ pub enum JudgePolicy {
     Off,
 }
 
+/// Default for [`ResolvedJudge::same_provider_as_session`].
+///
+/// A record written before judges could live on another provider described one
+/// that necessarily did not, so reading it back must say so.
+#[cfg(feature = "goal")]
+fn yes() -> bool {
+    true
+}
+
 /// The model [`JudgePolicy::Auto`] actually selected, recorded so the choice is
 /// visible and auditable rather than implicit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +309,10 @@ pub struct ResolvedJudge {
     pub label: CompactString,
     pub provider: CompactString,
     pub model: CompactString,
+    /// True when the judge lives on the session's own provider, so the
+    /// session's client can reach it. A judge elsewhere needs its own.
+    #[serde(default = "yes")]
+    pub same_provider_as_session: bool,
     /// True when the judge is the agent's own model, which the UI labels so a
     /// same-model verdict is never mistaken for an independent one.
     #[serde(default)]
@@ -1388,6 +1401,7 @@ mod tests {
             label: "session".into(),
             provider: "openai".into(),
             model: "gpt-x".into(),
+            same_provider_as_session: true,
             same_as_session: true,
         };
         assert!(same.describe().contains("session model"));
@@ -1397,6 +1411,7 @@ mod tests {
             label: "goal_judge".into(),
             provider: "anthropic".into(),
             model: "small".into(),
+            same_provider_as_session: false,
             same_as_session: false,
         };
         assert_eq!(distinct.describe(), "goal_judge (anthropic/small)");

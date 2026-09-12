@@ -307,10 +307,42 @@ pub fn decision_line(goal: &Goal, decision: &GateDecision) -> String {
         }
         GateDecision::Continue { .. } => format!("goal: not yet (round {round}) — {reason}"),
         GateDecision::Stop { status, .. } => match status {
-            GoalStatus::Met => format!("goal: met after {round} round(s) — {reason}"),
+            GoalStatus::Met => {
+                format!(
+                    "goal: met after {round} round(s) — {reason}{}",
+                    met_caveat(goal)
+                )
+            }
             GoalStatus::Active => format!("goal: {reason}"),
             other => format!("goal: {} — {reason}", other.label()),
         },
+    }
+}
+
+/// What a completion rests on, when it does not rest on a command.
+///
+/// Every surface prints this line, so this is where a completion nothing
+/// proved gets said out loud rather than reading exactly like one a test
+/// suite confirmed. A judge that is the agent's own model is named too: a
+/// second opinion from the model that just did the work is a weaker thing
+/// than a second opinion, and the reader is owed the difference.
+fn met_caveat(goal: &Goal) -> String {
+    if !goal.met_unverified() {
+        return String::new();
+    }
+    let same_model_judge = goal
+        .last_verdict
+        .as_ref()
+        .is_some_and(|verdict| verdict.evidence.contains(&super::VerificationKind::Judge))
+        && goal
+            .resolved_judge
+            .as_ref()
+            .is_some_and(|resolved| resolved.same_as_session);
+    if same_model_judge {
+        " (self-reported: no command proved it, and the judge was the agent's own model)"
+            .to_string()
+    } else {
+        " (self-reported: no command proved it)".to_string()
     }
 }
 

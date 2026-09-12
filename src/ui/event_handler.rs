@@ -593,7 +593,6 @@ async fn start_goal_verification(
     );
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let client = ui.client.clone();
-    let retry = ui.cfg.retry.clone();
 
     run.goal_gate_generation = run
         .goal_gate_generation
@@ -606,15 +605,19 @@ async fn start_goal_verification(
     let pending_request = request.clone();
     let task = tokio::spawn(async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, &sandbox, &cfg).await;
+        // A failing check already decides the claim, and the gate returns
+        // before it looks at the judge: asking anyway spends a model call on
+        // an answer nobody reads.
+        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
-            Some(resolved) if request.run_judge => Some(
+            Some(resolved) if request.run_judge && !checks_rejected => Some(
                 crate::extras::goal::judge::ask_with_transcript(
                     &goal,
                     &request,
                     &resolved,
                     &client,
                     &transcript,
-                    &retry,
+                    &cfg,
                 )
                 .await,
             ),

@@ -48,6 +48,14 @@ struct CheckRecord {
 struct JudgeRecord {
     outcome: &'static str,
     reason: String,
+    /// Which model answered, and whether it was the agent's own. A second
+    /// opinion from the model that just did the work is weaker than one from a
+    /// distinct model, so the record says which it was rather than leaving a
+    /// reader to assume the stronger reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    same_model_as_agent: bool,
 }
 
 fn clip(text: &str) -> String {
@@ -76,7 +84,38 @@ pub fn save_round(
         return;
     };
 
-    let record = RoundRecord {
+    let record = build_record(goal, summary, decision, instruction, checks, judge);
+
+    let dir = paths.goals_dir().join(goal.id.as_str());
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(%error, "goal: could not create the transcript directory");
+        return;
+    }
+    let path = dir.join(format!("round-{:04}.json", goal.progress.rounds));
+    match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => {
+            if let Err(error) = crate::fs::private_atomic_write_sync(&path, &bytes) {
+                tracing::warn!(%error, "goal: could not write the round transcript");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "goal: could not serialize the round transcript"),
+    }
+}
+
+/// Assemble the record for one gate evaluation.
+///
+/// Split from the write so the shape can be asserted without a filesystem, and
+/// so the tests that do assert it are looking at the very record that gets
+/// written rather than a second one built to match.
+fn build_record<'a>(
+    goal: &'a Goal,
+    summary: &'a RoundSummary,
+    decision: &GateDecision,
+    instruction: &str,
+    checks: Option<&CheckOutcome>,
+    judge: Option<&JudgeOutcome>,
+) -> RoundRecord<'a> {
+    RoundRecord {
         round: goal.progress.rounds,
         timestamp: chrono::Utc::now().to_rfc3339(),
         goal_id: goal.id.as_str(),
@@ -95,19 +134,33 @@ pub fn save_round(
             all_passed: outcome.all_passed,
             failure_tail: outcome.failure_tail.as_deref().map(clip),
         }),
-        judge: judge.map(|outcome| match outcome {
-            JudgeOutcome::Verdict { outcome, reason } => JudgeRecord {
-                outcome: match outcome {
-                    super::Outcome::Met => "met",
-                    super::Outcome::NotYet => "not_yet",
-                    super::Outcome::Impossible => "impossible",
+        judge: judge.map(|outcome| {
+            let model = goal
+                .resolved_judge
+                .as_ref()
+                .map(|resolved| resolved.describe());
+            let same_model_as_agent = goal
+                .resolved_judge
+                .as_ref()
+                .is_some_and(|resolved| resolved.same_as_session);
+            match outcome {
+                JudgeOutcome::Verdict { outcome, reason } => JudgeRecord {
+                    outcome: match outcome {
+                        super::Outcome::Met => "met",
+                        super::Outcome::NotYet => "not_yet",
+                        super::Outcome::Impossible => "impossible",
+                    },
+                    reason: clip(reason),
+                    model,
+                    same_model_as_agent,
                 },
-                reason: clip(reason),
-            },
-            JudgeOutcome::Unavailable { reason } => JudgeRecord {
-                outcome: "unavailable",
-                reason: clip(reason),
-            },
+                JudgeOutcome::Unavailable { reason } => JudgeRecord {
+                    outcome: "unavailable",
+                    reason: clip(reason),
+                    model,
+                    same_model_as_agent,
+                },
+            }
         }),
         evidence: goal
             .last_verdict
@@ -125,21 +178,6 @@ pub fn save_round(
                     .collect()
             })
             .unwrap_or_default(),
-    };
-
-    let dir = paths.goals_dir().join(goal.id.as_str());
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(%error, "goal: could not create the transcript directory");
-        return;
-    }
-    let path = dir.join(format!("round-{:04}.json", goal.progress.rounds));
-    match serde_json::to_vec_pretty(&record) {
-        Ok(bytes) => {
-            if let Err(error) = crate::fs::private_atomic_write_sync(&path, &bytes) {
-                tracing::warn!(%error, "goal: could not write the round transcript");
-            }
-        }
-        Err(error) => tracing::warn!(%error, "goal: could not serialize the round transcript"),
     }
 }
 
@@ -187,9 +225,9 @@ mod tests {
         }
     }
 
-    /// The record is serialized without touching the filesystem so the shape is
-    /// asserted directly; the write path is a `create_dir_all` plus an atomic
-    /// write and is exercised by the real-binary scenario.
+    /// Render the very record `save_round` writes, without touching the
+    /// filesystem. The write itself is a `create_dir_all` plus an atomic write
+    /// and is exercised by the real-binary scenario.
     fn render(goal: &Goal, checks: Option<&CheckOutcome>, judge: Option<&JudgeOutcome>) -> String {
         let summary = summary();
         let decision = GateDecision::Stop {
@@ -197,39 +235,9 @@ mod tests {
             reason: "cargo test passed".into(),
             paused_reason: None,
             source: VerdictSource::Checks,
-            evidence: vec![VerificationKind::Checks],
+            evidence: vec![VerificationKind::SelfReport, VerificationKind::Checks],
         };
-        let record = RoundRecord {
-            round: goal.progress.rounds,
-            timestamp: "now".into(),
-            goal_id: goal.id.as_str(),
-            instruction_sha256: crate::hex::encode_lower(Sha256::digest(b"instruction")),
-            status_after: goal.status.label(),
-            decision: "stop",
-            reason: clip(decision.reason()),
-            tool_calls: summary.tool_calls,
-            mutating_tool_calls: summary.mutating_tool_calls,
-            report: summary.report.as_ref(),
-            checks: checks.map(|o| CheckRecord {
-                all_passed: o.all_passed,
-                failure_tail: o.failure_tail.as_deref().map(clip),
-            }),
-            judge: judge.map(|o| match o {
-                JudgeOutcome::Verdict { outcome, reason } => JudgeRecord {
-                    outcome: match outcome {
-                        Outcome::Met => "met",
-                        Outcome::NotYet => "not_yet",
-                        Outcome::Impossible => "impossible",
-                    },
-                    reason: clip(reason),
-                },
-                JudgeOutcome::Unavailable { reason } => JudgeRecord {
-                    outcome: "unavailable",
-                    reason: clip(reason),
-                },
-            }),
-            evidence: vec!["self_report", "checks"],
-        };
+        let record = build_record(goal, &summary, &decision, "instruction", checks, judge);
         serde_json::to_string_pretty(&record).unwrap()
     }
 

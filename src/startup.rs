@@ -2020,18 +2020,14 @@ async fn run_headless_goal_rounds(
                 &session.provider,
                 &session.model,
             );
-            // With --no-session the session carries nothing, so the round's
-            // own record is the only account of what happened.
-            let transcript = {
-                let from_session = crate::extras::goal::judge::transcript_tail(session);
-                if from_session.trim().is_empty() {
-                    crate::extras::goal::judge::transcript_from_interactions(&turn.interactions)
-                } else {
-                    from_session
-                }
-            };
+            // The round that just ran is persisted after the gate settles, so
+            // the session does not contain it yet and the judge would be shown
+            // every round except the one it was asked about. The turn's own
+            // record fills that gap, here and under --no-session alike.
+            let transcript =
+                crate::extras::goal::judge::transcript_for_round(session, &turn.interactions);
             let client_for_judge = client.clone();
-            let retry = cfg.retry.clone();
+            let cfg_for_judge = cfg.clone();
             // An interrupt during verification ends the goal rather than
             // feeding a cancelled command back to the agent as a failure it
             // should fix. The flag survives the closure so the loop can stop.
@@ -2053,15 +2049,21 @@ async fn run_headless_goal_rounds(
                     if interrupted {
                         interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // A failing check already decides the claim, and the
+                    // gate returns before it looks at the judge. Asking
+                    // anyway would spend a model call on an answer nobody
+                    // reads, and a transport failure there would count
+                    // against the judge's own failure ladder.
+                    let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
                     let judged = match judge {
-                        Some(resolved) if request.run_judge => Some(
+                        Some(resolved) if request.run_judge && !checks_rejected => Some(
                             crate::extras::goal::judge::ask_with_transcript(
                                 &goal_for_checks,
                                 &request,
                                 &resolved,
                                 &client_for_judge,
                                 &transcript,
-                                &retry,
+                                &cfg_for_judge,
                             )
                             .await,
                         ),
