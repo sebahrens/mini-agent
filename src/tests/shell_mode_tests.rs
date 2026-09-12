@@ -482,6 +482,24 @@ fn lazygit_style_caller_drop_audits_cleanup_and_allows_the_next_launch() {
             assert_eq!(next.status, CommandStatus::Completed);
             assert!(next.exit_status.is_some_and(|status| status.success()));
             let _ = std::fs::remove_file(started);
+
+            // Wait for the cancelled utility's audit line here, inside the
+            // runtime and inside the subscriber's scope.
+            //
+            // The worker that emits it is a separate task: it disarms its
+            // process-group guard, which is what `active_group_count` watches,
+            // and only then emits. So observing zero groups does not mean the
+            // record has been written. Asserting after this closure returns
+            // also uninstalls the subscriber, and a line emitted a moment later
+            // would then be lost rather than late — which is a test that fails
+            // for a reason the failure cannot show.
+            wait_until_named("the cancelled utility's audit record", || {
+                let captured = logs.lock().unwrap();
+                let captured = String::from_utf8_lossy(&captured);
+                captured.contains("lazygit-caller-drop-test")
+                    && captured.contains("support utility ended after process cleanup")
+            })
+            .await;
         });
     });
 
