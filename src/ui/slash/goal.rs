@@ -2,11 +2,11 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Surfaces).
 
-use crate::extras::goal::{Goal, GoalStatus};
+use crate::extras::goal::{Goal, GoalStatus, PauseReason};
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 const USAGE: &str = "usage: /goal <objective>  |  /goal status | pause | resume | reopen | clear \
-| bounds <key>=<value>";
+| bounds <key>=<value> | check <command>";
 
 /// Split a `/goal` body into its objective and any `done when:` criteria.
 ///
@@ -179,34 +179,49 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
     let store = ctx.session.goal_store.clone();
     let subcommand = parts.get(1).copied().unwrap_or("status");
 
+    // The verbs that take no argument only match when none was given.
+    // Otherwise `/goal clear the cache` deletes the goal instead of setting
+    // one, and `/goal pause the deploy` parks it: an objective that happens to
+    // start with a command word is still an objective.
+    let bare = parts.len() <= 2;
+
     match subcommand {
-        "status" if parts.len() <= 2 => match store.snapshot() {
+        "status" if bare => match store.snapshot() {
             Some(goal) => write_result(ctx.renderer, render_status(&goal)),
             None => write_result(ctx.renderer, "no goal set — /goal <objective> to set one"),
         },
-        "clear" => match store.clear() {
+        "clear" if bare => match store.clear() {
             Some(goal) => {
                 write_ok(ctx.renderer, format!("goal cleared: {}", goal.objective));
                 ctx.rebuild_agent().await;
             }
             None => write_result(ctx.renderer, "no goal to clear"),
         },
-        "pause" => {
+        "pause" if bare => {
             let changed = store.with_mut(|goal| {
-                goal.set_status(GoalStatus::Paused, None);
-                goal.status
+                (
+                    goal.set_status(GoalStatus::Paused, Some(PauseReason::UserRequested)),
+                    goal.status,
+                )
             });
             match changed {
-                Some(status) => write_ok(ctx.renderer, format!("goal {}", status.label())),
+                Some((true, status)) => write_ok(ctx.renderer, format!("goal {}", status.label())),
+                Some((false, status)) => write_error(
+                    ctx.renderer,
+                    format!(
+                        "the goal is already {}; it cannot be paused",
+                        status.label()
+                    ),
+                ),
                 None => write_error(ctx.renderer, "no goal to pause"),
             }
         }
-        "resume" => match store.with_mut(Goal::resume) {
+        "resume" if bare => match store.with_mut(Goal::resume) {
             Some(true) => write_ok(ctx.renderer, "goal resumed"),
             Some(false) => write_error(ctx.renderer, "a finished goal cannot resume; /goal reopen"),
             None => write_error(ctx.renderer, "no goal to resume"),
         },
-        "reopen" => match store.with_mut(Goal::reopen) {
+        "reopen" if bare => match store.with_mut(Goal::reopen) {
             Some(true) => {
                 write_ok(ctx.renderer, "goal reopened");
                 ctx.rebuild_agent().await;
@@ -222,7 +237,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
             let mut applied = Vec::new();
             let mut failed = Vec::new();
             store.with_mut(|goal| {
-                for assignment in &parts[2..] {
+                for assignment in parts[2..].iter().flat_map(|rest| rest.split_whitespace()) {
                     match parse_bound(goal, assignment) {
                         Ok(message) => applied.push(message),
                         Err(message) => failed.push(message),
@@ -321,6 +336,46 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An objective that happens to start with a command word is still an
+    /// objective. Before this, `/goal clear the cache` deleted the goal and
+    /// `/goal pause the deploy` parked it, which is the opposite of what was
+    /// typed and destroys the record of the work in the process.
+    #[test]
+    fn a_bare_verb_is_a_command_and_anything_after_it_is_an_objective() {
+        for verb in ["status", "clear", "pause", "resume", "reopen"] {
+            let bare = format!("/goal {verb}");
+            assert!(
+                bare.splitn(3, ' ').count() <= 2,
+                "`/goal {verb}` alone is the command form"
+            );
+
+            let with_text = format!("/goal {verb} the deploy pipeline");
+            assert!(
+                with_text.splitn(3, ' ').count() > 2,
+                "`/goal {verb} ...` carries an objective and must not be the command form"
+            );
+        }
+    }
+
+    /// `/goal bounds` was documented as taking assignments, plural, but the
+    /// command line is split into at most three pieces, so the whole tail
+    /// arrived as one string and the second assignment was read as part of the
+    /// first value.
+    #[test]
+    fn several_bounds_can_be_set_at_once() {
+        let mut goal = Goal::new("ship it", Vec::new()).expect("valid goal");
+        let tail = "max_rounds=5 no_progress_rounds=2";
+
+        for assignment in tail.split_whitespace() {
+            parse_bound(&mut goal, assignment).expect("each assignment parses on its own");
+        }
+        assert_eq!(goal.bounds.max_rounds, 5);
+        assert_eq!(goal.bounds.no_progress_rounds, 2);
+
+        // Read as one string it is neither.
+        assert!(parse_bound(&mut goal, tail).is_err());
+    }
 
     #[test]
     fn criteria_are_parsed_from_a_done_when_section() {

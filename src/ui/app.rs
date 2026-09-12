@@ -1793,13 +1793,33 @@ impl<'a> App<'a> {
         let failed_prompt = (!preserve_progress)
             .then(|| rollback_pending_main_turn(&mut self.run, self.ui.session))
             .flatten();
-        // An interrupt parks the goal rather than discarding it: the user can
-        // resume, and the objective is the record of what was being attempted.
+        // An interrupt is not the agent's verdict on anything, so the round it
+        // stopped is settled through the gate's own interrupt row: the goal is
+        // left exactly as it was, uncounted, ready to resume. Writing a status
+        // here instead would park it with no reason to show the user, and
+        // would disagree with what the headless and editor surfaces do with
+        // the same signal.
+        //
+        // The round's collector goes with it. A collector left behind is
+        // adopted by the next ordinary turn, which then inherits this round's
+        // tool counts and a clock that has been running since the interrupt —
+        // so a stretch of idle time lands in the goal's time budget.
         #[cfg(feature = "goal")]
-        if self.ui.session.goal_store.is_active() {
-            self.ui.session.goal_store.with_mut(|goal| {
-                goal.set_status(crate::extras::goal::GoalStatus::Paused, None);
-            });
+        if let Some(collector) = self.run.goal_round.take()
+            && let Some(goal) = self.ui.session.goal_store.snapshot()
+            && !goal.status.is_terminal()
+        {
+            let summary =
+                collector.finish(&goal, crate::extras::goal::gate::RoundEnd::Cancelled, 0);
+            let outcome = crate::extras::goal::driver::apply_decision(
+                &self.ui.session.goal_store,
+                &summary,
+                crate::extras::goal::gate::gate_interrupted(),
+                &crate::extras::goal::driver::Verification::default(),
+            );
+            if let crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } = outcome {
+                let _ = self.renderer.write_line(&line, C_AGENT);
+            }
             self.chain.loop_label = None;
         }
         if !self.input.buffer.is_empty() {

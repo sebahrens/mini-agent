@@ -698,7 +698,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         // itself and deliberately ignores `--tools` (see
         // `filter_tools_by_allowlist`).
         #[cfg(feature = "goal")]
-        if goal_store.is_live() {
+        // A parked goal is not being advanced, so there is nothing for the
+        // model to report against; offering the tool would let a claim filed
+        // during ordinary chat speak for a round that has not started.
+        if goal_store.is_active() {
             base_tools.push(Box::new(crate::extras::goal::report_tool::GoalReport::new(
                 goal_store.clone(),
             )));

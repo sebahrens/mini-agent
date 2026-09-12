@@ -318,6 +318,22 @@ fn bound_decision(goal: &Goal, round: &RoundSummary) -> GateDecision {
     }
 }
 
+/// Row 1, as a value.
+///
+/// An interrupt is not the agent's verdict on anything: the goal is left
+/// exactly as it was, uncounted, ready to resume. A surface that knows a round
+/// was interrupted without assembling one can settle it with this and get the
+/// same answer `gate_pre` would give.
+pub fn gate_interrupted() -> GateDecision {
+    GateDecision::Stop {
+        status: GoalStatus::Active,
+        reason: "interrupted".into(),
+        paused_reason: None,
+        source: VerdictSource::Runtime,
+        evidence: Vec::new(),
+    }
+}
+
 /// First phase: decide everything that needs no command or model call.
 pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     let bounds = &goal.bounds;
@@ -325,13 +341,7 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
 
     // Row 1. An interrupted round is not the agent's verdict on anything.
     if round.end == RoundEnd::Cancelled {
-        return Step::Decided(GateDecision::Stop {
-            status: GoalStatus::Active,
-            reason: "interrupted".into(),
-            paused_reason: None,
-            source: VerdictSource::Runtime,
-            evidence: Vec::new(),
-        });
+        return Step::Decided(gate_interrupted());
     }
 
     // Rows 2 to 4. A failed run gets retried; repeated failure parks the goal
@@ -825,7 +835,15 @@ pub fn apply(
 ) {
     // An interrupted round is not counted at all: nothing about it reflects on
     // the goal's progress.
+    //
+    // Its reports go with it. A report filed just before the interrupt carries
+    // this round's number, and the round number does not advance — so the
+    // attempt that replaces it would inherit a claim made about the attempt
+    // that was stopped, and a `met` or a `needs_user` filed seconds before a
+    // Ctrl-C would decide a round that filed nothing.
     if round.end == RoundEnd::Cancelled {
+        let interrupted = goal.progress.current_round();
+        goal.reports.retain(|report| report.round != interrupted);
         goal.touch();
         return;
     }
@@ -979,6 +997,32 @@ mod tests {
         assert_eq!(
             g.progress.rounds, 0,
             "an interrupt does not consume a round"
+        );
+        assert_eq!(g.status, GoalStatus::Active);
+    }
+
+    /// A report filed just before an interrupt spoke for the attempt that was
+    /// stopped. The attempt that replaces it reuses the round number, so the
+    /// claim has to go with the round it belonged to.
+    #[test]
+    fn an_interrupted_rounds_report_does_not_speak_for_the_next_attempt() {
+        let mut g = goal();
+        g.push_report(report(ReportStatus::Met));
+        assert_eq!(g.reports_in_round(1).count(), 1);
+
+        let interrupted = RoundSummary {
+            end: RoundEnd::Cancelled,
+            report: Some(report(ReportStatus::Met)),
+            ..worked()
+        };
+        let decision = decided(&g, &interrupted);
+        apply(&mut g, &interrupted, &decision, None, None);
+
+        assert_eq!(g.progress.rounds, 0, "the round is uncounted");
+        assert_eq!(
+            g.reports_in_round(1).count(),
+            0,
+            "and its claim does not survive to decide the next attempt"
         );
         assert_eq!(g.status, GoalStatus::Active);
     }

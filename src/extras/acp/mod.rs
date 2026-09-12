@@ -1607,7 +1607,9 @@ async fn settle_acp_goal_round(
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
 
-    let goal = store.snapshot().filter(|g| !g.status.is_terminal())?;
+    // Only a running goal is having rounds run for it; an ordinary prompt
+    // while one is parked for the user is not a round of it.
+    let goal = store.snapshot().filter(|g| g.status.is_running())?;
     let open_todos = todos
         .iter()
         .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))

@@ -1560,10 +1560,11 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/ui/slash/goal.rs",
-        "Some(status) => write_ok(ctx.renderer, format!(\"goal {}\", status.label())),",
+        "Some((true, status)) => write_ok(ctx.renderer, format!(\"goal {}\", status.label())),",
         1,
         "NON-PROCESS",
     ),
+    ("src/ui/slash/goal.rs", "status.label()", 1, "NON-PROCESS"),
     (
         "src/extras/subagents/task_tool.rs",
         "output: Ok(\"first result\".into()),",
@@ -2540,10 +2541,16 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     ),
     (
         "src/ui/slash/goal.rs",
-        &[(
-            "d478ccc3c3b6804387a50239b4aaa9b27cd77e842bdfe3ff83d27ecaa182cc5d",
-            1,
-        )],
+        &[
+            (
+                "9d89a11800afded3a584c81d94dc1d867961f62af82e5e1ad5019accf7e6cc48",
+                1,
+            ),
+            (
+                "d478ccc3c3b6804387a50239b4aaa9b27cd77e842bdfe3ff83d27ecaa182cc5d",
+                1,
+            ),
+        ],
     ),
     (
         "src/startup.rs",

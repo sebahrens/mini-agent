@@ -189,9 +189,13 @@ impl Tool for GoalReport {
                 "no goal is active; goal_report has nothing to report against".into(),
             ));
         };
-        if goal.status.is_terminal() {
+        // Only a running goal has a round to report against. A parked one is
+        // waiting on the user, and a report filed while it waits would be
+        // picked up as the first resumed round's account of itself — a claim
+        // about work that has not happened yet.
+        if !goal.status.is_running() {
             return Err(ToolError::Msg(format!(
-                "the goal is already {}; goal_report is not accepted",
+                "the goal is {}; goal_report is not accepted until it is running again",
                 goal.status.label()
             )));
         }
@@ -362,8 +366,13 @@ mod tests {
         assert!(err.to_string().contains(&MAX_EVIDENCE_CHARS.to_string()));
     }
 
+    /// A report only ever speaks for the round being judged, so there has to
+    /// be one: no goal, a finished goal, and a goal parked for the user are
+    /// all refused. The parked case matters most — a claim filed during
+    /// ordinary chat would otherwise be picked up as the first resumed round's
+    /// account of work that has not happened yet.
     #[tokio::test]
-    async fn reporting_without_a_goal_or_against_a_finished_one_is_refused() {
+    async fn reporting_is_refused_unless_a_round_is_running() {
         let empty = GoalReport::new(GoalStore::default());
         assert!(
             empty
@@ -374,16 +383,25 @@ mod tests {
                 .contains("no goal is active")
         );
 
-        let store = store_with_goal();
-        store.with_mut(|g| g.set_status(GoalStatus::Met, None));
-        let done = GoalReport::new(store);
-        assert!(
-            done.call(args("progress"))
+        for parked in [
+            GoalStatus::Met,
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::BudgetLimited,
+            GoalStatus::AwaitingUser,
+        ] {
+            let store = store_with_goal();
+            store.with_mut(|g| g.set_status(parked, None));
+            let refused = GoalReport::new(store)
+                .call(args("progress"))
                 .await
                 .unwrap_err()
-                .to_string()
-                .contains("already met")
-        );
+                .to_string();
+            assert!(
+                refused.contains(parked.label()),
+                "a {parked:?} goal says so when it refuses: {refused}"
+            );
+        }
     }
 
     /// The schema is the whole guarantee that the model cannot edit what it is

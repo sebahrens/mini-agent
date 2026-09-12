@@ -69,8 +69,13 @@ pub async fn handle_agent_event(
     // Every event contributes to the round the gate will judge, so the goal
     // sees the run exactly as it happened rather than as the final response
     // describes it.
+    // Only a running goal is having rounds run for it. A paused, blocked or
+    // budget-limited one is parked for the user, and an ordinary chat turn
+    // while it sits there is not a round of it: collecting one would spend its
+    // budget, print a gate line nobody asked for, and let a completion claim
+    // made in passing close it.
     #[cfg(feature = "goal")]
-    if ui.session.goal_store.is_live() {
+    if ui.session.goal_store.is_active() {
         run.goal_round
             .get_or_insert_with(crate::extras::goal::driver::RoundCollector::new)
             .observe(&event);
@@ -526,7 +531,7 @@ async fn run_goal_round(
         return Ok(false);
     };
     let goal = ui.session.goal_store.snapshot();
-    let Some(goal) = goal.filter(|g| !g.status.is_terminal()) else {
+    let Some(goal) = goal.filter(|g| g.status.is_running()) else {
         return Ok(false);
     };
 
@@ -724,10 +729,25 @@ async fn finish_goal_round(
         }
         RoundOutcome::Relaunch { relaunch, line } => {
             renderer.write_line(&line, C_AGENT)?;
-            if let Err(e) =
-                crate::ui::persist_session_if_settled(ui.session, !ui.cli.no_session, run)
-            {
-                renderer.write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?;
+            // Close the round that just ran and open the next one in the
+            // record: persist what happened, and write down the instruction
+            // the next round is about to be launched with.
+            match crate::ui::record_goal_round_boundary(
+                ui.session,
+                run,
+                !ui.cli.no_session,
+                &relaunch.prompt,
+            ) {
+                Ok(errors) => {
+                    for error in errors {
+                        renderer.write_line(
+                            &format!("warning: failed to append chat history entry: {error}"),
+                            C_ERROR,
+                        )?;
+                    }
+                }
+                Err(e) => renderer
+                    .write_line(&format!("warning: failed to save session: {e}"), C_ERROR)?,
             }
             let keep_recent = ui.cfg.resolve_keep_recent_tool_results();
             run.request_tool_results_cleared =

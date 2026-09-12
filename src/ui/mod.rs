@@ -471,11 +471,37 @@ pub(crate) enum SubmitAction {
 
 /// Commands that are safe to run *even while a main run is active* because they
 /// don't spawn or mutate the main run — the single "bypass" whitelist. Add
-/// future parallel-safe commands here. Currently: `/queue` (queue management)
-/// and `/btw` (isolated, tool-less side question on its own event stream).
+/// future parallel-safe commands here. Currently: `/queue` (queue management),
+/// `/btw` (isolated, tool-less side question on its own event stream), and the
+/// two read-or-park `/goal` verbs.
+///
+/// A goal relaunches back to back, so a run is active almost continuously for
+/// as long as the goal lasts. Without these, asking what the goal is doing or
+/// telling it to stop after this round would be unreachable for the entire
+/// life of the thing you most want to ask about, leaving Ctrl-C as the only
+/// control. Neither spawns anything: one reads the record, the other writes a
+/// status the driver checks before it relaunches.
 pub(crate) fn allowed_while_running(text: &str) -> bool {
     let t = text.trim_start();
-    t == "/queue" || t.starts_with("/queue ") || t == "/btw" || t.starts_with("/btw ")
+    t == "/queue"
+        || t.starts_with("/queue ")
+        || t == "/btw"
+        || t.starts_with("/btw ")
+        || goal_control_while_running(t)
+}
+
+/// `/goal status` and `/goal pause`, and only those two.
+#[cfg(feature = "goal")]
+fn goal_control_while_running(text: &str) -> bool {
+    matches!(
+        text.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["/goal", "status"] | ["/goal", "pause"] | ["/goal"]
+    )
+}
+
+#[cfg(not(feature = "goal"))]
+fn goal_control_while_running(_text: &str) -> bool {
+    false
 }
 
 /// Build the rewind picker's list of `(message_index, preview)` for every user
@@ -627,6 +653,17 @@ pub(crate) async fn start_main_run(
     slash: &SlashState,
     prebuild: &mut Option<prebuild::AgentPrebuild>,
 ) -> anyhow::Result<()> {
+    // A goal that asked the user a question is waiting, not finished. The
+    // answer is the thing it was waiting for, so typing one resumes it — the
+    // guide has always said so, and without this the user has to discover
+    // `/goal resume` to get the work moving again.
+    #[cfg(feature = "goal")]
+    ui.session.goal_store.with_mut(|goal| {
+        if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+            goal.resume();
+        }
+    });
+
     #[allow(unused_mut)]
     let mut pending_turn = PendingMainTurn::capture(ui.session, text);
     #[cfg(feature = "memory")]
@@ -685,6 +722,42 @@ pub(crate) async fn start_main_run(
         mark_main_turn_started(ui.session, run, pending_turn);
     }
     Ok(())
+}
+
+/// Close the goal round that just ran and open the next one in the record.
+///
+/// Two things have to happen at a round boundary, and both were missing.
+///
+/// The round that finished is a complete turn even though the conversation
+/// continues: the agent ran and the gate decided. Leaving its transaction open
+/// until the goal stops means a fifty-round goal writes nothing until round
+/// fifty, and a crash at round thirty loses all thirty — while
+/// `persist_session_if_settled` returns a silent `false` the whole way, because
+/// a turn is still pending.
+///
+/// The instruction the next round is launched with belongs in the record too.
+/// In `continue` mode that round's history is rebuilt from the session, so an
+/// instruction that never lands there is one the model never sees: the
+/// transcript becomes a run of assistant messages with no account of why any
+/// of them happened.
+///
+/// Returns any chat-history errors the caller should surface.
+#[cfg(feature = "goal")]
+pub(crate) fn record_goal_round_boundary(
+    session: &mut Session,
+    run: &mut AgentRunState,
+    persistence_enabled: bool,
+    next_prompt: &str,
+) -> Result<Vec<anyhow::Error>, anyhow::Error> {
+    let settled = match run.pending_turn.take() {
+        Some(pending) if persistence_enabled => {
+            crate::session::storage::save_session(session)?;
+            pending.commit_side_effects(true)
+        }
+        _ => Vec::new(),
+    };
+    mark_main_turn_started(session, run, PendingMainTurn::capture(session, next_prompt));
+    Ok(settled)
 }
 
 pub(crate) fn mark_main_turn_started(
@@ -1108,6 +1181,59 @@ pub(crate) async fn handle_human_handoff(
 
     let _ = req.reply.send(response);
     Ok(())
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_round_boundary_tests {
+    use super::*;
+
+    /// Every goal round is a turn in the record.
+    ///
+    /// The user's turn stays pending for the whole goal, so the ordinary
+    /// "persist once the turn settles" path returned false on every round and
+    /// nothing reached disk until the goal stopped. And the instruction each
+    /// round was launched with was never written down at all, so a `continue`
+    /// round rebuilt its history from the session and found a run of assistant
+    /// messages with no account of why any of them happened.
+    #[test]
+    fn a_round_boundary_settles_the_finished_turn_and_records_the_next_prompt() {
+        let mut session = Session::new("openrouter", "test", 128_000, "");
+        session.add_message(MessageRole::User, "start the work");
+        session.add_message(MessageRole::Assistant, "round one done");
+
+        let mut run = AgentRunState {
+            pending_turn: Some(PendingMainTurn::capture(&session, "start the work")),
+            ..AgentRunState::default()
+        };
+
+        // Persistence is off in this test, so the save is skipped; the record
+        // keeping either side of it is what this covers.
+        let errors = record_goal_round_boundary(
+            &mut session,
+            &mut run,
+            false,
+            "Verification failed, so the goal is not met yet:\ncargo test",
+        )
+        .expect("the boundary is recorded");
+        assert!(errors.is_empty());
+
+        assert!(
+            run.pending_turn.is_some(),
+            "the next round opens its own transaction, so its own failure rolls back"
+        );
+        assert_eq!(
+            run.pending_turn.as_ref().map(PendingMainTurn::prompt),
+            Some("Verification failed, so the goal is not met yet:\ncargo test"),
+        );
+
+        let last = session.messages.last().expect("a message was added");
+        assert_eq!(last.role, MessageRole::User);
+        assert!(
+            last.content.contains("Verification failed"),
+            "the gate's instruction is in the record the next round reads: {}",
+            last.content
+        );
+    }
 }
 
 #[cfg(all(test, feature = "advisor"))]
