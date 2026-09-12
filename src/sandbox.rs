@@ -3471,7 +3471,8 @@ async fn finish_pipe_readers(
 /// stops waiting. SIGKILL delivery converges in well under a millisecond, so
 /// this only has to cover scheduling delay on a loaded host; it exists at all
 /// because a member whose parent never reaps it must not stall cancellation.
-const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
@@ -3497,8 +3498,13 @@ async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
 /// Signal zero only observes the group, and succeeds while any member remains,
 /// including one that has exited but not yet been reaped by its parent. The
 /// bound therefore has to be real rather than a formality.
+///
+/// Shared with the hooks subprocess path, which terminates its own children
+/// and must report settlement on the same terms: signalling a group is not the
+/// same as the group being gone, and a caller that returns in between has
+/// answered while a descendant is still runnable.
 #[cfg(unix)]
-async fn await_drained_process_group(pid: u32, budget: std::time::Duration) {
+pub(crate) async fn await_drained_process_group(pid: u32, budget: std::time::Duration) {
     use nix::errno::Errno;
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;

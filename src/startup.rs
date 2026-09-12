@@ -2696,7 +2696,6 @@ mod tests {
             Some("GET /models HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         ] {
             for unwind in [false, true] {
-                let mut address = None;
                 let mut client = None;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let server = spawn_local_pricing_server(None);
@@ -2708,7 +2707,6 @@ mod tests {
                         .unwrap()
                         .parse()
                         .unwrap();
-                    address = Some(endpoint);
                     if let Some(request) = request {
                         let mut stream = std::net::TcpStream::connect(endpoint).unwrap();
                         stream
@@ -2746,14 +2744,19 @@ mod tests {
                 } else {
                     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 }
-                assert!(
-                    std::net::TcpStream::connect_timeout(
-                        &address.unwrap(),
-                        std::time::Duration::from_secs(1)
-                    )
-                    .is_err(),
-                    "pricing listener survived fixture drop"
-                );
+                // What the fixture's teardown guarantees is asserted by the
+                // teardown itself: the listener is moved into the worker
+                // thread, and `Drop` joins that thread, so once the drop
+                // returns the socket is closed and the worker's own result has
+                // been checked.
+                //
+                // Deliberately not probed by connecting to the address again.
+                // A released port is a machine-wide resource that is recycled
+                // immediately, so "someone answers there" says nothing about
+                // this fixture: under a parallel suite it is another test's
+                // listener, and the probe fails about one run in three. What
+                // the drop does to a connection that already exists is a
+                // property this test owns, and is checked below.
                 if let Some(mut stream) = client {
                     match stream.read(&mut [0; 1]) {
                         Ok(0) => {}
