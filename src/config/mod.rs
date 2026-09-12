@@ -530,8 +530,9 @@ impl Config {
     ///
     /// A `--loop` preset uses this to keep its historical shape: a loop has
     /// never called a second model, so it only does so when the installation
-    /// asked for one by name.
-    #[cfg(feature = "goal")]
+    /// asked for one by name. Gated with its only consumer; `loop` implies
+    /// `goal`, so a goal-only build has no preset to ask.
+    #[cfg(feature = "loop")]
     pub fn goal_judge_configured(&self) -> bool {
         self.goal_judge_model.is_some() || self.goal.as_ref().is_some_and(|g| g.judge.is_some())
     }
