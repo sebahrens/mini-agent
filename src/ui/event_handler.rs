@@ -547,7 +547,12 @@ async fn run_goal_round(
     match gate::gate_pre(&goal, &summary) {
         gate::Step::Decided(decision) => {
             Box::pin(finish_goal_round(
-                renderer, run, ui, summary, decision, None, None,
+                renderer,
+                run,
+                ui,
+                summary,
+                decision,
+                crate::extras::goal::driver::Verification::default(),
             ))
             .await
         }
@@ -674,8 +679,11 @@ pub(crate) async fn handle_goal_verification_event(
         ui,
         pending.summary,
         decision,
-        event.checks,
-        event.judge,
+        crate::extras::goal::driver::Verification {
+            request: Some(pending.request),
+            checks: event.checks,
+            judge: event.judge,
+        },
     ))
     .await
 }
@@ -688,8 +696,7 @@ async fn finish_goal_round(
     ui: &mut UiContext<'_>,
     summary: crate::extras::goal::gate::RoundSummary,
     decision: crate::extras::goal::gate::GateDecision,
-    checks: Option<crate::extras::goal::gate::CheckOutcome>,
-    judge: Option<crate::extras::goal::gate::JudgeOutcome>,
+    verification: crate::extras::goal::driver::Verification,
 ) -> anyhow::Result<bool> {
     use crate::extras::goal::driver::{self, RoundOutcome};
 
@@ -699,13 +706,7 @@ async fn finish_goal_round(
             .await,
     );
 
-    let outcome = driver::apply_decision(
-        &ui.session.goal_store,
-        &summary,
-        decision,
-        checks.as_ref(),
-        judge.as_ref(),
-    );
+    let outcome = driver::apply_decision(&ui.session.goal_store, &summary, decision, &verification);
 
     match outcome {
         RoundOutcome::Inactive => Ok(false),

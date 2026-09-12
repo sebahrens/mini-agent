@@ -197,7 +197,7 @@ impl Tool for GoalReport {
         }
 
         // Reports belong to the round that is about to be judged.
-        let round = goal.progress.rounds + 1;
+        let round = goal.progress.current_round();
         let report = build_report(args, round)?;
         let status = report.status;
         self.store.append_report(report);

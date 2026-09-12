@@ -43,9 +43,9 @@ pub const MAX_REPORTS: usize = 8;
 
 /// Why a goal is parked in [`GoalStatus::Paused`].
 ///
-/// `Paused` is reachable from four unrelated runtime conditions; without this
+/// `Paused` is reachable from several unrelated conditions; without this
 /// discriminator a user cannot tell "your judge is down" from "the model
-/// stalled".
+/// stalled" from "you asked me to stop".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReason {
@@ -59,6 +59,8 @@ pub enum PauseReason {
     RoundFailure,
     /// A persisted session carried a status this build does not know.
     UnknownStatusOnLoad,
+    /// The user parked it: `/goal pause`, or an interrupt they asked for.
+    UserRequested,
 }
 
 impl PauseReason {
@@ -70,6 +72,7 @@ impl PauseReason {
             Self::ContextOverflow => "the context window overflowed unrecoverably",
             Self::RoundFailure => "consecutive agent runs failed",
             Self::UnknownStatusOnLoad => "the stored goal status is not recognized",
+            Self::UserRequested => "you paused it",
         }
     }
 }
@@ -333,7 +336,11 @@ pub enum ContinuationMode {
 pub const DEFAULT_RESTART_SUMMARY_CHARS: usize = 1_024;
 
 /// Limits enforced by the harness rather than by prompt text.
+///
+/// `serde(default)` at the struct level so a bounds object written before a
+/// bound existed still loads, taking this build's default for the new one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GoalBounds {
     /// Maximum rounds (agent run plus gate evaluation) before wrapping up.
     pub max_rounds: u32,
@@ -418,7 +425,12 @@ impl Default for GoalBounds {
 }
 
 /// Counters the driver maintains across rounds.
+///
+/// `serde(default)` at the struct level so a record written by a build with
+/// one counter fewer still loads: a goal outliving a downgrade is the entire
+/// point of keeping it outside the conversation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GoalProgress {
     pub rounds: u32,
     pub tokens_used: u64,
@@ -431,6 +443,16 @@ pub struct GoalProgress {
     pub wrap_up_issued: bool,
     /// Consecutive judge failures, for the fail-open ladder.
     pub judge_failures: u32,
+}
+
+impl GoalProgress {
+    /// The number of the round now running: the rounds already folded in, plus
+    /// this one. Saturating, because these counters are read back from a
+    /// session file and a corrupt one must park a goal rather than panic the
+    /// process that loaded it.
+    pub fn current_round(&self) -> u32 {
+        self.rounds.saturating_add(1)
+    }
 }
 
 /// Rejected goal construction or mutation.
@@ -615,10 +637,7 @@ impl Goal {
         if self.status.is_terminal() {
             return false;
         }
-        self.progress.wrap_up_issued = false;
-        self.progress.consecutive_no_progress = 0;
-        self.progress.consecutive_blocked = 0;
-        self.progress.consecutive_round_failures = 0;
+        self.clear_streaks();
         self.set_status(GoalStatus::Active, None)
     }
 
@@ -627,8 +646,23 @@ impl Goal {
         if self.status != GoalStatus::Impossible {
             return false;
         }
-        self.progress.wrap_up_issued = false;
+        self.clear_streaks();
         self.set_status(GoalStatus::Active, None)
+    }
+
+    /// Forget every "this has happened N times in a row" counter.
+    ///
+    /// Shared by `resume` and `reopen`: both mean the user looked at why the
+    /// goal stopped and decided it may run again, so none of the streaks that
+    /// stopped it may carry over and stop it a round later. The cumulative
+    /// counters (`rounds`, `tokens_used`, `active_secs`) are the record of
+    /// what the goal cost and are deliberately kept.
+    fn clear_streaks(&mut self) {
+        self.progress.wrap_up_issued = false;
+        self.progress.consecutive_no_progress = 0;
+        self.progress.consecutive_blocked = 0;
+        self.progress.consecutive_round_failures = 0;
+        self.progress.judge_failures = 0;
     }
 
     pub fn touch(&mut self) {
@@ -806,6 +840,24 @@ impl<'de> Deserialize<'de> for GoalStore {
     }
 }
 
+/// Deserialize a field a newer build may have widened, taking this build's
+/// default rather than failing the whole session load.
+///
+/// The rule the record lives by is that a goal survives everything: a session
+/// written by a build that knows one more `PauseReason` or one more
+/// `ContinuationMode` must still open here, with the objective intact and the
+/// unreadable detail dropped. Only `status` gets the stronger treatment of
+/// parking the goal, because a goal running under a status this build cannot
+/// reason about is the one case where carrying on would be wrong.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// Deserialization shim that tolerates an unknown `status`.
 #[derive(Deserialize)]
 struct StoredGoal {
@@ -814,15 +866,15 @@ struct StoredGoal {
     #[serde(default)]
     criteria: Vec<String>,
     status: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     paused_reason: Option<PauseReason>,
     #[serde(default)]
     checks: Vec<GoalCheck>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     judge: JudgePolicy,
     #[serde(default)]
     resolved_judge: Option<ResolvedJudge>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     continuation: ContinuationMode,
     #[serde(default)]
     context_file: Option<std::path::PathBuf>,
@@ -831,8 +883,8 @@ struct StoredGoal {
     #[serde(default)]
     progress: GoalProgress,
     #[serde(default)]
-    reports: VecDeque<Report>,
-    #[serde(default)]
+    reports: VecDeque<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient")]
     last_verdict: Option<Verdict>,
     created_at: CompactString,
     updated_at: CompactString,
@@ -864,7 +916,13 @@ impl StoredGoal {
             context_file: self.context_file,
             bounds: self.bounds,
             progress: self.progress,
-            reports: self.reports,
+            // One report this build cannot read is one line of history lost,
+            // not a session that will not open.
+            reports: self
+                .reports
+                .into_iter()
+                .filter_map(|value| serde_json::from_value::<Report>(value).ok())
+                .collect(),
             last_verdict: self.last_verdict,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -1143,6 +1201,75 @@ mod tests {
         assert_eq!(goal.status, GoalStatus::Paused);
         assert_eq!(goal.paused_reason, Some(PauseReason::UnknownStatusOnLoad));
         assert_eq!(goal.objective, "ship the feature", "payload is preserved");
+    }
+
+    /// A goal outlives the build that wrote it.
+    ///
+    /// A session written by a newer build may carry a pause reason, a
+    /// continuation mode or a report status this one has never heard of. None
+    /// of those may cost the user the objective: the unreadable detail is
+    /// dropped and everything else loads.
+    #[test]
+    fn a_record_from_a_newer_build_loads_with_the_objective_intact() {
+        let store = GoalStore::default();
+        let mut g = goal();
+        g.set_status(GoalStatus::Paused, Some(PauseReason::NoProgress));
+        g.push_report(Report {
+            status: ReportStatus::Progress,
+            evidence: None,
+            blocker: None,
+            reason: None,
+            question: None,
+            round: 1,
+            at: "now".into(),
+        });
+        g.last_verdict = Some(Verdict {
+            outcome: Outcome::NotYet,
+            reason: "keep going".into(),
+            source: VerdictSource::Structural,
+            evidence: vec![VerificationKind::SelfReport],
+            at: "now".into(),
+        });
+        store.set(g, false).unwrap();
+        let json = serde_json::to_string(&store).unwrap();
+
+        for (from, to) in [
+            ("\"no_progress\"", "\"sunspots\""),
+            ("\"continue\"", "\"telepathy\""),
+            ("\"auto\"", "\"oracle\""),
+            ("\"progress\"", "\"vibing\""),
+            ("\"structural\"", "\"astrology\""),
+        ] {
+            let tampered = json.replace(from, to);
+            assert_ne!(tampered, json, "the fixture must actually change {from}");
+            let back: GoalStore =
+                serde_json::from_str(&tampered).expect("an unknown value must not fail the load");
+            let loaded = back.snapshot().expect("goal retained");
+            assert_eq!(
+                loaded.objective, "ship the feature",
+                "payload survives {to}"
+            );
+            assert_eq!(loaded.progress.rounds, 0);
+        }
+
+        // A counter this build does not write yet, and one it no longer
+        // writes, both load: the struct takes its own defaults for the gaps.
+        let widened = json.replace(
+            "\"judge_failures\":0",
+            "\"judge_failures\":0,\"moon_phase\":\"waxing\"",
+        );
+        assert_ne!(widened, json);
+        assert!(serde_json::from_str::<GoalStore>(&widened).is_ok());
+        let narrowed = json.replace(",\"judge_failures\":0", "");
+        assert_ne!(narrowed, json);
+        let back: GoalStore = serde_json::from_str(&narrowed).expect("a missing counter defaults");
+        assert_eq!(
+            back.snapshot()
+                .expect("goal retained")
+                .progress
+                .judge_failures,
+            0
+        );
     }
 
     #[test]

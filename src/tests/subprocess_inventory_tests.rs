@@ -1482,13 +1482,13 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::BudgetLimited);",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
         "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::Blocked);",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -1512,7 +1512,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/gate.rs",
         "assert_eq!(*status, GoalStatus::Met);",
-        2,
+        3,
         "NON-PROCESS",
     ),
     (
@@ -2454,10 +2454,14 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         &[
             (
                 "1c395765e43cd9b6cd43b9a473b7ceffb32e994c1223a3b582b653177a95a9fd",
-                1,
+                2,
             ),
             (
                 "2d4dd6b0880b43f63964a9fafcc049782905712a4ac5a0ac7d070073cb11736c",
+                2,
+            ),
+            (
+                "30b402ca4a0e1f2324e2b9461d55e5847661e8e9a4cfa5eaf663529dab3f2a73",
                 1,
             ),
             (
@@ -2477,20 +2481,12 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "5caff534ef1da101b49ed63823ea4d4c649ad26addedd3d7ff20a77c87578f73",
-                1,
-            ),
-            (
-                "7ab08e8c047a60e0c0e6d0333f4e21a779c83bb8d52abed97af6cc8833cb447b",
-                1,
-            ),
-            (
                 "8d75b0cb773e965bfd51463713ca3a6d85ef592e89b0d7de8d512d7076d993ae",
-                1,
+                2,
             ),
             (
                 "8e683c287c05b02ec770d6282642cc2ca52a1a16f7c38fb8abf40adaf4031a8e",
-                2,
+                3,
             ),
             (
                 "c532de8f1745797862d32e6fe009e5387d6fd988a9c36866da808b774d1ca804",

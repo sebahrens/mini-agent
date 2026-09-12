@@ -99,7 +99,7 @@ impl RoundCollector {
     /// Close the round and produce what the gate reads.
     pub fn finish(mut self, goal: &Goal, end: RoundEnd, open_todos: usize) -> RoundSummary {
         self.accrue();
-        let round = goal.progress.rounds + 1;
+        let round = goal.progress.current_round();
         // Only a report filed during this round speaks for it.
         let report = goal
             .reports_in_round(round)
@@ -186,7 +186,7 @@ pub fn next_round(goal: &Goal, decision: &GateDecision) -> Option<Relaunch> {
         return None;
     };
 
-    let round = goal.progress.rounds + 1;
+    let round = goal.progress.current_round();
     let mut prompt = String::with_capacity(instruction.len() + 512);
 
     match goal.continuation {
@@ -579,7 +579,7 @@ mod tests {
                 gate::Step::Decided(d) => d,
                 gate::Step::Verify(r) => gate::gate_post(&g, &summary, &r, None, None),
             };
-            gate::apply(&mut g, &summary, &decision, None);
+            gate::apply(&mut g, &summary, &decision, None, None);
             assert!(should_continue(&g), "round {round} should continue");
             assert!(next_round(&g, &decision).is_some());
         }
@@ -595,7 +595,7 @@ mod tests {
             gate::Step::Decided(d) => d,
             gate::Step::Verify(r) => gate::gate_post(&g, &summary, &r, None, None),
         };
-        gate::apply(&mut g, &summary, &decision, None);
+        gate::apply(&mut g, &summary, &decision, None, None);
         assert_eq!(g.status, GoalStatus::Met);
         assert!(!should_continue(&g));
         assert_eq!(next_round(&g, &decision), None);
@@ -720,6 +720,29 @@ pub fn persist_round(
     Ok(response)
 }
 
+/// What the driver learned by running the tiers [`gate_pre`] asked for.
+///
+/// The three travel together from the moment a round asks for verification to
+/// the moment it is folded in, and every one of them is absent for a round the
+/// gate decided on its own, so they are one value rather than three arguments
+/// threaded through each surface.
+///
+/// [`gate_pre`]: super::gate::gate_pre
+#[derive(Debug, Default, Clone)]
+pub struct Verification {
+    /// What was asked for, and why. `None` when the gate decided alone.
+    pub request: Option<super::gate::VerifyRequest>,
+    pub checks: Option<super::gate::CheckOutcome>,
+    pub judge: Option<super::gate::JudgeOutcome>,
+}
+
+impl Verification {
+    /// Why verification was asked for, if it was.
+    fn cause(&self) -> Option<super::gate::VerifyCause> {
+        self.request.as_ref().map(|request| request.cause)
+    }
+}
+
 /// Fold an already-decided round into the goal.
 ///
 /// The shared half of [`settle_round`], split out for surfaces that run
@@ -728,11 +751,12 @@ pub fn apply_decision(
     store: &super::GoalStore,
     summary: &RoundSummary,
     decision: GateDecision,
-    checks: Option<&super::gate::CheckOutcome>,
-    judge: Option<&super::gate::JudgeOutcome>,
+    verification: &Verification,
 ) -> RoundOutcome {
+    let checks = verification.checks.as_ref();
+    let judge = verification.judge.as_ref();
     let line = match store.with_mut(|goal| {
-        super::gate::apply(goal, summary, &decision, judge);
+        super::gate::apply(goal, summary, &decision, judge, verification.cause());
         super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
         #[cfg(feature = "hooks")]
         super::publish_hook_info(Some(goal));
@@ -745,7 +769,13 @@ pub fn apply_decision(
     let Some(goal) = store.snapshot() else {
         return RoundOutcome::Inactive;
     };
-    record_outcome(&goal);
+    // One row per goal, not per round. A round that merely continues has
+    // settled nothing, and an interrupted round is not the agent's verdict on
+    // anything: recording either would bury the one verdict that matters under
+    // a run of manufactured failures for the same goal id.
+    if matches!(decision, GateDecision::Stop { .. }) && summary.end != RoundEnd::Cancelled {
+        record_outcome(&goal);
+    }
     match next_round(&goal, &decision) {
         Some(relaunch) if goal.status.is_running() => RoundOutcome::Relaunch { relaunch, line },
         _ => RoundOutcome::Stopped {
@@ -782,17 +812,24 @@ where
         return RoundOutcome::Inactive;
     }
 
-    let (decision, checked, judged) = match super::gate::gate_pre(&goal, &summary) {
-        super::gate::Step::Decided(decision) => (decision, None, None),
+    let (decision, verification) = match super::gate::gate_pre(&goal, &summary) {
+        super::gate::Step::Decided(decision) => (decision, Verification::default()),
         super::gate::Step::Verify(request) => {
             let (checks, judge) = run_verification(request.clone()).await;
             let decision =
                 super::gate::gate_post(&goal, &summary, &request, checks.as_ref(), judge.as_ref());
-            (decision, checks, judge)
+            (
+                decision,
+                Verification {
+                    request: Some(request),
+                    checks,
+                    judge,
+                },
+            )
         }
     };
 
-    apply_decision(store, &summary, decision, checked.as_ref(), judged.as_ref())
+    apply_decision(store, &summary, decision, &verification)
 }
 
 /// Where a settled verdict is reported as skill evidence.
@@ -1056,7 +1093,7 @@ pub fn summary_from_headless_turn(
         }
     }
 
-    let round = goal.progress.rounds + 1;
+    let round = goal.progress.current_round();
     RoundSummary {
         end: match failure {
             // An interrupt is the operator stopping the work, not the round
