@@ -926,7 +926,9 @@ pub async fn no_verification(_request: super::gate::VerifyRequest) -> Verificati
 #[cfg(test)]
 mod settle_tests {
     use super::*;
-    use crate::extras::goal::{Goal, GoalStore, JudgePolicy, ReportStatus};
+    use crate::extras::goal::{Goal, GoalCheck, GoalStatus, GoalStore, JudgePolicy, ReportStatus};
+    use crate::permission::checker::PermissionChecker;
+    use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
 
     /// Redirect the application data root so a settled round writes its
     /// transcript into a temporary directory instead of the real one.
@@ -1086,6 +1088,89 @@ mod settle_tests {
             goal.last_verdict.is_none(),
             "and the cancelled check leaves no verdict behind to hand the agent \
              next round as a failure it should fix"
+        );
+    }
+
+    /// A goal bounds how long the harness keeps working and decides when it may
+    /// stop. It never widens what may run.
+    ///
+    /// This holds by construction — the goal module is handed no permission
+    /// checker and no sandbox policy, and cannot reach one — but "by
+    /// construction" is exactly the kind of claim that quietly stops being
+    /// true, so a whole lifecycle is run against a live checker and the
+    /// checker is asked afterwards whether anything moved.
+    #[tokio::test]
+    async fn a_goal_lifecycle_never_changes_what_may_run() {
+        let paths = isolated_paths();
+        // Inside the isolated root, so it is cleaned up with it.
+        let workspace = paths.path.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                read: Some(ToolPerm::Simple(Action::Allow)),
+                write: Some(ToolPerm::Simple(Action::Deny)),
+                ..PermissionConfig::default()
+            }),
+            SecurityMode::Restrictive,
+            Some(workspace.clone()),
+            Some(vec!["restrictive".to_string()]),
+        )
+        .expect("a permission checker");
+
+        let before = (
+            checker.mode(),
+            checker.check("write", "anything"),
+            checker.check("read", "anything"),
+            checker.check("bash", "rm -rf /"),
+        );
+
+        // A full lifecycle: a goal with a check and a judge, several rounds,
+        // a completion claim adjudicated, then parked, resumed and cleared.
+        let store = GoalStore::default();
+        let mut goal = Goal::new("ship the parser", vec!["tests pass".into()]).expect("valid goal");
+        goal.checks.push(GoalCheck::new("true"));
+        goal.judge = JudgePolicy::Session;
+        store.set(goal, false).expect("no prior goal");
+
+        for _ in 0..3 {
+            report(&store, ReportStatus::Progress);
+            let summary = RoundSummary {
+                mutating_tool_calls: 1,
+                report: store.snapshot().unwrap().last_report().cloned(),
+                ..RoundSummary::completed()
+            };
+            settle_round(&store, summary, no_verification).await;
+        }
+
+        report(&store, ReportStatus::Met);
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        settle_round(&store, summary, |_| async {
+            Verification {
+                checks: Some(crate::extras::goal::gate::CheckOutcome {
+                    all_passed: true,
+                    failure_tail: None,
+                    verified: vec![crate::extras::goal::VerificationKind::Checks],
+                }),
+                ..Verification::default()
+            }
+        })
+        .await;
+        assert_eq!(store.snapshot().unwrap().status, GoalStatus::Met);
+        store.clear();
+
+        assert_eq!(
+            (
+                checker.mode(),
+                checker.check("write", "anything"),
+                checker.check("read", "anything"),
+                checker.check("bash", "rm -rf /"),
+            ),
+            before,
+            "a goal decides when work may stop, never what work may run"
         );
     }
 
