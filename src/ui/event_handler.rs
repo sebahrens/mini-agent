@@ -691,6 +691,7 @@ pub(crate) async fn handle_goal_verification_event(
             request: Some(pending.request),
             checks: event.checks,
             judge: event.judge,
+            interrupted: false,
         },
     ))
     .await

@@ -9,37 +9,23 @@ use crate::provider::AnyAgent;
 use crate::sandbox::Sandbox;
 use crate::session::Session;
 
-#[cfg(any(feature = "hooks", all(test, unix)))]
-fn hook_loop_active(iteration: u32, max_iterations: Option<u32>) -> bool {
-    max_iterations.is_none_or(|max| iteration < max)
-}
-
-/// Run `--loop` as a goal.
+/// Install the goal a `--loop` run is, before the agent is built.
 ///
-/// A loop iteration is a goal round in restart mode: a fresh conversation each
-/// time, the plan file re-read into every prompt, and the validator run every
-/// round as feedback. Both features share one round engine so they cannot drift
-/// on what an iteration is or when one stops.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_headless_loop(
-    agent: AnyAgent,
+/// Order matters: the agent's preamble carries the goal block, and that block
+/// is captured when the agent is built. A loop whose goal arrived afterwards
+/// ran every iteration without the rules that tell the agent to report — so
+/// the early finish the guide documents could never happen and every iteration
+/// looked like a stall to the gate.
+///
+/// Returns `false` when there is nothing to run.
+pub(crate) async fn install_loop_goal(
     cli: &Cli,
     cfg: &Config,
-    _context: &ContextFiles,
     session: &Session,
-    status_signals: Option<StatusSignals>,
-    sandbox: &Sandbox,
-    client: &crate::provider::AnyClient,
-) -> anyhow::Result<()> {
-    let prompt = cli
-        .loop_prompt
-        .clone()
-        .or_else(|| {
-            let msg = cli.message.join(" ");
-            if msg.is_empty() { None } else { Some(msg) }
-        })
-        .ok_or_else(|| anyhow::anyhow!("No loop prompt. Use --loop-prompt or pass a message."))?;
-
+) -> anyhow::Result<bool> {
+    let Some(prompt) = loop_prompt(cli) else {
+        anyhow::bail!("No loop prompt. Use --loop-prompt or pass a message.");
+    };
     let plan_file = cli
         .loop_plan
         .clone()
@@ -54,7 +40,7 @@ pub(crate) async fn run_headless_loop(
     // iteration the operator asked not to have.
     if cli.loop_max == Some(0) {
         eprintln!("[loop] max iterations (0) reached, stopping");
-        return Ok(());
+        return Ok(false);
     }
 
     let preset = crate::extras::goal::preset::loop_goal(
@@ -78,6 +64,40 @@ pub(crate) async fn run_headless_loop(
         .map_err(|error| {
             anyhow::anyhow!("{error} (or pass --goal-replace to start the loop anyway)")
         })?;
+    Ok(true)
+}
+
+/// The prompt a loop was given, from either spelling.
+fn loop_prompt(cli: &Cli) -> Option<String> {
+    cli.loop_prompt.clone().or_else(|| {
+        let msg = cli.message.join(" ");
+        if msg.is_empty() { None } else { Some(msg) }
+    })
+}
+
+/// Run `--loop` as a goal.
+///
+/// A loop iteration is a goal round in restart mode: a fresh conversation each
+/// time, the plan file re-read into every prompt, and the validator run every
+/// round as feedback. Both features share one round engine so they cannot drift
+/// on what an iteration is or when one stops.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_headless_loop(
+    agent: AnyAgent,
+    cli: &Cli,
+    cfg: &Config,
+    _context: &ContextFiles,
+    session: &Session,
+    status_signals: Option<StatusSignals>,
+    sandbox: &Sandbox,
+    client: &crate::provider::AnyClient,
+) -> anyhow::Result<()> {
+    // `install_loop_goal` ran before the agent was built, and answered the
+    // "nothing to run" cases there.
+    if !session.goal_store.is_active() {
+        return Ok(());
+    }
+    let prompt = loop_prompt(cli).unwrap_or_default();
 
     let mut saved_session = session.clone();
     if let Some(ss) = status_signals.as_ref() {
@@ -101,6 +121,7 @@ pub(crate) async fn run_headless_loop(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(feature = "hooks")]
     use super::*;
 
     /// A resumed session's history reaches the first round. Later rounds are
@@ -130,11 +151,33 @@ mod tests {
         assert_eq!(preset.goal.bounds.max_rounds, 3);
     }
 
+    /// A `Stop` hook still learns which iteration it is watching and whether
+    /// more are coming. Folding the loop onto the goal driver moved where
+    /// those two facts come from; it must not empty the fields.
+    #[cfg(feature = "hooks")]
     #[test]
-    fn final_bounded_iteration_is_not_reported_as_looping() {
-        assert!(hook_loop_active(1, Some(2)));
-        assert!(!hook_loop_active(2, Some(2)));
-        assert!(hook_loop_active(99, None));
+    fn a_loop_round_still_reports_its_iteration_to_stop_hooks() {
+        let session = Session::new("openrouter", "test", 128_000, "");
+        let goal = crate::extras::goal::Goal::new("keep going", Vec::new()).expect("valid goal");
+        session.goal_store.set(goal, false).expect("no prior goal");
+
+        let info = crate::startup::loop_round_info(&session, true).expect("a loop reports");
+        assert_eq!(info.iteration, 1, "the round about to run is iteration one");
+        assert!(info.active);
+
+        // Three rounds in, and then parked.
+        session.goal_store.with_mut(|goal| {
+            goal.progress.rounds = 3;
+            goal.set_status(crate::extras::goal::GoalStatus::BudgetLimited, None);
+        });
+        let info = crate::startup::loop_round_info(&session, true).expect("a loop reports");
+        assert_eq!(info.iteration, 4);
+        assert!(!info.active, "a parked goal is not still looping");
+
+        assert!(
+            crate::startup::loop_round_info(&session, false).is_none(),
+            "a plain -p run is not a loop and says so"
+        );
     }
 }
 
@@ -257,6 +300,13 @@ mod persistence_tests {
             let mut session = Session::new("openrouter", "test", 128_000, "");
             session.add_message(MessageRole::User, "prior turn");
             session.total_input_tokens = 7;
+            // The same two steps production takes: the goal is installed
+            // before the agent would be built, then the rounds run.
+            assert!(
+                install_loop_goal(&cli, &Config::default(), &session)
+                    .await
+                    .expect("the loop goal installs")
+            );
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 run_headless_loop(

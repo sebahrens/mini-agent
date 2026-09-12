@@ -763,6 +763,13 @@ pub struct Verification {
     pub request: Option<super::gate::VerifyRequest>,
     pub checks: Option<super::gate::CheckOutcome>,
     pub judge: Option<super::gate::JudgeOutcome>,
+    /// The operator stopped the work while the tiers were running.
+    ///
+    /// That is not a verdict on the claim — a cancelled check has proved
+    /// nothing either way — so the round is settled as interrupted rather than
+    /// counted, and the cancellation is not fed back to the agent next round
+    /// as a failure it should go and fix.
+    pub interrupted: bool,
 }
 
 impl Verification {
@@ -827,12 +834,7 @@ pub async fn settle_round<F, Fut>(
 ) -> RoundOutcome
 where
     F: FnOnce(super::gate::VerifyRequest) -> Fut,
-    Fut: std::future::Future<
-            Output = (
-                Option<super::gate::CheckOutcome>,
-                Option<super::gate::JudgeOutcome>,
-            ),
-        >,
+    Fut: std::future::Future<Output = Verification>,
 {
     let Some(goal) = store.snapshot() else {
         return RoundOutcome::Inactive;
@@ -841,20 +843,28 @@ where
         return RoundOutcome::Inactive;
     }
 
+    let mut summary = summary;
     let (decision, verification) = match super::gate::gate_pre(&goal, &summary) {
         super::gate::Step::Decided(decision) => (decision, Verification::default()),
         super::gate::Step::Verify(request) => {
-            let (checks, judge) = run_verification(request.clone()).await;
-            let decision =
-                super::gate::gate_post(&goal, &summary, &request, checks.as_ref(), judge.as_ref());
-            (
-                decision,
-                Verification {
-                    request: Some(request),
-                    checks,
-                    judge,
-                },
-            )
+            let mut verification = run_verification(request.clone()).await;
+            if verification.interrupted {
+                // Row 1, reached late. A cancelled check is not a failing
+                // check: nothing was proved either way, so the round is
+                // settled as the interrupted round it became.
+                summary.end = super::gate::RoundEnd::Cancelled;
+                (super::gate::gate_interrupted(), Verification::default())
+            } else {
+                let decision = super::gate::gate_post(
+                    &goal,
+                    &summary,
+                    &request,
+                    verification.checks.as_ref(),
+                    verification.judge.as_ref(),
+                );
+                verification.request = Some(request);
+                (decision, verification)
+            }
         }
     };
 
@@ -919,13 +929,8 @@ fn record_outcome(goal: &Goal) {
 
 /// Verification hook for tests and for surfaces with no tiers wired.
 #[cfg(test)]
-pub async fn no_verification(
-    _request: super::gate::VerifyRequest,
-) -> (
-    Option<super::gate::CheckOutcome>,
-    Option<super::gate::JudgeOutcome>,
-) {
-    (None, None)
+pub async fn no_verification(_request: super::gate::VerifyRequest) -> Verification {
+    Verification::default()
 }
 
 #[cfg(test)]
@@ -1045,6 +1050,55 @@ mod settle_tests {
         assert_eq!(goal.status, GoalStatus::Active);
     }
 
+    /// An interrupt that lands while the tiers are running is still an
+    /// interrupt.
+    ///
+    /// A cancelled check has proved nothing either way, so treating it as a
+    /// failing one counted the round, spent the budget, and handed the agent
+    /// the cancellation next round as a failure to go and fix — for work the
+    /// operator had just asked it to stop.
+    #[tokio::test]
+    async fn an_interrupt_during_verification_leaves_the_goal_untouched() {
+        let _paths = isolated_paths();
+        let store = store();
+        store.with_mut(|goal| {
+            goal.checks
+                .push(crate::extras::goal::GoalCheck::new("true"))
+        });
+        report(&store, ReportStatus::Met);
+
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        let outcome = settle_round(&store, summary, |_| async {
+            Verification {
+                interrupted: true,
+                checks: Some(crate::extras::goal::gate::CheckOutcome {
+                    all_passed: false,
+                    failure_tail: Some("[validation status=cancelled]".into()),
+                    verified: Vec::new(),
+                }),
+                ..Verification::default()
+            }
+        })
+        .await;
+
+        match outcome {
+            RoundOutcome::Stopped { status, .. } => assert_eq!(status, GoalStatus::Active),
+            other => panic!("an interrupt hands control back, got {other:?}"),
+        }
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.progress.rounds, 0, "the round is uncounted");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert!(
+            goal.last_verdict.is_none(),
+            "and the cancelled check leaves no verdict behind to hand the agent \
+             next round as a failure it should fix"
+        );
+    }
+
     /// The verification hook is only consulted when the gate asks for it, so an
     /// ordinary round never pays for checks or a judge.
     #[tokio::test]
@@ -1062,7 +1116,7 @@ mod settle_tests {
         };
         settle_round(&store, summary, move |_| {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            async { (None, None) }
+            async { Verification::default() }
         })
         .await;
         assert!(
@@ -1079,7 +1133,7 @@ mod settle_tests {
         };
         settle_round(&store, summary, move |_| {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            async { (None, None) }
+            async { Verification::default() }
         })
         .await;
         assert!(

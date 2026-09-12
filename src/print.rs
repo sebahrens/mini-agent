@@ -237,7 +237,12 @@ impl HeadlessStopReason {
             GoalStatus::Blocked => Self::GoalBlocked,
             GoalStatus::AwaitingUser => Self::GoalAwaitingUser,
             GoalStatus::BudgetLimited => Self::GoalBudgetLimited,
-            GoalStatus::Paused | GoalStatus::Active => Self::GoalPaused,
+            GoalStatus::Paused => Self::GoalPaused,
+            // Still running at exit means the operator stopped the process
+            // rather than the goal stopping itself: an interrupt. Nothing
+            // about the goal failed and nothing is waiting on an answer, so
+            // this is not the parked outcome and must not be reported as one.
+            GoalStatus::Active => Self::Completed,
         }
     }
 }
@@ -1046,6 +1051,61 @@ mod tests {
         installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
         render_headless_json, write_output,
     };
+
+    /// Every way a goal can stop has its own exit code, so an unattended
+    /// caller can tell "resume me" from "stop retrying" without parsing prose.
+    ///
+    /// This walks the production mapping rather than restating it: a table of
+    /// literals beside the one in `exit_code` would agree with itself forever
+    /// while the binary did something else.
+    #[cfg(feature = "goal")]
+    #[test]
+    fn every_goal_outcome_has_its_own_exit_code() {
+        use crate::extras::goal::GoalStatus;
+
+        let mapped: Vec<(GoalStatus, i32)> = [
+            GoalStatus::Met,
+            GoalStatus::Impossible,
+            GoalStatus::Blocked,
+            GoalStatus::AwaitingUser,
+            GoalStatus::Paused,
+            GoalStatus::BudgetLimited,
+        ]
+        .into_iter()
+        .map(|outcome| {
+            (
+                outcome,
+                super::HeadlessStopReason::for_goal(outcome).exit_code(),
+            )
+        })
+        .collect();
+
+        for (outcome, code) in &mapped {
+            assert_eq!(
+                *code == 0,
+                matches!(outcome, GoalStatus::Met),
+                "only a met goal exits zero, not {outcome:?}"
+            );
+            assert_ne!(
+                *code, 1,
+                "{outcome:?} must not collide with the generic failure code"
+            );
+        }
+
+        let mut codes: Vec<i32> = mapped.iter().map(|(_, code)| *code).collect();
+        let before = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), before, "two outcomes share an exit code");
+
+        // A goal still running when the process exits was interrupted: the
+        // operator stopped the work, nothing about the goal failed, and it is
+        // not the parked outcome.
+        assert_eq!(
+            super::HeadlessStopReason::for_goal(GoalStatus::Active).exit_code(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn headless_turn_settles_registered_blocking_work_before_returning() {

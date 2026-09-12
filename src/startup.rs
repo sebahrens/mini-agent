@@ -1563,6 +1563,8 @@ impl Startup {
                 &msg,
                 history,
                 json_output,
+                #[cfg(feature = "hooks")]
+                false,
             ))
             .await;
             if let Some(ss) = self.status_signals.as_ref() {
@@ -1573,11 +1575,16 @@ impl Startup {
             // incurred usage before propagating the failure, so a resumed
             // session has a durable record of what happened instead of
             // repeating the effects.
-            let crate::agent::runner::HeadlessTurn {
-                response,
-                usage,
-                interactions,
-                failure,
+            let HeadlessRounds {
+                turn:
+                    crate::agent::runner::HeadlessTurn {
+                        response,
+                        usage,
+                        interactions,
+                        failure,
+                    },
+                prompt: recorded_prompt,
+                persisted: already_persisted,
             } = response_result;
             let json_context = if json_output {
                 let files_changed = crate::print::files_changed_since(
@@ -1606,9 +1613,20 @@ impl Startup {
                 // Prompt, then tool calls/results in provider order, then the
                 // assistant message: the same record order the interactive UI
                 // writes, so `--continue` replays the turn in sequence.
-                crate::print::persist_headless_turn(&mut session, &msg, &response, &interactions);
-                let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
-                session.charge_usage_delta(usage.into(), anthropic_native);
+                //
+                // A goal run has already written this round, under the prompt
+                // that round actually ran with. Writing it again would double
+                // every record in it and charge its tokens twice.
+                if !already_persisted {
+                    crate::print::persist_headless_turn(
+                        &mut session,
+                        &recorded_prompt,
+                        &response,
+                        &interactions,
+                    );
+                    let anthropic_native = self.cfg.is_anthropic_native(&session.provider);
+                    session.charge_usage_delta(usage.into(), anthropic_native);
+                }
                 if let Err(error) = session::storage::save_session(&session) {
                     persistence_failure = Some(error);
                 } else {
@@ -1653,11 +1671,21 @@ impl Startup {
                         finished_goal.as_ref(),
                     )?
                 );
-                #[cfg(feature = "goal")]
-                if stop_reason.exit_code() != 0 && failure.is_none() {
-                    // The turn itself succeeded; only the goal's outcome is
-                    // non-zero, so exit with its code rather than an error.
-                    return Err(crate::print::HeadlessGoalExit(stop_reason).into());
+            }
+            // A goal that stopped for a reason of its own exits with that
+            // reason's code, whatever the output format. The distinction
+            // between "resume me" and "stop retrying" is what an unattended
+            // caller acts on, and it does not depend on whether a human asked
+            // for JSON.
+            #[cfg(feature = "goal")]
+            if failure.is_none() && persistence_failure.is_none() {
+                let goal_stop = finished_goal
+                    .as_ref()
+                    .map(|goal| crate::print::HeadlessStopReason::for_goal(goal.status));
+                if let Some(reason) = goal_stop
+                    && reason.exit_code() != 0
+                {
+                    return Err(crate::print::HeadlessGoalExit(reason).into());
                 }
             }
             // The turn's own failure wins: a partial persistence failure is
@@ -1683,6 +1711,14 @@ impl Startup {
 
     #[cfg(feature = "loop")]
     async fn dispatch_loop(self) -> anyhow::Result<()> {
+        // The goal is installed before the agent is built: the preamble's goal
+        // block is captured at build time, and an agent built without it never
+        // learns it is working toward anything.
+        if !crate::extras::r#loop::headless::install_loop_goal(&self.cli, &self.cfg, &self.session)
+            .await?
+        {
+            return Ok(());
+        }
         let model_completion = self.client.completion_model(self.model.to_string());
         let temperature = config::resolve_temperature(&self.cli, &self.cfg, &self.model);
         let extra_body = config::resolve_extra_body(&self.cfg, &self.model);
@@ -1921,21 +1957,55 @@ pub(crate) async fn run_goal_rounds_for_loop(
     client: &provider::AnyClient,
     prompt: &str,
 ) -> anyhow::Result<()> {
-    let turn = Box::pin(run_headless_goal_rounds(
+    // The first iteration gets the same framing every later one does: the
+    // objective, the round header, and the plan file re-read fresh. Passing the
+    // bare prompt meant a `--loop-max 1` run never saw its own plan.
+    let first_prompt = session
+        .goal_store
+        .snapshot()
+        .map(|goal| crate::extras::goal::driver::first_round_prompt(&goal))
+        .unwrap_or_else(|| prompt.to_string());
+
+    // A resumed session's history reaches the first iteration. Later ones are
+    // restart rounds and deliberately start clean, carrying the objective and
+    // a harness-built summary instead.
+    let history = crate::agent::runner::convert_history_shared_with_tool_result_retention(
+        session,
+        cfg.resolve_keep_recent_tool_results(),
+    );
+
+    let rounds = Box::pin(run_headless_goal_rounds(
         agent,
         session,
         cli,
         cfg,
         sandbox,
         client,
-        prompt,
-        std::sync::Arc::from(Vec::new()),
+        &first_prompt,
+        history,
         false,
+        #[cfg(feature = "hooks")]
+        true,
     ))
     .await;
-    match turn.failure {
-        Some(failure) => Err(failure),
-        None => Ok(()),
+    if let Some(failure) = rounds.turn.failure {
+        return Err(failure);
+    }
+
+    // A loop that stopped because the agent is blocked, or waiting on the
+    // user, or stalled, has not done what was asked. Reporting that as success
+    // is how an unattended caller retries forever, or stops retrying something
+    // that only needed an answer.
+    let stop_reason = session
+        .goal_store
+        .snapshot()
+        .map(|goal| crate::print::HeadlessStopReason::for_goal(goal.status));
+    match stop_reason {
+        // A loop reaching its iteration cap is the ordinary end of a loop, not
+        // a failure, and has always exited zero.
+        Some(crate::print::HeadlessStopReason::GoalBudgetLimited) | None => Ok(()),
+        Some(reason) if reason.exit_code() == 0 => Ok(()),
+        Some(reason) => Err(crate::print::HeadlessGoalExit(reason).into()),
     }
 }
 
@@ -1961,9 +2031,22 @@ async fn run_headless_goal_rounds(
     message: &str,
     history: std::sync::Arc<[rig::completion::Message]>,
     json_output: bool,
-) -> crate::agent::runner::HeadlessTurn {
+    // Whether these rounds are a `--loop`. A loop's iterations have always been
+    // reported to `Stop` hooks as `loop_iteration`/`loop_active`, and folding
+    // the loop onto the goal driver must not silently empty those fields for
+    // everyone who reads them.
+    #[cfg(feature = "hooks")] loop_mode: bool,
+) -> HeadlessRounds {
     let quiet = cli.pure_stdout && !json_output;
     let stream = !json_output;
+    // Rounds after the first run the gate's instruction rather than the
+    // message the operator typed, and each is persisted as it completes. The
+    // caller has to know both, or it writes the final turn a second time and
+    // files it under a prompt that was never sent.
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
+    let mut round_prompt = message.to_string();
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
+    let mut persisted = false;
 
     // A goal's time bound measures how long the agent worked. Headless runs
     // never wait on a permission prompt, so the round's wall clock is its
@@ -1979,7 +2062,7 @@ async fn run_headless_goal_rounds(
             &cfg.retry,
             history,
             #[cfg(feature = "hooks")]
-            None,
+            loop_round_info(session, loop_mode),
         )
         .await;
     #[cfg(feature = "goal")]
@@ -2057,6 +2140,21 @@ async fn run_headless_goal_rounds(
                     .await;
                     if interrupted {
                         interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Say what was stopped. The diagnostic used to reach
+                        // the operator only because the cancelled check was
+                        // fed back to the agent as a failure, which is exactly
+                        // what must not happen: nothing was proved either way,
+                        // so the round settles as interrupted and the reason
+                        // is reported here instead.
+                        if let Some(tail) = checks.as_ref().and_then(|o| o.failure_tail.as_deref())
+                        {
+                            eprintln!("{tail}");
+                        }
+                        return driver::Verification {
+                            interrupted: true,
+                            checks,
+                            ..driver::Verification::default()
+                        };
                     }
                     // A failing check already decides the claim, and the
                     // gate returns before it looks at the judge. Asking
@@ -2078,7 +2176,11 @@ async fn run_headless_goal_rounds(
                         ),
                         _ => None,
                     };
-                    (checks, judged)
+                    driver::Verification {
+                        checks,
+                        judge: judged,
+                        ..driver::Verification::default()
+                    }
                 })
                 .await;
             // The round that just ran is history for whatever comes next, and its
@@ -2086,7 +2188,7 @@ async fn run_headless_goal_rounds(
             // gate's decision is acted on rather than only on a relaunch.
             if let Err(error) = crate::extras::goal::driver::persist_round(
                 session,
-                message,
+                &round_prompt,
                 crate::agent::runner::HeadlessTurn {
                     response: turn.response.clone(),
                     usage: turn.usage,
@@ -2097,7 +2199,18 @@ async fn run_headless_goal_rounds(
                 cli.no_session,
             ) {
                 eprintln!("warning: failed to save session between goal rounds: {error}");
+            } else {
+                persisted = true;
             }
+            // An interrupt that landed while the tiers were running is
+            // reported in its own words: the round settled as interrupted, so
+            // the gate's line would say only that, and an operator needs to
+            // know the check they stopped is why.
+            if verification_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("goal: interrupted during verification");
+                break;
+            }
+
             let RoundOutcome::Relaunch { relaunch, line } = outcome else {
                 if let RoundOutcome::Stopped { line, .. } = outcome {
                     eprintln!("{line}");
@@ -2105,11 +2218,6 @@ async fn run_headless_goal_rounds(
                 break;
             };
             eprintln!("{line}");
-
-            if verification_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("goal: interrupted during verification");
-                break;
-            }
 
             let next_history: std::sync::Arc<[rig::completion::Message]> = match relaunch.history {
                 driver::HistoryMode::Retained => {
@@ -2132,6 +2240,8 @@ async fn run_headless_goal_rounds(
                 }
                 None => agent,
             };
+            round_prompt = relaunch.prompt.clone();
+            persisted = false;
             round_started = std::time::Instant::now();
             let next = round_agent
                 .run_print(
@@ -2141,7 +2251,7 @@ async fn run_headless_goal_rounds(
                     &cfg.retry,
                     next_history,
                     #[cfg(feature = "hooks")]
-                    None,
+                    loop_round_info(session, loop_mode),
                 )
                 .await;
             round_elapsed = round_started.elapsed();
@@ -2151,7 +2261,50 @@ async fn run_headless_goal_rounds(
         }
     }
 
-    turn
+    HeadlessRounds {
+        turn,
+        prompt: round_prompt,
+        persisted,
+    }
+}
+
+/// The `--loop` fields a `Stop` hook expects, derived from the goal.
+///
+/// A loop iteration is a goal round, so the round about to run is the
+/// iteration about to run, and the loop is active while the goal is.
+#[cfg(feature = "hooks")]
+pub(crate) fn loop_round_info(
+    session: &Session,
+    loop_mode: bool,
+) -> Option<crate::extras::hooks::LoopInfo> {
+    if !loop_mode {
+        return None;
+    }
+    // `loop` implies `goal`, so a build without goals has no loop to report.
+    #[cfg(feature = "goal")]
+    {
+        let goal = session.goal_store.snapshot()?;
+        Some(crate::extras::hooks::LoopInfo {
+            iteration: goal.progress.current_round(),
+            active: goal.status.is_running(),
+        })
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        let _ = session;
+        None
+    }
+}
+
+/// What a headless run leaves for its caller to finish.
+///
+/// A goal run persists each round as it completes, so the caller must not
+/// write the last one again, and must not attribute it to the message the
+/// operator typed: every round after the first ran the gate's instruction.
+pub(crate) struct HeadlessRounds {
+    pub turn: crate::agent::runner::HeadlessTurn,
+    pub prompt: String,
+    pub persisted: bool,
 }
 
 #[cfg(test)]

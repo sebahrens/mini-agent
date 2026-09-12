@@ -1635,7 +1635,10 @@ async fn settle_acp_goal_round(
     // ACP yet; a self-reported completion is still labelled as unverified.
     let outcome = driver::settle_round(store, summary, |request| async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
-        (checks, None)
+        driver::Verification {
+            checks,
+            ..driver::Verification::default()
+        }
     })
     .await;
     let line = match outcome {

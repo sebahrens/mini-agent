@@ -1458,7 +1458,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/goal/driver.rs",
         "RoundOutcome::Stopped { status, .. } => assert_eq!(status, GoalStatus::Active),",
-        1,
+        2,
         "NON-PROCESS",
     ),
     (
@@ -2446,7 +2446,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "9616cc3a86ba50ddf5ec520a82165e50da9f169a345f44e31d480d9f8600e411",
-                1,
+                2,
             ),
         ],
     ),

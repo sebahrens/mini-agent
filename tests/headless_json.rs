@@ -122,8 +122,13 @@ impl TempRoot {
                 // Verify the actual model schema as well as the validator's
                 // effects: operator validation must not expose model tools.
                 let expected_tools: Option<&[&str]> = match outcome {
+                    // A `--loop` run is a goal, and the agent is told how to
+                    // report on it: `goal_report` follows the goal rather than
+                    // the `--tools` allowlist. `--no-tools` is the exception
+                    // and means exactly what it says — such a loop can only be
+                    // driven by its validator.
                     "validation_no_tools" => Some(&[]),
-                    "validation_read_only" => Some(&["read"]),
+                    "validation_read_only" => Some(&["read", "goal_report"]),
                     "verification_without_shell" => Some(&["write"]),
                     _ => None,
                 };
@@ -393,6 +398,26 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 "test",
                 "-p",
                 "hello",
+            ][..],
+            "finished",
+        ),
+        // `--loop` assembles a goal, an agent and a round driver on the same
+        // startup frame, and is dispatched down a different path from `-p`.
+        (
+            &[
+                "--no-sandbox",
+                "--no-context-files",
+                "--no-session",
+                "--no-tools",
+                "--provider",
+                "local-test",
+                "--model",
+                "test",
+                "--loop",
+                "--loop-prompt",
+                "hello",
+                "--loop-max",
+                "1",
             ][..],
             "finished",
         ),
@@ -1016,35 +1041,5 @@ fn completion_verification_runs_without_exposing_the_shell_tool() {
     assert_eq!(
         std::fs::read_to_string(root.0.join("verified.txt")).unwrap(),
         "checked"
-    );
-}
-
-/// A goal reports its own outcome and exit code so a script can branch on it
-/// without parsing prose.
-#[test]
-fn goal_status_and_exit_codes_are_distinct() {
-    // This mirrors the mapping in `print::HeadlessStopReason::exit_code`; the
-    // point is that a caller can tell "resume me" from "stop retrying".
-    let distinct = [
-        ("met", 0),
-        ("impossible", 20),
-        ("blocked", 21),
-        ("awaiting user", 22),
-        ("paused", 23),
-        ("budget limited", 24),
-    ];
-    let mut codes: Vec<i32> = distinct.iter().map(|(_, code)| *code).collect();
-    let before = codes.len();
-    codes.sort_unstable();
-    codes.dedup();
-    assert_eq!(
-        codes.len(),
-        before,
-        "every non-met goal outcome needs its own exit code"
-    );
-    assert_eq!(distinct[0].1, 0, "only a met goal exits zero");
-    assert!(
-        !codes.contains(&1),
-        "the goal codes must not collide with the generic failure code"
     );
 }
