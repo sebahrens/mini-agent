@@ -1548,7 +1548,10 @@ impl Startup {
                 )
                 .await,
             );
-            let response_result = run_headless_goal_rounds(
+            // Boxed: this future is inlined into `run_inner`'s, which the
+            // startup path builds on the stack before pinning it. A regression
+            // test runs the binary under the 1 MiB Windows default stack.
+            let response_result = Box::pin(run_headless_goal_rounds(
                 &agent,
                 &mut self.session,
                 &self.cli,
@@ -1558,7 +1561,7 @@ impl Startup {
                 &msg,
                 history,
                 json_output,
-            )
+            ))
             .await;
             if let Some(ss) = self.status_signals.as_ref() {
                 ss.send_stop();
@@ -1840,7 +1843,13 @@ pub(crate) fn js_runtime_banner_lines(report: &provider::JsRuntimeReport) -> Vec
 fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyhow::Result<()> {
     use crate::extras::goal::{ContinuationMode, DEFAULT_RESTART_SUMMARY_CHARS, Goal};
 
-    let Some(objective) = cli.goal.as_deref().map(str::trim).filter(|o| !o.is_empty()) else {
+    let Some(objective) = cli
+        .goal_args
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+    else {
         return Ok(());
     };
     // Without tools the agent can never file a report, so every round would
@@ -1850,11 +1859,12 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         anyhow::bail!("a goal needs the goal_report tool; remove --no-tools to use --goal");
     }
 
-    let mut goal = Goal::new(objective, cli.goal_done.clone()).map_err(|e| anyhow::anyhow!(e))?;
-    if let Some(max_rounds) = cli.goal_max_rounds {
+    let mut goal =
+        Goal::new(objective, cli.goal_args.goal_done.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(max_rounds) = cli.goal_args.goal_max_rounds {
         goal.bounds.max_rounds = max_rounds.max(1);
     }
-    if let Some(mode) = cli.goal_continuation.as_deref() {
+    if let Some(mode) = cli.goal_args.goal_continuation.as_deref() {
         goal.continuation = match mode {
             "restart" => ContinuationMode::Restart {
                 summary_chars: DEFAULT_RESTART_SUMMARY_CHARS,
@@ -1872,14 +1882,14 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         goal.checks
             .push(crate::extras::goal::GoalCheck::new(command.as_str()));
     }
-    for command in &cli.goal_check {
+    for command in &cli.goal_args.goal_check {
         goal.checks
             .push(crate::extras::goal::GoalCheck::new(command.clone()));
     }
 
     session
         .goal_store
-        .set(goal, cli.goal_replace)
+        .set(goal, cli.goal_args.goal_replace)
         .map_err(|error| anyhow::anyhow!("{error} (or pass --goal-replace)"))
 }
 

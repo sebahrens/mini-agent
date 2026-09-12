@@ -742,48 +742,14 @@ pub struct Cli {
     )]
     pub loop_run: Option<String>,
 
+    /// Goal flags, boxed so they cost one pointer in `Cli`.
+    ///
+    /// `Cli` is held for the whole of `run_inner`, whose future the startup
+    /// path keeps on the stack; a regression test runs the binary under the
+    /// 1 MiB Windows default stack, and inline fields here are charged to it.
     #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal",
-        help = "Persistent objective to work toward across turns"
-    )]
-    pub goal: Option<String>,
-
-    #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal-done",
-        help = "Completion criterion for the goal (repeatable)"
-    )]
-    pub goal_done: Vec<String>,
-
-    #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal-check",
-        help = "Command that must exit zero before the goal may be reported complete (repeatable)"
-    )]
-    pub goal_check: Vec<String>,
-
-    #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal-max-rounds",
-        help = "Maximum goal rounds before wrapping up [default: 50]"
-    )]
-    pub goal_max_rounds: Option<u32>,
-
-    #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal-continuation",
-        value_parser = ["continue", "restart"],
-        help = "Whether each goal round keeps the conversation or starts fresh"
-    )]
-    pub goal_continuation: Option<String>,
-
-    #[cfg(feature = "goal")]
-    #[arg(
-        long = "goal-replace",
-        help = "Replace an unfinished goal instead of refusing"
-    )]
-    pub goal_replace: bool,
+    #[command(flatten)]
+    pub goal_args: Box<GoalArgs>,
 
     #[cfg(feature = "git-worktree")]
     #[arg(long = "worktree", help = "Create a git worktree and cd into it")]
@@ -870,6 +836,48 @@ pub struct Cli {
 
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
+}
+
+/// Goal selection and bounds. Boxed by `Cli` so the startup future stays small.
+#[cfg(feature = "goal")]
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct GoalArgs {
+    #[arg(
+        long = "goal",
+        help = "Persistent objective to work toward across turns"
+    )]
+    pub goal: Option<String>,
+
+    #[arg(
+        long = "goal-done",
+        help = "Completion criterion for the goal (repeatable)"
+    )]
+    pub goal_done: Vec<String>,
+
+    #[arg(
+        long = "goal-check",
+        help = "Command that must exit zero before the goal may be reported complete (repeatable)"
+    )]
+    pub goal_check: Vec<String>,
+
+    #[arg(
+        long = "goal-max-rounds",
+        help = "Maximum goal rounds before wrapping up [default: 50]"
+    )]
+    pub goal_max_rounds: Option<u32>,
+
+    #[arg(
+        long = "goal-continuation",
+        value_parser = ["continue", "restart"],
+        help = "Whether each goal round keeps the conversation or starts fresh"
+    )]
+    pub goal_continuation: Option<String>,
+
+    #[arg(
+        long = "goal-replace",
+        help = "Replace an unfinished goal instead of refusing"
+    )]
+    pub goal_replace: bool,
 }
 
 impl Cli {
@@ -978,7 +986,9 @@ impl Cli {
             return true;
         }
         #[cfg(feature = "goal")]
-        if !self.goal_check.is_empty() || cfg.goal_checks.as_ref().is_some_and(|c| !c.is_empty()) {
+        if !self.goal_args.goal_check.is_empty()
+            || cfg.goal_checks.as_ref().is_some_and(|c| !c.is_empty())
+        {
             return true;
         }
         cfg.verify_command

@@ -96,7 +96,7 @@ pub struct Config {
     /// working, never what it is allowed to run.
     #[cfg(feature = "goal")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub goal: Option<types::GoalConfig>,
+    pub goal: Option<Box<types::GoalConfig>>,
     /// Commands that must exit zero before a goal may be reported complete.
     ///
     /// Sensitive by construction: it is a top-level key outside
