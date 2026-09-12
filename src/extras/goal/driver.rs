@@ -907,17 +907,9 @@ fn record_outcome(goal: &Goal) {
             verdict.outcome == super::Outcome::Met,
             goal.progress.rounds,
             verdict
-                .evidence
-                .iter()
-                .map(|kind| {
-                    match kind {
-                        super::VerificationKind::SelfReport => "self_report",
-                        super::VerificationKind::Checks => "checks",
-                        super::VerificationKind::VerifyCommand => "verify_command",
-                        super::VerificationKind::Judge => "judge",
-                    }
-                    .to_string()
-                })
+                .evidence_labels()
+                .into_iter()
+                .map(str::to_string)
                 .collect(),
         );
     }

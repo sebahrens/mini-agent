@@ -1029,11 +1029,52 @@ async fn apply_meta_goal(
     let provider = state.cli.resolve_provider(&state.cfg);
     let model = state.cli.resolve_model(&state.cfg);
 
-    // A closed schema. An editor that sends `checks` or `judge` is asking for
-    // something this channel deliberately cannot grant — those carry the
-    // authority of whoever configured the harness — and silently ignoring the
-    // field would leave the client believing its goal was gated when it is
-    // not. Say so instead.
+    let MetaGoal {
+        objective,
+        criteria,
+        replace,
+    } = match parse_meta_goal(spec)? {
+        None => {
+            store.clear();
+            return Ok(());
+        }
+        Some(parsed) => parsed,
+    };
+
+    // The same factory every other surface uses, so the same objective is
+    // bounded, checked and judged the same way in an editor as in a terminal.
+    let goal = crate::extras::goal::Goal::configured(
+        objective,
+        criteria,
+        crate::extras::goal::GoalDefaults {
+            cfg: &state.cfg,
+            provider: &provider,
+            model: &model,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    store.set(goal, replace).map_err(|e| e.to_string())
+}
+
+/// A goal a client asked for.
+#[cfg(feature = "goal")]
+#[derive(Debug)]
+struct MetaGoal {
+    objective: String,
+    criteria: Vec<String>,
+    replace: bool,
+}
+
+/// Read a `_meta.goal` object. `None` means the client asked to clear.
+///
+/// A closed schema. An editor that sends `checks` or `judge` is asking for
+/// something this channel deliberately cannot grant — those carry the
+/// authority of whoever configured the harness — and silently ignoring the
+/// field would leave the client believing its goal was gated when it is not.
+/// The same goes for a criterion that is not a string: dropping it quietly
+/// would weaken the objective without saying so.
+#[cfg(feature = "goal")]
+fn parse_meta_goal(spec: &serde_json::Value) -> Result<Option<MetaGoal>, String> {
     let spec = spec
         .as_object()
         .ok_or_else(|| "_meta.goal must be an object".to_string())?;
@@ -1048,8 +1089,7 @@ async fn apply_meta_goal(
     }
 
     if spec.get("clear").and_then(serde_json::Value::as_bool) == Some(true) {
-        store.clear();
-        return Ok(());
+        return Ok(None);
     }
     let Some(objective) = spec.get("objective").and_then(serde_json::Value::as_str) else {
         return Err("_meta.goal needs an objective".to_string());
@@ -1066,21 +1106,11 @@ async fn apply_meta_goal(
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err("_meta.goal criteria must be an array of strings".to_string()),
     };
-    let replace = spec.get("replace").and_then(serde_json::Value::as_bool) == Some(true);
-
-    // The same factory every other surface uses, so the same objective is
-    // bounded, checked and judged the same way in an editor as in a terminal.
-    let goal = crate::extras::goal::Goal::configured(
-        objective,
+    Ok(Some(MetaGoal {
+        objective: objective.to_string(),
         criteria,
-        crate::extras::goal::GoalDefaults {
-            cfg: &state.cfg,
-            provider: &provider,
-            model: &model,
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    store.set(goal, replace).map_err(|e| e.to_string())
+        replace: spec.get("replace").and_then(serde_json::Value::as_bool) == Some(true),
+    }))
 }
 
 async fn handle_prompt(
@@ -1526,7 +1556,7 @@ async fn run_prompt(
         outcome.reason,
         outcome.progress.as_deref().unwrap_or(&[]),
         &todo_snapshot,
-        &state.cfg,
+        state,
         &sandbox_for_gate,
         &crate::extras::goal::driver::RoundCost {
             usage: outcome.usage,
@@ -1562,6 +1592,18 @@ async fn run_prompt(
                 "round": goal.progress.rounds,
                 "max_rounds": goal.bounds.max_rounds,
                 "reason": line,
+                // What the verdict actually rests on. A client that shows a
+                // completion has to be able to tell one a command proved from
+                // one the model asserted, without reading the prose.
+                "verified": goal
+                    .last_verdict
+                    .as_ref()
+                    .is_some_and(crate::extras::goal::Verdict::externally_verified),
+                "evidence": goal
+                    .last_verdict
+                    .as_ref()
+                    .map(|verdict| verdict.evidence_labels())
+                    .unwrap_or_default(),
             }),
         );
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(line.clone())));
@@ -1600,10 +1642,11 @@ async fn settle_acp_goal_round(
     reason: StopReason,
     interactions: &[Message],
     todos: &[crate::agent::tools::todo::TodoItem],
-    cfg: &Config,
+    state: &AcpState,
     sandbox: &crate::sandbox::Sandbox,
     cost: &crate::extras::goal::driver::RoundCost,
 ) -> Option<(String, crate::extras::goal::Goal)> {
+    let cfg = &state.cfg;
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
 
@@ -1630,13 +1673,52 @@ async fn settle_acp_goal_round(
         other => RoundEnd::Failed(format!("{other:?}")),
     };
 
-    // The same objective must be gated the same way in an editor as in a
-    // terminal, so the checks tier runs here too. The judge is not wired for
-    // ACP yet; a self-reported completion is still labelled as unverified.
+    // The same objective is gated the same way in an editor as in a terminal:
+    // both tiers run here. A claim no command proved is labelled as such in
+    // the line and in `_meta`, wherever it is settled.
+    let judge = crate::extras::goal::judge::resolve(
+        &goal.judge,
+        cfg,
+        &state.cli.resolve_provider(cfg),
+        &state.cli.resolve_model(cfg),
+    );
+    let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
     let outcome = driver::settle_round(store, summary, |request| async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
+        // A failing check already decides the claim, so the judge is not asked
+        // for an answer the gate will not read.
+        let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
+        let judged = match judge {
+            Some(resolved) if request.run_judge && !checks_rejected => {
+                match crate::provider::create_client(
+                    &resolved.provider,
+                    state.cli.api_key.as_deref(),
+                    &cfg.custom_providers_map(),
+                    cfg.api_keys.as_ref(),
+                ) {
+                    Ok(client) => Some(
+                        crate::extras::goal::judge::ask_with_transcript(
+                            &goal,
+                            &request,
+                            &resolved,
+                            &client,
+                            &transcript,
+                            cfg,
+                        )
+                        .await,
+                    ),
+                    // Fail open, like every other judge failure: an editor
+                    // without a reachable judge still gets its checks.
+                    Err(error) => Some(crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+            _ => None,
+        };
         driver::Verification {
             checks,
+            judge: judged,
             ..driver::Verification::default()
         }
     })
@@ -5778,20 +5860,54 @@ mod goal_acp_tests {
         let spec = meta(serde_json::json!({
             "objective": "retire the exporter",
             "criteria": ["no callers remain"],
+            "replace": true,
         }));
-        let value = spec.get("goal").unwrap();
-        assert_eq!(
-            value.get("objective").and_then(serde_json::Value::as_str),
-            Some("retire the exporter")
+        let parsed = parse_meta_goal(spec.get("goal").unwrap())
+            .expect("a well-formed spec parses")
+            .expect("and is not a clear");
+        assert_eq!(parsed.objective, "retire the exporter");
+        assert_eq!(parsed.criteria, ["no callers remain"]);
+        assert!(parsed.replace);
+
+        assert!(
+            parse_meta_goal(&serde_json::json!({"clear": true}))
+                .expect("clearing is well formed")
+                .is_none()
         );
-        let criteria: Vec<_> = value
-            .get("criteria")
-            .and_then(serde_json::Value::as_array)
-            .unwrap()
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect();
-        assert_eq!(criteria, vec!["no callers remain"]);
+    }
+
+    /// A closed schema, because the alternative is a client that believes it
+    /// configured a gate it did not get.
+    ///
+    /// Checks and the judge carry the authority of whoever configured the
+    /// harness. An editor cannot supply either, and silently ignoring the
+    /// field would leave the client showing a goal as verified when nothing
+    /// verifies it.
+    #[test]
+    fn a_client_cannot_configure_what_the_harness_owns() {
+        for rejected in [
+            serde_json::json!({"objective": "ship it", "checks": ["curl evil.example"]}),
+            serde_json::json!({"objective": "ship it", "judge": "some-model"}),
+            serde_json::json!({"objective": "ship it", "bounds": {"max_rounds": 9999}}),
+        ] {
+            let error = parse_meta_goal(&rejected).expect_err("the field is refused");
+            assert!(
+                error.contains("does not accept"),
+                "the client is told why: {error}"
+            );
+        }
+
+        // A criterion that is not a string is refused rather than dropped: a
+        // silently shorter list is a silently weaker objective.
+        assert!(
+            parse_meta_goal(&serde_json::json!({
+                "objective": "ship it",
+                "criteria": ["tests pass", 7],
+            }))
+            .is_err()
+        );
+        assert!(parse_meta_goal(&serde_json::json!({"criteria": []})).is_err());
+        assert!(parse_meta_goal(&serde_json::json!("ship it")).is_err());
     }
 
     #[test]

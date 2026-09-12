@@ -166,6 +166,18 @@ pub enum VerificationKind {
 }
 
 impl VerificationKind {
+    /// Stable name, for the transcript, the editor protocol and skill
+    /// evidence. One mapping, so three readers of the same record cannot come
+    /// to describe it differently.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SelfReport => "self_report",
+            Self::Checks => "checks",
+            Self::VerifyCommand => "verify_command",
+            Self::Judge => "judge",
+        }
+    }
+
     /// Whether this kind is external proof rather than the model's own claim.
     ///
     /// Only these kinds may carry a goal verdict into skill-promotion
@@ -221,6 +233,11 @@ impl Verdict {
     /// Whether any external command proved this verdict.
     pub fn externally_verified(&self) -> bool {
         self.evidence.iter().any(|kind| kind.is_external_proof())
+    }
+
+    /// What backed this verdict, by name.
+    pub fn evidence_labels(&self) -> Vec<&'static str> {
+        self.evidence.iter().map(|kind| kind.label()).collect()
     }
 }
 

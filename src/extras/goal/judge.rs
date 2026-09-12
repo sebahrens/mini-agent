@@ -242,12 +242,17 @@ fn assemble_tail(newest_first: Vec<String>) -> String {
     clip(&kept.join(BLOCK_SEPARATOR), TAIL_BYTES)
 }
 
-/// Blocks from one turn's interactions, newest first.
+/// Bounded tail built from one turn's own interactions.
 ///
-/// The headless driver may be running with no session at all, in which case
-/// the conversation exists only as the turn's record. Judging an empty
-/// transcript would make every completion claim look unsupported, so the round
-/// itself is the source there.
+/// An editor session keeps its history in the protocol's own shape rather than
+/// in a [`crate::session::Session`], so the turn's record is the whole
+/// transcript there. Judging an empty one would make every completion claim
+/// look unsupported.
+pub fn transcript_from_interactions(interactions: &[rig::completion::Message]) -> String {
+    assemble_tail(interaction_blocks(interactions))
+}
+
+/// Blocks from one turn's interactions, newest first.
 fn interaction_blocks(interactions: &[rig::completion::Message]) -> Vec<String> {
     use rig::message::{AssistantContent, Message, UserContent};
 

@@ -165,18 +165,7 @@ fn build_record<'a>(
         evidence: goal
             .last_verdict
             .as_ref()
-            .map(|verdict| {
-                verdict
-                    .evidence
-                    .iter()
-                    .map(|kind| match kind {
-                        super::VerificationKind::SelfReport => "self_report",
-                        super::VerificationKind::Checks => "checks",
-                        super::VerificationKind::VerifyCommand => "verify_command",
-                        super::VerificationKind::Judge => "judge",
-                    })
-                    .collect()
-            })
+            .map(super::Verdict::evidence_labels)
             .unwrap_or_default(),
     }
 }
