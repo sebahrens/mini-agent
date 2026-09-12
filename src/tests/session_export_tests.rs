@@ -31,6 +31,49 @@ fn jsonl_round_trip_preserves_messages() {
     }
 }
 
+/// The objective an export was working toward travels with it, and an export
+/// that carries one still imports. Reading the goal record as a message failed
+/// the whole file, so exporting a session with a goal produced something the
+/// harness itself could not open.
+#[cfg(feature = "goal")]
+#[test]
+fn an_export_carrying_a_goal_still_imports() {
+    let session = sample_session();
+    session
+        .goal_store
+        .set(
+            crate::extras::goal::Goal::new("retire the legacy exporter", vec!["tests pass".into()])
+                .expect("valid goal"),
+            false,
+        )
+        .expect("no prior goal");
+
+    let jsonl = session_to_jsonl(&session).unwrap();
+    let goal_line = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|value| value["type"] == "goal")
+        .expect("the goal travels with the export");
+    assert_eq!(goal_line["objective"], "retire the legacy exporter");
+
+    let messages = parse_jsonl_import(&jsonl).expect("an export with a goal imports");
+    assert_eq!(
+        messages.len(),
+        session.messages.len(),
+        "and the goal record is not mistaken for a message"
+    );
+
+    let parsed = parse_session_file(&jsonl).expect("the session file parses too");
+    match parsed {
+        ParsedSessionFile::Jsonl(session) => assert_eq!(
+            session.messages.len(),
+            messages.len(),
+            "both import paths agree"
+        ),
+        _ => panic!("expected a JSONL session"),
+    }
+}
+
 #[test]
 fn jsonl_first_line_is_session_metadata() {
     let session = sample_session();

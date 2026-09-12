@@ -227,6 +227,13 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         {
             anyhow::bail!("duplicate JSONL session header on line {}", index + 1);
         }
+        // The objective an export was working toward travels with it as a
+        // record of its own. It is not a message and has no role, so reading it
+        // as one failed the whole import — an export that carried a goal could
+        // not be imported at all.
+        if value.get("type").and_then(|item| item.as_str()) == Some("goal") {
+            continue;
+        }
         let message: ImportMessage = serde_json::from_value(value)
             .with_context(|| format!("line {} is not a session message", index + 1))?;
         messages.push(SessionMessage {
@@ -266,7 +273,12 @@ pub fn parse_jsonl_import(content: &str) -> Result<Vec<SessionMessage>> {
         }
         let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("line {} is not valid JSON", idx + 1))?;
-        if value.get("type").and_then(|t| t.as_str()) == Some("session") {
+        // Neither the header nor the goal record is a message; both are
+        // skipped so an export that carries a goal still imports.
+        if matches!(
+            value.get("type").and_then(|t| t.as_str()),
+            Some("session") | Some("goal")
+        ) {
             continue;
         }
         let msg: ImportMessage = serde_json::from_value(value)

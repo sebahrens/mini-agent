@@ -159,6 +159,11 @@ impl SlashCtx<'_> {
         *self.client = next_client;
         *self.agent = Some(next_agent);
         *self.session = session;
+        // Hooks are told about the goal of the session that is now current.
+        // The published record is process-wide, so without this a `Stop` hook
+        // would keep describing the goal of the session just left behind.
+        #[cfg(all(feature = "goal", feature = "hooks"))]
+        crate::extras::goal::publish_hook_info(self.session.goal_store.snapshot().as_ref());
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(&self.session.provider, self.client.clone());

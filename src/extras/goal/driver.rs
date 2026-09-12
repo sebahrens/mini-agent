@@ -794,8 +794,6 @@ pub fn apply_decision(
     let line = match store.with_mut(|goal| {
         super::gate::apply(goal, summary, &decision, judge, verification.cause());
         super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
-        #[cfg(feature = "hooks")]
-        super::publish_hook_info(Some(goal));
         decision_line(goal, &decision)
     }) {
         Some(line) => line,

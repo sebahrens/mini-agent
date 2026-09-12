@@ -784,6 +784,10 @@ static CURRENT_GOAL: std::sync::Mutex<Option<(CompactString, &'static str, u64)>
     std::sync::Mutex::new(None);
 
 /// Publish (or clear) the goal a `Stop` hook should be told about.
+///
+/// Called by every writer on the store rather than only by the gate, so the
+/// envelope is never a round behind and never describes a goal that has since
+/// been cleared, replaced, or left behind with the session it belonged to.
 #[cfg(feature = "hooks")]
 pub fn publish_hook_info(goal: Option<&Goal>) {
     let value = goal
@@ -834,12 +838,18 @@ impl GoalStore {
             });
         }
         *slot = Some(goal);
+        #[cfg(feature = "hooks")]
+        publish_hook_info(slot.as_ref());
         Ok(())
     }
 
     /// Drop the goal entirely.
     pub fn clear(&self) -> Option<Goal> {
-        self.lock().take()
+        let mut slot = self.lock();
+        let dropped = slot.take();
+        #[cfg(feature = "hooks")]
+        publish_hook_info(None);
+        dropped
     }
 
     /// A copy of the current goal.
@@ -867,7 +877,11 @@ impl GoalStore {
 
     /// Mutate the goal in place, returning `None` when there is none.
     pub fn with_mut<T>(&self, f: impl FnOnce(&mut Goal) -> T) -> Option<T> {
-        self.lock().as_mut().map(f)
+        let mut guard = self.lock();
+        let result = guard.as_mut().map(f);
+        #[cfg(feature = "hooks")]
+        publish_hook_info(guard.as_ref());
+        result
     }
 
     /// Record a model report against the current round.
@@ -1422,24 +1436,51 @@ mod tests {
 mod hook_info_tests {
     use super::*;
 
+    /// What a `Stop` hook is told about the goal, from the moment one exists
+    /// to the moment it does not.
+    ///
+    /// One test, because the published record is a process-wide single slot:
+    /// two tests asserting against it would race each other rather than the
+    /// behaviour. It used to be written only by the gate, so the very first
+    /// round — the one a hook is most likely to be watching — reported no goal
+    /// at all, and clearing one left hooks describing it until some other goal
+    /// happened to run a round.
     #[test]
-    fn a_live_goal_is_published_and_a_finished_one_is_not() {
-        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
-        goal.progress.rounds = 4;
-        publish_hook_info(Some(&goal));
-        let info = current_hook_info().expect("a live goal is visible to hooks");
-        assert_eq!(info.id, goal.id.to_string());
+    fn hooks_see_a_goal_from_the_moment_it_is_set_until_it_is_gone() {
+        let store = GoalStore::default();
+        store
+            .set(
+                Goal::new("ship the feature", Vec::new()).expect("valid goal"),
+                false,
+            )
+            .expect("no prior goal");
+        let info = current_hook_info().expect("a goal is visible before its first round");
         assert_eq!(info.status, "active");
-        assert_eq!(info.round, 4);
+        assert_eq!(info.round, 0, "no round has run yet");
 
-        goal.set_status(GoalStatus::Met, None);
-        publish_hook_info(Some(&goal));
-        assert!(
-            current_hook_info().is_none(),
-            "a finished goal is not an active goal"
+        store.with_mut(|goal| goal.progress.rounds = 4);
+        let info = current_hook_info().expect("still visible");
+        assert_eq!(info.round, 4);
+        assert_eq!(
+            info.id,
+            store.snapshot().expect("a goal").id.to_string(),
+            "and it is this goal, not some other"
         );
 
-        publish_hook_info(None);
+        // A finished goal is not an active goal.
+        store.with_mut(|goal| goal.set_status(GoalStatus::Met, None));
+        assert!(current_hook_info().is_none());
+
+        // Nor is a cleared one. A finished goal cannot be revived, so the
+        // live goal to clear is a new one.
+        store
+            .set(
+                Goal::new("the next thing", Vec::new()).expect("valid goal"),
+                true,
+            )
+            .expect("replacing a finished goal is allowed");
+        assert!(current_hook_info().is_some());
+        store.clear();
         assert!(current_hook_info().is_none());
     }
 }

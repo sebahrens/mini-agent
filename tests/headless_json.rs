@@ -403,6 +403,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
         ),
         // `--loop` assembles a goal, an agent and a round driver on the same
         // startup frame, and is dispatched down a different path from `-p`.
+        #[cfg(feature = "loop")]
         (
             &[
                 "--no-sandbox",
