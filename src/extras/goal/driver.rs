@@ -632,6 +632,40 @@ mod tests {
         assert!(third.prompt.contains("carry on"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// An interrupt is the operator stopping the work. Reported as a round
+    /// failure it would be retried, which is the opposite of what was asked
+    /// for, and the goal would keep spending its budget after the signal.
+    #[test]
+    fn an_interrupted_headless_turn_is_cancelled_not_failed() {
+        let goal = Goal::new("ship it", Vec::new()).unwrap();
+        let usage = rig::completion::Usage::default();
+
+        let interrupted = anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED);
+        let summary = summary_from_headless_turn(
+            &goal,
+            &[],
+            &usage,
+            Some(&interrupted),
+            0,
+            false,
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(summary.end, RoundEnd::Cancelled);
+
+        // An ordinary failure is still a failure and is still retried.
+        let failed = anyhow::anyhow!("provider returned 500");
+        let summary = summary_from_headless_turn(
+            &goal,
+            &[],
+            &usage,
+            Some(&failed),
+            0,
+            false,
+            std::time::Duration::from_secs(1),
+        );
+        assert!(matches!(summary.end, RoundEnd::Failed(_)));
+    }
 }
 
 /// What the surface should do once a round has been judged.
@@ -1025,6 +1059,16 @@ pub fn summary_from_headless_turn(
     let round = goal.progress.rounds + 1;
     RoundSummary {
         end: match failure {
+            // An interrupt is the operator stopping the work, not the round
+            // failing. Reported as a failure it would be retried, which is the
+            // opposite of what was asked for.
+            Some(error)
+                if error
+                    .to_string()
+                    .contains(crate::agent::runner::HEADLESS_INTERRUPTED) =>
+            {
+                RoundEnd::Cancelled
+            }
             Some(error) => RoundEnd::Failed(error.to_string()),
             None => RoundEnd::Done,
         },

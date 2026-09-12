@@ -615,6 +615,14 @@ fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
     }
 }
 
+/// What an interrupted headless run reports as its failure.
+///
+/// An interrupt is the operator's decision, not a fault the agent should be
+/// asked to fix, so whoever consumes a turn failure has to be able to tell the
+/// two apart. Matching on a shared constant keeps that from becoming a string
+/// comparison against a message someone later rewords.
+pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
+
 pub(crate) fn tool_may_mutate_workspace(name: &str) -> bool {
     !matches!(
         name,
@@ -980,7 +988,7 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 ) -> anyhow::Result<F::Output> {
     tokio::select! {
         biased;
-        _ = current_work_scope_cancelled() => Err(anyhow::anyhow!("headless agent interrupted")),
+        _ = current_work_scope_cancelled() => Err(anyhow::anyhow!(HEADLESS_INTERRUPTED)),
         result = work => Ok(result),
     }
 }

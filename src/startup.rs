@@ -2061,16 +2061,9 @@ async fn run_headless_goal_rounds(
                     (checks, judged)
                 })
                 .await;
-            let RoundOutcome::Relaunch { relaunch, line } = outcome else {
-                if let RoundOutcome::Stopped { line, .. } = outcome {
-                    eprintln!("{line}");
-                }
-                break;
-            };
-            eprintln!("{line}");
-
-            // The round that just ran is now history for the next one, so it
-            // is persisted before the relaunch rather than at the very end.
+            // The round that just ran is history for whatever comes next, and its
+            // work has to survive an interrupt, so it is persisted before the
+            // gate's decision is acted on rather than only on a relaunch.
             if let Err(error) = crate::extras::goal::driver::persist_round(
                 session,
                 message,
@@ -2085,6 +2078,14 @@ async fn run_headless_goal_rounds(
             ) {
                 eprintln!("warning: failed to save session between goal rounds: {error}");
             }
+            let RoundOutcome::Relaunch { relaunch, line } = outcome else {
+                if let RoundOutcome::Stopped { line, .. } = outcome {
+                    eprintln!("{line}");
+                }
+                break;
+            };
+            eprintln!("{line}");
+
             if verification_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("goal: interrupted during verification");
                 break;
