@@ -295,6 +295,22 @@ pub(crate) fn report_headless_mcp_notices(
 
 // ── Startup state ────────────────────────────────────────────────────────
 
+/// Build a future and move it to the heap inside this short, non-async frame.
+///
+/// `Box::pin(child()).await` in an async fn still evaluates `child()` inside
+/// the caller's poll function, and an unoptimized build reserves that value's
+/// full size there, once per temporary, for as long as the caller is polled.
+/// Startup stacks several such frames on the main thread, which on Windows has
+/// a 1 MiB default stack; `startup_commands_run_with_the_windows_default_stack_budget`
+/// runs the binary under that budget. Building the child here charges the
+/// caller's frame one pointer instead.
+#[inline(never)]
+pub(crate) fn heap_future<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 pub(crate) struct Startup {
     pub cli: Cli,
     pub cfg: Config,
@@ -1325,8 +1341,9 @@ impl Startup {
     }
 
     /// Phase 4: mode dispatch — print, loop, or interactive.
-    /// Box the mode futures so their large states are not embedded in every
-    /// startup frame, including early exits such as `--print-config`.
+    /// Each mode future is built on the heap by [`heap_future`], so neither its
+    /// state nor its construction is reserved in this frame, which stays on the
+    /// stack for the whole run.
     pub(crate) async fn dispatch(mut self) -> anyhow::Result<()> {
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_workspace(self.workspace.root());
@@ -1342,7 +1359,7 @@ impl Startup {
             if let Some(task) = self.session_start_task.take() {
                 let _ = task.await;
             }
-            Box::pin(self.dispatch_print()).await
+            heap_future(|| self.dispatch_print()).await
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
@@ -1350,10 +1367,10 @@ impl Startup {
                 if let Some(task) = self.session_start_task.take() {
                     let _ = task.await;
                 }
-                return Box::pin(self.dispatch_loop()).await;
+                return heap_future(|| self.dispatch_loop()).await;
             }
 
-            Box::pin(self.dispatch_interactive()).await
+            heap_future(|| self.dispatch_interactive()).await
         }
     }
 
@@ -3180,7 +3197,7 @@ mod tests {
             .find("prompts?;")
             .expect("prompt error propagation missing");
         let dispatch = main
-            .find("startup.dispatch().await")
+            .find("startup::heap_future(|| startup.dispatch()).await")
             .expect("startup dispatch missing");
         assert!(
             start < features
@@ -3496,5 +3513,25 @@ mod tests {
         assert_eq!(restored.provider, "anthropic");
         assert_eq!(restored.model, "claude-saved");
         assert!(restored.provider_override_audit.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod heap_future_tests {
+    use super::heap_future;
+
+    #[test]
+    fn heap_future_runs_the_future_it_builds_with_borrowed_and_owned_inputs() {
+        let borrowed = String::from("stack");
+        let owned = String::from("heap");
+        let borrowed_ref = &borrowed;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(heap_future(move || async move {
+            format!("{borrowed_ref}-{owned}")
+        }));
+        assert_eq!(result, "stack-heap");
+        assert_eq!(borrowed, "stack");
     }
 }

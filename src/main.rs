@@ -62,10 +62,15 @@ fn main() -> anyhow::Result<ExitCode> {
         return Ok(exit_code);
     }
 
+    // Parse before the runtime starts. Clap's derived argument builder is the
+    // largest single stack frame at startup (hundreds of KiB in an unoptimized
+    // build); here it sits directly on `main` rather than on top of the
+    // runtime and startup frames, all under the 1 MiB Windows default stack.
+    let cli = cli::Cli::parse();
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
-    match runtime.block_on(Box::pin(run())) {
+    match runtime.block_on(Box::pin(run(cli))) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         // A goal that stopped short is an outcome, not a crash: it exits with
         // its own code so a script can branch on it, and without an error
@@ -93,9 +98,9 @@ fn normal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     builder.enable_all().build().map_err(Into::into)
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(cli: cli::Cli) -> anyhow::Result<()> {
     // Keep the large startup state out of this wrapper's future as CLI grows.
-    let result = Box::pin(run_inner()).await;
+    let result = startup::heap_future(|| run_inner(cli)).await;
     #[cfg(feature = "js")]
     {
         let shutdown = extras::js::supervisor::JsWorkerSupervisor::shutdown_shared().await;
@@ -114,9 +119,7 @@ async fn run() -> anyhow::Result<()> {
     result
 }
 
-async fn run_inner() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
-
+async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
     #[cfg(all(feature = "loop", unix))]
     if cli.loop_verification_policy_check {
         extras::r#loop::verify_workflow_only_headless_relevance()?;
@@ -136,7 +139,7 @@ async fn run_inner() -> anyhow::Result<()> {
 
     #[cfg(feature = "js")]
     if cli.js_runtime_check {
-        extras::js::verify_runtime(workspace).await?;
+        startup::heap_future(|| extras::js::verify_runtime(workspace)).await?;
         println!("JS runtime check: PASS (2)");
         return Ok(());
     }
@@ -194,7 +197,7 @@ async fn run_inner() -> anyhow::Result<()> {
     }
 
     if cli.acp_permission_policy_check {
-        permission::verify_acp_permission_policy().await?;
+        startup::heap_future(permission::verify_acp_permission_policy).await?;
         println!("ACP headless permission policy check: PASS");
         return Ok(());
     }
@@ -257,7 +260,10 @@ async fn run_inner() -> anyhow::Result<()> {
         let [session_id, tool_call_id] = target else {
             anyhow::bail!("--distill-learned-skill takes exactly a session id and a tool call id");
         };
-        extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id).await?;
+        startup::heap_future(|| {
+            extras::js::skills::distill::run(&cli, &cfg, &app_paths, session_id, tool_call_id)
+        })
+        .await?;
         return Ok(());
     }
 
@@ -406,21 +412,26 @@ async fn run_inner() -> anyhow::Result<()> {
                 .unwrap_or_else(|| serde_json::json!({}));
             println!(
                 "{}",
-                crate::extras::hooks::hooks_test_dry_run(tool_name, tool_input).await
+                startup::heap_future(|| crate::extras::hooks::hooks_test_dry_run(
+                    tool_name, tool_input
+                ))
+                .await
             );
             return Ok(());
         }
     }
 
-    let mut startup = startup::Startup::init(
-        cli,
-        cfg,
-        app_paths,
-        workspace,
-        is_first_startup,
-        version_changed,
-        is_interactive,
-    )
+    let mut startup = startup::heap_future(|| {
+        startup::Startup::init(
+            cli,
+            cfg,
+            app_paths,
+            workspace,
+            is_first_startup,
+            version_changed,
+            is_interactive,
+        )
+    })
     .await?;
 
     // ACP mode skips feature initialization, so validate the shared process
@@ -430,7 +441,10 @@ async fn run_inner() -> anyhow::Result<()> {
     // ACP mode: serve and exit before feature init
     #[cfg(feature = "acp")]
     if startup.cli.acp_enabled {
-        return extras::acp::serve(startup.cli, startup.cfg, startup.context).await;
+        return startup::heap_future(|| {
+            extras::acp::serve(startup.cli, startup.cfg, startup.context)
+        })
+        .await;
     }
 
     startup.start_openrouter_pricing_refresh();
@@ -438,5 +452,5 @@ async fn run_inner() -> anyhow::Result<()> {
     let prompts = startup.resolve_prompts().await;
     startup.finish_openrouter_pricing_refresh().await;
     prompts?;
-    startup.dispatch().await
+    startup::heap_future(|| startup.dispatch()).await
 }

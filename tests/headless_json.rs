@@ -454,7 +454,7 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
         if let Some(server) = server {
             assert!(
                 server.join().unwrap().is_ok(),
-                "local provider: {}",
+                "{args:?}: local provider: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
