@@ -449,7 +449,11 @@ mod tests {
         let mut collector = RoundCollector::new();
         std::thread::sleep(Duration::from_millis(20));
         collector.pause_clock();
-        std::thread::sleep(Duration::from_millis(120));
+        // The wait dwarfs the work: counting it would put `active` above 420 ms,
+        // while a loaded runner that oversleeps the 20 ms of work stays far below
+        // the ceiling. A 120 ms wait against a 100 ms ceiling failed on CI when
+        // the work sleep alone overran to 105 ms.
+        std::thread::sleep(Duration::from_millis(400));
         collector.resume_clock();
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
 
@@ -459,7 +463,7 @@ mod tests {
             summary.active
         );
         assert!(
-            summary.active < Duration::from_millis(100),
+            summary.active < Duration::from_millis(250),
             "but the wait for the user is not: {:?}",
             summary.active
         );
