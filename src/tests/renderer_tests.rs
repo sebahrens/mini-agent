@@ -857,3 +857,12 @@ mod viewport_math {
         assert_eq!(input_top_row(24, 1, usize::MAX), 1);
     }
 }
+
+#[test]
+fn picker_floor_row_rises_with_the_statusline() {
+    let mut r = crate::ui::renderer::Renderer::new().unwrap();
+    r.set_statusline_height(1);
+    let one_line = r.picker_floor_row();
+    r.set_statusline_height(3);
+    assert_eq!(r.picker_floor_row() + 2, one_line);
+}

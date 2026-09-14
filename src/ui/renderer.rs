@@ -411,6 +411,19 @@ impl Renderer {
         self.bottom_dirty = true;
     }
 
+    /// The separator row above the input: the first row, counting down, that a
+    /// picker overlay must leave alone. Tracks the statusline height and the
+    /// current input height, so a taller bottom region lifts the overlay.
+    pub(crate) fn picker_floor_row(&self) -> u16 {
+        let (_, rows) = self.terminal_size();
+        input_top_row(
+            rows,
+            self.statusline_reserve(),
+            self.prev_input_height.max(1),
+        )
+        .saturating_sub(1)
+    }
+
     pub fn visible_lines(&self) -> usize {
         let (_, rows) = self.terminal_size();
         let input_height = self.prev_input_height.max(1);
@@ -1085,8 +1098,9 @@ impl Renderer {
     }
 
     /// Re-place the terminal caret where the last full bottom draw left it.
-    /// Needed after a statusline-only redraw, which moves the cursor.
-    fn restore_bottom_cursor(&self) -> io::Result<()> {
+    /// Needed after a statusline-only redraw or a picker overlay, both of
+    /// which move the cursor.
+    pub(crate) fn restore_bottom_cursor(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
         match self.bottom_cursor {
             Some((x, row)) => {

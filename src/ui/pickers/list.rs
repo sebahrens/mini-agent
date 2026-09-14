@@ -19,6 +19,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/help",
     "/history",
     "/init",
+    "/memory",
     "/mode",
     "/model",
     "/models",
@@ -30,9 +31,9 @@ const BASE_COMMANDS: &[&str] = &[
     "/quit",
     "/reasoning",
     "/redo",
-    "/rename",
     "/regen-prompts",
     "/regen-themes",
+    "/rename",
     "/retry",
     "/review",
     "/rewind",
@@ -53,10 +54,10 @@ const BASE_COMMANDS: &[&str] = &[
 /// (that requires the unstable `stmt_expr_attributes` feature), so the
 /// feature-gated commands are appended via conditionally-compiled statements
 /// instead. Feature blocks are ordered alphabetically by feature name, and the
-/// commands within each block are likewise alphabetical. Keep this in sync with
-/// the dispatcher in `crate::ui::slash`.
-fn available_commands() -> Vec<&'static str> {
-    #[allow(unused_mut)]
+/// commands within each block are likewise alphabetical. The result is sorted,
+/// so ranking ties fall back to name order. Every command `/help` lists must
+/// appear here; a test in `crate::ui::slash::help` enforces that.
+pub(crate) fn available_commands() -> Vec<&'static str> {
     let mut cmds: Vec<&'static str> = BASE_COMMANDS.to_vec();
 
     #[cfg(feature = "advisor")]
@@ -68,6 +69,9 @@ fn available_commands() -> Vec<&'static str> {
         cmds.push("/import");
         cmds.push("/share");
     }
+
+    #[cfg(feature = "goal")]
+    cmds.push("/goal");
 
     #[cfg(feature = "git-worktree")]
     {
@@ -85,16 +89,39 @@ fn available_commands() -> Vec<&'static str> {
     #[cfg(feature = "mcp")]
     cmds.push("/mcp");
 
-    #[cfg(feature = "memory")]
-    cmds.push("/memory");
-
     #[cfg(feature = "subagents")]
     {
         cmds.push("/model-subagent");
         cmds.push("/models-subagent");
     }
 
+    cmds.sort_unstable();
     cmds
+}
+
+/// Rank how `name` matches a lowercase `query`, lower is better, or `None` when
+/// it does not contain the query. A leading `/` is ignored so `/re` and `re`
+/// rank the same: exact name, then prefix, then a match starting at a word
+/// boundary, then any other substring.
+pub(crate) fn match_rank(name: &str, query_lower: &str) -> Option<u8> {
+    let name_lower = name.to_lowercase();
+    let bare = name_lower.strip_prefix('/').unwrap_or(&name_lower);
+    let query = query_lower.strip_prefix('/').unwrap_or(query_lower);
+    if query.is_empty() {
+        return Some(0);
+    }
+    if bare == query {
+        return Some(0);
+    }
+    if bare.starts_with(query) {
+        return Some(1);
+    }
+    let position = bare.find(query)?;
+    let at_boundary = bare[..position]
+        .chars()
+        .next_back()
+        .is_some_and(|previous| matches!(previous, '-' | '_' | '.' | ' ' | ':' | '/'));
+    Some(if at_boundary { 2 } else { 3 })
 }
 
 pub struct ListPicker {
@@ -175,12 +202,18 @@ impl ListPicker {
 
     fn filter(&mut self) {
         let query_lower = self.query.to_lowercase();
-        self.matches = self
+        let mut ranked: Vec<(u8, usize)> = self
             .items
             .iter()
-            .filter(|name| name.to_lowercase().contains(&query_lower))
+            .enumerate()
+            .filter_map(|(index, name)| match_rank(name, &query_lower).map(|rank| (rank, index)))
+            .collect();
+        // Stable on the caller's order: for commands that order is alphabetical.
+        ranked.sort_unstable();
+        self.matches = ranked
+            .into_iter()
             .take(50)
-            .cloned()
+            .map(|(_, index)| self.items[index].clone())
             .collect();
         self.selected = 0;
     }
@@ -205,7 +238,7 @@ impl ListPicker {
         self.matches.get(self.selected).map(|s| s.as_str())
     }
 
-    pub fn draw(&self, empty_message: Option<&str>) -> std::io::Result<()> {
+    pub fn draw(&self, empty_message: Option<&str>, floor_row: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
@@ -214,7 +247,8 @@ impl ListPicker {
             self.selected,
             self.monochrome,
             empty_message,
-            4,
+            floor_row,
+            0,
         )
     }
 }

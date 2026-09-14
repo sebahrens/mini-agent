@@ -137,19 +137,16 @@ impl ModelsPicker {
         self.matches.get(self.selected).map(|s| s.as_str())
     }
 
-    pub fn draw(&self) -> std::io::Result<()> {
+    pub fn draw(&self, floor_row: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        let (_cols, rows) = crossterm::terminal::size()?;
         let mut stdout = std::io::stdout();
+        let window = super::picker_window(floor_row, 1, self.matches.len().max(1), self.selected);
 
-        let max_items = (rows.saturating_sub(5)).min(10) as usize;
-        let list_height = max_items.min(self.matches.len().max(1));
-        let top_row = rows.saturating_sub(3).saturating_sub(list_height as u16);
-
-        if rows >= 8 {
-            let header_row = top_row.saturating_sub(1);
+        if let Some(header_row) = window.top_row.checked_sub(1)
+            && floor_row >= 2
+        {
             stdout.execute(MoveTo(0, header_row))?;
             write!(
                 stdout,
@@ -177,6 +174,13 @@ impl ModelsPicker {
             write!(stdout, "{}", ResetColor)?;
         }
 
-        draw_picker_list(&self.matches, self.selected, self.monochrome, None, 5)
+        draw_picker_list(
+            &self.matches,
+            self.selected,
+            self.monochrome,
+            None,
+            floor_row,
+            1,
+        )
     }
 }

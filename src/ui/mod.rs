@@ -228,8 +228,10 @@ pub(crate) fn refresh_display(
     )?;
     if let Some(ref mut picker) = input.picker {
         let was_active = picker.active();
-        picker.draw()?;
+        picker.draw(renderer.picker_floor_row())?;
         if was_active {
+            // Drawing the list moved the caret; put it back in the input.
+            renderer.restore_bottom_cursor()?;
             // The picker painted over the chat and bottom regions, which the
             // dirty-region tracking cannot see; force a full repaint next
             // frame so a closing picker never leaves remnants behind.

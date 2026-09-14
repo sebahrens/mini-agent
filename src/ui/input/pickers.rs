@@ -35,20 +35,22 @@ impl Picker {
         }
     }
 
-    pub fn draw(&mut self) -> std::io::Result<()> {
+    /// Draw the overlay so it ends just above `floor_row`, the separator over
+    /// the input (see `Renderer::picker_floor_row`).
+    pub fn draw(&mut self, floor_row: u16) -> std::io::Result<()> {
         match self {
-            Picker::File(p) => p.draw(),
-            Picker::Command(p) => p.draw(None),
+            Picker::File(p) => p.draw(floor_row),
+            Picker::Command(p) => p.draw(None, floor_row),
             Picker::Prefixed(p, prefix) => {
                 let msg = if *prefix == "/provider " {
                     Some("no matches  (type a registered custom gateway name)")
                 } else {
                     None
                 };
-                p.draw(msg)
+                p.draw(msg, floor_row)
             }
-            Picker::Models(p) => p.draw(),
-            Picker::Rewind(p) => p.draw(),
+            Picker::Models(p) => p.draw(floor_row),
+            Picker::Rewind(p) => p.draw(floor_row),
         }
     }
 }

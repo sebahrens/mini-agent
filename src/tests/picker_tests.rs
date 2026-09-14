@@ -717,3 +717,240 @@ mod file_picker_multibyte {
         assert_eq!(cursor, "🦀 README.md".len());
     }
 }
+
+// --- slash picker interaction contract ---
+
+mod slash_picker_contract {
+    use super::*;
+    use crate::ui::pickers::handlers::handle_file_key;
+    use crate::ui::pickers::list::{available_commands, match_rank};
+    use crate::ui::pickers::{PickerWindow, picker_window};
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Route a key the way `App::handle_key_event` does: an active picker sees
+    /// it first, and a key the picker does not consume reaches the editor.
+    fn press(
+        input: &mut InputEditor,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<CompactString> {
+        let key = KeyEvent::new(code, modifiers);
+        if input.picker.as_ref().is_some_and(Picker::active) && input.handle_picker_key(key) {
+            return None;
+        }
+        input.handle_key(key)
+    }
+
+    fn typed(input: &mut InputEditor, text: &str) {
+        for c in text.chars() {
+            assert_eq!(press(input, KeyCode::Char(c), KeyModifiers::NONE), None);
+        }
+    }
+
+    fn command_picker_open(input: &InputEditor) -> bool {
+        matches!(input.picker.as_ref(), Some(Picker::Command(p)) if p.active)
+    }
+
+    fn highlighted(input: &InputEditor) -> Option<String> {
+        match input.picker.as_ref() {
+            Some(Picker::Command(p)) if p.active => p.selected_name().map(str::to_string),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn backspace_on_the_bare_slash_removes_it_and_a_new_slash_reopens_completion() {
+        for (code, modifiers) in [
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            let mut input = InputEditor::new();
+            typed(&mut input, "/");
+            assert!(command_picker_open(&input));
+
+            assert_eq!(press(&mut input, code, modifiers), None);
+            assert_eq!(input.buffer, "");
+            assert_eq!(input.cursor, 0);
+            assert!(!command_picker_open(&input));
+
+            typed(&mut input, "/mo");
+            assert!(
+                command_picker_open(&input),
+                "a new slash must reopen completion"
+            );
+            assert_eq!(input.buffer, "/mo");
+        }
+    }
+
+    #[test]
+    fn backspace_with_a_query_keeps_the_slash_and_the_picker() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/m");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/");
+        assert_eq!(input.cursor, 1);
+        assert!(command_picker_open(&input));
+    }
+
+    #[test]
+    fn enter_on_a_command_typed_in_full_runs_it_in_one_press() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/help");
+        assert_eq!(highlighted(&input).as_deref(), Some("/help"));
+
+        let submitted = press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(submitted.as_deref(), Some("/help"));
+        assert!(!command_picker_open(&input));
+        assert_eq!(input.buffer, "");
+    }
+
+    #[test]
+    fn enter_on_a_partial_command_inserts_the_highlight_without_submitting() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/hel");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/help ");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert!(!command_picker_open(&input));
+    }
+
+    #[test]
+    fn enter_on_a_command_with_an_argument_picker_opens_that_picker() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/queue");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/queue ");
+        assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/queue ")) if p.active));
+    }
+
+    #[test]
+    fn tab_inserts_the_highlight_and_shift_tab_moves_it_back() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/re");
+        assert_eq!(highlighted(&input).as_deref(), Some("/reasoning"));
+
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(highlighted(&input).as_deref(), Some("/redo"));
+        press(&mut input, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(highlighted(&input).as_deref(), Some("/reasoning"));
+        press(&mut input, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut input, KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(highlighted(&input).as_deref(), Some("/reasoning"));
+
+        assert_eq!(press(&mut input, KeyCode::Tab, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/reasoning ");
+        assert!(!command_picker_open(&input));
+    }
+
+    #[test]
+    fn tab_without_matches_leaves_the_input_and_picker_alone() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/zzz");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/zzz");
+        assert!(command_picker_open(&input));
+    }
+
+    #[test]
+    fn tab_inserts_the_highlight_in_the_argument_picker() {
+        let mut input = InputEditor::new();
+        input.set_prompt_names(vec!["alpha".to_string(), "beta".to_string()]);
+        typed(&mut input, "/prompt");
+        press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        typed(&mut input, "be");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/prompt beta");
+        assert!(!input.picker.as_ref().is_some_and(Picker::active));
+    }
+
+    #[test]
+    fn tab_inserts_the_highlighted_path_in_the_file_picker() {
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("README.md"),
+        ]);
+        let mut buffer: CompactString = "see @".into();
+        let mut cursor = buffer.len();
+        for c in "main".chars() {
+            handle_file_key(
+                &mut buffer,
+                &mut cursor,
+                &mut picker,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+        ));
+        assert_eq!(buffer, "see src/main.rs");
+        assert_eq!(cursor, buffer.len());
+        assert!(!picker.active);
+    }
+
+    #[test]
+    fn prefix_matches_rank_before_substring_matches() {
+        let mut picker = ListPicker::with_static_commands();
+        picker.activate();
+        for c in "re".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(picker.selected_name(), Some("/reasoning"));
+        let position = |name: &str| picker.matches.iter().position(|m| m == name).unwrap();
+        assert!(position("/rewind") < position("/compress"));
+
+        let mut picker = ListPicker::with_static_commands();
+        picker.activate();
+        for c in "mod".chars() {
+            picker.char_input(c);
+        }
+        assert_eq!(&picker.matches[..2], ["/mode", "/model"]);
+    }
+
+    #[test]
+    fn match_rank_orders_exact_prefix_boundary_then_substring() {
+        assert_eq!(match_rank("/model", "model"), Some(0));
+        assert_eq!(match_rank("/model", "/mod"), Some(1));
+        assert_eq!(match_rank("/model-subagent", "sub"), Some(2));
+        assert_eq!(match_rank("/compress", "re"), Some(3));
+        assert_eq!(match_rank("/compress", "xyz"), None);
+        assert_eq!(match_rank("Café", "caf"), Some(1));
+    }
+
+    #[test]
+    fn ties_keep_the_callers_item_order() {
+        let mut picker = ListPicker::new();
+        picker.set_items(vec!["zeta".to_string(), "alpha".to_string()]);
+        picker.activate();
+        assert_eq!(picker.matches, ["zeta", "alpha"]);
+    }
+
+    #[test]
+    fn command_list_is_sorted_unique_and_includes_feature_commands() {
+        let commands = available_commands();
+        let mut sorted = commands.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(commands, sorted);
+        #[cfg(feature = "goal")]
+        assert!(commands.contains(&"/goal"));
+    }
+
+    #[test]
+    fn picker_window_ends_above_the_floor_and_follows_the_selection() {
+        let window = |top_row, start, end| PickerWindow {
+            top_row,
+            start,
+            end,
+        };
+        assert_eq!(picker_window(26, 0, 38, 0), window(16, 0, 10));
+        assert_eq!(picker_window(26, 0, 3, 2), window(23, 0, 3));
+        assert_eq!(picker_window(26, 0, 38, 20), window(16, 15, 25));
+        assert_eq!(picker_window(4, 1, 38, 0), window(1, 0, 3));
+        assert_eq!(picker_window(0, 0, 38, 5), window(0, 5, 5));
+    }
+}

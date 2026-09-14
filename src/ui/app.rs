@@ -910,6 +910,11 @@ impl<'a> App<'a> {
                 }
                 Some(event) = async { self.run.agent_rx.as_mut()?.recv().await } => {
                     self.handle_agent_event(event).await?;
+                    // Streaming paints the chat directly and would leave an
+                    // open picker erased until the next key; repaint it.
+                    if self.input.picker.as_ref().is_some_and(|picker| picker.active()) {
+                        self.refresh()?;
+                    }
                 }
                 Some(ask_req) = async { self.ask_rx.as_mut()?.recv().await } => {
                     // A goal's time budget measures how long the agent worked,

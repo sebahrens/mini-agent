@@ -200,57 +200,26 @@ impl FilePicker {
         self.loading = false;
     }
 
-    pub fn draw(&mut self) -> std::io::Result<()> {
+    pub fn draw(&mut self, floor_row: u16) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
 
         self.try_finish_loading();
 
-        let (cols, rows) = crossterm::terminal::size()?;
-        let mut stdout = std::io::stdout();
-
-        let max_items = (rows.saturating_sub(4)).min(10) as usize;
-
         if self.loading && self.matches.is_empty() {
-            let r = rows.saturating_sub(3);
-            stdout.execute(MoveTo(0, r))?;
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkGrey))
-            )?;
-            write!(stdout, "scanning files...")?;
-            write!(stdout, "{}", ResetColor)?;
-            stdout.flush()?;
-            return Ok(());
+            return super::draw_picker_message("scanning files...", self.monochrome, floor_row);
         }
-
         if self.matches.is_empty() {
-            let r = rows.saturating_sub(4);
-            stdout.execute(MoveTo(0, r))?;
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkGrey))
-            )?;
-            write!(stdout, "no matches")?;
-            write!(stdout, "{}", ResetColor)?;
-            stdout.flush()?;
-            return Ok(());
+            return super::draw_picker_message("no matches", self.monochrome, floor_row);
         }
 
-        let list_height = max_items.min(self.matches.len());
-        let start_idx = self
-            .selected
-            .saturating_sub(list_height / 2)
-            .min(self.matches.len().saturating_sub(list_height));
-        let end_idx = (start_idx + list_height).min(self.matches.len());
+        let (cols, _rows) = crossterm::terminal::size()?;
+        let mut stdout = std::io::stdout();
+        let window = super::picker_window(floor_row, 0, self.matches.len(), self.selected);
 
-        let top_row = rows.saturating_sub(3).saturating_sub(list_height as u16);
-
-        for i in start_idx..end_idx {
-            let render_row = top_row + (i - start_idx) as u16;
+        for i in window.start..window.end {
+            let render_row = window.top_row + (i - window.start) as u16;
             stdout.execute(MoveTo(0, render_row))?;
             write!(
                 stdout,

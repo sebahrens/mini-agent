@@ -67,8 +67,8 @@ impl RewindPicker {
         self.outcome.take()
     }
 
-    pub fn draw(&self) -> std::io::Result<()> {
-        self.list.draw(None)
+    pub fn draw(&self, floor_row: u16) -> std::io::Result<()> {
+        self.list.draw(None, floor_row)
     }
 
     /// Handle a key while the picker is open. Always returns `true`: the picker

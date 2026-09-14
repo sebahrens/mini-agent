@@ -243,7 +243,11 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     feed.push_line(BlockStyle::Plain, "    Ctrl+H     Launch lazygit");
     feed.push_line(
         BlockStyle::Plain,
-        "    @query     File picker (Tab/Enter selects)",
+        "    /command   Command picker (Tab inserts, Enter runs)",
+    );
+    feed.push_line(
+        BlockStyle::Plain,
+        "    @query     File picker (Tab/Enter inserts)",
     );
     feed.push_line(
         BlockStyle::Plain,

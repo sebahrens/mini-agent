@@ -72,18 +72,11 @@ pub fn handle_file_key(
                 true
             }
         }
-        KeyCode::Tab => {
-            if key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
-                picker.select_prev();
-            } else {
-                picker.select_next();
-            }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            picker.select_prev();
             true
         }
-        KeyCode::Up => {
+        KeyCode::BackTab | KeyCode::Up => {
             picker.select_prev();
             true
         }
@@ -91,7 +84,8 @@ pub fn handle_file_key(
             picker.select_next();
             true
         }
-        KeyCode::Enter => {
+        KeyCode::Tab if picker.matches.is_empty() => true,
+        KeyCode::Enter | KeyCode::Tab => {
             if let Some(path) = picker.selected_path() {
                 let path_str = path.to_string_lossy().to_string();
                 if let Some(at) = buffer.rfind('@') {
@@ -121,6 +115,109 @@ pub struct CommandPickerCtx<'a> {
     pub provider_names: &'a [String],
 }
 
+/// Backspace in the command picker. With a query it deletes one query
+/// character; on the bare slash it deletes the slash itself and closes the
+/// picker, so the input is plain again and the next `/` reopens completion.
+fn command_backspace(buffer: &mut CompactString, cursor: &mut usize, picker: &mut ListPicker) {
+    if picker.cursor > 0 {
+        picker.backspace();
+        let byte_in_query = picker
+            .query
+            .char_indices()
+            .nth(picker.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(picker.query.len());
+        let remove_pos = 1 + byte_in_query;
+        if remove_pos < buffer.len() {
+            buffer.remove(remove_pos);
+        }
+        *cursor = prev_char_boundary(buffer, *cursor);
+    } else {
+        if buffer.starts_with('/') {
+            let after_offset = (1 + picker.query.len()).min(buffer.len());
+            *buffer = buffer[after_offset..].into();
+            *cursor = 0;
+        }
+        picker.deactivate();
+    }
+}
+
+/// Whether accepting `command` hands over to a second picker for its argument.
+fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
+    match command {
+        "/prompt" => !ctx.prompt_names.is_empty(),
+        "/agent" => !ctx.agent_names.is_empty(),
+        "/models" => !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty()),
+        "/theme" => !ctx.theme_names.is_empty(),
+        "/provider" => !ctx.provider_names.is_empty(),
+        "/queue" => true,
+        _ => false,
+    }
+}
+
+/// Replace the typed `/query` with the highlighted command plus a space, and
+/// open the argument picker when the command has one.
+fn accept_command(
+    buffer: &mut CompactString,
+    cursor: &mut usize,
+    ctx: &CommandPickerCtx,
+    picker: &mut ListPicker,
+) -> (bool, Option<Picker>) {
+    if let Some(cmd) = picker.selected_name() {
+        let selected = cmd.to_string();
+        let slash_pos = buffer.find('/').unwrap_or(0);
+        let before = &buffer[..slash_pos];
+        let after_offset = slash_pos + 1 + picker.query.len();
+        let after = &buffer[after_offset.min(buffer.len())..];
+        let insertion = if after.is_empty() || after.starts_with(' ') {
+            format!("{} ", selected)
+        } else {
+            format!("{}{}", selected, after)
+        };
+        let new_cursor = before.len() + selected.len() + 1;
+        let replacement = format!("{}{}", before, insertion);
+        *buffer = replacement.into();
+        *cursor = new_cursor;
+
+        if opens_sub_picker(&selected, ctx) {
+            picker.deactivate();
+            let sub = match selected.as_str() {
+                "/models" => {
+                    let mut mp = ModelsPicker::new();
+                    mp.set_groups(
+                        ctx.quick_model_names.to_vec(),
+                        ctx.live_model_names.to_vec(),
+                    );
+                    mp.activate();
+                    Picker::Models(mp)
+                }
+                other => {
+                    let (items, prefix): (Vec<String>, &'static str) = match other {
+                        "/prompt" => (ctx.prompt_names.to_vec(), "/prompt "),
+                        "/agent" => (ctx.agent_names.to_vec(), "/agent "),
+                        "/theme" => (ctx.theme_names.to_vec(), "/theme "),
+                        "/provider" => (ctx.provider_names.to_vec(), "/provider "),
+                        _ => (
+                            vec!["ls".to_string(), "clear".to_string(), "pop".to_string()],
+                            "/queue ",
+                        ),
+                    };
+                    let mut lp = ListPicker::new();
+                    lp.set_items(items);
+                    lp.activate();
+                    Picker::Prefixed(lp, prefix)
+                }
+            };
+            return (true, Some(sub));
+        }
+    }
+    picker.deactivate();
+    (true, None)
+}
+
+/// Keys while the slash-command picker is open. A `false` result means the
+/// key was not consumed: Enter on a command typed in full closes the picker
+/// and returns `false`, so the caller's normal Enter submits the input.
 pub fn handle_command_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -132,30 +229,7 @@ pub fn handle_command_key(
         KeyCode::Char(c)
             if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
         {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = 1 + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-            } else {
-                if buffer.starts_with('/') {
-                    let after: String = buffer
-                        .chars()
-                        .skip(1 + picker.query.chars().count())
-                        .collect();
-                    *buffer = format!("/{}", after).into();
-                    *cursor = 1;
-                }
-                picker.deactivate();
-            }
+            command_backspace(buffer, cursor, picker);
             (true, None)
         }
         KeyCode::Char(c) => {
@@ -172,45 +246,14 @@ pub fn handle_command_key(
             (true, None)
         }
         KeyCode::Backspace => {
-            if picker.cursor > 0 {
-                picker.backspace();
-                let byte_in_query = picker
-                    .query
-                    .char_indices()
-                    .nth(picker.cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(picker.query.len());
-                let remove_pos = 1 + byte_in_query;
-                if remove_pos < buffer.len() {
-                    buffer.remove(remove_pos);
-                }
-                *cursor = prev_char_boundary(buffer, *cursor);
-                (true, None)
-            } else {
-                if buffer.starts_with('/') {
-                    let after: String = buffer
-                        .chars()
-                        .skip(1 + picker.query.chars().count())
-                        .collect();
-                    *buffer = format!("/{}", after).into();
-                    *cursor = 1;
-                }
-                picker.deactivate();
-                (true, None)
-            }
-        }
-        KeyCode::Tab => {
-            if key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
-                picker.select_prev();
-            } else {
-                picker.select_next();
-            }
+            command_backspace(buffer, cursor, picker);
             (true, None)
         }
-        KeyCode::Up => {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            picker.select_prev();
+            (true, None)
+        }
+        KeyCode::BackTab | KeyCode::Up => {
             picker.select_prev();
             (true, None)
         }
@@ -218,77 +261,23 @@ pub fn handle_command_key(
             picker.select_next();
             (true, None)
         }
-        KeyCode::Enter => {
-            if let Some(cmd) = picker.selected_name() {
-                let selected = cmd.to_string();
-                let slash_pos = buffer.find('/').unwrap_or(0);
-                let before = &buffer[..slash_pos];
-                let after_offset = slash_pos + 1 + picker.query.len();
-                let after = &buffer[after_offset.min(buffer.len())..];
-                let insertion = if after.is_empty() || after.starts_with(' ') {
-                    format!("{} ", selected)
-                } else {
-                    format!("{}{}", selected, after)
-                };
-                let new_cursor = before.len() + selected.len() + 1;
-                let replacement = format!("{}{}", before, insertion);
-                *buffer = replacement.into();
-                *cursor = new_cursor;
-
-                if selected == "/prompt" && !ctx.prompt_names.is_empty() {
-                    picker.deactivate();
-                    let mut pp = ListPicker::new();
-                    pp.set_items(ctx.prompt_names.to_vec());
-                    pp.activate();
-                    return (true, Some(Picker::Prefixed(pp, "/prompt ")));
-                }
-                if selected == "/agent" && !ctx.agent_names.is_empty() {
-                    picker.deactivate();
-                    let mut ap = ListPicker::new();
-                    ap.set_items(ctx.agent_names.to_vec());
-                    ap.activate();
-                    return (true, Some(Picker::Prefixed(ap, "/agent ")));
-                }
-                if selected == "/models"
-                    && !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty())
-                {
-                    picker.deactivate();
-                    let mut mp = ModelsPicker::new();
-                    mp.set_groups(
-                        ctx.quick_model_names.to_vec(),
-                        ctx.live_model_names.to_vec(),
-                    );
-                    mp.activate();
-                    return (true, Some(Picker::Models(mp)));
-                }
-                if selected == "/theme" && !ctx.theme_names.is_empty() {
-                    picker.deactivate();
-                    let mut tp = ListPicker::new();
-                    tp.set_items(ctx.theme_names.to_vec());
-                    tp.activate();
-                    return (true, Some(Picker::Prefixed(tp, "/theme ")));
-                }
-                if selected == "/provider" && !ctx.provider_names.is_empty() {
-                    picker.deactivate();
-                    let mut pp = ListPicker::new();
-                    pp.set_items(ctx.provider_names.to_vec());
-                    pp.activate();
-                    return (true, Some(Picker::Prefixed(pp, "/provider ")));
-                }
-                if selected == "/queue" {
-                    picker.deactivate();
-                    let mut qp = ListPicker::new();
-                    qp.set_items(vec![
-                        "ls".to_string(),
-                        "clear".to_string(),
-                        "pop".to_string(),
-                    ]);
-                    qp.activate();
-                    return (true, Some(Picker::Prefixed(qp, "/queue ")));
-                }
+        KeyCode::Tab => {
+            if picker.matches.is_empty() {
+                return (true, None);
             }
-            picker.deactivate();
-            (true, None)
+            accept_command(buffer, cursor, ctx, picker)
+        }
+        KeyCode::Enter => {
+            let typed_in_full = picker.selected_name().is_some_and(|cmd| {
+                cmd.strip_prefix('/') == Some(picker.query.as_str())
+                    && buffer.as_str() == cmd
+                    && !opens_sub_picker(cmd, ctx)
+            });
+            if typed_in_full {
+                picker.deactivate();
+                return (false, None);
+            }
+            accept_command(buffer, cursor, ctx, picker)
         }
         KeyCode::Esc => {
             let slash_pos = buffer.find('/').unwrap_or(0);
@@ -382,18 +371,11 @@ pub fn handle_prefixed_key(
                 true
             }
         }
-        KeyCode::Tab => {
-            if key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
-                picker.select_prev();
-            } else {
-                picker.select_next();
-            }
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            picker.select_prev();
             true
         }
-        KeyCode::Up => {
+        KeyCode::BackTab | KeyCode::Up => {
             picker.select_prev();
             true
         }
@@ -401,7 +383,8 @@ pub fn handle_prefixed_key(
             picker.select_next();
             true
         }
-        KeyCode::Enter => {
+        KeyCode::Tab if picker.matches.is_empty() => true,
+        KeyCode::Enter | KeyCode::Tab => {
             if let Some(name) = picker.selected_name() {
                 let after_offset = prefix_len + picker.query.chars().count();
                 let before: String = buffer.chars().take(prefix_len).collect();

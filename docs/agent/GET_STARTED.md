@@ -172,7 +172,8 @@ Here is some keybindings to speed up your coding experience:
 | `PgUp` / `PgDn` | Scroll chat |
 | `Home` / `End` | Jump to top/bottom |
 | `Shift+Enter` / `Alt+Enter` | Insert a newline |
-| `@<query>` | Open the file picker; Tab or Enter selects |
+| `/` | Open the command picker; Tab inserts the highlight, Enter runs a command typed in full |
+| `@<query>` | Open the file picker; Tab or Enter inserts the highlighted path |
 | `Tab` | Insert two spaces when no picker is active |
 
 ## 5. CLI flags

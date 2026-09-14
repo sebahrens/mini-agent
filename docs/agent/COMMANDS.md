@@ -466,7 +466,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
 | `Ctrl+R` | Toggle reasoning visibility. |
-| `@<query>` | Activate the file picker; Tab/Enter selects and Escape closes it. |
+| `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. |
+| `@<query>` | Activate the file picker; Tab or Enter inserts the highlighted path and Escape closes it. |
 | `Tab` | Insert two spaces when no picker is active. |
 | `Up / Down` | Move vertically in multiline input; at an edge, navigate command history. |
 | `PageUp / PageDown` | Scroll viewport. |

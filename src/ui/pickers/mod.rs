@@ -67,44 +67,86 @@ pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
     Some(score)
 }
 
+/// Where a list overlay sits: rows `top_row..floor_row` show
+/// `matches[start..end]`, scrolled to keep the selection in view.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PickerWindow {
+    pub top_row: u16,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Lay out a list of `len` entries ending just above `floor_row` (the
+/// separator over the input), leaving `reserved_above` rows for a header and
+/// showing at most ten entries.
+pub(crate) fn picker_window(
+    floor_row: u16,
+    reserved_above: u16,
+    len: usize,
+    selected: usize,
+) -> PickerWindow {
+    let max_items = floor_row.saturating_sub(reserved_above).min(10) as usize;
+    let height = max_items.min(len);
+    let start = selected
+        .saturating_sub(height / 2)
+        .min(len.saturating_sub(height));
+    PickerWindow {
+        top_row: floor_row.saturating_sub(height as u16),
+        start,
+        end: (start + height).min(len),
+    }
+}
+
+/// Paint a one-line status message (e.g. "no matches") on the row just above
+/// `floor_row`.
+pub(crate) fn draw_picker_message(
+    message: &str,
+    monochrome: bool,
+    floor_row: u16,
+) -> std::io::Result<()> {
+    let Some(row) = floor_row.checked_sub(1) else {
+        return Ok(());
+    };
+    let mut stdout = std::io::stdout();
+    stdout.execute(MoveTo(0, row))?;
+    write!(
+        stdout,
+        "{}",
+        Clear(crossterm::terminal::ClearType::CurrentLine)
+    )?;
+    write!(
+        stdout,
+        "{}{}{}",
+        SetForegroundColor(resolve_color(Color::DarkGrey, monochrome)),
+        message,
+        ResetColor
+    )?;
+    stdout.flush()
+}
+
 pub(crate) fn draw_picker_list(
     matches: &[String],
     selected: usize,
     monochrome: bool,
     empty_message: Option<&str>,
-    bottom_reserved: u16,
+    floor_row: u16,
+    reserved_above: u16,
 ) -> std::io::Result<()> {
-    let (cols, rows) = crossterm::terminal::size()?;
-    let mut stdout = std::io::stdout();
-
-    let max_items = (rows.saturating_sub(bottom_reserved)).min(10) as usize;
-
     if matches.is_empty() {
-        let r = rows.saturating_sub(4);
-        stdout.execute(MoveTo(0, r))?;
-        let color = resolve_color(Color::DarkGrey, monochrome);
-        write!(stdout, "{}", SetForegroundColor(color))?;
-        write!(stdout, "{}", empty_message.unwrap_or("no matches"))?;
-        write!(stdout, "{}", ResetColor)?;
-        stdout.flush()?;
-        return Ok(());
+        return draw_picker_message(empty_message.unwrap_or("no matches"), monochrome, floor_row);
     }
 
-    let list_height = max_items.min(matches.len());
-    let start_idx = selected
-        .saturating_sub(list_height / 2)
-        .min(matches.len().saturating_sub(list_height));
-    let end_idx = (start_idx + list_height).min(matches.len());
-
-    let top_row = rows.saturating_sub(3).saturating_sub(list_height as u16);
+    let (cols, _rows) = crossterm::terminal::size()?;
+    let mut stdout = std::io::stdout();
+    let window = picker_window(floor_row, reserved_above, matches.len(), selected);
 
     for (i, item) in matches
         .iter()
         .enumerate()
-        .skip(start_idx)
-        .take(end_idx - start_idx)
+        .skip(window.start)
+        .take(window.end - window.start)
     {
-        let render_row = top_row + (i - start_idx) as u16;
+        let render_row = window.top_row + (i - window.start) as u16;
         stdout.execute(MoveTo(0, render_row))?;
         write!(
             stdout,
