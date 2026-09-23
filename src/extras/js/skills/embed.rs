@@ -1784,8 +1784,7 @@ mod skills_embed_live_tests {
     #[test]
     #[ignore = "downloads the BGE model and requires ONNX Runtime; see module docs"]
     fn skills_embed_live_produces_normalized_bge_vectors() {
-        let backend =
-            fastembed_backend::FastembedBackend::new().expect("fastembed model must initialize");
+        let backend = shared_backend();
 
         assert_eq!(backend.model_id(), "BAAI/bge-small-en-v1.5");
         assert_eq!(backend.dimensions(), 384);
@@ -1802,8 +1801,7 @@ mod skills_embed_live_tests {
     #[test]
     #[ignore = "downloads the BGE model and requires ONNX Runtime; see module docs"]
     fn skills_embed_live_batch_is_semantically_ordered() {
-        let backend =
-            fastembed_backend::FastembedBackend::new().expect("fastembed model must initialize");
+        let backend = shared_backend();
 
         let documents = vec![
             "a function that parses JSON text".to_string(),
