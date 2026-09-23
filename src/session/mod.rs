@@ -868,6 +868,14 @@ impl Session {
         self.add_message_with_tool_data(role, content, None, None);
     }
 
+    /// Record an explicit `!command` interaction. The command and its output
+    /// are stored together as one user-side message so the model never
+    /// mistakes shell output for words it authored.
+    pub fn add_shell_interaction(&mut self, interaction: &str, output: &str) {
+        let content = shell_interaction_message(interaction, output);
+        self.add_message(MessageRole::User, &content);
+    }
+
     /// Record the provider's own identity and reasoning items for the tool call
     /// already persisted under `tool_call_id`.
     pub(crate) fn record_tool_call_provenance(
@@ -1748,6 +1756,55 @@ fn apply_token_estimate_delta(value: u64, old: u64, new: u64) -> u64 {
         value.saturating_sub(old.saturating_sub(new))
     } else {
         value.saturating_add(new.saturating_sub(old))
+    }
+}
+
+const SHELL_INTERACTION_PREFIX: &str = "User ran `";
+const SHELL_INTERACTION_HEADER_END: &str = "`:\n";
+
+/// Render an explicit `!command` interaction (including its leading `!`) and
+/// its output as the user-side transcript text stored in the session. The
+/// output fence grows past any backtick run inside the output.
+pub(crate) fn shell_interaction_message(interaction: &str, output: &str) -> String {
+    let longest_run = output.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    format!(
+        "{SHELL_INTERACTION_PREFIX}{interaction}{SHELL_INTERACTION_HEADER_END}{fence}\n{output}\n{fence}"
+    )
+}
+
+/// The original `!command` of a message recorded by
+/// [`Session::add_shell_interaction`], or `None` for any other message.
+pub(crate) fn shell_interaction_command(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(SHELL_INTERACTION_PREFIX)?;
+    let (command, _) = rest.split_once(SHELL_INTERACTION_HEADER_END)?;
+    command.starts_with('!').then_some(command)
+}
+
+#[cfg(test)]
+mod shell_interaction_tests {
+    use super::*;
+
+    #[test]
+    fn shell_interaction_is_one_user_message_with_fenced_output() {
+        let mut session = Session::new("openai", "model", 1_000, "");
+        session.add_shell_interaction("!ls -a", "a\nb\n");
+        assert_eq!(session.messages.len(), 1);
+        let message = &session.messages[0];
+        assert_eq!(message.role, MessageRole::User);
+        assert_eq!(message.content, "User ran `!ls -a`:\n```\na\nb\n```");
+        assert_eq!(shell_interaction_command(&message.content), Some("!ls -a"));
+    }
+
+    #[test]
+    fn fence_outgrows_backticks_in_output_and_plain_text_is_not_a_command() {
+        let content = shell_interaction_message("!cat x.md", "```rust\nfn f() {}\n```");
+        assert!(content.starts_with("User ran `!cat x.md`:\n````\n```rust"));
+        assert!(content.ends_with("```\n````"));
+        assert_eq!(shell_interaction_command(&content), Some("!cat x.md"));
+        assert_eq!(shell_interaction_command("User ran `ls`:\nhi"), None);
+        assert_eq!(shell_interaction_command("hello"), None);
     }
 }
 

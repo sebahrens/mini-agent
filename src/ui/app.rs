@@ -19,7 +19,7 @@ use crate::sandbox::CommandCancellation;
 use crate::sandbox::{
     CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
 };
-use crate::session::{GitStatus, MessageRole, Session};
+use crate::session::{GitStatus, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::{InputEditor, Picker};
@@ -167,6 +167,29 @@ pub(crate) fn clipboard_shortcut(
         Some(ClipboardShortcut::Paste)
     } else {
         None
+    }
+}
+
+/// Whether releasing the left button should copy the transcript selection.
+/// Only a real drag copies; a plain click (no movement, one line) does not.
+fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => dragged || start != end,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod mouse_selection_tests {
+    use super::mouse_up_copies;
+
+    #[test]
+    fn plain_click_does_not_copy_but_a_drag_does() {
+        assert!(!mouse_up_copies(false, Some(4), Some(4)));
+        assert!(mouse_up_copies(true, Some(4), Some(4)));
+        assert!(mouse_up_copies(false, Some(4), Some(6)));
+        assert!(mouse_up_copies(true, Some(6), Some(4)));
+        assert!(!mouse_up_copies(true, None, None));
     }
 }
 
@@ -470,7 +493,7 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
-        let terminal_guard = TerminalGuard::new()?;
+        let terminal_guard = TerminalGuard::new(ui.cfg.resolve_mouse_capture())?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -1067,14 +1090,16 @@ impl<'a> App<'a> {
                         self.renderer.selection_active = true;
                         self.renderer.selection_start = Some(idx);
                         self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_dragged = false;
                     }
                 }
             }
             UserEvent::MouseDrag { row } => {
-                if self.renderer.selection_active
-                    && let Some(idx) = self.renderer.buffer_line_at_row(row)
-                {
-                    self.renderer.selection_end = Some(idx);
+                if self.renderer.selection_active {
+                    self.renderer.selection_dragged = true;
+                    if let Some(idx) = self.renderer.buffer_line_at_row(row) {
+                        self.renderer.selection_end = Some(idx);
+                    }
                 }
             }
             UserEvent::MouseUp { row } => {
@@ -1082,7 +1107,16 @@ impl<'a> App<'a> {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end = Some(idx);
                     }
-                    self.copy_selection_to_clipboard().await?;
+                    if mouse_up_copies(
+                        self.renderer.selection_dragged,
+                        self.renderer.selection_start,
+                        self.renderer.selection_end,
+                    ) {
+                        self.copy_selection_to_clipboard().await?;
+                    } else {
+                        // A plain click: drop the one-line highlight silently.
+                        self.renderer.clear_selection();
+                    }
                 }
             }
             UserEvent::LinkOpenFailed(error) => {
@@ -2603,8 +2637,7 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
 
-        self.ui.session.add_message(MessageRole::User, text);
-        self.ui.session.add_message(MessageRole::Assistant, &result);
+        self.ui.session.add_shell_interaction(text, &result);
         if !self.ui.cli.no_session {
             let _ = crate::session::chat_history::append_entry(
                 &crate::session::chat_history::ChatHistoryEntry {
