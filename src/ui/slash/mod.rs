@@ -583,6 +583,14 @@ where
     Ok((first_kept_index, tokens_before))
 }
 
+/// Commands `providers::handle` owns (apart from `/models-add`, which needs
+/// its own split). Subagent model commands are routed in every build so a
+/// build without the feature can say so instead of doing nothing.
+pub(crate) fn routes_to_providers(command: &str) -> bool {
+    matches!(command, "/provider" | "/model" | "/models")
+        || providers::subagent_model_command(command).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_slash(
     text: &str,
@@ -625,9 +633,7 @@ pub async fn handle_slash(
             let model_parts: SmallVec<[&str; 6]> = text.split_whitespace().collect();
             providers::handle(&model_parts, &mut ctx).await
         }
-        "/provider" | "/model" | "/models" | "/model-subagent" | "/models-subagent" => {
-            providers::handle(&parts, &mut ctx).await
-        }
+        command if routes_to_providers(command) => providers::handle(&parts, &mut ctx).await,
         "/prompt" | "/agent" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }

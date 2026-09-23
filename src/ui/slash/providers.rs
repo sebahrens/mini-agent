@@ -12,11 +12,53 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         "/model" => handle_model(parts, ctx).await,
         "/models" => handle_models(parts, ctx).await,
         "/models-add" => handle_models_add(parts, ctx).await,
-        #[cfg(feature = "subagents")]
-        "/model-subagent" => handle_model_subagent(parts, ctx).await,
-        #[cfg(feature = "subagents")]
-        "/models-subagent" => handle_models_subagent(parts, ctx).await,
-        _ => Ok(()),
+        name => match subagent_model_command(name) {
+            Some(command) => handle_subagent_model_command(command, parts, ctx).await,
+            None => Ok(()),
+        },
+    }
+}
+
+/// The subagent model commands, whatever spelling was typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentModelCommand {
+    /// Show or switch the subagent model.
+    Model,
+    /// List quick models or switch the subagent to one.
+    Models,
+}
+
+/// Recognise a subagent model command. Routed in every build so a build
+/// without the `subagents` feature reports why it does nothing.
+pub(crate) fn subagent_model_command(name: &str) -> Option<SubagentModelCommand> {
+    match name {
+        "/model-subagent" => Some(SubagentModelCommand::Model),
+        "/models-subagent" => Some(SubagentModelCommand::Models),
+        _ => None,
+    }
+}
+
+/// Shown when a subagent model command runs in a build without subagents.
+#[cfg(any(test, not(feature = "subagents")))]
+pub(crate) const SUBAGENTS_DISABLED: &str = "subagent commands require the 'subagents' feature: cargo install --path . --features subagents";
+
+async fn handle_subagent_model_command(
+    command: SubagentModelCommand,
+    parts: &[&str],
+    ctx: &mut SlashCtx<'_>,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "subagents")]
+    {
+        match command {
+            SubagentModelCommand::Model => handle_model_subagent(parts, ctx).await,
+            SubagentModelCommand::Models => handle_models_subagent(parts, ctx).await,
+        }
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        let _ = (command, parts);
+        write_error(ctx.renderer, SUBAGENTS_DISABLED);
+        Ok(())
     }
 }
 
@@ -572,6 +614,31 @@ async fn model_for_subagent(
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod subagent_command_tests {
+    use super::{SUBAGENTS_DISABLED, SubagentModelCommand, subagent_model_command};
+
+    #[test]
+    fn subagent_model_commands_are_recognised_in_every_build() {
+        assert_eq!(
+            subagent_model_command("/model-subagent"),
+            Some(SubagentModelCommand::Model)
+        );
+        assert_eq!(
+            subagent_model_command("/models-subagent"),
+            Some(SubagentModelCommand::Models)
+        );
+        assert_eq!(subagent_model_command("/model"), None);
+        assert!(crate::ui::slash::routes_to_providers("/model-subagent"));
+        assert!(crate::ui::slash::routes_to_providers("/models-subagent"));
+    }
+
+    #[test]
+    fn disabled_message_names_the_feature() {
+        assert!(SUBAGENTS_DISABLED.contains("'subagents' feature"));
+    }
 }
 
 #[cfg(test)]
