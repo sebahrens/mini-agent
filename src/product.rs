@@ -8,6 +8,15 @@ pub const PUBLIC_NAME: &str = "mini-agent";
 pub const REPOSITORY_SLUG: &str = "sebahrens/mini-agent";
 pub const REPOSITORY_URL: &str = "https://github.com/sebahrens/mini-agent";
 
+/// Single visible global home below the user's home directory (like `~/.codex`).
+///
+/// Adopted automatically only for fresh installs or when the directory already
+/// exists; an existing legacy `zerostack` install keeps its roots until the user
+/// explicitly creates this directory or sets [`GLOBAL_HOME_ENV`].
+pub const GLOBAL_HOME_DIRECTORY: &str = ".mini-agent";
+/// Environment override that places every global root below one directory.
+pub const GLOBAL_HOME_ENV: &str = "MINI_AGENT_HOME";
+
 pub const LEGACY_APP_COMPONENT: &str = "zerostack";
 pub const LEGACY_PROJECT_DIRECTORY: &str = ".zerostack";
 #[allow(dead_code)] // Documents the compatibility family checked by release tooling and tests.
@@ -31,5 +40,8 @@ mod tests {
         assert_eq!(LEGACY_PROJECT_DIRECTORY, ".zerostack");
         assert_eq!(LEGACY_ENV_PREFIX, "ZEROSTACK_");
         assert_ne!(PUBLIC_NAME, LEGACY_APP_COMPONENT);
+        assert_eq!(GLOBAL_HOME_DIRECTORY, format!(".{PUBLIC_NAME}"));
+        assert_eq!(GLOBAL_HOME_ENV, "MINI_AGENT_HOME");
+        assert_ne!(GLOBAL_HOME_DIRECTORY, LEGACY_PROJECT_DIRECTORY);
     }
 }

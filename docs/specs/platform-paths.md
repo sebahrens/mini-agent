@@ -1,10 +1,10 @@
 # Cross-Platform Paths and Persistent Storage
 
 - **Document role**: normative cross-phase foundation
-- **Specification version**: 1.2.0
+- **Specification version**: 1.3.0
 - **Delivery status**: delivered
 - **Owner**: mini-agent maintainers
-- **Last reconciled**: 2026-09-06
+- **Last reconciled**: 2026-09-23
 - **Entry dependency**: none
 - **Exit dependency**: every required test below and every Foundation blocker
 - **Target platforms**: Linux, macOS, and Windows MSVC
@@ -62,14 +62,30 @@ current directory must not redirect user-global state after startup.
 
 ### Override precedence
 
-| Root | Override | Default source |
-|------|----------|----------------|
-| Configuration | `ZS_CONFIG_DIR` | platform config directory |
-| Portable durable data | `ZS_DATA_DIR` | platform data directory |
-| Machine-local durable data | `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` for backward compatibility | platform local-data directory |
-| Runtime state | `ZS_STATE_DIR`, then `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` | platform state/local-data directory |
-| Rebuildable cache | `ZS_CACHE_DIR` | platform cache directory |
-| Credentials | `ZS_CREDENTIALS_DIR` | `<local_data_dir>/credentials` |
+| Root | Override | Global home (`<home>`) | Legacy default source |
+|------|----------|------------------------|-----------------------|
+| Configuration | `ZS_CONFIG_DIR` | `<home>` | platform config directory |
+| Portable durable data | `ZS_DATA_DIR` | `<home>` | platform data directory |
+| Machine-local durable data | `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` for backward compatibility | `<home>` | platform local-data directory |
+| Runtime state | `ZS_STATE_DIR`, then `ZS_LOCAL_DATA_DIR`, then `ZS_DATA_DIR` | `<home>/state` | platform state/local-data directory |
+| Rebuildable cache | `ZS_CACHE_DIR` | `<home>/cache` | platform cache directory |
+| Credentials | `ZS_CREDENTIALS_DIR` | `<local_data_dir>/credentials` (`<home>/credentials`) | `<local_data_dir>/credentials` |
+
+Each root is resolved independently: a per-root `ZS_*_DIR` override (and its documented cascade)
+always wins. Roots without an override use the **global home** when one is selected, otherwise the
+legacy per-OS platform mapping below. The global home is selected in this order:
+
+1. `MINI_AGENT_HOME`, when set (validated like every `ZS_*` override).
+2. `~/.mini-agent`, when that path already exists (the user adopted it, or an earlier fresh start
+   created it).
+3. `~/.mini-agent`, when no legacy `zerostack` configuration, data, or local-data root exists
+   (fresh install). A legacy cache root alone does not count: it is rebuildable.
+4. Otherwise no global home: an existing legacy install keeps its legacy roots unchanged. Startup
+   never moves user data because the product identity changed.
+
+Production probes steps 2-3 once in `PathEnvironment::from_process` and records the result as
+`PathOverrides::default_layout`; tests inject it and never inspect the real home directory. The
+VS Code extension (`editors/vscode/src/config.ts`) resolves its config root with the same order.
 
 Every override expands a leading `~` using the same helper and is then required to be absolute.
 An unset override falls through to the next source in the table. A set-but-empty value, a missing
@@ -115,7 +131,10 @@ store and are never authorized by project-config trust.
 
 ## Platform mapping
 
-All rows append the application component `zerostack` to the operating-system base directory.
+With a global home, every platform uses the same layout in the table above (`~/.mini-agent` is
+`%USERPROFILE%\.mini-agent` on Windows). The legacy mapping below applies only when no global home
+is selected. All legacy rows append the application component `zerostack` to the
+operating-system base directory.
 
 | Root | Linux | macOS | Windows |
 |------|-------|-------|---------|
@@ -312,6 +331,26 @@ An interactive client reports every conflicting candidate and requires an explic
 Headless/ACP startup never prompts or chooses: a required config conflict aborts startup with a
 typed error, while an optional feature conflict disables only that feature and emits a diagnostic.
 Neither path creates a new canonical artifact until the conflict is resolved.
+
+### Adopting `~/.mini-agent` from a legacy install
+
+Adoption is always explicit. Creating `~/.mini-agent` (or setting `MINI_AGENT_HOME`) selects the
+global home on the next start. The existing marker-guarded, copy-without-delete migration then
+copies configuration, sessions, tool outputs, loop transcripts, logs, chat history, hook trust,
+the welcome marker, architecture prompt state, memory, and the learned skill database from the
+legacy `zerostack` config/data roots, which are already documented legacy candidates. Other
+artifacts (prompts, themes, agents, docs, credentials, remaining state) are not copied
+automatically; to keep them, copy the legacy trees into the new home before the first start,
+because the legacy layouts map one-to-one onto the home layout:
+
+| Platform | Copy into `~/.mini-agent` | Copy into `~/.mini-agent/state` |
+|----------|---------------------------|---------------------------------|
+| Linux | `~/.config/zerostack/.` and `~/.local/share/zerostack/.` (includes `credentials/`) | `~/.local/state/zerostack/.` |
+| macOS | `~/Library/Application Support/zerostack/.` (includes `state/` and `credentials/`) | — |
+| Windows | `%APPDATA%\zerostack\*` and `%LOCALAPPDATA%\zerostack\*` (includes `state\`, `credentials\`) | — |
+
+The cache is rebuildable and need not be copied. Legacy sources are never deleted by the
+application; remove them manually once the new home is verified.
 
 User documentation may describe these locations as supported because the migration and platform
 test gates have passed. Windows storage/security claims remain qualified by the exact protected-
