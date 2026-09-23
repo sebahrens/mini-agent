@@ -12,7 +12,7 @@ use crate::agent::runner::{convert_history, run_print};
 use crate::agent::tools::{EditTool, ToolError, WriteTool};
 use crate::extras::js::host::AllowConfig;
 use crate::extras::js::tool::JsTool;
-use crate::extras::subagents::task_tool::{TaskArgs, run_scripted_task_for_eval};
+use crate::extras::subagents::task_tool::{TaskArgs, TaskTool, run_scripted_task_for_eval};
 use crate::retry::RetryConfig;
 use crate::sandbox::Sandbox;
 use crate::session::{MessageRole, Session};
@@ -192,30 +192,26 @@ struct EvalTaskTool {
     responses: Vec<String>,
 }
 
+impl EvalTaskTool {
+    fn production(&self) -> TaskTool {
+        TaskTool::new(None, None, true).with_workspace_binding(self.workspace.clone())
+    }
+}
+
 impl Tool for EvalTaskTool {
     const NAME: &'static str = "task";
     type Error = ToolError;
     type Args = TaskArgs;
     type Output = String;
 
+    // The eval exercises the production contract: description and schema are
+    // taken from the real task tool rather than a hand-maintained copy.
     fn description(&self) -> String {
-        "Run deterministic read-only fixture subagents through the production task scheduler."
-            .to_string()
+        Tool::description(&self.production())
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "prompts": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1
-                },
-                "agent_type": { "type": "string" }
-            },
-            "required": ["prompts"]
-        })
+        Tool::parameters(&self.production())
     }
 
     async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
@@ -484,6 +480,21 @@ fn scripted_case(
         }
         other => panic!("no scripted provider case for {other}"),
     }
+}
+
+#[test]
+fn eval_task_tool_advertises_the_production_task_contract() {
+    let dir = EvalDirectory::new();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(dir.path()).unwrap());
+    let eval = EvalTaskTool {
+        workspace: workspace.clone(),
+        responses: Vec::new(),
+    };
+    let production = TaskTool::new(None, None, true).with_workspace_binding(workspace);
+
+    assert_eq!(Tool::parameters(&eval), Tool::parameters(&production));
+    assert_eq!(Tool::description(&eval), Tool::description(&production));
+    assert!(Tool::parameters(&eval)["properties"]["briefs"].is_object());
 }
 
 #[test]
