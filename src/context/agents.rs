@@ -750,7 +750,7 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             credentials_dir: root.join("credentials"),
-            project_dir: Some(root.join(".zerostack")),
+            project_dir: Some(root.join(crate::product::LEGACY_PROJECT_DIRECTORY)),
         };
         crate::paths::prepare_storage_roots(&paths).unwrap();
         let agent_dir = root.join(".zerostack/agents");

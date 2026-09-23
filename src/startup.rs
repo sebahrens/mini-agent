@@ -1303,6 +1303,15 @@ impl Startup {
             // any directive that would raise the mode above the user's
             // CLI/config selection, so this can only narrow authority.
             if let Some(name) = &self.context.current_prompt_name
+                && let Ok(paths) = crate::paths::process_paths()
+            {
+                guard.set_prompt_grant_offer(crate::context::prompts::prompt_grant_offer(
+                    &self.context.prompts,
+                    name,
+                    &paths,
+                ));
+            }
+            if let Some(name) = &self.context.current_prompt_name
                 && let Some(mode) =
                     crate::permission::resolve_startup_prompt_mode(&self.context.prompts, name)
                 && !guard.set_prompt_mode(mode)

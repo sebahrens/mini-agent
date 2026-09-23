@@ -104,7 +104,7 @@ mini-agent → ACP frame → client.ts → panel.ts → postMessage → message 
 
 | Command ID | Palette label | Action |
 |---|---|---|
-| `mini-agent.openConfig` | `mini-agent: Open Config` | Resolve `~/.config/mini-agent/config.toml`; if absent, copy `config.template.toml` then open in editor |
+| `mini-agent.openConfig` | `mini-agent: Open Config` | Resolve the config file in mini-agent's legacy `zerostack` config root (`$ZS_CONFIG_DIR`, `~/.config/zerostack`, `~/Library/Application Support/zerostack`, or `%APPDATA%\zerostack`; see `editors/vscode/src/config.ts`); if absent, copy `config.template.toml` then open in editor |
 | `mini-agent.restart` | `mini-agent: Restart Agent` | Kill ACP child process, respawn |
 | `mini-agent.showOutput` | `mini-agent: Show Output` | Reveal the extension's `OutputChannel` |
 

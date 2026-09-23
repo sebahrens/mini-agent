@@ -1489,7 +1489,11 @@ impl AppPaths {
         let platform = PathPlatform::current()?;
         ensure_absolute(platform, AppPathRoot::Workspace, workspace_root)?;
         let mut paths = self.clone();
-        paths.project_dir = Some(join_component(platform, workspace_root, ".zerostack"));
+        paths.project_dir = Some(join_component(
+            platform,
+            workspace_root,
+            crate::product::LEGACY_PROJECT_DIRECTORY,
+        ));
         Ok(paths)
     }
 

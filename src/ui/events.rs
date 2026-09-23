@@ -218,16 +218,16 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
         BlockStyle::Plain,
         "    .<prompt>   Switch prompt or one-shot .<prompt> <message>",
     );
+    feed.push_line(
+        BlockStyle::Plain,
+        "    .autoconfig Guided configuration prompt",
+    );
     feed.push_line(BlockStyle::Plain, "");
     feed.push_line(BlockStyle::Tool, "  Slash Commands:");
     feed.push_line(BlockStyle::Plain, "    /model        Switch model");
     feed.push_line(
         BlockStyle::Plain,
         "    /prompt       List / activate prompts",
-    );
-    feed.push_line(
-        BlockStyle::Plain,
-        "    .autoconfig        Switches to auto-configurator",
     );
     feed.push_line(BlockStyle::Plain, "    /mode         Change security mode");
     feed.push_line(BlockStyle::Plain, "    /clear        Clear session");

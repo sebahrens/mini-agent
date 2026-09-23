@@ -35,17 +35,23 @@ pub(crate) struct LoadedPrompt {
 pub(crate) struct PromptDirectives<'a> {
     pub(crate) mode: Option<&'a str>,
     pub(crate) agent: Option<&'a str>,
+    /// `%%grant=<scope>:<tools>`; honoured only for embedded built-in prompts
+    /// (see [`apply_project_trust`]) and only after the user approves it.
+    pub(crate) grant: Option<&'a str>,
     pub(crate) content: &'a str,
 }
 
 pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     let mut mode = None;
     let mut agent = None;
+    let mut grant = None;
     loop {
         let line_end = content.find('\n').unwrap_or(content.len());
         let line = content[..line_end].trim().trim_end_matches('\r');
         let directive = if let Some(value) = line.strip_prefix("%%mode=") {
             Some((&mut mode, value.trim()))
+        } else if let Some(value) = line.strip_prefix("%%grant=") {
+            Some((&mut grant, value.trim()))
         } else {
             line.strip_prefix("%%agent=")
                 .map(|value| (&mut agent, value.trim()))
@@ -68,8 +74,74 @@ pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     PromptDirectives {
         mode,
         agent,
+        grant,
         content,
     }
+}
+
+/// The directory a `%%grant=` directive may name. Closed on purpose: a prompt
+/// cannot ask for an arbitrary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptGrantScope {
+    /// The resolved global config root.
+    ConfigDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptGrant {
+    pub(crate) scope: PromptGrantScope,
+    pub(crate) tools: Vec<&'static str>,
+}
+
+/// Parse `config_dir:read,edit[,list_dir]`. Any unknown scope or tool rejects
+/// the whole directive, and tools are limited to the folder-grant set, so a
+/// directive can never ask for `write`, `shell`, or other capabilities.
+pub(crate) fn parse_grant(value: &str) -> Option<PromptGrant> {
+    let (scope, tools) = value.split_once(':')?;
+    let scope = match scope.trim() {
+        "config_dir" => PromptGrantScope::ConfigDir,
+        _ => return None,
+    };
+    let mut granted = Vec::new();
+    for tool in tools.split(',').map(str::trim) {
+        let known = crate::permission::checker::FOLDER_GRANT_TOOLS
+            .iter()
+            .find(|candidate| **candidate == tool)?;
+        if !granted.contains(known) {
+            granted.push(*known);
+        }
+    }
+    Some(PromptGrant {
+        scope,
+        tools: granted,
+    })
+}
+
+/// The grant offer requested by prompt `name`, resolved against `paths`.
+/// Only embedded prompts still carry `%%grant=` after loading, so any
+/// directive found here came from the binary.
+pub(crate) fn prompt_grant_offer(
+    prompts: &HashMap<String, String>,
+    name: &str,
+    paths: &crate::paths::AppPaths,
+) -> Option<crate::permission::checker::PromptGrantOffer> {
+    let value = parse_directives(prompts.get(name)?).grant?;
+    let Some(grant) = parse_grant(value) else {
+        tracing::warn!(
+            prompt = name,
+            grant = value,
+            "ignoring malformed %%grant= directive"
+        );
+        return None;
+    };
+    let dir = match grant.scope {
+        PromptGrantScope::ConfigDir => paths.config_dir.clone(),
+    };
+    Some(crate::permission::checker::PromptGrantOffer {
+        prompt: name.to_string(),
+        dir,
+        tools: grant.tools,
+    })
 }
 
 /// Whether the workspace's project config is bound in the private trust
@@ -83,8 +155,63 @@ fn project_prompts_trusted(paths: &crate::paths::AppPaths) -> bool {
     )
 }
 
+/// Paths substituted into embedded and user prompts when they are loaded, so
+/// built-in workflows such as `autoconfig` name the exact files this process
+/// resolved instead of guessing per-platform locations. Placeholders are
+/// `{{config_file}}`, `{{config_dir}}`, `{{project_config_file}}`,
+/// `{{docs_dir}}`, `{{agent_docs_dir}}`, and `{{prompts_dir}}`; any other
+/// `{{...}}` text is left untouched. Project prompts are never rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptVariables {
+    config_file: String,
+    config_dir: String,
+    project_config_file: String,
+    docs_dir: String,
+    agent_docs_dir: String,
+    prompts_dir: String,
+}
+
+impl PromptVariables {
+    pub(crate) fn from_paths(paths: &crate::paths::AppPaths) -> Self {
+        let display = |path: &std::path::Path| path.display().to_string();
+        let docs_dir = paths.docs_dir();
+        Self {
+            config_file: display(&crate::config::load::pick_existing(&paths.config_dir)),
+            config_dir: display(&paths.config_dir),
+            project_config_file: paths
+                .project_config_file()
+                .map(|path| display(&path))
+                .unwrap_or_else(|| "(no workspace is bound, so there is no project config)".into()),
+            agent_docs_dir: display(&docs_dir.join(crate::docs::AGENT_DOCS_SUBDIR)),
+            docs_dir: display(&docs_dir),
+            prompts_dir: display(&paths.prompts_dir()),
+        }
+    }
+
+    fn render(&self, content: String) -> String {
+        if !content.contains("{{") {
+            return content;
+        }
+        [
+            ("{{config_file}}", &self.config_file),
+            ("{{config_dir}}", &self.config_dir),
+            ("{{project_config_file}}", &self.project_config_file),
+            ("{{docs_dir}}", &self.docs_dir),
+            ("{{agent_docs_dir}}", &self.agent_docs_dir),
+            ("{{prompts_dir}}", &self.prompts_dir),
+        ]
+        .into_iter()
+        .fold(content, |content, (placeholder, value)| {
+            content.replace(placeholder, value)
+        })
+    }
+}
+
 /// Merge prompt layers (embedded < user < project) while remembering the
-/// source of the winning entry for each name.
+/// source of the winning entry for each name. A user-layer file that is
+/// byte-identical to the embedded prompt of the same name is the unmodified
+/// copy installed by `ensure_global`/`regen`, so it keeps the embedded source:
+/// it cannot carry anything the binary did not ship.
 fn merge_sources(
     user: Vec<(String, String)>,
     project: Vec<(String, String)>,
@@ -97,13 +224,15 @@ fn merge_sources(
         });
     }
     for (name, content) in user {
-        prompts.insert(
-            name,
-            LoadedPrompt {
-                source: PromptSource::User,
-                content,
-            },
-        );
+        let source = match prompts.get(&name) {
+            Some(embedded)
+                if embedded.source == PromptSource::Embedded && embedded.content == content =>
+            {
+                PromptSource::Embedded
+            }
+            _ => PromptSource::User,
+        };
+        prompts.insert(name, LoadedPrompt { source, content });
     }
     for (name, content) in project {
         prompts.insert(
@@ -115,6 +244,32 @@ fn merge_sources(
         );
     }
     prompts
+}
+
+/// Render path placeholders in embedded and user prompts, then apply the
+/// project trust policy.
+pub(crate) fn finalize_prompts(
+    prompts: HashMap<String, LoadedPrompt>,
+    project_trusted: bool,
+    variables: &PromptVariables,
+) -> HashMap<String, String> {
+    let rendered = prompts
+        .into_iter()
+        .map(|(name, prompt)| {
+            let content = match prompt.source {
+                PromptSource::Embedded | PromptSource::User => variables.render(prompt.content),
+                PromptSource::Project => prompt.content,
+            };
+            (
+                name,
+                LoadedPrompt {
+                    source: prompt.source,
+                    content,
+                },
+            )
+        })
+        .collect();
+    apply_project_trust(rendered, project_trusted)
 }
 
 /// Reduce sourced prompts to the name-to-content map used by the rest of the
@@ -129,14 +284,44 @@ pub(crate) fn apply_project_trust(
     prompts
         .into_iter()
         .map(|(name, prompt)| {
-            let content = if prompt.source == PromptSource::Project && !project_trusted {
-                neutralize_untrusted_directive(&name, prompt.content)
-            } else {
+            let content = if prompt.source == PromptSource::Embedded {
                 prompt.content
+            } else {
+                strip_grant_directive(&name, prompt.content)
+            };
+            let content = if prompt.source == PromptSource::Project && !project_trusted {
+                neutralize_untrusted_directive(&name, content)
+            } else {
+                content
             };
             (name, content)
         })
         .collect()
+}
+
+/// `%%grant=` pre-authorizes a folder for a built-in workflow, so it is
+/// honoured only for prompts shipped in the binary. User and project prompts
+/// (trusted or not) lose the directive with a warning; their other directives
+/// are kept.
+fn strip_grant_directive(name: &str, content: String) -> String {
+    let directives = parse_directives(&content);
+    let Some(grant) = directives.grant else {
+        return content;
+    };
+    tracing::warn!(
+        prompt = name,
+        grant,
+        "ignoring %%grant= directive: only built-in prompts may request a scoped grant"
+    );
+    let mut rebuilt = String::new();
+    if let Some(mode) = directives.mode {
+        rebuilt.push_str(&format!("%%mode={mode}\n"));
+    }
+    if let Some(agent) = directives.agent {
+        rebuilt.push_str(&format!("%%agent={agent}\n"));
+    }
+    rebuilt.push_str(directives.content);
+    rebuilt
 }
 
 fn neutralize_untrusted_directive(name: &str, content: String) -> String {
@@ -181,11 +366,12 @@ pub(crate) fn load_for_workspace_binding(
     let project = workspace
         .read_relative_dir_files(std::path::Path::new(".zerostack/prompts"), "md")
         .unwrap_or_default();
-    let project_trusted = paths
-        .with_workspace_root(workspace.root())
-        .map(|paths| project_prompts_trusted(&paths))
-        .unwrap_or(false);
-    apply_project_trust(merge_sources(user, project), project_trusted)
+    let workspace_paths = paths.with_workspace_root(workspace.root()).ok();
+    let project_trusted = workspace_paths
+        .as_ref()
+        .is_some_and(project_prompts_trusted);
+    let variables = PromptVariables::from_paths(workspace_paths.as_ref().unwrap_or(&paths));
+    finalize_prompts(merge_sources(user, project), project_trusted, &variables)
 }
 
 fn load_with_paths(paths: &crate::paths::AppPaths) -> HashMap<String, String> {
@@ -194,7 +380,11 @@ fn load_with_paths(paths: &crate::paths::AppPaths) -> HashMap<String, String> {
         .project_prompts_dir()
         .expect("workspace paths must have a project prompt directory");
     let project = crate::context::load_dir_files(&project_prompts, "md");
-    apply_project_trust(merge_sources(user, project), project_prompts_trusted(paths))
+    finalize_prompts(
+        merge_sources(user, project),
+        project_prompts_trusted(paths),
+        &PromptVariables::from_paths(paths),
+    )
 }
 
 pub fn ensure_global() -> anyhow::Result<()> {
@@ -232,7 +422,7 @@ mod tests {
                 state_dir: dir.join("state"),
                 cache_dir: dir.join("cache"),
                 credentials_dir: dir.join("credentials"),
-                project_dir: Some(dir.join(".zerostack")),
+                project_dir: Some(dir.join(crate::product::LEGACY_PROJECT_DIRECTORY)),
             };
             TestDir { dir, paths }
         }
@@ -501,5 +691,195 @@ mod tests {
         assert!(prompts.contains_key("code"));
         assert!(prompts.contains_key("ask"));
         assert!(prompts.contains_key("default"));
+    }
+
+    // --- Load-time path variables (mini-agent-m5tai) ---
+
+    #[test]
+    fn autoconfig_names_the_resolved_config_paths() {
+        let td = TestDir::new();
+        let prompts = td.load();
+        let autoconfig = &prompts["autoconfig"];
+
+        let config_file = td.paths.config_dir.join("config.toml");
+        let project_config = td.paths.project_config_file().unwrap();
+        let agent_docs = td.paths.docs_dir().join("agent");
+        for expected in [&config_file, &project_config, &agent_docs] {
+            let expected = expected.display().to_string();
+            assert!(autoconfig.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            autoconfig.contains(&format!("{}/CONFIG.md", agent_docs.display())),
+            "autoconfig must point at the installed CONFIG.md"
+        );
+        assert!(!autoconfig.contains("{{"), "unrendered placeholder left");
+    }
+
+    #[test]
+    fn config_file_variable_follows_the_existing_candidate() {
+        let td = TestDir::new();
+        std::fs::create_dir_all(&td.paths.config_dir).unwrap();
+        std::fs::write(td.paths.config_dir.join("config.yaml"), "model: x\n").unwrap();
+
+        let prompts = td.load();
+
+        let yaml = td
+            .paths
+            .config_dir
+            .join("config.yaml")
+            .display()
+            .to_string();
+        assert!(prompts["autoconfig"].contains(&format!("`{yaml}`")));
+    }
+
+    #[test]
+    fn user_prompts_are_rendered_and_project_prompts_are_not() {
+        let td = TestDir::new();
+        write_prompt(
+            &td.global_dir(),
+            "mine",
+            "cfg={{config_dir}} other={{unknown}}",
+        );
+        write_prompt(&td.project_dir(), "theirs", "cfg={{config_dir}}");
+
+        let prompts = td.load();
+
+        assert_eq!(
+            prompts["mine"],
+            format!(
+                "cfg={} other={{{{unknown}}}}",
+                td.paths.config_dir.display()
+            )
+        );
+        assert_eq!(prompts["theirs"], "cfg={{config_dir}}");
+    }
+
+    #[test]
+    fn an_unmodified_installed_copy_keeps_the_embedded_source() {
+        let raw = EMBEDDED
+            .get_file("autoconfig.md")
+            .unwrap()
+            .contents_utf8()
+            .unwrap()
+            .to_string();
+        let sourced = merge_sources(
+            vec![
+                ("autoconfig".to_string(), raw.clone()),
+                ("code".to_string(), "edited by the user".to_string()),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(sourced["autoconfig"].source, PromptSource::Embedded);
+        assert_eq!(sourced["code"].source, PromptSource::User);
+
+        let project = merge_sources(Vec::new(), vec![("autoconfig".to_string(), raw)]);
+        assert_eq!(project["autoconfig"].source, PromptSource::Project);
+    }
+
+    // --- autoconfig workflow contract (mini-agent-d5bv1, mini-agent-mt00y) ---
+
+    #[test]
+    fn autoconfig_keeps_the_user_mode_and_avoids_guessing_or_probing() {
+        let raw = EMBEDDED
+            .get_file("autoconfig.md")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        let directives = parse_directives(raw);
+        // Never downgrade a more permissive session; never raise either.
+        assert_eq!(directives.mode, Some("last_user_mode"));
+        for stale in ["zerostack", "~/.config", "~/.local/share", "$ZS_CONFIG_DIR"] {
+            assert!(!raw.contains(stale), "stale reference {stale}");
+        }
+        assert!(raw.contains("Do not use `shell`, `js`, Python"));
+        assert!(raw.contains("confirmed absent") || raw.contains("confirmed-absent"));
+    }
+
+    // --- Built-in scoped grant (mini-agent-2rk6q) ---
+
+    #[test]
+    fn grant_directive_parses_only_the_closed_scope_and_tool_set() {
+        assert_eq!(
+            parse_grant("config_dir:read,edit"),
+            Some(PromptGrant {
+                scope: PromptGrantScope::ConfigDir,
+                tools: vec!["read", "edit"],
+            })
+        );
+        assert_eq!(
+            parse_grant("config_dir: read, list_dir ,read")
+                .unwrap()
+                .tools,
+            vec!["read", "list_dir"]
+        );
+        for rejected in [
+            "config_dir:read,write",
+            "config_dir:shell",
+            "home_dir:read",
+            "/etc:read",
+            "config_dir",
+            "config_dir:",
+        ] {
+            assert_eq!(parse_grant(rejected), None, "{rejected}");
+        }
+        let parsed = parse_directives("%%grant=config_dir:read\n%%mode=standard\nBody.");
+        assert_eq!(parsed.grant, Some("config_dir:read"));
+        assert_eq!(parsed.mode, Some("standard"));
+        assert_eq!(parsed.content, "Body.");
+    }
+
+    #[test]
+    fn embedded_autoconfig_requests_a_config_dir_grant() {
+        let td = TestDir::new();
+        let prompts = td.load();
+
+        let offer = prompt_grant_offer(&prompts, "autoconfig", &td.paths)
+            .expect("the built-in autoconfig prompt requests a grant");
+
+        assert_eq!(offer.dir, td.paths.config_dir);
+        assert_eq!(offer.tools, vec!["read", "edit", "list_dir"]);
+        assert_eq!(offer.prompt, "autoconfig");
+        // The directive never reaches the model.
+        let mut context_prompt = prompts["autoconfig"].clone();
+        context_prompt = parse_directives(&context_prompt).content.to_string();
+        assert!(!context_prompt.contains("%%grant"));
+    }
+
+    #[test]
+    fn user_and_project_grant_directives_are_dropped_but_other_directives_kept() {
+        let td = TestDir::new();
+        trust_project(&td);
+        write_prompt(
+            &td.global_dir(),
+            "autoconfig",
+            "%%grant=config_dir:read,edit\n%%mode=standard\nUser copy.",
+        );
+        write_prompt(
+            &td.project_dir(),
+            "sneaky",
+            "%%grant=config_dir:read,edit\n%%agent=rust-maintainer\nBody.",
+        );
+
+        let prompts = td.load();
+
+        assert_eq!(prompts["autoconfig"], "%%mode=standard\nUser copy.");
+        assert_eq!(prompts["sneaky"], "%%agent=rust-maintainer\nBody.");
+        assert_eq!(prompt_grant_offer(&prompts, "autoconfig", &td.paths), None);
+        assert_eq!(prompt_grant_offer(&prompts, "sneaky", &td.paths), None);
+    }
+
+    #[test]
+    fn untrusted_project_grant_directive_is_dropped() {
+        let td = TestDir::new();
+        write_prompt(
+            &td.project_dir(),
+            "autoconfig",
+            "%%grant=config_dir:read,edit\n%%mode=last_user_mode\nBody.",
+        );
+
+        let prompts = td.load();
+
+        assert_eq!(prompts["autoconfig"], "%%mode=last_user_mode\nBody.");
+        assert_eq!(prompt_grant_offer(&prompts, "autoconfig", &td.paths), None);
     }
 }

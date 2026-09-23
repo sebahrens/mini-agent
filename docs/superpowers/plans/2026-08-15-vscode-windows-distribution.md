@@ -21,7 +21,7 @@
 - Rust binary build is **unchanged** — no Rust code is touched.
 - Extension activates on `"onStartupFinished"` — no eager activation.
 - `bin/` directory is gitignored — never committed, only populated by CI.
-- Uses VS Code `SecretStorage` for nothing; all config delegated to mini-agent's `~/.config/mini-agent/config.toml`.
+- Uses VS Code `SecretStorage` for nothing; all config delegated to mini-agent's own config file in its legacy `zerostack` config root (`$ZS_CONFIG_DIR`, else `~/.config/zerostack` on Linux, `~/Library/Application Support/zerostack` on macOS, `%APPDATA%\zerostack` on Windows; first existing of `config.toml`/`.yaml`/`.yml`/`.json`), as resolved by `editors/vscode/src/config.ts`.
 - VS Code engine version floor: `^1.85.0`.
 - WiX v4 — not v3 (different project format and CLI).
 - No external CDN/network calls from either the extension or MSI at runtime.
