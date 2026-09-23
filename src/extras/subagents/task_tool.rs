@@ -357,9 +357,12 @@ fn resolve_persona_runtime(
         return Ok(ResolvedPersonaRuntime {
             client,
             provider_name: provider_name.to_string(),
+            execution: builder::PersonaExecution {
+                provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
+                ..builder::PersonaExecution::default()
+            },
             model_name,
             max_turns,
-            execution: builder::PersonaExecution::default(),
         });
     };
 
@@ -394,12 +397,15 @@ fn resolve_persona_runtime(
     Ok(ResolvedPersonaRuntime {
         client,
         provider_name: resolved_provider,
-        model_name,
         max_turns: specialization.max_turns(max_turns),
         execution: builder::PersonaExecution {
             tools: specialization.tools.clone(),
+            // The same global or quick-model `extra_body` the main agent
+            // would send for this model; persona params are merged on top.
+            provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
             additional_params,
         },
+        model_name,
     })
 }
 
@@ -1863,6 +1869,59 @@ mod tests {
         assert_eq!(
             runtime.execution.additional_params,
             Some(serde_json::json!({"seed": 7}))
+        );
+        assert_eq!(
+            runtime.execution.provider_extra_body,
+            Some(serde_json::json!({"seed": 7}))
+        );
+    }
+
+    #[test]
+    fn subagent_runtime_inherits_the_parent_extra_body_for_its_model() {
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("test-key"),
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let config = crate::config::Config {
+            extra_body: Some(serde_json::json!({"store": false, "user": "zdr"})),
+            ..crate::config::Config::default()
+        };
+
+        let unspecialized = resolve_persona_runtime(
+            client.clone(),
+            "openrouter",
+            "default/model".into(),
+            20,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            unspecialized.execution.provider_extra_body,
+            Some(serde_json::json!({"store": false, "user": "zdr"}))
+        );
+        assert_eq!(unspecialized.execution.additional_params, None);
+
+        let mut raw_model = runtime_specialization();
+        raw_model.model = Some("other/model".into());
+        let persona = resolve_persona_runtime(
+            client,
+            "openrouter",
+            "default/model".into(),
+            20,
+            None,
+            &config,
+            Some(&raw_model),
+        )
+        .unwrap();
+        assert_eq!(persona.model_name, "other/model");
+        assert_eq!(
+            persona.execution.provider_extra_body,
+            Some(serde_json::json!({"store": false, "user": "zdr"}))
         );
     }
 

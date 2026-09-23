@@ -373,6 +373,24 @@ When the subagent uses a different provider than the main agent, a separate
 API client is created at startup. The subagent client is independent from the
 main agent's client and can be switched at runtime.
 
+### Provider request parameters
+
+Every child request carries the same provider request-body parameters the main
+agent would send for the child's model, built by the same helpers:
+
+- the user's `extra_body`, resolved for the child's model exactly like the main
+  agent (a matching quick model's `extra_body`, otherwise the global one);
+- OpenAI Responses: the `[reasoning]` table mapped to `reasoning.effort`,
+  `reasoning.summary`, `store` (so `store = false` zero-data-retention settings
+  also apply to subagents), the encrypted-reasoning `include`, and a
+  per-child `prompt_cache_key`;
+- OpenAI Chat Completions: `[reasoning] effort` as `reasoning_effort`;
+- OpenRouter: the Anthropic routing/cache pin plus `extra_body`;
+- Anthropic, Gemini, and Ollama: `extra_body`.
+
+A persona's quick-model `extra_body` is shallow-merged on top, so persona keys
+win on collision.
+
 Example `config.toml`:
 
 ```toml
