@@ -73,7 +73,15 @@ For work with explicit scope or deliverables, prefer structured briefs:
 }
 ```
 
-`prompts` and `briefs` are mutually exclusive. Brief fields are rendered into
+Send exactly one of `prompts` or `briefs`. Only a *populated* field counts as
+a selection: a missing field, `null`, `[]`, a prompt list whose entries are all
+blank, or a brief list whose objectives are all blank is treated as absent, so
+`{"prompts": [], "briefs": [...]}` runs the briefs. The call is rejected only
+when both fields are populated (the error tells the model to omit the unused
+field) or when neither is present. The exclusivity rule lives in the tool and
+property descriptions rather than a top-level JSON Schema `oneOf`, because
+Anthropic rejects top-level combinators in tool input schemas and non-strict
+OpenAI-compatible gateways ignore them. Brief fields are rendered into
 a bounded, labelled child handoff; embedded newlines remain JSON-escaped so a
 field value cannot forge another handoff heading. `files` are scope hints, not
 permission grants. `constraints` bound the investigation, while
