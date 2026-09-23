@@ -198,14 +198,23 @@ struct TerminalSession<T: TerminalOperations> {
     terminal: T,
     undo: Vec<Undo>,
     attached: bool,
+    /// Whether attaching enables mouse capture (config `mouse_capture`).
+    /// Without it the terminal keeps its native selection.
+    mouse_capture: bool,
 }
 
 impl<T: TerminalOperations> TerminalSession<T> {
+    #[cfg(test)]
     fn new(terminal: T) -> io::Result<Self> {
+        Self::with_mouse_capture(terminal, true)
+    }
+
+    fn with_mouse_capture(terminal: T, mouse_capture: bool) -> io::Result<Self> {
         let mut session = Self {
             terminal,
             undo: Vec::with_capacity(7),
             attached: false,
+            mouse_capture,
         };
         session.resume()?;
         Ok(session)
@@ -243,7 +252,9 @@ impl<T: TerminalOperations> TerminalSession<T> {
             TerminalAction::LeaveAlternate,
         )?;
         self.terminal.apply(TerminalAction::Clear)?;
-        self.apply_with_undo(TerminalAction::EnableMouse, TerminalAction::DisableMouse)?;
+        if self.mouse_capture {
+            self.apply_with_undo(TerminalAction::EnableMouse, TerminalAction::DisableMouse)?;
+        }
         self.apply_with_undo(TerminalAction::EnablePaste, TerminalAction::DisablePaste)?;
         // Enhancement negotiation is unsupported by some otherwise valid terminals. Preserve the
         // existing best-effort behavior while remembering a successful push for symmetric cleanup.
@@ -332,13 +343,16 @@ impl TerminalGuard {
                 terminal: SystemTerminal,
                 undo: Vec::new(),
                 attached: false,
+                mouse_capture: true,
             },
         }
     }
 
-    pub fn new() -> Result<Self, TerminalLifecycleError> {
+    /// Attaches the terminal. `mouse_capture = false` skips enabling mouse
+    /// reporting so the terminal's own text selection keeps working.
+    pub fn new(mouse_capture: bool) -> Result<Self, TerminalLifecycleError> {
         let guard = Self {
-            session: TerminalSession::new(SystemTerminal)
+            session: TerminalSession::with_mouse_capture(SystemTerminal, mouse_capture)
                 .map_err(|error| TerminalLifecycleError::new("attachment", error))?,
         };
         SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
@@ -532,6 +546,24 @@ mod tests {
             assert!(TerminalSession::new(terminal).is_err(), "step {fail_at}");
             assert_restored(&state);
         }
+    }
+
+    #[test]
+    fn disabled_mouse_capture_never_enables_mouse_reporting() {
+        let (terminal, state) = mock(None);
+        let session = TerminalSession::with_mouse_capture(terminal, false).unwrap();
+        {
+            let state = state.lock().unwrap();
+            assert!(state.raw_mode);
+            assert!(!state.mouse_capture);
+            assert!(
+                !state
+                    .calls
+                    .contains(&Operation::Action(TerminalAction::EnableMouse))
+            );
+        }
+        drop(session);
+        assert_restored(&state);
     }
 
     #[test]

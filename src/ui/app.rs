@@ -493,7 +493,7 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
-        let terminal_guard = TerminalGuard::new()?;
+        let terminal_guard = TerminalGuard::new(ui.cfg.resolve_mouse_capture())?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);

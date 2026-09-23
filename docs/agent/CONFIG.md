@@ -488,6 +488,7 @@ Accepted top-level keys:
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
+| `mouse_capture`           | boolean | Capture mouse events in the TUI: wheel scrolling, click to place the input cursor, click to open links, and drag to select and copy transcript lines. Set `false` to leave the mouse to the terminal so its native text selection works (the in-app mouse features are then unavailable; use `PageUp`/`PageDown` to scroll). Default: `true`. |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees; requires `git-worktree`. |

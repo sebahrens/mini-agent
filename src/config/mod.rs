@@ -270,6 +270,11 @@ pub struct Config {
     /// Left padding (columns) for the chat area. Default: 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_left_margin: Option<u16>,
+    /// Capture mouse events in the TUI (wheel scrolling, click-to-place-cursor,
+    /// link opening, drag-to-copy). `false` leaves the mouse to the terminal so
+    /// its native selection works. Default: true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_capture: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
@@ -554,6 +559,10 @@ impl Config {
 
     pub fn resolve_chat_left_margin(&self) -> u16 {
         self.chat_left_margin.unwrap_or(0)
+    }
+
+    pub fn resolve_mouse_capture(&self) -> bool {
+        self.mouse_capture.unwrap_or(true)
     }
 
     /// Resolves temperature: CLI `--temperature` > quick-model `temperature` >
@@ -1039,6 +1048,17 @@ mod tests {
     fn resolve_prompt_model_returns_none_for_empty_map() {
         let cfg = make_config(HashMap::new());
         assert_eq!(cfg.resolve_prompt_model("plan"), None);
+    }
+
+    #[test]
+    fn toml_mouse_capture_defaults_on_and_can_be_disabled() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.resolve_mouse_capture());
+        let cfg: Config = toml::from_str("mouse_capture = false\n").unwrap();
+        assert_eq!(cfg.mouse_capture, Some(false));
+        assert!(!cfg.resolve_mouse_capture());
+        let cfg: Config = toml::from_str("mouse_capture = true\n").unwrap();
+        assert!(cfg.resolve_mouse_capture());
     }
 
     #[test]

@@ -476,7 +476,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `PageUp / PageDown` | Scroll viewport. |
 | `Home / End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
-| Mouse drag | Select text and copy it on release. |
+| Mouse drag | Select transcript lines and copy them on release. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's native selection. |
 | Mouse scroll | Scroll chat history. |
 
 Learned-skill feedback can be inspected and corrected by the authenticated local
