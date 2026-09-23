@@ -396,6 +396,23 @@ impl SecurityMode {
         }
     }
 
+    /// Every mode, in [`Self::NAMES`] order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::NAMES.iter().filter_map(|name| Self::from_str(name))
+    }
+
+    /// One-line summary of what the mode allows, shown by `/mode`.
+    pub fn description(self) -> &'static str {
+        match self {
+            SecurityMode::Standard => "allow within CWD, ask for external",
+            SecurityMode::Restrictive => "ask for all operations",
+            SecurityMode::ReadOnly => "allow reads, deny everything else",
+            SecurityMode::PlanWrite => "readonly, except writing the workspace plan file",
+            SecurityMode::Guarded => "allow reads, ask for everything else",
+            SecurityMode::Yolo => "allow all, ask for destructive bash",
+        }
+    }
+
     /// Relative authority granted by a mode. A prompt `%%mode=` directive may
     /// only move to a mode whose rank is at most the user's selected mode, so
     /// prompt content can narrow but never widen what the model may do.

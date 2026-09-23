@@ -81,13 +81,14 @@ built-in prompts, or create a custom `code.md` prompt).
 
 | Command | Description |
 | ------- | ----------- |
-| `/mode` | Show the current security mode. |
+| `/mode` | Show the current security mode and every mode with a one-line description. |
 | `/mode standard` | Allow path tools within CWD, ask for external paths. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
 | `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. |
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
 | `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
+| `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 
 Prompts can set the security mode automatically via `%%mode=<mode>` on
 the first line. When a prompt with `%%mode=last_user_mode` is activated,
