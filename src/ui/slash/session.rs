@@ -686,7 +686,10 @@ async fn handle_retry(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         .cloned();
     match last_user {
         Some(msg) => {
-            ctx.input.load_text(&msg.content);
+            // A recorded `!command` retries as the command, not its transcript.
+            let text =
+                crate::session::shell_interaction_command(&msg.content).unwrap_or(&msg.content);
+            ctx.input.load_text(text);
             write_ok(ctx.renderer, "edit last message and press Enter to retry");
         }
         None => {

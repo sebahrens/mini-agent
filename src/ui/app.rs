@@ -19,7 +19,7 @@ use crate::sandbox::CommandCancellation;
 use crate::sandbox::{
     CommandLimits, CommandStatus, DEFAULT_COMMAND_LIMITS, SupportCommandAudit, SupportCommandLimits,
 };
-use crate::session::{GitStatus, MessageRole, Session};
+use crate::session::{GitStatus, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
@@ -2594,8 +2594,7 @@ impl<'a> App<'a> {
         }
         self.renderer.write_line("", Color::White)?;
 
-        self.ui.session.add_message(MessageRole::User, text);
-        self.ui.session.add_message(MessageRole::Assistant, &result);
+        self.ui.session.add_shell_interaction(text, &result);
         if !self.ui.cli.no_session {
             let _ = crate::session::chat_history::append_entry(
                 &crate::session::chat_history::ChatHistoryEntry {

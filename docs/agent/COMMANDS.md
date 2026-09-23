@@ -329,8 +329,11 @@ verdict, and the last reason. Goal round records are written under `state/goals/
 ## Shell Commands
 
 Prefix a message with `!` to run it as a shell command instead of sending it to
-the agent. The command's output is captured and stored in the session history as
-an Assistant message. Works in both TUI and `--print` mode.
+the agent. The command and its captured output are stored in the session history
+as one user message (``User ran `!cmd`:`` followed by the output in a fenced
+block), so the model sees the output as something you shared, never as its own
+reply. `/undo` removes that message, and `/retry` reloads the original `!cmd`.
+Works in both TUI and `--print` mode.
 In `--print` mode, a failed command or empty `!` exits nonzero. Captured output is still
 rendered and saved before reporting a command failure; `--output json` marks that result
 with `"stop_reason":"failed"`.

@@ -611,13 +611,25 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
         assert_eq!(value["cost"], 0.0);
         if saves_session {
             let saved = root.saved_session();
+            let messages = saved["messages"].as_array().unwrap();
+            // The command and its output are one user-side message; the model
+            // must never see shell output as its own assistant reply.
             assert!(
-                saved["messages"]
-                    .as_array()
-                    .unwrap()
+                !messages
                     .iter()
-                    .any(|message| message["role"] == "assistant" && message["content"] == result)
+                    .any(|message| message["role"] == "assistant"),
+                "{messages:?}"
             );
+            let recorded = messages
+                .iter()
+                .find(|message| message["role"] == "user")
+                .and_then(|message| message["content"].as_str())
+                .unwrap();
+            assert!(
+                recorded.starts_with(&format!("User ran `{message}`:\n```")),
+                "{recorded}"
+            );
+            assert!(recorded.contains(result.trim_end()), "{recorded}");
         } else {
             assert!(
                 root.0.join("sessions").is_file(),

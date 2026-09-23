@@ -10,7 +10,7 @@ use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::PermCheck;
 use crate::provider::{self, AnyClient};
 use crate::sandbox::{DEFAULT_COMMAND_LIMITS, Sandbox, SandboxPolicy};
-use crate::session::{self, MessageRole, Session};
+use crate::session::{self, Session};
 
 // ── Helper functions ─────────────────────────────────────────────────────
 
@@ -1418,8 +1418,7 @@ impl Startup {
                 let mut persistence_failure = None;
                 if !self.cli.no_session {
                     let mut session = self.session;
-                    session.add_message(MessageRole::User, &msg);
-                    session.add_message(MessageRole::Assistant, &result);
+                    session.add_shell_interaction(&msg, &result);
                     if let Err(error) = session::storage::save_session(&session) {
                         persistence_failure = Some(error);
                     } else if let Err(e) = session::chat_history::append_entry(
