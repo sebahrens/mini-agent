@@ -187,7 +187,6 @@ impl Drop for EditorTemp {
     }
 }
 
-#[cfg(not(windows))]
 /// A character key carrying Ctrl or Alt (but not both: Ctrl+Alt is AltGr on
 /// Windows and delivers the composed character). Ctrl+H is excluded because
 /// it is backspace everywhere in the editor and pickers.
@@ -209,6 +208,7 @@ pub(crate) fn mention_can_start_at(buffer: &str, pos: usize) -> bool {
         .is_none_or(|prev| prev.is_whitespace() || matches!(prev, '(' | '"' | '\'' | '`'))
 }
 
+#[cfg(not(windows))]
 fn editor_draft_too_large() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
