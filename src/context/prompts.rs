@@ -35,17 +35,23 @@ pub(crate) struct LoadedPrompt {
 pub(crate) struct PromptDirectives<'a> {
     pub(crate) mode: Option<&'a str>,
     pub(crate) agent: Option<&'a str>,
+    /// `%%grant=<scope>:<tools>`; honoured only for embedded built-in prompts
+    /// (see [`apply_project_trust`]) and only after the user approves it.
+    pub(crate) grant: Option<&'a str>,
     pub(crate) content: &'a str,
 }
 
 pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     let mut mode = None;
     let mut agent = None;
+    let mut grant = None;
     loop {
         let line_end = content.find('\n').unwrap_or(content.len());
         let line = content[..line_end].trim().trim_end_matches('\r');
         let directive = if let Some(value) = line.strip_prefix("%%mode=") {
             Some((&mut mode, value.trim()))
+        } else if let Some(value) = line.strip_prefix("%%grant=") {
+            Some((&mut grant, value.trim()))
         } else {
             line.strip_prefix("%%agent=")
                 .map(|value| (&mut agent, value.trim()))
@@ -68,8 +74,74 @@ pub(crate) fn parse_directives(mut content: &str) -> PromptDirectives<'_> {
     PromptDirectives {
         mode,
         agent,
+        grant,
         content,
     }
+}
+
+/// The directory a `%%grant=` directive may name. Closed on purpose: a prompt
+/// cannot ask for an arbitrary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptGrantScope {
+    /// The resolved global config root.
+    ConfigDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptGrant {
+    pub(crate) scope: PromptGrantScope,
+    pub(crate) tools: Vec<&'static str>,
+}
+
+/// Parse `config_dir:read,edit[,list_dir]`. Any unknown scope or tool rejects
+/// the whole directive, and tools are limited to the folder-grant set, so a
+/// directive can never ask for `write`, `shell`, or other capabilities.
+pub(crate) fn parse_grant(value: &str) -> Option<PromptGrant> {
+    let (scope, tools) = value.split_once(':')?;
+    let scope = match scope.trim() {
+        "config_dir" => PromptGrantScope::ConfigDir,
+        _ => return None,
+    };
+    let mut granted = Vec::new();
+    for tool in tools.split(',').map(str::trim) {
+        let known = crate::permission::checker::FOLDER_GRANT_TOOLS
+            .iter()
+            .find(|candidate| **candidate == tool)?;
+        if !granted.contains(known) {
+            granted.push(*known);
+        }
+    }
+    Some(PromptGrant {
+        scope,
+        tools: granted,
+    })
+}
+
+/// The grant offer requested by prompt `name`, resolved against `paths`.
+/// Only embedded prompts still carry `%%grant=` after loading, so any
+/// directive found here came from the binary.
+pub(crate) fn prompt_grant_offer(
+    prompts: &HashMap<String, String>,
+    name: &str,
+    paths: &crate::paths::AppPaths,
+) -> Option<crate::permission::checker::PromptGrantOffer> {
+    let value = parse_directives(prompts.get(name)?).grant?;
+    let Some(grant) = parse_grant(value) else {
+        tracing::warn!(
+            prompt = name,
+            grant = value,
+            "ignoring malformed %%grant= directive"
+        );
+        return None;
+    };
+    let dir = match grant.scope {
+        PromptGrantScope::ConfigDir => paths.config_dir.clone(),
+    };
+    Some(crate::permission::checker::PromptGrantOffer {
+        prompt: name.to_string(),
+        dir,
+        tools: grant.tools,
+    })
 }
 
 /// Whether the workspace's project config is bound in the private trust
@@ -212,14 +284,44 @@ pub(crate) fn apply_project_trust(
     prompts
         .into_iter()
         .map(|(name, prompt)| {
-            let content = if prompt.source == PromptSource::Project && !project_trusted {
-                neutralize_untrusted_directive(&name, prompt.content)
-            } else {
+            let content = if prompt.source == PromptSource::Embedded {
                 prompt.content
+            } else {
+                strip_grant_directive(&name, prompt.content)
+            };
+            let content = if prompt.source == PromptSource::Project && !project_trusted {
+                neutralize_untrusted_directive(&name, content)
+            } else {
+                content
             };
             (name, content)
         })
         .collect()
+}
+
+/// `%%grant=` pre-authorizes a folder for a built-in workflow, so it is
+/// honoured only for prompts shipped in the binary. User and project prompts
+/// (trusted or not) lose the directive with a warning; their other directives
+/// are kept.
+fn strip_grant_directive(name: &str, content: String) -> String {
+    let directives = parse_directives(&content);
+    let Some(grant) = directives.grant else {
+        return content;
+    };
+    tracing::warn!(
+        prompt = name,
+        grant,
+        "ignoring %%grant= directive: only built-in prompts may request a scoped grant"
+    );
+    let mut rebuilt = String::new();
+    if let Some(mode) = directives.mode {
+        rebuilt.push_str(&format!("%%mode={mode}\n"));
+    }
+    if let Some(agent) = directives.agent {
+        rebuilt.push_str(&format!("%%agent={agent}\n"));
+    }
+    rebuilt.push_str(directives.content);
+    rebuilt
 }
 
 fn neutralize_untrusted_directive(name: &str, content: String) -> String {
@@ -691,5 +793,93 @@ mod tests {
         }
         assert!(raw.contains("Do not use `shell`, `js`, Python"));
         assert!(raw.contains("confirmed absent") || raw.contains("confirmed-absent"));
+    }
+
+    // --- Built-in scoped grant (mini-agent-2rk6q) ---
+
+    #[test]
+    fn grant_directive_parses_only_the_closed_scope_and_tool_set() {
+        assert_eq!(
+            parse_grant("config_dir:read,edit"),
+            Some(PromptGrant {
+                scope: PromptGrantScope::ConfigDir,
+                tools: vec!["read", "edit"],
+            })
+        );
+        assert_eq!(
+            parse_grant("config_dir: read, list_dir ,read")
+                .unwrap()
+                .tools,
+            vec!["read", "list_dir"]
+        );
+        for rejected in [
+            "config_dir:read,write",
+            "config_dir:shell",
+            "home_dir:read",
+            "/etc:read",
+            "config_dir",
+            "config_dir:",
+        ] {
+            assert_eq!(parse_grant(rejected), None, "{rejected}");
+        }
+        let parsed = parse_directives("%%grant=config_dir:read\n%%mode=standard\nBody.");
+        assert_eq!(parsed.grant, Some("config_dir:read"));
+        assert_eq!(parsed.mode, Some("standard"));
+        assert_eq!(parsed.content, "Body.");
+    }
+
+    #[test]
+    fn embedded_autoconfig_requests_a_config_dir_grant() {
+        let td = TestDir::new();
+        let prompts = td.load();
+
+        let offer = prompt_grant_offer(&prompts, "autoconfig", &td.paths)
+            .expect("the built-in autoconfig prompt requests a grant");
+
+        assert_eq!(offer.dir, td.paths.config_dir);
+        assert_eq!(offer.tools, vec!["read", "edit", "list_dir"]);
+        assert_eq!(offer.prompt, "autoconfig");
+        // The directive never reaches the model.
+        let mut context_prompt = prompts["autoconfig"].clone();
+        context_prompt = parse_directives(&context_prompt).content.to_string();
+        assert!(!context_prompt.contains("%%grant"));
+    }
+
+    #[test]
+    fn user_and_project_grant_directives_are_dropped_but_other_directives_kept() {
+        let td = TestDir::new();
+        trust_project(&td);
+        write_prompt(
+            &td.global_dir(),
+            "autoconfig",
+            "%%grant=config_dir:read,edit\n%%mode=standard\nUser copy.",
+        );
+        write_prompt(
+            &td.project_dir(),
+            "sneaky",
+            "%%grant=config_dir:read,edit\n%%agent=rust-maintainer\nBody.",
+        );
+
+        let prompts = td.load();
+
+        assert_eq!(prompts["autoconfig"], "%%mode=standard\nUser copy.");
+        assert_eq!(prompts["sneaky"], "%%agent=rust-maintainer\nBody.");
+        assert_eq!(prompt_grant_offer(&prompts, "autoconfig", &td.paths), None);
+        assert_eq!(prompt_grant_offer(&prompts, "sneaky", &td.paths), None);
+    }
+
+    #[test]
+    fn untrusted_project_grant_directive_is_dropped() {
+        let td = TestDir::new();
+        write_prompt(
+            &td.project_dir(),
+            "autoconfig",
+            "%%grant=config_dir:read,edit\n%%mode=last_user_mode\nBody.",
+        );
+
+        let prompts = td.load();
+
+        assert_eq!(prompts["autoconfig"], "%%mode=last_user_mode\nBody.");
+        assert_eq!(prompt_grant_offer(&prompts, "autoconfig", &td.paths), None);
     }
 }

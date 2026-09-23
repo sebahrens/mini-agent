@@ -1378,6 +1378,24 @@ never degrade to a match-all rule.
 Both fields can be used together; rules from both are merged. If both define a
 default action (`"*"`), the glob default takes precedence.
 
+### Interactive approvals
+
+When a rule resolves to `ask`, the TUI shows the request and these keys:
+
+- `y` allows this one call.
+- `a` allows the suggested scope (a path tree, or the exact shell script) for
+  the rest of this session. It is recorded with the session for `--resume`
+  but never written to the config.
+- `f` (only for `read`, `edit`, and `list_dir` requests) allows `read`,
+  `edit`, and `list_dir` on the request's folder and everything beneath it
+  for this session in one approval: the directory itself for `list_dir`,
+  otherwise the file's parent. It does not cover `write`, so creating files
+  still asks.
+- `n` denies the call; `Esc`, `Ctrl+C`, or `Ctrl+D` abort it.
+
+Session grants never override a `deny` rule (see below). ACP clients keep
+their own approval choices.
+
 ### Rule precedence
 
 When several rules for one tool match the same input, the outcome is
@@ -1858,8 +1876,9 @@ provide the same functionality at runtime.
 ## Prompt directives
 
 Custom prompt `.md` files may start with a contiguous directive header. The
-recognized lines are `%%mode=<mode>` and `%%agent=<name>`; they may appear in
-either order and are stripped before the prompt reaches the model. The first
+recognized lines are `%%mode=<mode>` and `%%agent=<name>` (built-in prompts
+may also use `%%grant=`, see Built-in scoped grants); they may appear in
+any order and are stripped before the prompt reaches the model. The first
 selects the security mode and the second composes the prompt with a main-agent
 persona when the prompt is activated (via `/prompt <name>`, `.name`, or as the
 `default_prompt`). `%%agent=default` clears an active persona.
@@ -1905,6 +1924,24 @@ are replaced when prompts are loaded:
 
 Unknown `{{...}}` text is left as written. Project prompts
 (`.zerostack/prompts/`) are never rendered.
+
+### Built-in scoped grants
+
+Prompts shipped in the binary may also carry
+`%%grant=config_dir:<tools>`, where `<tools>` is a comma-separated subset of
+`read`, `edit`, and `list_dir`. The built-in `autoconfig` prompt uses
+`%%grant=config_dir:read,edit,list_dir`. The directive grants nothing by
+itself: on the workflow's first request that needs one of those tools inside
+the resolved global config directory, the TUI asks once whether to allow them
+there for this session. Declining falls back to ordinary per-call approval
+for the rest of the workflow; switching prompts withdraws an unanswered
+offer. Deny rules still apply, and headless or ACP sessions never see the
+offer.
+
+`%%grant=` is honoured only for embedded prompts, including an unmodified
+copy of one in the user prompts directory. It is removed with a warning from
+edited user prompts and from project prompts, trusted or not. Any other scope
+or tool (for example `write` or `shell`) rejects the whole directive.
 
 Example `ask.md`:
 

@@ -112,6 +112,25 @@ pub struct PermissionChecker {
     /// entry, so one hook verdict can never overwrite another call's.
     #[cfg(feature = "hooks")]
     hook_decisions: std::collections::HashMap<u64, HookOneShot>,
+    /// A scoped grant an embedded built-in prompt asked for, waiting for the
+    /// user's one-time decision. Arming it grants nothing by itself.
+    prompt_grant_offer: Option<PromptGrantOffer>,
+}
+
+/// Tools covered by a one-approval folder grant: enough to inspect and edit
+/// existing files in one directory tree, but never to create files (`write`),
+/// run commands, or reach other directories.
+pub const FOLDER_GRANT_TOOLS: [&str; 3] = ["read", "edit", "list_dir"];
+
+/// A folder grant requested by an embedded built-in prompt's `%%grant=`
+/// directive. It is offered to the user once, the first time the prompt's
+/// workflow asks to touch the folder; only the user's approval adds it to the
+/// session allowlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptGrantOffer {
+    pub prompt: String,
+    pub dir: PathBuf,
+    pub tools: Vec<&'static str>,
 }
 
 /// A hook verdict recorded for exactly one wrapped tool invocation.
@@ -348,6 +367,7 @@ impl PermissionChecker {
             cached_resolved_cwd,
             #[cfg(feature = "hooks")]
             hook_decisions: std::collections::HashMap::new(),
+            prompt_grant_offer: None,
         };
         #[cfg(feature = "hooks")]
         crate::extras::hooks::set_active_permission_mode(mode);
@@ -983,6 +1003,83 @@ impl PermissionChecker {
                 }
             }
         }
+    }
+
+    /// The folder a one-approval grant for this request would cover: the
+    /// directory itself for `list_dir` (or an existing directory), otherwise
+    /// the file's parent. `None` for tools outside [`FOLDER_GRANT_TOOLS`].
+    pub fn folder_grant_scope(&self, tool: &str, input: &str) -> Option<PathBuf> {
+        let tool = canonical_permission_tool(tool);
+        if !FOLDER_GRANT_TOOLS.contains(&tool) {
+            return None;
+        }
+        let absolute = normalize_path(Path::new(&resolve_absolute(input, &self.working_dir)));
+        if tool == "list_dir" || absolute.is_dir() {
+            Some(absolute)
+        } else {
+            absolute.parent().map(Path::to_path_buf)
+        }
+    }
+
+    /// Allow each of `tools` on `folder` and everything beneath it for the
+    /// rest of the session, in one user approval. Deny rules keep precedence
+    /// because they are evaluated before the session allowlist. Returns the
+    /// `(tool, pattern)` entries so the caller can persist them with the
+    /// session.
+    pub fn add_session_folder_grant(
+        &mut self,
+        folder: &Path,
+        tools: &[&str],
+    ) -> Vec<(String, String)> {
+        let scopes = [
+            crate::permission::pattern::exact_path_pattern(folder),
+            crate::permission::pattern::descendant_path_pattern(folder),
+        ];
+        let mut entries = Vec::with_capacity(tools.len() * scopes.len());
+        for tool in tools {
+            for scope in &scopes {
+                self.add_session_allowlist(tool.to_string(), scope);
+                entries.push((tool.to_string(), scope.clone()));
+            }
+        }
+        entries
+    }
+
+    /// Arm (or clear) the scoped grant the active prompt requested. Called on
+    /// every prompt activation so a stale offer never outlives its prompt.
+    pub fn set_prompt_grant_offer(&mut self, offer: Option<PromptGrantOffer>) {
+        self.prompt_grant_offer = offer;
+    }
+
+    /// The pending prompt grant, when this request falls inside it. The UI
+    /// consults this only for requests that already resolved to `Ask`.
+    pub fn prompt_grant_offer_for(&self, tool: &str, input: &str) -> Option<PromptGrantOffer> {
+        let offer = self.prompt_grant_offer.as_ref()?;
+        let tool = canonical_permission_tool(tool);
+        if !offer.tools.contains(&tool) {
+            return None;
+        }
+        let absolute = resolve_absolute(input, &self.working_dir);
+        let resolved = resolve_path_allow_missing(Path::new(&absolute))
+            .unwrap_or_else(|| normalize_path(Path::new(&absolute)));
+        let dir =
+            resolve_path_allow_missing(&offer.dir).unwrap_or_else(|| normalize_path(&offer.dir));
+        resolved.starts_with(&dir).then(|| offer.clone())
+    }
+
+    /// The user approved the pending prompt grant: add it to the session
+    /// allowlist and stop offering it. Returns the entries to persist.
+    pub fn accept_prompt_grant(&mut self) -> Vec<(String, String)> {
+        let Some(offer) = self.prompt_grant_offer.take() else {
+            return Vec::new();
+        };
+        self.add_session_folder_grant(&offer.dir, &offer.tools)
+    }
+
+    /// The user declined the pending prompt grant; later requests fall back to
+    /// ordinary per-call approval without asking again.
+    pub fn decline_prompt_grant(&mut self) {
+        self.prompt_grant_offer = None;
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
@@ -2039,5 +2136,199 @@ mod tests {
             !write_entries.is_empty(),
             "should have write entry for docs/**"
         );
+    }
+}
+
+#[cfg(test)]
+mod folder_grant_tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("zs_folder_grant_{}", uuid::Uuid::new_v4()));
+            let workspace = root.join("workspace");
+            let config = root.join("config");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("config.toml"), "model = \"x\"\n").unwrap();
+            Self {
+                root,
+                workspace,
+                config,
+            }
+        }
+
+        fn checker_with(&self, config: PermissionConfig) -> PermissionChecker {
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(self.workspace.clone()),
+                None,
+            )
+            .expect("valid folder-grant fixture")
+        }
+
+        fn checker(&self) -> PermissionChecker {
+            self.checker_with(PermissionConfig::default())
+        }
+
+        fn file(&self) -> String {
+            self.config
+                .join("config.toml")
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        fn dir(&self) -> String {
+            self.config.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn external_config_reads_and_edits_ask_before_any_grant() {
+        let fx = Fixture::new();
+        let mut checker = fx.checker();
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Ask);
+        assert_eq!(checker.check_path("edit", &fx.file()), CheckResult::Ask);
+    }
+
+    #[test]
+    fn one_folder_grant_covers_read_edit_and_list_dir_but_not_write() {
+        let fx = Fixture::new();
+        let mut checker = fx.checker();
+        let scope = checker.folder_grant_scope("read", &fx.file()).unwrap();
+        assert_eq!(scope, fx.config);
+
+        let entries = checker.add_session_folder_grant(&scope, &FOLDER_GRANT_TOOLS);
+
+        assert_eq!(entries.len(), FOLDER_GRANT_TOOLS.len() * 2);
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Allowed);
+        assert_eq!(checker.check_path("edit", &fx.file()), CheckResult::Allowed);
+        assert_eq!(
+            checker.check_path("list_dir", &fx.dir()),
+            CheckResult::Allowed
+        );
+        let new_file = fx.config.join("new.toml").to_string_lossy().into_owned();
+        assert_eq!(checker.check_path("write", &new_file), CheckResult::Ask);
+        // A sibling of the granted folder is not covered.
+        let sibling = fx
+            .root
+            .join("config-other/x.toml")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(checker.check_path("read", &sibling), CheckResult::Ask);
+    }
+
+    #[test]
+    fn persisted_folder_grant_entries_restore_the_same_scope() {
+        let fx = Fixture::new();
+        let mut first = fx.checker();
+        let entries = first.add_session_folder_grant(&fx.config, &FOLDER_GRANT_TOOLS);
+
+        let mut restored = fx.checker();
+        restored.load_session_allowlist(&entries);
+
+        assert_eq!(
+            restored.check_path("edit", &fx.file()),
+            CheckResult::Allowed
+        );
+    }
+
+    #[test]
+    fn folder_grant_never_overrides_a_deny_rule() {
+        let fx = Fixture::new();
+        let config = PermissionConfig {
+            edit: Some(ToolPerm::Granular(HashMap::from([(
+                format!("{}/**", fx.dir()),
+                Action::Deny,
+            )]))),
+            ..PermissionConfig::default()
+        };
+        let mut checker = fx.checker_with(config);
+        checker.add_session_folder_grant(&fx.config, &FOLDER_GRANT_TOOLS);
+
+        assert!(matches!(
+            checker.check_path("edit", &fx.file()),
+            CheckResult::Denied(_)
+        ));
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Allowed);
+    }
+
+    #[test]
+    fn folder_grant_scope_uses_the_directory_for_list_dir_and_skips_other_tools() {
+        let fx = Fixture::new();
+        let checker = fx.checker();
+        assert_eq!(
+            checker.folder_grant_scope("list_dir", &fx.dir()),
+            Some(fx.config.clone())
+        );
+        assert_eq!(
+            checker.folder_grant_scope("edit", &fx.file()),
+            Some(fx.config.clone())
+        );
+        assert_eq!(checker.folder_grant_scope("write", &fx.file()), None);
+        assert_eq!(checker.folder_grant_scope("shell", "ls"), None);
+    }
+
+    fn offer(fx: &Fixture) -> PromptGrantOffer {
+        PromptGrantOffer {
+            prompt: "autoconfig".into(),
+            dir: fx.config.clone(),
+            tools: vec!["read", "edit"],
+        }
+    }
+
+    #[test]
+    fn an_armed_prompt_grant_grants_nothing_until_accepted() {
+        let fx = Fixture::new();
+        let mut checker = fx.checker();
+        checker.set_prompt_grant_offer(Some(offer(&fx)));
+
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Ask);
+        assert_eq!(
+            checker.prompt_grant_offer_for("read", &fx.file()),
+            Some(offer(&fx))
+        );
+        // Outside the scope or for another tool, there is no offer.
+        assert_eq!(checker.prompt_grant_offer_for("list_dir", &fx.dir()), None);
+        let outside = fx.workspace.join("a.txt").to_string_lossy().into_owned();
+        assert_eq!(checker.prompt_grant_offer_for("read", &outside), None);
+
+        let entries = checker.accept_prompt_grant();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Allowed);
+        assert_eq!(checker.check_path("edit", &fx.file()), CheckResult::Allowed);
+        // Accepted once: never offered again.
+        assert_eq!(checker.prompt_grant_offer_for("read", &fx.file()), None);
+        assert!(checker.accept_prompt_grant().is_empty());
+    }
+
+    #[test]
+    fn a_declined_or_replaced_prompt_grant_is_not_offered_again() {
+        let fx = Fixture::new();
+        let mut checker = fx.checker();
+        checker.set_prompt_grant_offer(Some(offer(&fx)));
+        checker.decline_prompt_grant();
+        assert_eq!(checker.prompt_grant_offer_for("read", &fx.file()), None);
+        assert_eq!(checker.check_path("read", &fx.file()), CheckResult::Ask);
+
+        checker.set_prompt_grant_offer(Some(offer(&fx)));
+        checker.set_prompt_grant_offer(None);
+        assert_eq!(checker.prompt_grant_offer_for("read", &fx.file()), None);
     }
 }

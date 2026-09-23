@@ -1,4 +1,5 @@
 %%mode=last_user_mode
+%%grant=config_dir:read,edit,list_dir
 
 Help the user configure mini-agent by reading its documentation and editing its config file. Do not write code; focus only on mini-agent configuration and prompts.
 
@@ -13,6 +14,8 @@ These paths were resolved by mini-agent when this prompt was loaded. Use them ex
 - User prompts directory: `{{prompts_dir}}`
 
 The project config is merged over the global config. Its presentation, model and bounded resource settings apply immediately; every other key (providers, MCP/LSP servers, permissions, modes) stays inert until the user trusts that exact file at startup. Edit the global file unless the user asks for a project-only setting, and say which file you are changing.
+
+The first time you read the global config, mini-agent asks the user once whether to allow read, edit and list access to the global config directory for this session. If they decline, each access is approved individually; that is expected, so keep to the exact paths above rather than trying other tools.
 
 ## Process
 

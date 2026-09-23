@@ -110,7 +110,24 @@ pub(crate) fn apply_prompt_mode(
     let Some(mode_directive) = context.activate_prompt(name) else {
         return PromptModeOutcome::None;
     };
+    arm_prompt_grant(name, context, permission);
     apply_mode_directive(mode_directive.as_deref(), permission)
+}
+
+/// Arm the scoped grant requested by an embedded prompt's `%%grant=`
+/// directive, or clear a previous prompt's offer. Nothing is granted here:
+/// the permission prompt offers it to the user once, on the workflow's first
+/// matching request.
+pub(crate) fn arm_prompt_grant(name: &str, context: &ContextFiles, permission: &Option<PermCheck>) {
+    let Some(perm) = permission else {
+        return;
+    };
+    let offer = crate::paths::process_paths().ok().and_then(|paths| {
+        crate::context::prompts::prompt_grant_offer(&context.prompts, name, &paths)
+    });
+    perm.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_prompt_grant_offer(offer);
 }
 
 /// Apply an already-parsed `%%mode=` directive to the permission checker.
@@ -152,6 +169,7 @@ pub(crate) fn apply_current_prompt_mode(
         .current_agent_explicit
         .then(|| context.current_agent_name.clone());
     let mode_directive = context.activate_prompt(&name).flatten();
+    arm_prompt_grant(&name, context, permission);
     if let Some(agent) = explicit_agent {
         context.current_agent_name =
             agent.filter(|name| context.agent_definitions.contains_key(name));

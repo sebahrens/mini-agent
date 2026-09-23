@@ -143,7 +143,6 @@ pub(crate) fn descendant_path_pattern(path: &std::path::Path) -> String {
 /// An exact path encoded as a glob without interpreting any of its filename
 /// characters as metacharacters. The bracket escapes are standard glob forms
 /// and are understood by [`glob_to_regex`].
-#[cfg(feature = "lsp")]
 pub(crate) fn exact_path_pattern(path: &std::path::Path) -> String {
     let display = path.to_string_lossy();
     let normalized = normalize_path_separators(&display);

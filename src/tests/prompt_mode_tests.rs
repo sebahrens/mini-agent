@@ -279,6 +279,41 @@ fn directive_may_lower_mode_and_last_user_mode_restores_it() {
     assert_eq!(current_mode(&perm), SecurityMode::Yolo);
 }
 
+/// mini-agent-2rk6q: activating a prompt that still carries `%%grant=`
+/// (only embedded prompts do after loading) arms a one-time offer without
+/// granting anything; switching to another prompt withdraws it.
+#[test]
+fn prompt_activation_arms_and_switching_clears_the_grant_offer() {
+    let mut context = make_context(&[
+        ("autoconfig", "%%grant=config_dir:read,edit\nBody."),
+        ("code", "Body."),
+    ]);
+    let perm = make_perm(SecurityMode::Standard);
+    let config_dir = crate::paths::process_paths().unwrap().config_dir;
+    let config_file = config_dir
+        .join("config.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    apply_prompt_mode("autoconfig", &mut context, &Some(perm.clone()));
+    {
+        let guard = perm.lock().unwrap();
+        let offer = guard
+            .prompt_grant_offer_for("edit", &config_file)
+            .expect("offer armed for the config dir");
+        assert_eq!(offer.tools, vec!["read", "edit"]);
+    }
+    assert_eq!(context.current_prompt.as_deref(), Some("Body."));
+
+    apply_prompt_mode("code", &mut context, &Some(perm.clone()));
+    assert!(
+        perm.lock()
+            .unwrap()
+            .prompt_grant_offer_for("edit", &config_file)
+            .is_none()
+    );
+}
+
 /// mini-agent-mt00y: the built-in autoconfig workflow must not downgrade a
 /// more permissive session (which multiplied approvals for yolo users), and it
 /// still cannot raise a narrower one.
