@@ -1848,8 +1848,8 @@ future_security_switch = true
         let (root, _, trust_path) = fixture("symlink");
         let first = root.join("first");
         let second = root.join("second");
-        std::fs::create_dir_all(first.join(".zerostack")).unwrap();
-        std::fs::create_dir_all(second.join(".zerostack")).unwrap();
+        std::fs::create_dir_all(first.join(crate::product::LEGACY_PROJECT_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(second.join(crate::product::LEGACY_PROJECT_DIRECTORY)).unwrap();
         std::fs::write(first.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
         std::fs::write(second.join(".zerostack/config.toml"), "yolo = true\n").unwrap();
         let linked_project = root.join("linked-project");

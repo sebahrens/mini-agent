@@ -422,7 +422,7 @@ mod tests {
                 state_dir: dir.join("state"),
                 cache_dir: dir.join("cache"),
                 credentials_dir: dir.join("credentials"),
-                project_dir: Some(dir.join(".zerostack")),
+                project_dir: Some(dir.join(crate::product::LEGACY_PROJECT_DIRECTORY)),
             };
             TestDir { dir, paths }
         }

@@ -155,7 +155,9 @@ including `frontend-design`, `review-security`, `simplify`, `write-prompt`,
 
 ## 3. Autoconfig
 
-There is one special prompt, called `autoconfig`, that has full access to your mini-agent configuration and the project's documentation. Load `autoconfig` when you want the agent to manage configuration for you.
+Load the built-in `autoconfig` prompt (`.autoconfig`) when you want the agent to manage configuration for you. It is given the exact paths of your global config file, your project config file, and the installed documentation, and it proposes each change as a diff for your approval before editing.
+
+`autoconfig` has no standing access to your configuration. It runs in the security mode you already chose, and the first time it needs your config directory mini-agent asks once whether to allow reading, editing, and listing that directory for this session. Decline and each access is approved individually instead.
 
 ## 4. Keybindings
 
