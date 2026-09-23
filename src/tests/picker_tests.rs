@@ -965,7 +965,8 @@ mod slash_picker_contract {
     fn match_rank_orders_exact_prefix_boundary_then_substring() {
         assert_eq!(match_rank("/model", "model"), Some(0));
         assert_eq!(match_rank("/model", "/mod"), Some(1));
-        assert_eq!(match_rank("/model-subagent", "sub"), Some(2));
+        assert_eq!(match_rank("/subagent-model", "sub"), Some(1));
+        assert_eq!(match_rank("/drop-all", "all"), Some(2));
         assert_eq!(match_rank("/compress", "re"), Some(3));
         assert_eq!(match_rank("/compress", "xyz"), None);
         assert_eq!(match_rank("Café", "caf"), Some(1));

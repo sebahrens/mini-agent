@@ -403,15 +403,19 @@ and delivery record.
 | Command                            | Description                                |
 |------------------------------------|--------------------------------------------|
 | `/agent [name]`                    | Show or switch the main-agent persona      |
-| `/model-subagent [name]`           | Show or switch the subagent's model        |
-| `/models-subagent [name]`          | List quick models or switch subagent to one|
+| `/subagent-model [name]`           | Show or switch the subagent's model        |
+| `/subagent-models [name]`          | List quick models or switch subagent to one|
 
-- **`/model-subagent`** with no arguments shows the current subagent provider
+- **`/subagent-model`** with no arguments shows the current subagent provider
   and model. With a model name, it switches the subagent to that model (using
   the same provider).
-- **`/models-subagent`** with no arguments lists quick models. With a quick
+- **`/subagent-models`** with no arguments lists quick models. With a quick
   model name, it switches the subagent to that quick model's provider + model.
   If the quick model uses a different provider, a new API client is created.
+- The earlier spellings `/model-subagent` and `/models-subagent` still work as
+  hidden aliases; completion and `/help` show only the names above.
+- In a build without the `subagents` feature these commands (either spelling)
+  print that the feature is required instead of doing nothing.
 
 These commands update the global `SubagentConfig` at runtime. The next call
 to the `task` tool picks up the new settings automatically.

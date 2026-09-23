@@ -277,15 +277,15 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     {
         emit(
             false,
-            "  /model-subagent [name] show or switch subagent model",
+            "  /subagent-model [name] show or switch subagent model",
         );
         emit(
             false,
-            "  /models-subagent       list quick models for subagent",
+            "  /subagent-models       list quick models for subagent",
         );
         emit(
             false,
-            "  /models-subagent <n>   switch subagent to a quick model",
+            "  /subagent-models <n>   switch subagent to a quick model",
         );
     }
     emit(true, "keys:");

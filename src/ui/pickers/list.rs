@@ -91,8 +91,9 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
 
     #[cfg(feature = "subagents")]
     {
-        cmds.push("/model-subagent");
-        cmds.push("/models-subagent");
+        // `/model-subagent` and `/models-subagent` remain hidden aliases.
+        cmds.push("/subagent-model");
+        cmds.push("/subagent-models");
     }
 
     cmds.sort_unstable();

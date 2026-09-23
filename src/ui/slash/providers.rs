@@ -28,12 +28,15 @@ pub(crate) enum SubagentModelCommand {
     Models,
 }
 
-/// Recognise a subagent model command. Routed in every build so a build
-/// without the `subagents` feature reports why it does nothing.
+/// Recognise a subagent model command. `/subagent-model` and
+/// `/subagent-models` are the canonical names; `/model-subagent` and
+/// `/models-subagent` stay as hidden aliases (not offered by completion or
+/// `/help`). Routed in every build so a build without the `subagents`
+/// feature reports why it does nothing.
 pub(crate) fn subagent_model_command(name: &str) -> Option<SubagentModelCommand> {
     match name {
-        "/model-subagent" => Some(SubagentModelCommand::Model),
-        "/models-subagent" => Some(SubagentModelCommand::Models),
+        "/subagent-model" | "/model-subagent" => Some(SubagentModelCommand::Model),
+        "/subagent-models" | "/models-subagent" => Some(SubagentModelCommand::Models),
         _ => None,
     }
 }
@@ -623,6 +626,14 @@ mod subagent_command_tests {
     #[test]
     fn subagent_model_commands_are_recognised_in_every_build() {
         assert_eq!(
+            subagent_model_command("/subagent-model"),
+            Some(SubagentModelCommand::Model)
+        );
+        assert_eq!(
+            subagent_model_command("/subagent-models"),
+            Some(SubagentModelCommand::Models)
+        );
+        assert_eq!(
             subagent_model_command("/model-subagent"),
             Some(SubagentModelCommand::Model)
         );
@@ -631,8 +642,22 @@ mod subagent_command_tests {
             Some(SubagentModelCommand::Models)
         );
         assert_eq!(subagent_model_command("/model"), None);
+        assert!(crate::ui::slash::routes_to_providers("/subagent-model"));
+        assert!(crate::ui::slash::routes_to_providers("/subagent-models"));
         assert!(crate::ui::slash::routes_to_providers("/model-subagent"));
         assert!(crate::ui::slash::routes_to_providers("/models-subagent"));
+    }
+
+    #[test]
+    fn completion_offers_only_the_canonical_names() {
+        let offered = crate::ui::pickers::list::available_commands();
+        assert!(!offered.contains(&"/model-subagent"));
+        assert!(!offered.contains(&"/models-subagent"));
+        #[cfg(feature = "subagents")]
+        {
+            assert!(offered.contains(&"/subagent-model"));
+            assert!(offered.contains(&"/subagent-models"));
+        }
     }
 
     #[test]

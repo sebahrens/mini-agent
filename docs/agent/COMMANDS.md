@@ -213,10 +213,14 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 
 | Command | Description |
 | ------- | ----------- |
-| `/model-subagent` | Show the model currently used for subagents. |
-| `/model-subagent <name>` | Switch the subagent model. |
-| `/models-subagent` | List quick models available for subagents. |
-| `/models-subagent <name>` | Switch subagents to a named quick model. |
+| `/subagent-model` | Show the model currently used for subagents. |
+| `/subagent-model <name>` | Switch the subagent model. |
+| `/subagent-models` | List quick models available for subagents. |
+| `/subagent-models <name>` | Switch subagents to a named quick model. |
+
+`/model-subagent` and `/models-subagent` remain accepted as hidden aliases
+for `/subagent-model` and `/subagent-models`. Without the `subagents` feature,
+either spelling prints that the feature is required.
 
 ## Worktree (feature-gated)
 
