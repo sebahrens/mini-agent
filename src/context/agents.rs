@@ -51,7 +51,7 @@ impl AgentTool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AgentEffort {
+pub(crate) enum AgentTurnBudget {
     Low,
     Medium,
     High,
@@ -63,7 +63,9 @@ struct AgentMetadata {
     description: Option<String>,
     tools: Option<Vec<AgentTool>>,
     model: Option<String>,
-    effort: Option<AgentEffort>,
+    turn_budget: Option<AgentTurnBudget>,
+    /// The turn budget came from the deprecated `effort` alias.
+    deprecated_effort_alias: bool,
     unknown_keys: Vec<String>,
 }
 
@@ -180,17 +182,42 @@ fn normalize_agent_definition(
             Ok(model.to_string())
         })
         .transpose()?;
-    let effort = mapping
-        .get(serde_yaml_ng::Value::String("effort".into()))
-        .map(|value| match value.as_str() {
-            Some("low") => Ok(AgentEffort::Low),
-            Some("medium") => Ok(AgentEffort::Medium),
-            Some("high") => Ok(AgentEffort::High),
-            Some(_) => Err("frontmatter effort must be low, medium, or high"),
-            None => Err("frontmatter effort must be a string"),
-        })
-        .transpose()?;
-    let known_keys = ["name", "mode", "description", "tools", "model", "effort"];
+    let parse_turn_budget = |key: &str| {
+        mapping
+            .get(serde_yaml_ng::Value::String(key.into()))
+            .map(|value| match value.as_str() {
+                Some("low") => Ok(AgentTurnBudget::Low),
+                Some("medium") => Ok(AgentTurnBudget::Medium),
+                Some("high") => Ok(AgentTurnBudget::High),
+                Some(_) if key == "effort" => {
+                    Err("frontmatter effort (deprecated alias of turn_budget) must be low, medium, or high")
+                }
+                Some(_) => Err("frontmatter turn_budget must be low, medium, or high"),
+                None if key == "effort" => {
+                    Err("frontmatter effort (deprecated alias of turn_budget) must be a string")
+                }
+                None => Err("frontmatter turn_budget must be a string"),
+            })
+            .transpose()
+    };
+    let turn_budget = parse_turn_budget("turn_budget")?;
+    let deprecated_effort = parse_turn_budget("effort")?;
+    if turn_budget.is_some() && deprecated_effort.is_some() {
+        return Err(
+            "frontmatter sets both turn_budget and its deprecated alias effort; keep only turn_budget",
+        );
+    }
+    let deprecated_effort_alias = deprecated_effort.is_some();
+    let turn_budget = turn_budget.or(deprecated_effort);
+    let known_keys = [
+        "name",
+        "mode",
+        "description",
+        "tools",
+        "model",
+        "turn_budget",
+        "effort",
+    ];
     let mut unknown_keys = mapping
         .keys()
         .filter_map(serde_yaml_ng::Value::as_str)
@@ -212,7 +239,8 @@ fn normalize_agent_definition(
                     description,
                     tools,
                     model,
-                    effort,
+                    turn_budget,
+                    deprecated_effort_alias,
                     unknown_keys,
                 },
             )
@@ -277,8 +305,9 @@ pub struct AgentDefinition {
     pub(crate) tools: Option<Vec<AgentTool>>,
     /// Optional raw model id or configured quick-model alias for specialist children.
     pub(crate) model: Option<String>,
-    /// Optional exploration-effort tier that narrows the global child turn cap.
-    pub(crate) effort: Option<AgentEffort>,
+    /// Optional `turn_budget` tier (formerly `effort`) that narrows the global
+    /// child turn cap. Unrelated to the model's `[reasoning] effort`.
+    pub(crate) turn_budget: Option<AgentTurnBudget>,
     pub source: AgentDefinitionSource,
     project_notes_path: Option<PathBuf>,
     ignored_definition_notices: Vec<String>,
@@ -290,7 +319,7 @@ fn merge_definitions(
     source: AgentDefinitionSource,
 ) {
     for (name, prompt, metadata) in definitions {
-        warn_unknown_keys(&name, &source, &metadata.unknown_keys);
+        warn_metadata(&name, &source, &metadata);
         agents.insert(
             name,
             AgentDefinition {
@@ -299,7 +328,7 @@ fn merge_definitions(
                 description: metadata.description,
                 tools: metadata.tools,
                 model: metadata.model,
-                effort: metadata.effort,
+                turn_budget: metadata.turn_budget,
                 source: source.clone(),
                 project_notes_path: None,
                 ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
@@ -317,7 +346,7 @@ impl AgentDefinition {
             description: None,
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -409,17 +438,29 @@ fn unknown_key_notices(keys: &[String]) -> Vec<String> {
     }
 }
 
-fn warn_unknown_keys(name: &str, source: &AgentDefinitionSource, keys: &[String]) {
-    if !keys.is_empty() {
+fn warn_metadata(name: &str, source: &AgentDefinitionSource, metadata: &AgentMetadata) {
+    if metadata.unknown_keys.is_empty() && !metadata.deprecated_effort_alias {
+        return;
+    }
+    let source = match source {
+        AgentDefinitionSource::Embedded => "compiled-in default".to_string(),
+        AgentDefinitionSource::UserGlobal => "user-global configuration".to_string(),
+        AgentDefinitionSource::ProjectOverride { directory } => directory.display().to_string(),
+    };
+    if !metadata.unknown_keys.is_empty() {
         tracing::warn!(
             agent_type = name,
-            source = %match source {
-                AgentDefinitionSource::Embedded => "compiled-in default".to_string(),
-                AgentDefinitionSource::UserGlobal => "user-global configuration".to_string(),
-                AgentDefinitionSource::ProjectOverride { directory } => directory.display().to_string(),
-            },
-            unknown_keys = %keys.join(", "),
+            source = %source,
+            unknown_keys = %metadata.unknown_keys.join(", "),
             "ignoring unknown specialist frontmatter keys"
+        );
+    }
+    if metadata.deprecated_effort_alias {
+        tracing::warn!(
+            agent_type = name,
+            source = %source,
+            "specialist frontmatter `effort` is deprecated; rename it to `turn_budget` \
+             (it scales the child turn cap, not model reasoning effort)"
         );
     }
 }
@@ -539,7 +580,7 @@ fn merge_external_definitions(
         });
         match normalized {
             Ok((name, prompt, metadata)) => {
-                warn_unknown_keys(&name, &source, &metadata.unknown_keys);
+                warn_metadata(&name, &source, &metadata);
                 agents.insert(
                     name,
                     AgentDefinition {
@@ -548,7 +589,7 @@ fn merge_external_definitions(
                         description: metadata.description,
                         tools: metadata.tools,
                         model: metadata.model,
-                        effort: metadata.effort,
+                        turn_budget: metadata.turn_budget,
                         source: source.clone(),
                         project_notes_path: None,
                         ignored_definition_notices: unknown_key_notices(&metadata.unknown_keys),
@@ -856,7 +897,7 @@ mod tests {
 
         let configured = normalize_agent_definition(
             "review".into(),
-            "---\nname: review\ndescription: Focused review\ntools: Read, Grep, Glob\nmodel: fast\neffort: medium\nfuture-key: ignored\n---\nbody".into(),
+            "---\nname: review\ndescription: Focused review\ntools: Read, Grep, Glob\nmodel: fast\nturn_budget: medium\nfuture-key: ignored\n---\nbody".into(),
         )
         .unwrap();
         assert_eq!(configured.2.description.as_deref(), Some("Focused review"));
@@ -865,7 +906,7 @@ mod tests {
             Some(vec![AgentTool::Read, AgentTool::Grep, AgentTool::FindFiles])
         );
         assert_eq!(configured.2.model.as_deref(), Some("fast"));
-        assert_eq!(configured.2.effort, Some(AgentEffort::Medium));
+        assert_eq!(configured.2.turn_budget, Some(AgentTurnBudget::Medium));
         assert_eq!(configured.2.unknown_keys, vec!["future-key"]);
         #[cfg(feature = "skills")]
         assert_eq!(
@@ -902,6 +943,39 @@ mod tests {
                 "---\nname: review\nmode: [review]\n---\nbody".into(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn persona_turn_budget_accepts_deprecated_effort_alias_but_not_both() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition(
+                "review".into(),
+                format!("---\nname: review\n{frontmatter}\n---\nbody"),
+            )
+        };
+
+        let current = parse("turn_budget: low").unwrap().2;
+        assert_eq!(current.turn_budget, Some(AgentTurnBudget::Low));
+        assert!(!current.deprecated_effort_alias);
+        assert!(current.unknown_keys.is_empty());
+
+        let legacy = parse("effort: high").unwrap().2;
+        assert_eq!(legacy.turn_budget, Some(AgentTurnBudget::High));
+        assert!(legacy.deprecated_effort_alias);
+        assert!(legacy.unknown_keys.is_empty());
+
+        let both = parse("turn_budget: low\neffort: low").unwrap_err();
+        assert!(both.contains("both turn_budget"), "{both}");
+        assert!(
+            parse("turn_budget: maximal")
+                .unwrap_err()
+                .contains("turn_budget must be low, medium, or high")
+        );
+        assert!(
+            parse("effort: 3")
+                .unwrap_err()
+                .contains("deprecated alias of turn_budget")
         );
     }
 
@@ -1051,7 +1125,7 @@ mod tests {
             description: None,
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1062,7 +1136,7 @@ mod tests {
             description: None,
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
             source: AgentDefinitionSource::UserGlobal,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),
@@ -1079,7 +1153,7 @@ mod tests {
             description: None,
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
             source: AgentDefinitionSource::Embedded,
             project_notes_path: None,
             ignored_definition_notices: Vec::new(),

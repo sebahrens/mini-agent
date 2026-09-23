@@ -166,7 +166,7 @@ invalidates that content-and-path-bound trust.
 Before reading a persona file, the task permission prompt identifies the
 requested `agent_type` and the highest-precedence source path that would be
 loaded, without embedding or parsing the specialist prompt body. Once approved,
-the resolved provider/model, effort tier, and tool subset are applied. When a trusted
+the resolved provider/model, turn-budget tier, and tool subset are applied. When a trusted
 project definition wins, the host also prefixes the task result with its
 `.zerostack/agents/<name>.md` source. This makes a repository-controlled
 replacement visible to the calling agent instead of silently presenting it as
@@ -192,7 +192,7 @@ name: rust-review
 description: Focused Rust API and test review
 tools: [Read, Grep, Glob]
 model: fast-review
-effort: medium
+turn_budget: medium
 mode: review
 ---
 ```
@@ -210,11 +210,14 @@ mode: review
   provider and `extra_body`. Otherwise it is a raw model ID on the current
   subagent provider. A provider switch that cannot authenticate fails the task
   explicitly rather than falling back to another model.
-- `effort` is `low`, `medium`, or `high`. It selects one-third, two-thirds, or
-  all of the configured `task_max_turns`, rounded up, and can never widen that
-  global cap.
+- `turn_budget` is `low`, `medium`, or `high`. It selects one-third,
+  two-thirds, or all of the configured `task_max_turns`, rounded up, and can
+  never widen that global cap. It is unrelated to the model's
+  `[reasoning] effort`. The older `effort` key is still accepted as a
+  deprecated alias and logs a warning; setting both `turn_budget` and `effort`
+  rejects the definition.
 - `mode` remains the prompt default used when the persona is selected for the
-  main loop through `/agent`. Child-only `tools`, `model`, and `effort`
+  main loop through `/agent`. Child-only `tools`, `model`, and `turn_budget`
   settings do not alter main-loop authority.
 
 The block is validated and removed before the prompt is installed. Malformed
@@ -392,7 +395,7 @@ subagent_provider = "openrouter"
   Coverage skeleton (mini-agent-nfd7, mini-agent-sux9).
 - Persona names are present in the schema enum and orchestrator prompt
   (mini-agent-kh1o), project definitions are trust-gated (mini-agent-yb9w),
-  frontmatter controls per-persona descriptions, models, effort, and read-only
+  frontmatter controls per-persona descriptions, models, turn budgets, and read-only
   tool subsets (mini-agent-6khf), and trusted `.notes.md` content extends
   generic embedded personas without replacing them (mini-agent-7hjo).
 

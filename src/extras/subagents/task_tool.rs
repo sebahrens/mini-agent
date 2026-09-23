@@ -317,20 +317,20 @@ struct ResolvedSpecialization {
     source: String,
     tools: Option<Vec<crate::context::agents::AgentTool>>,
     model: Option<String>,
-    effort: Option<crate::context::agents::AgentEffort>,
+    turn_budget: Option<crate::context::agents::AgentTurnBudget>,
 }
 
 impl ResolvedSpecialization {
     fn max_turns(&self, configured_max: usize) -> usize {
-        use crate::context::agents::AgentEffort;
+        use crate::context::agents::AgentTurnBudget;
 
         if configured_max == 0 {
             return 0;
         }
-        match self.effort {
-            Some(AgentEffort::Low) => configured_max.div_ceil(3).max(1),
-            Some(AgentEffort::Medium) => configured_max.saturating_mul(2).div_ceil(3).max(1),
-            Some(AgentEffort::High) | None => configured_max,
+        match self.turn_budget {
+            Some(AgentTurnBudget::Low) => configured_max.div_ceil(3).max(1),
+            Some(AgentTurnBudget::Medium) => configured_max.saturating_mul(2).div_ceil(3).max(1),
+            Some(AgentTurnBudget::High) | None => configured_max,
         }
     }
 }
@@ -440,7 +440,7 @@ fn resolve_specialization(
         source,
         tools: definition.tools,
         model: definition.model,
-        effort: definition.effort,
+        turn_budget: definition.turn_budget,
     }))
 }
 
@@ -1769,13 +1769,13 @@ mod tests {
             &["audit authentication".into()],
             Some("rust-security-review"),
             Some("compiled-in default"),
-            Some("provider=openrouter, model=test/reviewer, effort=medium, tools=read,grep"),
+            Some("provider=openrouter, model=test/reviewer, turn_budget=medium, tools=read,grep"),
         );
 
         assert!(input.contains("agent_type: rust-security-review"));
         assert!(input.contains("specialist source: compiled-in default"));
         assert!(input.contains("specialist execution: provider=openrouter"));
-        assert!(input.contains("effort=medium, tools=read,grep"));
+        assert!(input.contains("turn_budget=medium, tools=read,grep"));
         assert!(input.contains("prompts: audit authentication"));
         assert!(!input.contains("You are a"));
     }
@@ -1788,7 +1788,7 @@ mod tests {
             source: "trusted project override /workspace/.zerostack/agents/review.md".into(),
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
         };
 
         assert_eq!(
@@ -1811,12 +1811,12 @@ mod tests {
             source: "compiled-in default".into(),
             tools: Some(vec![crate::context::agents::AgentTool::Read]),
             model: Some("fast-review".into()),
-            effort: Some(crate::context::agents::AgentEffort::Medium),
+            turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
         }
     }
 
     #[test]
-    fn persona_runtime_resolves_quick_model_tools_and_bounded_effort() {
+    fn persona_runtime_resolves_quick_model_tools_and_bounded_turn_budget() {
         use compact_str::CompactString;
 
         let client = crate::provider::create_client(
@@ -1867,17 +1867,17 @@ mod tests {
     }
 
     #[test]
-    fn persona_effort_never_widens_the_configured_turn_cap() {
-        use crate::context::agents::AgentEffort;
+    fn persona_turn_budget_never_widens_the_configured_turn_cap() {
+        use crate::context::agents::AgentTurnBudget;
 
         let mut specialization = runtime_specialization();
-        specialization.effort = Some(AgentEffort::Low);
+        specialization.turn_budget = Some(AgentTurnBudget::Low);
         assert_eq!(specialization.max_turns(20), 7);
-        specialization.effort = Some(AgentEffort::Medium);
+        specialization.turn_budget = Some(AgentTurnBudget::Medium);
         assert_eq!(specialization.max_turns(20), 14);
-        specialization.effort = Some(AgentEffort::High);
+        specialization.turn_budget = Some(AgentTurnBudget::High);
         assert_eq!(specialization.max_turns(20), 20);
-        specialization.effort = None;
+        specialization.turn_budget = None;
         assert_eq!(specialization.max_turns(20), 20);
         assert_eq!(specialization.max_turns(0), 0);
     }
