@@ -52,9 +52,10 @@ The Command Palette exposes six commands:
 | **Mini Agent: Open Config** | Open the agent's global config, creating an inert owner-private `config.toml` when none exists. |
 | **Mini Agent: Show Output** | Reveal the Mini Agent output channel without moving keyboard focus. |
 
-Open Config follows the same platform-native global `zerostack` configuration
-root and `ZS_CONFIG_DIR` override as the binary and opens an existing
-TOML/YAML/JSON config when present.
+Open Config resolves the global configuration root exactly like the binary:
+`ZS_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it exists
+or no legacy `zerostack` root exists, otherwise the legacy platform-native
+`zerostack` root. It opens an existing TOML/YAML/JSON config when present.
 
 ### Settings
 
@@ -110,8 +111,9 @@ openssl rand -hex 32
 
 ### 3. Configure mini-agent
 
-Add to your platform global config (for example
-`~/.config/zerostack/config.toml` on Linux) or project-local
+Add to your global config (for example `~/.mini-agent/config.toml`, or
+`~/.config/zerostack/config.toml` for an existing legacy Linux install) or
+project-local
 `.zerostack/config.toml`. The `type` key selects the transport; the `host`
 and `port` must match the listener you start in the next step:
 

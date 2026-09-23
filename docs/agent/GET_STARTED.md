@@ -69,10 +69,12 @@ You can just set the matching env var with :
 | Gemini     | `GEMINI_API_KEY`      |
 | Ollama     | (none — local)        |
 
-Then, you can change your configuration file (`~/.config/zerostack/config.toml`
-on Linux, `~/Library/Application Support/zerostack/config.toml` on macOS, or
-`%APPDATA%\zerostack\config.toml` on Windows, unless overridden by
-`ZS_CONFIG_DIR`; see [CONFIG.md](CONFIG.md)) by adding
+Then, you can change your configuration file (`~/.mini-agent/config.toml`
+on a fresh install; an existing legacy install keeps
+`~/.config/zerostack/config.toml` on Linux,
+`~/Library/Application Support/zerostack/config.toml` on macOS, or
+`%APPDATA%\zerostack\config.toml` on Windows; `ZS_CONFIG_DIR` or
+`MINI_AGENT_HOME` override it; see [CONFIG.md](CONFIG.md)) by adding
 `provider = "provider_name"`.
 
 `ZS_MODEL` selects a model through the same CLI field as `--model`. For

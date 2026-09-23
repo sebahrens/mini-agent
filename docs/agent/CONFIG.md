@@ -5,9 +5,17 @@ description: "Full zerostack configuration reference: config file locations, pro
 # Configuration
 
 zerostack reads an optional TOML, YAML, or JSON config from one canonical
-configuration root. `ZS_CONFIG_DIR` overrides that root. Otherwise it is
-`~/.config/zerostack` on Linux, `~/Library/Application Support/zerostack` on
-macOS, and `%APPDATA%\zerostack` on Windows. Within that directory the filename
+configuration root, resolved in this order:
+
+1. `ZS_CONFIG_DIR`, when set.
+2. `MINI_AGENT_HOME`, when set (one directory for every global root).
+3. `~/.mini-agent` (`%USERPROFILE%\.mini-agent` on Windows) when it exists, or
+   on a fresh install where no legacy `zerostack` root exists yet.
+4. Otherwise, for an existing legacy install, the legacy root:
+   `~/.config/zerostack` on Linux, `~/Library/Application Support/zerostack`
+   on macOS, and `%APPDATA%\zerostack` on Windows.
+
+`--print-config` shows the resolved values. Within that directory the filename
 priority is `config.toml`, `config.yaml`, `config.yml`, then `config.json`.
 If none exists, zerostack creates `config.toml` in that same directory.
 
@@ -57,19 +65,30 @@ overriding earlier ones for same-named files:
 
 **Prompts** (priority low to high):
 1. Embedded at compile time
-2. The platform data root's `zerostack/prompts/` (global, user-level)
+2. `<data-root>/prompts/` (global, user-level; `~/.mini-agent/prompts/` with the global home)
 3. `<startup-workspace>/.zerostack/prompts/` (project-level, highest priority)
 
 **Themes** (priority low to high):
 1. Embedded at compile time
-2. The platform data root's `zerostack/themes/` (global, user-level)
+2. `<data-root>/themes/` (global, user-level; `~/.mini-agent/themes/` with the global home)
 
 `ZS_CONFIG_DIR` changes only the config root; prompts and themes continue to
-use `ZS_DATA_DIR` or the platform data root.
+use `ZS_DATA_DIR`, the global home, or the legacy platform data root.
 
-Persistent storage uses separate platform roots:
+With the global home (`~/.mini-agent` or `MINI_AGENT_HOME`), every platform
+uses one directory:
 
-| Content | Linux default | macOS default | Windows default |
+| Content | Global home layout |
+| --- | --- |
+| Config, portable data, local data | `~/.mini-agent` |
+| State, sessions, transcripts, logs | `~/.mini-agent/state` |
+| Cache | `~/.mini-agent/cache` |
+| Credentials | `~/.mini-agent/credentials` |
+
+An existing legacy install keeps its separate platform roots until you adopt
+the global home:
+
+| Content | Linux legacy | macOS legacy | Windows legacy |
 | --- | --- | --- | --- |
 | Config | `~/.config/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
 | Portable data | `~/.local/share/zerostack` | `~/Library/Application Support/zerostack` | `%APPDATA%\zerostack` |
@@ -79,9 +98,31 @@ Persistent storage uses separate platform roots:
 
 The corresponding overrides are `ZS_CONFIG_DIR`, `ZS_DATA_DIR`,
 `ZS_LOCAL_DATA_DIR`, `ZS_STATE_DIR`, `ZS_CACHE_DIR`, and
-`ZS_CREDENTIALS_DIR`. Overrides must be absolute (a leading `~` is expanded).
-zerostack never uses the current directory as a fallback for user-global
-state.
+`ZS_CREDENTIALS_DIR`; each one takes precedence over `MINI_AGENT_HOME` and
+`~/.mini-agent` for its own root. Overrides must be absolute (a leading `~` is
+expanded). zerostack never uses the current directory as a fallback for
+user-global state.
+
+**Adopting `~/.mini-agent` from a legacy install** is explicit; nothing is
+moved automatically. Create the directory (or set `MINI_AGENT_HOME`) and
+zerostack uses it from the next start. The config, sessions, logs, chat
+history, hook trust, memory, and learned skill database are then copied (never
+moved) from the legacy config/data roots. To keep everything else (prompts,
+themes, agents, credentials, remaining state), copy the legacy trees first:
+
+```sh
+# Linux
+mkdir -p ~/.mini-agent/state
+cp -a ~/.config/zerostack/. ~/.local/share/zerostack/. ~/.mini-agent/
+cp -a ~/.local/state/zerostack/. ~/.mini-agent/state/
+# macOS
+mkdir -p ~/.mini-agent
+cp -a ~/Library/Application\ Support/zerostack/. ~/.mini-agent/
+```
+
+On Windows, copy the contents of `%APPDATA%\zerostack` and
+`%LOCALAPPDATA%\zerostack` into `%USERPROFILE%\.mini-agent`. The cache is
+rebuildable. Delete the legacy directories yourself once the new home works.
 
 The brokered JavaScript effect audit permits one active parent writer for its private state store
 across the machine. A second parent cannot initialize JS auditing while that lock is held. The
@@ -544,8 +585,9 @@ backend falls back to in-parent or uncontained JavaScript.
 You can append custom text to **every** system prompt by creating a
 `SUFFIX.md` file in the config directory (same location as `config.toml`):
 
-- Linux: `~/.config/zerostack/SUFFIX.md` (or `$ZS_CONFIG_DIR/SUFFIX.md`)
-- macOS: `~/Library/Application Support/zerostack/SUFFIX.md`
+- Global home: `~/.mini-agent/SUFFIX.md` (or `$MINI_AGENT_HOME/SUFFIX.md`)
+- Linux legacy: `~/.config/zerostack/SUFFIX.md` (or `$ZS_CONFIG_DIR/SUFFIX.md`)
+- macOS legacy: `~/Library/Application Support/zerostack/SUFFIX.md`
 
 If the file exists and contains non-whitespace content, its contents are
 appended at the very end of the system prompt preamble — **after** AGENTS.md,
@@ -588,7 +630,7 @@ to three locations, loaded and merged in this order:
 
 | Location | Trust |
 | -------- | ----- |
-| `~/.config/zerostack/settings.json` (global; on macOS `~/Library/Application Support/zerostack/settings.json`; on Windows `%APPDATA%\zerostack\settings.json`, experimental) | Trusted by default |
+| `<config-root>/settings.json`, e.g. `~/.mini-agent/settings.json` (global; legacy `~/.config/zerostack/settings.json`, on macOS `~/Library/Application Support/zerostack/settings.json`; on Windows `%APPDATA%\zerostack\settings.json`, experimental) | Trusted by default |
 | `.zerostack/settings.json` (project, relative to CWD) | **Not** trusted by default — see Trust model below |
 | `/etc/zerostack/managed-settings.json` (Linux) / `/Library/Application Support/zerostack/managed-settings.json` (macOS) / `C:\ProgramData\zerostack\managed-settings.json` (Windows, experimental) — admin-controlled | Always trusted; unaffected by `disableAllHooks` |
 
