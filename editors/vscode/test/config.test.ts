@@ -17,13 +17,49 @@ afterEach(async () => {
 });
 
 describe('Mini Agent config paths', () => {
-  it('matches the application platform defaults', () => {
-    expect(resolveConfigDirectory('linux', '/home/alice', {}))
+  const legacyInstall = (...existing: string[]) => (candidate: string) =>
+    existing.includes(candidate);
+  const nothingExists = () => false;
+
+  it('keeps the legacy platform roots for an existing zerostack install', () => {
+    expect(resolveConfigDirectory('linux', '/home/alice', {},
+      legacyInstall('/home/alice/.config/zerostack')))
       .toBe('/home/alice/.config/zerostack');
-    expect(resolveConfigDirectory('darwin', '/Users/alice', {}))
+    expect(resolveConfigDirectory('linux', '/home/alice', {},
+      legacyInstall('/home/alice/.local/share/zerostack')))
+      .toBe('/home/alice/.config/zerostack');
+    expect(resolveConfigDirectory('darwin', '/Users/alice', {},
+      legacyInstall('/Users/alice/Library/Application Support/zerostack')))
       .toBe('/Users/alice/Library/Application Support/zerostack');
-    expect(resolveConfigDirectory('win32', 'C:\\Users\\Alice', { APPDATA: 'D:\\Roaming' }))
+    expect(resolveConfigDirectory('win32', 'C:\\Users\\Alice', { APPDATA: 'D:\\Roaming' },
+      legacyInstall('D:\\Roaming\\zerostack')))
       .toBe('D:\\Roaming\\zerostack');
+  });
+
+  it('uses ~/.mini-agent for fresh installs or once it exists', () => {
+    expect(resolveConfigDirectory('linux', '/home/alice', {}, nothingExists))
+      .toBe('/home/alice/.mini-agent');
+    expect(resolveConfigDirectory('darwin', '/Users/alice', {}, nothingExists))
+      .toBe('/Users/alice/.mini-agent');
+    expect(resolveConfigDirectory('win32', 'C:\\Users\\Alice', {}, nothingExists))
+      .toBe('C:\\Users\\Alice\\.mini-agent');
+    expect(resolveConfigDirectory('linux', '/home/alice', {}, legacyInstall(
+      '/home/alice/.config/zerostack', '/home/alice/.mini-agent',
+    ))).toBe('/home/alice/.mini-agent');
+  });
+
+  it('honors MINI_AGENT_HOME below ZS_CONFIG_DIR', () => {
+    const legacy = legacyInstall('/home/alice/.config/zerostack');
+    expect(resolveConfigDirectory('linux', '/home/alice',
+      { MINI_AGENT_HOME: '~/agent-home' }, legacy))
+      .toBe('/home/alice/agent-home');
+    expect(resolveConfigDirectory('linux', '/home/alice',
+      { MINI_AGENT_HOME: '~/agent-home', ZS_CONFIG_DIR: '/zs/config' }, legacy))
+      .toBe('/zs/config');
+    expect(() => resolveConfigDirectory('linux', '/home/alice', { MINI_AGENT_HOME: '' }))
+      .toThrow(/empty/);
+    expect(() => resolveConfigDirectory('linux', '/home/alice', { MINI_AGENT_HOME: 'rel' }))
+      .toThrow(/absolute/);
   });
 
   it('honors an absolute or home-relative ZS_CONFIG_DIR override', () => {

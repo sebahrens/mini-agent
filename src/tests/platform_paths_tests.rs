@@ -2,10 +2,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::paths::{
-    AppPathError, AppPathRoot, AppPaths, LegacyArtifactKind, LegacyArtifactRequirement,
-    LegacyMigrationError, LegacyMigrationRequest, LegacyMigrationStatus, PathEnvironment,
-    PathOverrides, PathPlatform, PortablePathError, collision_key, ensure_no_link_traversal,
-    migrate_legacy_path, prepare_storage_roots, validate_portable_component,
+    AppPathError, AppPathRoot, AppPaths, DefaultLayout, LegacyArtifactKind,
+    LegacyArtifactRequirement, LegacyMigrationError, LegacyMigrationRequest, LegacyMigrationStatus,
+    PathEnvironment, PathOverrides, PathPlatform, PortablePathError, collision_key,
+    ensure_no_link_traversal, migrate_legacy_path, prepare_storage_roots, probe_default_layout,
+    validate_portable_component,
 };
 
 struct TempRoot(PathBuf);
@@ -186,6 +187,199 @@ fn app_paths_matrix_acceptance_defaults_on_all_platforms() {
     assert_default_root_contract(PathPlatform::Windows, &windows).unwrap();
 }
 
+fn with_layout(mut environment: PathEnvironment, layout: DefaultLayout) -> PathEnvironment {
+    environment.overrides.default_layout = layout;
+    environment
+}
+
+fn assert_home_layout(paths: &AppPaths, home: &str, separator: char) {
+    let child = |name: &str| PathBuf::from(format!("{home}{separator}{name}"));
+    assert_eq!(paths.config_dir, PathBuf::from(home));
+    assert_eq!(paths.data_dir, PathBuf::from(home));
+    assert_eq!(paths.local_data_dir, PathBuf::from(home));
+    assert_eq!(paths.state_dir, child("state"));
+    assert_eq!(paths.cache_dir, child("cache"));
+    assert_eq!(paths.credentials_dir, child("credentials"));
+}
+
+#[test]
+fn app_paths_matrix_fresh_install_uses_global_home_on_all_platforms() {
+    let linux =
+        AppPaths::resolve(&with_layout(linux_environment(), DefaultLayout::GlobalHome)).unwrap();
+    assert_home_layout(&linux, "/home/alice/.mini-agent", '/');
+    assert_eq!(
+        linux.project_dir,
+        Some(PathBuf::from("/work/project/.zerostack")),
+        "the global home never relocates workspace storage"
+    );
+
+    let macos =
+        AppPaths::resolve(&with_layout(macos_environment(), DefaultLayout::GlobalHome)).unwrap();
+    assert_home_layout(&macos, "/Users/alice/.mini-agent", '/');
+
+    let windows = AppPaths::resolve(&with_layout(
+        windows_environment(),
+        DefaultLayout::GlobalHome,
+    ))
+    .unwrap();
+    assert_home_layout(&windows, r"C:\Users\Alice\.mini-agent", '\\');
+
+    let mut environment = with_layout(linux_environment(), DefaultLayout::GlobalHome);
+    environment.home_dir = None;
+    assert_eq!(
+        AppPaths::resolve(&environment),
+        Err(AppPathError::MissingBase {
+            root: AppPathRoot::Home,
+            platform: PathPlatform::Linux,
+        })
+    );
+}
+
+#[test]
+fn app_paths_matrix_mini_agent_home_overrides_the_default_layout() {
+    for layout in [DefaultLayout::LegacyPlatform, DefaultLayout::GlobalHome] {
+        let mut linux = with_layout(linux_environment(), layout);
+        linux.overrides.home_dir = Some(OsString::from("~/agent-home"));
+        assert_home_layout(
+            &AppPaths::resolve(&linux).unwrap(),
+            "/home/alice/agent-home",
+            '/',
+        );
+
+        let mut macos = with_layout(macos_environment(), layout);
+        macos.overrides.home_dir = Some(OsString::from("/opt/mini"));
+        assert_home_layout(&AppPaths::resolve(&macos).unwrap(), "/opt/mini", '/');
+
+        let mut windows = with_layout(windows_environment(), layout);
+        windows.overrides.home_dir = Some(OsString::from(r"D:\mini"));
+        assert_home_layout(&AppPaths::resolve(&windows).unwrap(), r"D:\mini", '\\');
+    }
+
+    let variable = "MINI_AGENT_HOME";
+    let mut environment = linux_environment();
+    environment.overrides.home_dir = Some(OsString::new());
+    assert_eq!(
+        AppPaths::resolve(&environment),
+        Err(AppPathError::EmptyOverride { variable })
+    );
+    environment.overrides.home_dir = Some(OsString::from("relative/home"));
+    assert_eq!(
+        AppPaths::resolve(&environment),
+        Err(AppPathError::RelativeOverride {
+            variable,
+            value: PathBuf::from("relative/home"),
+        })
+    );
+    environment.overrides.home_dir = Some(OsString::from("~/home"));
+    environment.home_dir = None;
+    assert_eq!(
+        AppPaths::resolve(&environment),
+        Err(AppPathError::MissingHomeForTilde { variable })
+    );
+}
+
+#[test]
+fn app_paths_matrix_zs_overrides_take_precedence_over_the_global_home() {
+    for layout in [DefaultLayout::GlobalHome, DefaultLayout::LegacyPlatform] {
+        let mut environment = with_layout(linux_environment(), layout);
+        if layout == DefaultLayout::LegacyPlatform {
+            environment.overrides.home_dir = Some(OsString::from("/home/alice/.mini-agent"));
+        }
+        environment.overrides.config_dir = Some(OsString::from("/zs/config"));
+        environment.overrides.cache_dir = Some(OsString::from("/zs/cache"));
+        environment.overrides.credentials_dir = Some(OsString::from("/zs/secrets"));
+        let paths = AppPaths::resolve(&environment).unwrap();
+        assert_eq!(paths.config_dir, PathBuf::from("/zs/config"));
+        assert_eq!(paths.data_dir, PathBuf::from("/home/alice/.mini-agent"));
+        assert_eq!(paths.local_data_dir, paths.data_dir);
+        assert_eq!(
+            paths.state_dir,
+            PathBuf::from("/home/alice/.mini-agent/state")
+        );
+        assert_eq!(paths.cache_dir, PathBuf::from("/zs/cache"));
+        assert_eq!(paths.credentials_dir, PathBuf::from("/zs/secrets"));
+
+        environment.overrides.data_dir = Some(OsString::from("/zs/data"));
+        let paths = AppPaths::resolve(&environment).unwrap();
+        assert_eq!(paths.data_dir, PathBuf::from("/zs/data"));
+        assert_eq!(paths.local_data_dir, PathBuf::from("/zs/data"));
+        assert_eq!(
+            paths.state_dir,
+            PathBuf::from("/zs/data"),
+            "ZS_DATA_DIR keeps its documented local/state cascade"
+        );
+
+        environment.overrides.local_data_dir = Some(OsString::from("/zs/local"));
+        environment.overrides.state_dir = Some(OsString::from("/zs/state"));
+        let paths = AppPaths::resolve(&environment).unwrap();
+        assert_eq!(paths.local_data_dir, PathBuf::from("/zs/local"));
+        assert_eq!(paths.state_dir, PathBuf::from("/zs/state"));
+        assert_eq!(paths.config_dir, PathBuf::from("/zs/config"));
+    }
+}
+
+#[test]
+fn default_layout_probe_keeps_legacy_installs_and_adopts_home_otherwise() {
+    let root = TempRoot::new("layout-probe");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let base = |name: &str| root.path().join(name);
+    let environment = PathEnvironment {
+        platform: if cfg!(windows) {
+            PathPlatform::Windows
+        } else {
+            PathPlatform::Linux
+        },
+        home_dir: Some(home.clone()),
+        config_base: Some(base("config")),
+        data_base: Some(base("data")),
+        local_data_base: Some(base("local")),
+        state_base: Some(base("state")),
+        cache_base: Some(base("cache")),
+        workspace_root: None,
+        overrides: PathOverrides::default(),
+    };
+
+    assert_eq!(
+        probe_default_layout(&environment),
+        DefaultLayout::GlobalHome,
+        "a fresh install adopts ~/.mini-agent"
+    );
+
+    std::fs::create_dir_all(base("cache").join("zerostack")).unwrap();
+    assert_eq!(
+        probe_default_layout(&environment),
+        DefaultLayout::GlobalHome,
+        "a disposable legacy cache alone does not pin the legacy layout"
+    );
+
+    for legacy in ["config", "data", "local"] {
+        let legacy_root = base(legacy).join("zerostack");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        assert_eq!(
+            probe_default_layout(&environment),
+            DefaultLayout::LegacyPlatform,
+            "an existing legacy {legacy} root keeps the legacy layout"
+        );
+        std::fs::remove_dir_all(&legacy_root).unwrap();
+    }
+
+    std::fs::create_dir_all(base("config").join("zerostack")).unwrap();
+    std::fs::create_dir_all(home.join(".mini-agent")).unwrap();
+    assert_eq!(
+        probe_default_layout(&environment),
+        DefaultLayout::GlobalHome,
+        "an explicitly created ~/.mini-agent wins over legacy roots"
+    );
+
+    let mut homeless = environment.clone();
+    homeless.home_dir = None;
+    assert_eq!(
+        probe_default_layout(&homeless),
+        DefaultLayout::LegacyPlatform
+    );
+}
+
 #[test]
 fn app_paths_matrix_acceptance_all_overrides_and_precedence() {
     for mut environment in [
@@ -208,6 +402,7 @@ fn app_paths_matrix_acceptance_all_overrides_and_precedence() {
             state_dir: Some(absolute("state")),
             cache_dir: Some(absolute("cache")),
             credentials_dir: Some(absolute("credentials")),
+            ..PathOverrides::default()
         };
         let paths = AppPaths::resolve(&environment).unwrap();
         assert_eq!(paths.config_dir, PathBuf::from(absolute("config")));
@@ -317,7 +512,7 @@ fn app_paths_matrix_acceptance_missing_bases_fail_closed() {
             AppPathRoot::LocalData => environment.local_data_base = None,
             AppPathRoot::State => environment.state_base = None,
             AppPathRoot::Cache => environment.cache_base = None,
-            AppPathRoot::Workspace => unreachable!(),
+            AppPathRoot::Home | AppPathRoot::Workspace => unreachable!(),
         }
         assert_eq!(
             AppPaths::resolve(&environment),

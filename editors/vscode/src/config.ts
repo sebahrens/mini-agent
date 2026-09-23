@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { lstatSync, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 const CONFIG_FILENAMES = ['config.toml', 'config.yaml', 'config.yml', 'config.json'] as const;
@@ -23,39 +23,98 @@ function expandHome(value: string, homeDirectory: string, paths: path.PlatformPa
   return value;
 }
 
-/** Resolve the same legacy `zerostack` configuration root as Rust `AppPaths`. */
+/** Reports whether a path exists without following a final symbolic link. */
+export type PathProbe = (candidate: string) => boolean;
+
+function pathExists(candidate: string): boolean {
+  try {
+    lstatSync(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function overridePath(
+  variable: string,
+  value: string | undefined,
+  homeDirectory: string,
+  paths: path.PlatformPath,
+): string | undefined {
+  if (value === undefined) { return undefined; }
+  if (value.length === 0) { throw new Error(`${variable} must not be empty.`); }
+  const expanded = expandHome(value, homeDirectory, paths);
+  if (!paths.isAbsolute(expanded)) {
+    throw new Error(`${variable} must resolve to an absolute path.`);
+  }
+  return paths.normalize(expanded);
+}
+
+/** Legacy per-OS `zerostack` roots whose presence marks an existing install. */
+function legacyRoots(
+  platform: NodeJS.Platform,
+  homeDirectory: string,
+  environment: ConfigEnvironment,
+  paths: path.PlatformPath,
+): { config: string; markers: string[] } {
+  if (platform === 'linux') {
+    const xdgConfig = environment.XDG_CONFIG_HOME;
+    const configBase = xdgConfig && paths.isAbsolute(xdgConfig)
+      ? xdgConfig
+      : paths.join(homeDirectory, '.config');
+    const xdgData = environment.XDG_DATA_HOME;
+    const dataBase = xdgData && paths.isAbsolute(xdgData)
+      ? xdgData
+      : paths.join(homeDirectory, '.local', 'share');
+    const config = paths.join(configBase, 'zerostack');
+    return { config, markers: [config, paths.join(dataBase, 'zerostack')] };
+  }
+  if (platform === 'darwin') {
+    const config = paths.join(homeDirectory, 'Library', 'Application Support', 'zerostack');
+    return { config, markers: [config] };
+  }
+  if (platform === 'win32') {
+    const roaming = environment.APPDATA;
+    const roamingBase = roaming && paths.isAbsolute(roaming)
+      ? roaming
+      : paths.join(homeDirectory, 'AppData', 'Roaming');
+    const local = environment.LOCALAPPDATA;
+    const localBase = local && paths.isAbsolute(local)
+      ? local
+      : paths.join(homeDirectory, 'AppData', 'Local');
+    const config = paths.join(roamingBase, 'zerostack');
+    return { config, markers: [config, paths.join(localBase, 'zerostack')] };
+  }
+  throw new Error(`Mini Agent does not support configuration paths on ${platform}.`);
+}
+
+/**
+ * Resolve the same configuration root as Rust `AppPaths`:
+ * `ZS_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it exists
+ * or no legacy `zerostack` root exists, otherwise the legacy per-OS root.
+ */
 export function resolveConfigDirectory(
   platform: NodeJS.Platform,
   homeDirectory: string,
   environment: ConfigEnvironment,
+  exists: PathProbe = pathExists,
 ): string {
   const paths = pathApi(platform);
-  const override = environment.ZS_CONFIG_DIR;
-  if (override !== undefined) {
-    if (override.length === 0) { throw new Error('ZS_CONFIG_DIR must not be empty.'); }
-    const expanded = expandHome(override, homeDirectory, paths);
-    if (!paths.isAbsolute(expanded)) {
-      throw new Error('ZS_CONFIG_DIR must resolve to an absolute path.');
-    }
-    return paths.normalize(expanded);
-  }
+  const configOverride = overridePath(
+    'ZS_CONFIG_DIR', environment.ZS_CONFIG_DIR, homeDirectory, paths,
+  );
+  if (configOverride !== undefined) { return configOverride; }
+  const homeOverride = overridePath(
+    'MINI_AGENT_HOME', environment.MINI_AGENT_HOME, homeDirectory, paths,
+  );
+  if (homeOverride !== undefined) { return homeOverride; }
 
-  if (platform === 'linux') {
-    const xdg = environment.XDG_CONFIG_HOME;
-    const base = xdg && paths.isAbsolute(xdg) ? xdg : paths.join(homeDirectory, '.config');
-    return paths.join(base, 'zerostack');
+  const legacy = legacyRoots(platform, homeDirectory, environment, paths);
+  const globalHome = paths.join(homeDirectory, '.mini-agent');
+  if (exists(globalHome) || !legacy.markers.some(marker => exists(marker))) {
+    return globalHome;
   }
-  if (platform === 'darwin') {
-    return paths.join(homeDirectory, 'Library', 'Application Support', 'zerostack');
-  }
-  if (platform === 'win32') {
-    const roaming = environment.APPDATA;
-    const base = roaming && paths.isAbsolute(roaming)
-      ? roaming
-      : paths.join(homeDirectory, 'AppData', 'Roaming');
-    return paths.join(base, 'zerostack');
-  }
-  throw new Error(`Mini Agent does not support configuration paths on ${platform}.`);
+  return legacy.config;
 }
 
 async function existingConfig(configDirectory: string): Promise<string | undefined> {

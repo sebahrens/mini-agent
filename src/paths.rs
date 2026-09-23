@@ -1148,6 +1148,7 @@ impl std::fmt::Display for PathPlatform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppPathRoot {
+    Home,
     Config,
     Data,
     LocalData,
@@ -1159,6 +1160,7 @@ pub enum AppPathRoot {
 impl std::fmt::Display for AppPathRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Home => formatter.write_str("global home"),
             Self::Config => formatter.write_str("configuration"),
             Self::Data => formatter.write_str("portable data"),
             Self::LocalData => formatter.write_str("local data"),
@@ -1196,25 +1198,45 @@ pub enum AppPathError {
     NotInitialized,
 }
 
+/// Default layout used for roots that no environment override selects.
+///
+/// Production observes the host once in [`PathEnvironment::from_process`]
+/// ([`probe_default_layout`]); tests inject the value. The default models an
+/// existing legacy install so fixtures never depend on the host filesystem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DefaultLayout {
+    /// Per-OS `dirs` bases joined with the legacy `zerostack` component.
+    #[default]
+    LegacyPlatform,
+    /// One visible `~/.mini-agent` home, like `~/.codex` or `~/.claude`.
+    GlobalHome,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathOverrides {
+    /// `MINI_AGENT_HOME`: hosts every root not selected by a `ZS_*_DIR` override.
+    pub home_dir: Option<OsString>,
     pub config_dir: Option<OsString>,
     pub data_dir: Option<OsString>,
     pub local_data_dir: Option<OsString>,
     pub state_dir: Option<OsString>,
     pub cache_dir: Option<OsString>,
     pub credentials_dir: Option<OsString>,
+    /// Host-observed layout for roots with no override; not an environment variable.
+    pub default_layout: DefaultLayout,
 }
 
 impl PathOverrides {
     fn from_process() -> Self {
         Self {
+            home_dir: std::env::var_os(crate::product::GLOBAL_HOME_ENV),
             config_dir: std::env::var_os("ZS_CONFIG_DIR"),
             data_dir: std::env::var_os("ZS_DATA_DIR"),
             local_data_dir: std::env::var_os("ZS_LOCAL_DATA_DIR"),
             state_dir: std::env::var_os("ZS_STATE_DIR"),
             cache_dir: std::env::var_os("ZS_CACHE_DIR"),
             credentials_dir: std::env::var_os("ZS_CREDENTIALS_DIR"),
+            default_layout: DefaultLayout::LegacyPlatform,
         }
     }
 }
@@ -1238,7 +1260,7 @@ pub struct PathEnvironment {
 
 impl PathEnvironment {
     pub fn from_process(workspace_root: Option<PathBuf>) -> Result<Self, AppPathError> {
-        Ok(Self {
+        let mut environment = Self {
             platform: PathPlatform::current()?,
             home_dir: dirs::home_dir(),
             config_base: dirs::config_dir(),
@@ -1248,7 +1270,47 @@ impl PathEnvironment {
             cache_base: dirs::cache_dir(),
             workspace_root,
             overrides: PathOverrides::from_process(),
-        })
+        };
+        environment.overrides.default_layout = probe_default_layout(&environment);
+        Ok(environment)
+    }
+}
+
+/// Chooses the default layout from what already exists on disk.
+///
+/// `~/.mini-agent` wins when it exists (the user adopted it, or a previous
+/// fresh start created it) or when no legacy `zerostack` configuration, data,
+/// or local-data root exists (fresh install). Otherwise an existing legacy
+/// install keeps its roots: identity changes never silently move user data.
+pub fn probe_default_layout(environment: &PathEnvironment) -> DefaultLayout {
+    let platform = environment.platform;
+    let Some(home) = environment
+        .home_dir
+        .as_deref()
+        .filter(|home| is_absolute(platform, home))
+    else {
+        return DefaultLayout::LegacyPlatform;
+    };
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    if exists(&join_component(
+        platform,
+        home,
+        crate::product::GLOBAL_HOME_DIRECTORY,
+    )) {
+        return DefaultLayout::GlobalHome;
+    }
+    let legacy_present = [
+        &environment.config_base,
+        &environment.data_base,
+        &environment.local_data_base,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|base| exists(&join_component(platform, base, APP_COMPONENT)));
+    if legacy_present {
+        DefaultLayout::LegacyPlatform
+    } else {
+        DefaultLayout::GlobalHome
     }
 }
 
@@ -1313,6 +1375,7 @@ impl AppPaths {
 
     pub fn resolve(environment: &PathEnvironment) -> Result<Self, AppPathError> {
         let platform = environment.platform;
+        let global_home = resolve_global_home(environment)?;
         let config_override = resolve_override(
             environment,
             "ZS_CONFIG_DIR",
@@ -1334,17 +1397,20 @@ impl AppPaths {
             environment.overrides.state_dir.as_deref(),
         )?;
 
-        let config_dir = match config_override {
-            Some(path) => path,
-            None => default_root(environment, AppPathRoot::Config, &environment.config_base)?,
+        let config_dir = match (config_override, &global_home) {
+            (Some(path), _) => path,
+            (None, Some(home)) => home.clone(),
+            (None, None) => {
+                default_root(environment, AppPathRoot::Config, &environment.config_base)?
+            }
         };
-        let data_dir = match &data_override {
-            Some(path) => path.clone(),
-            None => default_root(environment, AppPathRoot::Data, &environment.data_base)?,
-        };
-        let local_data_dir = match (&local_data_override, &data_override) {
+        let data_dir = match (&data_override, &global_home) {
             (Some(path), _) | (None, Some(path)) => path.clone(),
-            (None, None) => default_root(
+            (None, None) => default_root(environment, AppPathRoot::Data, &environment.data_base)?,
+        };
+        let local_data_dir = match (&local_data_override, &data_override, &global_home) {
+            (Some(path), _, _) | (None, Some(path), _) | (None, None, Some(path)) => path.clone(),
+            (None, None, None) => default_root(
                 environment,
                 AppPathRoot::LocalData,
                 &environment.local_data_base,
@@ -1352,6 +1418,9 @@ impl AppPaths {
         };
         let state_dir = match (&state_override, &local_data_override, &data_override) {
             (Some(path), _, _) | (None, Some(path), _) | (None, None, Some(path)) => path.clone(),
+            (None, None, None) if global_home.is_some() => {
+                join_component(platform, &local_data_dir, "state")
+            }
             (None, None, None) => match platform {
                 PathPlatform::Linux => {
                     default_root(environment, AppPathRoot::State, &environment.state_base)?
@@ -1361,13 +1430,15 @@ impl AppPaths {
                 }
             },
         };
-        let cache_dir = match resolve_override(
+        let cache_override = resolve_override(
             environment,
             "ZS_CACHE_DIR",
             environment.overrides.cache_dir.as_deref(),
-        )? {
-            Some(path) => path,
-            None => {
+        )?;
+        let cache_dir = match (cache_override, &global_home) {
+            (Some(path), _) => path,
+            (None, Some(home)) => join_component(platform, home, "cache"),
+            (None, None) => {
                 let base = required_base(
                     platform,
                     AppPathRoot::Cache,
@@ -2637,6 +2708,33 @@ fn reject_link_components(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `MINI_AGENT_HOME` when set, else `~/.mini-agent` when the default layout is
+/// the global home, else `None` (legacy per-OS roots).
+fn resolve_global_home(environment: &PathEnvironment) -> Result<Option<PathBuf>, AppPathError> {
+    if let Some(home) = resolve_override(
+        environment,
+        crate::product::GLOBAL_HOME_ENV,
+        environment.overrides.home_dir.as_deref(),
+    )? {
+        return Ok(Some(home));
+    }
+    match (environment.overrides.default_layout, &environment.home_dir) {
+        (DefaultLayout::GlobalHome, Some(home)) => {
+            ensure_absolute(environment.platform, AppPathRoot::Home, home)?;
+            Ok(Some(join_component(
+                environment.platform,
+                home,
+                crate::product::GLOBAL_HOME_DIRECTORY,
+            )))
+        }
+        (DefaultLayout::GlobalHome, None) => Err(AppPathError::MissingBase {
+            root: AppPathRoot::Home,
+            platform: environment.platform,
+        }),
+        (DefaultLayout::LegacyPlatform, _) => Ok(None),
+    }
+}
+
 fn default_root(
     environment: &PathEnvironment,
     root: AppPathRoot,
@@ -2936,6 +3034,7 @@ mod tests {
             state_dir: Some(OsString::from("/state")),
             cache_dir: Some(OsString::from("/cache")),
             credentials_dir: Some(OsString::from("/secrets")),
+            ..PathOverrides::default()
         };
 
         let paths = AppPaths::resolve(&environment).unwrap();
