@@ -175,6 +175,74 @@ fn is_ctrl_h(key: KeyEvent) -> bool {
         || key.code == KeyCode::Char('\u{8}')
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptScroll {
+    Top,
+    Bottom,
+}
+
+/// Decide whether Home/End scroll the transcript instead of editing the
+/// prompt. Ctrl+Home/Ctrl+End always scroll. Plain Home/End scroll only when
+/// the input is empty (nothing to move through) or a picker is open (moving
+/// the caret would desynchronise the picker query from the buffer); otherwise
+/// they reach the editor and move the caret to the line start/end.
+fn transcript_scroll_key(
+    key: KeyEvent,
+    input_empty: bool,
+    picker_active: bool,
+) -> Option<TranscriptScroll> {
+    let target = match key.code {
+        KeyCode::Home => TranscriptScroll::Top,
+        KeyCode::End => TranscriptScroll::Bottom,
+        _ => return None,
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    (ctrl || input_empty || picker_active).then_some(target)
+}
+
+#[cfg(test)]
+mod home_end_tests {
+    use super::*;
+
+    #[test]
+    fn home_end_edit_a_non_empty_prompt_and_scroll_otherwise() {
+        let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+
+        // Non-empty prompt, no picker: the editor gets the key.
+        assert_eq!(transcript_scroll_key(home, false, false), None);
+        assert_eq!(transcript_scroll_key(end, false, false), None);
+        // Empty prompt: plain Home/End scroll the transcript.
+        assert_eq!(
+            transcript_scroll_key(home, true, false),
+            Some(TranscriptScroll::Top)
+        );
+        assert_eq!(
+            transcript_scroll_key(end, true, false),
+            Some(TranscriptScroll::Bottom)
+        );
+        // An open picker keeps its query in sync by not moving the caret.
+        assert_eq!(
+            transcript_scroll_key(end, false, true),
+            Some(TranscriptScroll::Bottom)
+        );
+        // Ctrl+Home/Ctrl+End always scroll.
+        assert_eq!(
+            transcript_scroll_key(ctrl_home, false, false),
+            Some(TranscriptScroll::Top)
+        );
+        assert_eq!(
+            transcript_scroll_key(ctrl_end, false, false),
+            Some(TranscriptScroll::Bottom)
+        );
+        // Other keys are never transcript scrolls here.
+        let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(transcript_scroll_key(page_up, true, false), None);
+    }
+}
+
 #[cfg(test)]
 mod ctrl_h_tests {
     use super::*;
@@ -1220,15 +1288,22 @@ impl<'a> App<'a> {
                 self.renderer.scroll_page_down();
                 return Ok(());
             }
-            KeyCode::Home => {
+            _ => {}
+        }
+        match transcript_scroll_key(
+            key,
+            self.input.buffer.is_empty(),
+            self.input.picker.as_ref().is_some_and(|p| p.active()),
+        ) {
+            Some(TranscriptScroll::Top) => {
                 self.renderer.scroll_to_top();
                 return Ok(());
             }
-            KeyCode::End => {
+            Some(TranscriptScroll::Bottom) => {
                 self.renderer.scroll_to_bottom()?;
                 return Ok(());
             }
-            _ => {}
+            None => {}
         }
 
         if self.input.picker.as_ref().is_some_and(|p| p.active())

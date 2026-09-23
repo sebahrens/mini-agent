@@ -954,3 +954,201 @@ mod slash_picker_contract {
         assert_eq!(picker_window(0, 0, 38, 5), window(0, 5, 5));
     }
 }
+
+/// Ctrl/Alt chords in pickers: they never type their letter into the query,
+/// Ctrl+W deletes the query word, and a space ends an `@` mention.
+mod picker_chords {
+    use super::*;
+    use crate::ui::pickers::handlers::{handle_file_key, handle_models_key};
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(input: &mut InputEditor, key: KeyEvent) -> Option<CompactString> {
+        if input.picker.as_ref().is_some_and(Picker::active) && input.handle_picker_key(key) {
+            return None;
+        }
+        input.handle_key(key)
+    }
+
+    fn typed(input: &mut InputEditor, text: &str) {
+        for c in text.chars() {
+            press(input, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn picker_open(input: &InputEditor) -> bool {
+        input.picker.as_ref().is_some_and(Picker::active)
+    }
+
+    /// An active file picker over a fixed cache with `buffer` ending in `@`.
+    fn file_picker(buffer: &str) -> (CompactString, usize, FilePicker) {
+        let mut picker = FilePicker::new();
+        picker.activate();
+        picker.test_set_cache(vec![PathBuf::from("src/main.rs")]);
+        let buffer: CompactString = buffer.into();
+        let cursor = buffer.len();
+        (buffer, cursor, picker)
+    }
+
+    #[test]
+    fn command_picker_ignores_chords_and_ctrl_w_deletes_the_query() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/mo");
+        for key in [alt('b'), alt('l'), ctrl('a'), ctrl('g')] {
+            press(&mut input, key);
+            assert_eq!(input.buffer, "/mo", "{key:?} must not type");
+            assert_eq!(input.cursor, 3);
+            assert!(picker_open(&input));
+        }
+
+        press(&mut input, ctrl('w'));
+        assert_eq!(input.buffer, "/");
+        assert_eq!(input.cursor, 1);
+        assert!(picker_open(&input));
+
+        press(&mut input, ctrl('w'));
+        assert_eq!(input.buffer, "");
+        assert!(!picker_open(&input));
+    }
+
+    #[test]
+    fn prefixed_picker_ignores_chords_and_ctrl_w_deletes_the_query() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/queue");
+        press(
+            &mut input,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        typed(&mut input, "cl");
+        press(&mut input, alt('f'));
+        assert_eq!(input.buffer, "/queue cl");
+        press(&mut input, ctrl('w'));
+        assert_eq!(input.buffer, "/queue ");
+        assert_eq!(input.cursor, "/queue ".len());
+        assert!(picker_open(&input));
+    }
+
+    #[test]
+    fn models_picker_ignores_chords() {
+        let mut picker = ModelsPicker::new();
+        picker.set_groups(vec!["fast".to_string()], vec![]);
+        picker.activate();
+        let mut buffer: CompactString = "/models ".into();
+        let mut cursor = buffer.len();
+        for key in [
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            alt('x'),
+        ] {
+            assert!(handle_models_key(
+                &mut buffer,
+                &mut cursor,
+                &mut picker,
+                key
+            ));
+        }
+        assert_eq!(buffer, "/models f");
+        assert!(handle_models_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            ctrl('w')
+        ));
+        assert_eq!(buffer, "/models ");
+        assert_eq!(cursor, buffer.len());
+    }
+
+    #[test]
+    fn file_picker_ignores_chords_and_ctrl_w_deletes_query_then_at() {
+        let (mut buffer, mut cursor, mut picker) = file_picker("see @");
+        for key in [
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            alt('l'),
+            ctrl('b'),
+        ] {
+            assert!(handle_file_key(&mut buffer, &mut cursor, &mut picker, key));
+        }
+        assert_eq!(buffer, "see @ma");
+        assert_eq!(picker.query, "ma");
+
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            ctrl('w')
+        ));
+        assert_eq!(buffer, "see @");
+        assert_eq!(cursor, buffer.len());
+        assert!(picker.active);
+
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            ctrl('w')
+        ));
+        assert_eq!(buffer, "see ");
+        assert!(!picker.active);
+    }
+
+    #[test]
+    fn altgr_characters_still_reach_the_file_query() {
+        let (mut buffer, mut cursor, mut picker) = file_picker("@");
+        let altgr_backslash = KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert!(handle_file_key(
+            &mut buffer,
+            &mut cursor,
+            &mut picker,
+            altgr_backslash
+        ));
+        assert_eq!(buffer, "@\\");
+        assert_eq!(picker.query, "\\");
+    }
+
+    #[test]
+    fn space_closes_the_file_picker_and_enter_then_submits() {
+        let (buffer, cursor, mut picker) = file_picker("see @");
+        picker.char_input('x');
+        let mut input = InputEditor::new();
+        input.buffer = format!("{buffer}x").into();
+        input.cursor = cursor + 1;
+        input.picker = Some(Picker::File(picker));
+
+        press(
+            &mut input,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert_eq!(input.buffer, "see @x ");
+        assert!(!picker_open(&input));
+        let submitted = press(
+            &mut input,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(submitted.as_deref(), Some("see @x "));
+    }
+
+    #[test]
+    fn pasting_text_with_a_space_into_the_file_picker_keeps_the_rest_plain() {
+        let (buffer, cursor, picker) = file_picker("@");
+        let mut input = InputEditor::new();
+        input.buffer = buffer;
+        input.cursor = cursor;
+        input.picker = Some(Picker::File(picker));
+
+        input.handle_paste("main and more".to_string());
+        assert_eq!(input.buffer, "@main and more");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert!(!picker_open(&input));
+    }
+}

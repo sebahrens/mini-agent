@@ -188,6 +188,27 @@ impl Drop for EditorTemp {
 }
 
 #[cfg(not(windows))]
+/// A character key carrying Ctrl or Alt (but not both: Ctrl+Alt is AltGr on
+/// Windows and delivers the composed character). Ctrl+H is excluded because
+/// it is backspace everywhere in the editor and pickers.
+pub(crate) fn is_modifier_chord(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    ctrl != alt && !(ctrl && matches!(c, 'h' | 'H'))
+}
+
+/// Whether an `@` inserted at byte offset `pos` starts a file mention: at the
+/// buffer start or after whitespace, an opening parenthesis or a quote.
+pub(crate) fn mention_can_start_at(buffer: &str, pos: usize) -> bool {
+    buffer[..pos]
+        .chars()
+        .next_back()
+        .is_none_or(|prev| prev.is_whitespace() || matches!(prev, '(' | '"' | '\'' | '`'))
+}
+
 fn editor_draft_too_large() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -510,7 +531,13 @@ impl InputEditor {
                 && data.chars().all(|c| !c.is_control())
         });
         if picker_accepts_query {
-            for c in data.chars() {
+            for (i, c) in data.char_indices() {
+                if !self.picker.as_ref().is_some_and(Picker::active) {
+                    // A space closes the file picker; the rest is plain text.
+                    self.buffer.insert_str(self.cursor, &data[i..]);
+                    self.cursor += data.len() - i;
+                    break;
+                }
                 let handled =
                     self.handle_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
                 debug_assert!(handled, "active query picker must accept printable text");
@@ -521,6 +548,14 @@ impl InputEditor {
             }
             self.buffer.insert_str(self.cursor, &data);
             self.cursor += data.len();
+            // A pasted trailing `@` at a mention start opens completion just
+            // as typing it would.
+            if data.ends_with('@')
+                && self.cursor == self.buffer.len()
+                && mention_can_start_at(&self.buffer, self.cursor - 1)
+            {
+                self.start_file_picker();
+            }
         }
         self.history_pos = None;
         self.draft = None;
@@ -533,30 +568,14 @@ impl InputEditor {
 
         if ctrl {
             match key.code {
+                // Start/end of the current line; idempotent at the edge.
                 KeyCode::Char('a') => {
-                    let current = line_start(&self.buffer, self.cursor);
-                    if self.cursor == current {
-                        let (line, _) = cursor_to_line_col(&self.buffer, self.cursor);
-                        if line > 0 {
-                            self.cursor = line_end(&self.buffer, current - 1);
-                        }
-                    } else {
-                        self.cursor = current;
-                    }
+                    self.cursor = line_start(&self.buffer, self.cursor);
                     self.yank_pos = None;
                     return None;
                 }
                 KeyCode::Char('e') => {
-                    let current = line_end(&self.buffer, self.cursor);
-                    if self.cursor == current {
-                        let (line, _) = cursor_to_line_col(&self.buffer, self.cursor);
-                        let total = count_lines(&self.buffer);
-                        if line + 1 < total {
-                            self.cursor = line_start(&self.buffer, self.cursor + 1);
-                        }
-                    } else {
-                        self.cursor = current;
-                    }
+                    self.cursor = line_end(&self.buffer, self.cursor);
                     self.yank_pos = None;
                     return None;
                 }
@@ -688,6 +707,14 @@ impl InputEditor {
             }
         }
 
+        // An unbound Ctrl or Alt chord must not type its base letter: with
+        // Option-as-Meta on macOS, Option+L (`@` on a German layout) arrives
+        // as Alt+l. Ctrl+Alt together is AltGr on Windows and carries the
+        // composed character, so it still inserts. Ctrl+H stays backspace.
+        if is_modifier_chord(key) {
+            return None;
+        }
+
         match key.code {
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -726,15 +753,8 @@ impl InputEditor {
                 None
             }
             KeyCode::Char(c) => {
-                if c == '@' {
-                    let at_word_start = self.cursor == 0
-                        || self.buffer[..self.cursor]
-                            .chars()
-                            .next_back()
-                            .is_some_and(|prev| prev == ' ');
-                    if at_word_start {
-                        self.start_file_picker();
-                    }
+                if c == '@' && mention_can_start_at(&self.buffer, self.cursor) {
+                    self.start_file_picker();
                 }
                 if c == '/' && self.cursor == 0 {
                     self.start_command_picker();
@@ -850,12 +870,12 @@ impl InputEditor {
                 self.cursor_down()
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                self.cursor = line_start(&self.buffer, self.cursor);
                 self.yank_pos = None;
                 None
             }
             KeyCode::End => {
-                self.cursor = self.buffer.len();
+                self.cursor = line_end(&self.buffer, self.cursor);
                 self.yank_pos = None;
                 None
             }
@@ -884,7 +904,8 @@ impl InputEditor {
         };
         self.history_pos = Some(pos);
         self.buffer = self.history[pos].clone();
-        self.cursor = 0;
+        // Like shells: the caret lands at the end, ready to append.
+        self.cursor = self.buffer.len();
         None
     }
 

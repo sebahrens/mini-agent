@@ -246,3 +246,127 @@ fn alt_y_after_yanking_multibyte_text_mid_buffer() {
     assert_eq!(editor.buffer.as_str(), "[🦀🦀]");
     assert_eq!(editor.cursor, "[🦀🦀".len());
 }
+
+// --- line-edge keys, history recall, unbound chords, @ triggers ---
+
+fn shift_enter() -> KeyEvent {
+    KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+}
+
+/// "first\nsecond" with the caret inside "second".
+fn two_line_editor() -> InputEditor {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "first");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "second");
+    editor.cursor = "first\nsec".len();
+    editor
+}
+
+#[test]
+fn home_and_end_move_to_the_current_line_edges() {
+    let mut editor = two_line_editor();
+    editor.handle_key(press(KeyCode::Home));
+    assert_eq!(editor.cursor, "first\n".len());
+    editor.handle_key(press(KeyCode::End));
+    assert_eq!(editor.cursor, "first\nsecond".len());
+
+    editor.cursor = 2;
+    editor.handle_key(press(KeyCode::End));
+    assert_eq!(editor.cursor, "first".len());
+    editor.handle_key(press(KeyCode::Home));
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn ctrl_a_and_ctrl_e_stay_put_at_the_line_edge() {
+    let mut editor = two_line_editor();
+    editor.handle_key(ctrl('a'));
+    editor.handle_key(ctrl('a'));
+    assert_eq!(
+        editor.cursor,
+        "first\n".len(),
+        "Ctrl+A must not leave the line"
+    );
+
+    editor.cursor = 2;
+    editor.handle_key(ctrl('e'));
+    editor.handle_key(ctrl('e'));
+    assert_eq!(
+        editor.cursor,
+        "first".len(),
+        "Ctrl+E must not leave the line"
+    );
+}
+
+#[test]
+fn history_up_places_the_caret_at_the_end_of_the_recalled_prompt() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "earlier prompt");
+    assert!(editor.handle_key(press(KeyCode::Enter)).is_some());
+
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "earlier prompt");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    type_str(&mut editor, "!");
+    assert_eq!(editor.buffer.as_str(), "earlier prompt!");
+}
+
+#[test]
+fn unbound_alt_and_ctrl_chords_do_not_insert_their_letter() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "a");
+    for key in [alt('l'), alt('x'), alt('Q'), ctrl('g'), ctrl('o')] {
+        editor.handle_key(key);
+        assert_eq!(editor.buffer.as_str(), "a", "{key:?} must not type");
+        assert_eq!(editor.cursor, 1);
+    }
+    assert!(editor.picker.is_none());
+}
+
+#[test]
+fn altgr_characters_still_insert() {
+    // Windows reports AltGr+Q on a German layout as Ctrl+Alt+'@'.
+    let mut editor = InputEditor::new();
+    editor.handle_key(KeyEvent::new(
+        KeyCode::Char('@'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ));
+    assert_eq!(editor.buffer.as_str(), "@");
+    assert!(file_picker_open(&editor));
+}
+
+fn file_picker_open(editor: &InputEditor) -> bool {
+    matches!(editor.picker.as_ref(), Some(crate::ui::input::Picker::File(p)) if p.active)
+}
+
+#[test]
+fn at_opens_the_file_picker_after_newline_paren_and_quotes() {
+    for prefix in ["", "see ", "(", "\"", "'", "`", "x\t"] {
+        let mut editor = InputEditor::new();
+        editor.handle_paste(prefix.to_string());
+        type_str(&mut editor, "@");
+        assert!(file_picker_open(&editor), "after {prefix:?}");
+    }
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "line");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "@");
+    assert!(file_picker_open(&editor), "after a newline");
+
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "user@");
+    assert!(!file_picker_open(&editor), "mid-word @ is an address");
+}
+
+#[test]
+fn pasting_a_trailing_at_opens_the_file_picker() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("look at @".to_string());
+    assert_eq!(editor.buffer.as_str(), "look at @");
+    assert!(file_picker_open(&editor));
+
+    let mut editor = InputEditor::new();
+    editor.handle_paste("user@".to_string());
+    assert!(!file_picker_open(&editor));
+}
