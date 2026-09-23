@@ -170,6 +170,29 @@ pub(crate) fn clipboard_shortcut(
     }
 }
 
+/// Whether releasing the left button should copy the transcript selection.
+/// Only a real drag copies; a plain click (no movement, one line) does not.
+fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => dragged || start != end,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod mouse_selection_tests {
+    use super::mouse_up_copies;
+
+    #[test]
+    fn plain_click_does_not_copy_but_a_drag_does() {
+        assert!(!mouse_up_copies(false, Some(4), Some(4)));
+        assert!(mouse_up_copies(true, Some(4), Some(4)));
+        assert!(mouse_up_copies(false, Some(4), Some(6)));
+        assert!(mouse_up_copies(true, Some(6), Some(4)));
+        assert!(!mouse_up_copies(true, None, None));
+    }
+}
+
 fn is_ctrl_h(key: KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Char('h' | 'H')) && key.modifiers.contains(KeyModifiers::CONTROL))
         || key.code == KeyCode::Char('\u{8}')
@@ -1058,14 +1081,16 @@ impl<'a> App<'a> {
                         self.renderer.selection_active = true;
                         self.renderer.selection_start = Some(idx);
                         self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_dragged = false;
                     }
                 }
             }
             UserEvent::MouseDrag { row } => {
-                if self.renderer.selection_active
-                    && let Some(idx) = self.renderer.buffer_line_at_row(row)
-                {
-                    self.renderer.selection_end = Some(idx);
+                if self.renderer.selection_active {
+                    self.renderer.selection_dragged = true;
+                    if let Some(idx) = self.renderer.buffer_line_at_row(row) {
+                        self.renderer.selection_end = Some(idx);
+                    }
                 }
             }
             UserEvent::MouseUp { row } => {
@@ -1073,7 +1098,16 @@ impl<'a> App<'a> {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end = Some(idx);
                     }
-                    self.copy_selection_to_clipboard().await?;
+                    if mouse_up_copies(
+                        self.renderer.selection_dragged,
+                        self.renderer.selection_start,
+                        self.renderer.selection_end,
+                    ) {
+                        self.copy_selection_to_clipboard().await?;
+                    } else {
+                        // A plain click: drop the one-line highlight silently.
+                        self.renderer.clear_selection();
+                    }
                 }
             }
             UserEvent::LinkOpenFailed(error) => {

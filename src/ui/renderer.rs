@@ -179,6 +179,9 @@ pub struct Renderer {
     pub selection_active: bool,
     pub selection_start: Option<usize>,
     pub selection_end: Option<usize>,
+    /// Set once the pointer moved while the button was held. A plain click
+    /// (press + release without movement) never copies.
+    pub selection_dragged: bool,
     prev_input_height: usize,
     /// Number of statusline rows (1-3), fixed by the statusline config at startup.
     statusline_height: usize,
@@ -228,6 +231,7 @@ impl Renderer {
             selection_active: false,
             selection_start: None,
             selection_end: None,
+            selection_dragged: false,
             prev_input_height: 0,
             statusline_height: 1,
             chat_margin: 0,
@@ -486,6 +490,7 @@ impl Renderer {
         self.selection_active = false;
         self.selection_start = None;
         self.selection_end = None;
+        self.selection_dragged = false;
     }
 
     pub fn link_url_at(&self, buf_idx: usize, col: u16) -> Option<String> {
@@ -787,6 +792,7 @@ impl Renderer {
             self.selection_active = false;
             self.selection_start = None;
             self.selection_end = None;
+            self.selection_dragged = false;
             self.chat_dirty = true;
         }
     }
