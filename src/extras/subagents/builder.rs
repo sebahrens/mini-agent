@@ -37,9 +37,40 @@ pub(crate) struct PersonaExecution {
     /// `None` installs the complete read-only child tool set. `Some` is always
     /// a narrowing parsed from trusted persona metadata.
     pub(crate) tools: Option<Vec<AgentTool>>,
+    /// The user's provider `extra_body` (quick-model or global) resolved for
+    /// the child's model exactly as the main agent resolves it. It is combined
+    /// with the provider-specific request defaults (OpenRouter routing,
+    /// Responses `reasoning`/`store`/`prompt_cache_key`, Completions
+    /// `reasoning_effort`) before persona params are merged on top.
+    pub(crate) provider_extra_body: Option<serde_json::Value>,
     /// Provider request parameters resolved from the persona's quick-model
-    /// alias.
+    /// alias. These win over every inherited provider parameter.
     pub(crate) additional_params: Option<serde_json::Value>,
+}
+
+/// Provider request-body parameters a child sends before persona overrides:
+/// the same per-provider shape the main agent builds in
+/// `provider::build_agent_in_workspace`, so subagents keep the user's
+/// `extra_body` and `[reasoning]` settings (including `store = false`).
+pub(crate) fn subagent_provider_params(
+    model: &AnyModel,
+    cfg: &crate::config::Config,
+    provider_extra_body: Option<serde_json::Value>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let reasoning = cfg.reasoning.as_ref();
+    match model {
+        AnyModel::OpenRouter(_, routing) => {
+            crate::provider::merge_extra_body(routing.clone(), provider_extra_body)
+        }
+        AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
+            crate::provider::openai_responses_extra_body(provider_extra_body, session_id, reasoning)
+        }
+        AnyModel::OpenAI(OpenAiModel::Completions(_)) => {
+            crate::provider::openai_completions_extra_body(provider_extra_body, reasoning)
+        }
+        AnyModel::Anthropic(_) | AnyModel::Gemini(_) | AnyModel::Ollama(_) => provider_extra_body,
+    }
 }
 
 impl SubagentAuthorization {
@@ -213,7 +244,8 @@ fn build_explore_agent_inner<M: CompletionModel + 'static>(
     max_find_results: u64,
     max_list_dir_entries: Option<u64>,
     authorization: &SubagentAuthorization,
-    // OpenRouter `provider.order` pin for `anthropic/*` (see `AnyClient::completion_model`).
+    // Inherited provider request params (see `subagent_provider_params`);
+    // persona params are merged on top.
     additional_params: Option<serde_json::Value>,
     #[cfg(feature = "archmd")] architecture: Option<&str>,
     // Optional specialization prompt prepended before the base explore prompt.
@@ -379,8 +411,14 @@ pub(crate) async fn build_explore_agent(
     #[cfg(feature = "archmd")]
     let arch_ref = architecture.as_deref();
     let spec_ref = specialization.as_deref();
+    let provider_params = subagent_provider_params(
+        &model,
+        cfg,
+        persona.provider_extra_body.clone(),
+        &uuid::Uuid::new_v4().to_string(),
+    );
     let inner = match model {
-        AnyModel::OpenRouter(m, extra) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
+        AnyModel::OpenRouter(m, _) => AnyAgentInner::OpenRouter(build_explore_agent_inner(
             m,
             max_turns,
             max_text_file_size,
@@ -389,7 +427,7 @@ pub(crate) async fn build_explore_agent(
             max_find_results,
             max_list_dir_entries,
             &authorization,
-            extra,
+            provider_params.clone(),
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
@@ -407,7 +445,7 @@ pub(crate) async fn build_explore_agent(
                 max_find_results,
                 max_list_dir_entries,
                 &authorization,
-                None,
+                provider_params.clone(),
                 #[cfg(feature = "archmd")]
                 arch_ref,
                 spec_ref,
@@ -424,7 +462,7 @@ pub(crate) async fn build_explore_agent(
                 max_find_results,
                 max_list_dir_entries,
                 &authorization,
-                None,
+                provider_params.clone(),
                 #[cfg(feature = "archmd")]
                 arch_ref,
                 spec_ref,
@@ -442,7 +480,7 @@ pub(crate) async fn build_explore_agent(
             max_find_results,
             max_list_dir_entries,
             &authorization,
-            None,
+            provider_params.clone(),
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
@@ -459,7 +497,7 @@ pub(crate) async fn build_explore_agent(
             max_find_results,
             max_list_dir_entries,
             &authorization,
-            None,
+            provider_params.clone(),
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
@@ -476,7 +514,7 @@ pub(crate) async fn build_explore_agent(
             max_find_results,
             max_list_dir_entries,
             &authorization,
-            None,
+            provider_params.clone(),
             #[cfg(feature = "archmd")]
             arch_ref,
             spec_ref,
@@ -608,7 +646,7 @@ mod js_isolation_tests {
             None,
             &PersonaExecution {
                 tools: Some(vec![AgentTool::Read]),
-                additional_params: None,
+                ..PersonaExecution::default()
             },
             #[cfg(feature = "skills")]
             None,
@@ -706,7 +744,7 @@ mod js_isolation_tests {
             None,
             &PersonaExecution {
                 tools: Some(vec![crate::context::agents::AgentTool::Read]),
-                additional_params: None,
+                ..PersonaExecution::default()
             },
             Some(&services),
         );
@@ -1069,5 +1107,210 @@ mod tests {
 
         assert!(error.contains("Permission system unavailable"));
         assert!(!error.contains("SUBAGENT_SECRET"));
+    }
+}
+
+#[cfg(test)]
+mod provider_param_tests {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use rig::completion::{Completion, CompletionModel};
+
+    use super::{
+        PersonaExecution, SubagentAuthorization, build_explore_agent_inner,
+        subagent_provider_params,
+    };
+    use crate::config::{
+        ApiStyle, Config, CustomProviderConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
+    };
+    use crate::provider::{AnyModel, OpenAiModel, create_client};
+
+    /// Accepts one HTTP request, returns its JSON body, and answers 400 so the
+    /// client fails fast without needing a provider-shaped response.
+    fn capture_one_request(listener: TcpListener) -> mpsc::Receiver<serde_json::Value> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let (header_end, content_length) = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .expect("request must include Content-Length");
+                break (end + 4, length);
+            };
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            tx.send(body).unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        rx
+    }
+
+    fn zdr_config() -> Config {
+        Config {
+            extra_body: Some(serde_json::json!({"user": "zdr-tenant", "seed": 1})),
+            reasoning: Some(ReasoningConfig {
+                effort: Some(ReasoningEffort::High),
+                summary: Some(ReasoningSummary::Concise),
+                encrypted_content: None,
+                store: Some(false),
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn openai_model(style: ApiStyle) -> (AnyModel, mpsc::Receiver<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = capture_one_request(listener);
+        let custom = HashMap::from([(
+            "openai-capture".to_string(),
+            CustomProviderConfig {
+                provider_type: "openai".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key_env: None,
+                danger_accept_invalid_certs: None,
+                api_style: Some(style),
+                headers: HashMap::new(),
+                timeout_secs: None,
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: None,
+                model: None,
+            },
+        )]);
+        let client = create_client("openai-capture", Some("test-key"), &custom, None).unwrap();
+        (client.completion_model("gpt-test"), requests)
+    }
+
+    async fn send_child_request<M: CompletionModel + 'static>(
+        model: M,
+        params: Option<serde_json::Value>,
+        persona: &PersonaExecution,
+        requests: mpsc::Receiver<serde_json::Value>,
+    ) -> serde_json::Value {
+        let agent = build_explore_agent_inner(
+            model,
+            2,
+            1024 * 1024,
+            1_000,
+            1_000,
+            1_000,
+            Some(1_000),
+            &SubagentAuthorization::new(None, None, true),
+            params,
+            #[cfg(feature = "archmd")]
+            None,
+            None,
+            persona,
+            #[cfg(feature = "skills")]
+            None,
+        );
+        let result = agent
+            .completion("inspect", Vec::<rig::completion::Message>::new())
+            .await
+            .expect("request builder")
+            .send()
+            .await;
+        assert!(result.is_err(), "capture server always answers 400");
+        requests.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    fn persona() -> PersonaExecution {
+        let config = zdr_config();
+        PersonaExecution {
+            tools: None,
+            provider_extra_body: config.extra_body.clone(),
+            additional_params: Some(serde_json::json!({"user": "persona-tenant"})),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_subagent_request_keeps_store_false_reasoning_and_extra_body() {
+        let config = zdr_config();
+        let persona = persona();
+        let (model, requests) = openai_model(ApiStyle::Responses);
+        let params =
+            subagent_provider_params(&model, &config, persona.provider_extra_body.clone(), "c1");
+        let AnyModel::OpenAI(OpenAiModel::Responses(model)) = model else {
+            panic!("expected a Responses model");
+        };
+
+        let body = send_child_request(model, params, &persona, requests).await;
+
+        assert_eq!(body["store"], false, "{body}");
+        assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+        assert_eq!(body["reasoning"]["summary"], "concise", "{body}");
+        assert!(body["prompt_cache_key"].is_string(), "{body}");
+        // Persona params win over inherited provider params.
+        assert_eq!(body["user"], "persona-tenant", "{body}");
+    }
+
+    #[tokio::test]
+    async fn completions_subagent_request_keeps_reasoning_effort_and_extra_body() {
+        let config = zdr_config();
+        let persona = persona();
+        let (model, requests) = openai_model(ApiStyle::Completions);
+        let params =
+            subagent_provider_params(&model, &config, persona.provider_extra_body.clone(), "c1");
+        let AnyModel::OpenAI(OpenAiModel::Completions(model)) = model else {
+            panic!("expected a Chat Completions model");
+        };
+
+        let body = send_child_request(model, params, &persona, requests).await;
+
+        assert_eq!(body["reasoning_effort"], "high", "{body}");
+        assert!(body.get("reasoning").is_none(), "{body}");
+        // Inherited user extra_body survives; persona params win on collision.
+        assert_eq!(body["seed"], 1, "{body}");
+        assert_eq!(body["user"], "persona-tenant", "{body}");
+    }
+
+    #[test]
+    fn other_providers_inherit_extra_body_and_openrouter_keeps_routing() {
+        let config = zdr_config();
+        let extra = Some(serde_json::json!({"user": "zdr-tenant"}));
+        for provider in ["anthropic", "gemini", "ollama"] {
+            let client = create_client(provider, Some("test-key"), &HashMap::new(), None).unwrap();
+            let model = client.completion_model("model");
+            assert_eq!(
+                subagent_provider_params(&model, &config, extra.clone(), "c1"),
+                extra,
+                "{provider}"
+            );
+        }
+
+        let client = create_client("openrouter", Some("test-key"), &HashMap::new(), None).unwrap();
+        let model = client.completion_model("anthropic/claude-sonnet-4.6");
+        let params = subagent_provider_params(&model, &config, extra.clone(), "c1").unwrap();
+        assert_eq!(params["user"], "zdr-tenant");
+        assert_eq!(
+            params["provider"]["order"],
+            serde_json::json!(["Anthropic"])
+        );
     }
 }

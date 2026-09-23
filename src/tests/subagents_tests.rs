@@ -79,9 +79,65 @@ mod tests {
     }
 
     #[test]
+    fn task_args_treats_null_empty_and_blank_handoffs_as_absent() {
+        use crate::extras::subagents::task_tool::TaskArgs;
+
+        /// (json, expected prompts, expected brief objectives)
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            Option<&'static [&'static str]>,
+        );
+        let accepted: &[Case] = &[
+            (
+                r#"{"prompts":[],"briefs":[{"objective":"y"}]}"#,
+                &[],
+                Some(&["y"]),
+            ),
+            (
+                r#"{"prompts":null,"briefs":[{"objective":"y"}]}"#,
+                &[],
+                Some(&["y"]),
+            ),
+            (
+                r#"{"prompts":["", "  "],"briefs":[{"objective":"y"}]}"#,
+                &[],
+                Some(&["y"]),
+            ),
+            (r#"{"prompts":["x"],"briefs":[]}"#, &["x"], None),
+            (r#"{"prompts":["x"],"briefs":null}"#, &["x"], None),
+            (
+                r#"{"prompts":["x"],"briefs":[{"objective":" "}]}"#,
+                &["x"],
+                None,
+            ),
+            (
+                r#"{"prompts":["x"],"briefs":[],"agent_type":null}"#,
+                &["x"],
+                None,
+            ),
+        ];
+        for (json, prompts, briefs) in accepted {
+            let args: TaskArgs = serde_json::from_str(json)
+                .unwrap_or_else(|error| panic!("rejected {json}: {error}"));
+            assert_eq!(args.prompts, *prompts, "{json}");
+            let objectives = args.briefs.as_ref().map(|briefs| {
+                briefs
+                    .iter()
+                    .map(|b| b.objective.as_str())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(objectives.as_deref(), *briefs, "{json}");
+        }
+    }
+
+    #[test]
     fn task_args_rejects_ambiguous_or_unknown_handoff_fields() {
         for json in [
             r#"{"prompts":["x"],"briefs":[{"objective":"y"}]}"#,
+            r#"{"prompts":["x",""],"briefs":[{"objective":"y"},{"objective":""}]}"#,
+            r#"{"prompts":null,"briefs":null}"#,
+            r#"{"prompts":[],"briefs":[]}"#,
             r#"{"briefs":[{"objective":"y","unknown":true}]}"#,
             r#"{"prompts":["x"],"unknown":true}"#,
         ] {

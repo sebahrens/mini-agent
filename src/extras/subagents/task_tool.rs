@@ -35,6 +35,8 @@ const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
 const MAX_BRIEF_LIST_ITEMS: usize = 64;
 const MAX_BRIEF_ITEM_BYTES: usize = 8 * 1024;
+const TASK_AMBIGUOUS_HANDOFF_ERROR: &str = "task: send only one of prompts or briefs; to use briefs omit prompts entirely (or pass []), and to use prompts omit briefs entirely (or pass [])";
+const TASK_MISSING_HANDOFF_ERROR: &str = "task: send exactly one of prompts (a list of investigation strings) or briefs (a list of {objective, files?, constraints?, expected_sections?} objects)";
 
 pub struct TaskArgs {
     /// One or more exploration prompts. Concurrency and aggregate resources
@@ -78,23 +80,46 @@ impl<'de> Deserialize<'de> for TaskArgs {
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
-        match (raw.prompts, raw.briefs) {
-            (Some(prompts), None) => Ok(Self {
-                prompts,
+        // Non-strict gateways routinely send `null`, `[]`, or blank
+        // placeholders for the handoff form they are not using. Only a
+        // populated field counts as a selection; ambiguity is two populated
+        // fields, not two present keys.
+        let prompts_populated = raw
+            .prompts
+            .as_ref()
+            .is_some_and(|prompts| prompts.iter().any(|prompt| !prompt.trim().is_empty()));
+        let briefs_populated = raw.briefs.as_ref().is_some_and(|briefs| {
+            briefs
+                .iter()
+                .any(|brief| !brief.objective.trim().is_empty())
+        });
+        match (prompts_populated, briefs_populated) {
+            (true, true) => Err(serde::de::Error::custom(TASK_AMBIGUOUS_HANDOFF_ERROR)),
+            (true, false) => Ok(Self {
+                prompts: raw.prompts.unwrap_or_default(),
                 briefs: None,
                 agent_type: raw.agent_type,
             }),
-            (None, Some(briefs)) => Ok(Self {
+            (false, true) => Ok(Self {
                 prompts: Vec::new(),
-                briefs: Some(briefs),
+                briefs: raw.briefs,
                 agent_type: raw.agent_type,
             }),
-            (Some(_), Some(_)) => Err(serde::de::Error::custom(
-                "task accepts exactly one of prompts or briefs",
-            )),
-            (None, None) => Err(serde::de::Error::custom(
-                "task requires exactly one of prompts or briefs",
-            )),
+            // Neither form is populated. Keep a present-but-empty field so
+            // `TaskTool::call` reports the specific validation failure.
+            (false, false) => match (raw.prompts, raw.briefs) {
+                (Some(prompts), None) => Ok(Self {
+                    prompts,
+                    briefs: None,
+                    agent_type: raw.agent_type,
+                }),
+                (None, Some(briefs)) => Ok(Self {
+                    prompts: Vec::new(),
+                    briefs: Some(briefs),
+                    agent_type: raw.agent_type,
+                }),
+                _ => Err(serde::de::Error::custom(TASK_MISSING_HANDOFF_ERROR)),
+            },
         }
     }
 }
@@ -292,20 +317,20 @@ struct ResolvedSpecialization {
     source: String,
     tools: Option<Vec<crate::context::agents::AgentTool>>,
     model: Option<String>,
-    effort: Option<crate::context::agents::AgentEffort>,
+    turn_budget: Option<crate::context::agents::AgentTurnBudget>,
 }
 
 impl ResolvedSpecialization {
     fn max_turns(&self, configured_max: usize) -> usize {
-        use crate::context::agents::AgentEffort;
+        use crate::context::agents::AgentTurnBudget;
 
         if configured_max == 0 {
             return 0;
         }
-        match self.effort {
-            Some(AgentEffort::Low) => configured_max.div_ceil(3).max(1),
-            Some(AgentEffort::Medium) => configured_max.saturating_mul(2).div_ceil(3).max(1),
-            Some(AgentEffort::High) | None => configured_max,
+        match self.turn_budget {
+            Some(AgentTurnBudget::Low) => configured_max.div_ceil(3).max(1),
+            Some(AgentTurnBudget::Medium) => configured_max.saturating_mul(2).div_ceil(3).max(1),
+            Some(AgentTurnBudget::High) | None => configured_max,
         }
     }
 }
@@ -332,9 +357,12 @@ fn resolve_persona_runtime(
         return Ok(ResolvedPersonaRuntime {
             client,
             provider_name: provider_name.to_string(),
+            execution: builder::PersonaExecution {
+                provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
+                ..builder::PersonaExecution::default()
+            },
             model_name,
             max_turns,
-            execution: builder::PersonaExecution::default(),
         });
     };
 
@@ -369,12 +397,15 @@ fn resolve_persona_runtime(
     Ok(ResolvedPersonaRuntime {
         client,
         provider_name: resolved_provider,
-        model_name,
         max_turns: specialization.max_turns(max_turns),
         execution: builder::PersonaExecution {
             tools: specialization.tools.clone(),
+            // The same global or quick-model `extra_body` the main agent
+            // would send for this model; persona params are merged on top.
+            provider_extra_body: crate::config::resolve_extra_body(config, &model_name),
             additional_params,
         },
+        model_name,
     })
 }
 
@@ -415,7 +446,7 @@ fn resolve_specialization(
         source,
         tools: definition.tools,
         model: definition.model,
-        effort: definition.effort,
+        turn_budget: definition.turn_budget,
     }))
 }
 
@@ -526,6 +557,8 @@ Use for any cross-file question: where is X used, how does Y work, \
 find/list/count all X across the codebase, what calls Z, audit Q. \
 The subagent uses its configured subset of read, grep, file discovery, \
 directory listing, and read-only memory tools, then returns a verified summary. \
+Send exactly one of `prompts` (plain investigation strings) or `briefs` \
+(structured handoffs); omit the unused field entirely or pass it as []. \
 Multiple prompts or briefs use bounded parallelism and return in input order. \
 If a child fails or an aggregate resource limit is reached, remaining work \
 is cancelled and explicit partial statuses are returned. \
@@ -554,14 +587,12 @@ editing in a known location, grepping for a literal you will act on immediately.
             "properties": {
                 "prompts": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": max_prompts,
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "Investigation prompt for the subagent. Use one for a focused question, or multiple to run independent investigations with bounded parallelism. Examples: 'List all tests in this project', 'Where is config loaded?', 'How does the agent loop work?'"
+                    "description": "Investigation prompt for the subagent. Use one for a focused question, or multiple to run independent investigations with bounded parallelism. Examples: 'List all tests in this project', 'Where is config loaded?', 'How does the agent loop work?'. Send either prompts or briefs, never both populated: omit this field or pass [] when using briefs."
                 },
                 "briefs": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": max_prompts,
                     "items": {
                         "type": "object",
@@ -586,7 +617,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         },
                         "required": ["objective"]
                     },
-                    "description": "Structured handoffs for independent subagents. Each gives an objective plus optional file scope hints, constraints, and expected content. Mutually exclusive with prompts."
+                    "description": "Structured handoffs for independent subagents. Each gives an objective plus optional file scope hints, constraints, and expected content. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
                 },
                 "agent_type": {
                     "type": "string",
@@ -594,11 +625,12 @@ editing in a known location, grepping for a literal you will act on immediately.
                     "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Available specialists:\n{specialist_descriptions}")
                 }
             },
-            "additionalProperties": false,
-            "oneOf": [
-                { "required": ["prompts"] },
-                { "required": ["briefs"] }
-            ]
+            // Exclusivity is stated in the descriptions and enforced by
+            // `TaskArgs` deserialization, not with a top-level `oneOf`:
+            // Anthropic rejects top-level combinators in `input_schema`,
+            // non-strict OpenAI-compatible gateways ignore them, and strict
+            // schema sanitizers rewrite them into an unsatisfiable shape.
+            "additionalProperties": false
         })
     }
 
@@ -1561,11 +1593,52 @@ mod tests {
         assert!(description.contains("rust-security-review:"));
         assert_eq!(description.lines().count(), names.len() + 1);
         assert!(crate::agent::prompt::TASK_TOOL_PROMPT.contains("agent_type"));
-        assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
         assert_eq!(
             schema["properties"]["briefs"]["items"]["required"][0],
             "objective"
         );
+    }
+
+    #[test]
+    fn task_schema_states_exclusivity_without_top_level_combinators() {
+        let tool = TaskTool::new(None, None, true);
+        let schema = tool.parameters();
+        // Anthropic `input_schema` and OpenAI function parameters both require
+        // a plain top-level object; combinators there are rejected, ignored,
+        // or rewritten by strict sanitizers.
+        assert_eq!(schema["type"], "object");
+        for combinator in ["oneOf", "anyOf", "allOf", "not", "enum"] {
+            assert!(
+                schema.get(combinator).is_none(),
+                "top-level {combinator} in task schema"
+            );
+        }
+        assert!(schema.get("required").is_none());
+        for (field, other) in [("prompts", "briefs"), ("briefs", "prompts")] {
+            let property = &schema["properties"][field];
+            assert!(
+                property.get("minItems").is_none(),
+                "{field} must accept [] as absent"
+            );
+            let description = property["description"].as_str().unwrap();
+            assert!(description.contains(&format!("pass [] when using {other}")));
+        }
+        assert!(tool.description().contains("exactly one of `prompts`"));
+    }
+
+    #[test]
+    fn task_args_error_tells_the_model_how_to_recover() {
+        let error =
+            serde_json::from_str::<TaskArgs>(r#"{"prompts":["x"],"briefs":[{"objective":"y"}]}"#)
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("omit prompts entirely"), "{error}");
+        let error = serde_json::from_str::<TaskArgs>(r#"{"prompts":null}"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("exactly one of prompts"), "{error}");
     }
 
     #[test]
@@ -1702,13 +1775,13 @@ mod tests {
             &["audit authentication".into()],
             Some("rust-security-review"),
             Some("compiled-in default"),
-            Some("provider=openrouter, model=test/reviewer, effort=medium, tools=read,grep"),
+            Some("provider=openrouter, model=test/reviewer, turn_budget=medium, tools=read,grep"),
         );
 
         assert!(input.contains("agent_type: rust-security-review"));
         assert!(input.contains("specialist source: compiled-in default"));
         assert!(input.contains("specialist execution: provider=openrouter"));
-        assert!(input.contains("effort=medium, tools=read,grep"));
+        assert!(input.contains("turn_budget=medium, tools=read,grep"));
         assert!(input.contains("prompts: audit authentication"));
         assert!(!input.contains("You are a"));
     }
@@ -1721,7 +1794,7 @@ mod tests {
             source: "trusted project override /workspace/.zerostack/agents/review.md".into(),
             tools: None,
             model: None,
-            effort: None,
+            turn_budget: None,
         };
 
         assert_eq!(
@@ -1744,12 +1817,12 @@ mod tests {
             source: "compiled-in default".into(),
             tools: Some(vec![crate::context::agents::AgentTool::Read]),
             model: Some("fast-review".into()),
-            effort: Some(crate::context::agents::AgentEffort::Medium),
+            turn_budget: Some(crate::context::agents::AgentTurnBudget::Medium),
         }
     }
 
     #[test]
-    fn persona_runtime_resolves_quick_model_tools_and_bounded_effort() {
+    fn persona_runtime_resolves_quick_model_tools_and_bounded_turn_budget() {
         use compact_str::CompactString;
 
         let client = crate::provider::create_client(
@@ -1797,20 +1870,73 @@ mod tests {
             runtime.execution.additional_params,
             Some(serde_json::json!({"seed": 7}))
         );
+        assert_eq!(
+            runtime.execution.provider_extra_body,
+            Some(serde_json::json!({"seed": 7}))
+        );
     }
 
     #[test]
-    fn persona_effort_never_widens_the_configured_turn_cap() {
-        use crate::context::agents::AgentEffort;
+    fn subagent_runtime_inherits_the_parent_extra_body_for_its_model() {
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("test-key"),
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let config = crate::config::Config {
+            extra_body: Some(serde_json::json!({"store": false, "user": "zdr"})),
+            ..crate::config::Config::default()
+        };
+
+        let unspecialized = resolve_persona_runtime(
+            client.clone(),
+            "openrouter",
+            "default/model".into(),
+            20,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            unspecialized.execution.provider_extra_body,
+            Some(serde_json::json!({"store": false, "user": "zdr"}))
+        );
+        assert_eq!(unspecialized.execution.additional_params, None);
+
+        let mut raw_model = runtime_specialization();
+        raw_model.model = Some("other/model".into());
+        let persona = resolve_persona_runtime(
+            client,
+            "openrouter",
+            "default/model".into(),
+            20,
+            None,
+            &config,
+            Some(&raw_model),
+        )
+        .unwrap();
+        assert_eq!(persona.model_name, "other/model");
+        assert_eq!(
+            persona.execution.provider_extra_body,
+            Some(serde_json::json!({"store": false, "user": "zdr"}))
+        );
+    }
+
+    #[test]
+    fn persona_turn_budget_never_widens_the_configured_turn_cap() {
+        use crate::context::agents::AgentTurnBudget;
 
         let mut specialization = runtime_specialization();
-        specialization.effort = Some(AgentEffort::Low);
+        specialization.turn_budget = Some(AgentTurnBudget::Low);
         assert_eq!(specialization.max_turns(20), 7);
-        specialization.effort = Some(AgentEffort::Medium);
+        specialization.turn_budget = Some(AgentTurnBudget::Medium);
         assert_eq!(specialization.max_turns(20), 14);
-        specialization.effort = Some(AgentEffort::High);
+        specialization.turn_budget = Some(AgentTurnBudget::High);
         assert_eq!(specialization.max_turns(20), 20);
-        specialization.effort = None;
+        specialization.turn_budget = None;
         assert_eq!(specialization.max_turns(20), 20);
         assert_eq!(specialization.max_turns(0), 0);
     }

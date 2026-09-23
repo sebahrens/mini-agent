@@ -2027,8 +2027,11 @@ the prompt itself contains a different `%%agent=` directive.
 
 For `task` subagents, the same frontmatter may declare a bounded `description`,
 a `tools` subset of the read-only child tools, a raw model ID or `quick_models`
-alias in `model`, and `effort = low|medium|high`. Effort narrows the global
-`task_max_turns` cap to one-third, two-thirds, or all of it. See
+alias in `model`, and `turn_budget: low|medium|high` (YAML frontmatter, not
+TOML). The turn budget narrows the global `task_max_turns` cap to one-third,
+two-thirds, or all of it; it does not change `[reasoning] effort`. The older
+`effort:` key is a deprecated alias that logs a warning, and setting both keys
+rejects the definition. See
 [SUBAGENTS.md](SUBAGENTS.md#specialist-agent-types) for syntax and validation.
 
 ## Prompt-to-model switching
