@@ -82,8 +82,13 @@ mod tests {
     fn task_args_treats_null_empty_and_blank_handoffs_as_absent() {
         use crate::extras::subagents::task_tool::TaskArgs;
 
-        // (json, expected prompts, expected brief objectives)
-        let accepted: &[(&str, &[&str], Option<&[&str]>)] = &[
+        /// (json, expected prompts, expected brief objectives)
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            Option<&'static [&'static str]>,
+        );
+        let accepted: &[Case] = &[
             (
                 r#"{"prompts":[],"briefs":[{"objective":"y"}]}"#,
                 &[],
