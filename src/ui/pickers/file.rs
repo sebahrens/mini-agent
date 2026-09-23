@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -14,8 +14,16 @@ use super::super::utils::resolve_color;
 /// batches keep the first matches visible quickly on large trees.
 const WALK_BATCH_SIZE: usize = 25;
 
-/// Hard cap on walked paths, same bound the picker always had.
-const MAX_WALK_FILES: usize = 200;
+/// Cap on walked files. Directories are listed too but do not count, so a
+/// wide tree of folders cannot starve the files that sort after them.
+pub(crate) const MAX_WALK_FILES: usize = 20_000;
+
+/// Safety cap on all emitted entries (files plus directories) so a tree made
+/// almost entirely of empty directories still terminates promptly.
+const MAX_WALK_ENTRIES: usize = 50_000;
+
+/// Deepest directory level the walk descends into.
+const MAX_WALK_DEPTH: usize = 16;
 
 pub struct FilePicker {
     pub active: bool,
@@ -93,6 +101,11 @@ impl FilePicker {
         self.walk_cancel.store(true, Ordering::Relaxed);
         self.walk_rx = None;
         self.loading = false;
+    }
+
+    /// Whether the background walk is still streaming paths.
+    pub fn is_loading(&self) -> bool {
+        self.loading
     }
 
     /// Drain walk batches that arrived since the last call. Returns true
@@ -253,49 +266,73 @@ impl FilePicker {
     }
 }
 
+/// Whether a walk entry is a dot-entry (`.git`, `.env`, `.cache`, ...). The
+/// walk root itself (depth 0) is never pruned, even when its own name starts
+/// with a dot.
+fn is_dot_entry(entry: &ignore::DirEntry) -> bool {
+    entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.')
+}
+
 /// Walk `root`, invoking `emit` with batches of paths as they are found so
 /// the picker can show matches incrementally. Stops early when `cancel` is
 /// set (Esc/deactivate) or when `emit` returns false (receiver dropped).
+///
+/// The walk honours `.gitignore`/`.ignore`, prunes dot-directories such as
+/// `.git` before descending into them, never emits the root itself, lists
+/// directories alongside files, and stops after [`MAX_WALK_FILES`] files
+/// (directories do not count toward that cap).
 pub(crate) fn walk_files_streaming(
     root: &str,
     cancel: &AtomicBool,
     mut emit: impl FnMut(Vec<PathBuf>) -> bool,
 ) {
     let walker = ignore::WalkBuilder::new(root)
+        // Dot-entries are pruned by `filter_entry` below so the walker never
+        // descends into `.git`; the built-in hidden filter is equivalent but
+        // implicit.
         .hidden(false)
         .git_ignore(true)
-        .max_depth(Some(8))
+        .max_depth(Some(MAX_WALK_DEPTH))
         .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|entry| !is_dot_entry(entry))
         .build();
 
     let mut batch = Vec::with_capacity(WALK_BATCH_SIZE);
-    let mut total = 0usize;
+    let mut files = 0usize;
+    let mut entries = 0usize;
     for entry in walker.flatten() {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
+        if entry.depth() == 0 {
+            continue;
+        }
         let path = entry.path();
-        if !path.is_file() && !path.is_dir() {
-            continue;
-        }
-        if path
-            .components()
-            .any(|c| matches!(c, Component::Normal(n) if n.to_string_lossy().starts_with('.')))
-        {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
+        let is_file = match entry.file_type() {
+            Some(kind) if kind.is_file() => true,
+            Some(kind) if kind.is_dir() => false,
+            // Symlinks and unknown kinds: follow them once to classify.
+            _ if path.is_file() => true,
+            _ if path.is_dir() => false,
+            _ => continue,
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let rel = rel
             .to_string_lossy()
+            .trim_start_matches(['/', '\\'])
             .to_string();
-        let rel = rel.trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            continue;
+        }
         batch.push(PathBuf::from(rel));
-        total += 1;
+        entries += 1;
+        if is_file {
+            files += 1;
+        }
         if batch.len() >= WALK_BATCH_SIZE && !emit(std::mem::take(&mut batch)) {
             return;
         }
-        if total >= MAX_WALK_FILES {
+        if files >= MAX_WALK_FILES || entries >= MAX_WALK_ENTRIES {
             break;
         }
     }

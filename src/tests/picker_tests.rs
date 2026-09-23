@@ -481,10 +481,9 @@ fn test_walk_files_root_is_sorted_and_stripped() {
         let files = walk_files(&root.to_string_lossy());
         let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
 
-        let root_idx = names.iter().position(|n| n.is_empty());
         assert!(
-            root_idx.is_some(),
-            "root entry (empty string) should be present"
+            !names.contains(&""),
+            "the walk root must not be listed as an empty path, got {names:?}"
         );
 
         let file_indices: Vec<usize> = names
@@ -506,9 +505,92 @@ fn test_walk_files_empty_directory() {
         let files = walk_files(&root.to_string_lossy());
         let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
 
-        assert_eq!(names.len(), 1, "only root entry expected in empty dir");
-        assert!(names.contains(&""), "root entry should be present");
+        assert!(names.is_empty(), "empty dir lists nothing, got {names:?}");
     });
+}
+
+#[test]
+fn test_walk_files_finds_a_file_sorted_after_hundreds_of_entries() {
+    // Regression for mini-agent-2lt0a: the old walk stopped after 200 paths
+    // (directories included), so anything sorting after a busy folder, such
+    // as `src/` in this repository, was never offered.
+    with_temp_dir(|root| {
+        for i in 0..150 {
+            fs::create_dir_all(root.join("aaa_dirs").join(format!("d{i:03}"))).unwrap();
+        }
+        fs::create_dir(root.join("bbb_files")).unwrap();
+        for i in 0..250 {
+            fs::write(root.join("bbb_files").join(format!("f{i:03}.txt")), b"x").unwrap();
+        }
+        fs::create_dir(root.join("zzz")).unwrap();
+        fs::write(root.join("zzz").join("target.rs"), b"fn main() {}").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+
+        assert!(files.len() > 400, "walked {} entries", files.len());
+        assert!(
+            files.contains(&Path::new("zzz").join("target.rs")),
+            "a file sorted after 400 entries must still be found"
+        );
+    });
+}
+
+#[test]
+fn test_walk_files_respects_gitignore_and_prunes_dot_git() {
+    with_temp_dir(|root| {
+        fs::create_dir_all(root.join(".git").join("objects")).unwrap();
+        fs::write(root.join(".git").join("objects").join("abc"), b"blob").unwrap();
+        fs::write(root.join(".gitignore"), b"ignored/\n*.log\n").unwrap();
+        fs::create_dir(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored").join("x.rs"), b"x").unwrap();
+        fs::write(root.join("debug.log"), b"log").unwrap();
+        fs::write(root.join("kept.rs"), b"kept").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(names.contains(&"kept.rs".to_string()), "got {names:?}");
+        assert!(
+            names.iter().all(|n| !n.starts_with(".git")),
+            "nothing under .git may be listed: {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| !n.starts_with("ignored")),
+            "gitignored directories must be skipped: {names:?}"
+        );
+        assert!(!names.contains(&"debug.log".to_string()), "got {names:?}");
+    });
+}
+
+#[test]
+fn test_file_picker_empty_query_never_highlights_an_empty_path() {
+    // mini-agent-fis1t: Enter/Tab right after `@` used to insert the empty
+    // root entry and so delete the `@`.
+    with_temp_dir(|root| {
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(walk_files(&root.to_string_lossy()));
+        picker.char_input('a');
+        picker.backspace();
+        let selected = picker.selected_path().expect("a.txt is listed");
+        assert_eq!(selected, &PathBuf::from("a.txt"));
+    });
+}
+
+#[test]
+fn test_file_picker_is_not_loading_once_the_cache_is_set() {
+    let mut picker = FilePicker::new();
+    picker.test_set_cache(vec![PathBuf::from("a.txt")]);
+    assert!(!picker.is_loading());
+    let mut wrapped = Picker::File(picker);
+    assert!(!wrapped.is_loading());
+    assert!(
+        !wrapped.poll_background(),
+        "nothing to repaint without a background walk"
+    );
 }
 
 // ── walk_files_streaming tests ───────────────────────────────────────
@@ -532,7 +614,7 @@ fn test_walk_files_streaming_batches_match_walk_files() {
 
         assert!(
             batches.len() > 1,
-            "31 entries should arrive in multiple batches"
+            "30 entries should arrive in multiple batches"
         );
         assert!(batches.iter().all(|b| b.len() <= 25));
 
@@ -952,5 +1034,161 @@ mod slash_picker_contract {
         assert_eq!(picker_window(26, 0, 38, 20), window(16, 15, 25));
         assert_eq!(picker_window(4, 1, 38, 0), window(1, 0, 3));
         assert_eq!(picker_window(0, 0, 38, 5), window(0, 5, 5));
+    }
+}
+
+// --- `!` completion from previously run shell commands (mini-agent-356ht) ---
+
+mod bang_history_picker {
+    use super::*;
+    use crate::ui::pickers::bang::bang_history;
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(input: &mut InputEditor, code: KeyCode) -> Option<CompactString> {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if input.picker.as_ref().is_some_and(Picker::active) && input.handle_picker_key(key) {
+            return None;
+        }
+        input.handle_key(key)
+    }
+
+    fn typed(input: &mut InputEditor, text: &str) {
+        for c in text.chars() {
+            assert_eq!(press(input, KeyCode::Char(c)), None);
+        }
+    }
+
+    /// Submit each line as the user would, oldest first.
+    fn editor_with_history(lines: &[&str]) -> InputEditor {
+        let mut input = InputEditor::new();
+        for line in lines {
+            typed(&mut input, line);
+            if input.picker.as_ref().is_some_and(Picker::active) {
+                input.picker = None;
+            }
+            assert_eq!(press(&mut input, KeyCode::Enter).as_deref(), Some(*line));
+        }
+        input
+    }
+
+    fn suggestions(input: &InputEditor) -> Option<Vec<String>> {
+        match input.picker.as_ref() {
+            Some(Picker::Bang(p)) if p.active => Some(p.matches.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bang_history_is_newest_first_deduplicated_and_shell_only() {
+        let history = [
+            "!ls -la",
+            "explain this",
+            "!cargo test",
+            "/help",
+            "!ls -la",
+            "!  git status  ",
+            "!",
+            "!echo a\necho b",
+        ];
+        assert_eq!(
+            bang_history(&history),
+            vec!["git status", "ls -la", "cargo test"]
+        );
+    }
+
+    #[test]
+    fn bang_history_is_empty_without_shell_commands() {
+        assert!(bang_history(&["hello", "/model"]).is_empty());
+        assert!(bang_history::<&str>(&[]).is_empty());
+    }
+
+    #[test]
+    fn no_history_means_no_picker_and_bang_types_plainly() {
+        let mut input = editor_with_history(&["hello"]);
+        typed(&mut input, "!ls");
+        assert_eq!(suggestions(&input), None);
+        assert_eq!(input.buffer, "!ls");
+    }
+
+    #[test]
+    fn bang_at_start_lists_recent_commands_and_ranks_prefix_matches_first() {
+        let mut input =
+            editor_with_history(&["!cargo test", "!git status", "!echo cargo", "!cargo fmt"]);
+        typed(&mut input, "!");
+        assert_eq!(
+            suggestions(&input).unwrap(),
+            vec!["cargo fmt", "echo cargo", "git status", "cargo test"]
+        );
+
+        typed(&mut input, "car");
+        assert_eq!(input.buffer, "!car");
+        assert_eq!(
+            suggestions(&input).unwrap(),
+            vec!["cargo fmt", "cargo test", "echo cargo"],
+            "prefix matches (newest first) come before substring matches"
+        );
+    }
+
+    #[test]
+    fn enter_takes_the_highlight_then_submits_on_the_next_press() {
+        let mut input = editor_with_history(&["!cargo test"]);
+        typed(&mut input, "!ca");
+        assert_eq!(press(&mut input, KeyCode::Enter), None);
+        assert_eq!(input.buffer, "!cargo test");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert_eq!(suggestions(&input), None);
+        assert_eq!(
+            press(&mut input, KeyCode::Enter).as_deref(),
+            Some("!cargo test")
+        );
+    }
+
+    #[test]
+    fn enter_submits_a_command_typed_in_full_or_one_without_matches() {
+        let mut input = editor_with_history(&["!ls"]);
+        typed(&mut input, "!ls");
+        assert_eq!(press(&mut input, KeyCode::Enter).as_deref(), Some("!ls"));
+
+        typed(&mut input, "!pwd");
+        assert_eq!(suggestions(&input).unwrap(), Vec::<String>::new());
+        assert_eq!(press(&mut input, KeyCode::Enter).as_deref(), Some("!pwd"));
+    }
+
+    #[test]
+    fn esc_closes_without_discarding_the_typed_command() {
+        let mut input = editor_with_history(&["!cargo test"]);
+        typed(&mut input, "!cargo b");
+        assert_eq!(press(&mut input, KeyCode::Esc), None);
+        assert_eq!(input.buffer, "!cargo b");
+        assert_eq!(suggestions(&input), None);
+    }
+
+    #[test]
+    fn backspace_on_the_bare_bang_deletes_it() {
+        let mut input = editor_with_history(&["!ls"]);
+        typed(&mut input, "!");
+        assert!(suggestions(&input).is_some());
+        assert_eq!(press(&mut input, KeyCode::Backspace), None);
+        assert_eq!(input.buffer, "");
+        assert_eq!(input.cursor, 0);
+        assert_eq!(suggestions(&input), None);
+    }
+
+    #[test]
+    fn tab_inserts_the_highlight_and_down_moves_it() {
+        let mut input = editor_with_history(&["!make", "!ls"]);
+        typed(&mut input, "!");
+        assert_eq!(press(&mut input, KeyCode::Down), None);
+        assert_eq!(press(&mut input, KeyCode::Tab), None);
+        assert_eq!(input.buffer, "!make");
+    }
+
+    #[test]
+    fn bang_mid_buffer_does_not_open_the_picker() {
+        let mut input = editor_with_history(&["!ls"]);
+        typed(&mut input, "hi !");
+        assert_eq!(suggestions(&input), None);
+        assert_eq!(input.buffer, "hi !");
     }
 }

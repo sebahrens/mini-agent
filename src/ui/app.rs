@@ -22,7 +22,7 @@ use crate::sandbox::{
 use crate::session::{GitStatus, MessageRole, Session};
 use crate::ui::event_handler;
 use crate::ui::events::{render_session, sanitize_output};
-use crate::ui::input::InputEditor;
+use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{
@@ -943,6 +943,15 @@ impl<'a> App<'a> {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
                     self.renderer.tick_spinner()?;
+                }
+                // The @ file picker fills from a background walk; repaint as
+                // results land so "scanning files..." never waits for a key.
+                _ = tokio::time::sleep(Duration::from_millis(50)),
+                    if self.input.picker.as_ref().is_some_and(Picker::is_loading) =>
+                {
+                    if self.input.picker.as_mut().is_some_and(Picker::poll_background) {
+                        self.refresh()?;
+                    }
                 }
                 else => {
                     if let Some(rx) = self.prebuild.as_mut()

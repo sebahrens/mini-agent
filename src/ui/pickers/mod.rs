@@ -1,3 +1,4 @@
+pub(crate) mod bang;
 pub(crate) mod file;
 pub(crate) mod handlers;
 pub(crate) mod list;

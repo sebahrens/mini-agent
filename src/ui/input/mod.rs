@@ -339,6 +339,20 @@ impl InputEditor {
         self.picker = Some(Picker::File(picker));
     }
 
+    /// Open the `!` picker over previously run shell commands. Stays closed
+    /// when there are none, so a first `!command` types like plain text.
+    pub fn start_bang_picker(&mut self) {
+        let commands = crate::ui::pickers::bang::bang_history(&self.history);
+        if commands.is_empty() {
+            return;
+        }
+        let mut picker = ListPicker::new();
+        picker.set_monochrome(self.monochrome);
+        picker.set_items(commands);
+        picker.activate();
+        self.picker = Some(Picker::Bang(picker));
+    }
+
     pub fn start_command_picker(&mut self) {
         let mut picker = ListPicker::with_static_commands();
         picker.set_monochrome(self.monochrome);
@@ -738,6 +752,15 @@ impl InputEditor {
                 }
                 if c == '/' && self.cursor == 0 {
                     self.start_command_picker();
+                }
+                if c == '!' && self.buffer.is_empty() {
+                    self.buffer.insert(0, c);
+                    self.cursor = c.len_utf8();
+                    self.start_bang_picker();
+                    self.history_pos = None;
+                    self.draft = None;
+                    self.yank_pos = None;
+                    return None;
                 }
                 if c == '.' && self.cursor == 0 {
                     self.buffer.insert(self.cursor, c);

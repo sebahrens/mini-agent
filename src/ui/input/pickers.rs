@@ -1,5 +1,6 @@
 use crossterm::event::KeyEvent;
 
+use crate::ui::pickers::bang;
 use crate::ui::pickers::file::FilePicker;
 use crate::ui::pickers::handlers;
 use crate::ui::pickers::list::ListPicker;
@@ -12,6 +13,8 @@ pub enum Picker {
     Prefixed(ListPicker, &'static str),
     Models(ModelsPicker),
     Rewind(RewindPicker),
+    /// `!` at the start of the input: previously run shell commands.
+    Bang(ListPicker),
 }
 
 impl Picker {
@@ -22,6 +25,22 @@ impl Picker {
             Picker::Prefixed(p, _) => p.active,
             Picker::Models(p) => p.active,
             Picker::Rewind(p) => p.active(),
+            Picker::Bang(p) => p.active,
+        }
+    }
+
+    /// Whether the picker is still filling in the background (the file
+    /// picker's directory walk), so the UI should keep repainting it.
+    pub fn is_loading(&self) -> bool {
+        matches!(self, Picker::File(p) if p.active && p.is_loading())
+    }
+
+    /// Take background results that arrived since the last call. Returns true
+    /// when the picker changed and should be repainted.
+    pub fn poll_background(&mut self) -> bool {
+        match self {
+            Picker::File(p) if p.active => p.try_finish_loading(),
+            _ => false,
         }
     }
 
@@ -32,6 +51,7 @@ impl Picker {
             Picker::Prefixed(p, _) => p.set_monochrome(monochrome),
             Picker::Models(p) => p.set_monochrome(monochrome),
             Picker::Rewind(p) => p.set_monochrome(monochrome),
+            Picker::Bang(p) => p.set_monochrome(monochrome),
         }
     }
 
@@ -51,6 +71,10 @@ impl Picker {
             }
             Picker::Models(p) => p.draw(floor_row),
             Picker::Rewind(p) => p.draw(floor_row),
+            // A new command has no history match; stay out of the way
+            // instead of announcing "no matches" for every keystroke.
+            Picker::Bang(p) if p.matches.is_empty() => Ok(()),
+            Picker::Bang(p) => p.draw(None, floor_row),
         }
     }
 }
@@ -86,6 +110,9 @@ impl InputEditor {
                 handlers::handle_models_key(&mut self.buffer, &mut self.cursor, p, key)
             }
             Some(Picker::Rewind(p)) => p.handle(key),
+            Some(Picker::Bang(p)) => {
+                bang::handle_bang_key(&mut self.buffer, &mut self.cursor, p, key)
+            }
             None => false,
         };
         if handled {

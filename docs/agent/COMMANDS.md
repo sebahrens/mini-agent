@@ -367,6 +367,14 @@ If you want to run a command and then discuss the output with the agent, just
 type `!<command>` first (it stores the output as an Assistant message), then
 follow up with a normal message asking the agent about it.
 
+In the TUI, typing `!` into an empty input opens a picker of shell commands you
+ran before (from the global chat history), newest first. Typing filters it, and
+commands that start with the typed text rank first. Tab inserts the highlighted
+command and Enter inserts it too, unless nothing matches or the highlight is
+exactly what you typed, in which case Enter runs the command. Up/Down move the
+highlight, Escape closes the picker and keeps what you typed, and Backspace on
+the bare `!` removes it. With no earlier `!` commands the picker stays closed.
+
 ## Prompt Shortcut
 
 Prefix a message with `.` to quickly switch prompts or run a one-shot query with
