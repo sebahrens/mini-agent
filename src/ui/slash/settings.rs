@@ -223,44 +223,59 @@ async fn handle_mode(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).mode())
         .unwrap_or(SecurityMode::Standard);
 
+    // The interactive picker (see `ui::pickers::handlers`) handles a bare
+    // `/mode` typed into the TUI; this listing is the fallback wherever no
+    // picker is available.
     if parts.len() < 2 {
         write_ok(ctx.renderer, "security mode:");
-        write_result(ctx.renderer, format!("  current: {}", current_mode));
-        write_result(ctx.renderer, "");
-        write_result(
-            ctx.renderer,
-            "  /mode standard      allow within CWD, ask for external",
-        );
-        write_result(ctx.renderer, "  /mode restrictive   ask for all operations");
-        write_result(
-            ctx.renderer,
-            "  /mode readonly      allow reads, deny everything else",
-        );
-        write_result(
-            ctx.renderer,
-            "  /mode guarded       allow reads, ask for everything else",
-        );
-        write_result(
-            ctx.renderer,
-            "  /mode yolo          allow all, ask for destructive bash",
-        );
+        for line in mode_listing(current_mode) {
+            write_result(ctx.renderer, line);
+        }
         return Ok(());
     }
-    match parts[1] {
-        "standard" => set_mode(ctx, SecurityMode::Standard, "standard").await,
-        "restrictive" => set_mode(ctx, SecurityMode::Restrictive, "restrictive").await,
-        "readonly" => set_mode(ctx, SecurityMode::ReadOnly, "readonly").await,
-        "guarded" => set_mode(ctx, SecurityMode::Guarded, "guarded").await,
-        "yolo" => set_mode(ctx, SecurityMode::Yolo, "yolo").await,
-        _ => write_error(ctx.renderer, format!("unknown mode: {}", parts[1])),
+    match parse_mode_arg(parts[1]) {
+        Some(mode) => set_mode(ctx, mode).await,
+        None => write_error(
+            ctx.renderer,
+            format!(
+                "unknown mode: {} (expected one of {})",
+                parts[1],
+                SecurityMode::NAMES.join(", ")
+            ),
+        ),
     }
     Ok(())
 }
 
-async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode, label: &str) {
+/// The `/mode` listing: the current mode, then one line per mode in
+/// [`SecurityMode::NAMES`] order with its description.
+pub(crate) fn mode_listing(current: SecurityMode) -> Vec<String> {
+    let width = SecurityMode::NAMES
+        .iter()
+        .map(|name| name.len())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![format!("  current: {current}"), String::new()];
+    lines.extend(SecurityMode::all().map(|mode| {
+        format!(
+            "  /mode {:<width$}   {}",
+            mode.to_string(),
+            mode.description()
+        )
+    }));
+    lines
+}
+
+/// Parse a `/mode` argument: every name in [`SecurityMode::NAMES`], plus the
+/// `accept` alias for `standard` that `default_permission_mode` also takes.
+pub(crate) fn parse_mode_arg(arg: &str) -> Option<SecurityMode> {
+    SecurityMode::from_config_value(arg)
+}
+
+async fn set_mode(ctx: &mut SlashCtx<'_>, mode: SecurityMode) {
     if let Some(p) = ctx.permission {
         p.lock().unwrap_or_else(|e| e.into_inner()).set_mode(mode);
-        write_ok(ctx.renderer, format!("security mode: {}", label));
+        write_ok(ctx.renderer, format!("security mode: {mode}"));
     } else {
         write_error(ctx.renderer, "permission system not active");
     }
@@ -580,6 +595,45 @@ fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         Err(e) => write_error(ctx.renderer, format!("logout failed: {e}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::{mode_listing, parse_mode_arg};
+    use crate::permission::SecurityMode;
+
+    #[test]
+    fn every_documented_mode_name_round_trips_through_mode() {
+        for name in SecurityMode::NAMES {
+            let mode = parse_mode_arg(name).unwrap_or_else(|| panic!("/mode {name} rejected"));
+            assert_eq!(mode.to_string(), name);
+        }
+        assert_eq!(parse_mode_arg("planwrite"), Some(SecurityMode::PlanWrite));
+    }
+
+    #[test]
+    fn accept_is_an_alias_for_standard_and_unknown_names_are_rejected() {
+        assert_eq!(parse_mode_arg("accept"), Some(SecurityMode::Standard));
+        assert_eq!(parse_mode_arg("auto"), None);
+        assert_eq!(parse_mode_arg(""), None);
+    }
+
+    #[test]
+    fn listing_names_the_current_mode_and_every_mode_with_its_description() {
+        let lines = mode_listing(SecurityMode::PlanWrite);
+        assert_eq!(lines[0], "  current: planwrite");
+        let modes: Vec<SecurityMode> = SecurityMode::all().collect();
+        assert_eq!(modes.len(), SecurityMode::NAMES.len());
+        for mode in modes {
+            let prefix = format!("  /mode {mode} ");
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&prefix) && line.ends_with(mode.description())),
+                "listing is missing {mode}: {lines:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -81,13 +81,14 @@ built-in prompts, or create a custom `code.md` prompt).
 
 | Command | Description |
 | ------- | ----------- |
-| `/mode` | Show the current security mode. |
+| `/mode` | Pick a security mode. In the TUI, accepting `/mode` from completion (Tab, or Enter on the full name) opens a picker listing every mode with a one-line description, the current mode highlighted and marked `(current)`; choosing one inserts `/mode <name>` for Enter to apply. Submitting a bare `/mode` (or running without a permission system) prints the current mode and the same described list as text. |
 | `/mode standard` | Allow path tools within CWD, ask for external paths. Config rules apply. |
 | `/mode restrictive` | Ask for every operation. Config rules skipped. |
 | `/mode readonly` | Allow reads only; deny writes, edits, shell, and everything else. |
 | `/mode planwrite` | Read-only except for the built-in, workspace-contained plan-file write exception. |
 | `/mode guarded` | Allow reads; ask for writes, edits, shell, and everything else. Config rules apply. |
 | `/mode yolo` | Allow everything; ask for destructive shell commands. Config rules apply. |
+| `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 
 Prompts can set the security mode automatically via `%%mode=<mode>` on
 the first line. When a prompt with `%%mode=last_user_mode` is activated,
@@ -212,10 +213,14 @@ Requires the `subagents` feature (default-on; see [SUBAGENTS.md](SUBAGENTS.md)).
 
 | Command | Description |
 | ------- | ----------- |
-| `/model-subagent` | Show the model currently used for subagents. |
-| `/model-subagent <name>` | Switch the subagent model. |
-| `/models-subagent` | List quick models available for subagents. |
-| `/models-subagent <name>` | Switch subagents to a named quick model. |
+| `/subagent-model` | Show the model currently used for subagents. |
+| `/subagent-model <name>` | Switch the subagent model. |
+| `/subagent-models` | List quick models available for subagents. |
+| `/subagent-models <name>` | Switch subagents to a named quick model. |
+
+`/model-subagent` and `/models-subagent` remain accepted as hidden aliases
+for `/subagent-model` and `/subagent-models`. Without the `subagents` feature,
+either spelling prints that the feature is required.
 
 ## Worktree (feature-gated)
 

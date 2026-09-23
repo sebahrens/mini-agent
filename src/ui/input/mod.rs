@@ -246,6 +246,8 @@ pub struct InputEditor {
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
     provider_names: Vec<String>,
+    /// Source of the current security mode for the `/mode` picker.
+    permission: Option<crate::permission::checker::PermCheck>,
     editor: Option<String>,
     kill_ring: Vec<CompactString>,
     yank_pos: Option<usize>,
@@ -268,6 +270,7 @@ impl InputEditor {
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
             provider_names: Vec::new(),
+            permission: None,
             editor: None,
             kill_ring: Vec::with_capacity(MAX_KILL_RING),
             yank_pos: None,
@@ -318,6 +321,12 @@ impl InputEditor {
 
     pub fn set_provider_names(&mut self, names: Vec<String>) {
         self.provider_names = names;
+    }
+
+    /// Share the permission checker so the `/mode` picker can show and
+    /// highlight the mode that is current when it opens.
+    pub fn set_permission(&mut self, permission: Option<crate::permission::checker::PermCheck>) {
+        self.permission = permission;
     }
 
     pub fn set_editor(&mut self, editor: String) {

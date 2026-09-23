@@ -610,6 +610,7 @@ impl<'a> App<'a> {
             providers.extend(ui.cfg.custom_providers_map().keys().cloned());
             input.set_provider_names(providers);
         }
+        input.set_permission(ui.permission.clone());
         input.load_global_history();
 
         let mut run = AgentRunState {

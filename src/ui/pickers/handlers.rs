@@ -141,6 +141,9 @@ pub struct CommandPickerCtx<'a> {
     pub quick_model_names: &'a [String],
     pub live_model_names: &'a [String],
     pub provider_names: &'a [String],
+    /// The active security mode, or `None` when no permission system is
+    /// running (then `/mode` has no picker and submits as text).
+    pub security_mode: Option<crate::permission::SecurityMode>,
 }
 
 /// Backspace in the command picker. With a query it deletes one query
@@ -179,6 +182,7 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
         "/queue" => true,
+        "/mode" => ctx.security_mode.is_some(),
         _ => false,
     }
 }
@@ -219,6 +223,7 @@ fn accept_command(
                     mp.activate();
                     Picker::Models(mp)
                 }
+                "/mode" => Picker::Prefixed(mode_picker(ctx.security_mode), "/mode "),
                 other => {
                     let (items, prefix): (Vec<String>, &'static str) = match other {
                         "/prompt" => (ctx.prompt_names.to_vec(), "/prompt "),
@@ -241,6 +246,20 @@ fn accept_command(
     }
     picker.deactivate();
     (true, None)
+}
+
+/// The `/mode` argument picker: every security mode with its one-line
+/// description, the current one marked and highlighted.
+pub(crate) fn mode_picker(current: Option<crate::permission::SecurityMode>) -> ListPicker {
+    let mut picker = ListPicker::new();
+    picker.set_described_items(
+        crate::permission::SecurityMode::all()
+            .map(|mode| (mode.to_string(), mode.description().to_string()))
+            .collect(),
+    );
+    picker.set_current(current.map(|mode| mode.to_string()));
+    picker.activate();
+    picker
 }
 
 /// Keys while the slash-command picker is open. A `false` result means the

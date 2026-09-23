@@ -95,6 +95,10 @@ impl InputEditor {
                     quick_model_names: &self.quick_model_names,
                     live_model_names: &self.live_model_names,
                     provider_names: &self.provider_names,
+                    security_mode: self
+                        .permission
+                        .as_ref()
+                        .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).mode()),
                 };
                 let (handled, replacement) =
                     handlers::handle_command_key(&mut self.buffer, &mut self.cursor, &ctx, p, key);
