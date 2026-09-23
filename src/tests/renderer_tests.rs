@@ -50,7 +50,7 @@ mod desktop_process_tests {
         }
 
         async fn started(&self) -> i32 {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(FIXTURE_OBSERVATION, async {
                 loop {
                     if let Some(pid) = self.pid("pid") {
                         return pid;
@@ -72,8 +72,13 @@ mod desktop_process_tests {
         }
     }
 
+    /// Upper bound for observing a fixture process start or be reaped. These
+    /// waits only poll for an event that must happen, so they can be generous
+    /// for loaded CI runners without weakening any behavioural bound.
+    const FIXTURE_OBSERVATION: Duration = Duration::from_secs(15);
+
     async fn assert_reaped(pid: i32) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(FIXTURE_OBSERVATION, async {
             while kill(Pid::from_raw(pid), None).is_ok() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
