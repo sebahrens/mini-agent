@@ -287,7 +287,11 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     }
     emit(true, "keys:");
     emit(false, "  PgUp/PgDn             scroll chat history");
-    emit(false, "  Home/End               jump to top/bottom");
+    emit(
+        false,
+        "  Home/End               line start/end (empty input: top/bottom)",
+    );
+    emit(false, "  Ctrl+Home/Ctrl+End     jump to top/bottom of chat");
     emit(
         false,
         "  /<command>             command picker (Tab insert, Enter run, Esc cancel)",

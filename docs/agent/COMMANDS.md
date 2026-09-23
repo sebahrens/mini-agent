@@ -469,20 +469,22 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+W` | Delete word backwards. |
 | `Ctrl+U` | Delete everything before the cursor. |
 | `Ctrl+K` | Delete everything after the cursor. |
-| `Ctrl+A` / `Ctrl+E` | Move to the start/end of the current input line. |
+| `Ctrl+A` / `Ctrl+E` | Move to the start/end of the current input line; pressing again at the edge stays put. |
 | `Ctrl+B` / `Ctrl+F` | Move one character left/right. |
 | `Alt+B` / `Alt+F` | Move one word left/right. |
 | `Alt+D` | Delete the next word. |
+| Other `Ctrl`/`Alt` letters | Ignored in the input and pickers; they never type the plain letter. With macOS Option-as-Meta enabled, Option-layer characters such as `@` on a German layout arrive as `Alt`+letter, so disable Option-as-Meta (or use the right Option key without it) to type them. |
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
 | `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
 | `Ctrl+R` | Toggle reasoning visibility. |
 | `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. |
-| `@<query>` | Activate the file picker; Tab or Enter inserts the highlighted path and Escape closes it. |
+| `@<query>` | Activate the file picker when `@` starts a word (input start, or after whitespace, a newline, `(` or a quote, including a pasted trailing `@`); Tab or Enter inserts the highlighted path, a space keeps the typed text and closes the picker, Ctrl+W deletes the query, and Escape closes it. |
 | `Tab` | Insert two spaces when no picker is active. |
-| `Up / Down` | Move vertically in multiline input; at an edge, navigate command history. |
+| `Up / Down` | Move vertically in multiline input; at an edge, navigate command history (a recalled prompt puts the cursor at its end). |
 | `PageUp / PageDown` | Scroll viewport. |
-| `Home / End` | Jump to the top/bottom of chat history. |
+| `Home / End` | Move to the start/end of the current input line. With an empty input (or while a picker is open) they jump to the top/bottom of chat history instead. |
+| `Ctrl+Home / Ctrl+End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
 | Mouse drag | Select transcript lines and copy them on release. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's native selection. |
 | Mouse scroll | Scroll chat history. |

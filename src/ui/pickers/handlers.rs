@@ -5,8 +5,18 @@ use super::file::FilePicker;
 use super::list::ListPicker;
 use super::models::ModelsPicker;
 
-use crate::ui::input::Picker;
 use crate::ui::input::cursor::prev_char_boundary;
+use crate::ui::input::{Picker, is_modifier_chord};
+
+/// Ctrl+W in a picker: delete the typed query (it is one word), or, when the
+/// query is already empty, act like Backspace and drop the trigger.
+fn is_ctrl_w(key: KeyEvent) -> bool {
+    is_modifier_chord(key)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('w' | 'W'))
+}
+
+const BACKSPACE: KeyEvent = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
 
 /// Replace the `@<query>` span that starts at byte offset `at` with
 /// `replacement` and return the byte cursor just after the inserted text.
@@ -50,6 +60,24 @@ pub fn handle_file_key(
                 }
                 picker.deactivate();
             }
+            true
+        }
+        _ if is_ctrl_w(key) => {
+            if picker.cursor == 0 {
+                return handle_file_key(buffer, cursor, picker, BACKSPACE);
+            }
+            while picker.cursor > 0 && !picker.query.is_empty() {
+                handle_file_key(buffer, cursor, picker, BACKSPACE);
+            }
+            true
+        }
+        // Other Ctrl/Alt chords must not type their letter into the query.
+        KeyCode::Char(_) if is_modifier_chord(key) => true,
+        // A space ends the mention: keep what was typed, close the picker.
+        KeyCode::Char(' ') => {
+            picker.deactivate();
+            buffer.insert(*cursor, ' ');
+            *cursor += 1;
             true
         }
         KeyCode::Char(c) => {
@@ -232,6 +260,16 @@ pub fn handle_command_key(
             command_backspace(buffer, cursor, picker);
             (true, None)
         }
+        _ if is_ctrl_w(key) => {
+            if picker.cursor == 0 {
+                command_backspace(buffer, cursor, picker);
+            }
+            while picker.cursor > 0 && !picker.query.is_empty() {
+                command_backspace(buffer, cursor, picker);
+            }
+            (true, None)
+        }
+        KeyCode::Char(_) if is_modifier_chord(key) => (true, None),
         KeyCode::Char(c) => {
             picker.char_input(c);
             let byte_in_query = picker
@@ -331,6 +369,16 @@ pub fn handle_prefixed_key(
             }
             true
         }
+        _ if is_ctrl_w(key) => {
+            if picker.cursor == 0 {
+                return handle_prefixed_key(buffer, cursor, picker, prefix, BACKSPACE);
+            }
+            while picker.cursor > 0 && !picker.query.is_empty() {
+                handle_prefixed_key(buffer, cursor, picker, prefix, BACKSPACE);
+            }
+            true
+        }
+        KeyCode::Char(_) if is_modifier_chord(key) => true,
         KeyCode::Char(c) => {
             picker.char_input(c);
             let byte_in_query = picker
@@ -447,6 +495,16 @@ pub fn handle_models_key(
             }
             true
         }
+        _ if is_ctrl_w(key) => {
+            if picker.cursor == 0 {
+                return handle_models_key(buffer, cursor, picker, BACKSPACE);
+            }
+            while picker.cursor > 0 && !picker.query.is_empty() {
+                handle_models_key(buffer, cursor, picker, BACKSPACE);
+            }
+            true
+        }
+        KeyCode::Char(_) if is_modifier_chord(key) => true,
         KeyCode::Char(c) => {
             picker.char_input(c);
             let byte_in_query = picker
