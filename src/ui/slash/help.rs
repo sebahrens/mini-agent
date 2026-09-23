@@ -99,7 +99,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         "  /reasoning             toggle LLM reasoning ability",
     );
     emit(false, "  /thinking              alias for /reasoning");
-    emit(false, "  /mode                  show/change security mode");
+    emit(
+        false,
+        "  /mode                  pick a security mode (described list)",
+    );
     emit(
         false,
         "  /mode <mode>           set mode (standard|restrictive|readonly|planwrite|guarded|yolo)",

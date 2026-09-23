@@ -131,6 +131,11 @@ pub struct ListPicker {
     pub matches: Vec<String>,
     pub selected: usize,
     items: Vec<String>,
+    /// One-line description per entry of `items`, shown after the name;
+    /// empty when the list has none. Filtering only looks at the names.
+    descriptions: Vec<String>,
+    /// The entry marked `(current)` and highlighted while the query is empty.
+    current: Option<String>,
     monochrome: bool,
 }
 
@@ -143,6 +148,8 @@ impl ListPicker {
             matches: Vec::new(),
             selected: 0,
             items: Vec::new(),
+            descriptions: Vec::new(),
+            current: None,
             monochrome: false,
         }
     }
@@ -159,6 +166,52 @@ impl ListPicker {
 
     pub fn set_items(&mut self, items: Vec<String>) {
         self.items = items;
+        self.descriptions.clear();
+    }
+
+    /// Set `(name, description)` entries. Names are matched and inserted;
+    /// descriptions are only drawn.
+    pub fn set_described_items(&mut self, entries: Vec<(String, String)>) {
+        (self.items, self.descriptions) = entries.into_iter().unzip();
+    }
+
+    /// Mark `name` as the current value: it is labelled `(current)` and
+    /// highlighted whenever the query is empty.
+    pub fn set_current(&mut self, name: Option<String>) {
+        self.current = name;
+    }
+
+    /// The rows the overlay draws for `matches`: the bare name, or for
+    /// described lists the padded name, its description and a `(current)`
+    /// marker on the current entry.
+    pub(crate) fn display_rows(&self) -> Vec<String> {
+        if self.descriptions.is_empty() {
+            return self.matches.clone();
+        }
+        let width = self
+            .items
+            .iter()
+            .map(|n| n.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.matches
+            .iter()
+            .map(|name| {
+                let description = self
+                    .items
+                    .iter()
+                    .position(|item| item == name)
+                    .and_then(|index| self.descriptions.get(index))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let marker = if self.current.as_deref() == Some(name.as_str()) {
+                    "  (current)"
+                } else {
+                    ""
+                };
+                format!("{name:<width$}  {description}{marker}")
+            })
+            .collect()
     }
 
     pub fn activate(&mut self) {
@@ -215,7 +268,14 @@ impl ListPicker {
             .take(50)
             .map(|(_, index)| self.items[index].clone())
             .collect();
-        self.selected = 0;
+        self.selected = if self.query.is_empty() {
+            self.current
+                .as_ref()
+                .and_then(|current| self.matches.iter().position(|m| m == current))
+                .unwrap_or(0)
+        } else {
+            0
+        };
     }
 
     pub fn select_next(&mut self) {
@@ -243,7 +303,7 @@ impl ListPicker {
             return Ok(());
         }
         draw_picker_list(
-            &self.matches,
+            &self.display_rows(),
             self.selected,
             self.monochrome,
             empty_message,

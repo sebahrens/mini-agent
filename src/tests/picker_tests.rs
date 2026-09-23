@@ -824,6 +824,56 @@ mod slash_picker_contract {
         assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/queue ")) if p.active));
     }
 
+    fn input_with_mode(mode: crate::permission::SecurityMode) -> InputEditor {
+        use crate::permission::PermissionConfigs;
+        use crate::permission::checker::PermissionChecker;
+        let checker = PermissionChecker::new(&PermissionConfigs::default(), mode, None, None)
+            .expect("valid permission test configuration");
+        let mut input = InputEditor::new();
+        input.set_permission(Some(std::sync::Arc::new(std::sync::Mutex::new(checker))));
+        input
+    }
+
+    #[test]
+    fn enter_on_mode_opens_a_described_picker_with_the_current_mode_highlighted() {
+        use crate::permission::SecurityMode;
+        let mut input = input_with_mode(SecurityMode::Guarded);
+        typed(&mut input, "/mode");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/mode ");
+        let Some(Picker::Prefixed(picker, "/mode ")) = input.picker.as_ref() else {
+            panic!("/mode should open its argument picker");
+        };
+        assert!(picker.active);
+        assert_eq!(picker.matches, SecurityMode::NAMES);
+        assert_eq!(picker.selected_name(), Some("guarded"));
+
+        let rows = picker.display_rows();
+        for (row, mode) in rows.iter().zip(SecurityMode::all()) {
+            assert!(row.starts_with(&mode.to_string()), "{row}");
+            assert!(row.contains(mode.description()), "{row}");
+            assert_eq!(row.ends_with("(current)"), mode == SecurityMode::Guarded);
+        }
+
+        typed(&mut input, "plan");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/mode planwrite");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("/mode planwrite")
+        );
+    }
+
+    #[test]
+    fn mode_without_a_permission_system_submits_for_the_text_listing() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/mode");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("/mode")
+        );
+    }
+
     #[test]
     fn tab_inserts_the_highlight_and_shift_tab_moves_it_back() {
         let mut input = InputEditor::new();
