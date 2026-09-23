@@ -1884,7 +1884,27 @@ only restore the user's selection.
 
 Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
 set explicitly via `/mode` or startup config — useful when a prompt wants
-to avoid overriding the user's chosen mode.
+to avoid overriding the user's chosen mode. The built-in `autoconfig`
+prompt uses it, so a `yolo` or `guarded` session keeps its mode while
+configuring and a `readonly` session stays read-only.
+
+### Prompt path variables
+
+Embedded prompts and prompts in the user prompts directory may reference
+paths that mini-agent resolved for the current process. The placeholders
+are replaced when prompts are loaded:
+
+| Placeholder | Value |
+| --- | --- |
+| `{{config_file}}` | The global config file in use (first existing of `config.toml`, `config.yaml`, `config.yml`, `config.json` in the config root, else `config.toml`) |
+| `{{config_dir}}` | The global config root |
+| `{{project_config_file}}` | `<workspace>/.zerostack/config.toml` for the bound workspace |
+| `{{docs_dir}}` | The installed documentation root (`<data-dir>/docs`) |
+| `{{agent_docs_dir}}` | The installed copy of these guides (`<data-dir>/docs/agent`) |
+| `{{prompts_dir}}` | The user prompts directory |
+
+Unknown `{{...}}` text is left as written. Project prompts
+(`.zerostack/prompts/`) are never rendered.
 
 Example `ask.md`:
 

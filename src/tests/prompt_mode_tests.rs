@@ -278,3 +278,24 @@ fn directive_may_lower_mode_and_last_user_mode_restores_it() {
     );
     assert_eq!(current_mode(&perm), SecurityMode::Yolo);
 }
+
+/// mini-agent-mt00y: the built-in autoconfig workflow must not downgrade a
+/// more permissive session (which multiplied approvals for yolo users), and it
+/// still cannot raise a narrower one.
+#[test]
+fn autoconfig_keeps_the_user_selected_mode() {
+    let autoconfig = include_str!("../../data/prompts/autoconfig.md");
+    for mode in [
+        SecurityMode::Yolo,
+        SecurityMode::Standard,
+        SecurityMode::Guarded,
+        SecurityMode::ReadOnly,
+    ] {
+        let mut context = make_context(&[("autoconfig", autoconfig)]);
+        let perm = make_perm(mode);
+
+        apply_prompt_mode("autoconfig", &mut context, &Some(perm.clone()));
+
+        assert_eq!(current_mode(&perm), mode);
+    }
+}
