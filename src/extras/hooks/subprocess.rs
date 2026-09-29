@@ -496,6 +496,23 @@ async fn run_hook_with_policy_and_limits(
     let active_groups: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
     let pid = child.id();
     let mut guard = ProcessGroupGuard::new(pid, active_groups);
+    // A trusted Windows hook is not an AppContainer helper, so the helper
+    // termination path can neither reach its descendants nor skip waiting for
+    // a helper cancellation event. Own its tree with a kill-on-close Job.
+    // Declared after `guard` so that on drop the Job closes first.
+    #[cfg(windows)]
+    let trusted_tree = (policy.trust == HookTrust::Trusted)
+        .then(|| crate::sandbox::TrustedProcessTree::adopt(&child));
+    #[cfg(windows)]
+    let tree = HookTree {
+        pid,
+        trusted: trusted_tree.as_ref(),
+    };
+    #[cfg(not(windows))]
+    let tree = HookTree {
+        pid,
+        _lifetime: std::marker::PhantomData,
+    };
     let stdin_pipe = child.stdin.take();
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -538,9 +555,9 @@ async fn run_hook_with_policy_and_limits(
             // that deliberately closed their inherited pipes before outliving
             // the hook, and wait for them to go: a hook that reports completion
             // while one of its children is still runnable has not finished.
+            tree.terminate().await;
+            #[cfg(unix)]
             if let Some(pid) = pid {
-                terminate_process_group(pid).await;
-                #[cfg(unix)]
                 await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
             }
             guard.disarm();
@@ -552,7 +569,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Finished(Ok(Err(error))) => {
-            terminate_and_reap(&mut child, pid).await;
+            terminate_and_reap(&mut child, &tree).await;
             guard.disarm();
             let status = match error {
                 RunError::OutputLimit(limit) => HookStatus::OutputLimitExceeded(limit),
@@ -573,7 +590,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Finished(Err(_)) => {
-            terminate_and_reap(&mut child, pid).await;
+            terminate_and_reap(&mut child, &tree).await;
             guard.disarm();
             policy.classify_spawned_output(output_from_capture(
                 &captured,
@@ -583,7 +600,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Cancelled => {
-            terminate_and_reap(&mut child, pid).await;
+            terminate_and_reap(&mut child, &tree).await;
             guard.disarm();
             output_from_capture(&captured, None, HookStatus::Failed, policy.diagnostics())
         }
@@ -616,10 +633,33 @@ where
     }
 }
 
-async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        terminate_process_group(pid).await;
+/// The process tree a spawned hook owns: its Unix process group, or on
+/// Windows the trusted hook's Job. Sandboxed Windows hooks never launch
+/// (AppContainer direct-exec containment is unavailable), so a Windows hook
+/// without a trusted tree falls back to the helper termination path.
+struct HookTree<'a> {
+    pid: Option<u32>,
+    #[cfg(windows)]
+    trusted: Option<&'a crate::sandbox::TrustedProcessTree>,
+    #[cfg(not(windows))]
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl HookTree<'_> {
+    async fn terminate(&self) {
+        #[cfg(windows)]
+        if let Some(trusted) = self.trusted {
+            trusted.terminate().await;
+            return;
+        }
+        if let Some(pid) = self.pid {
+            terminate_process_group(pid).await;
+        }
     }
+}
+
+async fn terminate_and_reap(child: &mut Child, tree: &HookTree<'_>) {
+    tree.terminate().await;
     let _ = child.start_kill();
     if let Err(error) = child.wait().await {
         tracing::warn!("hooks: failed to reap terminated hook subprocess: {error}");
@@ -629,9 +669,10 @@ async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     // is how a cancelled turn answers before its process tree has left the
     // machine. Drain after reaping the leader, which is itself a member of the
     // group. The sandbox path learned this; this one is the same problem and
-    // now shares the same wait.
+    // now shares the same wait. (A Windows trusted Job drains inside
+    // `terminate`.)
     #[cfg(unix)]
-    if let Some(pid) = pid {
+    if let Some(pid) = tree.pid {
         await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
     }
 }

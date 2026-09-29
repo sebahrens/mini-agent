@@ -4866,8 +4866,7 @@ mod tests {
             "invalid records must not authorize release"
         );
         drop(guardian);
-        release_reaped_guardian(&mut parent).unwrap();
-        assert!(parent.is_none());
+        release_until_closed(&mut parent);
 
         // The guardian can be killed between notifying and receiving the
         // acknowledgement. A closed heartbeat must still allow exact reap.
@@ -4875,8 +4874,27 @@ mod tests {
         let mut parent = Some(parent);
         guardian.write_all(&[GUARDIAN_WORKER_REAPED]).unwrap();
         drop(guardian);
-        release_reaped_guardian(&mut parent).unwrap();
-        assert!(parent.is_none());
+        release_until_closed(&mut parent);
+    }
+
+    /// Polls the nonblocking release until the heartbeat is released.
+    ///
+    /// Dropping our end does not close the socket at once when another test
+    /// thread forks meanwhile: the child holds an inherited copy of the
+    /// descriptor until its `exec` applies close-on-exec, and until then a
+    /// nonblocking read sees "would block" rather than EOF (mini-agent-s2nl0).
+    fn release_until_closed(parent: &mut Option<UnixStream>) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while parent.is_some() {
+            release_reaped_guardian(parent).unwrap();
+            if parent.is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "a closed heartbeat never released the guardian"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     #[test]

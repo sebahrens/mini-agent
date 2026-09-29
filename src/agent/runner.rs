@@ -2613,7 +2613,12 @@ where
     #[cfg(feature = "subagents")]
     let subagent_event_tx = event_tx.clone();
 
-    let agent_future = async move {
+    // The turn state machine is several hundred KiB in an unoptimized build.
+    // Build it on the heap inside `heap_future`'s short frame: held by value,
+    // this frame and every wrapper below (cancellation select, subagent and
+    // tool-call scopes, `tokio::spawn`) would each reserve a full copy, which
+    // overflowed a 2 MiB test thread with `acp,hooks` (mini-agent-ood0d).
+    let agent_future = crate::startup::heap_future(|| async move {
         if let Some(start_rx) = start_rx
             && start_rx.await.is_err()
         {
@@ -3296,7 +3301,7 @@ where
             turns_at_stream_start = turns_used;
             response_len_at_stream_start = response.len();
         }
-    };
+    });
 
     let task_scope = Arc::clone(&work_scope);
     // Construct before spawning so abort-before-first-poll still drops the
@@ -4108,6 +4113,46 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RetryInvalidTool;
+
+    /// Regression for mini-agent-ood0d: spawning a turn must not hold the turn
+    /// state machine by value in the spawning frames. Before the fix, the
+    /// spawner and each wrapper reserved a full copy of that future, which
+    /// overflowed a 2 MiB libtest thread under `--features acp,hooks`. CI sets
+    /// `RUST_MIN_STACK` to 8 MiB, so this pins the budget explicitly.
+    #[test]
+    fn spawning_a_turn_keeps_the_turn_state_machine_off_the_caller_stack() {
+        std::thread::Builder::new()
+            .name("small-stack-spawn".into())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let model = MockCompletionModel::from_stream_turns(vec![vec![
+                        MockStreamEvent::final_response_with_default_usage(),
+                    ]]);
+                    let paused = super::spawn_agent_paused(
+                        AgentBuilder::new(model).build(),
+                        "spawn only".to_owned(),
+                        Vec::new(),
+                        crate::retry::RetryConfig::default(),
+                        None,
+                        #[cfg(feature = "skills")]
+                        None,
+                        #[cfg(feature = "hooks")]
+                        None,
+                    );
+                    // Never polled: dropping the start owner and the runtime
+                    // retires the parked task without running the turn here.
+                    drop(paused);
+                });
+            })
+            .unwrap()
+            .join()
+            .expect("spawning a turn overflowed a 256 KiB stack");
+    }
 
     #[tokio::test]
     async fn paused_runner_start_cancel_and_drop_preserve_start_barrier() {

@@ -122,6 +122,50 @@ class Phase6MacosEvidenceTests(unittest.TestCase):
             self.assertIn("worker=available", summary)
             self.assertIn("raw_output=false", summary)
 
+    def test_named_fifo_denial_is_recorded_per_runner(self) -> None:
+        for runner in ("macos-15", "macos-26"):
+            with self.subTest(runner=runner):
+                evidence = self.module.build_evidence(
+                    runner,
+                    "success",
+                    "passed",
+                    "passed",
+                    "skipped-unsupported-runner",
+                    "denied",
+                )
+                self.assertEqual(evidence["containment"]["named_fifo_denial"], "denied")
+                self.assertIn("named_fifo=denied", self.module.summary_line(evidence))
+
+    def test_named_fifo_defaults_to_not_run_and_rejects_unknown_results(self) -> None:
+        evidence = self.module.build_evidence(
+            "macos-26", "success", "passed", "passed", "recorded"
+        )
+        self.assertEqual(evidence["containment"]["named_fifo_denial"], "not-run")
+        with self.assertRaises(self.module.InconsistentEvidence):
+            self.module.build_evidence(
+                "macos-26", "success", "passed", "passed", "recorded", "assumed"
+            )
+
+    def test_the_workflow_records_named_fifo_denial_on_every_macos_runner(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        macos = workflow.split("  macos-worker-containment-gate:", 1)[1].split(
+            "\n  windows-worker-launcher-unit:", 1
+        )[0]
+        step = macos.split(
+            "name: Confirm the worker profile denies named FIFOs on this runner", 1
+        )[1].split("- name:", 1)[0]
+        # Runs on both matrix legs: no runner condition may narrow it.
+        self.assertNotIn("if:", step)
+        self.assertIn(
+            "sandbox::worker::platform::tests::"
+            "seatbelt_profile_denies_named_fifos_but_keeps_inherited_pipes",
+            step,
+        )
+        self.assertIn("--exact --nocapture", step)
+        self.assertIn("skipping:", step)
+        self.assertIn("PHASE6_NAMED_FIFO=denied", step)
+        self.assertIn('--named-fifo "${PHASE6_NAMED_FIFO:-not-run}"', macos)
+
     def test_the_workflow_uses_the_generator_instead_of_hard_coded_fields(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         macos = workflow.split("  macos-worker-containment-gate:", 1)[1]

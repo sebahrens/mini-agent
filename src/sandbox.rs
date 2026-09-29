@@ -3640,6 +3640,75 @@ pub(crate) async fn terminate_process_group(pid: u32) {
     kill_process_group(pid);
 }
 
+/// Owns a trusted (non-helper) Windows child's whole process tree.
+///
+/// Windows has no process group, and [`terminate_process_group`] targets the
+/// AppContainer helper: for any other child it first waits up to ~4 s for a
+/// helper cancellation event that never appears, then kills only that one
+/// process. A trusted hook instead gets a kill-on-close Job right after it
+/// is spawned, so a timeout, cancellation, or completion ends its
+/// descendants too, without the cooperative wait (mini-agent-8cxmy). If the
+/// Job cannot be created or assigned, termination falls back to killing the
+/// direct child, still without the wait.
+#[cfg(all(windows, feature = "hooks"))]
+pub(crate) struct TrustedProcessTree {
+    pid: Option<u32>,
+    job: Option<windows::ProcessTreeJob>,
+}
+
+#[cfg(all(windows, feature = "hooks"))]
+impl TrustedProcessTree {
+    pub(crate) fn adopt(child: &tokio::process::Child) -> Self {
+        let job = child.raw_handle().and_then(|process| {
+            windows::ProcessTreeJob::adopt(process)
+                .inspect_err(|error| {
+                    tracing::warn!("sandbox: trusted child tree is not Job-owned: {error}")
+                })
+                .ok()
+        });
+        Self {
+            pid: child.id(),
+            job,
+        }
+    }
+
+    /// Terminates the tree and waits, bounded by
+    /// [`PROCESS_GROUP_DRAIN_BUDGET`], until the Job reports no live process.
+    pub(crate) async fn terminate(&self) {
+        if let Some(job) = &self.job {
+            match job.terminate() {
+                Ok(()) => {
+                    let deadline = tokio::time::Instant::now() + PROCESS_GROUP_DRAIN_BUDGET;
+                    loop {
+                        match job.active_processes() {
+                            Ok(0) => return,
+                            Ok(active) if tokio::time::Instant::now() >= deadline => {
+                                tracing::warn!(
+                                    "sandbox: {active} trusted child processes outlived the drain budget"
+                                );
+                                return;
+                            }
+                            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                            Err(error) => {
+                                tracing::warn!("sandbox: {error}");
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("sandbox: {error}"),
+            }
+        }
+        if let Some(pid) = self.pid
+            && tokio::task::spawn_blocking(move || windows::terminate_process(pid))
+                .await
+                .is_err()
+        {
+            tracing::warn!("sandbox: trusted child termination task for process {pid} failed");
+        }
+    }
+}
+
 /// Best-effort post-reap cleanup. Unlike the primary kill path, this first
 /// verifies that the process group still has a live member and therefore
 /// avoids signalling an already-empty, potentially recycled pgid.

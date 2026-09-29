@@ -4558,6 +4558,70 @@ pub(crate) fn terminate_helper(pid: u32) {
     }
 }
 
+/// Kill-on-close Job owning a trusted (non-helper) child's process tree.
+///
+/// Trusted hooks run outside the AppContainer helper, so they have neither a
+/// helper cancellation event to wait for nor a helper Job that drains their
+/// descendants. The child is assigned right after creation and every process
+/// it creates afterwards inherits the Job; terminating or closing the Job
+/// ends the whole tree (mini-agent-8cxmy). A descendant created in the few
+/// instructions between `CreateProcess` and the assignment is not covered.
+#[cfg(feature = "hooks")]
+pub(crate) struct ProcessTreeJob(Handle);
+
+#[cfg(feature = "hooks")]
+impl ProcessTreeJob {
+    /// `process` must be a live process handle with `PROCESS_SET_QUOTA` and
+    /// `PROCESS_TERMINATE` access, such as the one owned by a spawned `Child`.
+    pub(crate) fn adopt(process: HANDLE) -> Result<Self, String> {
+        let job = Handle::created(
+            unsafe { CreateJobObjectW(null(), null()) },
+            "create trusted process-tree Job",
+        )?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(last_error("configure trusted process-tree Job"));
+        }
+        if unsafe { AssignProcessToJobObject(job.raw(), process) } == 0 {
+            return Err(last_error("assign trusted child to its process-tree Job"));
+        }
+        Ok(Self(job))
+    }
+
+    /// Starts termination of every process in the tree. Does not wait.
+    pub(crate) fn terminate(&self) -> Result<(), String> {
+        if unsafe { TerminateJobObject(self.0.raw(), 125) } == 0 {
+            return Err(last_error("terminate trusted process-tree Job"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn active_processes(&self) -> Result<u32, String> {
+        active_job_processes(&self.0)
+    }
+}
+
+/// Terminates exactly one non-helper process. Unlike [`terminate_helper`],
+/// this never waits for a cooperative cancellation event that a non-helper
+/// child cannot create.
+#[cfg(feature = "hooks")]
+pub(crate) fn terminate_process(pid: u32) {
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+    if let Ok(process) = Handle::created(process, "open trusted child for termination") {
+        unsafe { TerminateProcess(process.raw(), 125) };
+        let _ = unsafe { WaitForSingleObject(process.raw(), 1_000) };
+    }
+}
+
 fn run_runtime_probe() -> Result<i32, String> {
     let base = std::env::temp_dir().join(format!(
         "mini-agent-windows-sandbox-{}",

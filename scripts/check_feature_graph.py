@@ -121,18 +121,10 @@ TEST_MATRIX_ROWS = (
     "js-skills",
     "full",
 )
-CLIPPY_MATRIX_ROWS = (
-    "default",
-    "no-default",
-    "memory",
-    "sandbox",
-    "acp",
-    "goal",
-    "extras",
-    "hooks-js-subagents-skills",
-    "js-skills",
-    "full",
-)
+# Every test row is also a strict Clippy row: a test row compiles with warnings
+# allowed, so a cfg-gated item that is dead on Linux under exactly that feature
+# set would otherwise reach main unnoticed.
+CLIPPY_MATRIX_ROWS = TEST_MATRIX_ROWS
 
 
 def load_manifest(path: Path) -> dict[str, Any]:

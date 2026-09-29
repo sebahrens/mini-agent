@@ -37,8 +37,8 @@ concurrency:
 jobs:
   # Which jobs need to run for this event.
   #
-  # A documentation-only commit used to trigger the whole matrix: 13 test rows
-  # on two platforms, nine strict Clippy rows, the VS Code extension smoke, and
+  # A documentation-only commit used to trigger the whole matrix: 14 test rows
+  # on two platforms, the same 14 rows under strict Clippy, the VS Code extension smoke, and
   # the packaging smoke. None of that can be affected by editing Markdown that
   # nothing embeds or reads, so the expensive jobs below take `needs: changes`
   # and run only when a code path (including embedded or test-read docs) moved. `fmt` stays unconditional because it also runs the repository
@@ -321,11 +321,20 @@ jobs:
         # Runtime), which has no prebuilt binaries for some hosts and adds a
         # large native download to every run. That backend is exercised by the
         # optional job below.
+        #
+        # Every `test` row below also has a row here (enforced by
+        # scripts/tests/test_phase6_ci_workflow.py). A test row only compiles
+        # with warnings allowed, so a cfg-gated item that is dead on Linux
+        # under exactly that feature set reaches main unnoticed otherwise.
         features:
           - ""
           - "--no-default-features"
           - "--no-default-features --features memory"
+          - "--no-default-features --features js"
           - "--no-default-features --features sandbox"
+          - "--no-default-features --features skills"
+          - "--no-default-features --features js,sandbox"
+          - "--no-default-features --features mcp"
           - "--no-default-features --features acp"
           - "--no-default-features --features goal"
           # Opt-in extras that neither the default set nor any focused row
@@ -509,6 +518,48 @@ jobs:
       # specifically prevents default-feature cfg and compilation drift.
       - name: Compile the Windows default feature suite
         run: cargo test --locked --no-run
+
+  # `hooks` is opt-in, so the default-feature compile above never builds the
+  # hook launcher or its Windows process-tree code. A Windows-only duplicate
+  # `Sandbox::wrap_direct_command` under hooks once compiled everywhere except
+  # Windows. These rows compile the complete hooks test suites on Windows and
+  # run the Windows-only trusted-hook tree termination test.
+  windows-hooks-compile:
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
+          - "--no-default-features --features hooks,js,subagents,skills,sandbox"
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      RUST_MIN_STACK: 8388608
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
+      # bash, not the default pwsh: PowerShell turns an unquoted
+      # `hooks,advisor,...` into an array and passes each name separately.
+      - name: Compile the Windows hooks feature suite (${{ matrix.features }})
+        shell: bash
+        run: cargo test --locked ${{ matrix.features }} --no-run
+
+      - name: Test Windows trusted hook tree termination
+        shell: bash
+        run: |
+          filter='hook_subprocess_windows_'
+          listing=$(cargo test --locked ${{ matrix.features }} "$filter" -- --list)
+          count=$(printf '%s\n' "$listing" | grep -c ': test$' || true)
+          if [ "$count" -lt 1 ]; then
+            echo "no Windows trusted hook termination test was discovered" >&2
+            exit 1
+          fi
+          cargo test --locked ${{ matrix.features }} "$filter" -- --test-threads=1
 
   linux-sandbox-policy:
     if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
@@ -761,6 +812,28 @@ jobs:
           test "$matrix_output" = 'MACOS_CONTAINMENT_MATRIX_V1=passed'
           echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
 
+      # mini-agent-vvzsy removed the worker profile's `(vnode-type FIFO)` rule
+      # after validating only on macOS 26. The production-binary matrix above
+      # already runs the new profile on both legs; this live regression proves
+      # on each runner that inherited protocol pipes still work while opening a
+      # named FIFO is denied. Its "Seatbelt unusable" early return is a failure
+      # here, and the result is recorded in the gate evidence (mini-agent-vy77b).
+      - name: Confirm the worker profile denies named FIFOs on this runner
+        shell: bash
+        run: |
+          test_name='sandbox::worker::platform::tests::seatbelt_profile_denies_named_fifos_but_keeps_inherited_pipes'
+          echo 'PHASE6_NAMED_FIFO=failed' >> "$GITHUB_ENV"
+          output=$(cargo test --locked --no-default-features --features js \
+            "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
+          printf '%s\n' "$output"
+          if printf '%s\n' "$output" | grep -q 'skipping:'; then
+            echo 'PHASE6_NAMED_FIFO=skipped-seatbelt-unusable' >> "$GITHUB_ENV"
+            echo "named-FIFO regression skipped instead of running under Seatbelt" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
+          echo 'PHASE6_NAMED_FIFO=denied' >> "$GITHUB_ENV"
+
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
         shell: bash
@@ -843,6 +916,7 @@ jobs:
             --probe "$probe" \
             --adversarial "$adversarial" \
             --resource "$resource" \
+            --named-fifo "${PHASE6_NAMED_FIFO:-not-run}" \
             --json-out phase6-gate-evidence.json \
             --log-out phase6-gate-evidence.log
           cat phase6-gate-evidence.log
