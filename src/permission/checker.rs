@@ -92,6 +92,9 @@ impl CheckResult {
     }
 }
 
+#[cfg(feature = "hooks")]
+const PINNED_HOOK_FILE_DENIAL: &str = "Blocked: this file is a configured hook executable or script and cannot be modified while hooks are loaded";
+
 pub struct PermissionChecker {
     rules: HashMap<String, Vec<(Pattern, Action)>>,
     default_action: Action,
@@ -112,6 +115,10 @@ pub struct PermissionChecker {
     /// entry, so one hook verdict can never overwrite another call's.
     #[cfg(feature = "hooks")]
     hook_decisions: std::collections::HashMap<u64, HookOneShot>,
+    /// Test seam for the content-bound hook files that file tools may not
+    /// modify; `None` consults the installed hook dispatcher.
+    #[cfg(feature = "hooks")]
+    pinned_hook_files_override: Option<Vec<PathBuf>>,
     /// A scoped grant an embedded built-in prompt asked for, waiting for the
     /// user's one-time decision. Arming it grants nothing by itself.
     prompt_grant_offer: Option<PromptGrantOffer>,
@@ -367,6 +374,8 @@ impl PermissionChecker {
             cached_resolved_cwd,
             #[cfg(feature = "hooks")]
             hook_decisions: std::collections::HashMap::new(),
+            #[cfg(feature = "hooks")]
+            pinned_hook_files_override: None,
             prompt_grant_offer: None,
         };
         #[cfg(feature = "hooks")]
@@ -419,6 +428,30 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         CheckResult::Ask
+    }
+
+    #[cfg(all(feature = "hooks", test))]
+    pub(crate) fn set_pinned_hook_files_for_test(&mut self, files: Vec<PathBuf>) {
+        self.pinned_hook_files_override = Some(files);
+    }
+
+    /// Built-in deny: file tools never modify a hook file whose content the
+    /// hook dispatcher bound at load time, in any security mode.
+    #[cfg(feature = "hooks")]
+    fn writes_pinned_hook_file(&self, tool: &str, relative: Option<&str>) -> bool {
+        if !matches!(tool, "write" | "edit" | "js/write_file") {
+            return false;
+        }
+        let Some(relative) = relative else {
+            return false;
+        };
+        match &self.pinned_hook_files_override {
+            Some(files) => crate::extras::hooks::is_pinned_hook_file(files, relative),
+            None => crate::extras::hooks::is_pinned_hook_file(
+                &crate::extras::hooks::pinned_hook_files(),
+                relative,
+            ),
+        }
     }
 
     fn apply_rules(&self) -> bool {
@@ -793,6 +826,10 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
+        #[cfg(feature = "hooks")]
+        if self.writes_pinned_hook_file(tool, relative.as_deref()) {
+            return CheckResult::Denied(PINNED_HOOK_FILE_DENIAL.to_string());
+        }
         if tool == "todo_write" {
             return CheckResult::Allowed;
         }
@@ -889,6 +926,10 @@ impl PermissionChecker {
 
         if self.matches_deny_rule(tool, &[&logical, &relative]) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        #[cfg(feature = "hooks")]
+        if self.writes_pinned_hook_file(tool, Some(&relative)) {
+            return CheckResult::Denied(PINNED_HOOK_FILE_DENIAL.to_string());
         }
         #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();
@@ -2330,5 +2371,59 @@ mod folder_grant_tests {
         checker.set_prompt_grant_offer(Some(offer(&fx)));
         checker.set_prompt_grant_offer(None);
         assert_eq!(checker.prompt_grant_offer_for("read", &fx.file()), None);
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod pinned_hook_file_tests {
+    use super::*;
+
+    #[test]
+    fn file_tools_cannot_modify_content_bound_hook_files_in_any_mode() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_pinned_hook_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("hooks")).unwrap();
+        std::fs::write(workspace.join("hooks/guard.sh"), "#!/bin/sh\n").unwrap();
+        for mode in [SecurityMode::Standard, SecurityMode::Yolo] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::default(),
+                mode,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap();
+            checker.set_pinned_hook_files_for_test(vec![PathBuf::from("hooks/guard.sh")]);
+            for (tool, path) in [
+                ("write", "hooks/guard.sh"),
+                ("edit", "./hooks/guard.sh"),
+                ("edit", "HOOKS/Guard.sh"),
+                ("js/write_file", "hooks/guard.sh"),
+            ] {
+                assert!(
+                    matches!(checker.check_path(tool, path), CheckResult::Denied(_)),
+                    "{mode:?} {tool} {path}"
+                );
+            }
+            let absolute = workspace.join("hooks/guard.sh");
+            assert!(matches!(
+                checker.check_path("edit", &absolute.to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert!(matches!(
+                checker.check_bound_path("write", &absolute.to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert_eq!(
+                checker.check_path("read", "hooks/guard.sh"),
+                CheckResult::Allowed
+            );
+            assert_eq!(
+                checker.check_path("edit", "hooks/other.sh"),
+                CheckResult::Allowed
+            );
+        }
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

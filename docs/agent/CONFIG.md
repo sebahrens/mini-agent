@@ -675,7 +675,7 @@ zerostack sets `$ZEROSTACK_PROJECT_DIR` rather than `$CLAUDE_PROJECT_DIR`.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `type` | string | Only `"command"` is supported. |
-| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace. Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
+| `command` | string | Executable to run directly. Relative paths such as `./guard.sh` resolve from the canonical selected workspace; bare names resolve through absolute `PATH` entries only. Workspace-resident files are content-bound (see Trust model). Receives the stdin envelope as JSON; `$ZEROSTACK_PROJECT_DIR` is set to that same directory. To use a shell intentionally, set this to the shell executable and pass the script in `args`. |
 | `args` | array of strings | Required, but may be empty. Passed directly as the executable's argv with no shell metacharacter expansion. |
 | `timeout` | integer (seconds) | Per-hook timeout; the whole process group is killed on expiry. Default: 60. |
 | `async` | boolean | When `true`, the hook's `if` condition and handler run in the background and its decision is ignored. Agent-turn work owns the background task, so turn cancellation still terminates and reaps it before the turn settles. Default: `false`. |
@@ -794,8 +794,9 @@ control-sanitized block reason.
 Project-level hook handlers (`.zerostack/settings.json` — global and managed
 hooks are trusted automatically) require interactive confirmation the first
 time they'd run, keyed by a hash of the handler's definition (event +
-matcher + command/args/timeout/etc.); changing the definition changes the
-hash and requires re-confirmation. Confirmations persist to
+matcher + command/args/timeout/etc.) and of the content of every workspace
+file it executes; changing either changes the hash and requires
+re-confirmation. Confirmations persist to
 the state root at `hooks/trusted-hooks.json` (a user-level file, so child
 processes/orchestrated subagents sharing it inherit trust automatically). In
 headless contexts (`-p`, `--loop`) an unconfirmed project hook is skipped with
@@ -805,6 +806,32 @@ Project confirmation and subprocess authority are separate decisions. The
 confirmation hash includes `trust` and `env`, so either change requires new
 consent. Global and managed provenance does not silently select the trusted
 bypass: omitted `trust` still means `"sandboxed"` for every source.
+
+**Workspace hook files are content-bound.** A hook executable or script that
+lives inside the workspace (`./guard.sh`, `sh hooks/guard.sh`,
+`--config=hooks/policy.toml`, or a file named in an `if` condition such as
+`./check.sh`) is ordinary workspace content the model could otherwise rewrite
+to approve its own tool calls or escape the sandbox. When hooks load,
+zerostack records a SHA-256 digest of every such file: each argument, and each
+whitespace/shell-punctuation separated token of the arguments and condition,
+that resolves to an existing regular file inside the workspace (lexically or
+through a symlink) is bound, as is the resolved executable. Before every
+launch the same operands are re-resolved against the selected workspace; a
+changed file, a file that did not exist at load time, or a symlink retargeted
+elsewhere denies the launch (which blocks a `PreToolUse` call, fail-closed)
+until the session restarts. The `write`, `edit`, and JS `write_file` tools also
+refuse to modify a bound file in every security mode. For project hooks the
+digests are part of the confirmation hash and are shown in the prompt, so a
+rewritten script requires fresh confirmation on the next start; bindings that
+execute no workspace file keep their existing approval. Global and managed
+hooks are bound for the running session only, so point them at files outside
+the workspace. The binding is best-effort for shell text: variables expanded
+by a condition and files a script reads or sources on its own are not bound.
+
+Bare command names (`sh`, `python3`) resolve only through absolute `PATH`
+entries; empty, `.`, or other relative entries are ignored so a planted file in
+the workspace can never shadow a system executable. `if` conditions always run
+through `/bin/sh` on Unix.
 
 ### Global switches
 
