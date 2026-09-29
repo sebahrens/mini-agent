@@ -945,6 +945,7 @@ impl Startup {
                 handoff_tx: None,
                 enabled,
                 kilobytes_limit,
+                request_config: std::sync::Arc::new(self.cfg.clone()),
             };
             self.handoff_rx = config.prepare_handoff_channel(self.is_interactive);
             crate::extras::advisor::init_config(config);

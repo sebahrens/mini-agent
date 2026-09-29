@@ -45,6 +45,9 @@ pub struct AdvisorToolConfig {
     pub handoff_tx: Option<HandoffSender>,
     pub enabled: bool,
     pub kilobytes_limit: u32,
+    /// The configuration advisor requests are shaped by: `extra_body`,
+    /// `[reasoning]` (including `store = false`) and `[retry]`.
+    pub request_config: std::sync::Arc<crate::config::Config>,
 }
 
 impl AdvisorToolConfig {
@@ -67,6 +70,7 @@ impl AdvisorToolConfig {
         self.advisor_provider = provider;
         self.advisor_model = model;
         self.client = Some(client);
+        self.request_config = std::sync::Arc::new(cfg.clone());
         Ok(())
     }
 
@@ -394,9 +398,16 @@ conversation, so focus your question on the specific decision you need help with
 
             let model = client.completion_model(cfg.advisor_model.clone());
             let messages = current_messages();
-            run_advisor_completion(model, &args.question, &messages, cfg.kilobytes_limit)
-                .await
-                .map_err(|e| ToolError::Msg(format!("Advisor call failed: {e}")))
+            run_advisor_completion(
+                model,
+                &args.question,
+                &messages,
+                cfg.kilobytes_limit,
+                &cfg.advisor_model,
+                &cfg.request_config,
+            )
+            .await
+            .map_err(|e| ToolError::Msg(format!("Advisor call failed: {e}")))
         }
     }
 }
@@ -406,22 +417,34 @@ async fn run_advisor_completion(
     question: &str,
     messages: &[SessionMessage],
     kilobytes_limit: u32,
+    model_name: &str,
+    cfg: &crate::config::Config,
 ) -> anyhow::Result<String> {
     let conversation = format_conversation(messages, kilobytes_limit);
     let prompt = format!(
         "## Conversation\n\n{}\n\n## Assistant's question\n\n{}",
         conversation, question
     );
+    // The advisor receives the whole transcript, so it must carry the same
+    // provider parameters (store=false/ZDR, reasoning, OpenRouter routing,
+    // extra_body) and retry policy as the main agent.
+    let params = crate::provider::provider_request_params(
+        &model,
+        cfg,
+        crate::config::resolve_extra_body(cfg, model_name),
+        &uuid::Uuid::new_v4().to_string(),
+    );
+    let retry = &cfg.retry;
 
     match model {
-        AnyModel::OpenRouter(m, _) => advisor_call(m, prompt).await,
+        AnyModel::OpenRouter(m, _) => advisor_call(m, prompt, params, retry).await,
         AnyModel::OpenAI(m) => match m {
-            OpenAiModel::Responses(m) => advisor_call(m, prompt).await,
-            OpenAiModel::Completions(m) => advisor_call(m, prompt).await,
+            OpenAiModel::Responses(m) => advisor_call(m, prompt, params, retry).await,
+            OpenAiModel::Completions(m) => advisor_call(m, prompt, params, retry).await,
         },
-        AnyModel::Anthropic(m) => advisor_call(m, prompt).await,
-        AnyModel::Gemini(m) => advisor_call(m, prompt).await,
-        AnyModel::Ollama(m) => advisor_call(m, prompt).await,
+        AnyModel::Anthropic(m) => advisor_call(m, prompt, params, retry).await,
+        AnyModel::Gemini(m) => advisor_call(m, prompt, params, retry).await,
+        AnyModel::Ollama(m) => advisor_call(m, prompt, params, retry).await,
     }
 }
 
@@ -507,7 +530,12 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
     result
 }
 
-async fn advisor_call<M>(model: M, prompt: String) -> anyhow::Result<String>
+async fn advisor_call<M>(
+    model: M,
+    prompt: String,
+    params: Option<serde_json::Value>,
+    retry: &RetryConfig,
+) -> anyhow::Result<String>
 where
     M: rig::completion::CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -518,14 +546,16 @@ where
         preamble.push_str(&s);
     }
 
-    let agent = rig::agent::AgentBuilder::new(model)
-        .preamble(&preamble)
-        .build();
+    let mut builder = rig::agent::AgentBuilder::new(model).preamble(&preamble);
+    if let Some(params) = params {
+        builder = builder.additional_params(params);
+    }
+    let agent = builder.build();
 
     use futures::StreamExt;
     let _history: Vec<rig::completion::Message> = vec![];
     let agent_ref = &agent;
-    let mut stream = retry::retry_stream_chat(&RetryConfig::default(), move || {
+    let mut stream = retry::retry_stream_chat(retry, move || {
         let p = prompt.clone();
         let h: Vec<rig::completion::Message> = vec![];
         async move { agent_ref.stream_chat(p, h).max_turns(1).await }
@@ -892,6 +922,7 @@ mod tests {
             handoff_tx: None,
             enabled: true,
             kilobytes_limit: 256,
+            request_config: Default::default(),
         }
     }
 
@@ -1067,6 +1098,7 @@ mod tests {
             handoff_tx: None,
             enabled: false,
             kilobytes_limit: 256,
+            request_config: Default::default(),
         };
         let mut config = initial.clone();
         let mut ui_rx = config
@@ -1118,5 +1150,129 @@ mod tests {
 
         *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = previous;
         assert!(matches!(result, Err(ConfigNotInitialized)));
+    }
+}
+
+#[cfg(test)]
+mod request_param_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::run_advisor_completion;
+
+    /// Accepts one HTTP request, returns its JSON body, and answers 400 so the
+    /// client fails fast without needing a provider-shaped response.
+    fn capture_one_request(listener: TcpListener) -> mpsc::Receiver<serde_json::Value> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let (header_end, content_length) = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .expect("request must include Content-Length");
+                break (end + 4, length);
+            };
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            tx.send(body).unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn advisor_requests_keep_store_false_reasoning_and_extra_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = capture_one_request(listener);
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            r#"
+            extra_body = {{ user = "zdr-tenant" }}
+
+            [reasoning]
+            effort = "high"
+            store = false
+
+            [retry]
+            max_attempts = 1
+            initial_backoff_ms = 1
+            max_backoff_ms = 1
+
+            [custom_providers.advisor_capture]
+            provider_type = "openai"
+            base_url = "http://{address}/v1"
+            api_style = "responses"
+            "#
+        ))
+        .unwrap();
+        let client = crate::provider::create_client(
+            "advisor_capture",
+            Some("test-key"),
+            &cfg.custom_providers_map(),
+            None,
+        )
+        .unwrap();
+        let model = client.completion_model("advisor-model");
+
+        let result =
+            run_advisor_completion(model, "what next?", &[], 8, "advisor-model", &cfg).await;
+        assert!(result.is_err(), "capture server always answers 400");
+        let body = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(body["store"], false, "{body}");
+        assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+        assert_eq!(body["user"], "zdr-tenant", "{body}");
+    }
+
+    #[test]
+    fn advisor_openrouter_requests_keep_provider_routing() {
+        let cfg = crate::config::Config {
+            extra_body: Some(serde_json::json!({"user": "zdr-tenant"})),
+            ..Default::default()
+        };
+        let client = crate::provider::create_client(
+            "openrouter",
+            Some("test-key"),
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let model = client.completion_model("anthropic/claude-sonnet-4.6");
+        let params = crate::provider::provider_request_params(
+            &model,
+            &cfg,
+            crate::config::resolve_extra_body(&cfg, "anthropic/claude-sonnet-4.6"),
+            "advisor",
+        )
+        .unwrap();
+        assert_eq!(params["user"], "zdr-tenant");
+        assert_eq!(
+            params["provider"]["order"],
+            serde_json::json!(["Anthropic"])
+        );
     }
 }

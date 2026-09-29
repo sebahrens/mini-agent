@@ -2205,6 +2205,12 @@ a bare model ID selects the current main provider. That selection remains bound
 to its provider when the main agent changes models, providers, or prompts.
 An invalid provider selection leaves the current advisor model unchanged.
 
+Advisor requests carry the same provider parameters as the main agent for the
+advisor's model: the resolved `extra_body` (quick-model or global),
+`[reasoning]` settings including `store = false`, the Responses
+`prompt_cache_key`, and OpenRouter provider routing. They use the configured
+`[retry]` policy.
+
 ### Human handoff mode
 
 When enabled, the agent's advisor calls are redirected to the

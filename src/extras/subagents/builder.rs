@@ -58,19 +58,7 @@ pub(crate) fn subagent_provider_params(
     provider_extra_body: Option<serde_json::Value>,
     session_id: &str,
 ) -> Option<serde_json::Value> {
-    let reasoning = cfg.reasoning.as_ref();
-    match model {
-        AnyModel::OpenRouter(_, routing) => {
-            crate::provider::merge_extra_body(routing.clone(), provider_extra_body)
-        }
-        AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
-            crate::provider::openai_responses_extra_body(provider_extra_body, session_id, reasoning)
-        }
-        AnyModel::OpenAI(OpenAiModel::Completions(_)) => {
-            crate::provider::openai_completions_extra_body(provider_extra_body, reasoning)
-        }
-        AnyModel::Anthropic(_) | AnyModel::Gemini(_) | AnyModel::Ollama(_) => provider_extra_body,
-    }
+    crate::provider::provider_request_params(model, cfg, provider_extra_body, session_id)
 }
 
 impl SubagentAuthorization {

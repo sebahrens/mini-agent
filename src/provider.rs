@@ -245,6 +245,30 @@ pub(crate) fn merge_extra_body(
     }
 }
 
+/// Provider request-body parameters for a secondary agent (subagent, advisor)
+/// built directly on an [`AnyModel`]: the same per-provider shape the main
+/// agent builds in `build_agent_in_workspace`, so every request keeps the
+/// user's `extra_body` and `[reasoning]` settings (including `store = false`)
+/// and OpenRouter keeps its provider routing.
+pub(crate) fn provider_request_params(
+    model: &AnyModel,
+    cfg: &Config,
+    provider_extra_body: Option<serde_json::Value>,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let reasoning = cfg.reasoning.as_ref();
+    match model {
+        AnyModel::OpenRouter(_, routing) => merge_extra_body(routing.clone(), provider_extra_body),
+        AnyModel::OpenAI(OpenAiModel::Responses(_)) => {
+            openai_responses_extra_body(provider_extra_body, session_id, reasoning)
+        }
+        AnyModel::OpenAI(OpenAiModel::Completions(_)) => {
+            openai_completions_extra_body(provider_extra_body, reasoning)
+        }
+        AnyModel::Anthropic(_) | AnyModel::Gemini(_) | AnyModel::Ollama(_) => provider_extra_body,
+    }
+}
+
 /// The one `include` value this agent requests on the Responses path, and the
 /// only one rig's closed `Include` enum needs for reasoning replay.
 pub(crate) const REASONING_ENCRYPTED_CONTENT: &str = "reasoning.encrypted_content";
