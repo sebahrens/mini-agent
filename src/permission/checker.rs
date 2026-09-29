@@ -849,11 +849,22 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
+        // Outside the workspace, a relative or match-anything allow such as
+        // `**/*.rs` or `read = "allow"` must not stand in for an
+        // `external_directory` decision: only an allow rule that names an
+        // absolute location, or an explicit external allow, grants access.
+        let external_allow_needs_anchor = external && external_action != Some(Action::Allow);
         let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
+                if *action == Action::Allow
+                    && external_allow_needs_anchor
+                    && !pattern.is_absolute_anchored()
+                {
+                    continue;
+                }
                 if inputs.iter().any(|input| pattern.matches_path(input)) {
                     matched.push((pattern.specificity(), *action));
                 }
@@ -2503,5 +2514,135 @@ mod external_directory_precedence_tests {
             );
         }
         let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_tool_allow_tests {
+    use super::*;
+
+    fn checker(
+        workspace: &Path,
+        config: PermissionConfig,
+        mode: SecurityMode,
+    ) -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            mode,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn relative_tool_allows_do_not_grant_external_paths() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_ext_tool_allow_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let other_repo = base.join("other-repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&other_repo).unwrap();
+        let external_rs = other_repo.join("build.rs").to_string_lossy().into_owned();
+        let write_rs_allow = || PermissionConfig {
+            write: Some(ToolPerm::Granular(
+                [
+                    ("**/*.rs".to_string(), Action::Allow),
+                    ("**".to_string(), Action::Ask),
+                ]
+                .into(),
+            )),
+            external_directory: Some([("/**".to_string(), Action::Ask)].into()),
+            ..PermissionConfig::default()
+        };
+
+        // The documented CONFIG.md example.
+        for mode in [
+            SecurityMode::Standard,
+            SecurityMode::Guarded,
+            SecurityMode::Restrictive,
+        ] {
+            let mut documented = checker(&workspace, write_rs_allow(), mode);
+            assert_eq!(
+                documented.check_path("write", &external_rs),
+                CheckResult::Ask,
+                "{mode:?}"
+            );
+            if mode != SecurityMode::Restrictive {
+                assert_eq!(
+                    documented.check_path("write", "src/main.rs"),
+                    CheckResult::Allowed,
+                    "{mode:?}"
+                );
+            }
+        }
+
+        let mut read_all = checker(
+            &workspace,
+            PermissionConfig {
+                read: Some(ToolPerm::Simple(Action::Allow)),
+                ..PermissionConfig::default()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(read_all.check_path("read", &external_rs), CheckResult::Ask);
+
+        let mut anchored = checker(
+            &workspace,
+            PermissionConfig {
+                write: Some(ToolPerm::Granular(
+                    [(
+                        format!("{}/**", other_repo.to_string_lossy()),
+                        Action::Allow,
+                    )]
+                    .into(),
+                )),
+                ..PermissionConfig::default()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(
+            anchored.check_path("write", &external_rs),
+            CheckResult::Allowed
+        );
+
+        let mut external_allowed = checker(
+            &workspace,
+            PermissionConfig {
+                external_directory: Some(
+                    [(
+                        format!("{}/**", other_repo.to_string_lossy()),
+                        Action::Allow,
+                    )]
+                    .into(),
+                ),
+                ..write_rs_allow()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(
+            external_allowed.check_path("write", &external_rs),
+            CheckResult::Allowed
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn only_absolute_patterns_are_anchored() {
+        use crate::permission::pattern::Pattern;
+        assert!(Pattern::new_path("/opt/**").is_absolute_anchored());
+        assert!(Pattern::new_path("~/src/**").is_absolute_anchored());
+        assert!(!Pattern::new_path("**/*.rs").is_absolute_anchored());
+        assert!(!Pattern::new_path("src/**").is_absolute_anchored());
+        assert!(!Pattern::new("**").is_absolute_anchored());
+        assert!(Pattern::new_regex("^/opt/").unwrap().is_absolute_anchored());
+        assert!(!Pattern::new_regex(r"^\d").unwrap().is_absolute_anchored());
+        assert!(
+            !Pattern::new_regex(r".*\.rs$")
+                .unwrap()
+                .is_absolute_anchored()
+        );
     }
 }

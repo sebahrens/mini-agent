@@ -1495,6 +1495,16 @@ relative rule such as `secrets/**` also applies when a tool passes the
 canonical absolute path. Bash scripts are checked as a whole and line by line
 against deny rules: a deny that matches any line denies the entire script.
 
+Outside the working directory, a tool `allow` rule only counts when it names
+an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with
+`^/`). Relative or match-anything allows such as `**/*.rs`, `src/**`, or
+`read = "allow"` never grant an external path by themselves: the
+`external_directory` rules decide instead (asking when none match in
+`standard`). In the example above, writing `src/main.rs` is allowed, but writing
+another repository's `build.rs` or a file under `~/.cargo/registry` asks via
+the `/**` external rule. Tool `ask` and `deny` rules still apply to every
+spelling.
+
 As a TOML-friendly alternative to the nested `permission` object, you can use
 `permission-allow`, `permission-ask`, and `permission-deny` at the top level.
 Each is a map from tool name to a list of glob patterns. These work side by
