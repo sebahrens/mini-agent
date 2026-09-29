@@ -1649,6 +1649,7 @@ impl Session {
 
     /// The [`compaction_ref`] of the summary this session currently replays
     /// as its recap, if it has one.
+    #[cfg(feature = "memory")]
     pub fn active_compaction_ref(&self) -> Option<&str> {
         self.compacted_context().0?;
         self.compactions.last()?.memory_ref.as_deref()
