@@ -796,6 +796,7 @@ impl Goal {
     /// checkout's plan while the agent edits the new workspace's
     /// (mini-agent-mw7ae). A plan outside `from` was named explicitly and is
     /// left alone. Returns the old and new paths when the plan moved.
+    #[cfg(any(test, feature = "git-worktree"))]
     pub fn rebase_context_file(
         &mut self,
         from: &std::path::Path,
