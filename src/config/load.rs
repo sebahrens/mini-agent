@@ -1124,7 +1124,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
             .entry("Exa Web Search".to_string())
             .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::EXA, headers));
     } else {
-        servers.remove("Exa Web Search");
+        remove_built_in(&mut servers, "Exa Web Search");
     }
 
     if cfg.resolve_enable_context7_mcp() {
@@ -1136,7 +1136,7 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
             .entry("Context7".to_string())
             .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::CONTEXT7, headers));
     } else {
-        servers.remove("Context7");
+        remove_built_in(&mut servers, "Context7");
     }
 
     if cfg.resolve_enable_grepapp_mcp() {
@@ -1148,10 +1148,22 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
             .entry("Grep.app".to_string())
             .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::GREP_APP, headers));
     } else {
-        servers.remove("Grep.app");
+        remove_built_in(&mut servers, "Grep.app");
     }
 
     cfg.mcp_servers = Some(servers);
+}
+
+/// Remove `name` only when it is the injected built-in. A user-defined server
+/// that shares the name is the user's configuration (mini-agent-ydfkp).
+#[cfg(feature = "mcp")]
+fn remove_built_in(servers: &mut HashMap<String, McpServerConfig>, name: &str) {
+    if servers
+        .get(name)
+        .is_some_and(|server| server.trusted_identity().is_some())
+    {
+        servers.remove(name);
+    }
 }
 
 // Both parameters are consumed only by the `mcp` and `lsp` arms below, so a build
@@ -1358,13 +1370,16 @@ fn save_config_changes_at(path: &Path, before: &Config, after: &Config) -> io::R
         Config::default()
     };
 
+    let mut before = before.clone();
+    strip_injected_mcp_defaults(&mut before);
+    let mut after = after.clone();
+    strip_injected_mcp_defaults(&mut after);
     let mut global_value = serde_json::to_value(global).map_err(io::Error::other)?;
     let before_value = serde_json::to_value(before).map_err(io::Error::other)?;
     let after_value = serde_json::to_value(after).map_err(io::Error::other)?;
     apply_json_delta(&mut global_value, &before_value, &after_value);
 
-    let mut updated: Config = serde_json::from_value(global_value).map_err(io::Error::other)?;
-    strip_injected_mcp_defaults(&mut updated);
+    let updated: Config = serde_json::from_value(global_value).map_err(io::Error::other)?;
     save_config_at(path, &updated)
 }
 
@@ -1378,11 +1393,17 @@ fn save_toml_config_changes_at(path: &Path, before: &Config, after: &Config) -> 
     } else {
         toml::Value::Table(toml::map::Map::new())
     };
+    // Injected built-ins are runtime state, never configuration: compare the
+    // configurations without them. The file itself can only hold user-defined
+    // servers, whatever they are named.
+    let mut before = before.clone();
+    strip_injected_mcp_defaults(&mut before);
+    let mut after = after.clone();
+    strip_injected_mcp_defaults(&mut after);
     let before = toml::Value::try_from(before).map_err(io::Error::other)?;
     let after = toml::Value::try_from(after).map_err(io::Error::other)?;
     apply_toml_delta(&mut global, &before, &after);
 
-    strip_injected_mcp_defaults_toml(&mut global);
     let _: Config = global.clone().try_into().map_err(io::Error::other)?;
     atomic_config_write(path, &toml::to_string(&global).map_err(io::Error::other)?)?;
     tracing::debug!("config saved to {}", path.display());
@@ -1459,27 +1480,15 @@ fn apply_json_delta(
     }
 }
 
+/// Drop injected built-in MCP servers (never user-defined ones, whatever
+/// their name) so they are neither persisted nor diffed as config changes.
 fn strip_injected_mcp_defaults(_cfg: &mut Config) {
     #[cfg(feature = "mcp")]
-    {
-        if let Some(ref mut servers) = _cfg.mcp_servers {
-            servers.remove("Exa Web Search");
-            servers.remove("Context7");
-            servers.remove("Grep.app");
+    if let Some(ref mut servers) = _cfg.mcp_servers {
+        servers.retain(|_, server| server.trusted_identity().is_none());
+        if servers.is_empty() {
+            _cfg.mcp_servers = None;
         }
-    }
-}
-
-fn strip_injected_mcp_defaults_toml(_cfg: &mut toml::Value) {
-    #[cfg(feature = "mcp")]
-    if let Some(servers) = _cfg
-        .as_table_mut()
-        .and_then(|root| root.get_mut("mcp_servers"))
-        .and_then(toml::Value::as_table_mut)
-    {
-        servers.remove("Exa Web Search");
-        servers.remove("Context7");
-        servers.remove("Grep.app");
     }
 }
 
@@ -1525,6 +1534,71 @@ mod config_delta_tests {
         assert!(raw["future_date"].is_datetime());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // mini-agent-ydfkp: a user-defined server that happens to share a
+    // built-in's name is the user's; only injected built-ins are transient.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn saving_keeps_user_mcp_servers_named_like_built_ins() {
+        for extension in ["toml", "json"] {
+            let root = std::env::temp_dir()
+                .join(format!("mini-agent-config-mcp-{}", uuid::Uuid::new_v4()));
+            let path = root.join(format!("config.{extension}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let content = if extension == "toml" {
+                "enable-context7-mcp = false\nenable-exa-mcp = true\nenable-grepapp-mcp = true\n\n\
+                 [mcp_servers.Context7]\nurl = \"https://custom.example.com/mcp\"\n\n\
+                 [mcp_servers.\"Exa Web Search\"]\ncommand = \"my-exa\"\n"
+                    .to_string()
+            } else {
+                serde_json::json!({
+                    "enable-context7-mcp": false,
+                    "enable-exa-mcp": true,
+                    "enable-grepapp-mcp": true,
+                    "mcp_servers": {
+                        "Context7": {"url": "https://custom.example.com/mcp"},
+                        "Exa Web Search": {"command": "my-exa"},
+                    }
+                })
+                .to_string()
+            };
+            std::fs::write(&path, &content).unwrap();
+
+            let mut before = parse_config_content(&path, &content).unwrap();
+            // Loading injects built-ins; neither toggle may drop a user entry.
+            crate::config::inject_mcp_defaults(&mut before);
+            let servers = before.mcp_servers.as_ref().unwrap();
+            assert!(servers["Context7"].trusted_identity().is_none());
+            assert!(servers["Exa Web Search"].trusted_identity().is_none());
+            assert!(
+                servers["Grep.app"].trusted_identity().is_some(),
+                "an enabled built-in without a user entry is injected"
+            );
+
+            let after = Config {
+                max_tokens: Some(321),
+                ..before.clone()
+            };
+            save_config_changes_at(&path, &before, &after).unwrap();
+            let saved_text = std::fs::read_to_string(&path).unwrap();
+            let saved = parse_config_content(&path, &saved_text).unwrap();
+            assert_eq!(saved.max_tokens, Some(321), "{extension}");
+            let servers = saved.mcp_servers.expect("user servers survive the save");
+            assert!(
+                servers.contains_key("Context7"),
+                "{extension}: {saved_text}"
+            );
+            assert!(
+                servers.contains_key("Exa Web Search"),
+                "{extension}: {saved_text}"
+            );
+            assert!(
+                !servers.contains_key("Grep.app"),
+                "{extension}: an injected built-in is never persisted: {saved_text}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 

@@ -692,7 +692,7 @@ pub struct Cli {
         long = "edit-system",
         help = "Edit system (similarity or hashedit). Default: similarity"
     )]
-    pub edit_system: Option<String>,
+    pub edit_system: Option<EditSystem>,
 
     #[arg(
         long = "no-context-files",
@@ -884,6 +884,16 @@ pub struct GoalArgs {
     pub goal_replace: bool,
 }
 
+/// The provider used when neither the CLI nor the config names one.
+fn default_provider(
+    quick_models: &std::collections::HashMap<String, config::QuickModelConfig>,
+) -> CompactString {
+    quick_models
+        .get("deepseek-v4-pro")
+        .map(|q| q.provider.clone())
+        .unwrap_or_else(|| CompactString::new("openrouter"))
+}
+
 impl Cli {
     pub fn output_format(&self) -> OutputFormat {
         self.output.unwrap_or_default()
@@ -911,50 +921,78 @@ impl Cli {
     }
 
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
-        // CLI --model takes a raw model string.
+        self.resolve_model_with_env(cfg, std::env::var("OPENROUTER_MODEL").ok().as_deref())
+    }
+
+    /// [`Self::resolve_model`] with the `OPENROUTER_MODEL` value passed in.
+    ///
+    /// The configured model is only used for the provider it belongs to: a
+    /// quick-model name belongs to its quick model's provider, and a raw model
+    /// id to the configured provider. When the provider in effect is another
+    /// one (`--provider anthropic` over the OpenRouter default, or
+    /// `provider = "anthropic"` over the default quick model), that provider's
+    /// own default model is used instead, so no provider is ever sent another
+    /// provider's model id (mini-agent-jm8cf).
+    fn resolve_model_with_env(
+        &self,
+        cfg: &config::Config,
+        openrouter_model: Option<&str>,
+    ) -> CompactString {
+        // CLI --model (or ZS_MODEL) takes a raw model string.
         if let Some(m) = self.model.as_deref() {
             return CompactString::new(m);
         }
-        // OPENROUTER_MODEL env var (higher priority than config file).
-        if let Ok(m) = std::env::var("OPENROUTER_MODEL")
-            && !m.is_empty()
+        let provider = self.resolve_provider(cfg);
+        // OPENROUTER_MODEL names an OpenRouter model; it outranks the config
+        // file, but only when OpenRouter is the provider in effect.
+        if provider == "openrouter"
+            && let Some(m) = openrouter_model.filter(|m| !m.is_empty())
         {
             return CompactString::new(m);
-        }
-        // Config model field references a quick model name; resolve it.
-        if let Some(m) = cfg.model.as_deref() {
-            let qm = config::quick_models_map(cfg);
-            if let Some(q) = qm.get(m) {
-                return q.model.clone();
-            }
-            return CompactString::new(m);
-        }
-        // No explicit model. If a provider was chosen explicitly, default to a
-        // model valid for it so `--provider anthropic` does not keep the
-        // OpenRouter default id; otherwise keep the historic deepseek default.
-        if (self.provider.is_some() || cfg.provider.is_some())
-            && let Some((model, _)) =
-                crate::provider::default_model_for_provider(&self.resolve_provider(cfg), cfg)
-        {
-            return CompactString::new(model);
         }
         let qm = config::quick_models_map(cfg);
-        qm.get("deepseek-v4-pro")
-            .map(|q| q.model.clone())
-            .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro"))
+        let configured = cfg.model.as_deref().map(|m| match qm.get(m) {
+            Some(q) => (q.model.clone(), q.provider.clone()),
+            None => (
+                CompactString::new(m),
+                cfg.provider
+                    .clone()
+                    .unwrap_or_else(|| default_provider(&qm)),
+            ),
+        });
+        let provider_default = || {
+            crate::provider::default_model_for_provider(&provider, cfg)
+                .map(|(model, _)| CompactString::new(model))
+        };
+        match configured {
+            Some((model, owner)) if owner == provider => model,
+            // Configured for another provider: prefer the provider's own
+            // default; with none known, the configured id is the best guess.
+            Some((model, _)) => provider_default().unwrap_or(model),
+            None if provider == default_provider(&qm) => qm
+                .get("deepseek-v4-pro")
+                .map(|q| q.model.clone())
+                .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro")),
+            None => {
+                provider_default().unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro"))
+            }
+        }
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
+        let qm = config::quick_models_map(cfg);
         self.provider
             .as_deref()
             .or(cfg.provider.as_deref())
             .map(CompactString::new)
-            .unwrap_or_else(|| {
-                let qm = config::quick_models_map(cfg);
-                qm.get("deepseek-v4-pro")
+            // A configured quick-model name carries its own provider.
+            .or_else(|| {
+                cfg.model
+                    .as_deref()
+                    .and_then(|m| qm.get(m))
                     .map(|q| q.provider.clone())
-                    .unwrap_or_else(|| CompactString::new("openrouter"))
             })
+            .unwrap_or_else(|| default_provider(&qm))
     }
 
     /// The startup provider/model pair: `--provider`/`--model`/config
@@ -1122,11 +1160,7 @@ impl Cli {
     }
 
     pub fn resolve_edit_system(&self, cfg: &config::Config) -> EditSystem {
-        self.edit_system
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .or(cfg.edit_system)
-            .unwrap_or_default()
+        self.edit_system.or(cfg.edit_system).unwrap_or_default()
     }
 
     #[cfg(feature = "git-worktree")]
@@ -1199,6 +1233,126 @@ mod tests {
 
     use super::{Cli, OutputFormat, default_sandbox_backend};
     use crate::config;
+
+    /// The shipped default shape: OpenRouter with the deepseek quick model,
+    /// plus an Anthropic quick model.
+    const DEFAULT_LIKE_CONFIG: &str = r#"
+provider = "openrouter"
+model = "deepseek-v4-pro"
+
+[quick_models.deepseek-v4-pro]
+provider = "openrouter"
+model = "deepseek/deepseek-v4-pro"
+input_token_cost = 0.0
+output_token_cost = 0.0
+
+[quick_models.sonnet]
+provider = "anthropic"
+model = "claude-sonnet-test"
+input_token_cost = 0.0
+output_token_cost = 0.0
+"#;
+
+    fn resolved(config: &str, args: &[&str], env: Option<&str>) -> (String, String) {
+        let cfg: config::Config = toml::from_str(config).unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("mini-agent").chain(args.iter().copied())).unwrap();
+        (
+            cli.resolve_provider(&cfg).to_string(),
+            cli.resolve_model_with_env(&cfg, env).to_string(),
+        )
+    }
+
+    // mini-agent-jm8cf: `--provider X` must not keep another provider's model.
+    // mini-agent-r2y6m: a typo in --edit-system is a usage error, not a
+    // silent fall back to the default.
+    #[test]
+    fn edit_system_flag_rejects_unknown_values() {
+        let error = Cli::try_parse_from(["mini-agent", "--edit-system", "hashedt"])
+            .expect_err("an unknown edit system must be rejected");
+        assert!(error.to_string().contains("unknown edit system"), "{error}");
+        let cli = Cli::try_parse_from(["mini-agent", "--edit-system", "hashedit"]).unwrap();
+        assert_eq!(
+            cli.resolve_edit_system(&config::Config::default()),
+            crate::config::types::EditSystem::Hashedit
+        );
+    }
+
+    #[test]
+    fn provider_override_uses_that_providers_default_model() {
+        assert_eq!(
+            resolved(DEFAULT_LIKE_CONFIG, &[], None),
+            ("openrouter".into(), "deepseek/deepseek-v4-pro".into())
+        );
+        assert_eq!(
+            resolved(DEFAULT_LIKE_CONFIG, &["--provider", "anthropic"], None),
+            ("anthropic".into(), "claude-sonnet-test".into())
+        );
+        assert_eq!(
+            resolved(DEFAULT_LIKE_CONFIG, &["--provider", "openai"], None),
+            ("openai".into(), "gpt-5.5".into())
+        );
+        // An explicit model always wins.
+        assert_eq!(
+            resolved(
+                DEFAULT_LIKE_CONFIG,
+                &["--provider", "anthropic", "--model", "claude-x"],
+                None
+            ),
+            ("anthropic".into(), "claude-x".into())
+        );
+        // Editing only `provider` in the config file behaves the same way.
+        let edited = DEFAULT_LIKE_CONFIG.replacen(
+            "provider = \"openrouter\"\nmodel",
+            "provider = \"anthropic\"\nmodel",
+            1,
+        );
+        assert_eq!(
+            resolved(&edited, &[], None),
+            ("anthropic".into(), "claude-sonnet-test".into())
+        );
+    }
+
+    #[test]
+    fn configured_model_is_kept_for_its_own_provider() {
+        let raw = "provider = \"anthropic\"\nmodel = \"claude-pinned\"\n";
+        assert_eq!(
+            resolved(raw, &[], None),
+            ("anthropic".into(), "claude-pinned".into())
+        );
+        assert_eq!(
+            resolved(raw, &["--provider", "anthropic"], None),
+            ("anthropic".into(), "claude-pinned".into())
+        );
+        // A quick-model name with no configured provider selects its provider.
+        let quick_only = DEFAULT_LIKE_CONFIG
+            .replacen("provider = \"openrouter\"\n", "", 1)
+            .replacen("model = \"deepseek-v4-pro\"", "model = \"sonnet\"", 1);
+        assert_eq!(
+            resolved(&quick_only, &[], None),
+            ("anthropic".into(), "claude-sonnet-test".into())
+        );
+    }
+
+    #[test]
+    fn openrouter_model_env_applies_only_to_openrouter() {
+        assert_eq!(
+            resolved(DEFAULT_LIKE_CONFIG, &[], Some("vendor/env-model")),
+            ("openrouter".into(), "vendor/env-model".into())
+        );
+        assert_eq!(
+            resolved(
+                DEFAULT_LIKE_CONFIG,
+                &["--provider", "anthropic"],
+                Some("vendor/env-model")
+            ),
+            ("anthropic".into(), "claude-sonnet-test".into())
+        );
+        assert_eq!(
+            resolved(DEFAULT_LIKE_CONFIG, &[], Some("")),
+            ("openrouter".into(), "deepseek/deepseek-v4-pro".into())
+        );
+    }
 
     #[cfg(feature = "advisor")]
     #[test]

@@ -1896,12 +1896,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/agent/runner.rs", "output,", 1, "NON-PROCESS"),
     ("src/agent/runner.rs", "output.len(),", 1, "NON-PROCESS"),
     (
-        "src/agent/runner.rs",
-        "println!(\"{}\", output);",
-        1,
-        "NON-PROCESS",
-    ),
-    (
         "src/agent/tools/bash.rs",
         "assert!(output.stderr.is_empty());",
         1,
@@ -2612,10 +2606,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             ),
             (
                 "2e9d6fe2b541c8535dfabf335779690424c0bb5bb198ff7429dbaede8642b50f",
-                1,
-            ),
-            (
-                "9b95c26fba2e0e1c67f90565d197425d7c3bdecbbe365dd0c071de7130a7eafb",
                 1,
             ),
             (

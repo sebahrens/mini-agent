@@ -1609,6 +1609,24 @@ fn append_tool_call(interactions: &mut Vec<Message>, tool_call: &ToolCall) {
     }
 }
 
+/// Whether a tool result is a `goal_report` the goal accepted.
+///
+/// Such a report is the round's account of itself, so the turn that filed it
+/// is complete even when the model adds no closing text. A rejected report (no
+/// running goal) does not count.
+fn is_accepted_goal_report(tool_name: &str, output: &str) -> bool {
+    #[cfg(feature = "goal")]
+    {
+        tool_name == <crate::extras::goal::report_tool::GoalReport as rig::tool::Tool>::NAME
+            && crate::extras::goal::report_tool::is_accepted_report_output(output)
+    }
+    #[cfg(not(feature = "goal"))]
+    {
+        let _ = (tool_name, output);
+        false
+    }
+}
+
 fn reconcile_terminal_response(response: &mut String, stream_start: usize, terminal: &str) {
     if response.len() > stream_start {
         return;
@@ -1625,6 +1643,8 @@ struct RunnerStreamPolicy {
     drop_completion_calls: bool,
     #[cfg(test)]
     drop_tool_results: bool,
+    #[cfg(test)]
+    drop_text: bool,
 }
 
 impl RunnerStreamPolicy {
@@ -1636,6 +1656,16 @@ impl RunnerStreamPolicy {
             )),
             drop_completion_calls: false,
             drop_tool_results: false,
+            drop_text: false,
+        }
+    }
+
+    /// A provider that delivers its answer only in the terminal response.
+    #[cfg(test)]
+    fn without_streamed_text() -> Self {
+        Self {
+            drop_text: true,
+            ..Self::default()
         }
     }
 
@@ -1680,7 +1710,8 @@ impl RunnerStreamPolicy {
                 .is_ok();
             let drop_completion_calls = self.drop_completion_calls;
             let drop_tool_results = self.drop_tool_results;
-            if drop_terminal || drop_completion_calls || drop_tool_results {
+            let drop_text = self.drop_text;
+            if drop_terminal || drop_completion_calls || drop_tool_results || drop_text {
                 return stream
                     .filter(move |item| {
                         let is_terminal = matches!(item, Ok(MultiTurnStreamItem::FinalResponse(_)));
@@ -1692,10 +1723,17 @@ impl RunnerStreamPolicy {
                                 StreamedUserContent::ToolResult { .. }
                             ))
                         );
+                        let is_text = matches!(
+                            item,
+                            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::Text(_)
+                            ))
+                        );
                         std::future::ready(
                             !(drop_terminal && is_terminal
                                 || drop_completion_calls && is_completion
-                                || drop_tool_results && is_tool_result),
+                                || drop_tool_results && is_tool_result
+                                || drop_text && is_text),
                         )
                     })
                     .boxed();
@@ -2011,6 +2049,10 @@ fn convert_history_uncached(session: &Session, keep_recent_tool_results: usize) 
                 messages.push(Message::user(msg.content.to_string()));
                 replay_kind = ReplayKind::Other;
             }
+            // An empty assistant record (a round that ended in its accepted
+            // `goal_report` with no closing text) carries nothing to replay,
+            // and providers reject an empty text block.
+            MessageRole::Assistant if msg.content.is_empty() => {}
             MessageRole::Assistant => {
                 messages.push(Message::assistant(msg.content.to_string()));
                 replay_kind = ReplayKind::Assistant;
@@ -2578,6 +2620,7 @@ where
         let mut stream_prompt: Option<String> = None;
         let mut empty_response_count: u32 = 0;
         const MAX_EMPTY_RESPONSES: u32 = 3;
+        let mut goal_report_accepted = false;
         let mut workspace_may_have_changed = false;
         let mut verification_attempt = 0u32;
         let max_turns = agent.default_max_turns.unwrap_or(1);
@@ -2823,6 +2866,7 @@ where
                         );
                         #[cfg(feature = "acp")]
                         crate::permission::ask::finish_tool_call(&tool_name, &internal_call_id);
+                        goal_report_accepted |= is_accepted_goal_report(&tool_name, &output);
                         let loop_notice = is_tool_loop_notice(&output).then(|| output.clone());
                         let is_error = take_tool_failure(&internal_call_id);
                         let _ = event_tx
@@ -2918,7 +2962,12 @@ where
                             return;
                         }
 
-                        if terminal_was_streamed || !response_text.is_empty() {
+                        // An accepted `goal_report` completes a round even when
+                        // no closing text follows it (mini-agent-64qyf).
+                        if terminal_was_streamed
+                            || !response_text.is_empty()
+                            || goal_report_accepted
+                        {
                             let verification_ran = workspace_may_have_changed
                                 && completion_verification
                                     .as_ref()
@@ -3485,6 +3534,7 @@ where
     // empty response must never be returned (and persisted) as the turn.
     let mut empty_response_count: u32 = 0;
     const MAX_EMPTY_RESPONSES: u32 = 3;
+    let mut goal_report_accepted = false;
     let mut workspace_may_have_changed = false;
     let mut verification_attempt = 0u32;
     let mut next_instruction: Option<String> = None;
@@ -3529,8 +3579,7 @@ where
                     full_response.push_str(&text.text);
                     append_streamed_text(&mut interactions, &text.text);
                     if emit_stdout {
-                        print!("{}", text.text);
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        crate::print::headless_stdout(format_args!("{}", text.text));
                     }
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
@@ -3564,10 +3613,15 @@ where
                         fail_turn!(error);
                     }
                     completion_had_tool_call = true;
+                    // The turn's response is the text of its final completion,
+                    // exactly as in the interactive runner: text written before
+                    // a tool call is its own transcript segment, not a prefix
+                    // of the answer (mini-agent-knwk1).
+                    full_response.clear();
+                    response_len_at_stream_start = 0;
                     if pure_stdout {
                         let summary = format_tool_args_summary(&tool_call.function.arguments);
-                        println!("\n◈ {} {}", name, summary);
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        crate::print::headless_stdout(format_args!("\n◈ {} {}\n", name, summary));
                     }
                     append_tool_call(&mut interactions, &tool_call);
                     #[cfg(feature = "acp")]
@@ -3597,17 +3651,22 @@ where
                     };
                     #[cfg(feature = "acp")]
                     crate::permission::ask::finish_tool_call(&name, &internal_call_id);
+                    goal_report_accepted |= is_accepted_goal_report(&name, &output);
                     if pure_stdout && !output.is_empty() {
-                        println!("◈ {} result:", name);
                         let lines: Vec<&str> = output.lines().collect();
                         if lines.len() > 40 {
                             let truncated: Vec<&str> = lines.iter().take(40).copied().collect();
-                            println!("{}", truncated.join("\n"));
-                            println!("(truncated {} more lines)", lines.len().saturating_sub(40));
+                            crate::print::headless_stdout(format_args!(
+                                "◈ {} result:\n{}\n(truncated {} more lines)\n",
+                                name,
+                                truncated.join("\n"),
+                                lines.len().saturating_sub(40)
+                            ));
                         } else {
-                            println!("{}", output);
+                            crate::print::headless_stdout(format_args!(
+                                "◈ {name} result:\n{output}\n"
+                            ));
                         }
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
@@ -3636,15 +3695,29 @@ where
                 Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                     terminal_response_seen = true;
                     usage_ledger.reconcile_terminal(res.usage());
+                    let terminal_was_streamed = full_response.len() > response_len_at_stream_start;
                     reconcile_terminal_response(
                         &mut full_response,
                         response_len_at_stream_start,
                         &res.output,
                     );
+                    // A terminal answer that was never streamed must still
+                    // reach the continuation transcript and the terminal, as
+                    // it does interactively (mini-agent-4v2iq).
+                    if !terminal_was_streamed && !res.output.is_empty() {
+                        append_streamed_text(&mut interactions, &res.output);
+                        if emit_stdout {
+                            crate::print::headless_stdout(format_args!("{}", res.output));
+                        }
+                    }
                     if !tool_calls.finalize_unresolved(&mut interactions).is_empty() {
                         fail_turn!(UNRESOLVED_TOOL_CALLS_ERROR);
                     }
-                    if full_response.len() == response_len_at_stream_start {
+                    // A round whose work ended in an accepted `goal_report` has
+                    // said what it had to say; it is complete, not empty
+                    // (mini-agent-64qyf).
+                    if full_response.len() == response_len_at_stream_start && !goal_report_accepted
+                    {
                         empty_response_count += 1;
                         if empty_response_count >= MAX_EMPTY_RESPONSES {
                             tracing::warn!(
@@ -3796,7 +3869,11 @@ where
         }
     }
 
-    println!();
+    // Terminate the streamed text line. JSON output streams nothing, and its
+    // stdout must be exactly one JSON value (mini-agent-itc4b).
+    if emit_stdout {
+        crate::print::headless_stdout(format_args!("\n"));
+    }
     committed_interactions.append(&mut interactions);
     HeadlessTurn {
         response: full_response,
@@ -8619,6 +8696,223 @@ mod tests {
             error.to_string(),
             "Agent returned empty response too many times, aborting."
         );
+    }
+
+    // mini-agent-knwk1: the headless response is the final completion's text,
+    // as it is interactively; text before a tool call is its own segment.
+    #[tokio::test]
+    async fn headless_response_excludes_text_written_before_a_tool_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::text("I'll read the file."),
+                MockStreamEvent::tool_call("read-call", CountingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("Done."),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(CountingTool(calls.clone()))
+            .default_max_turns(3)
+            .build();
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(response, "Done.");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The earlier segment is still part of the transcript.
+        let texts: Vec<String> = interactions
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant { content, .. } => {
+                    Some(content.iter().filter_map(|item| match item {
+                        AssistantContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    }))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(texts, ["I'll read the file.", "Done."]);
+    }
+
+    // mini-agent-4v2iq: an answer delivered only in the terminal response
+    // enters the headless transcript, as it does interactively.
+    #[tokio::test]
+    async fn headless_unstreamed_terminal_text_enters_the_transcript() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("answer"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(1)
+            .build();
+
+        let (response, _, interactions) = super::run_print_with_stream_policy(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            RunnerStreamPolicy::without_streamed_text(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(response, "answer");
+        assert_eq!(interactions, vec![Message::assistant("answer")]);
+    }
+
+    #[cfg(feature = "goal")]
+    fn goal_report_agent(
+        turns: Vec<Vec<MockStreamEvent>>,
+    ) -> (MockCompletionModel, rig::agent::Agent<MockCompletionModel>) {
+        let store = crate::extras::goal::GoalStore::default();
+        store
+            .set(
+                crate::extras::goal::Goal::new("ship it", Vec::new()).unwrap(),
+                false,
+            )
+            .unwrap();
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(crate::extras::goal::report_tool::GoalReport::new(store))
+            .default_max_turns(4)
+            .build();
+        (model, agent)
+    }
+
+    #[cfg(feature = "goal")]
+    fn goal_report_then_silence() -> Vec<Vec<MockStreamEvent>> {
+        vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "report",
+                    "goal_report",
+                    serde_json::json!({"status": "progress"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+        ]
+    }
+
+    // mini-agent-64qyf: a round that ends in an accepted goal_report with no
+    // closing text is complete, not an empty response to retry and abort.
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn headless_goal_report_without_closing_text_completes_the_turn() {
+        let (model, agent) = goal_report_agent(goal_report_then_silence());
+
+        let (response, _, interactions) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("an accepted goal_report completes the turn");
+
+        assert_eq!(response, "");
+        assert_eq!(model.requests().len(), 2, "no 'Please continue.' retries");
+        assert_eq!(tool_result_ids_of(&interactions), ["report"]);
+    }
+
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn interactive_goal_report_without_closing_text_completes_the_turn() {
+        let (model, agent) = goal_report_agent(goal_report_then_silence());
+        let paused = super::spawn_agent_paused(
+            agent,
+            "start".to_owned(),
+            Vec::new(),
+            crate::retry::RetryConfig::default(),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        let mut runner = paused.start_interactive();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match runner.event_rx.recv().await.expect("runner terminal event") {
+                    crate::event::AgentEvent::Done { response, .. } => break response,
+                    crate::event::AgentEvent::Error { message, .. } => {
+                        panic!("an accepted goal_report must not fail the round: {message}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("runner finishes");
+        assert_eq!(response, "");
+        assert_eq!(model.requests().len(), 2);
+    }
+
+    // A goal_report the goal refused does not make an empty turn complete.
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn headless_rejected_goal_report_still_counts_as_empty() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::tool_call(
+                    "report",
+                    "goal_report",
+                    serde_json::json!({"status": "progress"}),
+                ),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![MockStreamEvent::final_response_with_default_usage()],
+            vec![
+                MockStreamEvent::text("closing"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .tool(crate::extras::goal::report_tool::GoalReport::new(
+                crate::extras::goal::GoalStore::default(),
+            ))
+            .default_max_turns(4)
+            .build();
+
+        let (response, _, _) = super::run_print(
+            &agent,
+            "start",
+            false,
+            &crate::retry::RetryConfig::default(),
+            None,
+            Vec::new(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await
+        .expect("the continuation produces text");
+        assert_eq!(response, "closing");
+        assert_eq!(model.requests().len(), 3);
     }
 }
 

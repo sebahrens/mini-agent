@@ -1314,3 +1314,64 @@ fn effective_reserve_adds_block_estimate() {
     // never drops below base
     assert!(effective_reserve(1000, Some("tiny")) >= 1000);
 }
+
+// ---- compaction summary injected once (mini-agent-vx0yg) -------------------
+
+#[test]
+fn the_active_compaction_summary_is_not_injected_twice() {
+    let m = fresh("vx0yg");
+    m.append_daily("note", "unrelated earlier entry").unwrap();
+    let older = "older summary\n### Inner heading\nolder detail";
+    flush_compaction_summary(&m, older, Some(4));
+    let active = "## Progress\nactive summary\n### Next steps\nactive detail";
+    flush_compaction_summary(&m, active, Some(9));
+    m.append_daily("note", "later entry").unwrap();
+
+    // The session replays `active` as its recap after /compress.
+    let mut session = crate::session::Session::new("openai", "gpt-test", 128_000, "");
+    session.add_message(crate::session::MessageRole::User, "old turn");
+    session.add_message(crate::session::MessageRole::User, "kept turn");
+    session.compress(active.to_string(), 1, 1);
+    let reference = session
+        .active_compaction_ref()
+        .expect("a fresh compaction carries its memory tag");
+    assert_eq!(reference, crate::session::compaction_ref(active));
+
+    let full = m.context_block().unwrap();
+    assert!(full.contains("active detail"));
+
+    let block = m.context_block_excluding(Some(reference)).unwrap();
+    assert!(!block.contains("active summary"), "{block}");
+    assert!(
+        !block.contains("active detail"),
+        "headings inside the summary body stay with its entry: {block}"
+    );
+    assert!(block.contains("older detail"), "{block}");
+    assert!(block.contains("unrelated earlier entry"), "{block}");
+    assert!(block.contains("later entry"), "{block}");
+
+    // The persisted log still holds every entry.
+    let log = fs::read_to_string(daily(&m, &m.today)).unwrap();
+    assert!(log.contains("active detail"));
+
+    // Each compaction is tagged by its own summarizer text.
+    session.compress("another".to_string(), 1, 1);
+    assert_eq!(
+        session.active_compaction_ref(),
+        Some(crate::session::compaction_ref("another").as_str())
+    );
+    cleanup(&m);
+}
+
+#[test]
+fn legacy_compactions_without_a_tag_exclude_nothing() {
+    let json = serde_json::json!({
+        "summary": "s",
+        "first_kept_index": 1,
+        "summarized_count": 1,
+        "token_savings": 0,
+        "created_at": "2026-01-01T00:00:00Z"
+    });
+    let compaction: crate::session::Compaction = serde_json::from_value(json).unwrap();
+    assert!(compaction.memory_ref.is_none());
+}
