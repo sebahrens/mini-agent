@@ -783,6 +783,34 @@ impl Verification {
     }
 }
 
+/// Run one verification tier unless the operator interrupts it first.
+///
+/// `None` means the interrupt won. The tier's future is dropped rather than
+/// awaited, so a judge request still waiting on its provider is abandoned
+/// instead of arriving after the operator stopped the run and deciding the
+/// goal anyway. A signal handler that could not be installed is not an
+/// interrupt: the tier then runs to completion as it would have without one.
+pub async fn unless_interrupted<T>(
+    work: impl std::future::Future<Output = T>,
+    interrupt: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Option<T> {
+    tokio::pin!(work);
+    tokio::pin!(interrupt);
+    tokio::select! {
+        // Poll the signal first so its handler is installed before the tier
+        // sends anything.
+        biased;
+        signal = &mut interrupt => match signal {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "goal: verification interrupt handler failed");
+                Some(work.await)
+            }
+        },
+        value = &mut work => Some(value),
+    }
+}
+
 /// Fold an already-decided round into the goal.
 ///
 /// The shared half of [`settle_round`], split out for surfaces that run
@@ -980,6 +1008,101 @@ mod settle_tests {
             round,
             at: compact_str::CompactString::new("now"),
         });
+    }
+
+    /// A judge still waiting on its provider when the operator interrupts is
+    /// abandoned, not awaited: its late verdict must not decide the goal
+    /// (mini-agent-e3nb6).
+    #[tokio::test]
+    async fn an_interrupt_drops_a_pending_tier_instead_of_awaiting_it() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let judge = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            "met"
+        };
+        let result = unless_interrupted(judge, async { Ok(()) }).await;
+        assert_eq!(result, None);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Without an interrupt the tier's answer comes through.
+        let result = unless_interrupted(async { "met" }, std::future::pending()).await;
+        assert_eq!(result, Some("met"));
+
+        // A signal handler that failed to install is not an interrupt.
+        let result = unless_interrupted(async { "met" }, async {
+            Err(std::io::Error::other("no handler"))
+        })
+        .await;
+        assert_eq!(result, Some("met"));
+    }
+
+    /// An interrupted verification leaves the goal active and the round
+    /// uncounted, whichever tier was running (mini-agent-e3nb6).
+    #[tokio::test]
+    async fn an_interrupted_judge_leaves_the_goal_active_and_uncounted() {
+        let _paths = isolated_paths();
+        let store = GoalStore::default();
+        let mut goal = Goal::new("finish the job", Vec::new()).unwrap();
+        goal.judge = JudgePolicy::Session;
+        store.set(goal, false).unwrap();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked_in_tier = asked.clone();
+        report(&store, ReportStatus::Met);
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        let outcome = settle_round(&store, summary, |request| async move {
+            assert!(request.run_judge, "a met claim with a judge asks it");
+            asked_in_tier.store(true, std::sync::atomic::Ordering::SeqCst);
+            match unless_interrupted(
+                async {
+                    super::super::gate::JudgeOutcome::Verdict {
+                        outcome: super::super::Outcome::Met,
+                        reason: "late".into(),
+                    }
+                },
+                async { Ok(()) },
+            )
+            .await
+            {
+                Some(judge) => Verification {
+                    judge: Some(judge),
+                    ..Verification::default()
+                },
+                None => Verification {
+                    interrupted: true,
+                    ..Verification::default()
+                },
+            }
+        })
+        .await;
+        assert!(
+            !matches!(
+                outcome,
+                RoundOutcome::Stopped {
+                    status: GoalStatus::Met,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(
+            goal.progress.rounds, 0,
+            "the interrupted round is uncounted"
+        );
     }
 
     #[tokio::test]

@@ -143,7 +143,9 @@ are all failures, and a goal whose checks cannot run can never reach `met` throu
 Cancellation is not a failure. A check the operator interrupted proved nothing either way, so the
 round settles as interrupted — untouched and uncounted — rather than being judged on a command that
 was stopped. The command is cancelled rather than dropped, so its process group is terminated and
-reaped instead of outliving the interrupt.
+reaped instead of outliving the interrupt. The same interrupt covers the judge: a judge request still
+waiting on its provider is abandoned, and the round settles as interrupted, so a verdict that would
+have arrived after the operator stopped the run can never mark the goal met.
 
 ### Judge
 
