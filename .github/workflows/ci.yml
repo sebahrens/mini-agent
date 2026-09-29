@@ -811,6 +811,28 @@ jobs:
           test "$matrix_output" = 'MACOS_CONTAINMENT_MATRIX_V1=passed'
           echo 'PHASE6_REAL_PROBE=passed' >> "$GITHUB_ENV"
 
+      # mini-agent-vvzsy removed the worker profile's `(vnode-type FIFO)` rule
+      # after validating only on macOS 26. The production-binary matrix above
+      # already runs the new profile on both legs; this live regression proves
+      # on each runner that inherited protocol pipes still work while opening a
+      # named FIFO is denied. Its "Seatbelt unusable" early return is a failure
+      # here, and the result is recorded in the gate evidence (mini-agent-vy77b).
+      - name: Confirm the worker profile denies named FIFOs on this runner
+        shell: bash
+        run: |
+          test_name='sandbox::worker::platform::tests::seatbelt_profile_denies_named_fifos_but_keeps_inherited_pipes'
+          echo 'PHASE6_NAMED_FIFO=failed' >> "$GITHUB_ENV"
+          output=$(cargo test --locked --no-default-features --features js \
+            "$test_name" -- --exact --nocapture --test-threads=1 2>&1)
+          printf '%s\n' "$output"
+          if printf '%s\n' "$output" | grep -q 'skipping:'; then
+            echo 'PHASE6_NAMED_FIFO=skipped-seatbelt-unusable' >> "$GITHUB_ENV"
+            echo "named-FIFO regression skipped instead of running under Seatbelt" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
+          echo 'PHASE6_NAMED_FIFO=denied' >> "$GITHUB_ENV"
+
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
         shell: bash
@@ -893,6 +915,7 @@ jobs:
             --probe "$probe" \
             --adversarial "$adversarial" \
             --resource "$resource" \
+            --named-fifo "${PHASE6_NAMED_FIFO:-not-run}" \
             --json-out phase6-gate-evidence.json \
             --log-out phase6-gate-evidence.log
           cat phase6-gate-evidence.log
