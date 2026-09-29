@@ -966,3 +966,64 @@ fn a_blank_line_inside_a_fence_round_trips() {
         .unwrap();
     assert_eq!(after.color, Color::White);
 }
+
+fn block_texts(feed: &Feed) -> Vec<String> {
+    (0..feed.block_count())
+        .map(|index| feed.block_text(index).unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn tool_results_render_under_their_own_calls() {
+    let mut feed = Feed::new();
+    feed.push_anchored_block("a", BlockStyle::Tool, "call a");
+    feed.push_anchored_block("b", BlockStyle::Tool, "call b");
+    feed.push_anchored_block("c", BlockStyle::Tool, "call c");
+    assert!(feed.insert_after_anchor("b", BlockStyle::ToolResult, "result b"));
+    assert!(feed.insert_after_anchor("a", BlockStyle::ToolResult, "result a"));
+    assert!(feed.insert_after_anchor("c", BlockStyle::ToolResult, "result c"));
+    assert!(feed.insert_after_anchor("a", BlockStyle::ToolResult, "more a"));
+    assert_eq!(
+        block_texts(&feed),
+        [
+            "call a", "result a", "more a", "call b", "result b", "call c", "result c"
+        ]
+    );
+}
+
+#[test]
+fn an_unknown_or_empty_anchor_is_left_to_the_caller() {
+    let mut feed = Feed::new();
+    feed.push_anchored_block("", BlockStyle::Tool, "call");
+    assert!(!feed.insert_after_anchor("", BlockStyle::ToolResult, "result"));
+    assert!(!feed.insert_after_anchor("missing", BlockStyle::ToolResult, "result"));
+    assert_eq!(block_texts(&feed), ["call"]);
+}
+
+#[test]
+fn insertion_never_shifts_a_running_streaming_block() {
+    let mut feed = Feed::new();
+    feed.push_anchored_block("a", BlockStyle::Tool, "call a");
+    feed.push_streaming_block(BlockStyle::Agent);
+    let live = feed.block_count() - 1;
+    assert!(!feed.insert_after_anchor("a", BlockStyle::ToolResult, "result a"));
+    assert!(feed.is_streaming(live));
+    feed.finalize_block(live);
+    assert!(feed.insert_after_anchor("a", BlockStyle::ToolResult, "result a"));
+    assert_eq!(block_texts(&feed)[..2], ["call a", "result a"]);
+}
+
+#[test]
+fn inserting_a_block_changes_the_generation_and_layout() {
+    let mut feed = Feed::new();
+    feed.push_anchored_block("a", BlockStyle::Tool, "call a");
+    feed.push_line(BlockStyle::Plain, "later");
+    let before = feed.generation();
+    assert!(feed.insert_after_anchor("a", BlockStyle::ToolResult, "result"));
+    assert_ne!(feed.generation(), before);
+    let lines = feed.lines(40);
+    let rows: Vec<_> = indexed_rows(&lines)
+        .map(|line| line.text.to_string())
+        .collect();
+    assert_eq!(rows, ["call a", "result", "later"]);
+}
