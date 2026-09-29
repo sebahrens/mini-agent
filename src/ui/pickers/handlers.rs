@@ -285,6 +285,17 @@ pub(crate) fn mode_picker(current: Option<crate::permission::SecurityMode>) -> L
     picker
 }
 
+/// The command the input names in full, when the whole buffer is `/<query>`
+/// with the caret at its end and `/<query>` is a listed command or a hidden
+/// alias.
+fn typed_command(buffer: &str, cursor: usize, picker: &ListPicker) -> Option<String> {
+    if cursor != buffer.len() || buffer.strip_prefix('/') != Some(picker.query.as_str()) {
+        return None;
+    }
+    (picker.matches.iter().any(|m| m == buffer) || super::list::is_command_alias(buffer))
+        .then(|| buffer.to_string())
+}
+
 /// Keys while the slash-command picker is open. A `false` result means the
 /// key was not consumed: Enter on a command typed in full closes the picker
 /// and returns `false`, so the caller's normal Enter submits the input.
@@ -312,6 +323,20 @@ pub fn handle_command_key(
             (true, None)
         }
         KeyCode::Char(_) if is_modifier_chord(key) => (true, None),
+        // A space after a command typed in full ends the command word: open
+        // its argument picker (`/model ` -> model picker), or close
+        // completion and let the editor insert the space.
+        KeyCode::Char(' ') if typed_command(buffer, *cursor, picker).is_some() => {
+            let command = typed_command(buffer, *cursor, picker).unwrap_or_default();
+            if opens_sub_picker(&command, ctx) {
+                if let Some(index) = picker.matches.iter().position(|m| *m == command) {
+                    picker.selected = index;
+                    return accept_command(buffer, cursor, ctx, picker);
+                }
+            }
+            picker.deactivate();
+            (false, None)
+        }
         KeyCode::Char(c) => {
             picker.char_input(c);
             let byte_in_query = picker
