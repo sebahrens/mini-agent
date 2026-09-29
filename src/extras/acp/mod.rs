@@ -701,15 +701,23 @@ struct TcpServerSettings {
     api_key: String,
 }
 
+/// Opt-in for a non-loopback ACP TCP bind. The TCP transport authenticates
+/// only the connection handshake: the session afterwards is plaintext and the
+/// client never authenticates the server, so anyone on the network path can
+/// read or inject into a tool-executing session.
+const ACP_ALLOW_REMOTE_ENV: &str = "MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE";
+
 fn resolve_tcp_settings(cli: &Cli, cfg: &Config) -> anyhow::Result<Option<TcpServerSettings>> {
     let environment_key = std::env::var("MINI_AGENT_ACP_API_KEY").ok();
-    resolve_tcp_settings_with_key(cli, cfg, environment_key)
+    let allow_remote = std::env::var(ACP_ALLOW_REMOTE_ENV).is_ok_and(|value| value == "1");
+    resolve_tcp_settings_with_key(cli, cfg, environment_key, allow_remote)
 }
 
 fn resolve_tcp_settings_with_key(
     cli: &Cli,
     cfg: &Config,
     environment_key: Option<String>,
+    allow_remote: bool,
 ) -> anyhow::Result<Option<TcpServerSettings>> {
     let configured_host = cli.acp_host.clone().or_else(|| cfg.acp_host.clone());
     let configured_port = cli.acp_port.or(cfg.acp_port);
@@ -729,10 +737,22 @@ fn resolve_tcp_settings_with_key(
         })?;
 
     if !is_loopback_host(&host) {
-        tracing::warn!(
-            "ACP TCP remote bind explicitly enabled for {}; authentication is required",
-            host
+        if !allow_remote {
+            anyhow::bail!(
+                "refusing ACP TCP bind on non-loopback host '{host}': the TCP transport \
+                 authenticates only the handshake, then carries the session in plaintext \
+                 without authenticating the server, so an on-path attacker could read or \
+                 inject into a tool-executing session. Bind to 127.0.0.1 and tunnel (for \
+                 example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 to accept that risk"
+            );
+        }
+        let warning = format!(
+            "WARNING: ACP TCP is listening on non-loopback host {host} because \
+             {ACP_ALLOW_REMOTE_ENV}=1. The session is unencrypted and the server is not \
+             authenticated to clients; use only on a trusted network."
         );
+        tracing::warn!("{warning}");
+        eprintln!("{warning}");
     }
 
     Ok(Some(TcpServerSettings {
@@ -6353,7 +6373,8 @@ mod tcp_authentication_tests {
     #[test]
     fn stdio_remains_default_without_tcp_endpoint() {
         let settings =
-            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None).unwrap();
+            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false)
+                .unwrap();
         assert!(settings.is_none());
     }
 
@@ -6365,7 +6386,7 @@ mod tcp_authentication_tests {
         };
         let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None)
+        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false)
             .unwrap()
             .unwrap();
         assert_eq!(settings.host, DEFAULT_TCP_HOST);
@@ -6380,10 +6401,42 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
 
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None)
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false)
             .err()
             .expect("TCP without authentication must fail");
         assert!(error.to_string().contains("requires authentication"));
+    }
+
+    #[test]
+    fn non_loopback_tcp_bind_requires_an_explicit_insecure_opt_in() {
+        let cli = Cli {
+            acp_host: Some("0.0.0.0".to_owned()),
+            ..Default::default()
+        };
+        let key = Some("secret".to_owned());
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+            .err()
+            .expect("a remote bind must be refused by default");
+        assert!(error.to_string().contains(ACP_ALLOW_REMOTE_ENV), "{error}");
+        assert!(!error.to_string().contains("secret"));
+
+        let settings = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.host, "0.0.0.0");
+
+        for loopback in ["127.0.0.1", "::1", "localhost"] {
+            let cli = Cli {
+                acp_host: Some(loopback.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+                    .unwrap()
+                    .is_some(),
+                "{loopback} needs no opt-in"
+            );
+        }
     }
 
     #[test]

@@ -1722,8 +1722,13 @@ ACP server configs (in `acp_servers`) support two transport types:
 When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
 (the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
 `acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
-host defaults to `127.0.0.1`. A non-loopback `acp_host` is an explicit remote
-exposure choice and emits a startup warning.
+host defaults to `127.0.0.1`. A non-loopback `acp_host` is refused at startup
+unless the environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which
+case a prominent warning is printed. The TCP handshake authenticates the
+client, but the session that follows is plaintext and the server is never
+authenticated to the client, so an on-path attacker could read or inject into
+a tool-executing session. Prefer a loopback bind behind an SSH tunnel or
+another encrypted, mutually authenticated channel.
 
 Every `session/new` request must provide an existing directory as `cwd`.
 zerostack canonicalizes that directory before creating the session and binds

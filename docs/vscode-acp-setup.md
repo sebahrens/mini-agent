@@ -134,8 +134,12 @@ the key in the config file. The environment variable takes precedence.
 mini-agent --acp-port 7890
 ```
 
-`--acp-host` overrides the bind address (default `127.0.0.1`); binding a
-non-loopback address is logged as a warning and still requires the API key.
+`--acp-host` overrides the bind address (default `127.0.0.1`). A non-loopback
+address is refused unless `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1` is set:
+the API key authenticates only the connection handshake, after which the
+session is unencrypted and the client cannot authenticate the server. To reach
+the agent from another machine, keep it on loopback and tunnel (for example
+`ssh -L 7890:127.0.0.1:7890 host`).
 The default port when only `--acp-host` is given is `7243`.
 
 ### 5. Point your client at the agent
