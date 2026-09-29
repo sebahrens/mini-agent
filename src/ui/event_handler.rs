@@ -628,6 +628,7 @@ async fn start_goal_verification(
     );
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let client = ui.client.clone();
+    let session_prices = (ui.session.input_token_cost, ui.session.output_token_cost);
 
     run.goal_gate_generation = run
         .goal_gate_generation
@@ -644,34 +645,57 @@ async fn start_goal_verification(
     // reaps it, which dropping this task's future would not.
     let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
-            &goal,
-            &request,
-            &sandbox,
-            &cfg,
-            async move {
-                let _ = cancelled.await;
-                Ok(())
-            },
-        )
-        .await;
+        // Shared, so the checks and then the judge can each wait on the same
+        // cancellation, and a signal that already fired stays fired.
+        let cancelled = futures::FutureExt::shared(async move {
+            let _ = cancelled.await;
+        });
+        let (checks, mut interrupted) =
+            crate::extras::goal::checks::run_with_interrupt(&goal, &request, &sandbox, &cfg, {
+                let cancelled = cancelled.clone();
+                async move {
+                    cancelled.await;
+                    Ok(())
+                }
+            })
+            .await;
         // A failing check already decides the claim, and the gate returns
         // before it looks at the judge: asking anyway spends a model call on
         // an answer nobody reads.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
+        let mut judge_charge = None;
         let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => Some(
-                crate::extras::goal::judge::ask_with_transcript(
-                    &goal,
-                    &request,
-                    &resolved,
-                    &client,
-                    &transcript,
-                    &cfg,
-                    checks.as_ref(),
+            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
+                // The judge is cancelled like a check: an interrupt or a
+                // `/goal pause` while it waits on its provider abandons the
+                // request rather than letting it run to an ignored verdict
+                // (mini-agent-4teup).
+                let verdict = crate::extras::goal::driver::unless_interrupted(
+                    crate::extras::goal::judge::ask_with_transcript(
+                        &goal,
+                        &request,
+                        &resolved,
+                        &client,
+                        &transcript,
+                        &cfg,
+                        checks.as_ref(),
+                    ),
+                    async move {
+                        cancelled.await;
+                        Ok(())
+                    },
                 )
-                .await,
-            ),
+                .await;
+                interrupted = verdict.is_none();
+                judge_charge = verdict.as_ref().and_then(|call| {
+                    call.charge(
+                        &resolved,
+                        &cfg,
+                        crate::extras::goal::judge::judge_prices(&resolved, &cfg, session_prices),
+                    )
+                });
+                verdict
+            }
             _ => None,
         };
         let _ = tx
@@ -680,6 +704,7 @@ async fn start_goal_verification(
                     operation_id,
                     checks,
                     judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                    judge_charge,
                     judge: judged.map(|call| call.outcome),
                     interrupted,
                 },
@@ -699,6 +724,37 @@ async fn start_goal_verification(
     Ok(true)
 }
 
+/// Stop a goal round's verification once a goal control command (`/goal
+/// pause`) has left its goal no longer running (mini-agent-4teup).
+///
+/// The result would be set aside when it arrived anyway; cancelling now also
+/// terminates the running check's process group and abandons a judge request,
+/// instead of letting them run on for nothing. The task is left to wind down
+/// rather than aborted, because it is what reaps the check. Returns whether a
+/// verification was stopped.
+#[cfg(feature = "goal")]
+pub(crate) fn retire_goal_verification_after_control(
+    run: &mut AgentRunState,
+    session: &crate::session::Session,
+) -> bool {
+    let Some(pending) = run.pending_goal_gate.as_ref() else {
+        return false;
+    };
+    if session
+        .goal_store
+        .snapshot()
+        .is_some_and(|goal| goal_verification_still_applies(&goal, &pending.goal_id))
+    {
+        return false;
+    }
+    if let Some(pending) = run.pending_goal_gate.take() {
+        let _ = pending.cancel.send(());
+    }
+    run.main_abort = None;
+    run.is_running = false;
+    true
+}
+
 /// Whether a verification result may still settle its round.
 #[cfg(feature = "goal")]
 pub(crate) fn goal_verification_still_applies(
@@ -716,6 +772,21 @@ pub(crate) async fn handle_goal_verification_event(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
 ) -> anyhow::Result<bool> {
+    // The judge's tokens were spent whatever happens to its verdict, so the
+    // session is charged for them at the judge model's own prices before a
+    // stale or set-aside result is dropped (mini-agent-kfsup).
+    if let Some(charge) = event.judge_charge.as_ref() {
+        let first_unpriced = ui.session.unpriced_judge_tokens == 0;
+        if !ui.session.charge_judge_call(charge) && first_unpriced {
+            renderer.write_line(
+                &format!(
+                    "goal: no known price for judge model {}; its tokens are counted without cost",
+                    charge.model
+                ),
+                C_AGENT,
+            )?;
+        }
+    }
     // A result from a superseded round is ignored: its generation no longer
     // matches the one in flight.
     let Some(pending) = run

@@ -577,6 +577,12 @@ pub(crate) fn interrupt_target(
     }
 }
 
+/// A background session-title call's answer (mini-agent-3wsib).
+struct SessionTitleResult {
+    session_id: compact_str::CompactString,
+    title: anyhow::Result<compact_str::CompactString>,
+}
+
 pub(crate) struct App<'a> {
     ui: UiContext<'a>,
     run: AgentRunState,
@@ -595,6 +601,13 @@ pub(crate) struct App<'a> {
 
     btw_tx: mpsc::Sender<BtwEvent>,
     btw_rx: mpsc::Receiver<BtwEvent>,
+    /// Generated session titles coming back from the background title call
+    /// (mini-agent-3wsib), keyed by the session they were generated for.
+    title_tx: mpsc::Sender<SessionTitleResult>,
+    title_rx: mpsc::Receiver<SessionTitleResult>,
+    /// The session a title was last requested for, so each session is asked
+    /// about at most once per process whatever the outcome.
+    title_requested_for: Option<compact_str::CompactString>,
     btw_abort: Vec<(
         u32,
         tokio::task::AbortHandle,
@@ -967,6 +980,7 @@ impl<'a> App<'a> {
         }
 
         let (btw_tx, btw_rx) = mpsc::channel::<BtwEvent>(32);
+        let (title_tx, title_rx) = mpsc::channel::<SessionTitleResult>(4);
         let (git_status_tx, git_status_rx) = mpsc::channel(1);
 
         let mut app = Self {
@@ -985,6 +999,9 @@ impl<'a> App<'a> {
             handoff_rx,
             btw_tx,
             btw_rx,
+            title_tx,
+            title_rx,
+            title_requested_for: None,
             btw_abort: Vec::new(),
             btw_inflight: 0,
             btw_next_id: 0,
@@ -1106,6 +1123,9 @@ impl<'a> App<'a> {
                 Some(bev) = self.btw_rx.recv() => {
                     self.handle_btw_event(bev)?;
                     self.refresh()?;
+                }
+                Some(titled) = self.title_rx.recv() => {
+                    self.apply_session_title(titled)?;
                 }
                 _ = tokio::time::sleep_until(
                     self.renderer.notice_deadline().map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
@@ -1821,6 +1841,10 @@ impl<'a> App<'a> {
 
         if terminal_error {
             self.run.turn_trace.clear();
+        }
+
+        if terminal_success {
+            self.request_session_title();
         }
 
         if let Some(text) = failed_prompt {
@@ -2899,6 +2923,61 @@ impl<'a> App<'a> {
         rendered
     }
 
+    /// Ask the opt-in `session_title_model` for a title once the session's
+    /// first exchange is complete (mini-agent-3wsib). The call runs on its own
+    /// task and reports back through `title_rx`; nothing waits for it, and
+    /// until (or unless) it answers, lists keep the first-message title.
+    fn request_session_title(&mut self) {
+        if self.ui.cli.no_session
+            || self.title_requested_for.as_deref() == Some(self.ui.session.id.as_str())
+        {
+            return;
+        }
+        let Some(request) = crate::session::title::title_request(self.ui.cfg, self.ui.session)
+        else {
+            return;
+        };
+        self.title_requested_for = Some(request.session_id.clone());
+        let client = if request.provider == self.ui.session.provider {
+            Ok(self.ui.client.clone())
+        } else {
+            crate::provider::create_client(
+                &request.provider,
+                None,
+                &self.ui.cfg.custom_providers_map(),
+                self.ui.cfg.api_keys.as_ref(),
+            )
+        };
+        let cfg = self.ui.cfg.clone();
+        let tx = self.title_tx.clone();
+        tokio::spawn(async move {
+            let title = match client {
+                Ok(client) => crate::session::title::generate(&request, &client, &cfg).await,
+                Err(error) => Err(error),
+            };
+            let _ = tx
+                .send(SessionTitleResult {
+                    session_id: request.session_id,
+                    title,
+                })
+                .await;
+        });
+    }
+
+    fn apply_session_title(&mut self, titled: SessionTitleResult) -> anyhow::Result<()> {
+        match titled.title {
+            Ok(title) => {
+                if crate::session::title::apply(self.ui.session, &titled.session_id, title) {
+                    self.save_session()?;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "session title generation failed; keeping the first-message title");
+            }
+        }
+        Ok(())
+    }
+
     fn handle_btw_event(&mut self, bev: BtwEvent) -> anyhow::Result<()> {
         match bev {
             BtwEvent::Done {
@@ -3918,6 +3997,7 @@ mod input_reader_lifecycle_tests {
                     }),
                     judge: None,
                     judge_tokens: 0,
+                    judge_charge: None,
                     interrupted: false,
                 }))
             };

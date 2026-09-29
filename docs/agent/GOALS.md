@@ -100,8 +100,12 @@ reached, the goal keeps working rather than completing or ending; three consecut
 completion claims park the goal so an outage cannot pass for verification.
 
 The judge's tokens are the goal's tokens: `/goal status`, the headless `goal` object and the
-`max_tokens` bound count them alongside the agent's, whichever provider the judge is on. The
-session's own cost counters do not yet include them.
+`max_tokens` bound count them alongside the agent's, whichever provider the judge is on. In the
+terminal and headless runs they are also charged to the session's token and cost counters at the
+judge model's own prices (its `quick_models` entry, else the model catalog; the session's prices
+when it judges with the session model). If no price is known for the judge model, its tokens are
+added without cost, the first such call says so, and `/goal status` shows how many judge tokens the
+session cost leaves out.
 
 ## Statuses
 

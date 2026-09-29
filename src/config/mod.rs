@@ -114,6 +114,14 @@ pub struct Config {
     #[cfg(feature = "goal")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_judge_model: Option<CompactString>,
+    /// A `quick_models` entry name that titles sessions for `--resume` and
+    /// `/sessions` after their first exchange. Unset (the default) keeps the
+    /// first-user-message title and makes no model call.
+    ///
+    /// Sensitive like any model selection: the first exchange is sent to the
+    /// named entry's endpoint (mini-agent-3wsib).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title_model: Option<CompactString>,
     /// Wall-clock bound for one verification attempt. Default: 300 seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_timeout_secs: Option<u64>,

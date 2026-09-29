@@ -216,12 +216,23 @@ terminal around its own prompt, an editor by subtracting what the client spent d
 headless run by the round's wall clock, since nothing there can prompt.
 
 `max_tokens` and the goal's token total count the whole round: the agent's usage, including any
-mid-round reminder it was sent, plus the judge call that adjudicated it. A judge is counted in input
-plus output tokens as its provider reported them for the call that returned an answer, parseable or
-not, on whichever provider it runs. A call that failed, was interrupted, or was retried away before a
-final response reported nothing and adds nothing. Tokens, not cost, are what the bound measures, so a
-judge on a cheaper model counts the same per token. The session's cost counters do not include judge
-calls.
+mid-round reminder it was sent, plus the judge call that adjudicated it. The agent's usage is
+normalised once per provider report on every surface (terminal, headless and editor alike), so a
+provider that reports reasoning tokens beside its output (Gemini) has them counted as output. A
+judge is counted in input plus output tokens as its provider reported them (normalised the same
+way) for the call that returned an answer, parseable or not, on whichever provider it runs. A call
+that failed, was interrupted, or was retried away before a final response reported nothing and adds
+nothing. Tokens, not cost, are what the bound measures, so a judge on a cheaper model counts the
+same per token.
+
+The terminal and headless surfaces also charge each judge call to the session's token and cost
+counters, at the judge model's own prices: the session's prices when the judge is the session
+model, otherwise its `quick_models` entry's, then the model catalog's. A judge model with no known
+non-zero price has its tokens added without cost and counted as `unpriced_judge_tokens` in the
+session; the first such call says so (in the transcript, or on stderr headless) and `/goal status`
+shows the running count. The charge is made even when the verdict itself is set aside. An editor
+(ACP) session keeps no cost counters, so there is nothing to charge there. `--output json`'s `cost`
+remains the agent turn's own.
 
 The wrap-up round runs on an agent capped to `wrap_up_max_agent_turns`, so the bound the harness
 announces is the bound the round gets. It is issued once per exhaustion and re-armed by resuming or
@@ -260,9 +271,10 @@ flags applies them afterwards, so a flag always beats the file it overrides.
   unfinished goal is refused. A status-line item shows round and status. Each gate decision prints
   one line, because an agent that keeps going without saying why is the most common complaint about
   autonomous loops. `status` and `pause` are reachable while rounds are chaining, which is the whole
-  time a goal exists. A pause while a completion claim is being verified wins: the result that
-  arrives afterwards is set aside, the round is not counted, and `resume` picks the goal up again.
-  The same holds for a result whose goal was cleared or replaced meanwhile.
+  time a goal exists. A pause while a completion claim is being verified wins: the running check
+  is cancelled (its process group terminated and reaped) and a judge request still waiting on its
+  provider is abandoned, any result that still arrives is set aside, the round is not counted, and
+  `resume` picks the goal up again. The same holds for a goal cleared or replaced meanwhile.
 - **CLI**: `--goal`, `--goal-done`, `--goal-check`, `--goal-max-rounds`, `--goal-continuation`,
   `--goal-replace`. The dependent flags require `--goal` rather than being accepted and dropped. A
   goal under `--no-tools` is refused at startup, whether it came from the flag or from a resumed

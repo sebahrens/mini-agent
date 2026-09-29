@@ -399,6 +399,26 @@ impl AnyClient {
         max_output_tokens: u64,
         retry_config: &RetryConfig,
     ) -> anyhow::Result<(String, rig::completion::Usage)> {
+        self.plain_completion(
+            model_name,
+            prompt,
+            preamble,
+            max_output_tokens,
+            retry_config,
+        )
+        .await
+    }
+
+    /// One no-tools, single-turn completion with a bounded response, on the
+    /// summarizer's request path. Used for goal judging and session titles.
+    pub async fn plain_completion(
+        &self,
+        model_name: &str,
+        prompt: String,
+        preamble: String,
+        max_output_tokens: u64,
+        retry_config: &RetryConfig,
+    ) -> anyhow::Result<(String, rig::completion::Usage)> {
         let model = self.completion_model(model_name.to_string());
         summarize_with_model(
             model,

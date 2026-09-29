@@ -767,6 +767,12 @@ pub async fn handle_slash(
             // the three-way split above.
             let body = text.trim().strip_prefix("/goal").unwrap_or("").trim();
             goal::handle_goal(&parts, body, &mut ctx).await;
+            // A pause (or clear) while the round's claim is being verified
+            // stops the check and the judge rather than letting them finish
+            // for a result that would only be set aside.
+            if crate::ui::event_handler::retire_goal_verification_after_control(run, ui.session) {
+                write_result(renderer, "goal: verification stopped");
+            }
             Ok(())
         }
         #[cfg(not(feature = "goal"))]

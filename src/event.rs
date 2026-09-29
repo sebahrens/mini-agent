@@ -163,6 +163,9 @@ pub(crate) struct GoalVerificationEvent {
     pub judge: Option<crate::extras::goal::gate::JudgeOutcome>,
     /// Tokens the judge call spent, for the goal's token total and budget.
     pub judge_tokens: u64,
+    /// The judge call's usage priced at the judge model's own rates, charged
+    /// to the session whether or not the result still applies.
+    pub judge_charge: Option<crate::extras::goal::judge::JudgeCharge>,
     /// The operator stopped the check while it was running. Nothing was proved
     /// either way, so the round settles as interrupted rather than judged on a
     /// command that was cancelled.

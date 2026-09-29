@@ -1567,6 +1567,16 @@ fn a_goal_counts_the_judges_tokens() {
     // Each scripted completion reports 100 input and 20 output tokens: two
     // for the agent's round and one for the judge.
     assert_eq!(goal["progress"]["tokens_used"], 360, "{goal}");
+    // The judge call is charged to the session's own counters too; the
+    // scripted provider has no price, so its tokens are recorded without cost
+    // and the run says so (mini-agent-kfsup).
+    assert_eq!(session["total_input_tokens"], 300, "{session}");
+    assert_eq!(session["total_output_tokens"], 60, "{session}");
+    assert_eq!(session["unpriced_judge_tokens"], 120, "{session}");
+    assert!(
+        stderr.contains("no known price for judge model"),
+        "{stderr}"
+    );
 }
 
 /// `--no-session` leaves nothing of the run behind: no session file, and no

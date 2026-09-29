@@ -49,6 +49,12 @@ struct SessionHistory {
     turns: VecDeque<CommittedTurn>,
     serialized_bytes: usize,
     summary: Option<String>,
+    /// [`crate::session::compaction_ref`] of the summarizer text behind
+    /// `summary`, so a daily-memory copy of the recap this history already
+    /// replays is left out of the turn's memory block (mini-agent-p9oyv).
+    /// `None` for the emergency recap, which is never written to memory.
+    #[cfg(feature = "memory")]
+    summary_ref: Option<String>,
 }
 
 impl SessionHistory {
@@ -216,6 +222,10 @@ impl SessionHistory {
                         self.serialized_bytes.saturating_sub(turn.serialized_bytes);
                 }
             }
+            #[cfg(feature = "memory")]
+            {
+                self.summary_ref = Some(crate::session::compaction_ref(&summary));
+            }
             // A summarizer may drop anything in the turns it replaces, so the
             // objective is restated from the record rather than hoped for.
             #[cfg(feature = "goal")]
@@ -229,8 +239,20 @@ impl SessionHistory {
         Some(())
     }
 
+    /// The reference of the recap this history replays, which the turn's
+    /// memory block must not repeat.
+    #[cfg(feature = "memory")]
+    fn active_compaction_ref(&self) -> Option<String> {
+        self.summary.as_ref()?;
+        self.summary_ref.clone()
+    }
+
     fn emergency_compact(&mut self) {
         self.summary = Some(Self::EMERGENCY_RECAP.to_string());
+        #[cfg(feature = "memory")]
+        {
+            self.summary_ref = None;
+        }
         while self.needs_compaction() {
             let Some(turn) = self.turns.pop_front() else {
                 break;
@@ -2007,12 +2029,11 @@ async fn settle_acp_goal_round(
                     ),
                     // Fail open, like every other judge failure: an editor
                     // without a reachable judge still gets its checks.
-                    Err(error) => Some(crate::extras::goal::judge::JudgeCall {
-                        outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                    Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
+                        crate::extras::goal::gate::JudgeOutcome::Unavailable {
                             reason: error.to_string(),
                         },
-                        tokens: 0,
-                    }),
+                    )),
                 }
             }
             _ => None,
@@ -2097,12 +2118,10 @@ async fn execute_prompt(
     }
     #[cfg(feature = "hooks")]
     crate::extras::hooks::set_active_workspace(workspace.root());
-    #[cfg(feature = "memory")]
-    let context = {
-        let mut refreshed = (*context).clone();
-        refreshed.refresh_memory_if_changed(None).await;
-        Arc::new(refreshed)
-    };
+    // The provider this turn's usage is reported by, so a goal's token total
+    // is normalised the same way as the TUI's and headless rounds'.
+    #[cfg(feature = "goal")]
+    let usage_provider = acp_provider_and_model(&state.cli, &state.cfg).0;
     #[cfg(test)]
     if let Some(fixture) = &state.runner_fixture {
         let prior_history = history
@@ -2114,7 +2133,15 @@ async fn execute_prompt(
             }
             runner = fixture(prompt_text.to_owned(), prior_history.clone()) => runner,
         };
-        return Ok(relay_paused_runner(session_id, cx, control, paused_runner).await);
+        return Ok(relay_paused_runner(
+            session_id,
+            cx,
+            control,
+            paused_runner,
+            #[cfg(feature = "goal")]
+            (&state.cfg, &usage_provider),
+        )
+        .await);
     }
 
     #[cfg(test)]
@@ -2141,7 +2168,15 @@ async fn execute_prompt(
             })?;
         }
         drop(event_tx);
-        return Ok(relay_prompt_events(session_id, cx, control, event_rx).await);
+        return Ok(relay_prompt_events(
+            session_id,
+            cx,
+            control,
+            event_rx,
+            #[cfg(feature = "goal")]
+            (&state.cfg, &usage_provider),
+        )
+        .await);
     }
 
     let workspace_root = workspace.root();
@@ -2223,6 +2258,16 @@ async fn execute_prompt(
             return Ok(PromptOutcome::cancelled(None));
         }
     }
+    // Refreshed after compaction, so the recap this turn replays is the one
+    // whose daily-memory copy is left out of the block.
+    #[cfg(feature = "memory")]
+    let context = {
+        let mut refreshed = (*context).clone();
+        refreshed
+            .refresh_memory_if_changed(history.active_compaction_ref())
+            .await;
+        Arc::new(refreshed)
+    };
     let prior_history =
         history.snapshot_with_tool_result_retention(state.cfg.resolve_keep_recent_tool_results());
 
@@ -2303,7 +2348,15 @@ async fn execute_prompt(
     else {
         return Ok(PromptOutcome::cancelled(None));
     };
-    Ok(relay_paused_runner(session_id, cx, control, paused_runner).await)
+    Ok(relay_paused_runner(
+        session_id,
+        cx,
+        control,
+        paused_runner,
+        #[cfg(feature = "goal")]
+        (&state.cfg, &usage_provider),
+    )
+    .await)
 }
 
 #[cfg(feature = "mcp")]
@@ -2357,13 +2410,41 @@ async fn relay_paused_runner(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
+    #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
         return cancelled_after_runner(&mut runner.event_rx).await;
     }
-    relay_prompt_events(session_id, cx, control, runner.event_rx).await
+    relay_prompt_events(
+        session_id,
+        cx,
+        control,
+        runner.event_rx,
+        #[cfg(feature = "goal")]
+        usage_provider,
+    )
+    .await
+}
+
+/// Add one usage report to an ACP goal round's token total, normalised for
+/// `provider` exactly once (Gemini reports thinking tokens beside output), so
+/// the goal's `max_tokens` bound counts what the TUI and headless rounds count
+/// (mini-agent-da4my).
+#[cfg(feature = "goal")]
+fn add_goal_usage(
+    total: &mut rig::completion::Usage,
+    cfg: &Config,
+    provider: &str,
+    delta: crate::event::UsageDelta,
+) {
+    let delta = cfg.normalize_usage(provider, delta);
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.total_tokens = total
+        .total_tokens
+        .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
 }
 
 async fn relay_prompt_events(
@@ -2371,6 +2452,7 @@ async fn relay_prompt_events(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
@@ -2514,13 +2596,7 @@ async fn relay_prompt_events(
                 // enforced from this total, so it is accumulated rather than
                 // dropped.
                 #[cfg(feature = "goal")]
-                {
-                    usage.input_tokens = usage.input_tokens.saturating_add(delta.input_tokens);
-                    usage.output_tokens = usage.output_tokens.saturating_add(delta.output_tokens);
-                    usage.total_tokens = usage
-                        .total_tokens
-                        .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
-                }
+                add_goal_usage(&mut usage, usage_provider.0, usage_provider.1, delta);
                 #[cfg(not(feature = "goal"))]
                 let _ = delta;
             }
@@ -3073,6 +3149,66 @@ mod history_tests {
                 ))]
             );
         }
+    }
+
+    /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
+    /// of the recap the ACP history already replays, like the terminal does.
+    #[cfg(feature = "memory")]
+    #[tokio::test]
+    async fn acp_memory_block_excludes_the_recap_history_replays() {
+        let summary = "ACP recap: renamed the parser module";
+        let mut history = SessionHistory::default();
+        assert_eq!(history.active_compaction_ref(), None);
+        history.commit_completed_turn(
+            &"u".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("old answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok((summary.to_string(), messages.len())) },
+            )
+            .await
+            .unwrap();
+        let reference = history.active_compaction_ref().expect("recap reference");
+        assert_eq!(reference, crate::session::compaction_ref(summary));
+
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-acp-p9oyv-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mem = crate::extras::memory::Mem {
+            root: root.clone(),
+            project: "proj".into(),
+            today: "2026-05-25".into(),
+        };
+        crate::extras::memory::flush_compaction_summary(&mem, summary, Some(2));
+        crate::extras::memory::flush_compaction_summary(&mem, "an unrelated summary", None);
+        let block = mem.context_block_excluding(Some(&reference)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!block.contains(summary), "{block}");
+        assert!(block.contains("an unrelated summary"), "{block}");
+
+        // The emergency recap was never written to memory, so nothing is
+        // excluded on its behalf.
+        history.commit_completed_turn(
+            &"v".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("newer answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| async move { anyhow::bail!("summarizer unavailable") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.active_compaction_ref(), None);
     }
 }
 
@@ -6760,5 +6896,41 @@ mod goal_acp_tests {
                 .unwrap_or_default()
                 .contains("already done")
         );
+    }
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_usage_tests {
+    use super::*;
+
+    fn report(output_tokens: u64, reasoning_tokens: u64) -> crate::event::UsageDelta {
+        crate::event::UsageDelta {
+            input_tokens: 100,
+            output_tokens,
+            total_tokens: 100 + output_tokens + reasoning_tokens,
+            reasoning_tokens,
+            ..crate::event::UsageDelta::default()
+        }
+    }
+
+    #[test]
+    fn acp_goal_usage_folds_gemini_thinking_tokens_into_output() {
+        let cfg = Config::default();
+        let mut total = rig::completion::Usage::default();
+        add_goal_usage(&mut total, &cfg, "gemini", report(20, 30));
+        add_goal_usage(&mut total, &cfg, "gemini", report(5, 0));
+        assert_eq!(total.input_tokens, 200);
+        assert_eq!(total.output_tokens, 55);
+        assert_eq!(total.total_tokens, 255);
+    }
+
+    #[test]
+    fn acp_goal_usage_does_not_double_count_inclusive_reasoning() {
+        let cfg = Config::default();
+        let mut total = rig::completion::Usage::default();
+        // OpenAI already includes reasoning in output_tokens.
+        add_goal_usage(&mut total, &cfg, "openai", report(50, 30));
+        assert_eq!(total.output_tokens, 50);
+        assert_eq!(total.total_tokens, 150);
     }
 }

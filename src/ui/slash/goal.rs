@@ -118,6 +118,15 @@ fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
 }
 
 /// Human-readable status, used by `/goal status` and the headless summary.
+/// The `/goal status` line saying how many judge tokens the session cost
+/// leaves out because the judge model's price is unknown (mini-agent-kfsup).
+fn unpriced_judge_line(tokens: u64) -> String {
+    if tokens == 0 {
+        return String::new();
+    }
+    format!("judge tokens without a known price: {tokens} (not in the session cost)\n")
+}
+
 pub(crate) fn render_status(goal: &Goal) -> String {
     let mut out = String::new();
     out.push_str(&format!("objective: {}\n", goal.objective));
@@ -196,7 +205,11 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
 
     match subcommand {
         "status" if bare => match store.snapshot() {
-            Some(goal) => write_result(ctx.renderer, render_status(&goal)),
+            Some(goal) => {
+                let mut status = render_status(&goal);
+                status.push_str(&unpriced_judge_line(ctx.session.unpriced_judge_tokens));
+                write_result(ctx.renderer, status)
+            }
             None => write_result(ctx.renderer, "no goal set — /goal <objective> to set one"),
         },
         "clear" if bare => match store.clear() {
