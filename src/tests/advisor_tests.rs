@@ -37,18 +37,15 @@ fn format_conversation_retains_real_head_and_tail_at_utf8_byte_boundary() {
     // The 1-KB budget gives each side 512 bytes. The User prefix is eight bytes.
     let exact = "界".repeat(168);
     let too_large = format!("{exact}x");
-    for (head, tail, expected) in [(
-        exact.as_str(),
-        exact.as_str(),
-        format!("[User]: {exact}\n\n[... conversation omitted ...]\n\n[User]: {exact}"),
-    )] {
-        let msgs = [
-            msg(MessageRole::User, head),
-            msg(MessageRole::Assistant, "omitted middle"),
-            msg(MessageRole::User, tail),
-        ];
-        assert_eq!(format_conversation(&msgs, 1), expected);
-    }
+    let msgs = [
+        msg(MessageRole::User, &exact),
+        msg(MessageRole::Assistant, "omitted middle"),
+        msg(MessageRole::User, &exact),
+    ];
+    assert_eq!(
+        format_conversation(&msgs, 1),
+        format!("[User]: {exact}\n\n[... conversation omitted ...]\n\n[User]: {exact}")
+    );
     // One byte over the side budget is truncated at a UTF-8 boundary, not dropped.
     let rendered = format_conversation(
         &[

@@ -250,6 +250,7 @@ pub(crate) fn merge_extra_body(
 /// agent builds in `build_agent_in_workspace`, so every request keeps the
 /// user's `extra_body` and `[reasoning]` settings (including `store = false`)
 /// and OpenRouter keeps its provider routing.
+#[cfg(any(feature = "subagents", feature = "advisor"))]
 pub(crate) fn provider_request_params(
     model: &AnyModel,
     cfg: &Config,

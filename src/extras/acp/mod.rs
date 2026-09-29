@@ -542,6 +542,7 @@ struct AcpState {
     /// Client-supplied stdio MCP servers launch local processes, so they are
     /// accepted only from the editor that spawned this server over stdio,
     /// never from a network peer.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     accepts_client_mcp: bool,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
@@ -1051,8 +1052,10 @@ async fn handle_new_session(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
-    #[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+    #[cfg(feature = "mcp")]
     let client_mcp_servers = client_mcp_servers(state, &req.mcp_servers)?;
+    #[cfg(not(feature = "mcp"))]
+    client_mcp_servers(state, &req.mcp_servers)?;
     let workspace_root = workspace.root();
     let sandbox = acp_session_sandbox(state, workspace.clone())?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -1131,7 +1134,10 @@ fn client_mcp_servers(
 ) -> Result<ClientMcpServers, agent_client_protocol::Error> {
     let refuse = |message: String| Err(agent_client_protocol::Error::new(-32602, message));
     if servers.is_empty() {
-        return Ok(Default::default());
+        #[cfg(feature = "mcp")]
+        return Ok(ClientMcpServers::new());
+        #[cfg(not(feature = "mcp"))]
+        return Ok(());
     }
     #[cfg(not(feature = "mcp"))]
     {
