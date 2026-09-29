@@ -556,3 +556,28 @@ fn replayed_tool_history_converts_into_responses_api_input_items() {
         );
     }
 }
+
+// mini-agent-64qyf: a goal round that ended in its goal_report leaves an empty
+// assistant record interactively; replaying it would send an empty text block.
+#[test]
+fn empty_assistant_records_are_not_replayed() {
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "work on the goal");
+    session.add_tool_call_with_id(
+        "call_1",
+        "goal_report",
+        &serde_json::json!({"status": "progress"}),
+    );
+    session.add_tool_result_with_id("call_1", "goal_report", "Report recorded for round 1 of 5.");
+    session.add_message(MessageRole::Assistant, "");
+    session.add_message(MessageRole::User, "next");
+
+    let history = convert_history(&session);
+    assert!(
+        !history
+            .iter()
+            .any(|message| *message == Message::assistant("")),
+        "{history:?}"
+    );
+    assert_eq!(history.last(), Some(&Message::user("next")));
+}

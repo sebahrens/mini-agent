@@ -78,9 +78,15 @@ on a fresh install; an existing legacy install keeps
 `provider = "provider_name"`.
 
 `ZS_MODEL` selects a model through the same CLI field as `--model`. For
-compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback—even
-when another provider is selected—and takes precedence over the config-file
-model. Prefer `ZS_MODEL` for provider-neutral configuration.
+compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback when
+OpenRouter is the provider in effect, and then takes precedence over the
+config-file model; it is ignored for other providers. Prefer `ZS_MODEL` for
+provider-neutral configuration.
+
+The config-file `model` is used only with the provider it belongs to (a quick
+model's own provider, otherwise the configured `provider`). When `--provider`
+or the config's `provider` selects a different one and no model is given,
+that provider's default model is used instead of another provider's model id.
 
 If you are using a provider that's not your default one, use the `--provider` CLI flag:
 
@@ -191,11 +197,11 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--pure-stdout` | With `-p`, include tool calls and results on stdout rather than reserving stdout for the final answer. |
 | `--output text\|json` | With `-p`, select plain streamed text (the default) or one machine-readable JSON result. JSON conflicts with `--pure-stdout`. |
 | `-c`, `--continue` | Continue the most recent session. |
-| `-r`, `--resume` | List recent sessions for selection. |
+| `-r`, `--resume` | List recent sessions for selection, each titled by its name or first message. |
 | `--name <name>` | Set a name for the new session |
-| `--session <id-or-name>` | Load session by ID prefix or name |
+| `--session <id-or-name>` | Load a session: an exact ID or exact (case-insensitive) name wins, otherwise a unique ID prefix or name substring |
 | `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |
-| `--no-session` | Run ephemerally without saving a session. |
+| `--no-session` | Run ephemerally without saving a session or goal round records. |
 | `--restrictive` | Ask for every operation. |
 | `--read-only` | Only reads files |
 | `--guarded` | Allow reads and ask for other operations. |
@@ -221,6 +227,15 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 {"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
 ```
 
+The object is the first and only line on stdout. `result` is the text of the turn's final
+completion: text the agent wrote before a tool call is saved as its own message in the session but
+is not prepended to `result`, matching the interactive transcript. A goal round that ends with an
+accepted `goal_report` and no closing text completes with an empty `result` rather than being
+retried as an empty response.
+
+In text mode, closing stdout early (for example `mini-agent -p ... | head -5`) no longer aborts
+the run: output stops, the turn finishes, and the session is still saved.
+
 `stop_reason` is `"completed"` on success and `"failed"` when the agent, explicit shell command,
 or session save fails. Failed turns retain observed output, tool counts, changed files, usage,
 and cost, and exit nonzero; completed tool records are saved unless `--no-session` is set or
@@ -238,7 +253,10 @@ is interrupted through the same cleanup path.
 with `write` and `edit` targets visible in the provider transcript. It is empty when no
 change can be observed (for example, a non-Git workspace changed only by an opaque shell command).
 `cost` is the estimated cost of this invocation in US dollars using the resolved model prices; it
-is zero when prices are unavailable. Status and diagnostic messages remain on stderr so scripts can
+is zero when prices are unavailable. `usage.output_tokens` includes reasoning tokens for every
+provider: Gemini reports its thinking tokens separately, so they are added to it (and still shown
+in `usage.reasoning_tokens`), and the session totals and cost charge them the same way. Status and
+diagnostic messages remain on stderr so scripts can
 parse stdout directly. Headless runs use a non-interactive prompt: the agent states reasonable
 assumptions and proceeds within its granted authority instead of waiting for clarification.
 

@@ -43,6 +43,28 @@ pub const MAX_CRITERION_CHARS: usize = 500;
 /// Retained [`Report`] history. Bounded so a long goal cannot grow the session
 /// file without limit.
 pub const MAX_REPORTS: usize = 8;
+/// Retained [`RoundHistoryEntry`] lines, for `/goal status`. Bounded for the
+/// same reason as the reports; the full record is the round transcripts.
+pub const MAX_ROUND_HISTORY: usize = 10;
+/// Longest summary kept per history entry.
+pub const ROUND_HISTORY_CHARS: usize = 200;
+
+/// One gate evaluation, as `/goal status` lists it.
+///
+/// A round can be evaluated more than once: an interrupted verification
+/// settles without counting the round, and the next evaluation is the same
+/// round's second attempt. Listing both is how an operator sees why round 2
+/// took two tries rather than reading a counter that did not move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundHistoryEntry {
+    /// The round this evaluation was for.
+    pub round: u32,
+    /// Which evaluation of that round, from 1.
+    pub attempt: u32,
+    /// The line the surfaces printed for it, bounded.
+    pub summary: String,
+    pub at: CompactString,
+}
 
 /// Why a goal is parked in [`GoalStatus::Paused`].
 ///
@@ -586,6 +608,9 @@ pub struct Goal {
     pub reports: VecDeque<Report>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verdict: Option<Verdict>,
+    /// The most recent gate evaluations, newest last.
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub history: VecDeque<RoundHistoryEntry>,
     pub created_at: CompactString,
     pub updated_at: CompactString,
 }
@@ -683,6 +708,7 @@ impl Goal {
             progress: GoalProgress::default(),
             reports: VecDeque::new(),
             last_verdict: None,
+            history: VecDeque::new(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -702,6 +728,35 @@ impl Goal {
         };
         self.touch();
         true
+    }
+
+    /// Record one gate evaluation of `round`, discarding the oldest beyond
+    /// [`MAX_ROUND_HISTORY`]. Consecutive evaluations of the same round are
+    /// numbered as attempts.
+    pub fn push_history(&mut self, round: u32, summary: &str) {
+        let attempt = self
+            .history
+            .back()
+            .filter(|last| last.round == round)
+            .map_or(1, |last| last.attempt.saturating_add(1));
+        let summary = if summary.chars().count() > ROUND_HISTORY_CHARS {
+            summary
+                .chars()
+                .take(ROUND_HISTORY_CHARS)
+                .collect::<String>()
+                + "…"
+        } else {
+            summary.to_string()
+        };
+        self.history.push_back(RoundHistoryEntry {
+            round,
+            attempt,
+            summary,
+            at: now_rfc3339(),
+        });
+        while self.history.len() > MAX_ROUND_HISTORY {
+            self.history.pop_front();
+        }
     }
 
     /// Append a model report, discarding the oldest beyond [`MAX_REPORTS`].
@@ -1005,6 +1060,8 @@ struct StoredGoal {
     reports: VecDeque<serde_json::Value>,
     #[serde(default, deserialize_with = "lenient")]
     last_verdict: Option<Verdict>,
+    #[serde(default)]
+    history: VecDeque<serde_json::Value>,
     created_at: CompactString,
     updated_at: CompactString,
 }
@@ -1053,6 +1110,11 @@ impl StoredGoal {
                 .filter_map(|value| serde_json::from_value::<Report>(value).ok())
                 .collect(),
             last_verdict: self.last_verdict,
+            history: self
+                .history
+                .into_iter()
+                .filter_map(|value| serde_json::from_value::<RoundHistoryEntry>(value).ok())
+                .collect(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -1163,6 +1225,42 @@ mod tests {
         let mut met = goal.clone();
         met.set_status(GoalStatus::Met, None);
         assert!(!met.reopen(), "only an impossible goal reopens");
+    }
+
+    /// The round history is bounded, numbers repeated evaluations of a round
+    /// as attempts, survives a save, and a record without one still loads
+    /// (mini-agent-2jqy9).
+    #[test]
+    fn round_history_is_bounded_numbers_attempts_and_round_trips() {
+        let mut goal = goal();
+        goal.push_history(1, "not yet");
+        goal.push_history(1, "not yet again");
+        goal.push_history(2, &"x".repeat(ROUND_HISTORY_CHARS * 2));
+        let attempts: Vec<_> = goal.history.iter().map(|e| (e.round, e.attempt)).collect();
+        assert_eq!(attempts, vec![(1, 1), (1, 2), (2, 1)]);
+        assert!(goal.history[2].summary.chars().count() <= ROUND_HISTORY_CHARS + 1);
+
+        for round in 3..(3 + MAX_ROUND_HISTORY as u32) {
+            goal.push_history(round, "not yet");
+        }
+        assert_eq!(goal.history.len(), MAX_ROUND_HISTORY);
+        assert_eq!(
+            goal.history.back().unwrap().round,
+            2 + MAX_ROUND_HISTORY as u32
+        );
+
+        let json = serde_json::to_value(&goal).unwrap();
+        let reloaded: Goal = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(reloaded.history, goal.history);
+
+        // A goal written before the history existed has none, and one with
+        // no history writes none.
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("history");
+        let reloaded: Goal = serde_json::from_value(legacy).unwrap();
+        assert!(reloaded.history.is_empty());
+        let fresh = serde_json::to_value(super::Goal::new("x", Vec::new()).unwrap()).unwrap();
+        assert!(fresh.get("history").is_none());
     }
 
     #[test]

@@ -19,6 +19,37 @@ use crate::session::{
 
 const CHAT_HISTORY_FILE_LABEL: &str = "chat history file";
 
+/// Set once headless stdout has failed (normally `EPIPE` from `| head`).
+static HEADLESS_STDOUT_CLOSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Write headless (`-p`) output to stdout without ever panicking.
+///
+/// `print!` panics when the reader has gone away, which in a headless run
+/// would abort the process before the turn is finished and the session saved
+/// (mini-agent-4nqvb). Once a write fails, later output is dropped silently:
+/// the turn still completes and is persisted, it just has nowhere to be shown.
+pub(crate) fn headless_stdout(args: std::fmt::Arguments<'_>) {
+    emit_headless(io::stdout().lock(), &HEADLESS_STDOUT_CLOSED, args);
+}
+
+fn emit_headless(
+    mut writer: impl IoWrite,
+    closed: &std::sync::atomic::AtomicBool,
+    args: std::fmt::Arguments<'_>,
+) {
+    use std::sync::atomic::Ordering;
+    if closed.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Err(error) = writer.write_fmt(args).and_then(|()| writer.flush()) {
+        closed.store(true, Ordering::Relaxed);
+        if error.kind() != io::ErrorKind::BrokenPipe {
+            tracing::warn!("headless stdout write failed; further output is dropped: {error}");
+        }
+    }
+}
+
 /// Wait for a headless interruption without affecting the interactive UI.
 pub(crate) async fn headless_interrupt() -> io::Result<()> {
     #[cfg(unix)]
@@ -466,9 +497,11 @@ impl std::error::Error for HeadlessGoalExit {}
 /// `interactions` is the runner's canonical provider transcript for the turn
 /// (`run_print`'s third return value), accumulated across every stream of the
 /// turn. Tool results are attributed to their tool by the same identifier the
-/// call was recorded under so the record carries the real tool name; assistant
-/// text inside `interactions` is not persisted separately because `response`
-/// already carries the turn's complete text.
+/// call was recorded under so the record carries the real tool name. Assistant
+/// text written before a tool call is persisted as its own message ahead of
+/// that call, as the interactive UI does; text after the last call is the
+/// turn's `response`, written last (mini-agent-knwk1). An empty response (a
+/// round that ended in its `goal_report`) writes no assistant message.
 ///
 /// Records are keyed by [`persisted_call_identifier`] — the provider `call_id`
 /// when there is one — because the interactive path adopts that same key when
@@ -486,6 +519,7 @@ pub(crate) fn persist_headless_turn(
     session.add_message(MessageRole::User, prompt);
     let mut tool_names: HashMap<String, &str> = HashMap::new();
     let mut pending_reasoning: Vec<PersistedReasoning> = Vec::new();
+    let mut pending_text = String::new();
     for interaction in interactions {
         match interaction {
             Message::Assistant { content, .. } => {
@@ -498,6 +532,12 @@ pub(crate) fn persist_headless_turn(
                             }
                         }
                         AssistantContent::ToolCall(call) => {
+                            if !pending_text.is_empty() {
+                                session.add_message(
+                                    MessageRole::Assistant,
+                                    &std::mem::take(&mut pending_text),
+                                );
+                            }
                             let identifier = persisted_call_identifier(
                                 call.call_id.as_deref(),
                                 call.id.as_str(),
@@ -521,7 +561,8 @@ pub(crate) fn persist_headless_turn(
                                 },
                             );
                         }
-                        AssistantContent::Text(_) | AssistantContent::Image(_) => {}
+                        AssistantContent::Text(text) => pending_text.push_str(&text.text),
+                        AssistantContent::Image(_) => {}
                     }
                 }
             }
@@ -553,7 +594,11 @@ pub(crate) fn persist_headless_turn(
             Message::System { .. } => {}
         }
     }
-    session.add_message(MessageRole::Assistant, response);
+    // Text after the last tool call is the final answer, which `response`
+    // carries.
+    if !response.is_empty() {
+        session.add_message(MessageRole::Assistant, response);
+    }
 }
 
 const CHAT_HISTORY_ENTRY_LIMIT_LABEL: &str = "chat history entry limit";
@@ -775,6 +820,34 @@ fn write_output(mut writer: impl IoWrite, output: &str) -> io::Result<()> {
     }
 }
 
+/// One session in `--resume` and `/sessions`: id, time, size and model, then
+/// its title ([`Session::list_title`]) and the tail of its last message.
+pub(crate) fn session_list_line(s: &Session) -> String {
+    let last = s
+        .messages
+        .last()
+        .map(|m| {
+            let preview = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("...{}", preview.chars().take(30).collect::<String>())
+        })
+        .unwrap_or_default();
+    let title = s.list_title();
+    let title = if title.is_empty() {
+        String::new()
+    } else {
+        format!("{title}  ")
+    };
+    format!(
+        "  {}  {}  {}msgs  {}  {}{}",
+        short_session_id(&s.id),
+        crate::ui::events::format_time(&s.updated_at),
+        s.messages.len(),
+        s.model,
+        title,
+        last,
+    )
+}
+
 pub(crate) fn print_sessions() {
     let sessions = match session::storage::find_recent_sessions(20) {
         Ok(s) => s,
@@ -788,29 +861,7 @@ pub(crate) fn print_sessions() {
     } else {
         println!("recent sessions ({}):", sessions.len());
         for s in &sessions {
-            let last = s
-                .messages
-                .last()
-                .map(|m| {
-                    let truncated: String = m.content.chars().take(30).collect();
-                    format!("...{truncated}")
-                })
-                .unwrap_or_default();
-            let time = crate::ui::events::format_time(&s.updated_at);
-            let name_col = if s.name.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", s.name)
-            };
-            println!(
-                "  {}  {}  {}msgs  {}  {}{}",
-                short_session_id(&s.id),
-                time,
-                s.messages.len(),
-                s.model,
-                last,
-                name_col
-            );
+            println!("{}", session_list_line(s));
         }
         println!();
         println!("Use --session <id-or-name> to load a session by its ID prefix or name.");
@@ -1042,7 +1093,7 @@ mod tests {
 
     use super::{
         CHAT_HISTORY_FILE_LABEL, chat_history_limit_entry, chat_history_path_policy_entry,
-        installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
+        emit_headless, installed_build_entry, javascript_worker_compiled_entry, parse_git_status,
         render_headless_json, write_output,
     };
 
@@ -1171,6 +1222,55 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    // mini-agent-72jb0: session lists lead with a title — the name, else the
+    // first user message — before the last-message preview.
+    #[test]
+    fn session_list_line_shows_a_title_before_the_preview() {
+        use crate::session::{MessageRole, SESSION_TITLE_CHARS, Session};
+        let mut session = Session::new("openai", "gpt-test", 128_000, "");
+        assert_eq!(session.list_title(), "");
+        session.add_message(MessageRole::User, "  fix the\nflaky   parser test  ");
+        session.add_message(MessageRole::Assistant, "done, the parser test passes");
+        assert_eq!(session.list_title(), "fix the flaky parser test");
+        let line = super::session_list_line(&session);
+        let title_at = line.find("fix the flaky parser test").expect(&line);
+        let preview_at = line.find("...done, the parser").expect(&line);
+        assert!(title_at < preview_at, "{line}");
+
+        let mut long = Session::new("openai", "gpt-test", 128_000, "");
+        long.add_message(MessageRole::User, &"é".repeat(200));
+        let title = long.list_title();
+        assert_eq!(title.chars().count(), SESSION_TITLE_CHARS);
+        assert!(title.ends_with('…'));
+
+        session.name = "parser".into();
+        assert_eq!(session.list_title(), "[parser]");
+    }
+
+    // mini-agent-4nqvb: a closed stdout must neither panic nor keep writing.
+    #[test]
+    fn headless_output_stops_quietly_after_a_closed_pipe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let closed = AtomicBool::new(false);
+        emit_headless(BrokenPipeWriter, &closed, format_args!("first"));
+        assert!(closed.load(Ordering::Relaxed));
+
+        // Once closed, nothing reaches the writer at all.
+        let mut sink = Vec::new();
+        emit_headless(&mut sink, &closed, format_args!("second"));
+        assert!(sink.is_empty());
+
+        let open = AtomicBool::new(false);
+        emit_headless(FlushBrokenPipeWriter, &open, format_args!("x"));
+        assert!(open.load(Ordering::Relaxed), "a failed flush also closes");
+
+        let open = AtomicBool::new(false);
+        let mut sink = Vec::new();
+        emit_headless(&mut sink, &open, format_args!("ok {}", 1));
+        assert_eq!(sink, b"ok 1");
+        assert!(!open.load(Ordering::Relaxed));
     }
 
     #[test]

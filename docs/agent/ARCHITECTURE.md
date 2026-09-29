@@ -62,8 +62,10 @@ Files from all levels are concatenated, with source-path headers indicating
 where each block came from. This lets you define organization-wide conventions
 in the global file while having project-specific architecture in each repo.
 
-At startup, if no `ARCHITECTURE.md` is found anywhere in the directory tree,
-zerostack offers to create one:
+At an interactive startup, if no `ARCHITECTURE.md` is found anywhere in the
+directory tree, zerostack offers to create one. Headless runs (`-p`, `--goal`
+with `-p`, `--loop`, `--acp`) never ask, so they cannot stop on the question or
+consume piped input:
 
 ```
 No ARCHITECTURE.md found in /home/you/project. Create one? [y/N]

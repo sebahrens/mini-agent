@@ -30,6 +30,36 @@ pub(crate) fn read_utf8_bounded_status(
     })
 }
 
+/// Read at most `limit` bytes of UTF-8 text: `Some((text, truncated))`, or
+/// `None` when the prefix is not valid UTF-8. A multi-byte character split by
+/// the limit is dropped rather than making the whole prefix invalid.
+pub(crate) fn read_utf8_prefix(
+    reader: impl Read,
+    limit: usize,
+) -> io::Result<Option<(String, bool)>> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024).saturating_add(1));
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some((text, truncated))),
+        Err(error) => {
+            let utf8 = error.utf8_error();
+            // Only an incomplete character at the cut is tolerated.
+            if truncated && utf8.error_len().is_none() {
+                let valid = utf8.valid_up_to();
+                let mut bytes = error.into_bytes();
+                bytes.truncate(valid);
+                Ok(String::from_utf8(bytes).ok().map(|text| (text, true)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// A canonical workspace directory plus the filesystem identity captured when
 /// an ACP session was created.  Keeping the pathname alone is insufficient:
 /// an attacker could rename the directory and replace it with a symlink (or a
@@ -172,16 +202,21 @@ impl WorkspaceBinding {
         Ok(files)
     }
 
-    pub(crate) fn read_ancestor_files(&self, names: &[&str]) -> Vec<(PathBuf, String, String)> {
+    /// Each named context file in the workspace, read up to `max_bytes`:
+    /// `(directory, name, content, truncated)`. A file that is not UTF-8 is
+    /// skipped; one larger than `max_bytes` is never read whole.
+    pub(crate) fn read_ancestor_files(
+        &self,
+        names: &[&str],
+        max_bytes: usize,
+    ) -> Vec<(PathBuf, String, String, bool)> {
         let mut files = Vec::new();
         for (path, directory) in &self.ancestors {
             for name in names {
-                if let Ok(mut file) = open_file_no_follow(directory, OsStr::new(name)) {
-                    let mut content = String::new();
-                    if file.read_to_string(&mut content).is_err() {
-                        continue;
-                    }
-                    files.push((path.clone(), (*name).to_string(), content));
+                if let Ok(file) = open_file_no_follow(directory, OsStr::new(name))
+                    && let Ok(Some((content, truncated))) = read_utf8_prefix(file, max_bytes)
+                {
+                    files.push((path.clone(), (*name).to_string(), content, truncated));
                 }
             }
         }
@@ -742,15 +777,19 @@ mod workspace_binding_tests {
         std::fs::write(root.join("AGENTS.md"), "workspace instruction").unwrap();
 
         let binding = WorkspaceBinding::capture(&root).unwrap();
-        let context = binding.read_ancestor_files(&["AGENTS.md"]);
+        let context = binding.read_ancestor_files(&["AGENTS.md"], 1024);
         assert_eq!(
             context,
             vec![(
                 root.clone(),
                 "AGENTS.md".to_string(),
-                "workspace instruction".to_string()
+                "workspace instruction".to_string(),
+                false
             )]
         );
+        let capped = binding.read_ancestor_files(&["AGENTS.md"], 9);
+        assert_eq!(capped[0].2, "workspace");
+        assert!(capped[0].3);
 
         std::fs::remove_dir_all(container).unwrap();
     }
@@ -1732,6 +1771,16 @@ pub fn artifact_disabled(artifact: &'static str) -> bool {
         .get()
         .and_then(|disabled| disabled.lock().ok())
         .is_some_and(|disabled| disabled.contains(artifact))
+}
+
+/// Suppress the per-run records that belong to a session.
+///
+/// `--no-session` promises that the run leaves no session behind. A goal's
+/// round transcripts are that session's audit trail, written as the rounds
+/// settle, so they are switched off with it rather than left as an orphaned
+/// directory for a session that was never saved.
+pub fn disable_session_artifacts() {
+    disable_artifact("goal transcripts");
 }
 
 fn disable_artifact(artifact: &'static str) {

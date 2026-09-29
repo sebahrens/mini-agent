@@ -274,6 +274,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
             verified: vec![crate::extras::goal::VerificationKind::Checks],
         }),
         judge: None,
+        judge_tokens: 0,
         interrupted: false,
     };
     assert!(
@@ -290,4 +291,146 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
 
     std::fs::write(&release, b"go").unwrap();
     while rx.try_recv().is_ok() {}
+}
+
+/// `/goal pause` while a completion claim is being verified wins over the
+/// verdict that arrives afterwards: the goal stays paused, the round is not
+/// counted, and resuming it works as for any paused goal (mini-agent-v5r3p).
+#[cfg(all(unix, feature = "goal"))]
+#[tokio::test]
+async fn a_goal_paused_during_verification_is_not_overwritten_by_its_result() {
+    use crate::event::{AgentEvent, UserEvent};
+    use crate::extras::goal::{GoalStatus, PauseReason};
+    use crate::sandbox::Sandbox;
+    use crate::ui::event_handler::{handle_agent_event, handle_goal_verification_event};
+    use crate::ui::state::{AgentRunState, ChainState, SlashState, UiContext};
+    use clap::Parser;
+    use std::time::Duration;
+
+    let root = loop_test_data_dir();
+    let workspace =
+        std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&root.path).unwrap());
+    let mut context = crate::context::load(true);
+    context.workspace_root = workspace.root().to_path_buf();
+    let cli = crate::cli::Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--no-sandbox",
+        "--shell",
+        "/bin/sh",
+    ]);
+    let cfg = crate::config::Config::default();
+    let mut session = crate::session::Session::new("openrouter", "test", 128_000, "");
+    let mut goal = crate::extras::goal::Goal::new("verify something", Vec::new()).unwrap();
+    goal.judge = crate::extras::goal::JudgePolicy::Off;
+    goal.checks
+        .push(crate::extras::goal::GoalCheck::new("true"));
+    session.goal_store.set(goal, false).unwrap();
+    session
+        .goal_store
+        .append_report(crate::extras::goal::Report {
+            status: crate::extras::goal::ReportStatus::Met,
+            evidence: Some("claimed".into()),
+            blocker: None,
+            reason: None,
+            question: None,
+            round: 1,
+            at: compact_str::CompactString::new("now"),
+        });
+
+    let client = crate::provider::AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::new("unused-test-key").unwrap(),
+    );
+    let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
+        .unwrap()
+        .0;
+    let sandbox = crate::permission::bind_configured_shell(
+        &cli,
+        &cfg,
+        authority,
+        &workspace,
+        None,
+        Sandbox::new(false, "__missing_goal_test_backend__"),
+    )
+    .with_workspace_binding(workspace.clone());
+    let mut ui = UiContext::new(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+        client,
+        None,
+        None,
+        sandbox,
+        None,
+    );
+    let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+    let slash = SlashState {
+        show_reasoning: false,
+        reasoning_enabled: false,
+        todo_tools_enabled: false,
+    };
+    let mut chain = ChainState::default();
+    let mut run = AgentRunState::default();
+    run.goal_round = Some(crate::extras::goal::driver::RoundCollector::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    handle_agent_event(
+        AgentEvent::Done {
+            response: "finished".into(),
+            interactions: Vec::new(),
+        },
+        &mut renderer,
+        &mut run,
+        &mut ui,
+        &slash,
+        &mut chain,
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert!(run.pending_goal_gate.is_some(), "verification is in flight");
+
+    // The operator pauses while the check runs, exactly as `/goal pause` does.
+    ui.session
+        .goal_store
+        .with_mut(|goal| goal.set_status(GoalStatus::Paused, Some(PauseReason::UserRequested)));
+
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the check finishes")
+        .expect("a verification result");
+    let UserEvent::GoalVerificationDone(event) = event else {
+        panic!("expected the verification result");
+    };
+    assert!(
+        event
+            .checks
+            .as_ref()
+            .is_some_and(|checks| checks.all_passed),
+        "the passing check would have completed the goal"
+    );
+    assert!(
+        !handle_goal_verification_event(event, &mut renderer, &mut run, &mut ui)
+            .await
+            .unwrap(),
+        "a paused goal is not relaunched"
+    );
+    let goal = ui.session.goal_store.snapshot().unwrap();
+    assert_eq!(goal.status, GoalStatus::Paused, "the pause stands");
+    assert_eq!(goal.paused_reason, Some(PauseReason::UserRequested));
+    assert_eq!(goal.progress.rounds, 0, "the set-aside round is uncounted");
+    assert!(run.pending_goal_gate.is_none() && !run.is_running);
+
+    assert_eq!(
+        ui.session
+            .goal_store
+            .with_mut(crate::extras::goal::Goal::resume),
+        Some(true)
+    );
+    assert_eq!(
+        ui.session.goal_store.snapshot().unwrap().status,
+        GoalStatus::Active
+    );
 }

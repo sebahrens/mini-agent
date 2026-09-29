@@ -19,7 +19,7 @@ All slash commands are available from the TUI input prompt.
 | `/retry` | Load the last user message into the input editor for editing. |
 | `/quit` | Exit zerostack. |
 | `/exit` | Alias for `/quit`. |
-| `/sessions` | List recent saved sessions (up to 20). |
+| `/sessions` | List recent saved sessions (up to 20). Each line shows a title (the session name, or else its first message) before a preview of the last message. |
 | `/sessions <id-or-name>` | Load a session by its ID prefix or name. |
 | `/sessions delete <id-or-name>` | Delete a session by its ID prefix or name. |
 | `/rename <name>` | Rename the current session. |
@@ -40,7 +40,11 @@ while executable/active schemes, non-HTTPS images, and tags are removed. The pag
 restrictive Content Security Policy as defense in depth. JSONL exports preserve the original text
 and, for newly recorded tool interactions, the correlated tool-call name, arguments, identifier,
 and bounded tool result used to resume the model conversation. Older exports without those optional
-fields remain importable and replay their tool records as labeled transcript text.
+fields remain importable and replay their tool records as labeled transcript text. The JSONL header
+also carries the session's token and cost totals and its context window, and a goal travels as its
+objective, criteria, status and progress; `/import` restores both. An imported goal takes its
+checks, judge and bounds from the importing installation, never from the file, and a status this
+build does not know parks it.
 
 ## Provider & Model
 
@@ -255,7 +259,10 @@ are written under the goal transcript directory rather than a separate one.
 model's update instructions (default: `LOOP_PLAN.md`). When that file exists,
 startup asks whether to resume if stdin is a terminal; unattended runs resume
 automatically without reading stdin. To start fresh unattended, remove the plan
-before launching or select a new path.
+before launching or select a new path. `/loop` uses `LOOP_PLAN.md` in the
+current workspace (the worktree, after `/worktree`), resolved when the loop
+starts. Each iteration re-reads the plan and shows at most its first 32 KiB, so
+a plan that keeps growing cannot overflow the context.
 
 The optional `--loop-run <command>` validator uses the selected process sandbox
 and the same captured shell contract as the model-visible shell tool (`-c` for

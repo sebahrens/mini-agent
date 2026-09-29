@@ -292,6 +292,7 @@ pub fn load_session_exact(id: &str) -> anyhow::Result<Option<Session>> {
     }
 }
 
+#[cfg(test)]
 pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
     if disabled("sessions") {
         return Ok(None);
@@ -321,15 +322,50 @@ pub fn find_session_by_name(name: &str) -> anyhow::Result<Option<Session>> {
     Ok(None)
 }
 
-pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
-    if disabled("sessions") {
-        return Ok(Vec::new());
+/// How a `--session <query>` argument resolved against the saved sessions.
+pub enum SessionSelection {
+    One(Box<Session>),
+    NoMatch,
+    Ambiguous(Vec<Session>),
+}
+
+/// Pick the session a `--session <query>` means from the prefix-search
+/// candidates (id prefix or name substring, newest first).
+///
+/// An exact id wins, then an exact (case-insensitive) name, then a single
+/// prefix/substring match. Without the exact-name step a session named `work`
+/// could never be selected while another was named `homework`
+/// (mini-agent-6wvoz).
+pub fn select_session(query: &str, candidates: Vec<Session>) -> SessionSelection {
+    if let Some(index) = candidates.iter().position(|s| s.id == query) {
+        return SessionSelection::One(Box::new(candidates.into_iter().nth(index).unwrap()));
     }
-    let Some(dir) = existing_session_dir()? else {
-        return Ok(Vec::new());
-    };
-    // Sort by filesystem mtime to avoid loading all sessions
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
+    let lower = query.to_lowercase();
+    let exact_names = candidates
+        .iter()
+        .filter(|s| !s.name.is_empty() && s.name.to_lowercase() == lower)
+        .count();
+    if exact_names > 0 {
+        let mut named: Vec<Session> = candidates
+            .into_iter()
+            .filter(|s| !s.name.is_empty() && s.name.to_lowercase() == lower)
+            .collect();
+        return if named.len() == 1 {
+            SessionSelection::One(Box::new(named.remove(0)))
+        } else {
+            SessionSelection::Ambiguous(named)
+        };
+    }
+    match candidates.len() {
+        0 => SessionSelection::NoMatch,
+        1 => SessionSelection::One(Box::new(candidates.into_iter().next().unwrap())),
+        _ => SessionSelection::Ambiguous(candidates),
+    }
+}
+
+/// Saved session files, newest modification first.
+fn session_paths_newest_first(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|e| e == "json"))
         .map(|e| {
@@ -340,15 +376,25 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
             (mtime, path)
         })
         .collect();
-
-    // Sort newest first
     entries.sort_by_key(|b| std::cmp::Reverse(b.0));
+    Ok(entries.into_iter().map(|(_, path)| path).collect())
+}
+
+pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
+    if disabled("sessions") {
+        return Ok(Vec::new());
+    }
+    let Some(dir) = existing_session_dir()? else {
+        return Ok(Vec::new());
+    };
+    // Sort by filesystem mtime to avoid loading all sessions
+    let entries = session_paths_newest_first(&dir)?;
 
     let mut sessions: Vec<Session> = Vec::new();
     let mut skipped = SkippedEntries::default();
     // The limit applies to sessions that actually decoded: a run of broken
     // recent files must not hide older valid sessions.
-    for (_, path) in entries.iter() {
+    for path in entries.iter() {
         if sessions.len() == limit {
             break;
         }
@@ -368,21 +414,60 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
 /// Return recent sessions whose persisted workspace is exactly the captured
 /// workspace. `--continue` uses this instead of silently importing history and
 /// approvals from whichever project happened to run most recently.
+///
+/// Files are visited newest first, and only a file whose `working_dir`
+/// matches is fully decoded, so `--continue` stops at the first match instead
+/// of deserializing every saved session (mini-agent-5s9me).
 pub fn find_recent_sessions_for_workspace(
     limit: usize,
     workspace: &Path,
 ) -> anyhow::Result<Vec<Session>> {
+    #[derive(serde::Deserialize)]
+    struct WorkspacePeek {
+        #[serde(default)]
+        working_dir: String,
+    }
+
     let workspace = std::fs::canonicalize(workspace)?;
     let mut matches = Vec::new();
-    for session in find_recent_sessions(usize::MAX)? {
-        let saved = Path::new(session.working_dir.as_str());
-        if std::fs::canonicalize(saved).ok().as_deref() == Some(workspace.as_path()) {
-            matches.push(session);
-            if matches.len() == limit {
-                break;
+    if limit == 0 || disabled("sessions") {
+        return Ok(matches);
+    }
+    let Some(dir) = existing_session_dir()? else {
+        return Ok(matches);
+    };
+    let mut skipped = SkippedEntries::default();
+    for path in session_paths_newest_first(&dir)? {
+        let json = match read_private_string(&path) {
+            Ok(json) => json,
+            Err(error) => {
+                skipped.note(&path, &error);
+                continue;
+            }
+        };
+        let peek = match serde_json::from_str::<WorkspacePeek>(&json) {
+            Ok(peek) => peek,
+            Err(error) => {
+                skipped.note(&path, &error);
+                continue;
+            }
+        };
+        let saved = Path::new(peek.working_dir.as_str());
+        if std::fs::canonicalize(saved).ok().as_deref() != Some(workspace.as_path()) {
+            continue;
+        }
+        match serde_json::from_str::<Session>(&json) {
+            Ok(session) => matches.push(session),
+            Err(error) => {
+                skipped.note(&path, &error);
+                continue;
             }
         }
+        if matches.len() == limit {
+            break;
+        }
     }
+    skipped.finish("workspace sessions");
     Ok(matches)
 }
 
