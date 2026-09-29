@@ -114,6 +114,12 @@ impl InputEditor {
             self.close_query_picker();
             return false;
         }
+        // Argument pickers of slash commands (`/theme `, `/models `, ...).
+        let argument_picker = match &self.picker {
+            Some(Picker::Prefixed(_, prefix)) => prefix.starts_with('/'),
+            Some(Picker::Models(_)) => true,
+            _ => false,
+        };
         let handled = match self.picker.as_mut() {
             Some(Picker::File(p)) => {
                 handlers::handle_file_key(&mut self.buffer, &mut self.cursor, p, key)
@@ -153,6 +159,31 @@ impl InputEditor {
         if handled {
             self.yank_pos = None;
         }
+        if handled
+            && argument_picker
+            && super::is_backward_delete(key)
+            && !self.picker.as_ref().is_some_and(Picker::active)
+        {
+            self.back_out_of_argument_picker();
+        }
         handled
+    }
+
+    /// Backspace on an empty argument query closed the argument picker and
+    /// left `/command `: delete that space too and reopen slash completion
+    /// on the command, so backing out walks back the way the user came.
+    fn back_out_of_argument_picker(&mut self) {
+        if self.cursor == self.buffer.len()
+            && self.buffer.ends_with(' ')
+            && !self
+                .buffer
+                .trim_end_matches(' ')
+                .contains(char::is_whitespace)
+            && self.buffer.starts_with('/')
+        {
+            self.buffer.pop();
+            self.cursor = self.buffer.len();
+        }
+        self.reopen_command_picker_for_slash_word();
     }
 }

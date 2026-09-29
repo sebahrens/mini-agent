@@ -865,6 +865,54 @@ mod slash_picker_contract {
         }
     }
 
+    /// mini-agent-o6zkz: backing out of an argument picker returns to slash
+    /// completion for the command instead of leaving a dead `/command `.
+    #[test]
+    fn backspace_out_of_an_argument_picker_reopens_command_completion() {
+        let mut input = InputEditor::new();
+        input.set_theme_names(vec!["dark".to_string(), "light".to_string()]);
+        typed(&mut input, "/theme");
+        press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/theme ")) if p.active));
+        typed(&mut input, "d");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/theme ");
+
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/theme");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert!(command_picker_open(&input));
+        assert_eq!(highlighted(&input).as_deref(), Some("/theme"));
+
+        // Further Backspaces edit the command query, down to the bare slash.
+        for _ in 0.."theme".len() {
+            press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        assert_eq!(input.buffer, "/");
+        assert!(command_picker_open(&input));
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "");
+        assert!(!command_picker_open(&input));
+    }
+
+    #[test]
+    fn backspace_after_an_inserted_command_reopens_completion() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/hel");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/help ");
+        assert!(!command_picker_open(&input));
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/help");
+        assert!(command_picker_open(&input));
+        assert_eq!(highlighted(&input).as_deref(), Some("/help"));
+        // Plain prose with a space never reopens it.
+        let mut input = InputEditor::new();
+        input.load_text("/help me x");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(!command_picker_open(&input));
+    }
+
     #[test]
     fn backspace_with_a_query_keeps_the_slash_and_the_picker() {
         let mut input = InputEditor::new();

@@ -199,6 +199,17 @@ pub(crate) fn is_modifier_chord(key: KeyEvent) -> bool {
     ctrl != alt && !(ctrl && matches!(c, 'h' | 'H'))
 }
 
+/// Backspace, Ctrl+H, Ctrl+W or Alt+Backspace: keys that delete backwards.
+pub(crate) fn is_backward_delete(key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace => true,
+        KeyCode::Char('\x08') => true,
+        KeyCode::Char('h' | 'w') => ctrl,
+        _ => false,
+    }
+}
+
 /// Whether an `@` inserted at byte offset `pos` starts a file mention: at the
 /// buffer start or after whitespace, an opening parenthesis or a quote.
 pub(crate) fn mention_can_start_at(buffer: &str, pos: usize) -> bool {
@@ -680,6 +691,33 @@ impl InputEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        let submitted = self.handle_editor_key(key);
+        if is_backward_delete(key) {
+            self.reopen_command_picker_for_slash_word();
+        }
+        submitted
+    }
+
+    /// After deleting back to a bare `/command` word (for example out of an
+    /// argument picker), offer slash completion again, seeded with the word.
+    pub(crate) fn reopen_command_picker_for_slash_word(&mut self) {
+        if self.picker.as_ref().is_some_and(Picker::active)
+            || self.cursor != self.buffer.len()
+            || !self.buffer.starts_with('/')
+            || self.buffer.chars().any(char::is_whitespace)
+        {
+            return;
+        }
+        let query: String = self.buffer[1..].to_string();
+        self.start_command_picker();
+        if let Some(Picker::Command(picker)) = self.picker.as_mut() {
+            for c in query.chars() {
+                picker.char_input(c);
+            }
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> Option<CompactString> {
         self.clamp_cursor();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
