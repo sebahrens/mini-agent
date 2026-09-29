@@ -107,6 +107,9 @@ pub(crate) struct PermissionBridge {
     invocation_cancellation: Option<PermCancellation>,
     host_call_cancellation: Option<PermCancellation>,
     timeout: Duration,
+    /// The same checker the receiver task consults, read only for the
+    /// non-prompting deny snapshot that filters discovery walks.
+    deny_source: Option<PermCheck>,
     #[cfg(test)]
     sync_wait_clock: Option<Arc<std::sync::Mutex<Instant>>>,
 }
@@ -123,9 +126,25 @@ impl PermissionBridge {
             invocation_cancellation: None,
             host_call_cancellation: None,
             timeout,
+            deny_source: None,
             #[cfg(test)]
             sync_wait_clock: None,
         }
+    }
+
+    /// Deny-only filter for a JS discovery walk (`js/list_dir`, `js/glob`,
+    /// `js/grep`) rooted beneath the approved directory: entries matched by
+    /// the tool's own or the `read`/`js/read_file` path deny rules are hidden
+    /// and denied directories are pruned (mini-agent-c1o7m). It never
+    /// prompts, never consults allow rules or the session allowlist, and
+    /// never feeds doom-loop tracking; see
+    /// [`crate::permission::checker::PermissionChecker::path_deny_probe`].
+    pub(crate) fn walk_deny_filter(
+        &self,
+        tool: &str,
+        workspace_root: Option<&std::path::Path>,
+    ) -> Option<crate::agent::tools::find_files::PathFilter> {
+        crate::agent::tools::walk_deny_filter(&self.deny_source, tool, workspace_root)
     }
 
     pub(crate) fn for_invocation(&self, cancellation: PermCancellation) -> Self {
@@ -462,14 +481,11 @@ impl PermissionBridgeOwner {
     ) -> Self {
         let (tx, rx) = tokio_mpsc::unbounded_channel();
         let shutdown = PermCancellation::new();
-        let task = tokio::spawn(run_permission_receiver(
-            rx,
-            permission,
-            ask_tx,
-            shutdown.clone(),
-        ));
+        let mut bridge = PermissionBridge::new(tx, shutdown.clone(), timeout);
+        bridge.deny_source = permission.clone();
+        let task = tokio::spawn(run_permission_receiver(rx, permission, ask_tx, shutdown));
         Self {
-            bridge: PermissionBridge::new(tx, shutdown, timeout),
+            bridge,
             task: task.abort_handle(),
         }
     }

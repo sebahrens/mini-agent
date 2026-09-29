@@ -1049,7 +1049,8 @@ impl PermissionChecker {
     /// Non-prompting deny probe for one candidate path surfaced by a walking
     /// tool. Only deny rules are evaluated (the tool's own, its aliases, and
     /// the `read` rules for the read-class walkers `grep`, `find_files` and
-    /// `list_dir`, plus `external_directory` denies for paths outside the
+    /// `list_dir` and the JS discovery effects `js/list_dir`, `js/glob` and
+    /// `js/grep`, plus `external_directory` denies for paths outside the
     /// workspace). It never asks, never consults allow rules or the session
     /// allowlist, and never feeds doom-loop tracking. `path` is either
     /// workspace-relative or absolute; both spellings are evaluated.
@@ -1070,6 +1071,13 @@ impl PermissionChecker {
         tools.extend(permission_tool_aliases(canonical).iter().copied());
         if matches!(canonical, "grep" | "find_files" | "list_dir") {
             tools.push("read");
+        }
+        // The JS discovery effects read what they surface too, so `read`
+        // denies (and a `js/read_file` deny, which `read` aliases to) hide
+        // their entries as well (mini-agent-c1o7m).
+        if matches!(canonical, "js/list_dir" | "js/glob" | "js/grep") {
+            tools.push("read");
+            tools.push("js/read_file");
         }
         let mut rules = Vec::new();
         for tool in tools {
@@ -3227,6 +3235,43 @@ mod path_deny_probe_tests {
             CheckResult::Allowed
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    // mini-agent-c1o7m: the JS discovery effects surface what they walk, so
+    // `read` denies hide their entries like they do for the built-in walkers.
+    #[test]
+    fn is_path_denied_covers_js_discovery_effects() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_js_path_deny_probe_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("config/secrets/**".to_string(), Action::Deny),
+                    ("notes/**".to_string(), Action::Ask),
+                ]
+                .into(),
+            )),
+            edit: Some(ToolPerm::Granular(
+                [("src/**".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let checker = checker(&workspace, config);
+        let absolute = workspace
+            .join("config/secrets/key")
+            .to_string_lossy()
+            .into_owned();
+        for tool in ["js/list_dir", "js/glob", "js/grep"] {
+            assert!(checker.is_path_denied(tool, "config/secrets/key"), "{tool}");
+            assert!(checker.is_path_denied(tool, &absolute), "{tool}");
+            assert!(!checker.is_path_denied(tool, "notes/todo"), "{tool}");
+            assert!(!checker.is_path_denied(tool, "src/main.rs"), "{tool}");
+            assert!(!checker.is_path_denied(tool, "config/app.toml"), "{tool}");
+        }
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

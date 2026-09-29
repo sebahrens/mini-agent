@@ -796,6 +796,7 @@ impl BoundDirectory {
             if (!is_directory && !metadata.is_file())
                 || (is_directory && is_skip_dir(name.to_str().unwrap_or("")))
                 || is_ignored(&chain, &path, is_directory)
+                || self.is_hidden(&path, is_directory)
             {
                 continue;
             }

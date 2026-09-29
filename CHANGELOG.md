@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- The `js` tool's `list_dir`, `glob` and `grep` now honour per-file path deny rules like the built-in
+  walkers: with `read = { "config/secrets/**" = "deny" }` they no longer list or search those files.
+  JS file effects also treat `$HOME/...` like `~/...` (the home directory, checked by the ambient
+  path policy) instead of a literal `$HOME` directory inside the workspace.
+
 - Misspelled or unknown top-level config keys are no longer silently dropped: startup (and
   `--print-config`) warns with the nearest known key, keys of builds with other Cargo features stay
   quiet, and every kebab-case key (`permission-deny`, `sandbox-backend`, `permission-modes`,

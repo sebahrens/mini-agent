@@ -63,6 +63,8 @@ mod worker_containment;
 mod worker_effect_cancellation;
 mod worker_effect_services;
 mod worker_fault_matrix;
+#[cfg(unix)]
+mod worker_file_targets;
 mod worker_protocol;
 mod worker_resource_benchmark;
 pub(super) mod worker_runtime;

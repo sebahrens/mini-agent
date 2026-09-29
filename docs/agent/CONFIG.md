@@ -1715,7 +1715,10 @@ macOS and Windows. With `read = { "config/secrets/**" = "deny" }`, `grep`
 over `.` never returns lines from `config/secrets/`, and `find_files` and
 `list_dir` never list its files. This per-entry filter evaluates only `deny`
 rules; it never asks, and `ask` or `allow` rules on entries beneath an
-authorised root do not affect the walk.
+authorised root do not affect the walk. The `js` tool's discovery globals
+`list_dir`, `glob`, and `grep` apply the same filter, using the `deny` rules
+for `js/list_dir`, `js/glob`, or `js/grep` together with those for `read` and
+`js/read_file`.
 
 Outside the working directory, a tool `allow` rule only counts when it names
 an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with
