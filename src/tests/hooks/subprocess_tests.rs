@@ -376,29 +376,41 @@ async fn hook_subprocess_windows_trusted_timeout_ends_tree_without_helper_wait()
 #[cfg(unix)]
 #[tokio::test]
 async fn hook_subprocess_limits_forked_descendant_is_terminated() {
-    let pid_file = unique_temp_path("descendant-pid");
-    let command = format!(
-        "sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & wait",
-        pid_file.display()
-    );
-    let args = shell_args(command);
+    // The descendant must exist before the timeout for this to test its
+    // cleanup. On a loaded host 250 ms may pass before the hook even forks
+    // it; such an attempt proves nothing, so retry with a doubled timeout
+    // until the descendant has recorded its complete pid line.
+    let mut recorded = None;
+    for attempt in 0..6u32 {
+        let pid_file = unique_temp_path(&format!("descendant-pid-{attempt}"));
+        let command = format!(
+            "sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & wait",
+            pid_file.display()
+        );
+        let args = shell_args(command);
 
-    let output = run_hook_with_limits(
-        "sh",
-        Some(&args),
-        b"",
-        Duration::from_millis(250),
-        super::TEST_WORKING_DIR,
-        limits(64, 64, 128),
-    )
-    .await;
-    assert_eq!(output.status, HookStatus::TimedOut);
+        let output = run_hook_with_limits(
+            "sh",
+            Some(&args),
+            b"",
+            Duration::from_millis(250) * 2u32.pow(attempt),
+            super::TEST_WORKING_DIR,
+            limits(64, 64, 128),
+        )
+        .await;
+        assert_eq!(output.status, HookStatus::TimedOut);
 
-    let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
-        .expect("forked helper should record its pid before timeout")
-        .trim()
-        .parse()
-        .expect("recorded descendant pid should be numeric");
+        let text = std::fs::read_to_string(&pid_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&pid_file);
+        if let Some(pid) = text
+            .strip_suffix('\n')
+            .and_then(|pid| pid.parse::<u32>().ok())
+        {
+            recorded = Some(pid);
+            break;
+        }
+    }
+    let descendant_pid = recorded.expect("forked helper never started before the hook timeout");
     let cleanup_deadline = Instant::now() + Duration::from_secs(2);
     while process_is_alive(descendant_pid) && Instant::now() < cleanup_deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -407,7 +419,6 @@ async fn hook_subprocess_limits_forked_descendant_is_terminated() {
         !process_is_alive(descendant_pid),
         "forked hook descendant {descendant_pid} survived process-group cleanup"
     );
-    let _ = std::fs::remove_file(pid_file);
 }
 
 #[cfg(unix)]
@@ -437,15 +448,22 @@ async fn hook_subprocess_async_cancellation_terminates_descendants() {
         .await
     });
 
-    let ready_deadline = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() && Instant::now() < ready_deadline {
+    // A file can exist before its contents are written, so wait for a
+    // complete pid line rather than for the path. This is readiness polling
+    // only; the budget covers process start-up on a heavily loaded host.
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    let descendant_pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Some(pid) = text.strip_suffix('\n').and_then(|pid| pid.parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "descendant should start before cancellation"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
-        .expect("descendant should start before cancellation")
-        .trim()
-        .parse()
-        .unwrap();
+    };
     task.abort();
     let _ = task.await;
 

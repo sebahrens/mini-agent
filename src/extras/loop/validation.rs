@@ -338,6 +338,17 @@ mod tests {
 
     use super::*;
 
+    /// Deadline for commands expected to finish on their own (success,
+    /// non-zero exit, output limit) or to be cancelled by the test. A command
+    /// that behaves returns long before it, so the budget costs nothing when
+    /// the test passes; a short one only turned host load into failures.
+    const SETTLE: Duration = Duration::from_secs(30);
+
+    /// Readiness and cleanup polling budget. Polls return as soon as their
+    /// condition holds; the budget covers process start-up and group drain
+    /// (itself up to `PROCESS_GROUP_DRAIN_BUDGET`) on a heavily loaded host.
+    const POLL_BUDGET: Duration = Duration::from_secs(15);
+
     fn limits(timeout: Duration) -> CommandLimits {
         CommandLimits {
             timeout,
@@ -373,7 +384,7 @@ mod tests {
     }
 
     async fn wait_until(mut predicate: impl FnMut() -> bool, label: &str) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + POLL_BUDGET;
         while !predicate() {
             assert!(Instant::now() < deadline, "timed out waiting for {label}");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -381,7 +392,7 @@ mod tests {
     }
 
     async fn wait_for_pid(path: &Path) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + POLL_BUDGET;
         loop {
             if let Ok(contents) = std::fs::read_to_string(path)
                 && let Ok(pid) = contents.trim().parse()
@@ -408,7 +419,7 @@ mod tests {
         let success = run_with_limits(
             &sandbox,
             "printf 'ok\\n'; printf '\\377bad\\n\\033[31mred\\033[0m\\001' >&2",
-            limits(Duration::from_secs(2)),
+            limits(SETTLE),
         )
         .await;
         assert_eq!(
@@ -425,7 +436,7 @@ mod tests {
         let nonzero = run_with_limits(
             &sandbox,
             "printf 'partial'; printf 'problem' >&2; exit 23",
-            limits(Duration::from_secs(2)),
+            limits(SETTLE),
         )
         .await;
         assert_eq!(
@@ -448,7 +459,7 @@ mod tests {
             &sandbox,
             "while :; do printf '0123456789abcdef'; done",
             CommandLimits {
-                timeout: Duration::from_secs(2),
+                timeout: SETTLE,
                 stdout_bytes: 32,
                 stderr_bytes: 128,
                 combined_bytes: 160,
@@ -466,7 +477,7 @@ mod tests {
             &sandbox,
             "while :; do printf '0123456789abcdef' >&2; done",
             CommandLimits {
-                timeout: Duration::from_secs(2),
+                timeout: SETTLE,
                 stdout_bytes: 128,
                 stderr_bytes: 32,
                 combined_bytes: 160,
@@ -485,7 +496,7 @@ mod tests {
             "(while :; do printf 'stdout-output'; done) & \
              (while :; do printf 'stderr-output' >&2; done) & wait",
             CommandLimits {
-                timeout: Duration::from_secs(2),
+                timeout: SETTLE,
                 stdout_bytes: 128,
                 stderr_bytes: 128,
                 combined_bytes: 48,
@@ -503,29 +514,50 @@ mod tests {
 
     #[tokio::test]
     async fn loop_validation_process_limits_timeout_kills_ignored_term_process_tree_and_recovers() {
-        let pid_file = temp_path("timeout-pid");
         let sandbox = Sandbox::new(false, "bwrap");
-        let command = format!(
-            "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & \
-             child=$!; printf '%s' \"$child\" > {}; wait",
-            shell_quote(&pid_file)
+        // The TERM-ignoring child must exist before the deadline for this to
+        // test its cleanup. On a loaded host 150 ms may pass before the shell
+        // even forks it; such an attempt proves nothing, so retry with a
+        // doubled deadline until the child recorded its pid first.
+        let mut exercised = false;
+        for attempt in 0..6u32 {
+            let timeout = Duration::from_millis(150) * 2u32.pow(attempt);
+            let pid_file = temp_path("timeout-pid");
+            let command = format!(
+                "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & \
+                 child=$!; printf '%s\\n' \"$child\" > {}; wait",
+                shell_quote(&pid_file)
+            );
+
+            let result = run_with_limits(&sandbox, &command, limits(timeout)).await;
+            assert_eq!(result.status, ValidationStatus::TimedOut);
+            assert!(result.render().contains(&format!(
+                "status=timed_out timeout_ms={}",
+                timeout.as_millis()
+            )));
+            assert_eq!(sandbox.active_group_count(), 0);
+            let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let _ = std::fs::remove_file(&pid_file);
+            if let Some(pid) = recorded
+                .strip_suffix('\n')
+                .and_then(|pid| pid.parse::<u32>().ok())
+            {
+                assert_process_gone(pid).await;
+                exercised = true;
+                break;
+            }
+        }
+        assert!(
+            exercised,
+            "the TERM-ignoring child never started before the deadline"
         );
 
-        let result = run_with_limits(&sandbox, &command, limits(Duration::from_millis(150))).await;
-        let pid = wait_for_pid(&pid_file).await;
-        assert_eq!(result.status, ValidationStatus::TimedOut);
-        assert!(result.render().contains("status=timed_out timeout_ms=150"));
-        assert_process_gone(pid).await;
-        assert_eq!(sandbox.active_group_count(), 0);
-
-        let recovery =
-            run_with_limits(&sandbox, "printf recovered", limits(Duration::from_secs(1))).await;
+        let recovery = run_with_limits(&sandbox, "printf recovered", limits(SETTLE)).await;
         assert_eq!(
             recovery.status,
             ValidationStatus::Success { exit_code: Some(0) }
         );
         assert!(recovery.render().contains("[stdout]\nrecovered"));
-        let _ = std::fs::remove_file(pid_file);
     }
 
     async fn assert_scoped_cancellation_preserves_unrelated_command(sandbox: Sandbox, label: &str) {
@@ -544,7 +576,7 @@ mod tests {
                     .output_command_with_limits(
                         &unrelated_command,
                         CommandLimits {
-                            timeout: Duration::from_secs(5),
+                            timeout: SETTLE,
                             stdout_bytes: 128,
                             stderr_bytes: 128,
                             combined_bytes: 192,
@@ -568,8 +600,7 @@ mod tests {
             "(while :; do :; done) & child=$!; printf '%s' \"$child\" > {}; wait",
             shell_quote(&validator_pid_file)
         );
-        let operation =
-            start_with_limits(&sandbox, &validator_command, limits(Duration::from_secs(5)));
+        let operation = start_with_limits(&sandbox, &validator_command, limits(SETTLE));
         let cancellation = operation.cancellation();
         let mut validation_task = tokio::spawn(operation.wait());
 
@@ -586,7 +617,7 @@ mod tests {
         )
         .await;
         cancellation.cancel();
-        let cancelled = tokio::time::timeout(Duration::from_secs(2), validation_task)
+        let cancelled = tokio::time::timeout(POLL_BUDGET, validation_task)
             .await
             .expect("cancelled validation remained blocked")
             .expect("validation task panicked");
@@ -600,7 +631,7 @@ mod tests {
         assert_eq!(sandbox.active_group_count(), 1);
 
         std::fs::write(&unrelated_stop_file, b"stop").unwrap();
-        let unrelated = tokio::time::timeout(Duration::from_secs(2), unrelated_task)
+        let unrelated = tokio::time::timeout(POLL_BUDGET, unrelated_task)
             .await
             .expect("unrelated command did not finish")
             .expect("unrelated command task panicked")
@@ -608,8 +639,7 @@ mod tests {
         assert_eq!(unrelated.status, CommandStatus::Completed);
         assert_eq!(sandbox.active_group_count(), 0);
 
-        let recovery =
-            run_with_limits(&sandbox, "printf next", limits(Duration::from_secs(1))).await;
+        let recovery = run_with_limits(&sandbox, "printf next", limits(SETTLE)).await;
         assert_eq!(
             recovery.status,
             ValidationStatus::Success { exit_code: Some(0) }
@@ -647,7 +677,7 @@ mod tests {
         let probe = run_with_limits(
             sandbox,
             "printf mini-agent-seatbelt-capability",
-            limits(Duration::from_secs(1)),
+            limits(SETTLE),
         )
         .await;
         if probe.status == (ValidationStatus::Success { exit_code: Some(0) })
@@ -701,7 +731,7 @@ mod tests {
         );
         let task = tokio::spawn({
             let sandbox = sandbox.clone();
-            async move { run_with_limits(&sandbox, &command, limits(Duration::from_secs(5))).await }
+            async move { run_with_limits(&sandbox, &command, limits(SETTLE)).await }
         });
 
         let pid = wait_for_pid(&pid_file).await;

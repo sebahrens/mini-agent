@@ -390,8 +390,10 @@ mod tests {
             .is_ok_and(|status| status.success())
     }
 
+    /// Readiness polling only: returns as soon as the fixture has written.
+    /// The budget covers process start-up on a heavily loaded host.
     async fn wait_for_nonempty_file(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while std::fs::metadata(path).map_or(true, |metadata| metadata.len() == 0) {
             assert!(Instant::now() < deadline, "timed out waiting for pid file");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -480,30 +482,48 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_resource_limits_timeout_kills_descendant() {
-        let pid_file = std::env::temp_dir().join(format!(
-            "mini-agent-bash-timeout-descendant-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&pid_file);
-        let command = format!(
-            "sh -c 'printf \"%s\" \"$$\" > {}; while :; do sleep 1; done' & wait",
-            shell_quote(&pid_file)
-        );
+        // The descendant must exist before the timeout for this to test its
+        // cleanup. On a loaded host 200 ms may pass before the shell even
+        // forks it; such an attempt proves nothing, so retry with a doubled
+        // timeout until the descendant has recorded its complete pid line.
+        for attempt in 0..6u32 {
+            let timeout_ms = 200u64 << attempt;
+            let pid_file = std::env::temp_dir().join(format!(
+                "mini-agent-bash-timeout-descendant-{}-{attempt}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&pid_file);
+            let command = format!(
+                "sh -c 'printf \"%s\\n\" \"$$\" > {}; while :; do sleep 1; done' & wait",
+                shell_quote(&pid_file)
+            );
 
-        let error = test_tool()
-            .call(BashArgs {
-                command,
-                timeout: Some(200),
-                background: false,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("[status: timed_out; timeout_ms: 200]"));
+            let error = test_tool()
+                .call(BashArgs {
+                    command,
+                    timeout: Some(timeout_ms),
+                    background: false,
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("[status: timed_out; timeout_ms: {timeout_ms}]")),
+                "{error}"
+            );
 
-        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-        wait_for_process_exit(pid).await;
-        let _ = std::fs::remove_file(pid_file);
+            let recorded = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let _ = std::fs::remove_file(&pid_file);
+            let Some(pid) = recorded
+                .strip_suffix('\n')
+                .and_then(|pid| pid.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            wait_for_process_exit(pid).await;
+            return;
+        }
+        panic!("the descendant never started before the shell timeout");
     }
 
     #[cfg(unix)]
