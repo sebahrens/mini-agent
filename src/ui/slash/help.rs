@@ -396,6 +396,19 @@ mod tests {
         );
     }
 
+    /// mini-agent-5bvrb: the lazygit key stays discoverable from /help.
+    #[test]
+    fn help_names_the_lazygit_key() {
+        let mut lines = Vec::new();
+        help_lines(&mut |_, line| lines.push(line.to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Ctrl+O") && line.contains("lazygit")),
+            "{lines:?}"
+        );
+    }
+
     /// mini-agent-lqq0c: aliases are hidden from completion, but each one
     /// names an offered canonical command and `/help` still mentions it.
     #[test]

@@ -538,6 +538,20 @@ mod replay_tests {
         assert_eq!(rows.len(), 6, "{rows:?}");
     }
 
+    /// mini-agent-5bvrb: the welcome screen names the lazygit key.
+    #[test]
+    fn welcome_names_the_lazygit_key() {
+        let mut renderer = crate::ui::renderer::Renderer::new().unwrap();
+        super::show_welcome(&mut renderer).unwrap();
+        let feed = renderer.feed_mut();
+        let rows = texts(feed);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Ctrl+O") && row.contains("lazygit")),
+            "{rows:?}"
+        );
+    }
+
     /// Results without an id (legacy sessions) keep their stored order.
     #[test]
     fn replay_appends_results_without_a_matching_call() {
