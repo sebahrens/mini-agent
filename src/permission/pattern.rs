@@ -202,6 +202,17 @@ pub(crate) fn exact_path_pattern(path: &std::path::Path) -> String {
     encode_generated_scope(EXACT_SCOPE_PREFIX, &normalized)
 }
 
+/// The AllowAlways scope for one approved directory-walking search root
+/// (`grep`, `find_files`): the literal tree under `root` plus `root` itself,
+/// returned as `(descendants, exact)`. Both are opaque literal scopes, so a
+/// root is never widened to a sibling that merely shares its prefix and a
+/// root containing whitespace or glob metacharacters is kept whole.
+pub(crate) fn search_root_allow_scope(root: &str) -> (String, String) {
+    let expanded = crate::fs::expand_tilde(root);
+    let root = std::path::Path::new(&expanded);
+    (descendant_path_pattern(root), exact_path_pattern(root))
+}
+
 fn encode_generated_scope(prefix: &str, path: &str) -> String {
     let mut encoded = String::with_capacity(prefix.len() + path.len() * 2);
     encoded.push_str(prefix);

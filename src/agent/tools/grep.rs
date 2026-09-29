@@ -739,6 +739,104 @@ mod tests {
         result
     }
 
+    /// Approve `root` with the AllowAlways scope the tool offered, then
+    /// report whether each later search root is granted without a prompt.
+    async fn allow_always_then_probe(
+        workspace: &Path,
+        root: &Path,
+        probes: &[&Path],
+    ) -> Vec<(PathBuf, bool)> {
+        let permission = standard_permission(workspace);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let tool = GrepTool::new(Some(permission.clone()), Some(ask_tx), 10);
+        let call = tool.call(grep_args("needle", Some(root.to_str().unwrap()), None));
+        let canonical_root = std::fs::canonicalize(root).unwrap();
+        let respond = async {
+            let request = tokio::time::timeout(Duration::from_secs(1), ask_rx.recv())
+                .await
+                .expect("grep did not request path permission")
+                .expect("grep permission channel closed");
+            assert_eq!(PathBuf::from(request.input.as_str()), canonical_root);
+            let pattern = request
+                .suggested_pattern
+                .clone()
+                .expect("grep must offer a literal tree scope");
+            assert!(
+                !request.additional_allow_patterns.is_empty(),
+                "grep must also offer the exact root scope"
+            );
+            request
+                .reply
+                .send(UserDecision::AllowAlways(pattern))
+                .expect("grep dropped the permission reply");
+        };
+        let (result, ()) = tokio::join!(call, respond);
+        result.expect("approved grep must run");
+
+        let mut checker = permission.lock().unwrap();
+        probes
+            .iter()
+            .map(|probe| {
+                let canonical = std::fs::canonicalize(probe).unwrap();
+                let allowed = checker.check_path("grep", canonical.to_str().unwrap())
+                    == crate::permission::checker::CheckResult::Allowed;
+                (probe.to_path_buf(), allowed)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn grep_allow_always_scope_is_literal_tree_not_prefix() {
+        let container = TempDir::new("allow-always-tree");
+        let workspace = container.path().join("workspace");
+        let other = container.path().join("other");
+        let nested = other.join("nested");
+        let prefix_sibling = container.path().join("other-secrets");
+        for dir in [&workspace, &nested, &prefix_sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let results =
+            allow_always_then_probe(&workspace, &other, &[&other, &nested, &prefix_sibling]).await;
+        assert_eq!(
+            results,
+            vec![
+                (other.clone(), true),
+                (nested.clone(), true),
+                (prefix_sibling.clone(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_allow_always_scope_handles_whitespace_in_root() {
+        let container = TempDir::new("allow-always-space");
+        let workspace = container.path().join("workspace");
+        let spaced = container.path().join("my dir");
+        let nested = spaced.join("nested");
+        let token_prefix = container.path().join("my");
+        let token_sibling = container.path().join("myother");
+        for dir in [&workspace, &nested, &token_prefix, &token_sibling] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let results = allow_always_then_probe(
+            &workspace,
+            &spaced,
+            &[&spaced, &nested, &token_prefix, &token_sibling],
+        )
+        .await;
+        assert_eq!(
+            results,
+            vec![
+                (spaced.clone(), true),
+                (nested.clone(), true),
+                (token_prefix.clone(), false),
+                (token_sibling.clone(), false),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn grep_external_path_permission_prompts_before_traversal() {
         let external = TempDir::new("restrictive-external");
