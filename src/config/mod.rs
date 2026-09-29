@@ -281,6 +281,15 @@ pub struct Config {
     /// Default: true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<bool>,
+    /// Desktop notification escape (`osc9`, `osc777`) emitted when a turn
+    /// finishes or a permission prompt waits. Default: off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_notify: Option<TerminalNotify>,
+    /// Emit OSC 133 semantic prompt marks: a prompt while the TUI waits for
+    /// input, command start while a run is active, command end when it
+    /// finishes. Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_prompt_marks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
@@ -604,6 +613,14 @@ impl Config {
 
     pub fn resolve_terminal_title(&self) -> bool {
         self.terminal_title.unwrap_or(true)
+    }
+
+    pub fn resolve_terminal_notify(&self) -> TerminalNotify {
+        self.terminal_notify.unwrap_or_default()
+    }
+
+    pub fn resolve_terminal_prompt_marks(&self) -> bool {
+        self.terminal_prompt_marks.unwrap_or(false)
     }
 
     /// Resolves temperature: CLI `--temperature` > quick-model `temperature` >
@@ -1098,6 +1115,21 @@ mod tests {
         let cfg: Config = toml::from_str("terminal_title = false\n").unwrap();
         assert_eq!(cfg.terminal_title, Some(false));
         assert!(!cfg.resolve_terminal_title());
+    }
+
+    /// mini-agent-qfrps: notifications and prompt marks are opt-in.
+    #[test]
+    fn toml_terminal_notify_and_prompt_marks_default_off() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Off);
+        assert!(!cfg.resolve_terminal_prompt_marks());
+        let cfg: Config =
+            toml::from_str("terminal_notify = \"osc777\"\nterminal_prompt_marks = true\n").unwrap();
+        assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Osc777);
+        assert!(cfg.resolve_terminal_prompt_marks());
+        let cfg: Config = toml::from_str("terminal_notify = \"osc9\"\n").unwrap();
+        assert_eq!(cfg.resolve_terminal_notify(), TerminalNotify::Osc9);
+        assert!(toml::from_str::<Config>("terminal_notify = \"bell\"\n").is_err());
     }
 
     #[test]

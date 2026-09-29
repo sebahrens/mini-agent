@@ -642,6 +642,10 @@ impl<'a> App<'a> {
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
         renderer.set_title_status(ui.cfg.resolve_terminal_title());
+        renderer.set_activity_signals(crate::ui::terminal::ActivitySignals {
+            notify: ui.cfg.resolve_terminal_notify(),
+            prompt_marks: ui.cfg.resolve_terminal_prompt_marks(),
+        });
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
         if let Some(ref theme_name) = ui.context.current_theme_name {
             if let Some(content) = ui.context.themes.get(theme_name.as_str()) {

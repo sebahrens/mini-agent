@@ -505,6 +505,11 @@ pub struct Renderer {
     title_status: bool,
     /// Activity last written to the title, so unchanged frames write nothing.
     title_activity: Option<crate::ui::terminal::AgentActivity>,
+    /// Opt-in notification and prompt-mark sequences (config
+    /// `terminal_notify`, `terminal_prompt_marks`).
+    activity_signals: crate::ui::terminal::ActivitySignals,
+    /// Activity of the last frame, for the transitions those signals report.
+    last_activity: Option<crate::ui::terminal::AgentActivity>,
 }
 
 /// A status-line message that disappears on its own.
@@ -560,6 +565,8 @@ impl Renderer {
             notice: None,
             title_status: false,
             title_activity: None,
+            activity_signals: crate::ui::terminal::ActivitySignals::default(),
+            last_activity: None,
         })
     }
 
@@ -611,19 +618,41 @@ impl Renderer {
         self.title_status = enabled;
     }
 
-    /// Announce `activity` in the terminal title when it changed. A no-op
-    /// unless title reporting is enabled.
+    /// Enable the opt-in notification and prompt-mark sequences.
+    pub(crate) fn set_activity_signals(&mut self, signals: crate::ui::terminal::ActivitySignals) {
+        self.activity_signals = signals;
+    }
+
+    /// Announce `activity` in the terminal title when it changed, and emit
+    /// the enabled notification and prompt-mark sequences for the change.
+    /// A no-op unless one of them is enabled.
     pub(crate) fn set_activity(
         &mut self,
         activity: crate::ui::terminal::AgentActivity,
     ) -> io::Result<()> {
-        if !self.title_status || self.title_activity == Some(activity) {
+        let mut out = if self.activity_signals.any() {
+            crate::ui::terminal::activity_sequences(
+                self.last_activity,
+                activity,
+                self.activity_signals,
+            )
+        } else {
+            String::new()
+        };
+        self.last_activity = Some(activity);
+        let title_changed = self.title_status && self.title_activity != Some(activity);
+        if title_changed {
+            out.push_str(&crate::ui::terminal::title_sequence(activity));
+        }
+        if out.is_empty() {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        stdout.write_all(crate::ui::terminal::title_sequence(activity).as_bytes())?;
+        stdout.write_all(out.as_bytes())?;
         stdout.flush()?;
-        self.title_activity = Some(activity);
+        if title_changed {
+            self.title_activity = Some(activity);
+        }
         Ok(())
     }
 

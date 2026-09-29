@@ -480,3 +480,19 @@ impl ReasoningConfig {
             .unwrap_or(true)
     }
 }
+
+/// Desktop-notification escape the TUI emits when a turn finishes or a
+/// permission prompt starts waiting (config `terminal_notify`). Terminals
+/// disagree on these sequences, so it is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalNotify {
+    /// Emit nothing (the default).
+    #[default]
+    Off,
+    /// `OSC 9 ; <text> BEL` (iTerm2, WezTerm, Ghostty, kitty, foot, ...).
+    Osc9,
+    /// `OSC 777 ; notify ; <title> ; <body> BEL` (rxvt-unicode, foot,
+    /// Ghostty, WezTerm, VTE-based terminals with the patch).
+    Osc777,
+}
