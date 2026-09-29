@@ -1155,6 +1155,66 @@ def validate_local_markdown_links(root: Path) -> list[str]:
     return errors
 
 
+PRIVATE_VULNERABILITY_REPORT_URL = (
+    f"{CANONICAL_REPOSITORY_URL}/security/advisories/new"
+)
+
+
+def _markdown_link_targets(text: str) -> set[str]:
+    return {
+        unquote(match.group("target").strip("<>").split("#", 1)[0])
+        for match in MARKDOWN_LINK.finditer(text)
+    }
+
+
+def validate_security_policy(root: Path) -> list[str]:
+    """Require a private disclosure policy that README and issue routing point to."""
+
+    errors: list[str] = []
+    security = root / "SECURITY.md"
+    if not security.is_file():
+        errors.append(
+            "SECURITY.md is missing; publish a private vulnerability disclosure policy"
+        )
+    elif PRIVATE_VULNERABILITY_REPORT_URL not in security.read_text(encoding="utf-8"):
+        errors.append(
+            "SECURITY.md must name GitHub private vulnerability reporting "
+            f"({PRIVATE_VULNERABILITY_REPORT_URL}) as the reporting channel"
+        )
+
+    readme = root / "README.md"
+    if not readme.is_file():
+        errors.append("README.md is missing")
+    elif not {"SECURITY.md", "./SECURITY.md"} & _markdown_link_targets(
+        readme.read_text(encoding="utf-8")
+    ):
+        errors.append("README.md must link to SECURITY.md")
+
+    issue_config = root / ".github/ISSUE_TEMPLATE/config.yml"
+    if not issue_config.is_file():
+        errors.append(
+            ".github/ISSUE_TEMPLATE/config.yml is missing; "
+            "route security reports away from public issues"
+        )
+    else:
+        try:
+            config = parse_yaml_document(issue_config.read_text(encoding="utf-8"))
+        except ValueError as error:
+            return [*errors, f".github/ISSUE_TEMPLATE/config.yml: {error}"]
+        links = config.get("contact_links") if isinstance(config, dict) else None
+        urls = {
+            link.get("url")
+            for link in (links if isinstance(links, list) else [])
+            if isinstance(link, dict)
+        }
+        if PRIVATE_VULNERABILITY_REPORT_URL not in urls:
+            errors.append(
+                ".github/ISSUE_TEMPLATE/config.yml must have a contact link to "
+                f"{PRIVATE_VULNERABILITY_REPORT_URL}"
+            )
+    return errors
+
+
 def validate_distribution_notice_installs(root: Path) -> list[str]:
     """Require every maintained package recipe to install compliance documents."""
 
@@ -1489,6 +1549,7 @@ def validate(
     errors.extend(validate_stale_coordinates(root))
     errors.extend(validate_removed_nix_surface(root))
     errors.extend(validate_local_markdown_links(root))
+    errors.extend(validate_security_policy(root))
 
     version = cargo_version(metadata, root)
     if version:

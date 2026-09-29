@@ -380,3 +380,10 @@ mini-agent is licensed under [GPL-3.0-only](LICENSE). Binary releases include th
 It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.
+
+## Security
+
+Report vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/sebahrens/mini-agent/security/advisories/new),
+not public issues. [SECURITY.md](SECURITY.md) lists the supported versions, response targets and what
+is in scope; [CONTRIBUTING.md](CONTRIBUTING.md) covers the development workflow.

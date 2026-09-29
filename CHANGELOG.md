@@ -13,6 +13,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   welcome line's directory name are sanitised, and the chat feed and painter now strip control
   sequences from all text so only the renderer's own colours and hyperlinks reach the terminal.
 
+### Added
+
+- `SECURITY.md` documents private vulnerability reporting through GitHub, supported versions,
+  response targets and scope; the README and the new-issue page point security reports there, and
+  `CONTRIBUTING.md` describes the build, test, documentation and beads workflow.
+
 ### Fixed
 
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
