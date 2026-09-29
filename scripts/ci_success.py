@@ -7,7 +7,8 @@ not run, so a `skipped` result is accepted only where the workflow skips that
 job by design:
 
 * a documentation-only change (`changes` reported `code=false`) skips every
-  build, lint and test job, and only `changes` and `fmt` must still succeed.
+  build, lint and test job and the Corresponding Source assembly, and only
+  `changes` and `fmt` must still succeed.
 
 Whenever `changes` reported `code=true` every other gating job must succeed on
 every event, including `harness-regression` on a push (it used to run on pull
