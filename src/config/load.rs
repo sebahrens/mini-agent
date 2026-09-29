@@ -1632,6 +1632,7 @@ mod project_config_trust_tests {
              verify_command = \"untrusted-verifier\"\n\
              goal_checks = [\"untrusted-goal-check\"]\n\
              goal_judge_model = \"untrusted-judge\"\n\
+             session_title_model = \"untrusted-titler\"\n\
              [goal]\n\
              max_rounds = 9\n\
              judge = \"untrusted-quick-model\"\n\
@@ -1665,6 +1666,9 @@ mod project_config_trust_tests {
         assert_eq!(cfg.yolo, Some(false));
         assert_eq!(cfg.shell.as_deref(), Some("trusted-shell"));
         assert_eq!(cfg.verify_command.as_deref(), Some("trusted-verifier"));
+        // Titling a session sends its first exchange to the named endpoint, so
+        // an untrusted project cannot choose it (mini-agent-3wsib).
+        assert!(cfg.session_title_model.is_none());
         // Goal checks carry the authority of whoever configured them, so an
         // untrusted project config cannot introduce one. The bounds table next
         // to it is benign and does apply: it only limits how long the harness
