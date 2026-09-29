@@ -282,12 +282,28 @@ impl InputEditor {
     /// within the buffer. Used when a mouse click places the cursor.
     pub fn set_cursor(&mut self, pos: usize) {
         let pos = pos.min(self.buffer.len());
+        let pos = if self.buffer.is_char_boundary(pos) {
+            pos
+        } else {
+            prev_char_boundary(&self.buffer, pos)
+        };
+        if pos != self.cursor {
+            // A query picker assumes the caret sits at the end of its query.
+            self.close_query_picker();
+        }
+        self.cursor = pos;
+        self.yank_pos = None;
+    }
+
+    /// Keep `cursor` a valid byte offset on a char boundary so no edit can
+    /// slice or remove inside a multi-byte character.
+    fn clamp_cursor(&mut self) {
+        let pos = self.cursor.min(self.buffer.len());
         self.cursor = if self.buffer.is_char_boundary(pos) {
             pos
         } else {
             prev_char_boundary(&self.buffer, pos)
         };
-        self.yank_pos = None;
     }
 
     pub fn clear_buffer(&mut self) {
@@ -586,6 +602,7 @@ impl InputEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        self.clamp_cursor();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 

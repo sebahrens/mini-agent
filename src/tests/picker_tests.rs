@@ -1441,3 +1441,107 @@ mod picker_chords {
         assert!(!picker_open(&input));
     }
 }
+
+/// Caret keys while a query picker is open (mini-agent-v45ts): the picker
+/// mirrors its query into the buffer, so moving or deleting at the caret
+/// behind its back must close it first, and nothing may panic inside a
+/// multi-byte character.
+mod caret_keys_close_query_pickers {
+    use super::*;
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(input: &mut InputEditor, code: KeyCode) -> Option<CompactString> {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if input.picker.as_ref().is_some_and(Picker::active) && input.handle_picker_key(key) {
+            return None;
+        }
+        input.handle_key(key)
+    }
+
+    fn typed(input: &mut InputEditor, text: &str) {
+        for c in text.chars() {
+            press(input, KeyCode::Char(c));
+        }
+    }
+
+    fn picker_open(input: &InputEditor) -> bool {
+        input.picker.as_ref().is_some_and(Picker::active)
+    }
+
+    #[test]
+    fn left_in_the_command_picker_then_typing_and_delete_stay_coherent() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/é");
+        assert!(picker_open(&input));
+        press(&mut input, KeyCode::Left);
+        assert!(!picker_open(&input), "Left closes the picker");
+        assert_eq!(input.cursor, 1);
+        typed(&mut input, "x");
+        assert_eq!(input.buffer, "/xé");
+        assert_eq!(input.cursor, 2);
+        // Used to panic: the caret sat inside 'é'.
+        press(&mut input, KeyCode::Delete);
+        assert_eq!(input.buffer, "/x");
+        assert_eq!(input.cursor, 2);
+    }
+
+    #[test]
+    fn caret_keys_close_every_query_picker_and_edit_as_plain_text() {
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Delete] {
+            let mut input = InputEditor::new();
+            input.set_prompt_names(vec!["café".to_string()]);
+            typed(&mut input, "/prompt");
+            press(&mut input, KeyCode::Enter);
+            typed(&mut input, "ca");
+            assert!(picker_open(&input));
+            press(&mut input, code);
+            assert!(!picker_open(&input), "{code:?}");
+            typed(&mut input, "é");
+            assert!(input.buffer.is_char_boundary(input.cursor));
+            let expected = match code {
+                KeyCode::Left => "/prompt céa",
+                _ => "/prompt caé",
+            };
+            assert_eq!(input.buffer, expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn caret_keys_close_the_file_picker() {
+        let mut input = InputEditor::new();
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![PathBuf::from("README.md")]);
+        picker.activate();
+        input.buffer = "see @".into();
+        input.cursor = input.buffer.len();
+        input.picker = Some(Picker::File(picker));
+        typed(&mut input, "rea");
+        press(&mut input, KeyCode::Left);
+        assert!(!picker_open(&input));
+        typed(&mut input, "d");
+        assert_eq!(input.buffer, "see @reda");
+    }
+
+    #[test]
+    fn a_click_that_moves_the_caret_closes_the_picker() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/mo");
+        input.set_cursor(3);
+        assert!(picker_open(&input), "a click at the caret changes nothing");
+        input.set_cursor(1);
+        assert!(!picker_open(&input));
+        typed(&mut input, "x");
+        assert_eq!(input.buffer, "/xmo");
+    }
+
+    #[test]
+    fn a_stale_caret_inside_a_character_is_clamped_before_editing() {
+        let mut input = InputEditor::new();
+        input.buffer = "aé".into();
+        input.cursor = 2; // inside 'é'
+        press(&mut input, KeyCode::Delete);
+        assert_eq!(input.buffer, "a");
+        assert_eq!(input.cursor, 1);
+    }
+}
