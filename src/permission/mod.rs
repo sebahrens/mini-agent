@@ -221,7 +221,7 @@ pub(crate) fn resolve_configured_execution_authority(
     };
     let authority = resolve_execution_authority(cli, cfg, policy, &backend)?;
     let sandbox = if authority.sandbox == SandboxResolution::DegradedUnavailable {
-        report_degraded_sandbox_once(&backend);
+        report_degraded_sandbox_once(&backend, configured.unavailable_diagnostic());
         crate::sandbox::Sandbox::new(false, &backend).with_unavailable_default_fallback()
     } else {
         configured
@@ -515,14 +515,27 @@ pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &
 /// sandbox backend was unavailable. Every frontend shows the same text: the
 /// TUI as a first-turn chat notice (plus the persistent `sandbox:off` status
 /// segment), headless runs on stderr regardless of `RUST_LOG`.
+#[cfg(test)]
 pub(crate) fn degraded_sandbox_notice(backend: &str) -> String {
+    degraded_sandbox_notice_with(backend, None)
+}
+
+/// The degraded-sandbox notice naming the backend's closed preflight
+/// diagnostic (for bubblewrap: missing binary, AppArmor `userns`
+/// restriction, or disabled user namespaces) when one was recorded.
+pub(crate) fn degraded_sandbox_notice_with(backend: &str, diagnostic: Option<&str>) -> String {
     let remedy = if backend == "bwrap" {
         "install bubblewrap (and allow unprivileged user namespaces), "
     } else {
         ""
     };
+    // The diagnostics are closed single-line constants; keep the notice one
+    // line even if that ever changes.
+    let cause = diagnostic
+        .map(|diagnostic| format!(" Cause: {}.", diagnostic.replace(['\n', '\r'], " ")))
+        .unwrap_or_default();
     format!(
-        "warning: sandbox backend '{backend}' is unavailable — shell commands run UNSANDBOXED with your full user privileges. \
+        "warning: sandbox backend '{backend}' is unavailable — shell commands run UNSANDBOXED with your full user privileges.{cause} \
          Built-in auto-allows for build/test commands (cargo, pip, git status) are withheld and ask first. \
          To fix: {remedy}pass --sandbox (or set `sandbox = true`) to refuse to start instead, or pass --no-sandbox to run unsandboxed deliberately."
     )
@@ -532,9 +545,9 @@ pub(crate) fn degraded_sandbox_notice(backend: &str) -> String {
 /// when it is contained or was disabled deliberately (`--no-sandbox`).
 pub(crate) fn degraded_sandbox_notice_for(sandbox: &crate::sandbox::Sandbox) -> Option<String> {
     match sandbox.explicit_shell_boundary() {
-        crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { backend } => {
-            Some(degraded_sandbox_notice(&backend))
-        }
+        crate::sandbox::ExplicitShellBoundary::UnavailableDefaultFallback { backend } => Some(
+            degraded_sandbox_notice_with(&backend, sandbox.unavailable_diagnostic()),
+        ),
         _ => None,
     }
 }
@@ -544,19 +557,24 @@ pub(crate) fn degraded_sandbox_notice_for(sandbox: &crate::sandbox::Sandbox) -> 
 pub(crate) fn write_degraded_sandbox_notice(
     out: &mut dyn std::io::Write,
     backend: &str,
+    diagnostic: Option<&str>,
 ) -> std::io::Result<()> {
-    writeln!(out, "{}", degraded_sandbox_notice(backend))?;
+    writeln!(out, "{}", degraded_sandbox_notice_with(backend, diagnostic))?;
     out.flush()
 }
 
 /// Report an unavailable-default fallback once per process on stderr (and at
 /// `info` to the log file). Headless print, loop and ACP runs have no other
 /// surface; the TUI additionally shows a chat notice and a status segment.
-fn report_degraded_sandbox_once(backend: &str) {
+fn report_degraded_sandbox_once(backend: &str, diagnostic: Option<&str>) {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    tracing::info!(backend, "default sandbox unavailable; running unsandboxed");
+    tracing::info!(
+        backend,
+        diagnostic,
+        "default sandbox unavailable; running unsandboxed"
+    );
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let _ = write_degraded_sandbox_notice(&mut std::io::stderr().lock(), backend);
+        let _ = write_degraded_sandbox_notice(&mut std::io::stderr().lock(), backend, diagnostic);
     }
 }
 
@@ -1209,6 +1227,26 @@ mod execution_authority_tests {
         assert!(notice.contains("--no-sandbox"), "{notice}");
         assert!(!notice.contains('\n'), "{notice}");
         assert!(!super::degraded_sandbox_notice("seatbelt").contains("bubblewrap"));
+        assert!(!notice.contains("Cause:"), "{notice}");
+    }
+
+    /// The notice names the closed preflight cause (mini-agent-jj4qw), so an
+    /// Ubuntu AppArmor `userns` restriction is visible without reading logs.
+    #[test]
+    fn degraded_notice_names_the_preflight_diagnostic() {
+        let diagnostic = crate::sandbox::BWRAP_APPARMOR_USERNS_DIAGNOSTIC;
+        let notice = super::degraded_sandbox_notice_with("bwrap", Some(diagnostic));
+        assert!(notice.contains("UNSANDBOXED"), "{notice}");
+        assert!(notice.contains(diagnostic), "{notice}");
+        assert!(notice.contains("AppArmor"), "{notice}");
+        assert!(notice.contains("--no-sandbox"), "{notice}");
+        assert!(!notice.contains('\n'), "{notice}");
+        let multiline = super::degraded_sandbox_notice_with("bwrap", Some("first\nsecond"));
+        assert!(!multiline.contains('\n'), "{multiline}");
+
+        let mut stderr = Vec::new();
+        super::write_degraded_sandbox_notice(&mut stderr, "bwrap", Some(diagnostic)).unwrap();
+        assert_eq!(String::from_utf8(stderr).unwrap(), format!("{notice}\n"));
     }
 
     /// Headless runs report the fallback on stderr through a direct write,
@@ -1220,14 +1258,22 @@ mod execution_authority_tests {
 
         let degraded = Sandbox::new(false, "bwrap").with_unavailable_default_fallback();
         let notice = super::degraded_sandbox_notice_for(&degraded).expect("degraded");
-        assert_eq!(notice, super::degraded_sandbox_notice("bwrap"));
+        assert_eq!(
+            notice,
+            super::degraded_sandbox_notice_with("bwrap", degraded.unavailable_diagnostic())
+        );
         assert_eq!(
             super::degraded_sandbox_notice_for(&Sandbox::new(false, "bwrap")),
             None
         );
 
         let mut stderr = Vec::new();
-        super::write_degraded_sandbox_notice(&mut stderr, "bwrap").unwrap();
+        super::write_degraded_sandbox_notice(
+            &mut stderr,
+            "bwrap",
+            degraded.unavailable_diagnostic(),
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(stderr).unwrap(), format!("{notice}\n"));
     }
 }

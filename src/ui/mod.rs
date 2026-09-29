@@ -792,7 +792,10 @@ pub(crate) async fn git_stash_in_workspace(
         .await
         .map_err(|_| "git stash failed: Git executable discovery failed".to_string())?
         .map_err(|error| format!("git stash failed: {error}"))?;
+    // A stash walks the whole work tree, including repositories the model
+    // may have nested in it (mini-agent-jj4qw).
     runner
+        .probing_nested_repositories()
         .run(
             workspace,
             "stash",

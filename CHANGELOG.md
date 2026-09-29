@@ -8,6 +8,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Worktree merges, auto-commits and `/undo stash` can no longer run a filter or driver configured in a
+  repository the model nested inside the workspace: Git descends into such repositories, so their
+  `.git/config` is now probed (recursively) and its filter/diff/merge commands neutralised, and an
+  over-deep or unreadable nesting refuses the operation with an error naming the nested repository.
+- The "sandbox backend is unavailable" warning now names the recorded cause, for example Ubuntu's
+  AppArmor restriction on unprivileged user namespaces for bubblewrap.
+
 - Misspelled or unknown top-level config keys are no longer silently dropped: startup (and
   `--print-config`) warns with the nearest known key, keys of builds with other Cargo features stay
   quiet, and every kebab-case key (`permission-deny`, `sandbox-backend`, `permission-modes`,
