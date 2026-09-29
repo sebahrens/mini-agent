@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use compact_str::CompactString;
+use process_wrap::tokio::ChildWrapper;
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ListToolsRequest,
     PaginatedRequestParams, ServerResult, Tool,
@@ -16,13 +17,14 @@ use rmcp::service::{
     Peer, PeerRequestOptions, RoleClient, RunningService, RxJsonRpcMessage, ServiceError,
     TxJsonRpcMessage, serve_client,
 };
-use rmcp::transport::{Transport, child_process::TokioChildProcess, which_command};
+use rmcp::transport::async_rw::AsyncRwTransport;
+use rmcp::transport::{Transport, which_command};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 use super::config::{McpServerConfig, McpStdioNetwork, OAuthConfig, TrustedMcpServer};
-use crate::process_creation::RmcpCommandCreationExt;
+use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
 /// Bound on the MCP initialization handshake for every transport. For HTTP
@@ -46,17 +48,87 @@ pub struct McpClientHandle {
     pub running_service: RunningService<RoleClient, ()>,
 }
 
+/// Longest stdout line (one JSON-RPC message) accepted from a stdio MCP
+/// server. RMCP buffers each line until its newline with no bound of its own,
+/// so a server writing a large newline-free blob would otherwise grow the
+/// agent's memory without limit, independent of any call timeout.
+pub(crate) const MCP_STDIO_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Server stdout that fails the read once a line grows past `max_line`
+/// bytes. The owning transport then kills the server.
+struct LineCappedStdout<R> {
+    inner: R,
+    max_line: usize,
+    current_line: usize,
+    overflowed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCappedStdout<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.overflowed.load(std::sync::atomic::Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(line_overflow_error(this.max_line)));
+        }
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let read = &buf.filled()[before..];
+            this.current_line = match read.iter().rposition(|byte| *byte == b'\n') {
+                Some(newline) => read.len() - newline - 1,
+                None => this.current_line.saturating_add(read.len()),
+            };
+            if this.current_line > this.max_line {
+                this.overflowed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                // A failed read must not report filled bytes.
+                buf.set_filled(before);
+                return std::task::Poll::Ready(Err(line_overflow_error(this.max_line)));
+            }
+        }
+        poll
+    }
+}
+
+fn line_overflow_error(max_line: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("MCP server wrote a stdout line longer than {max_line} bytes"),
+    )
+}
+
+type StdioProtocol = AsyncRwTransport<RoleClient, LineCappedStdout<ChildStdout>, ChildStdin>;
+
 struct OwnedStdioTransport {
-    inner: Option<TokioChildProcess>,
+    child: Option<Box<dyn ChildWrapper>>,
+    protocol: Option<StdioProtocol>,
+    overflowed: Arc<std::sync::atomic::AtomicBool>,
     cleanup_complete: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl OwnedStdioTransport {
-    fn new(inner: TokioChildProcess) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+    fn new(
+        child: Box<dyn ChildWrapper>,
+        stdout: ChildStdout,
+        stdin: ChildStdin,
+        max_line: usize,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
         let (cleanup_complete, completion) = tokio::sync::oneshot::channel();
+        let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout = LineCappedStdout {
+            inner: stdout,
+            max_line,
+            current_line: 0,
+            overflowed: Arc::clone(&overflowed),
+        };
         (
             Self {
-                inner: Some(inner),
+                child: Some(child),
+                protocol: Some(AsyncRwTransport::new_client(stdout, stdin)),
+                overflowed,
                 cleanup_complete: Some(cleanup_complete),
             },
             completion,
@@ -64,12 +136,13 @@ impl OwnedStdioTransport {
     }
 
     fn start_cleanup(&mut self, graceful: bool) -> Option<JoinHandle<std::io::Result<()>>> {
-        let inner = self.inner.take()?;
-        let process_group = inner.id();
-        // Taking the owned child also closes its protocol pipes. Keep ownership
-        // in one cleanup task so cancellation cannot detach an untracked wait
-        // inside RMCP's ChildWithCleanup destructor.
-        let child = inner.into_inner();
+        let child = self.child.take()?;
+        let process_group = child.id();
+        // Dropping the protocol closes the server's stdin/stdout pipes. Keep
+        // child ownership in one cleanup task so cancellation cannot detach an
+        // untracked wait.
+        drop(self.protocol.take());
+        let child = Some(child);
         let completion = self.cleanup_complete.take();
         if !graceful {
             Self::terminate_tree(process_group);
@@ -124,7 +197,7 @@ impl Transport<RoleClient> for OwnedStdioTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let send = self.inner.as_mut().map(|inner| inner.send(item));
+        let send = self.protocol.as_mut().map(|inner| inner.send(item));
         async move {
             match send {
                 Some(send) => send.await,
@@ -137,10 +210,18 @@ impl Transport<RoleClient> for OwnedStdioTransport {
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
-        match self.inner.as_mut() {
+        let received = match self.protocol.as_mut() {
             Some(inner) => inner.receive().await,
             None => None,
+        };
+        if received.is_none() && self.overflowed.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                "MCP stdio server exceeded the {} byte line limit; terminating it",
+                MCP_STDIO_MAX_LINE_BYTES
+            );
+            drop(self.start_cleanup(false));
         }
+        received
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
@@ -149,6 +230,36 @@ impl Transport<RoleClient> for OwnedStdioTransport {
             None => Ok(()),
         }
     }
+}
+
+type SpawnedStdioServer = (
+    OwnedStdioTransport,
+    tokio::sync::oneshot::Receiver<()>,
+    Option<tokio::process::ChildStderr>,
+);
+
+/// Launch a stdio MCP server in its owned process tree with piped stdio and a
+/// line-capped protocol reader.
+fn spawn_stdio_server(cmd: Command, max_line: usize) -> std::io::Result<SpawnedStdioServer> {
+    let mut command = owned_workspace_service_tree(cmd);
+    command
+        .command_mut()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn_guarded()?;
+    let stdin = child.inner_mut().stdin().take();
+    let stdout = child.inner_mut().stdout().take();
+    let stderr = child.inner_mut().stderr().take();
+    let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+        let process_group = child.id();
+        OwnedStdioTransport::terminate_tree(process_group);
+        return Err(std::io::Error::other(
+            "MCP server stdio pipes were not created",
+        ));
+    };
+    let (transport, completion) = OwnedStdioTransport::new(child, stdout, stdin, max_line);
+    Ok((transport, completion, stderr))
 }
 
 impl Drop for McpClientHandle {
@@ -230,18 +341,14 @@ impl McpClientHandle {
                         "",
                     )
                 })?;
-                let (transport, stderr) =
-                    TokioChildProcess::builder(owned_workspace_service_tree(cmd))
-                        .stderr(Stdio::piped())
-                        .spawn_guarded()
-                        .map_err(|error| {
-                            bounded_stdio_error(
-                                &server_name,
-                                &format!("command spawn failed: {error}"),
-                                "",
-                            )
-                        })?;
-                let (transport, cleanup_complete) = OwnedStdioTransport::new(transport);
+                let (transport, cleanup_complete, stderr) =
+                    spawn_stdio_server(cmd, MCP_STDIO_MAX_LINE_BYTES).map_err(|error| {
+                        bounded_stdio_error(
+                            &server_name,
+                            &format!("command spawn failed: {error}"),
+                            "",
+                        )
+                    })?;
                 let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
                 let stderr_task =
                     stderr.map(|stderr| capture_stderr(stderr, Arc::clone(&stderr_buffer)));
@@ -793,6 +900,32 @@ fn is_restricted_ipv4(address: Ipv4Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stdout_lines_are_capped_but_long_streams_of_short_lines_are_not() {
+        use tokio::io::AsyncReadExt as _;
+        let reader = |bytes: Vec<u8>| super::LineCappedStdout {
+            inner: std::io::Cursor::new(bytes),
+            max_line: 16,
+            current_line: 0,
+            overflowed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let many_short_lines = "0123456789\n".repeat(1000).into_bytes();
+        let mut collected = Vec::new();
+        reader(many_short_lines.clone())
+            .read_to_end(&mut collected)
+            .await
+            .unwrap();
+        assert_eq!(collected, many_short_lines);
+
+        let mut capped = reader(vec![b'x'; 64]);
+        let error = capped.read_to_end(&mut Vec::new()).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(capped.overflowed.load(std::sync::atomic::Ordering::Acquire));
+        // Once overflowed, the reader stays failed.
+        assert!(capped.read_to_end(&mut Vec::new()).await.is_err());
+    }
+
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;

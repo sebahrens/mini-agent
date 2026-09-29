@@ -1552,7 +1552,10 @@ or oversized schemas are omitted. Startup notices report each applied bound.
 A server that exceeds the time or page budget is skipped without delaying the
 others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 (default 120); on expiry zerostack cancels the request and returns a tool error
-the model can act on instead of stalling the turn. Malformed JSON arguments are
+the model can act on instead of stalling the turn. A stdio server's protocol
+messages are newline-delimited; one line may be at most 16 MiB, and a server
+that writes more without a newline is disconnected and its process tree
+killed rather than buffered without bound. Malformed JSON arguments are
 rejected rather than silently converted to an argument-less call. Text, image,
 and embedded resource data from one result share the same model-facing bound as
 ordinary tool output: results over 12,000 characters are stored in the private
