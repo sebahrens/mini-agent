@@ -720,13 +720,24 @@ fn load_from_path(
         cfg.custom_providers.as_ref().map(|m| m.len()).unwrap_or(0),
     );
 
+    let clamped = cfg.retry.clamp_to_limits();
+    warn_clamped_retry(&cfg, clamped, "global config", &path);
     if let Some(local_config_path) = local_config_path {
+        let user_retry = cfg.retry.clone();
         apply_local_override(
             &mut cfg,
             local_config_path,
             project_trust_path,
             interactive,
             &confirm_project_config_trust,
+        );
+        // A repository may only tighten the user's retry policy.
+        let clamped = cfg.retry.cap_at(&user_retry);
+        warn_clamped_retry(
+            &cfg,
+            clamped,
+            "project config (may only tighten the global retry policy)",
+            local_config_path,
         );
     }
 
@@ -749,6 +760,24 @@ fn load_from_path(
     }
 
     (cfg, is_first_startup)
+}
+
+/// Report each `[retry]` field that load-time bounding changed, naming the
+/// file it came from and the value now in effect.
+fn warn_clamped_retry(cfg: &Config, fields: Vec<&'static str>, source: &str, path: &Path) {
+    for field in fields {
+        let value = match field {
+            "max_attempts" => cfg.retry.max_attempts as u64,
+            "initial_backoff_ms" => cfg.retry.initial_backoff_ms,
+            _ => cfg.retry.max_backoff_ms,
+        };
+        let warning = format!(
+            "{source} {}: retry.{field} is outside the allowed range and was clamped to {value}",
+            path.display()
+        );
+        tracing::warn!("config: {warning}");
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn confirm_project_config_trust(description: &str) -> bool {
@@ -1697,6 +1726,59 @@ mod project_config_trust_tests {
         #[cfg(feature = "lsp")]
         assert!(cfg.lsp.is_none());
         assert!(!trust_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn headless_load_clamps_extreme_project_retry_to_the_user_policy() {
+        let (root, config_path, trust_path) = fixture("retry-headless");
+        let global = root.join("global/config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "model = \"global-model\"\n").unwrap();
+        // `yolo` makes this an untrusted file with sensitive keys, so the
+        // headless path (no prompt, benign subset only) is what runs.
+        std::fs::write(
+            &config_path,
+            "yolo = true\n\
+             [retry]\n\
+             max_attempts = 4000000000\n\
+             initial_backoff_ms = 9000000000000000\n\
+             max_backoff_ms = 0\n",
+        )
+        .unwrap();
+
+        let (cfg, first_startup) =
+            super::load_from_path(global.clone(), Some(&config_path), &trust_path, false);
+
+        assert!(!first_startup);
+        assert_eq!(cfg.yolo, None, "sensitive key stays inert headless");
+        let defaults = crate::retry::RetryConfig::default();
+        assert_eq!(cfg.retry.max_attempts, defaults.max_attempts);
+        assert_eq!(cfg.retry.max_backoff_ms, 0);
+        assert_eq!(cfg.retry.initial_backoff_ms, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_clamps_global_retry_and_lets_project_tighten_within_it() {
+        let (root, config_path, trust_path) = fixture("retry-global");
+        let global = root.join("global/config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            &global,
+            "[retry]\n\
+             max_attempts = 50\n\
+             initial_backoff_ms = 1000\n\
+             max_backoff_ms = 120000\n",
+        )
+        .unwrap();
+        std::fs::write(&config_path, "[retry]\nmax_attempts = 8\n").unwrap();
+
+        let (cfg, _) = super::load_from_path(global, Some(&config_path), &trust_path, false);
+
+        assert_eq!(cfg.retry.max_attempts, 8);
+        assert_eq!(cfg.retry.initial_backoff_ms, 1000);
+        assert_eq!(cfg.retry.max_backoff_ms, crate::retry::MAX_RETRY_BACKOFF_MS);
         std::fs::remove_dir_all(root).unwrap();
     }
 

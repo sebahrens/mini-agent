@@ -55,6 +55,15 @@ stored in the private state root and is invalidated by a content change or a
 copied checkout. Headless and ACP startup never prompt; they apply only the
 benign subset and print a notice for ignored sensitive settings.
 
+`retry` is benign only as a tightening: a project `[retry]` value may lower
+`max_attempts`, `initial_backoff_ms`, or `max_backoff_ms` but never raise one
+above the user's own global (or default) policy, so a cloned repository cannot
+make a failing provider be retried more often or waited on longer. Every
+`[retry]` policy, global or project, is also clamped at load to
+`max_attempts` 1–10, both backoffs at most 60000 ms, and
+`initial_backoff_ms <= max_backoff_ms`; each clamped field prints a startup
+warning naming the field, the value now in effect, and the file it came from.
+
 Trusted project specialist definitions and the append-only
 `.zerostack/agents/.notes.md` layer use this same content-and-path-bound trust
 decision. They remain inert in untrusted, headless, or copied checkouts even
@@ -495,7 +504,7 @@ Accepted top-level keys:
 | `verify_max_attempts`     | integer | Maximum verification attempts in one agent turn, including the first check. Default: `3`; clamped to `1..=8` and also bounded by the remaining `max_agent_turns` budget. |
 | `temperature`             | number  | Model temperature (`0.0` to `2.0`). Precedence is `--temperature`, then the active quick model's value, then this global value; values are clamped to the supported range. |
 | `extra_body`              | object  | Provider-specific JSON shallow-merged into every completion request body as a global default (e.g. OpenRouter `plugins` routing presets). A matching `quick_models` entry's `extra_body` overrides this. See Provider-specific request body parameters below. |
-| `retry`                   | object  | Retry policy with `max_attempts` (default `3`), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
+| `retry`                   | object  | Retry policy with `max_attempts` (default `3`, clamped to 1–10), `initial_backoff_ms` (`500`), and `max_backoff_ms` (`10000`); both backoffs are clamped to at most `60000` and `initial_backoff_ms` to at most `max_backoff_ms`, with a startup warning for each clamped field. A retry sleeps the current backoff plus jitter but never longer than `max_backoff_ms`. A project `.zerostack/config.toml` may only tighten these values (see project-local trust above). The same configured policy drives ordinary completion starts and compaction summarizer calls through one shared retry primitive; interactive starts receive retry events from that primitive. The bound applies independently to each provider completion call in a tool-using turn; transient failures resume from preserved interactions and do not replay completed tools. Provider status codes are classified structurally when available and by explicit HTTP/status syntax otherwise; unrelated digits or words such as `connection` do not make an application error retryable. Context-window errors bypass retry and immediately include compaction guidance. |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. When unset, auto-detected from the selected model's catalog entry; falls back to `128000` if the model is not in the catalog. A value of `0` disables auto-compaction. |

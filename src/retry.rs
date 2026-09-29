@@ -22,6 +22,80 @@ impl Default for RetryConfig {
     }
 }
 
+/// Hard ceiling on `retry.max_attempts`. Every provider call path (agent
+/// turns, compaction summaries, goal judging, session titles) reads the same
+/// `RetryConfig`, so a larger value would multiply every transient failure.
+pub const MAX_RETRY_ATTEMPTS: usize = 10;
+/// Hard ceiling on either backoff, in milliseconds. A larger value cannot
+/// make a retry more useful, only let one request stall a headless run.
+pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+
+impl RetryConfig {
+    /// Clamp to the safety envelope: `max_attempts` in
+    /// `1..=MAX_RETRY_ATTEMPTS`, both backoffs at most `MAX_RETRY_BACKOFF_MS`,
+    /// and `initial_backoff_ms <= max_backoff_ms`. Returns the names of the
+    /// fields that had to change so the caller can say so.
+    pub fn clamp_to_limits(&mut self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let attempts = self.max_attempts.clamp(1, MAX_RETRY_ATTEMPTS);
+        if attempts != self.max_attempts {
+            self.max_attempts = attempts;
+            changed.push("max_attempts");
+        }
+        if self.max_backoff_ms > MAX_RETRY_BACKOFF_MS {
+            self.max_backoff_ms = MAX_RETRY_BACKOFF_MS;
+            changed.push("max_backoff_ms");
+        }
+        if self.initial_backoff_ms > self.max_backoff_ms {
+            self.initial_backoff_ms = self.max_backoff_ms;
+            changed.push("initial_backoff_ms");
+        }
+        changed
+    }
+
+    /// Cap every field at `ceiling`, then apply [`Self::clamp_to_limits`].
+    /// Used for repository-controlled project config, which may make retrying
+    /// stop sooner or wait less but never retry more often or wait longer than
+    /// the user's own (global or default) policy. Returns the changed fields.
+    pub fn cap_at(&mut self, ceiling: &RetryConfig) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.max_attempts > ceiling.max_attempts {
+            self.max_attempts = ceiling.max_attempts;
+            changed.push("max_attempts");
+        }
+        if self.initial_backoff_ms > ceiling.initial_backoff_ms {
+            self.initial_backoff_ms = ceiling.initial_backoff_ms;
+            changed.push("initial_backoff_ms");
+        }
+        if self.max_backoff_ms > ceiling.max_backoff_ms {
+            self.max_backoff_ms = ceiling.max_backoff_ms;
+            changed.push("max_backoff_ms");
+        }
+        for field in self.clamp_to_limits() {
+            if !changed.contains(&field) {
+                changed.push(field);
+            }
+        }
+        changed
+    }
+
+    /// A copy clamped to the safety envelope. The retry loops use this so a
+    /// `RetryConfig` built anywhere other than config load stays bounded too.
+    pub fn bounded(&self) -> RetryConfig {
+        let mut bounded = self.clone();
+        bounded.clamp_to_limits();
+        bounded
+    }
+}
+
+/// The sleep before the next retry: the current backoff plus jitter, never
+/// more than `max_backoff`.
+pub fn retry_delay(backoff: Duration, max_backoff: Duration) -> Duration {
+    let backoff = backoff.min(max_backoff);
+    let jitter = simple_jitter(backoff.as_millis() as u64);
+    (backoff + jitter).min(max_backoff)
+}
+
 pub fn simple_jitter(range_ms: u64) -> Duration {
     use std::time::SystemTime;
     let nanos = SystemTime::now()
@@ -206,6 +280,7 @@ where
     C: FnMut(RetryNotice) -> CFut,
     CFut: std::future::Future<Output = ()>,
 {
+    let config = &config.bounded();
     let mut attempt: usize = 0;
     let mut backoff = Duration::from_millis(config.initial_backoff_ms);
     let max_backoff = Duration::from_millis(config.max_backoff_ms);
@@ -224,8 +299,7 @@ where
                 if attempt >= config.max_attempts || !is_retryable(&e) {
                     return Err(e);
                 }
-                let jitter = simple_jitter(backoff.as_millis() as u64);
-                let delay = backoff + jitter;
+                let delay = retry_delay(backoff, max_backoff);
                 tracing::warn!(
                     "retryable error on first stream item (attempt {attempt}/{}): {e}",
                     config.max_attempts
@@ -406,6 +480,148 @@ mod tests {
             with_context_length_hint("permission denied"),
             "permission denied"
         );
+    }
+
+    #[test]
+    fn retry_config_clamps_extreme_values_to_the_safety_envelope() {
+        let mut cfg = RetryConfig {
+            max_attempts: 4_000_000_000,
+            initial_backoff_ms: 9_000_000_000_000_000,
+            max_backoff_ms: u64::MAX,
+        };
+        let changed = cfg.clamp_to_limits();
+        assert_eq!(cfg.max_attempts, MAX_RETRY_ATTEMPTS);
+        assert_eq!(cfg.max_backoff_ms, MAX_RETRY_BACKOFF_MS);
+        assert_eq!(cfg.initial_backoff_ms, MAX_RETRY_BACKOFF_MS);
+        assert_eq!(
+            changed,
+            ["max_attempts", "max_backoff_ms", "initial_backoff_ms"]
+        );
+
+        let mut zero = RetryConfig {
+            max_attempts: 0,
+            initial_backoff_ms: 5_000,
+            max_backoff_ms: 1_000,
+        };
+        assert_eq!(
+            zero.clamp_to_limits(),
+            ["max_attempts", "initial_backoff_ms"]
+        );
+        assert_eq!(zero.max_attempts, 1);
+        assert_eq!(zero.initial_backoff_ms, 1_000);
+
+        let mut defaults = RetryConfig::default();
+        assert!(defaults.clamp_to_limits().is_empty());
+    }
+
+    #[test]
+    fn retry_config_cap_only_tightens_toward_the_ceiling() {
+        let ceiling = RetryConfig::default();
+        let mut looser = RetryConfig {
+            max_attempts: 9,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 30_000,
+        };
+        assert_eq!(looser.cap_at(&ceiling), ["max_attempts", "max_backoff_ms"]);
+        assert_eq!(looser.max_attempts, 3);
+        assert_eq!(looser.initial_backoff_ms, 50);
+        assert_eq!(looser.max_backoff_ms, 10_000);
+
+        let mut tighter = RetryConfig {
+            max_attempts: 1,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+        assert!(tighter.cap_at(&ceiling).is_empty());
+    }
+
+    #[test]
+    fn first_retry_delay_never_exceeds_max_backoff() {
+        // The initial backoff above the maximum and jitter on top of it both
+        // used to leak past `max_backoff_ms`.
+        for (initial, max) in [(500, 10_000), (10_000, 10_000), (9_000, 1_000), (5, 0)] {
+            let max_backoff = Duration::from_millis(max);
+            for _ in 0..64 {
+                let delay = retry_delay(Duration::from_millis(initial), max_backoff);
+                assert!(delay <= max_backoff, "{delay:?} > {max_backoff:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_retry_primitive_bounds_an_unclamped_config() {
+        // Compaction summaries, goal judging and session titles hand
+        // `cfg.retry` straight to this primitive; an out-of-range policy
+        // built anywhere must still stop at the ceiling without a long sleep.
+        let config = RetryConfig {
+            max_attempts: usize::MAX,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+        };
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let attempt_counter = Arc::clone(&attempts);
+        let observed = Arc::clone(&notices);
+        let result = retry_stream_chat_with(
+            &config,
+            move || {
+                attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    futures::stream::iter(vec![Err::<&str, _>(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out",
+                    ))])
+                }
+            },
+            move |notice| {
+                let observed = Arc::clone(&observed);
+                async move { observed.lock().unwrap().push(notice) }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RETRY_ATTEMPTS
+        );
+        let notices = notices.lock().unwrap();
+        assert!(
+            notices
+                .iter()
+                .all(|notice| notice.max_attempts == MAX_RETRY_ATTEMPTS
+                    && notice.delay == Duration::ZERO)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_retry_primitive_caps_a_huge_initial_backoff() {
+        let config = RetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 9_000_000_000_000_000,
+            max_backoff_ms: 9_000_000_000_000_000,
+        };
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&notices);
+        let result = retry_stream_chat_with(
+            &config,
+            || async {
+                futures::stream::iter(vec![Err::<&str, _>(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out",
+                ))])
+            },
+            move |notice| {
+                let observed = Arc::clone(&observed);
+                async move { observed.lock().unwrap().push(notice) }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].delay <= Duration::from_millis(MAX_RETRY_BACKOFF_MS));
     }
 
     #[tokio::test]

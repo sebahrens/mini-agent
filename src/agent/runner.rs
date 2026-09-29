@@ -1150,6 +1150,7 @@ struct CompletionRetryState {
 
 impl CompletionRetryState {
     fn new(config: &RetryConfig) -> Self {
+        let config = config.bounded();
         Self {
             failures: 0,
             backoff: std::time::Duration::from_millis(config.initial_backoff_ms),
@@ -1158,6 +1159,7 @@ impl CompletionRetryState {
     }
 
     fn reset(&mut self, config: &RetryConfig) {
+        let config = config.bounded();
         self.failures = 0;
         self.backoff = std::time::Duration::from_millis(config.initial_backoff_ms);
     }
@@ -1167,6 +1169,7 @@ impl CompletionRetryState {
         config: &RetryConfig,
         error: &rig::agent::StreamingError,
     ) -> Option<(usize, std::time::Duration)> {
+        let config = &config.bounded();
         self.failures = self.failures.saturating_add(1);
         let provider_error = matches!(
             error,
@@ -1176,8 +1179,7 @@ impl CompletionRetryState {
             return None;
         }
 
-        let jitter = retry::simple_jitter(self.backoff.as_millis() as u64);
-        let delay = self.backoff + jitter;
+        let delay = retry::retry_delay(self.backoff, self.max_backoff);
         self.backoff = (self.backoff * 2).min(self.max_backoff);
         Some((self.failures, delay))
     }
@@ -2597,6 +2599,7 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let retry_config = retry_config.bounded();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(32);
     let (compaction_decision_tx, mut compaction_decision_rx) =
         mpsc::channel::<CompactionBoundaryDecision>(1);
@@ -3522,6 +3525,7 @@ where
         ));
     }
 
+    let retry_config = &retry_config.bounded();
     let mut first_attempt_history = Some(history.to_vec());
     let stream = await_headless_work(retry::retry_stream_chat(retry_config, || {
         let p = prompt.to_string();
@@ -4455,6 +4459,29 @@ mod tests {
         assert!(headless_error.contains("/compress"));
         assert!(headless_error.contains("compact_enabled = true"));
         assert_eq!(headless_model.requests().len(), 1);
+    }
+
+    #[test]
+    fn mid_stream_completion_retry_is_bounded_by_the_safety_envelope() {
+        let extreme = crate::retry::RetryConfig {
+            max_attempts: 4_000_000_000,
+            initial_backoff_ms: 9_000_000_000_000_000,
+            max_backoff_ms: 9_000_000_000_000_000,
+        };
+        let error = rig::agent::StreamingError::Completion(
+            rig::completion::CompletionError::ProviderError("HTTP 429 Too Many Requests".into()),
+        );
+        let mut state = super::CompletionRetryState::new(&extreme);
+        let mut retries = 0;
+        while let Some((_, delay)) = state.retry_delay(&extreme, &error) {
+            assert!(delay <= std::time::Duration::from_millis(crate::retry::MAX_RETRY_BACKOFF_MS));
+            retries += 1;
+            assert!(
+                retries < crate::retry::MAX_RETRY_ATTEMPTS,
+                "retry loop not bounded"
+            );
+        }
+        assert_eq!(retries, crate::retry::MAX_RETRY_ATTEMPTS - 1);
     }
 
     fn immediate_retry_config(max_attempts: usize) -> crate::retry::RetryConfig {

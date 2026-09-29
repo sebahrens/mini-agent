@@ -12,6 +12,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed
   from chat output and replaced with `�` in picker entries. ZWJ/ZWNJ and right-to-left text are kept.
+- `[retry]` is now bounded: every policy is clamped at load to 1–10 attempts and backoffs of at most
+  60 s (with a startup warning per clamped field), a retry never sleeps longer than `max_backoff_ms`,
+  and an untrusted project `.zerostack/config.toml` may only tighten the user's global/default retry
+  policy, so a cloned repository can no longer spin a zero-delay retry loop or hang headless runs.
 - Replayed sessions (`--continue`/`--resume`, double-Esc rewind, session or worktree switch, `/memory`,
   `/init`) no longer paint stored escape sequences: user, assistant and system messages and the
   welcome line's directory name are sanitised, and the chat feed and painter now strip control
