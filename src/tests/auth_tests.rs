@@ -250,3 +250,68 @@ fn builtin_provider_named_by_slug_keeps_kind_fallbacks() {
         .with_custom_provider_name(Some("google"));
     assert_eq!(resolver.resolve_with_env(env).unwrap(), "gemini-config-key");
 }
+
+// --- Explicit credential isolation for built-in-named custom providers (mini-agent-as8yw) ---
+
+#[test]
+fn isolated_builtin_alias_does_not_fall_back_to_vendor_credentials() {
+    let mut keys = HashMap::new();
+    keys.insert(
+        "openai".to_string(),
+        "sk-real-openai-config-key".to_string(),
+    );
+    keys.insert("gemini".to_string(), "real-gemini-config-key".to_string());
+    for (kind, name, vendor_env) in [
+        (ProviderKind::OpenAI, "custom", "OPENAI_API_KEY"),
+        (ProviderKind::OpenAI, "openai", "OPENAI_API_KEY"),
+        (ProviderKind::Gemini, "google", "GEMINI_API_KEY"),
+    ] {
+        let env = mock_env(vec![(vendor_env, "real-vendor-key")]);
+        let resolver = AuthResolver::new(kind)
+            .with_config_keys(Some(&keys))
+            .with_custom_provider_name(Some(name))
+            .with_credential_isolation(Some(true));
+        let message = resolver
+            .resolve_with_env(env)
+            .expect_err("isolated alias must not inherit vendor credentials")
+            .to_string();
+        assert!(
+            message.contains(&format!("No API key found for custom provider '{name}'")),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn isolated_builtin_alias_uses_its_own_env_and_config_entry() {
+    let env = mock_env(vec![
+        ("OPENAI_API_KEY", "real-vendor-key"),
+        ("GW_KEY", "gateway-env-key"),
+    ]);
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_env_override(Some("GW_KEY"))
+        .with_custom_provider_name(Some("custom"))
+        .with_credential_isolation(Some(true));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "gateway-env-key");
+
+    let env = mock_env(vec![("OPENAI_API_KEY", "real-vendor-key")]);
+    let mut keys = HashMap::new();
+    keys.insert("custom".to_string(), "gateway-config-key".to_string());
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_config_keys(Some(&keys))
+        .with_custom_provider_name(Some("custom"))
+        .with_credential_isolation(Some(true));
+    assert_eq!(
+        resolver.resolve_with_env(env).unwrap(),
+        "gateway-config-key"
+    );
+}
+
+#[test]
+fn explicit_inheritance_lets_custom_name_use_vendor_env_var() {
+    let env = mock_env(vec![("OPENAI_API_KEY", "real-vendor-key")]);
+    let resolver = AuthResolver::new(ProviderKind::OpenAI)
+        .with_custom_provider_name(Some("local-vllm"))
+        .with_credential_isolation(Some(false));
+    assert_eq!(resolver.resolve_with_env(env).unwrap(), "real-vendor-key");
+}

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 fn custom_provider(provider_type: &str) -> CustomProviderConfig {
     CustomProviderConfig {
         provider_type: CompactString::new(provider_type),
+        inherit_builtin_key: false,
         base_url: "https://gateway.example.com".to_string(),
         api_key_env: None,
         danger_accept_invalid_certs: None,
@@ -1177,4 +1178,19 @@ fn known_context_window_orders_pin_quick_model_then_catalog() {
         pinned.known_context_window("ollama", "llama3.1", &none),
         Some(32_000)
     );
+}
+
+#[test]
+fn custom_provider_inherit_builtin_key_defaults_false_and_parses() {
+    let parsed: CustomProviderConfig =
+        toml::from_str("provider_type = \"openai\"\nbase_url = \"https://gw.example\"\n").unwrap();
+    assert!(!parsed.inherit_builtin_key);
+    let serialized = toml::to_string(&parsed).unwrap();
+    assert!(!serialized.contains("inherit_builtin_key"), "{serialized}");
+
+    let parsed: CustomProviderConfig = toml::from_str(
+        "provider_type = \"openai\"\nbase_url = \"https://gw.example\"\ninherit_builtin_key = true\n",
+    )
+    .unwrap();
+    assert!(parsed.inherit_builtin_key);
 }

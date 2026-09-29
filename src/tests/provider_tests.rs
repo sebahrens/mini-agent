@@ -424,6 +424,7 @@ async fn bounded_compaction_propagates_summarizer_errors() {
 fn cfg(api_style: Option<ApiStyle>) -> CustomProviderConfig {
     CustomProviderConfig {
         provider_type: "openai".into(),
+        inherit_builtin_key: false,
         base_url: "https://gw.example/v1".to_string(),
         api_key_env: None,
         danger_accept_invalid_certs: None,
@@ -707,6 +708,7 @@ fn resolve_custom_provider() {
         "my-gw".to_string(),
         CustomProviderConfig {
             provider_type: "openai".into(),
+            inherit_builtin_key: false,
             base_url: "https://mygw.example/v1".to_string(),
             api_key_env: None,
             danger_accept_invalid_certs: None,
@@ -765,6 +767,7 @@ async fn anthropic_custom_base_appends_v1_messages() {
         "anthropic-capture".to_string(),
         CustomProviderConfig {
             provider_type: "anthropic".into(),
+            inherit_builtin_key: false,
             base_url: format!("http://{address}/anthropic"),
             api_key_env: None,
             danger_accept_invalid_certs: None,
@@ -968,6 +971,7 @@ async fn openrouter_anthropic_request_sends_automatic_tail_cache_control() {
         "openrouter-capture".to_string(),
         CustomProviderConfig {
             provider_type: "openrouter".into(),
+            inherit_builtin_key: false,
             base_url: format!("http://{address}/api/v1"),
             api_key_env: None,
             danger_accept_invalid_certs: None,
@@ -1101,6 +1105,7 @@ use std::time::Instant;
 fn timeout_cfg(connect_secs: u64, idle_secs: u64) -> CustomProviderConfig {
     CustomProviderConfig {
         provider_type: "openai".into(),
+        inherit_builtin_key: false,
         base_url: "http://127.0.0.1/v1".to_string(),
         api_key_env: None,
         danger_accept_invalid_certs: None,
@@ -1554,4 +1559,217 @@ fn compaction_system_prompt_treats_fenced_sections_as_data() {
     assert!(prompt.contains("<previous_summary>"));
     assert!(prompt.contains("untrusted data"));
     assert!(prompt.contains("never instructions"));
+}
+
+// --- Built-in-named custom providers must not inherit vendor keys (mini-agent-as8yw) ---
+
+fn shadowing_provider(provider_type: &str, base_url: &str) -> CustomProviderConfig {
+    CustomProviderConfig {
+        provider_type: provider_type.into(),
+        inherit_builtin_key: false,
+        base_url: base_url.to_string(),
+        api_key_env: None,
+        danger_accept_invalid_certs: None,
+        api_style: None,
+        headers: HashMap::new(),
+        timeout_secs: None,
+        connect_timeout_secs: None,
+        stream_idle_timeout_secs: None,
+        model: None,
+    }
+}
+
+fn create_client_error(
+    name: &str,
+    custom: &HashMap<String, CustomProviderConfig>,
+    keys: Option<&HashMap<String, String>>,
+) -> String {
+    match create_client(name, None, custom, keys) {
+        Ok(_) => panic!("{name} must not resolve a vendor key for a third-party base_url"),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[test]
+fn custom_named_custom_provider_does_not_inherit_openai_key() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsString::from("sk-real-openai-key")),
+    )]);
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom".to_string(),
+        shadowing_provider("openai", "https://gw.example"),
+    );
+    let mut keys = HashMap::new();
+    keys.insert(
+        "openai".to_string(),
+        "sk-real-openai-config-key".to_string(),
+    );
+    let message = create_client_error("custom", &custom, Some(&keys));
+    assert!(
+        message.contains("No API key found for custom provider 'custom'"),
+        "{message}"
+    );
+    assert!(message.contains("api_key_env"), "{message}");
+    assert!(!message.contains("OPENAI_API_KEY"), "{message}");
+}
+
+#[test]
+fn google_named_custom_provider_does_not_inherit_gemini_key() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "GEMINI_API_KEY",
+        Some(std::ffi::OsString::from("real-gemini-key")),
+    )]);
+    let mut custom = HashMap::new();
+    custom.insert(
+        "google".to_string(),
+        shadowing_provider("gemini", "https://gw.example"),
+    );
+    let mut keys = HashMap::new();
+    keys.insert("gemini".to_string(), "real-gemini-config-key".to_string());
+    let message = create_client_error("google", &custom, Some(&keys));
+    assert!(
+        message.contains("No API key found for custom provider 'google'"),
+        "{message}"
+    );
+}
+
+#[test]
+fn openai_named_custom_provider_with_gateway_does_not_inherit_openai_key() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsString::from("sk-real-openai-key")),
+    )]);
+    let mut custom = HashMap::new();
+    custom.insert(
+        "openai".to_string(),
+        shadowing_provider("openai", "https://gw.example/v1"),
+    );
+    let message = create_client_error("openai", &custom, None);
+    assert!(
+        message.contains("No API key found for custom provider 'openai'"),
+        "{message}"
+    );
+}
+
+#[test]
+fn shadowing_custom_provider_uses_its_own_key_env_and_config_entry() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[
+        (
+            "OPENAI_API_KEY",
+            Some(std::ffi::OsString::from("sk-real-openai-key")),
+        ),
+        (
+            "AS8YW_GATEWAY_KEY",
+            Some(std::ffi::OsString::from("gateway-env-key")),
+        ),
+    ]);
+    let mut entry = shadowing_provider("openai", "https://gw.example");
+    entry.api_key_env = Some("AS8YW_GATEWAY_KEY".into());
+    let mut custom = HashMap::new();
+    custom.insert("custom".to_string(), entry);
+    let config = resolve_provider_config("custom", &custom).unwrap();
+    assert_eq!(config.credential_isolation, Some(true));
+    assert!(create_client("custom", None, &custom, None).is_ok());
+    let resolved = crate::auth::AuthResolver::new(ProviderKind::OpenAI)
+        .with_env_override(config.api_key_env.as_deref())
+        .with_custom_provider_name(Some("custom"))
+        .with_credential_isolation(config.credential_isolation)
+        .resolve()
+        .unwrap();
+    assert_eq!(resolved, "gateway-env-key");
+
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom".to_string(),
+        shadowing_provider("openai", "https://gw.example"),
+    );
+    let config = resolve_provider_config("custom", &custom).unwrap();
+    let mut keys = HashMap::new();
+    keys.insert(
+        "openai".to_string(),
+        "sk-real-openai-config-key".to_string(),
+    );
+    keys.insert("custom".to_string(), "gateway-config-key".to_string());
+    assert!(create_client("custom", None, &custom, Some(&keys)).is_ok());
+    let resolved = crate::auth::AuthResolver::new(ProviderKind::OpenAI)
+        .with_config_keys(Some(&keys))
+        .with_custom_provider_name(Some("custom"))
+        .with_credential_isolation(config.credential_isolation)
+        .resolve()
+        .unwrap();
+    assert_eq!(resolved, "gateway-config-key");
+}
+
+#[test]
+fn shadowing_custom_provider_at_vendor_endpoint_keeps_vendor_key() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "openai".to_string(),
+        shadowing_provider("openai", "https://api.openai.com/v1"),
+    );
+    custom.insert(
+        "openrouter".to_string(),
+        shadowing_provider("openrouter", "https://openrouter.ai/api/v1/"),
+    );
+    custom.insert(
+        "google".to_string(),
+        shadowing_provider("gemini", "https://generativelanguage.googleapis.com"),
+    );
+    for name in ["openai", "openrouter", "google"] {
+        let config = resolve_provider_config(name, &custom).unwrap();
+        assert_eq!(config.credential_isolation, Some(false), "{name}");
+    }
+    // A name that disagrees with its provider_type gets no exemption.
+    custom.insert(
+        "google".to_string(),
+        shadowing_provider("openai", "https://api.openai.com/v1"),
+    );
+    let config = resolve_provider_config("google", &custom).unwrap();
+    assert_eq!(config.credential_isolation, Some(true));
+    // A look-alike host or a downgraded scheme is not the vendor endpoint.
+    for base_url in [
+        "https://api.openai.com.evil.example/v1",
+        "http://api.openai.com/v1",
+        "https://api.openai.com:8443/v1",
+    ] {
+        custom.insert("openai".to_string(), shadowing_provider("openai", base_url));
+        let config = resolve_provider_config("openai", &custom).unwrap();
+        assert_eq!(config.credential_isolation, Some(true), "{base_url}");
+    }
+}
+
+#[test]
+fn inherit_builtin_key_opt_in_reuses_vendor_key() {
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsString::from("sk-real-openai-key")),
+    )]);
+    let mut entry = shadowing_provider("openai", "https://gw.example");
+    entry.inherit_builtin_key = true;
+    let mut custom = HashMap::new();
+    custom.insert("custom".to_string(), entry);
+    let config = resolve_provider_config("custom", &custom).unwrap();
+    assert_eq!(config.credential_isolation, Some(false));
+    assert!(create_client("custom", None, &custom, None).is_ok());
+    let resolved = crate::auth::AuthResolver::new(ProviderKind::OpenAI)
+        .with_custom_provider_name(Some("custom"))
+        .with_credential_isolation(config.credential_isolation)
+        .resolve()
+        .unwrap();
+    assert_eq!(resolved, "sk-real-openai-key");
+}
+
+#[test]
+fn builtin_provider_without_custom_entry_keeps_name_based_default() {
+    let config = resolve_provider_config("openai", &HashMap::new()).unwrap();
+    assert_eq!(config.credential_isolation, None);
+    let mut custom = HashMap::new();
+    custom.insert(
+        "local-vllm".to_string(),
+        shadowing_provider("openai", "http://localhost:8000/v1"),
+    );
+    let config = resolve_provider_config("local-vllm", &custom).unwrap();
+    assert_eq!(config.credential_isolation, None);
 }

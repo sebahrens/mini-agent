@@ -46,6 +46,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   directories denied to `read` (or to the walking tool itself, or by an `external_directory` deny)
   are skipped, so `grep` over `.` can no longer return the contents, and `find_files`/`list_dir` the
   names, of files the user denied to `read`. Previously only the search root was checked.
+- A `custom_providers` entry named after a built-in alias (`custom`, `openai`, `google`, ...) with
+  a third-party `base_url` no longer inherits the vendor key (`OPENAI_API_KEY`, `api_keys.openai`,
+  ...); it uses only its own `api_key_env` or `api_keys` entry, unless it points at the vendor's
+  own endpoint or sets the new opt-in `inherit_builtin_key = true`.
 
 ### Added
 
