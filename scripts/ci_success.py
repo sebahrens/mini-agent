@@ -7,10 +7,11 @@ not run, so a `skipped` result is accepted only where the workflow skips that
 job by design:
 
 * a documentation-only change (`changes` reported `code=false`) skips every
-  build, lint and test job, and only `changes` and `fmt` must still succeed;
-* `harness-regression` runs on pull requests only.
+  build, lint and test job, and only `changes` and `fmt` must still succeed.
 
-Whenever `changes` reported `code=true` every other gating job must succeed.
+Whenever `changes` reported `code=true` every other gating job must succeed on
+every event, including `harness-regression` on a push (it used to run on pull
+requests only, which left it unexercised because work lands directly on main).
 `failure` and `cancelled` are never accepted.
 """
 
@@ -24,8 +25,6 @@ from typing import Any
 
 # Jobs that must succeed on every event ci-success runs for.
 ALWAYS_REQUIRED = ("changes", "fmt")
-# Jobs the workflow runs only for some events even when code changed.
-EVENT_SCOPED = {"harness-regression": frozenset({"pull_request"})}
 
 
 def evaluate(needs: dict[str, Any], event: str) -> list[str]:
@@ -51,12 +50,8 @@ def evaluate(needs: dict[str, Any], event: str) -> list[str]:
         result = entry.get("result") if isinstance(entry, dict) else None
         if result == "success":
             continue
-        if result == "skipped" and job not in ALWAYS_REQUIRED:
-            allowed_events = EVENT_SCOPED.get(job)
-            if allowed_events is not None and event not in allowed_events:
-                continue
-            if not full_matrix:
-                continue
+        if result == "skipped" and job not in ALWAYS_REQUIRED and not full_matrix:
+            continue
         errors.append(f"{job} finished with {result!r}")
     return errors
 

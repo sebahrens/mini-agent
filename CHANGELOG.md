@@ -59,6 +59,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- CI now runs the `harness-regression` job (the bounded deterministic harness evaluation and the only
+  Gym entrypoint smoke) on pushes as well as pull requests, and `ci-success` fails if it is skipped
+  while code changed; it had been pull-request-only and so never ran for work landing on `main`.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded
