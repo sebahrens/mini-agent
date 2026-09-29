@@ -105,10 +105,29 @@ fi
         uname.chmod(0o755)
         return release, stub_bin
 
-    def run_installer(self, root: Path, release: Path, stub_bin: Path) -> subprocess.CompletedProcess[str]:
+    def run_installer(
+        self,
+        root: Path,
+        release: Path,
+        stub_bin: Path,
+        *,
+        install_dir: str | None = None,
+        path_prefix: list[Path] | None = None,
+        home: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env["PATH"] = f"{stub_bin}:{env['PATH']}"
+        # Keep any real mini-agent on the developer's PATH from influencing
+        # the PATH-resolution checks.
+        system_path = os.pathsep.join(
+            entry
+            for entry in env["PATH"].split(os.pathsep)
+            if entry and not (Path(entry) / "mini-agent").exists()
+        )
+        prefix = "".join(f"{entry}:" for entry in path_prefix or [])
+        env["PATH"] = f"{prefix}{stub_bin}:{system_path}"
         env["INSTALL_TEST_RELEASE"] = str(release)
+        if home is not None:
+            env["HOME"] = str(home)
         return subprocess.run(
             [
                 "bash",
@@ -116,9 +135,10 @@ fi
                 "--release",
                 "1.7.2",
                 "--dir",
-                str(root / "prefix" / "bin"),
+                install_dir if install_dir is not None else str(root / "prefix" / "bin"),
             ],
             env=env,
+            cwd=root,
             capture_output=True,
             text=True,
         )
@@ -223,6 +243,128 @@ fi
                 f"{'0' * 64}  {misleading}\n", encoding="ascii"
             )
             self.assert_rejected_before_install(root, release, stub_bin, "has no entry")
+
+    def test_upgrade_replaces_existing_binary_by_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            bin_dir = root / "prefix/bin"
+            bin_dir.mkdir(parents=True)
+            target = bin_dir / "mini-agent"
+            target.write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+            target.chmod(0o755)
+            # A second link to the old inode shows whether the installer
+            # rewrote the running binary in place or replaced the entry.
+            running = root / "running-old-binary"
+            os.link(target, running)
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("#!/bin/sh\necho old\n", running.read_text(encoding="utf-8"))
+            self.assertIn("mini-agent 1.7.2", target.read_text(encoding="utf-8"))
+            self.assertNotEqual(running.stat().st_ino, target.stat().st_ino)
+            self.assertTrue(os.access(target, os.X_OK))
+            self.assertEqual(["mini-agent"], sorted(p.name for p in bin_dir.iterdir()))
+
+    def test_html_archive_reports_download_problem_not_checksum_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            sign_in = "<!DOCTYPE html>\n<html><body>Sign in to GitHub</body></html>\n"
+            (release / "mini-agent-aarch64-apple-darwin.tar.gz").write_text(sign_in)
+            (release / "SHA256SUMS").write_text(sign_in)
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("not a release asset (received an HTML page)", result.stderr)
+            self.assertIn("gh release download", result.stderr)
+            self.assertNotIn("has no entry", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    def test_html_checksum_manifest_reports_download_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (release / "SHA256SUMS").write_text("<html><title>Sign in</title></html>\n")
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("checksum manifest SHA256SUMS is not a release asset", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    def test_non_gzip_archive_is_rejected_before_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (release / "mini-agent-aarch64-apple-darwin.tar.gz").write_bytes(b"not found\n")
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("data that is not gzip", result.stderr)
+
+    def test_tilde_install_directory_expands_to_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            home = root / "home"
+            home.mkdir()
+
+            result = self.run_installer(
+                root, release, stub_bin, install_dir="~/bin", home=home
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((home / "bin/mini-agent").is_file())
+            self.assertFalse((root / "~").exists())
+
+    def test_path_hint_matches_whole_entries_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            lookalike = root / "prefix/bin2"
+            lookalike.mkdir(parents=True)
+
+            result = self.run_installer(root, release, stub_bin, path_prefix=[lookalike])
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("is not in your PATH", result.stdout)
+
+    def test_warns_when_path_resolves_to_a_shadowing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            shadow = root / "shadow"
+            shadow.mkdir()
+            (shadow / "mini-agent").write_text("#!/bin/sh\necho shadow\n")
+            (shadow / "mini-agent").chmod(0o755)
+            bin_dir = root / "prefix/bin"
+
+            result = self.run_installer(
+                root, release, stub_bin, path_prefix=[shadow, Path(f"{bin_dir}/")]
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("is not in your PATH", result.stdout)
+            self.assertIn("resolves to a different binary", result.stdout)
+            self.assertIn(f"Resolves to: {shadow}/mini-agent", result.stdout)
+            self.assertIn("hash -r", result.stdout)
+
+    def test_no_path_warning_when_install_directory_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+
+            result = self.run_installer(
+                root, release, stub_bin, path_prefix=[root / "prefix/bin"]
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("is not in your PATH", result.stdout)
+            self.assertNotIn("different binary", result.stdout)
 
 
 if __name__ == "__main__":

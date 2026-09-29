@@ -437,6 +437,54 @@ pub async fn create(
     .await
 }
 
+/// The checkout that contains `repo_path` (its Git toplevel) followed by the
+/// main worktree when `repo_path` is inside a linked worktree.
+async fn checkout_roots(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = run_query(repo_path, "worktree-root", ["rev-parse", "--show-toplevel"]).await?;
+    let toplevel = canonical_path(&output_path(&root.stdout), "worktree root")?;
+    let common = run_query(
+        repo_path,
+        "common-dir",
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    let common_dir = canonical_path(&output_path(&common.stdout), "common Git directory")?;
+    let mut roots = vec![toplevel];
+    if common_dir.file_name() == Some(std::ffi::OsStr::new(".git"))
+        && let Some(main) = common_dir.parent()
+        && !roots.iter().any(|root| root == main)
+    {
+        roots.push(main.to_path_buf());
+    }
+    Ok(roots)
+}
+
+/// Resolve the new worktree directory. The default base is the parent of the
+/// current checkout's toplevel (not of the process working directory, which
+/// may be a subdirectory), and no target may be nested inside a checkout.
+fn default_or_explicit_target(
+    checkouts: &[PathBuf],
+    base_dir: Option<&Path>,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let target = match base_dir {
+        Some(directory) => canonical_path(directory, "worktree base directory")?.join(name),
+        None => checkouts
+            .first()
+            .and_then(|toplevel| toplevel.parent())
+            .ok_or_else(|| "repository has no parent for default worktree path".to_string())?
+            .join(name),
+    };
+    if let Some(checkout) = checkouts.iter().find(|root| target.starts_with(root)) {
+        return Err(format!(
+            "worktree target {} is inside the checkout {}; choose a base directory outside the repository",
+            target.display(),
+            checkout.display()
+        ));
+    }
+    Ok(target)
+}
+
 async fn create_with_limits(
     repo_path: &Path,
     name: &str,
@@ -445,13 +493,8 @@ async fn create_with_limits(
     add_limits: CommandLimits,
 ) -> Result<(PathBuf, WorktreeInfo), String> {
     let repo_path = canonical_path(repo_path, "repository")?;
-    let target = match base_dir {
-        Some(directory) => canonical_path(directory, "worktree base directory")?.join(name),
-        None => repo_path
-            .parent()
-            .ok_or_else(|| "repository has no parent for default worktree path".to_string())?
-            .join(name),
-    };
+    let checkouts = checkout_roots(&repo_path).await?;
+    let target = default_or_explicit_target(&checkouts, base_dir, name)?;
     validate_branch_name(&repo_path, name).await?;
     let guard = acquire_repository(&repo_path).await?;
     if target.exists() {
