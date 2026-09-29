@@ -6423,13 +6423,16 @@ mod tests {
         let directory = TempDir::new();
         let permission =
             host_permission(directory.path().to_path_buf(), Action::Allow, Action::Allow);
+        // Build the owner first so the channel's item type is inferred from
+        // `PermissionBridgeOwner::new` before the approvals task uses it; this
+        // test only compiles on Linux, where inference from the task alone failed.
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
         let approvals = tokio::spawn(async move {
             while let Some(prompt) = ask_rx.recv().await {
                 let _ = prompt.reply.send(UserDecision::AllowOnce);
             }
         });
-        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
         let service = ParentHostEffectService::new(
             FileEffectService::new(
                 owner.bridge(),
