@@ -126,6 +126,23 @@ class SyncVersionTests(unittest.TestCase):
             self.assertEqual("1.3.0", registry["agent"]["protocol"]["version"])
 
     def test_unchanged_version_keeps_recorded_release_digests(self) -> None:
+        # The checked-in recipes hold either the pending placeholder (right
+        # after a version bump) or the published release digests (after
+        # `just post-release`). Replace every artifact digest with a sentinel so
+        # the fixture does not depend on which state the repository is in.
+        license_digest = (
+            "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+        )
+
+        def with_sentinel_digests(text: str) -> str:
+            return re.sub(
+                r"\b[0-9a-f]{64}\b",
+                lambda match: match.group(0)
+                if match.group(0) == license_digest
+                else "e" * 64,
+                text,
+            )
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -134,15 +151,15 @@ class SyncVersionTests(unittest.TestCase):
             recipe = REPOSITORY / "packaging/aur/PKGBUILD"
             destination = root / "packaging/aur/PKGBUILD"
             destination.parent.mkdir(parents=True)
-            text = recipe.read_text(encoding="utf-8").replace("0" * 64, "e" * 64)
+            text = with_sentinel_digests(recipe.read_text(encoding="utf-8"))
+            self.assertIn("e" * 64, text)
             destination.write_text(text, encoding="utf-8")
             srcinfo = root / "packaging/aur/.SRCINFO"
-            srcinfo.write_text(
-                (REPOSITORY / "packaging/aur/.SRCINFO")
-                .read_text(encoding="utf-8")
-                .replace("0" * 64, "e" * 64),
-                encoding="utf-8",
+            srcinfo_text = with_sentinel_digests(
+                (REPOSITORY / "packaging/aur/.SRCINFO").read_text(encoding="utf-8")
             )
+            self.assertIn("e" * 64, srcinfo_text)
+            srcinfo.write_text(srcinfo_text, encoding="utf-8")
             for relative in (
                 "packaging/conda/zerostack/meta.yaml",
                 "packaging/conda/zerostack-bin/meta.yaml",
