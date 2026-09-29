@@ -47,8 +47,11 @@ For a source checkout, use:
 ```
 git clone https://github.com/sebahrens/mini-agent.git
 cd mini-agent
-cargo install --path . --debug
+cargo install --path . --locked
 ```
+
+Contributors use the debug development build described in
+[CONTRIBUTING.md](https://github.com/sebahrens/mini-agent/blob/main/CONTRIBUTING.md).
 
 Do not run `cargo install mini-agent`: the crates.io package with that name is an unrelated project.
 

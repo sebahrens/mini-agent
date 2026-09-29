@@ -197,6 +197,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The goal round-clock test that proves time waiting on a permission prompt does not count against a
   goal's time budget no longer flakes on loaded macOS CI runners: it now injects the instants instead
   of bounding real sleeps from above.
+- On macOS, a failed JavaScript containment preflight (for example when mini-agent runs inside
+  another sandbox) no longer prints CI tokens such as `MACOS_CONTAINMENT_MATRIX_FAILED=launch` on
+  stderr during `--print-config`, `-p` or TUI startup; the worker's unavailable reason now names the
+  failed stage in a sentence. Set `MINI_AGENT_CONTAINMENT_EVIDENCE=1` to get the tokens back.
+- The README and Get Started source installs now use `cargo install --path . --locked` (the
+  `--debug` build moved to CONTRIBUTING.md), and the learned-skills Git install is pinned with
+  `--locked --tag vX.Y.Z`. The weekly model-catalog refresh runs with job-scoped permissions and no
+  persisted checkout credentials, and dispatches CI for its pull request. Dependabot now also watches
+  the VS Code extension's npm dependencies.
 
 ## [1.9.4] - 2026-09-29
 

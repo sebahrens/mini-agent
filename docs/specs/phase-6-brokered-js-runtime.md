@@ -707,6 +707,13 @@ macOS 26 is allowlisted after the exact installed production binary emitted
 `MACOS_CONTAINMENT_MATRIX_V1=passed` on macOS 26.5.2 for the complete worker denial/readback,
 one-time-image lifecycle, and guardian parent-death matrix. Availability is still recomputed by
 that same preflight, so a rejected profile or failed control returns typed unavailable.
+The parent-side stage tokens (`MACOS_CONTAINMENT_MATRIX_FAILED=<stage>`,
+`MACOS_PARENT_DEATH_FAILED=<stage>` and the relayed worker `MACOS_CONTAINMENT_PROBE_FAILED=<code>`)
+reach stderr only in the hosted production-binary matrix (`MINI_AGENT_INTERNAL_MACOS_HOSTED_LIFECYCLE`)
+or when `MINI_AGENT_CONTAINMENT_EVIDENCE=1` is set; ordinary startup (`--print-config`, `-p`, the
+TUI) records them as `tracing` debug events and folds one human sentence per stage (for example
+"could not launch the worker (nested sandbox?)") into the typed unavailable reason. This is a
+reporting change only: the availability decision is unchanged.
 
 The production launcher closes that scoped transition with a fresh one-time pathname. The public
 `sandbox_init` API remains deprecated and the assurance therefore remains explicitly

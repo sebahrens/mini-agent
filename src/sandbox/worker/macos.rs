@@ -841,6 +841,107 @@ fn initialize_hosted_process_paths() -> io::Result<()> {
     crate::paths::prepare_storage_roots(&paths)
 }
 
+/// Opt-in switch for the machine-readable `MACOS_*_FAILED=` preflight stage tokens on stderr.
+///
+/// Ordinary startup (`--print-config`, `-p`, the TUI) must not print CI tokens: the failure is
+/// reported as a human sentence in the worker's unavailable reason and the stage token goes to a
+/// `tracing::debug!` record. The hosted production-binary matrix (which runs with
+/// [`super::MACOS_HOSTED_LIFECYCLE_MARKER`]) and evidence collection that sets this variable to
+/// `1` still receive the tokens on stderr.
+const CONTAINMENT_EVIDENCE_ENV: &str = "MINI_AGENT_CONTAINMENT_EVIDENCE";
+
+fn containment_evidence_requested() -> bool {
+    containment_evidence_requested_for(
+        std::env::var_os(super::MACOS_HOSTED_LIFECYCLE_MARKER).as_deref(),
+        std::env::var_os(CONTAINMENT_EVIDENCE_ENV).as_deref(),
+    )
+}
+
+fn containment_evidence_requested_for(
+    hosted_lifecycle: Option<&std::ffi::OsStr>,
+    evidence: Option<&std::ffi::OsStr>,
+) -> bool {
+    hosted_lifecycle == Some(std::ffi::OsStr::new(HOSTED_LIFECYCLE_MARKER_VALUE))
+        || evidence == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The stderr line for a parent-side preflight stage token, if evidence output was requested.
+fn preflight_token_stderr_line(token: &str, evidence_requested: bool) -> Option<&str> {
+    evidence_requested.then_some(token)
+}
+
+/// Record a parent-side preflight stage token: on stderr only for opted-in evidence collection,
+/// otherwise as a debug trace.
+fn report_preflight_token(token: &str) {
+    match preflight_token_stderr_line(token, containment_evidence_requested()) {
+        Some(line) => eprintln!("{line}"),
+        None => tracing::debug!(token, "macOS containment preflight stage failed"),
+    }
+}
+
+/// A parent-side stage of the macOS containment preflight, with its CI token and the human
+/// sentence folded into the worker's unavailable reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreflightStage {
+    SentinelSetup,
+    SentinelPrecheck,
+    Launch,
+    WorkerAttestation,
+    SentinelPostcheck,
+    ParentDeath,
+}
+
+impl PreflightStage {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::SentinelSetup,
+        Self::SentinelPrecheck,
+        Self::Launch,
+        Self::WorkerAttestation,
+        Self::SentinelPostcheck,
+        Self::ParentDeath,
+    ];
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::SentinelSetup => "MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_setup",
+            Self::SentinelPrecheck => "MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_precheck",
+            Self::Launch => "MACOS_CONTAINMENT_MATRIX_FAILED=launch",
+            Self::WorkerAttestation => "MACOS_CONTAINMENT_MATRIX_FAILED=worker_attestation",
+            Self::SentinelPostcheck => "MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_postcheck",
+            Self::ParentDeath => "MACOS_CONTAINMENT_MATRIX_FAILED=parent_death",
+        }
+    }
+
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::SentinelSetup => "macOS containment preflight could not create its probe files",
+            Self::SentinelPrecheck => {
+                "macOS containment preflight found its probe files changed before launch"
+            }
+            Self::Launch => {
+                "macOS containment preflight could not launch the worker (nested sandbox?)"
+            }
+            Self::WorkerAttestation => {
+                "macOS containment preflight could not confirm the worker's containment \
+                 (nested sandbox?)"
+            }
+            Self::SentinelPostcheck => {
+                "macOS containment preflight found its probe files changed by the worker"
+            }
+            Self::ParentDeath => {
+                "macOS containment preflight could not confirm worker cleanup after parent exit"
+            }
+        }
+    }
+
+    /// Report this stage's token and return the error with its human sentence prefixed.
+    fn fail(self, error: io::Error) -> io::Error {
+        report_preflight_token(self.token());
+        io::Error::new(error.kind(), format!("{}: {error}", self.sentence()))
+    }
+}
+
 fn run_full_containment_preflight(executable: PathBuf) -> io::Result<()> {
     run_containment_preflight(executable, preflight_worker_args())
 }
@@ -857,18 +958,16 @@ fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::R
             "macOS alternate-exec canary was not a trusted system executable",
         ));
     }
-    let probes = HostedProbePaths::create().inspect_err(|_error| {
-        eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_setup");
-    })?;
-    probes.verify_unchanged().inspect_err(|_error| {
-        eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_precheck");
-    })?;
+    let probes =
+        HostedProbePaths::create().map_err(|error| PreflightStage::SentinelSetup.fail(error))?;
+    probes
+        .verify_unchanged()
+        .map_err(|error| PreflightStage::SentinelPrecheck.fail(error))?;
     let result = (|| {
         let mut process =
             launch_executable_unchecked_with_probe(executable.clone(), worker_args, Some(&probes))
                 .map_err(|error| {
-                    eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=launch");
-                    io::Error::other(error.to_string())
+                    PreflightStage::Launch.fail(io::Error::other(error.to_string()))
                 })?;
         let diagnostic_drain = spawn_closed_probe_diagnostic_drain(&process.stderr)?;
         let authentication = authenticate_ready_and_probe(&mut process, true);
@@ -877,21 +976,19 @@ fn run_containment_preflight(executable: PathBuf, worker_args: &[&str]) -> io::R
         }
         let closed_code = diagnostic_drain.join().ok().flatten();
         if let Some(code) = closed_code {
-            eprintln!("{code}");
+            report_preflight_token(code);
         }
         if let Err(error) = authentication {
             if closed_code.is_none() {
-                eprintln!("MACOS_CONTAINMENT_PROBE_FAILED=bootstrap");
+                report_preflight_token("MACOS_CONTAINMENT_PROBE_FAILED=bootstrap");
             }
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=worker_attestation");
-            return Err(error);
+            return Err(PreflightStage::WorkerAttestation.fail(error));
         }
-        probes.verify_unchanged().inspect_err(|_error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=sentinel_postcheck");
-        })?;
-        probe_guardian_parent_death(&executable, &probes).inspect_err(|_error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=parent_death");
-        })?;
+        probes
+            .verify_unchanged()
+            .map_err(|error| PreflightStage::SentinelPostcheck.fail(error))?;
+        probe_guardian_parent_death(&executable, &probes)
+            .map_err(|error| PreflightStage::ParentDeath.fail(error))?;
         probes.verify_unchanged()
     })();
     let cleanup = probes.cleanup();
@@ -970,13 +1067,13 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
     configure_parent_death_canary_command(&mut command, probes, &process_paths);
     let output = command
         .output()
-        .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;
+        .inspect_err(|_error| report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_spawn"))?;
     if !output.status.success() || output.stdout.len() > 96 {
-        eprintln!("MACOS_PARENT_DEATH_FAILED=child_status");
+        report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_status");
         return Err(io::Error::other("macOS parent-death canary child failed"));
     }
     let (guardian, orphan) = parse_parent_death_record(&output.stdout).ok_or_else(|| {
-        eprintln!("MACOS_PARENT_DEATH_FAILED=child_record");
+        report_preflight_token("MACOS_PARENT_DEATH_FAILED=child_record");
         io::Error::other("macOS parent-death canary record was invalid")
     })?;
     let orphan_path = publication_root.join(&orphan);
@@ -989,14 +1086,14 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
             Some((metadata.dev(), metadata.ino()))
         }
         Ok(_) => {
-            eprintln!("MACOS_PARENT_DEATH_FAILED=publication_identity");
+            report_preflight_token("MACOS_PARENT_DEATH_FAILED=publication_identity");
             return Err(io::Error::other(
                 "macOS parent-death publication identity was invalid",
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
-            eprintln!("MACOS_PARENT_DEATH_FAILED=publication_query");
+            report_preflight_token("MACOS_PARENT_DEATH_FAILED=publication_query");
             return Err(error);
         }
     };
@@ -1005,28 +1102,31 @@ fn probe_guardian_parent_death(executable: &Path, probes: &HostedProbePaths) -> 
         // SAFETY: signal zero performs an existence check without modifying the process group.
         let group_absent = unsafe { libc::kill(-guardian, 0) } < 0
             && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        let has_live_members = process_group_has_live_members(guardian)
-            .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=group_query"))?;
+        let has_live_members = process_group_has_live_members(guardian).inspect_err(|_error| {
+            report_preflight_token("MACOS_PARENT_DEATH_FAILED=group_query")
+        })?;
         if group_absent || !has_live_members {
             retry_busy_sweep(Instant::now() + SWEEP_CONTENTION_TIMEOUT, || {
                 stale_sweep::sweep_hosted_parent_death_publications(&publication_root)
             })
-            .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=recovery"))?;
+            .inspect_err(|_error| report_preflight_token("MACOS_PARENT_DEATH_FAILED=recovery"))?;
             if std::fs::symlink_metadata(&orphan_path).is_ok()
                 || orphan_identity.is_some_and(|identity| identity == (0, 0))
             {
-                eprintln!("MACOS_PARENT_DEATH_FAILED=recovery_survived");
+                report_preflight_token("MACOS_PARENT_DEATH_FAILED=recovery_survived");
                 return Err(io::Error::other(
                     "macOS parent-death publication identity survived recovery",
                 ));
             }
             probes
                 .restore_workspace_after_parent_death()
-                .inspect_err(|_error| eprintln!("MACOS_PARENT_DEATH_FAILED=workspace_cleanup"))?;
+                .inspect_err(|_error| {
+                    report_preflight_token("MACOS_PARENT_DEATH_FAILED=workspace_cleanup")
+                })?;
             return Ok(());
         }
         if Instant::now() >= deadline {
-            eprintln!("MACOS_PARENT_DEATH_FAILED=group_timeout");
+            report_preflight_token("MACOS_PARENT_DEATH_FAILED=group_timeout");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "macOS guardian process group survived parent death",
@@ -1844,7 +1944,7 @@ fn authenticate_ready_and_probe(
 
     let ready = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
         |_error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=ready_read");
+            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=ready_read");
         },
     )?;
     protocol
@@ -1858,7 +1958,7 @@ fn authenticate_ready_and_probe(
     process
         .finalize_authenticated_ready()
         .inspect_err(|_error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink");
+            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=image_unlink");
         })?;
 
     let containment = WireFrame::connection(
@@ -1874,7 +1974,7 @@ fn authenticate_ready_and_probe(
     process.input.flush()?;
     let attested = read_worker_frame_bounded(&mut process.output, PREFLIGHT_TIMEOUT).inspect_err(
         |_error| {
-            eprintln!("MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read");
+            report_preflight_token("MACOS_CONTAINMENT_MATRIX_FAILED=attestation_read");
         },
     )?;
     protocol
@@ -4663,6 +4763,57 @@ mod tests {
     #[test]
     fn macos_hosted_lifecycle_marker_is_exact() {
         assert_eq!(HOSTED_LIFECYCLE_MARKER_VALUE, "production-binary-v1");
+    }
+
+    #[test]
+    fn preflight_tokens_reach_stderr_only_for_opted_in_evidence_collection() {
+        use std::ffi::OsStr;
+
+        let token = PreflightStage::Launch.token();
+        assert_eq!(preflight_token_stderr_line(token, false), None);
+        assert_eq!(preflight_token_stderr_line(token, true), Some(token));
+
+        assert!(!containment_evidence_requested_for(None, None));
+        assert!(!containment_evidence_requested_for(
+            Some(OsStr::new("other")),
+            Some(OsStr::new("0"))
+        ));
+        assert!(!containment_evidence_requested_for(
+            None,
+            Some(OsStr::new("true"))
+        ));
+        assert!(containment_evidence_requested_for(
+            Some(OsStr::new(HOSTED_LIFECYCLE_MARKER_VALUE)),
+            None
+        ));
+        assert!(containment_evidence_requested_for(
+            None,
+            Some(OsStr::new("1"))
+        ));
+        assert_eq!(CONTAINMENT_EVIDENCE_ENV, "MINI_AGENT_CONTAINMENT_EVIDENCE");
+    }
+
+    #[test]
+    fn preflight_stage_failures_are_human_sentences_that_keep_the_cause() {
+        for stage in PreflightStage::ALL {
+            assert!(
+                stage
+                    .token()
+                    .starts_with("MACOS_CONTAINMENT_MATRIX_FAILED=")
+            );
+            assert!(stage.sentence().starts_with("macOS containment preflight "));
+            assert!(!stage.sentence().contains("_FAILED="));
+            let error = stage.fail(io::Error::new(io::ErrorKind::TimedOut, "Ready timed out"));
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(
+                error.to_string(),
+                format!("{}: Ready timed out", stage.sentence())
+            );
+        }
+        assert_eq!(
+            PreflightStage::Launch.sentence(),
+            "macOS containment preflight could not launch the worker (nested sandbox?)"
+        );
     }
 
     #[test]

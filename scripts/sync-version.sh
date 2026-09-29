@@ -85,6 +85,13 @@ if [ -f "$WINDOWS_README" ]; then
     sed_in_place "s/mini-agent-[0-9][0-9A-Za-z.+-]*-win32-x64\.vsix/mini-agent-${VERSION}-win32-x64.vsix/g" "$WINDOWS_README"
 fi
 
+# README pinned source install (`cargo install --locked --git ... --tag vX.Y.Z`)
+README="${ROOT_DIR}/README.md"
+if [ -f "$README" ]; then
+    sed_in_place "s|\(cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v\)[0-9][0-9A-Za-z.+-]*|\1${VERSION}|g" \
+        "$README"
+fi
+
 # ACP registry manifest (agent version is the 4-space-indented key; the
 # 6-space-indented protocol version must stay untouched)
 ACP_REGISTRY="${ROOT_DIR}/docs/acp-registry.json"

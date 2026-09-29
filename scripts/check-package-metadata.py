@@ -971,6 +971,108 @@ def validate_github_actions_updates(text: str) -> list[str]:
     ]
 
 
+MODEL_CATALOG_GENERATOR = "scripts/gen-models-catalog.sh"
+CI_DISPATCH_COMMAND = "gh workflow run ci.yml"
+
+
+def validate_update_models_workflow(text: str) -> list[str]:
+    """Keep the model-catalog refresh least-privileged and covered by CI.
+
+    The generator processes remote JSON, so it must run without write
+    permissions or persisted checkout credentials, and the PR opened with the
+    default GITHUB_TOKEN must get a dispatched CI run because `pull_request`
+    workflows do not trigger for it.
+    """
+
+    label = ".github/workflows/update-models.yml"
+    try:
+        document = parse_yaml_document(text)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return [f"{label} cannot be validated: {error}"]
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
+        return [f"{label} must define jobs"]
+
+    errors: list[str] = []
+    if document.get("permissions") not in ({}, None):
+        errors.append(f"{label} must scope permissions to jobs, not the workflow")
+    dispatches_ci = False
+    for name, job in document["jobs"].items():
+        if not isinstance(job, dict):
+            errors.append(f"{label} job {name!r} is malformed")
+            continue
+        permissions = job.get("permissions")
+        if not isinstance(permissions, dict):
+            errors.append(f"{label} job {name!r} must declare its own permissions")
+            permissions = {}
+        steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+        runs_generator = False
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            uses = step.get("uses")
+            if isinstance(uses, str) and uses.startswith("actions/checkout@"):
+                options = step.get("with") if isinstance(step.get("with"), dict) else {}
+                if options.get("persist-credentials") is not False:
+                    errors.append(
+                        f"{label} job {name!r} checkout must set persist-credentials: false"
+                    )
+            run = step.get("run")
+            if isinstance(run, str):
+                runs_generator = runs_generator or MODEL_CATALOG_GENERATOR in run
+                dispatches_ci = dispatches_ci or CI_DISPATCH_COMMAND in run
+        if runs_generator and any(value == "write" for value in permissions.values()):
+            errors.append(
+                f"{label} job {name!r} runs {MODEL_CATALOG_GENERATOR} and must not "
+                "hold write permissions"
+            )
+    if not dispatches_ci:
+        errors.append(
+            f"{label} must dispatch CI for its pull request ({CI_DISPATCH_COMMAND})"
+        )
+    return errors
+
+
+VSCODE_EXTENSION_DIRECTORY = "/editors/vscode"
+
+
+def validate_npm_updates(text: str) -> list[str]:
+    """Keep Dependabot watching the VS Code extension's npm dependencies."""
+
+    try:
+        document = parse_yaml_document(text)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return [f".github/dependabot.yml cannot be validated: {error}"]
+    if not isinstance(document, dict) or not isinstance(document.get("updates"), list):
+        return [".github/dependabot.yml must contain an updates list"]
+
+    for entry in document["updates"]:
+        if not isinstance(entry, dict) or entry.get("package-ecosystem") != "npm":
+            continue
+        schedule = entry.get("schedule")
+        limit = entry.get("open-pull-requests-limit", 5)
+        ignores = entry.get("ignore", [])
+        ignores_all = isinstance(ignores, list) and any(
+            isinstance(rule, dict)
+            and rule.get("dependency-name") == "*"
+            and "versions" not in rule
+            and "update-types" not in rule
+            for rule in ignores
+        )
+        if (
+            entry.get("directory") == VSCODE_EXTENSION_DIRECTORY
+            and isinstance(schedule, dict)
+            and schedule.get("interval") in {"daily", "weekly", "monthly"}
+            and type(limit) is int
+            and limit > 0
+            and not ignores_all
+        ):
+            return []
+    return [
+        ".github/dependabot.yml must schedule nonzero, non-ignored npm updates "
+        f"for {VSCODE_EXTENSION_DIRECTORY}"
+    ]
+
+
 def validate_file_fragments(root: Path, binary: str) -> list[str]:
     required: dict[str, tuple[str, ...]] = {
         "Cargo.toml": (
@@ -1427,6 +1529,54 @@ def validate_linux_sandbox_prerequisites(root: Path) -> list[str]:
     return errors
 
 
+END_USER_INSTALL_DOCUMENTS = ("README.md", "docs/agent/GET_STARTED.md")
+GIT_INSTALL_TAG = re.compile(r"--tag[ =]v[0-9]")
+
+
+def source_install_errors(relative_path: str, text: str) -> list[str]:
+    """Reject unpinned Git installs anywhere and debug installs in end-user docs.
+
+    A `cargo install --git` without `--locked` resolves fresh dependency
+    versions, and without `--tag vX.Y.Z` it builds whatever the default branch
+    holds. The `--debug` build is the contributor convention (CONTRIBUTING.md),
+    not what users should install.
+    """
+    errors: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if "cargo install" not in line:
+            continue
+        if "--git" in line and (
+            "--locked" not in line or not GIT_INSTALL_TAG.search(line)
+        ):
+            errors.append(
+                f"{relative_path}:{number}: `cargo install --git` must pin "
+                "`--locked --tag vX.Y.Z`"
+            )
+        if relative_path in END_USER_INSTALL_DOCUMENTS and "--debug" in line:
+            errors.append(
+                f"{relative_path}:{number}: end-user install commands must not use "
+                "`--debug`; keep the contributor build in CONTRIBUTING.md"
+            )
+    return errors
+
+
+def validate_source_install_commands(
+    root: Path, relative_paths: list[str] | None = None
+) -> list[str]:
+    paths = indexed_files(root) if relative_paths is None else relative_paths
+    errors: list[str] = []
+    for relative_path in paths:
+        if not relative_path.endswith(".md"):
+            continue
+        path = root / relative_path
+        if not path.is_file():
+            continue
+        errors.extend(
+            source_install_errors(relative_path, path.read_text(encoding="utf-8"))
+        )
+    return errors
+
+
 def indexed_files(root: Path) -> list[str]:
     """Return only files in Git's release index, excluding developer-local files."""
     result = subprocess.run(
@@ -1628,6 +1778,11 @@ def validate_versions(root: Path, version: str) -> list[str]:
             "packaging/windows/README.md",
             rf"mini-agent-{re.escape(version)}-win32-x64\.vsix",
         ),
+        (
+            "README.md",
+            rf"^cargo install --locked --git {re.escape(CANONICAL_REPOSITORY_URL)} "
+            rf"--tag v{re.escape(version)} --features skills$",
+        ),
     ]
 
     for relative_path, pattern in checks:
@@ -1697,9 +1852,14 @@ def validate(
     if not dependabot_path.is_file():
         errors.append(".github/dependabot.yml is missing")
     else:
+        dependabot = dependabot_path.read_text(encoding="utf-8")
+        errors.extend(validate_github_actions_updates(dependabot))
+        errors.extend(validate_npm_updates(dependabot))
+    update_models_path = root / ".github/workflows/update-models.yml"
+    if update_models_path.is_file():
         errors.extend(
-            validate_github_actions_updates(
-                dependabot_path.read_text(encoding="utf-8")
+            validate_update_models_workflow(
+                update_models_path.read_text(encoding="utf-8")
             )
         )
     errors.extend(validate_file_fragments(root, binary))
@@ -1709,6 +1869,7 @@ def validate(
     errors.extend(validate_linux_sandbox_prerequisites(root))
     errors.extend(validate_stale_coordinates(root))
     errors.extend(validate_removed_nix_surface(root))
+    errors.extend(validate_source_install_commands(root))
     errors.extend(validate_local_markdown_links(root))
     errors.extend(validate_security_policy(root))
 

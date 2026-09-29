@@ -31,6 +31,7 @@ class SyncVersionTests(unittest.TestCase):
                 "editors/vscode/SOURCE.md",
                 "packaging/windows/README.md",
                 "docs/acp-registry.json",
+                "README.md",
             ):
                 destination = root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +125,20 @@ class SyncVersionTests(unittest.TestCase):
             )
             self.assertEqual("9.8.7", registry["agent"]["version"])
             self.assertEqual("1.3.0", registry["agent"]["protocol"]["version"])
+
+            # The pinned source install follows the release tag, and nothing
+            # else in the README changes.
+            pin = re.compile(
+                r"^cargo install --locked --git https://github\.com/sebahrens/"
+                r"mini-agent --tag v([^ ]+) --features skills$",
+                re.MULTILINE,
+            )
+            original_readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+            readme = (root / "README.md").read_text(encoding="utf-8")
+            self.assertEqual(["9.8.7"], pin.findall(readme))
+            self.assertEqual(
+                pin.sub("PIN", original_readme), pin.sub("PIN", readme)
+            )
 
     def test_unchanged_version_keeps_recorded_release_digests(self) -> None:
         # The checked-in recipes hold either the pending placeholder (right

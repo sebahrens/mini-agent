@@ -323,8 +323,11 @@ currently assigns that name to an unrelated project.
 ```bash
 git clone https://github.com/sebahrens/mini-agent.git
 cd mini-agent
-cargo install --path . --debug
+cargo install --path . --locked
 ```
+
+`--locked` builds with the dependency versions in the checked-in `Cargo.lock`. Contributors use a
+separate debug build; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Linux prerequisites
 
@@ -407,7 +410,7 @@ Pre-built release archives include JavaScript execution but not learned-skill st
 build that can propose, verify, retrieve, and curate skills, build from source with:
 
 ```bash
-cargo install --git https://github.com/sebahrens/mini-agent --features skills
+cargo install --locked --git https://github.com/sebahrens/mini-agent --tag v1.9.4 --features skills
 ```
 
 | Feature | Adds |
@@ -447,12 +450,12 @@ The normative design is split by concern:
 
 ## Development
 
-Run production commands from the repository root:
+Contributor build, test, and commit rules, including the debug development build, are in
+[CONTRIBUTING.md](CONTRIBUTING.md). Run them from the repository root:
 
 ```bash
 cargo fmt
 cargo test
-cargo install --path . --debug
 ```
 
 The separate `spike/` workspace is retained only for QuickJS research and is never a production

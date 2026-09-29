@@ -4,6 +4,17 @@ name: Update model catalog
 # models.dev on a schedule. The committed JSON stays the single build-time
 # source of truth, so this only opens a PR when models.dev actually changes —
 # builds remain offline and reproducible. See scripts/gen-models-catalog.sh.
+#
+# The generator processes remote JSON, so it runs in a read-only job without
+# persisted checkout credentials. Only the second job holds write tokens, and it
+# never executes repository scripts.
+#
+# A pull request opened with the default GITHUB_TOKEN does not trigger
+# `pull_request` workflows, so CI would never run on the refresh. The PR job
+# therefore dispatches ci.yml (full scope) on the refresh branch; that run
+# reports its checks on the PR head commit. workflow_dispatch is the documented
+# exception to the GITHUB_TOKEN no-recursion rule, so no PAT or GitHub App token
+# is needed.
 
 on:
   schedule:
@@ -11,15 +22,20 @@ on:
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
+
+env:
+  REFRESH_BRANCH: chore/refresh-model-catalog
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -27,7 +43,34 @@ jobs:
       - name: Regenerate catalog
         run: ./scripts/gen-models-catalog.sh
 
+      - name: Upload regenerated catalog
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: models-catalog
+          path: data/models.json
+          if-no-files-found: error
+          retention-days: 1
+
+  open-pr:
+    needs: refresh
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download regenerated catalog
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: models-catalog
+          path: data
+
       - name: Open PR if changed
+        id: pr
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           commit-message: 'chore: refresh model catalog from models.dev'
@@ -36,7 +79,19 @@ jobs:
             Automated refresh of `data/models.json` from https://models.dev/api.json
             via `scripts/gen-models-catalog.sh`.
 
+            CI is dispatched on this branch by the update-models workflow
+            (a GITHUB_TOKEN-opened PR does not trigger `pull_request` runs).
+
             Review the diff for unexpected additions/removals before merging.
-          branch: chore/refresh-model-catalog
+          branch: ${{ env.REFRESH_BRANCH }}
           delete-branch: true
           add-paths: data/models.json
+
+      - name: Run CI on the refresh branch
+        if: steps.pr.outputs.pull-request-operation == 'created' || steps.pr.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.pull-request-head-sha }}
+        run: |
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$REFRESH_BRANCH" -f scope=full
+          echo "Dispatched CI for ${REFRESH_BRANCH} at ${HEAD_SHA}" >> "$GITHUB_STEP_SUMMARY"

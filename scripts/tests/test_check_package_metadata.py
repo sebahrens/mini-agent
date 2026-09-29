@@ -373,6 +373,168 @@ class ReleaseWorkflowValidationTests(unittest.TestCase):
             [], CHECK_PACKAGE_METADATA.validate_github_actions_updates(dependabot)
         )
 
+    def test_checked_in_dependabot_updates_vscode_npm_dependencies(self) -> None:
+        dependabot = (SCRIPT.parents[1] / ".github/dependabot.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual([], CHECK_PACKAGE_METADATA.validate_npm_updates(dependabot))
+
+    def test_dependabot_must_update_vscode_npm_dependencies(self) -> None:
+        cases = {
+            "missing": (
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: github-actions\n"
+                "    directory: /\n"
+                "    schedule:\n"
+                "      interval: weekly\n"
+            ),
+            "wrong directory": (
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: npm\n"
+                "    directory: /\n"
+                "    schedule:\n"
+                "      interval: weekly\n"
+            ),
+            "unscheduled": (
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: npm\n"
+                "    directory: /editors/vscode\n"
+            ),
+            "zero limit": (
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: npm\n"
+                "    directory: /editors/vscode\n"
+                "    schedule:\n"
+                "      interval: weekly\n"
+                "    open-pull-requests-limit: 0\n"
+            ),
+            "ignore all": (
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: npm\n"
+                "    directory: /editors/vscode\n"
+                "    schedule:\n"
+                "      interval: weekly\n"
+                "    ignore:\n"
+                "      - dependency-name: '*'\n"
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                errors = CHECK_PACKAGE_METADATA.validate_npm_updates(text)
+                self.assertEqual(1, len(errors), errors)
+                self.assertIn("/editors/vscode", errors[0])
+
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_npm_updates(
+                "version: 2\n"
+                "updates:\n"
+                "  - package-ecosystem: npm\n"
+                "    directory: /editors/vscode\n"
+                "    schedule:\n"
+                "      interval: weekly\n"
+            ),
+        )
+
+    def test_checked_in_update_models_workflow_is_least_privileged(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/update-models.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_update_models_workflow(workflow)
+        )
+
+    def test_update_models_workflow_regressions_are_rejected(self) -> None:
+        workflow = (
+            SCRIPT.parents[1] / ".github/workflows/update-models.yml"
+        ).read_text(encoding="utf-8")
+        cases = {
+            "workflow-wide write": (
+                "permissions: {}\n",
+                "permissions:\n  contents: write\n",
+                "scope permissions to jobs",
+            ),
+            "persisted credentials": (
+                "persist-credentials: false",
+                "persist-credentials: true",
+                "persist-credentials: false",
+            ),
+            "generator with write token": (
+                "    permissions:\n      contents: read\n",
+                "    permissions:\n      contents: write\n",
+                "must not hold write permissions",
+            ),
+            "no CI dispatch": (
+                "gh workflow run ci.yml",
+                "echo skipped",
+                "must dispatch CI",
+            ),
+        }
+        for label, (old, new, expected) in cases.items():
+            with self.subTest(label):
+                self.assertIn(old, workflow)
+                errors = CHECK_PACKAGE_METADATA.validate_update_models_workflow(
+                    workflow.replace(old, new, 1)
+                )
+                self.assertTrue(
+                    any(expected in error for error in errors), errors
+                )
+
+    def test_unpinned_git_source_install_is_rejected(self) -> None:
+        url = "https://github.com/sebahrens/mini-agent"
+        rejected = (
+            f"cargo install --git {url} --features skills",
+            f"cargo install --locked --git {url} --features skills",
+            f"cargo install --git {url} --tag v1.2.3 --features skills",
+            f"cargo install --locked --git {url} --branch main",
+            f"cargo install --locked --git {url} --tag latest",
+        )
+        for line in rejected:
+            with self.subTest(line=line):
+                errors = CHECK_PACKAGE_METADATA.source_install_errors(
+                    "docs/agent/SKILLS.md", f"intro\n{line}\n"
+                )
+                self.assertEqual(1, len(errors), errors)
+                self.assertIn("docs/agent/SKILLS.md:2", errors[0])
+                self.assertIn("--locked --tag", errors[0])
+
+        for line in (
+            f"cargo install --locked --git {url} --tag v1.2.3 --features skills",
+            f"cargo install --git {url} --tag=v1.2.3 --locked",
+            "cargo install --path . --locked",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    [],
+                    CHECK_PACKAGE_METADATA.source_install_errors("README.md", line),
+                )
+
+    def test_debug_install_is_rejected_only_in_end_user_documents(self) -> None:
+        line = "cargo install --path . --debug\n"
+        for relative in ("README.md", "docs/agent/GET_STARTED.md"):
+            with self.subTest(relative=relative):
+                errors = CHECK_PACKAGE_METADATA.source_install_errors(relative, line)
+                self.assertEqual(1, len(errors), errors)
+                self.assertIn("--debug", errors[0])
+        for relative in ("CONTRIBUTING.md", "AGENTS.md", "docs/agent/GYM.md"):
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    [], CHECK_PACKAGE_METADATA.source_install_errors(relative, line)
+                )
+
+    def test_checked_in_documents_pin_source_installs(self) -> None:
+        self.assertEqual(
+            [],
+            CHECK_PACKAGE_METADATA.validate_source_install_commands(SCRIPT.parents[1]),
+        )
+
     def test_wrong_binary_source_path_is_rejected(self) -> None:
         workflow = """
 env:
@@ -1356,6 +1518,7 @@ class VersionLiteralValidationTests(unittest.TestCase):
         "editors/vscode/SOURCE.md",
         "packaging/windows/README.md",
         "docs/acp-registry.json",
+        "README.md",
     )
 
     def copy_version_files(self, root: Path) -> None:
