@@ -711,6 +711,128 @@ steps:
         self.assertLess(release.index('git commit -am "bump'), committed_guard)
         self.assertLess(committed_guard, release.index("git tag -a"))
 
+    def test_tag_recipes_run_the_test_suite_before_tagging(self) -> None:
+        justfile = (SCRIPT.parents[1] / "justfile").read_text(encoding="utf-8")
+        add_tag = justfile[justfile.index("add-tag:") : justfile.index("remove-tag")]
+        release = justfile[
+            justfile.index("release BUMP:") : justfile.index("pre-release:")
+        ]
+
+        # add-tag re-checks the clean tree after the tests ran.
+        self.assertLess(add_tag.index("cargo test --locked"), add_tag.index("--require-clean"))
+        self.assertLess(add_tag.index("cargo test --locked"), add_tag.index("git push"))
+        self.assertLess(add_tag.index("cargo test --locked"), add_tag.index("git tag -a"))
+        # release tests the bumped tree before committing, pushing, and tagging it.
+        self.assertLess(release.index("cargo test --locked"), release.index("git commit -am"))
+        self.assertLess(release.index("cargo test --locked"), release.index("git push"))
+        self.assertLess(release.index("cargo test --locked"), release.index("git tag -a"))
+
+
+class ReleaseCiGateValidationTests(unittest.TestCase):
+    """The release workflow must not build or publish a commit CI has not passed."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = (
+            SCRIPT.parents[1] / ".github/workflows/release.yml"
+        ).read_text(encoding="utf-8")
+        cls.jobs = CHECK_PACKAGE_METADATA.parse_yaml_document(cls.workflow)["jobs"]
+
+    def errors(self, workflow: str) -> list[str]:
+        return CHECK_PACKAGE_METADATA.validate_release_ci_gate(workflow)
+
+    def test_checked_in_release_workflow_is_gated_on_ci(self) -> None:
+        self.assertEqual([], self.errors(self.workflow))
+
+    def test_every_release_job_transitively_depends_on_verify_ci(self) -> None:
+        def closure(name: str) -> set[str]:
+            needs = self.jobs[name].get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            found = set(needs)
+            for need in needs:
+                found |= closure(need)
+            return found
+
+        self.assertEqual("verify-ci", next(iter(self.jobs)))
+        self.assertNotIn("needs", self.jobs["verify-ci"])
+        for name in self.jobs:
+            if name == "verify-ci":
+                continue
+            with self.subTest(job=name):
+                self.assertIn("verify-ci", closure(name))
+        self.assertIn("verify-ci", self.jobs["publish-release"]["needs"])
+
+    def test_publish_release_declares_the_release_environment(self) -> None:
+        self.assertEqual("release", self.jobs["publish-release"]["environment"])
+
+    def test_verify_ci_checks_ci_success_and_main_ancestry_with_read_only_token(self) -> None:
+        gate = self.jobs["verify-ci"]
+        self.assertEqual(
+            {"actions": "read", "checks": "read", "contents": "read"},
+            gate["permissions"],
+        )
+        self.assertIsInstance(gate["timeout-minutes"], int)
+        steps = "\n".join(str(step.get("run", "")) for step in gate["steps"])
+        self.assertIn('git merge-base --is-ancestor "$GITHUB_SHA" origin/main', steps)
+        self.assertIn("python3 scripts/verify_release_ci.py", steps)
+
+    def test_missing_verify_ci_job_is_rejected(self) -> None:
+        workflow = self.workflow.replace("  verify-ci:\n", "  unrelated-gate:\n", 1)
+
+        errors = self.errors(workflow)
+
+        self.assertTrue(any("verify-ci job" in error for error in errors))
+
+    def test_build_job_without_the_gate_is_rejected(self) -> None:
+        workflow = self.workflow.replace(
+            "  package-metadata:\n    needs: verify-ci\n", "  package-metadata:\n", 1
+        )
+        self.assertNotEqual(self.workflow, workflow)
+
+        errors = self.errors(workflow)
+
+        self.assertTrue(
+            any("job package-metadata must depend on verify-ci" in error for error in errors)
+        )
+
+    def test_publish_release_without_direct_gate_or_environment_is_rejected(self) -> None:
+        workflow = self.workflow.replace(
+            "needs: [verify-ci, package-metadata, archive-smoke,",
+            "needs: [package-metadata, archive-smoke,",
+            1,
+        ).replace("    environment: release\n", "", 1)
+        self.assertNotEqual(self.workflow, workflow)
+
+        errors = self.errors(workflow)
+
+        self.assertTrue(any("directly need verify-ci" in error for error in errors))
+        self.assertTrue(any("'release' environment" in error for error in errors))
+        self.assertTrue(
+            any("missing=" in error and "verify-ci" in error
+                for error in CHECK_PACKAGE_METADATA.validate_workflow(workflow, "mini-agent"))
+        )
+
+    def test_job_that_runs_after_a_failed_gate_is_rejected(self) -> None:
+        workflow = self.workflow.replace(
+            "  checksums:\n", "  checksums:\n    if: always()\n", 1
+        )
+
+        errors = self.errors(workflow)
+
+        self.assertTrue(
+            any("checksums must not run after a failed verify-ci" in error for error in errors)
+        )
+
+    def test_verify_ci_without_ancestry_check_or_extra_permission_is_rejected(self) -> None:
+        workflow = self.workflow.replace(
+            'merge-base --is-ancestor "$GITHUB_SHA" origin/main', "true", 1
+        ).replace("      checks: read\n", "      checks: write\n", 1)
+
+        errors = self.errors(workflow)
+
+        self.assertTrue(any("ancestry" in error for error in errors))
+        self.assertTrue(any("permissions must be exactly" in error for error in errors))
+
 
 class ReleaseIdentityValidationTests(unittest.TestCase):
     def test_matching_stable_tag_is_accepted(self) -> None:

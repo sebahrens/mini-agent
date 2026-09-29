@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Releases are gated on CI: a new `ci-success` check aggregates every CI job, and the release
+  workflow builds and publishes nothing until the tagged commit is on `main` and its tag CI run
+  reports `ci-success`; publication runs in the `release` environment, and `just release` /
+  `just add-tag` run `cargo test --locked` before tagging.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

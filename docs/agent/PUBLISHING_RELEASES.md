@@ -147,15 +147,90 @@ release body, so the heading must match the Cargo version.
    `docs/acp-registry.json`. Because a version change invalidates every previously recorded release
    digest, the sync also replaces each recipe's artifact `sha256` with the placeholder
    `0000…0000` (64 zeros); only the version-independent GPL `LICENSE` digest is preserved.
-4. Commits as `bump to vX.Y.Z` and pushes the current branch
-5. Validates that the tag is exactly `vX.Y.Z` (or `vX.Y.Z-prerelease`) and matches the Cargo package version
-6. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets
-7. Leaves crates.io untouched because its `mini-agent` package belongs to an unrelated project
+4. Validates the package metadata and runs `cargo test --locked` on the bumped tree
+5. Commits as `bump to vX.Y.Z` and pushes the current branch
+6. Validates that the tag is exactly `vX.Y.Z` (or `vX.Y.Z-prerelease`) and matches the Cargo package version
+7. Creates and pushes an annotated tag — this triggers the [GitHub Actions release workflow](../../.github/workflows/release.yml), which builds binaries for all targets once CI has passed for the tagged commit
+8. Leaves crates.io untouched because its `mini-agent` package belongs to an unrelated project
 
 Both local tag commands require all tracked working-tree and staged changes to be committed, so
-the metadata they validate is the metadata in the commit they tag.
+the metadata they validate is the metadata in the commit they tag. Both also run
+`cargo test --locked` before anything is pushed or tagged; `just add-tag` re-checks that the tree
+is still clean after the tests.
 
-The release workflow accepts only pushed `v*` tags. Its first job rejects a non-tag ref,
+## CI gate before release
+
+A release is built and published only from a commit CI has passed:
+
+- `.github/workflows/ci.yml` ends with the `ci-success` aggregate job. It needs every other CI job,
+  runs even when one of them failed, and passes only when each dependency succeeded or was skipped
+  by design: a documentation-only change skips the build, lint, and test jobs, and
+  `harness-regression` runs on pull requests only. When code changed, every other job must
+  succeed; `failure` and `cancelled` are never accepted. `scripts/ci_success.py` owns that decision.
+  Adding a CI job without adding it to `ci-success` fails the workflow policy tests.
+- The release workflow's first job, `verify-ci`, runs before any build. It fails unless the tagged
+  commit is an ancestor of `origin/main`, then waits (up to 150 minutes, polling every 30 seconds)
+  for the CI run that the same tag push started and requires that run's `ci-success` check run
+  to conclude `success` (`scripts/verify_release_ci.py`). A `ci-success` from a `main` push is not
+  accepted in its place, because that run may have skipped the matrix for a documentation-only
+  diff; tag builds always run the full matrix. Every other release job depends on `verify-ci`.
+- `publish-release` runs in the `release` deployment environment, so the environment's protection
+  rules are the last gate before assets become public.
+
+If `verify-ci` fails because CI failed, fix the cause (or re-run the flaky CI jobs on the tag's CI
+run), wait for `ci-success` to pass, and then use **Re-run failed jobs** on the tag's release run.
+
+### Repository settings (manual, owner only)
+
+Two protections live in repository settings rather than in the workflow files. An administrator
+applies them once; automated agents are not permitted to change repository rules.
+
+1. **Require `ci-success` on `main`.** Settings → Rules → Rulesets → New branch ruleset: name
+   `Require CI`, enforcement *Active*, target *Default branch*, enable *Require status checks to
+   pass* and add the check `ci-success` from the *GitHub Actions* app. Equivalently:
+
+   ```bash
+   gh api -X POST repos/sebahrens/mini-agent/rulesets --input - <<'EOF'
+   {
+     "name": "Require CI",
+     "target": "branch",
+     "enforcement": "active",
+     "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+     "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}],
+     "rules": [{
+       "type": "required_status_checks",
+       "parameters": {
+         "strict_required_status_checks_policy": false,
+         "do_not_enforce_on_create": false,
+         "required_status_checks": [{"context": "ci-success", "integration_id": 15368}]
+       }
+     }]
+   }
+   EOF
+   ```
+
+   `integration_id` 15368 is the GitHub Actions app. The repository-admin bypass keeps the
+   existing direct-push release flow (`just release` pushes the version bump to `main`) working;
+   the check then binds pull requests from everyone else, and the release workflow's `verify-ci`
+   job still refuses to publish an admin-pushed commit that CI has not passed. Remove the bypass
+   actor only when every change, including the release bump, lands through a pull request.
+   Confirm with `gh api repos/sebahrens/mini-agent/rules/branches/main`, which must list a
+   `required_status_checks` rule naming `ci-success`. The existing `Blocking` ruleset (id
+   20623676) applies to every branch, so do not add the check there.
+2. **Protect the `release` environment.** Settings → Environments → `release` (GitHub creates it
+   on the first release run if it does not exist): under *Deployment branches and tags* choose
+   *Selected branches and tags* and add the tag rule `v*`; optionally add *Required reviewers* to
+   approve each publication. Equivalently:
+
+   ```bash
+   gh api -X PUT repos/sebahrens/mini-agent/environments/release \
+     -F 'deployment_branch_policy[protected_branches]=false' \
+     -F 'deployment_branch_policy[custom_branch_policies]=true'
+   gh api -X POST repos/sebahrens/mini-agent/environments/release/deployment-branch-policies \
+     -f name='v*' -f type=tag
+   ```
+
+The release workflow accepts only pushed `v*` tags. After `verify-ci`, its `package-metadata` job rejects a non-tag ref,
 a malformed tag, or a tag whose version differs from the root Cargo package version before any
 release binary is built. The same job reads the version once from `Cargo.toml` (and requires
 `editors/vscode/package.json` to agree) and exports it as a job output; every VSIX and SBOM file
@@ -265,7 +340,7 @@ These are useful for partial workflows or recovery:
 |---------|---------|
 | `just sync-version` | Sync `Cargo.toml` version to packaging, VS Code, Windows, and ACP registry files; resets recipe digests to the placeholder when the version changes (no commit) |
 | `just pre-release` | Same as `sync-version` (alias used by `release`) |
-| `just add-tag` | Validate, tag, and push the current Cargo version (no version bump) |
+| `just add-tag` | Run `cargo test --locked`, validate, tag, and push the current Cargo version (no version bump) |
 | `just remove-tag [VERSION]` | Delete a local + remote tag (interactive picker if omitted) |
 | `just aur-checksums` | Update AUR checksums only |
 | `just conda-source-sha256` | Update conda source tarball checksum only |
