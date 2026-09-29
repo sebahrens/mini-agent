@@ -91,7 +91,31 @@ pub(crate) fn set_active_workspace(path: &std::path::Path) {
     }
 }
 
+/// Sets the process-wide hook execution root used by dispatches that run
+/// outside a turn bound to its own root: `Some(root)` rebinds it, `None`
+/// disables it (fail-closed) because concurrent turns in different
+/// workspaces leave no single correct shared root.
+pub(crate) fn bind_shared_execution_root(root: Option<&std::path::Path>) {
+    match root {
+        Some(root) => set_active_workspace(root),
+        None => {
+            if let Some(dispatcher) = get_dispatcher() {
+                dispatcher.invalidate_shared_execution_root(
+                    "hooks: turns in several workspaces are active; hook dispatch outside a \
+                     workspace-bound turn is refused",
+                );
+            }
+        }
+    }
+}
+
+/// The workspace hook contexts report: the current turn's own hook root when
+/// it has one (see `AgentWorkScope::set_hook_execution_root`), else the
+/// process-wide selection.
 pub(crate) fn active_workspace() -> std::path::PathBuf {
+    if let Some(root) = crate::agent::runner::current_hook_execution_root() {
+        return root;
+    }
     ACTIVE_WORKSPACE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -330,6 +330,23 @@ impl HookDispatcher {
         paths
     }
 
+    /// Disables dispatch through the process-wide execution root (turns bound
+    /// to their own root are unaffected) until a later valid rebind. Used while
+    /// concurrent ACP turns in different workspaces leave no single correct
+    /// shared root, so any dispatch outside a turn scope fails closed.
+    pub(crate) fn invalidate_shared_execution_root(&self, reason: &str) {
+        let mut state = self
+            .execution_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Invalidate outstanding shared leases; an exhausted generation keeps
+        // the sticky invalid binding below, which also refuses them.
+        if let Some(next) = state.generation.checked_add(1) {
+            state.generation = next;
+        }
+        state.binding = ExecutionRootBinding::Invalid(reason.to_string());
+    }
+
     /// Rebind hook execution after a validated UI/session workspace switch.
     /// Failure is sticky and fail-closed until a later valid rebind succeeds.
     pub(crate) fn rebind_execution_root(&self, workspace: &Path) -> Result<(), String> {
@@ -364,6 +381,23 @@ impl HookDispatcher {
         ctx: &HookCtx,
     ) -> Result<(HookCtx, HookExecutionRootLease), String> {
         let mut ctx = ctx.clone();
+        // A turn bound to its own workspace (ACP sessions) dispatches against
+        // that root with a private lease, independent of the process-wide
+        // binding other concurrent turns share or rebind.
+        if let Some(turn_root) = crate::agent::runner::current_hook_execution_root() {
+            let root = ValidatedExecutionRoot::capture(&turn_root)?;
+            let lease = HookExecutionRootLease {
+                state: Arc::new(RwLock::new(ExecutionRootState {
+                    generation: 0,
+                    binding: ExecutionRootBinding::Valid(Box::new(root.clone())),
+                })),
+                generation: 0,
+                root,
+            };
+            let canonical = lease.root.revalidate()?.to_path_buf();
+            ctx.cwd = canonical.to_string_lossy().into_owned();
+            return Ok((ctx, lease));
+        }
         let state = self
             .execution_root
             .read()

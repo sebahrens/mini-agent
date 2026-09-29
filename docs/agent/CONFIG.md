@@ -1959,11 +1959,16 @@ directory-handle authority.
 Permission containment, LSP services, and delegated read-only agents use the
 same binding. Concurrent ACP sessions may therefore use different roots
 without changing or inheriting the server process working directory.
-Hooks are the exception: hook execution uses one process-wide workspace root,
-so when any hook is configured, a prompt is refused (JSON-RPC error `-32000`)
-while another session's prompt is active in a different workspace. Sessions in
-the same workspace still run concurrently, and the refused prompt can be
-retried once the other turn finishes. Missing
+Hooks follow the same rule: each ACP turn binds hook dispatch (prompt submit,
+tool hooks, `Stop`, and subagent hooks, including nested agent work) to its
+own session workspace, so `$ZEROSTACK_PROJECT_DIR`, the hook's working
+directory, and content-binding checks name that session's root even while
+sessions in other workspaces run concurrently. The process-wide hook root is
+only a fallback for dispatch outside a workspace-bound turn: it names the
+single active workspace, and while turns in several workspaces are active it
+is disabled, so such a dispatch is refused (fail-closed; a blocked
+`PreToolUse`) instead of running against another session's repository.
+Missing
 paths and non-directories are rejected before an agent is built. LSP file
 requests are strictly contained; other absolute, `..`, symlink, and reparse-point
 escapes are rejected.

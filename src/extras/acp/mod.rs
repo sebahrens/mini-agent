@@ -468,54 +468,79 @@ impl Drop for TurnRegistration {
     }
 }
 
-/// The workspace root that every active ACP turn shares while hooks are
-/// configured.
+/// Workspace roots of the active ACP turns while hooks are configured.
 ///
-/// Hook dispatch (the `HookedTool` context and the dispatcher's execution
-/// root) is process-wide: each prompt rebinds it to that session's workspace.
-/// Two concurrent turns in different workspaces would therefore run each
-/// other's hooks against the wrong repository. Until hook execution carries a
-/// per-turn root, a turn whose workspace differs from the one active turns
-/// already hold is refused instead.
-#[derive(Default)]
+/// Each turn dispatches hooks against its own session workspace through its
+/// agent work scope (`AgentWorkScope::set_hook_execution_root`), so concurrent
+/// turns in different workspaces run with hooks. The process-wide hook
+/// execution root remains only as the fallback for a dispatch that happens
+/// outside a workspace-bound turn: it names the single active workspace, and
+/// is disabled (fail-closed) while turns in several workspaces are active so
+/// such a dispatch can never run against another session's repository.
 struct HookRootClaims {
-    active: StdMutex<Option<(std::path::PathBuf, usize)>>,
+    active: StdMutex<HashMap<std::path::PathBuf, usize>>,
+    /// Publishes the shared fallback root: `Some` for a single active
+    /// workspace, `None` for several.
+    publish: Box<dyn Fn(Option<&Path>) + Send + Sync>,
 }
 
-/// One active turn's hold on the shared hook root; released on drop.
+impl Default for HookRootClaims {
+    fn default() -> Self {
+        Self::with_publisher(|root| {
+            #[cfg(feature = "hooks")]
+            crate::extras::hooks::bind_shared_execution_root(root);
+            #[cfg(not(feature = "hooks"))]
+            let _ = root;
+        })
+    }
+}
+
+/// One active turn's hold on its hook root; released on drop.
 struct HookRootLease {
     claims: Arc<HookRootClaims>,
+    root: std::path::PathBuf,
 }
 
 impl HookRootClaims {
-    fn try_acquire(self: &Arc<Self>, root: &Path) -> Result<HookRootLease, String> {
-        let mut active = lock_unpoisoned(&self.active);
-        match active.as_mut() {
-            Some((held, count)) if held.as_path() == root => *count += 1,
-            Some((held, _)) => {
-                return Err(format!(
-                    "hooks are configured and another ACP session is running a prompt in '{}'; \
-                     hooks run against one workspace at a time, so this prompt in '{}' was refused \
-                     (retry when that prompt finishes)",
-                    held.display(),
-                    root.display()
-                ));
-            }
-            None => *active = Some((root.to_path_buf(), 1)),
+    fn with_publisher(publish: impl Fn(Option<&Path>) + Send + Sync + 'static) -> Self {
+        Self {
+            active: StdMutex::new(HashMap::new()),
+            publish: Box::new(publish),
         }
-        Ok(HookRootLease {
+    }
+
+    fn acquire(self: &Arc<Self>, root: &Path) -> HookRootLease {
+        let mut active = lock_unpoisoned(&self.active);
+        let count = active.entry(root.to_path_buf()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            self.publish_locked(&active);
+        }
+        HookRootLease {
             claims: Arc::clone(self),
-        })
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Called with the claims lock held whenever the set of active roots
+    /// changed, so publications are ordered like the changes themselves.
+    fn publish_locked(&self, active: &HashMap<std::path::PathBuf, usize>) {
+        match active.len() {
+            0 => {}
+            1 => (self.publish)(active.keys().next().map(std::path::PathBuf::as_path)),
+            _ => (self.publish)(None),
+        }
     }
 }
 
 impl Drop for HookRootLease {
     fn drop(&mut self) {
         let mut active = lock_unpoisoned(&self.claims.active);
-        if let Some((_, count)) = active.as_mut() {
+        if let Some(count) = active.get_mut(&self.root) {
             *count -= 1;
             if *count == 0 {
-                *active = None;
+                active.remove(&self.root);
+                self.claims.publish_locked(&active);
             }
         }
     }
@@ -536,8 +561,8 @@ struct AcpState {
     sessions: Mutex<HashMap<SessionId, SessionState>>,
     cancel_routes: StdMutex<HashMap<SessionId, Arc<StdMutex<SessionTurns>>>>,
     shell_search_path: Option<std::ffi::OsString>,
-    /// Present only when hooks are configured. Hook dispatch uses one
-    /// process-wide execution root, so concurrent turns must agree on it.
+    /// Present only when hooks are configured: tracks the active turns'
+    /// workspaces to keep the shared fallback hook root safe.
     hook_roots: Option<Arc<HookRootClaims>>,
     /// How client-supplied stdio MCP servers are launched. They start local
     /// processes, so they are accepted only from the editor that spawned this
@@ -1477,9 +1502,7 @@ async fn handle_prompt(
             hook_lease = state
                 .hook_roots
                 .as_ref()
-                .map(|claims| claims.try_acquire(sess.workspace.root()))
-                .transpose()
-                .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+                .map(|claims| claims.acquire(sess.workspace.root()));
             let generation = turns.next_generation;
             turns.next_generation = turns.next_generation.wrapping_add(1);
             turns.queue.push_back(RegisteredTurn {
@@ -2152,8 +2175,6 @@ async fn execute_prompt(
     if let Err(error) = workspace.validate() {
         return Ok(PromptOutcome::failed(error.to_string()));
     }
-    #[cfg(feature = "hooks")]
-    crate::extras::hooks::set_active_workspace(workspace.root());
     #[cfg(feature = "memory")]
     let context = {
         let mut refreshed = (*context).clone();
@@ -2288,6 +2309,10 @@ async fn execute_prompt(
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
     let work_scope = crate::agent::runner::AgentWorkScope::new();
+    // Hooks dispatched by this turn (prompt submit, tools, stop, subagents)
+    // run against this session's workspace, independent of other sessions.
+    #[cfg(feature = "hooks")]
+    work_scope.set_hook_execution_root(workspace.root());
     #[cfg(feature = "mcp")]
     {
         *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
@@ -4028,7 +4053,7 @@ mod protocol_tests {
     }
 
     #[tokio::test]
-    async fn hooked_server_refuses_concurrent_turns_in_different_workspaces() {
+    async fn hooked_server_runs_concurrent_turns_in_different_workspaces() {
         let blocked_started = Arc::new(tokio::sync::Notify::new());
         let fixture: PromptFixture = {
             let blocked_started = blocked_started.clone();
@@ -4047,7 +4072,12 @@ mod protocol_tests {
             })
         };
         let mut state = fixture_state(fixture);
-        Arc::get_mut(&mut state).unwrap().hook_roots = Some(Arc::default());
+        let published = Arc::new(StdMutex::new(Vec::<Option<std::path::PathBuf>>::new()));
+        let recorder = published.clone();
+        Arc::get_mut(&mut state).unwrap().hook_roots =
+            Some(Arc::new(HookRootClaims::with_publisher(move |root| {
+                lock_unpoisoned(&recorder).push(root.map(Path::to_path_buf));
+            })));
         let repo_a = ProtocolTempDir::new();
         let repo_b = ProtocolTempDir::new();
         let (cwd_a, cwd_b) = (repo_a.path().to_path_buf(), repo_b.path().to_path_buf());
@@ -4090,12 +4120,13 @@ mod protocol_tests {
                     .await
                     .expect("the first turn should start");
 
-                let refused = cx
+                // Each turn dispatches hooks against its own workspace, so a
+                // prompt in another repository runs concurrently (mini-agent-su92b).
+                let other_repo = cx
                     .send_request(prompt(b.clone(), "other-repo"))
                     .block_task()
-                    .await
-                    .expect_err("hooks would run against the wrong workspace");
-                assert!(refused.to_string().contains("hooks"), "{refused}");
+                    .await?;
+                assert_eq!(other_repo.stop_reason, StopReason::EndTurn);
                 let same_repo = cx
                     .send_request(prompt(a_again, "same-repo"))
                     .block_task()
@@ -4116,6 +4147,13 @@ mod protocol_tests {
             })
             .await
             .unwrap();
+        // While both workspaces were active the shared fallback root was
+        // disabled rather than pointing at either repository.
+        assert!(
+            lock_unpoisoned(&published).contains(&None),
+            "{:?}",
+            lock_unpoisoned(&published)
+        );
     }
 
     #[cfg(feature = "mcp")]
@@ -6449,34 +6487,34 @@ mod hook_root_tests {
     use super::*;
 
     #[test]
-    fn concurrent_turns_must_share_the_hook_root() {
-        let claims = Arc::new(HookRootClaims::default());
+    fn concurrent_turns_in_different_workspaces_disable_the_shared_root() {
+        let published = Arc::new(StdMutex::new(Vec::<Option<std::path::PathBuf>>::new()));
+        let recorder = published.clone();
+        let claims = Arc::new(HookRootClaims::with_publisher(move |root| {
+            lock_unpoisoned(&recorder).push(root.map(Path::to_path_buf));
+        }));
         let repo_a = Path::new("/workspace/a");
         let repo_b = Path::new("/workspace/b");
+        let take = || std::mem::take(&mut *lock_unpoisoned(&published));
 
-        let first = claims
-            .try_acquire(repo_a)
-            .expect("first turn claims its root");
-        let same = claims
-            .try_acquire(repo_a)
-            .expect("a second session in the same workspace may run concurrently");
-        let refused = claims
-            .try_acquire(repo_b)
-            .err()
-            .expect("a turn in another workspace would run hooks against the wrong repo");
-        assert!(refused.contains("/workspace/a"), "{refused}");
+        let first = claims.acquire(repo_a);
+        assert_eq!(take(), vec![Some(repo_a.to_path_buf())]);
+        let same = claims.acquire(repo_a);
+        assert!(take().is_empty(), "the same root is not republished");
+        let other = claims.acquire(repo_b);
+        assert_eq!(
+            take(),
+            vec![None],
+            "several workspaces leave no correct shared root"
+        );
 
         drop(first);
-        assert!(
-            claims.try_acquire(repo_b).is_err(),
-            "the root stays held while any turn in it is active"
-        );
+        assert!(take().is_empty(), "repo a is still held by another turn");
         drop(same);
-        let other = claims
-            .try_acquire(repo_b)
-            .expect("once every turn settles another workspace may claim the root");
+        assert_eq!(take(), vec![Some(repo_b.to_path_buf())]);
         drop(other);
-        assert!(lock_unpoisoned(&claims.active).is_none());
+        assert!(take().is_empty());
+        assert!(lock_unpoisoned(&claims.active).is_empty());
     }
 }
 
