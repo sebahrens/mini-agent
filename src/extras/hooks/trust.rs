@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::dispatcher::HookDispatcher;
+use super::pins::HookContentPins;
 use super::settings::{HookGroup, HookHandler, HooksConfig, parse_hooks_config};
 
 /// Deterministic hash of a project hook binding (project root + event +
@@ -22,6 +23,35 @@ pub(crate) fn hash_hook_binding(
         .expect("serializing hook trust bindings cannot fail");
     let mut hasher = Sha256::new();
     hasher.update(b"mini-agent-hook-binding-v2\0");
+    hasher.update(canonical);
+    crate::hex::encode_lower(hasher.finalize())
+}
+
+/// Trust hash that also binds the content of every workspace-resident file
+/// the handler executes (see [`super::pins`]). A binding without such files
+/// keeps its [`hash_hook_binding`] identity, so existing approvals of
+/// system executables stay valid; rewriting a bound script changes the hash
+/// and requires a fresh confirmation.
+pub(crate) fn hash_hook_binding_with_content(
+    project_root: &Path,
+    event: &str,
+    matcher: Option<&str>,
+    handler: &HookHandler,
+    pins: &HookContentPins,
+) -> String {
+    if pins.is_empty() {
+        return hash_hook_binding(project_root, event, matcher, handler);
+    }
+    let canonical = serde_json::to_vec(&(
+        project_root.to_string_lossy(),
+        event,
+        matcher,
+        handler,
+        pins.entries(),
+    ))
+    .expect("serializing hook trust bindings cannot fail");
+    let mut hasher = Sha256::new();
+    hasher.update(b"mini-agent-hook-binding-v3\0");
     hasher.update(canonical);
     crate::hex::encode_lower(hasher.finalize())
 }
@@ -101,6 +131,7 @@ fn hook_confirmation_description(
     event: &str,
     matcher: Option<&str>,
     handler: &HookHandler,
+    pins: &HookContentPins,
 ) -> String {
     let argv = std::iter::once(handler.command.as_deref())
         .chain(handler.args.iter().flatten().map(|arg| Some(arg.as_str())))
@@ -118,8 +149,15 @@ fn hook_confirmation_description(
     let env_binding_sha256 = crate::hex::encode_lower(Sha256::digest(env_binding));
     let event = serde_json::to_string(event).expect("serializing hook event cannot fail");
     let matcher = serde_json::to_string(&matcher).expect("serializing hook matcher cannot fail");
+    let content = if pins.is_empty() {
+        String::new()
+    } else {
+        let files = serde_json::to_string(&pins.entries())
+            .expect("serializing hook content bindings cannot fail");
+        format!("; workspace files sha256={files}")
+    };
     let policy = format!(
-        "event={event}; matcher={matcher}; subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}"
+        "event={event}; matcher={matcher}; subprocess trust={trust:?}; explicit env keys={env_keys}; env binding sha256={env_binding_sha256:?}{content}"
     );
 
     match handler.condition.as_deref() {
@@ -191,8 +229,14 @@ fn filter_trusted_project_hooks(
         for group in groups {
             let mut kept_handlers = Vec::with_capacity(group.hooks.len());
             for handler in group.hooks {
-                let hash =
-                    hash_hook_binding(project_root, &event, group.matcher.as_deref(), &handler);
+                let pins = HookContentPins::capture(project_root, &handler);
+                let hash = hash_hook_binding_with_content(
+                    project_root,
+                    &event,
+                    group.matcher.as_deref(),
+                    &handler,
+                    &pins,
+                );
                 if trusted_hashes.contains(&hash) {
                     kept_handlers.push(handler);
                 } else if headless {
@@ -204,6 +248,7 @@ fn filter_trusted_project_hooks(
                     &event,
                     group.matcher.as_deref(),
                     &handler,
+                    &pins,
                 )) {
                     trusted_hashes.insert(hash);
                     kept_handlers.push(handler);
@@ -367,7 +412,12 @@ mod confirmation_tests {
             trust: super::super::settings::HookTrust::Sandboxed,
             env: Default::default(),
         };
-        let description = hook_confirmation_description("PreToolUse", Some("bash"), &handler);
+        let description = hook_confirmation_description(
+            "PreToolUse",
+            Some("bash"),
+            &handler,
+            &HookContentPins::default(),
+        );
         assert!(description.contains("event=\"PreToolUse\""));
         assert!(description.contains("matcher=\"bash\""));
     }

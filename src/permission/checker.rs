@@ -92,6 +92,9 @@ impl CheckResult {
     }
 }
 
+#[cfg(feature = "hooks")]
+const PINNED_HOOK_FILE_DENIAL: &str = "Blocked: this file is a configured hook executable or script and cannot be modified while hooks are loaded";
+
 pub struct PermissionChecker {
     rules: HashMap<String, Vec<(Pattern, Action)>>,
     default_action: Action,
@@ -112,6 +115,10 @@ pub struct PermissionChecker {
     /// entry, so one hook verdict can never overwrite another call's.
     #[cfg(feature = "hooks")]
     hook_decisions: std::collections::HashMap<u64, HookOneShot>,
+    /// Test seam for the content-bound hook files that file tools may not
+    /// modify; `None` consults the installed hook dispatcher.
+    #[cfg(feature = "hooks")]
+    pinned_hook_files_override: Option<Vec<PathBuf>>,
     /// A scoped grant an embedded built-in prompt asked for, waiting for the
     /// user's one-time decision. Arming it grants nothing by itself.
     prompt_grant_offer: Option<PromptGrantOffer>,
@@ -367,6 +374,8 @@ impl PermissionChecker {
             cached_resolved_cwd,
             #[cfg(feature = "hooks")]
             hook_decisions: std::collections::HashMap::new(),
+            #[cfg(feature = "hooks")]
+            pinned_hook_files_override: None,
             prompt_grant_offer: None,
         };
         #[cfg(feature = "hooks")]
@@ -419,6 +428,30 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         CheckResult::Ask
+    }
+
+    #[cfg(all(feature = "hooks", test))]
+    pub(crate) fn set_pinned_hook_files_for_test(&mut self, files: Vec<PathBuf>) {
+        self.pinned_hook_files_override = Some(files);
+    }
+
+    /// Built-in deny: file tools never modify a hook file whose content the
+    /// hook dispatcher bound at load time, in any security mode.
+    #[cfg(feature = "hooks")]
+    fn writes_pinned_hook_file(&self, tool: &str, relative: Option<&str>) -> bool {
+        if !matches!(tool, "write" | "edit" | "js/write_file") {
+            return false;
+        }
+        let Some(relative) = relative else {
+            return false;
+        };
+        match &self.pinned_hook_files_override {
+            Some(files) => crate::extras::hooks::is_pinned_hook_file(files, relative),
+            None => crate::extras::hooks::is_pinned_hook_file(
+                &crate::extras::hooks::pinned_hook_files(),
+                relative,
+            ),
+        }
     }
 
     fn apply_rules(&self) -> bool {
@@ -551,7 +584,14 @@ impl PermissionChecker {
                 let a = base.unwrap_or(self.default_action);
                 let is_external = external && !capability_contained;
                 if matched.is_empty() && self.is_path_tool(tool) && !is_external {
-                    Action::Allow
+                    // Workspace reads stay auto-allowed; an unmatched
+                    // workspace modification follows a configured `"*"`
+                    // default (which is `allow` when none is configured).
+                    if self.is_read_tool(tool) {
+                        Action::Allow
+                    } else {
+                        self.default_action
+                    }
                 } else if matched.is_empty() && a == Action::Allow && is_external {
                     external_action.unwrap_or(Action::Ask)
                 } else {
@@ -711,7 +751,17 @@ impl PermissionChecker {
             }
         }
 
-        let action = self.resolve_check_action(tool, &matched);
+        let mut action = self.resolve_check_action(tool, &matched);
+        // Yolo allows unmatched scripts but still asks before a recognizably
+        // destructive one; a configured rule for the script always decides.
+        if self.mode == SecurityMode::Yolo
+            && tool == "shell"
+            && matched.is_empty()
+            && action == Action::Allow
+            && crate::permission::is_destructive_shell_script(policy_input)
+        {
+            action = Action::Ask;
+        }
         let result = self.doom_loop_check(tool, identity, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]
@@ -793,6 +843,10 @@ impl PermissionChecker {
         if self.matches_deny_rule(tool, &inputs) {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
+        #[cfg(feature = "hooks")]
+        if self.writes_pinned_hook_file(tool, relative.as_deref()) {
+            return CheckResult::Denied(PINNED_HOOK_FILE_DENIAL.to_string());
+        }
         if tool == "todo_write" {
             return CheckResult::Allowed;
         }
@@ -812,11 +866,22 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
+        // Outside the workspace, a relative or match-anything allow such as
+        // `**/*.rs` or `read = "allow"` must not stand in for an
+        // `external_directory` decision: only an allow rule that names an
+        // absolute location, or an explicit external allow, grants access.
+        let external_allow_needs_anchor = external && external_action != Some(Action::Allow);
         let mut matched: SmallVec<[(usize, Action); 4]> = SmallVec::new();
         if self.apply_rules()
             && let Some(rules) = self.rules.get(tool)
         {
             for (pattern, action) in rules {
+                if *action == Action::Allow
+                    && external_allow_needs_anchor
+                    && !pattern.is_absolute_anchored()
+                {
+                    continue;
+                }
                 if inputs.iter().any(|input| pattern.matches_path(input)) {
                     matched.push((pattern.specificity(), *action));
                 }
@@ -891,6 +956,10 @@ impl PermissionChecker {
             return CheckResult::Denied("Blocked by deny rule".to_string());
         }
         #[cfg(feature = "hooks")]
+        if self.writes_pinned_hook_file(tool, Some(&relative)) {
+            return CheckResult::Denied(PINNED_HOOK_FILE_DENIAL.to_string());
+        }
+        #[cfg(feature = "hooks")]
         let hook_approved = self.take_pending_one_shot(tool).is_some();
         if self.is_session_allowed(tool, &logical) || self.is_session_allowed(tool, &relative) {
             return CheckResult::Allowed;
@@ -925,7 +994,7 @@ impl PermissionChecker {
             for (pattern, action) in rules {
                 let matches = |input: &&str| {
                     if is_path_tool_name(tool) {
-                        pattern.matches_path(input)
+                        pattern.matches_path_for_deny(input)
                     } else {
                         pattern.matches(input)
                     }
@@ -940,12 +1009,14 @@ impl PermissionChecker {
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
-            let matches = if tool == "shell" {
-                pattern.original == input
-            } else if is_path_tool_name(tool) {
+            // Only path tools receive generated scope patterns. Every other
+            // AllowAlways key (shell scripts, `git/commit` messages, `js/fetch`
+            // URLs, MCP operations) is a literal the model controls, so a `*`
+            // or `?` inside it must never widen the grant.
+            let matches = if is_path_tool_name(tool) {
                 pattern.matches_path(input)
             } else {
-                pattern.matches(input)
+                pattern.original == input
             };
             if allowed_tool == tool && matches {
                 return true;
@@ -1193,11 +1264,16 @@ impl PermissionChecker {
             let verbatim = windows_verbatim_policy_path(&ordinary);
             let mut decision = None;
             for (pattern, action) in &self.ext_dir_rules {
-                if pattern.matches_path(path_str)
-                    || pattern.matches_path(&ordinary)
-                    || verbatim
-                        .as_deref()
-                        .is_some_and(|path| pattern.matches_path(path))
+                let matches = |path: &str| {
+                    if *action == Action::Deny {
+                        pattern.matches_path_for_deny(path)
+                    } else {
+                        pattern.matches_path(path)
+                    }
+                };
+                if matches(path_str)
+                    || matches(&ordinary)
+                    || verbatim.as_deref().is_some_and(matches)
                 {
                     decision = Some(match (decision, *action) {
                         (_, Action::Deny) | (Some(Action::Deny), _) => Action::Deny,
@@ -1208,14 +1284,25 @@ impl PermissionChecker {
             }
             return decision;
         }
+        // Evaluate every rule so the outcome follows the documented
+        // order-independent precedence (any deny, then the most specific
+        // pattern, then ask over allow) rather than map iteration order.
         #[cfg(not(windows))]
-        for (pattern, action) in &self.ext_dir_rules {
-            if pattern.matches_path(path_str) {
-                return Some(*action);
-            }
+        {
+            let matched: SmallVec<[(usize, Action); 4]> = self
+                .ext_dir_rules
+                .iter()
+                .filter(|(pattern, action)| {
+                    if *action == Action::Deny {
+                        pattern.matches_path_for_deny(path_str)
+                    } else {
+                        pattern.matches_path(path_str)
+                    }
+                })
+                .map(|(pattern, action)| (pattern.specificity(), *action))
+                .collect();
+            Self::resolve_matched(&matched)
         }
-        #[cfg(not(windows))]
-        None
     }
 
     /// Feeds a hook-denied call into doom-loop detection. A hook deny never
@@ -2330,5 +2417,480 @@ mod folder_grant_tests {
         checker.set_prompt_grant_offer(Some(offer(&fx)));
         checker.set_prompt_grant_offer(None);
         assert_eq!(checker.prompt_grant_offer_for("read", &fx.file()), None);
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod pinned_hook_file_tests {
+    use super::*;
+
+    #[test]
+    fn file_tools_cannot_modify_content_bound_hook_files_in_any_mode() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_pinned_hook_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("hooks")).unwrap();
+        std::fs::write(workspace.join("hooks/guard.sh"), "#!/bin/sh\n").unwrap();
+        for mode in [SecurityMode::Standard, SecurityMode::Yolo] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfigs::default(),
+                mode,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap();
+            checker.set_pinned_hook_files_for_test(vec![PathBuf::from("hooks/guard.sh")]);
+            for (tool, path) in [
+                ("write", "hooks/guard.sh"),
+                ("edit", "./hooks/guard.sh"),
+                ("edit", "HOOKS/Guard.sh"),
+                ("js/write_file", "hooks/guard.sh"),
+            ] {
+                assert!(
+                    matches!(checker.check_path(tool, path), CheckResult::Denied(_)),
+                    "{mode:?} {tool} {path}"
+                );
+            }
+            let absolute = workspace.join("hooks/guard.sh");
+            assert!(matches!(
+                checker.check_path("edit", &absolute.to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert!(matches!(
+                checker.check_bound_path("write", &absolute.to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert_eq!(
+                checker.check_path("read", "hooks/guard.sh"),
+                CheckResult::Allowed
+            );
+            assert_eq!(
+                checker.check_path("edit", "hooks/other.sh"),
+                CheckResult::Allowed
+            );
+        }
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_directory_precedence_tests {
+    use super::*;
+
+    fn checker(workspace: &Path, rules: &[(String, Action)]) -> PermissionChecker {
+        let config = PermissionConfig {
+            external_directory: Some(rules.iter().cloned().collect()),
+            ..PermissionConfig::default()
+        };
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn external_directory_rules_resolve_independently_of_map_order() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_ext_precedence_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("tmp")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(home.join("tmp/scratch"), "x").unwrap();
+        std::fs::write(home.join("notes"), "x").unwrap();
+        let home_text = home.to_string_lossy();
+
+        // Each constructed HashMap gets a fresh random hasher seed, so many
+        // constructions cover both iteration orders.
+        for _ in 0..64 {
+            let mut deny_nested = checker(
+                &workspace,
+                &[
+                    (format!("{home_text}/**"), Action::Allow),
+                    (format!("{home_text}/.ssh/**"), Action::Deny),
+                ],
+            );
+            assert!(matches!(
+                deny_nested.check_path("read", &home.join(".ssh/id_ed25519").to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert_eq!(
+                deny_nested.check_path("read", &home.join("notes").to_string_lossy()),
+                CheckResult::Allowed
+            );
+
+            let mut specific_allow = checker(
+                &workspace,
+                &[
+                    (format!("{home_text}/tmp/**"), Action::Allow),
+                    ("/**".to_string(), Action::Ask),
+                ],
+            );
+            assert_eq!(
+                specific_allow.check_path("read", &home.join("tmp/scratch").to_string_lossy()),
+                CheckResult::Allowed
+            );
+            assert_eq!(
+                specific_allow.check_path("read", &home.join("notes").to_string_lossy()),
+                CheckResult::Ask
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_tool_allow_tests {
+    use super::*;
+
+    fn checker(
+        workspace: &Path,
+        config: PermissionConfig,
+        mode: SecurityMode,
+    ) -> PermissionChecker {
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            mode,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn relative_tool_allows_do_not_grant_external_paths() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_ext_tool_allow_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let other_repo = base.join("other-repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&other_repo).unwrap();
+        let external_rs = other_repo.join("build.rs").to_string_lossy().into_owned();
+        let write_rs_allow = || PermissionConfig {
+            write: Some(ToolPerm::Granular(
+                [
+                    ("**/*.rs".to_string(), Action::Allow),
+                    ("**".to_string(), Action::Ask),
+                ]
+                .into(),
+            )),
+            external_directory: Some([("/**".to_string(), Action::Ask)].into()),
+            ..PermissionConfig::default()
+        };
+
+        // The documented CONFIG.md example.
+        for mode in [
+            SecurityMode::Standard,
+            SecurityMode::Guarded,
+            SecurityMode::Restrictive,
+        ] {
+            let mut documented = checker(&workspace, write_rs_allow(), mode);
+            assert_eq!(
+                documented.check_path("write", &external_rs),
+                CheckResult::Ask,
+                "{mode:?}"
+            );
+            if mode != SecurityMode::Restrictive {
+                assert_eq!(
+                    documented.check_path("write", "src/main.rs"),
+                    CheckResult::Allowed,
+                    "{mode:?}"
+                );
+            }
+        }
+
+        let mut read_all = checker(
+            &workspace,
+            PermissionConfig {
+                read: Some(ToolPerm::Simple(Action::Allow)),
+                ..PermissionConfig::default()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(read_all.check_path("read", &external_rs), CheckResult::Ask);
+
+        let mut anchored = checker(
+            &workspace,
+            PermissionConfig {
+                write: Some(ToolPerm::Granular(
+                    [(
+                        format!("{}/**", other_repo.to_string_lossy()),
+                        Action::Allow,
+                    )]
+                    .into(),
+                )),
+                ..PermissionConfig::default()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(
+            anchored.check_path("write", &external_rs),
+            CheckResult::Allowed
+        );
+
+        let mut external_allowed = checker(
+            &workspace,
+            PermissionConfig {
+                external_directory: Some(
+                    [(
+                        format!("{}/**", other_repo.to_string_lossy()),
+                        Action::Allow,
+                    )]
+                    .into(),
+                ),
+                ..write_rs_allow()
+            },
+            SecurityMode::Standard,
+        );
+        assert_eq!(
+            external_allowed.check_path("write", &external_rs),
+            CheckResult::Allowed
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn only_absolute_patterns_are_anchored() {
+        use crate::permission::pattern::Pattern;
+        assert!(Pattern::new_path("/opt/**").is_absolute_anchored());
+        assert!(Pattern::new_path("~/src/**").is_absolute_anchored());
+        assert!(!Pattern::new_path("**/*.rs").is_absolute_anchored());
+        assert!(!Pattern::new_path("src/**").is_absolute_anchored());
+        assert!(!Pattern::new("**").is_absolute_anchored());
+        assert!(Pattern::new_regex("^/opt/").unwrap().is_absolute_anchored());
+        assert!(!Pattern::new_regex(r"^\d").unwrap().is_absolute_anchored());
+        assert!(
+            !Pattern::new_regex(r".*\.rs$")
+                .unwrap()
+                .is_absolute_anchored()
+        );
+    }
+}
+
+#[cfg(test)]
+mod standard_default_tests {
+    use super::*;
+
+    #[test]
+    fn configured_default_governs_unmatched_workspace_modifications_in_standard() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_standard_default_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let checker_with = |default: Option<Action>| {
+            PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    default,
+                    ..PermissionConfig::default()
+                }),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mut ask = checker_with(Some(Action::Ask));
+        for tool in ["write", "edit", "js/write_file"] {
+            assert_eq!(
+                ask.check_path(tool, "src/lib.rs"),
+                CheckResult::Ask,
+                "{tool}"
+            );
+        }
+        for tool in ["read", "grep", "find_files", "list_dir"] {
+            assert_eq!(
+                ask.check_path(tool, "src/lib.rs"),
+                CheckResult::Allowed,
+                "{tool}"
+            );
+        }
+        let mut deny = checker_with(Some(Action::Deny));
+        assert!(matches!(
+            deny.check_path("edit", "src/lib.rs"),
+            CheckResult::Denied(_)
+        ));
+
+        let mut unconfigured = checker_with(None);
+        for tool in ["write", "edit", "read", "grep"] {
+            assert_eq!(
+                unconfigured.check_path(tool, "src/lib.rs"),
+                CheckResult::Allowed,
+                "{tool}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod case_insensitive_deny_tests {
+    use super::*;
+
+    #[test]
+    fn relative_deny_rules_cover_case_variants_on_case_insensitive_volumes() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_case_deny_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("secrets")).unwrap();
+        std::fs::write(workspace.join(".env"), "TOKEN=x").unwrap();
+        std::fs::write(workspace.join("secrets/key"), "k").unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    (".env".to_string(), Action::Deny),
+                    ("secrets/**".to_string(), Action::Deny),
+                ]
+                .into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        for spelling in [".ENV", ".Env", "Secrets/key", "SECRETS/KEY", "secrets/KEY"] {
+            assert!(
+                matches!(checker.check_path("read", spelling), CheckResult::Denied(_)),
+                "check_path {spelling}"
+            );
+            let bound = workspace.join(spelling);
+            assert!(
+                matches!(
+                    checker.check_bound_path("read", &bound.to_string_lossy()),
+                    CheckResult::Denied(_)
+                ),
+                "check_bound_path {spelling}"
+            );
+        }
+        assert_eq!(
+            checker.check_path("read", "README.md"),
+            CheckResult::Allowed
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod exact_session_key_tests {
+    use super::*;
+
+    #[test]
+    fn allow_always_on_non_path_tools_grants_only_the_exact_key() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_exact_session_key_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Guarded,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("git/commit".into(), "fix *");
+        checker.add_session_allowlist("js/fetch".into(), "https://example.com/?q=*");
+        checker
+            .load_session_allowlist(&[("mcp_tool".to_string(), "mcp_tool:server:*".to_string())]);
+
+        assert_eq!(checker.check("git/commit", "fix *"), CheckResult::Allowed);
+        assert_eq!(
+            checker.check("git/commit", "fix everything"),
+            CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check("js/fetch", "https://example.com/?q=*"),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check("js/fetch", "https://example.com/?q=1&exfil=secret"),
+            CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check("mcp_tool", "mcp_tool:server:delete_all"),
+            CheckResult::Ask
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod yolo_destructive_tests {
+    use super::*;
+
+    fn yolo(bash: Option<ToolPerm>) -> PermissionChecker {
+        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                bash,
+                ..PermissionConfig::default()
+            }),
+            SecurityMode::Yolo,
+            Some(workspace),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn yolo_asks_before_destructive_shell_commands_even_with_custom_bash_rules() {
+        let custom = ToolPerm::Granular([("cargo test".to_string(), Action::Allow)].into());
+        for bash in [None, Some(custom)] {
+            let mut checker = yolo(bash);
+            for script in [
+                "rm -rf ~",
+                "rm -fr build",
+                "rm --recursive --force /",
+                "sudo rm -r /var/lib/data",
+                "cd /tmp && rm -rf *",
+                "echo hi; dd if=/dev/zero of=/dev/disk2",
+                "mkfs.ext4 /dev/sdb1",
+                "git push --force origin main",
+                "git reset --hard HEAD~3",
+                "git clean -fdx",
+                "find . -name '*.o' -delete",
+                "chmod -R 777 /",
+            ] {
+                assert_eq!(checker.check("bash", script), CheckResult::Ask, "{script}");
+            }
+            for script in [
+                "ls -la",
+                "rm notes.txt",
+                "cargo test",
+                "git push origin main",
+                "grep -rf x .",
+            ] {
+                assert_eq!(
+                    checker.check("bash", script),
+                    CheckResult::Allowed,
+                    "{script}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_configured_rule_still_decides_destructive_scripts_in_yolo() {
+        let mut checker = yolo(Some(ToolPerm::Granular(
+            [("rm -rf target".to_string(), Action::Allow)].into(),
+        )));
+        assert_eq!(checker.check("bash", "rm -rf target"), CheckResult::Allowed);
+        assert_eq!(checker.check("bash", "rm -rf src"), CheckResult::Ask);
     }
 }
