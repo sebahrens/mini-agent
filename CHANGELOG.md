@@ -53,6 +53,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Hooks and workspace services (MCP stdio and LSP servers, contained Git) now start in their own
   session with no controlling terminal, as sandboxed model commands already did, so they can no
   longer inject keystrokes into the TUI (`TIOCSTI`) or write escape sequences to your terminal.
+- Language servers and stdio MCP servers now resolve bare executable names only through absolute
+  `PATH` entries, as hooks already did: an empty or relative entry (`::`, `.`) can no longer make a
+  workspace-planted `rust-analyzer`, `gopls` or MCP server binary run unsandboxed. A relative
+  command with a directory component is rejected for LSP and needs an explicit `cwd` for MCP.
 
 ### Added
 

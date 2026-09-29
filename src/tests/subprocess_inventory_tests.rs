@@ -1131,6 +1131,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/extras/lsp/client.rs",
+        ") -> anyhow::Result<tokio::process::Command> {",
+        1,
+        "TC-LSP-SERVICE",
+    ),
+    (
+        "src/extras/lsp/client.rs",
         "let mut command = tokio::process::Command::new(program);",
         1,
         "TC-LSP-SERVICE",

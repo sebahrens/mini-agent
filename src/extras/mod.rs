@@ -34,6 +34,9 @@ pub mod advisor;
 #[cfg(feature = "hooks")]
 pub mod hooks;
 
+#[cfg(any(feature = "hooks", feature = "lsp", feature = "mcp"))]
+pub(crate) mod executable_search;
+
 pub mod chain;
 #[cfg(feature = "multimodal")]
 pub mod multimodal;

@@ -1231,13 +1231,26 @@ fn canonical_workspace_root(root: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn lsp_command(cfg: &LspServerConfig, root: &Path) -> anyhow::Result<tokio::process::Command> {
+    lsp_command_with_search_path(cfg, root, std::env::var_os("PATH").as_deref())
+}
+
+fn lsp_command_with_search_path(
+    cfg: &LspServerConfig,
+    root: &Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<tokio::process::Command> {
     let env = delegated_environment(&cfg.inherit_env, &cfg.env)?;
-    // Resolve the executable against the launcher's PATH before clearing the
-    // child's environment. Delegating PATH controls only subprocesses that
-    // the language server may launch itself.
-    let program = which::which(cfg.command.as_str()).map_err(|error| {
-        anyhow::anyhow!("LSP executable '{}' was not found: {error}", cfg.command)
-    })?;
+    // Resolve the executable against the absolute entries of the launcher's
+    // PATH before clearing the child's environment. Relative/empty entries
+    // would resolve against the workspace, and LSP configuration has no
+    // working-directory anchor for `./server`-style commands. Delegating PATH
+    // controls only subprocesses that the language server may launch itself.
+    let program = crate::extras::executable_search::resolve_service_executable(
+        cfg.command.as_str(),
+        search_path,
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("LSP {error}"))?;
     let args = cfg.args.iter().map(ToString::to_string).collect::<Vec<_>>();
     let mut command = if let Some(backend) = cfg.sandbox.as_deref() {
         Sandbox::new(true, backend)
@@ -1648,6 +1661,38 @@ fn language_id(path: &Path) -> &'static str {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_command_ignores_relative_and_empty_path_entries() {
+        use crate::extras::executable_search::PlantedExecutables;
+        let fixture = PlantedExecutables::new("lsp");
+        let cfg = LspServerConfig {
+            command: compact_str::CompactString::new("rust-analyzer"),
+            ..Default::default()
+        };
+        PlantedExecutables::plant(&fixture.workspace, "rust-analyzer");
+        for search in fixture.hostile_search_paths() {
+            let error = lsp_command_with_search_path(&cfg, &fixture.workspace, Some(&search))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not found"), "{error}");
+        }
+        let trusted = PlantedExecutables::plant(&fixture.bin, "rust-analyzer");
+        for search in fixture.hostile_search_paths() {
+            let command =
+                lsp_command_with_search_path(&cfg, &fixture.workspace, Some(&search)).unwrap();
+            assert_eq!(Path::new(command.as_std().get_program()), trusted);
+        }
+        let relative = LspServerConfig {
+            command: compact_str::CompactString::new("./rust-analyzer"),
+            ..Default::default()
+        };
+        let error = lsp_command_with_search_path(&relative, &fixture.workspace, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("directory component"), "{error}");
+    }
 
     #[test]
     fn server_requests_are_answered_with_their_exact_id() {
