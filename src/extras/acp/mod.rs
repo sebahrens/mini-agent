@@ -1,4 +1,5 @@
 pub mod config;
+mod tls;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -613,6 +614,7 @@ struct TcpTransport {
     host: String,
     port: u16,
     api_key: String,
+    tls: Option<Arc<tls::AcpTlsConfig>>,
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -629,6 +631,23 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let local_addr = listener.local_addr().map_err(|e| {
             agent_client_protocol::util::internal_error(format!("TCP local address: {}", e))
         })?;
+
+        if let Some(tls) = self.tls {
+            tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
+            let (stream, peer_addr) =
+                tls::accept_tls_peer(listener, self.api_key, tls, MAX_PENDING_AUTHENTICATIONS)
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
+                    })?;
+            tracing::info!("Authenticated ACP TLS client connected from {}", peer_addr);
+            let (read_half, write_half) = tokio::io::split(stream);
+            return ConnectTo::<Counterpart>::connect_to(
+                ByteStreams::new(tls::FuturesIo(write_half), tls::FuturesIo(read_half)),
+                client,
+            )
+            .await;
+        }
 
         tracing::info!("ACP TCP listening on {}", local_addr);
         let (stream, peer_addr) =
@@ -726,18 +745,40 @@ struct TcpServerSettings {
     host: String,
     port: u16,
     api_key: String,
+    tls: Option<Arc<tls::AcpTlsConfig>>,
 }
 
-/// Opt-in for a non-loopback ACP TCP bind. The TCP transport authenticates
-/// only the connection handshake: the session afterwards is plaintext and the
-/// client never authenticates the server, so anyone on the network path can
-/// read or inject into a tool-executing session.
+/// Opt-in for a non-loopback plaintext ACP TCP bind. Without TLS the TCP
+/// transport authenticates only the connection handshake: the session
+/// afterwards is plaintext and the client never authenticates the server, so
+/// anyone on the network path can read or inject into a tool-executing
+/// session. A TLS listener (`MINI_AGENT_ACP_TLS_CERT`/`_KEY`) needs no opt-in.
 const ACP_ALLOW_REMOTE_ENV: &str = "MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE";
 
 fn resolve_tcp_settings(cli: &Cli, cfg: &Config) -> anyhow::Result<Option<TcpServerSettings>> {
     let environment_key = std::env::var("MINI_AGENT_ACP_API_KEY").ok();
     let allow_remote = std::env::var(ACP_ALLOW_REMOTE_ENV).is_ok_and(|value| value == "1");
-    resolve_tcp_settings_with_key(cli, cfg, environment_key, allow_remote)
+    let tls_paths = tls::tls_paths_from_env()?;
+    let Some(mut settings) = resolve_tcp_settings_with_key(
+        cli,
+        cfg,
+        environment_key,
+        allow_remote,
+        tls_paths.is_some(),
+    )?
+    else {
+        if tls_paths.is_some() {
+            anyhow::bail!(
+                "{} is set but ACP is not listening on TCP; pass --acp-host/--acp-port",
+                tls::ACP_TLS_CERT_ENV
+            );
+        }
+        return Ok(None);
+    };
+    if let Some((certificate, key)) = tls_paths {
+        settings.tls = Some(Arc::new(tls::AcpTlsConfig::load(&certificate, &key)?));
+    }
+    Ok(Some(settings))
 }
 
 fn resolve_tcp_settings_with_key(
@@ -745,6 +786,7 @@ fn resolve_tcp_settings_with_key(
     cfg: &Config,
     environment_key: Option<String>,
     allow_remote: bool,
+    tls: bool,
 ) -> anyhow::Result<Option<TcpServerSettings>> {
     let configured_host = cli.acp_host.clone().or_else(|| cfg.acp_host.clone());
     let configured_port = cli.acp_port.or(cfg.acp_port);
@@ -763,14 +805,17 @@ fn resolve_tcp_settings_with_key(
             )
         })?;
 
-    if !is_loopback_host(&host) {
+    if !is_loopback_host(&host) && !tls {
         if !allow_remote {
             anyhow::bail!(
                 "refusing ACP TCP bind on non-loopback host '{host}': the TCP transport \
                  authenticates only the handshake, then carries the session in plaintext \
                  without authenticating the server, so an on-path attacker could read or \
-                 inject into a tool-executing session. Bind to 127.0.0.1 and tunnel (for \
-                 example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 to accept that risk"
+                 inject into a tool-executing session. Set {} and {} to serve TLS, bind to \
+                 127.0.0.1 and tunnel (for example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 \
+                 to accept that risk",
+                tls::ACP_TLS_CERT_ENV,
+                tls::ACP_TLS_KEY_ENV
             );
         }
         let warning = format!(
@@ -786,6 +831,7 @@ fn resolve_tcp_settings_with_key(
         host,
         port,
         api_key,
+        tls: None,
     }))
 }
 
@@ -934,6 +980,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
                 host: settings.host,
                 port: settings.port,
                 api_key: settings.api_key,
+                tls: settings.tls,
             },
         )
         .await
@@ -6541,7 +6588,7 @@ mod tcp_authentication_tests {
     #[test]
     fn stdio_remains_default_without_tcp_endpoint() {
         let settings =
-            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false)
+            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false, false)
                 .unwrap();
         assert!(settings.is_none());
     }
@@ -6554,7 +6601,7 @@ mod tcp_authentication_tests {
         };
         let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false)
+        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false, false)
             .unwrap()
             .unwrap();
         assert_eq!(settings.host, DEFAULT_TCP_HOST);
@@ -6569,7 +6616,7 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
 
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false)
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false, false)
             .err()
             .expect("TCP without authentication must fail");
         assert!(error.to_string().contains("requires authentication"));
@@ -6582,16 +6629,26 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
         let key = Some("secret".to_owned());
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
-            .err()
-            .expect("a remote bind must be refused by default");
+        let error =
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, false)
+                .err()
+                .expect("a remote bind must be refused by default");
         assert!(error.to_string().contains(ACP_ALLOW_REMOTE_ENV), "{error}");
         assert!(!error.to_string().contains("secret"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true)
-            .unwrap()
-            .unwrap();
+        let settings =
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true, false)
+                .unwrap()
+                .unwrap();
         assert_eq!(settings.host, "0.0.0.0");
+
+        // A TLS listener authenticates the server and protects the session,
+        // so a remote bind needs no insecure opt-in (mini-agent-bky6w).
+        assert!(
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, true)
+                .unwrap()
+                .is_some()
+        );
 
         for loopback in ["127.0.0.1", "::1", "localhost"] {
             let cli = Cli {
@@ -6599,7 +6656,7 @@ mod tcp_authentication_tests {
                 ..Default::default()
             };
             assert!(
-                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, false)
                     .unwrap()
                     .is_some(),
                 "{loopback} needs no opt-in"

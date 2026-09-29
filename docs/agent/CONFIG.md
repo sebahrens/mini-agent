@@ -1852,13 +1852,31 @@ ACP server configs (in `acp_servers`) support two transport types:
 When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
 (the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
 `acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
-host defaults to `127.0.0.1`. A non-loopback `acp_host` is refused at startup
-unless the environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which
-case a prominent warning is printed. The TCP handshake authenticates the
-client, but the session that follows is plaintext and the server is never
-authenticated to the client, so an on-path attacker could read or inject into
-a tool-executing session. Prefer a loopback bind behind an SSH tunnel or
-another encrypted, mutually authenticated channel.
+host defaults to `127.0.0.1`.
+
+**TLS.** Setting both `MINI_AGENT_ACP_TLS_CERT` (PEM certificate chain, leaf
+first) and `MINI_AGENT_ACP_TLS_KEY` (PEM PKCS#8 private key) in the agent's
+environment serves the TCP listener over TLS 1.2 or newer, using the platform
+TLS stack. Setting only one of them, or setting them without a TCP endpoint,
+is a startup error. Inside TLS the handshake is channel-bound: the server
+sends `MINI-AGENT-ACP-AUTH/2 CHALLENGE <nonce>` and the client answers
+`MINI-AGENT-ACP-AUTH/2 RESPONSE <hex>` where `<hex>` is
+`HMAC-SHA256(api_key, "MINI-AGENT-ACP-AUTH/2" 0x00 nonce 0x00 hex(SHA-256(server leaf certificate DER)))`
+in lowercase hex, computed over the certificate the client actually received.
+A man in the middle that terminates TLS with any other certificate therefore
+cannot relay a valid response, even to a client that does not verify the
+certificate chain; clients should still verify or pin the certificate. The
+session that follows is encrypted and integrity-protected. A TLS listener may
+bind a non-loopback `acp_host` without any opt-in.
+
+Without TLS, a non-loopback `acp_host` is refused at startup unless the
+environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which case a
+prominent warning is printed. The plaintext handshake
+(`MINI-AGENT-ACP-AUTH/1`) authenticates the client, but the session that
+follows is plaintext and the server is never authenticated to the client, so
+an on-path attacker could read or inject into a tool-executing session. Prefer
+TLS, or a loopback bind behind an SSH tunnel or another encrypted, mutually
+authenticated channel.
 
 Every `session/new` request must provide an existing directory as `cwd`.
 zerostack canonicalizes that directory before creating the session and binds

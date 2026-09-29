@@ -40,7 +40,7 @@ mcp = [
     "rmcp?/auth",
     "rmcp?/which-command",
 ]
-acp = ["dep:agent-client-protocol", "dep:blocking"]
+acp = ["dep:agent-client-protocol", "dep:blocking", "dep:native-tls", "dep:tokio-native-tls"]
 memory = []
 subagents = []
 archmd = []
@@ -91,6 +91,8 @@ tokio = { version = "1", features = [
     "process",
     "signal",
     "fs",
+    "net",
+    "io-util",
 ] }
 anyhow = "1"
 cap-std = "4.0.2"
@@ -122,6 +124,9 @@ include_dir = "0.7"
 http = "1"
 agent-client-protocol = { version = "2.0.0", optional = true }
 blocking = { version = "1", optional = true }
+# ACP TCP TLS reuses the native-tls stack reqwest already links.
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
 lsp-types = { version = "0.97", optional = true }
 rquickjs = { version = "0.12", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
