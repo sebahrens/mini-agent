@@ -146,6 +146,8 @@ mod portable_filename_tests;
     )
 ))]
 pub(crate) mod process_gate;
+#[cfg(all(test, unix))]
+mod process_group_guard_tests;
 #[cfg(all(
     any(feature = "acp", feature = "git-worktree", feature = "hooks"),
     any(target_os = "linux", target_os = "macos")

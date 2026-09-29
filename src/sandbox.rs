@@ -1077,6 +1077,11 @@ fn is_executable(path: &Path) -> bool {
 pub(crate) struct ProcessGroupGuard {
     pid: Option<u32>,
     active_groups: Arc<Mutex<HashSet<u32>>>,
+    /// Set once the owner has reaped the group leader. After that the pid
+    /// no longer pins the pgid: when the last descendant leaves, the kernel
+    /// may hand the number to an unrelated process, so cleanup must first
+    /// confirm the group is still live (mini-agent-7xrej.1).
+    leader_reaped: bool,
 }
 
 struct OutputCommandLifecycleGuard {
@@ -1156,7 +1161,17 @@ impl ProcessGroupGuard {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pid);
         }
-        Self { pid, active_groups }
+        Self {
+            pid,
+            active_groups,
+            leader_reaped: false,
+        }
+    }
+
+    /// Records that the owner has reaped the group leader, so any later
+    /// cleanup from this guard signals the group only while it is still live.
+    pub(crate) fn mark_leader_reaped(&mut self) {
+        self.leader_reaped = true;
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -1170,9 +1185,25 @@ impl ProcessGroupGuard {
 
     fn terminate_owned_group(&self) {
         if let Some(pid) = self.pid {
-            kill_process_group(pid);
+            signal_owned_group(pid, self.leader_reaped);
         }
     }
+}
+
+/// Signals a guard's group: unconditionally while the leader is unreaped
+/// (the leader, even as a zombie, keeps the pgid from being recycled), and
+/// only after confirming the group is live once the leader has been reaped.
+/// Windows has no process groups and the owner's `Child` handle keeps the pid
+/// reserved, so its arm is unchanged.
+fn signal_owned_group(pid: u32, leader_reaped: bool) {
+    #[cfg(unix)]
+    if leader_reaped {
+        kill_process_group_if_live(pid);
+        return;
+    }
+    #[cfg(not(unix))]
+    let _ = leader_reaped;
+    kill_process_group(pid);
 }
 
 impl Drop for ProcessGroupGuard {
@@ -1182,7 +1213,7 @@ impl Drop for ProcessGroupGuard {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&pid);
-            kill_process_group(pid);
+            signal_owned_group(pid, self.leader_reaped);
         }
     }
 }
@@ -3039,6 +3070,7 @@ impl Sandbox {
 
         let (mut exit_status, mut command_status) = match termination {
             CommandTermination::Exited(Ok(status)) => {
+                lifecycle.process.mark_leader_reaped();
                 // A descendant may inherit a pipe after the shell exits. End
                 // the process group before joining readers so it cannot hold
                 // the command open or continue running in the background. The
@@ -3059,7 +3091,7 @@ impl Sandbox {
             }
             CommandTermination::Exited(Err(error)) => {
                 tracing::warn!("sandbox: failed to wait for command: {error}");
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut lifecycle.process).await;
                 (None, CommandStatus::Failed)
             }
             CommandTermination::ReaderError(error) => {
@@ -3072,15 +3104,15 @@ impl Sandbox {
                         CommandStatus::Failed
                     }
                 };
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut lifecycle.process).await;
                 (None, status)
             }
             CommandTermination::TimedOut => {
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut lifecycle.process).await;
                 (None, CommandStatus::TimedOut)
             }
             CommandTermination::Cancelled => {
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut lifecycle.process).await;
                 (None, CommandStatus::Cancelled)
             }
         };
@@ -3152,7 +3184,7 @@ impl Sandbox {
         let foreground = match ForegroundProcessGroupGuard::acquire(pid) {
             Ok(foreground) => foreground,
             Err(error) => {
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut guard).await;
                 let output = CommandOutput {
                     exit_status: None,
                     stdout: Vec::new(),
@@ -3177,6 +3209,7 @@ impl Sandbox {
         };
         let (exit_status, status) = match termination {
             CommandTermination::Exited(Ok(status)) => {
+                guard.mark_leader_reaped();
                 if let Some(pid) = pid {
                     kill_process_group_if_live(pid);
                 }
@@ -3189,15 +3222,15 @@ impl Sandbox {
             }
             CommandTermination::Exited(Err(error)) => {
                 tracing::warn!("support command: failed to wait: {error}");
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut guard).await;
                 (None, CommandStatus::Failed)
             }
             CommandTermination::TimedOut => {
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut guard).await;
                 (None, CommandStatus::TimedOut)
             }
             CommandTermination::Cancelled => {
-                terminate_and_reap(&mut child, pid).await;
+                terminate_and_reap(&mut child, pid, &mut guard).await;
                 (None, CommandStatus::Cancelled)
             }
             CommandTermination::ReaderError(_) => unreachable!("support commands have no readers"),
@@ -3741,13 +3774,27 @@ async fn finish_pipe_readers(
 pub(crate) const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(2);
 
-async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
+async fn terminate_and_reap(child: &mut Child, pid: Option<u32>, guard: &mut ProcessGroupGuard) {
+    // The leader may already have been reaped (a wait that completed before
+    // this path was chosen, or this probe reaping an exited leader now). Its
+    // pid then no longer pins the pgid, so only signal a group that is still
+    // live rather than one the kernel may have handed to another process.
+    // Windows has no process groups and keeps its existing termination path.
+    let leader_reaped = matches!(child.try_wait(), Ok(Some(_)));
+    if leader_reaped {
+        guard.mark_leader_reaped();
+    }
     if let Some(pid) = pid {
-        terminate_process_group(pid).await;
+        if leader_reaped && cfg!(unix) {
+            kill_process_group_if_live(pid);
+        } else {
+            terminate_process_group(pid).await;
+        }
     }
     let _ = child.start_kill();
-    if let Err(error) = child.wait().await {
-        tracing::warn!("sandbox: failed to reap terminated command: {error}");
+    match child.wait().await {
+        Ok(_) => guard.mark_leader_reaped(),
+        Err(error) => tracing::warn!("sandbox: failed to reap terminated command: {error}"),
     }
     // kill_process_group only signals; returning here would report a settled
     // tree while a descendant is still runnable, which is how a cancelled turn
@@ -3856,6 +3903,32 @@ fn configure_new_session_child_lifetime(cmd: &mut Command) {
     }
 }
 
+// Test-only record of the groups `kill_process_group` signalled on the
+// calling thread, so tests can prove a post-reap path left a (possibly
+// recycled) pgid alone without depending on real pid reuse.
+#[cfg(all(test, unix))]
+thread_local! {
+    static SIGNALLED_GROUPS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_signalled_groups() -> Vec<u32> {
+    SIGNALLED_GROUPS.with(|groups| std::mem::take(&mut *groups.borrow_mut()))
+}
+
+/// Drops an output-command lifecycle guard whose leader was already reaped,
+/// exercising its cancellation cleanup without running a command.
+#[cfg(all(test, unix))]
+pub(crate) fn drop_reaped_output_lifecycle_guard(
+    pid: u32,
+    active_groups: Arc<Mutex<HashSet<u32>>>,
+) {
+    let mut lifecycle =
+        OutputCommandLifecycleGuard::new(ProcessGroupGuard::new(Some(pid), active_groups), None);
+    lifecycle.process.mark_leader_reaped();
+}
+
 pub(crate) fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -3871,6 +3944,8 @@ pub(crate) fn kill_process_group(pid: u32) {
             tracing::warn!("sandbox: refusing invalid child process group ID {pid}");
             return;
         }
+        #[cfg(test)]
+        SIGNALLED_GROUPS.with(|groups| groups.borrow_mut().push(pid));
         for (signal, label) in [(Signal::SIGTERM, "SIGTERM"), (Signal::SIGKILL, "SIGKILL")] {
             if let Err(error) = killpg(Pid::from_raw(group), signal)
                 && error != Errno::ESRCH

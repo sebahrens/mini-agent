@@ -11,7 +11,9 @@ use crate::sandbox::{
     hook_containment_supported, terminate_process_group,
 };
 #[cfg(unix)]
-use crate::sandbox::{PROCESS_GROUP_DRAIN_BUDGET, await_drained_process_group};
+use crate::sandbox::{
+    PROCESS_GROUP_DRAIN_BUDGET, await_drained_process_group, kill_process_group_if_live,
+};
 
 use super::settings::HookTrust;
 
@@ -555,7 +557,11 @@ async fn run_hook_with_policy_and_limits(
             // that deliberately closed their inherited pipes before outliving
             // the hook, and wait for them to go: a hook that reports completion
             // while one of its children is still runnable has not finished.
-            tree.terminate().await;
+            //
+            // The leader's pid no longer pins its pgid, so only signal the
+            // group while a descendant still holds it (mini-agent-7xrej.1).
+            guard.mark_leader_reaped();
+            tree.terminate_after_reap().await;
             #[cfg(unix)]
             if let Some(pid) = pid {
                 await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
@@ -569,7 +575,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Finished(Ok(Err(error))) => {
-            terminate_and_reap(&mut child, &tree).await;
+            terminate_and_reap(&mut child, &tree, &mut guard).await;
             guard.disarm();
             let status = match error {
                 RunError::OutputLimit(limit) => HookStatus::OutputLimitExceeded(limit),
@@ -590,7 +596,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Finished(Err(_)) => {
-            terminate_and_reap(&mut child, &tree).await;
+            terminate_and_reap(&mut child, &tree, &mut guard).await;
             guard.disarm();
             policy.classify_spawned_output(output_from_capture(
                 &captured,
@@ -600,7 +606,7 @@ async fn run_hook_with_policy_and_limits(
             ))
         }
         RunOutcome::Cancelled => {
-            terminate_and_reap(&mut child, &tree).await;
+            terminate_and_reap(&mut child, &tree, &mut guard).await;
             guard.disarm();
             output_from_capture(&captured, None, HookStatus::Failed, policy.diagnostics())
         }
@@ -656,13 +662,37 @@ impl HookTree<'_> {
             terminate_process_group(pid).await;
         }
     }
+
+    /// Terminates the tree after its leader has been reaped. A Unix pgid is
+    /// then only pinned by surviving descendants, so it is signalled only
+    /// while the group is still live; an empty group's number may already
+    /// belong to an unrelated process. The Windows arms are unchanged: the
+    /// trusted Job is handle-based and the helper path is pid-handle-backed.
+    async fn terminate_after_reap(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            kill_process_group_if_live(pid);
+        }
+        #[cfg(not(unix))]
+        self.terminate().await;
+    }
 }
 
-async fn terminate_and_reap(child: &mut Child, tree: &HookTree<'_>) {
-    tree.terminate().await;
+async fn terminate_and_reap(child: &mut Child, tree: &HookTree<'_>, guard: &mut ProcessGroupGuard) {
+    // A wait that completed before a reader failed, or this probe itself,
+    // may already have reaped the leader; then take the post-reap path.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        guard.mark_leader_reaped();
+        tree.terminate_after_reap().await;
+    } else {
+        tree.terminate().await;
+    }
     let _ = child.start_kill();
-    if let Err(error) = child.wait().await {
-        tracing::warn!("hooks: failed to reap terminated hook subprocess: {error}");
+    match child.wait().await {
+        Ok(_) => guard.mark_leader_reaped(),
+        Err(error) => {
+            tracing::warn!("hooks: failed to reap terminated hook subprocess: {error}")
+        }
     }
     // Signalling a group is not the same as the group being gone. Returning
     // here reports a settled hook while a descendant is still runnable, which
