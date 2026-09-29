@@ -1480,6 +1480,15 @@ fn listen_on_callback_listener(
         }
         match listener.accept() {
             Ok((mut stream, _addr)) => {
+                // BSD-derived kernels (macOS) hand out accepted sockets that
+                // inherit the listener's O_NONBLOCK. Reading such a stream
+                // before the browser has sent its request line fails with
+                // WouldBlock, which the branch below would misread as an
+                // unrelated callback and answer with 400, silently dropping
+                // the real redirect. Block with a bounded read timeout instead.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    tracing::warn!("oauth: could not make the redirect stream blocking: {error}");
+                }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 stream
                     .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
@@ -1592,15 +1601,36 @@ fn denied_callback(request_line: &str, expected_state: &str) -> Option<Authoriza
     Some(AuthorizationDenied(message))
 }
 
+/// Maximum bytes accepted while looking for the end of the redirect request
+/// line. A legitimate `GET /callback?code=...&state=... HTTP/1.1` line is far
+/// shorter; anything longer is rejected as unrelated.
+const MAX_REDIRECT_REQUEST_LINE_BYTES: usize = 4096;
+
 fn read_request_line(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
-    let mut buf = [0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .map_err(|e| anyhow::anyhow!("read redirect request failed: {e}"))?;
-    let text = String::from_utf8_lossy(&buf[..n]);
+    // A browser may deliver the request line in more than one segment, so keep
+    // reading until a line terminator (or EOF) arrives, bounded in size.
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| anyhow::anyhow!("read redirect request failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.contains(&b'\n') {
+            break;
+        }
+        if buf.len() >= MAX_REDIRECT_REQUEST_LINE_BYTES {
+            anyhow::bail!("redirect request line exceeds {MAX_REDIRECT_REQUEST_LINE_BYTES} bytes");
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
     let first = text
         .lines()
         .next()
+        .filter(|line| !line.is_empty())
         .ok_or_else(|| anyhow::anyhow!("empty redirect request"))?;
     Ok(first.to_string())
 }
@@ -1770,5 +1800,60 @@ mod product_identity_tests {
         let captured = listener.join().unwrap().unwrap();
         assert_eq!(captured.code, "right");
         assert_eq!(captured.state, "expected");
+    }
+
+    /// A browser connects first and sends its request line a little later. On
+    /// macOS the accepted socket inherits the listener's non-blocking flag, so
+    /// an eager read used to fail with `WouldBlock`, answer 400 and drop the
+    /// real redirect. The listener must wait for the bytes instead.
+    #[test]
+    fn callback_listener_waits_for_a_slow_client_to_send_its_redirect() {
+        let callback_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = callback_listener.local_addr().unwrap().port();
+
+        let listener = std::thread::spawn(move || {
+            super::listen_on_callback_listener(
+                callback_listener,
+                Duration::from_secs(5),
+                "expected",
+            )
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Give the listener's accept poll (100 ms) time to pick up the
+        // connection before any request bytes exist.
+        std::thread::sleep(Duration::from_millis(400));
+        // Split the request line so the listener also has to reassemble it.
+        stream.write_all(b"GET /callback?code=slow&st").unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream
+            .write_all(b"ate=expected HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+
+        let captured = listener.join().unwrap().unwrap();
+        assert_eq!(captured.code, "slow");
+        assert_eq!(captured.state, "expected");
+    }
+
+    #[test]
+    fn read_request_line_rejects_an_unterminated_oversized_request() {
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let junk = vec![b'a'; super::MAX_REDIRECT_REQUEST_LINE_BYTES + 64];
+            stream.write_all(&junk).unwrap();
+            stream.flush().unwrap();
+            stream
+        });
+        let (mut accepted, _) = server.accept().unwrap();
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let error = super::read_request_line(&mut accepted).unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        drop(client.join().unwrap());
     }
 }

@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
+  socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
+  answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded
+  read timeout and reassembles a split request line.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but
