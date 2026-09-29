@@ -70,13 +70,23 @@ pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
 
 /// A picker entry made safe to write to the terminal: file names, gateway
 /// model ids and history entries are untrusted, so every control character
-/// (ESC, CR, LF, ...) is shown as U+FFFD instead of reaching the terminal.
-/// Only the drawn text changes; accepting an entry inserts it unchanged.
+/// (ESC, CR, LF, ...) and every bidi or zero-width format character that
+/// could reorder or hide part of the name (see
+/// [`is_deceptive_format_char`](crate::ui::events::is_deceptive_format_char))
+/// is shown as U+FFFD instead of reaching the terminal. Only the drawn text
+/// changes; accepting an entry inserts it unchanged.
 pub(crate) fn display_safe(entry: &str) -> std::borrow::Cow<'_, str> {
-    if entry.chars().any(char::is_control) {
+    use crate::ui::events::needs_terminal_sanitizing;
+    if entry.chars().any(needs_terminal_sanitizing) {
         entry
             .chars()
-            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .map(|c| {
+                if needs_terminal_sanitizing(c) {
+                    '\u{fffd}'
+                } else {
+                    c
+                }
+            })
             .collect::<String>()
             .into()
     } else {

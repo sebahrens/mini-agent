@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::event::UserEvent;
 use crate::permission::checker::PromptGrantOffer;
-use crate::ui::events::sanitize_output;
+use crate::ui::events::sanitize_for_review;
 use crate::ui::renderer::Renderer;
 use crate::ui::state::{AgentRunState, UiContext};
 use crate::ui::utils::suggest_pattern;
@@ -140,7 +140,7 @@ async fn read_prompt_input(
     deferred_user_events: &mut VecDeque<UserEvent>,
     accept: impl Fn(PromptInput) -> bool,
 ) -> anyhow::Result<PromptInput> {
-    let header = sanitize_output(header);
+    let header = sanitize_for_review(header);
     let was_at_bottom = !renderer.is_scrolling();
     renderer.write_line(&header, C_PERM)?;
     renderer.write_line(options, C_PERM)?;
@@ -276,7 +276,7 @@ pub async fn handle_permission_request(
     let header = format!(
         "[permission] {}: {}",
         ask_req.tool,
-        sanitize_output(&ask_req.input)
+        sanitize_for_review(&ask_req.input)
     );
     let options = permission_options(folder.as_deref());
     let has_folder = folder.is_some();

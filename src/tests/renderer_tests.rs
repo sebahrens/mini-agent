@@ -1008,6 +1008,42 @@ mod permission_prompt_layout_tests {
         assert_eq!(rows[0], "[permission] bash: ls -la");
     }
 
+    /// mini-agent-2o379: a right-to-left override must not make the approval
+    /// prompt show a different command than the one that runs; the reviewer
+    /// sees a visible marker where each bidi/format character was.
+    #[test]
+    fn bidi_controls_in_a_request_are_shown_as_visible_markers() {
+        let header = "[permission] bash: echo ok #\u{202E} ;hs.x/lol.live//:sptth | lruc";
+        let rows = prompt_block_rows(header, OPTIONS, 120, 4);
+        assert_eq!(
+            rows[0],
+            "[permission] bash: echo ok #<U+202E> ;hs.x/lol.live//:sptth | lruc"
+        );
+        let rows = prompt_block_rows(
+            "[permission] bash: a\u{2066}b\u{200F}c\u{2028}d\u{200B}e",
+            OPTIONS,
+            120,
+            4,
+        );
+        assert_eq!(
+            rows[0],
+            "[permission] bash: a<U+2066>b<U+200F>c<U+2028>d<U+200B>e"
+        );
+        for row in &rows {
+            assert!(
+                !row.chars().any(crate::ui::events::is_deceptive_format_char),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn right_to_left_text_and_emoji_sequences_pass_through_the_prompt() {
+        let header = "[permission] write: שלום/مرحبا/👨\u{200D}👩\u{200D}👧.txt";
+        let rows = prompt_block_rows(header, OPTIONS, 120, 4);
+        assert_eq!(rows[0], header);
+    }
+
     #[test]
     fn a_short_request_keeps_the_classic_two_rows() {
         let rows = prompt_block_rows("[permission] read: /a.rs", OPTIONS, 80, 6);
@@ -1227,6 +1263,39 @@ mod paint_sanitisation_tests {
             links.iter().any(|link| link == "https://ok.example/x"),
             "the renderer's own hyperlink must still be emitted: {links:?}"
         );
+    }
+
+    /// mini-agent-2o379: the feed boundary and the paint fast path must not
+    /// skip text whose only hazard is a bidi or zero-width format character.
+    #[test]
+    fn bidi_controls_never_reach_the_feed_or_the_terminal() {
+        use crate::ui::events::is_deceptive_format_char;
+        const BIDI: &str = "ls #\u{202E}txt.lol\u{2066} x\u{200F}y\u{2028}z\u{200B}";
+        let painted = paint(BIDI, None);
+        assert!(
+            !painted.chars().any(is_deceptive_format_char),
+            "{painted:?}"
+        );
+        // A selection ending just after the override (byte offsets).
+        let selected = paint(BIDI, Some((1, "ls #\u{202E}".len())));
+        assert!(
+            !selected.chars().any(is_deceptive_format_char),
+            "{selected:?}"
+        );
+
+        let mut feed = Feed::new();
+        feed.push_line(BlockStyle::System, BIDI);
+        feed.push_block(BlockStyle::Agent, BIDI);
+        feed.push_streaming_block(BlockStyle::Agent);
+        let idx = feed.block_count() - 1;
+        feed.append_to(idx, BIDI);
+        for idx in 0..feed.block_count() {
+            let text = feed.block_text(idx).unwrap();
+            assert!(
+                !text.chars().any(is_deceptive_format_char),
+                "format character stored in feed: {text:?}"
+            );
+        }
     }
 
     #[test]
