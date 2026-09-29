@@ -2293,7 +2293,9 @@ Each server tracks at most 128 synchronized documents, retaining the identity
 of the authorized read handle for each. At the limit, a new document evicts
 the least recently synchronized one: the server receives `textDocument/didClose`
 for it before the new `didOpen`, and its cached diagnostics are dropped. A later
-change to an evicted file reopens it. A reply
+change to an evicted file reopens it. Requests a server sends to the client are
+answered with their exact id (number or string): `workspace/configuration`
+receives one `null` per requested item, every other request `null`. A reply
 is rejected if the source has been replaced since synchronization, including
 when its protocol version matches. Accepted cache entries share the synchronized
 identity, so a replacement racing cache insertion also invalidates the result.

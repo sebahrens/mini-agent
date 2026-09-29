@@ -484,23 +484,24 @@ impl LspClient {
                     };
                     let method = msg.get("method").and_then(Value::as_str);
                     let id = msg.get("id").and_then(Value::as_i64);
-                    match (method, id) {
-                        // Server→client request: reply null, we declare no
-                        // capabilities that would legitimately trigger one.
-                        (Some(_), Some(id)) => {
-                            let reply = json!({"jsonrpc": "2.0", "id": id, "result": Value::Null});
-                            let body = serde_json::to_vec(&reply).unwrap_or_default();
-                            if !write_owned_frame_with_deadline(
-                                &stdin,
-                                &transport,
-                                &body,
-                                transport.write_timeout(),
-                            )
-                            .await
-                            {
-                                break;
-                            }
+                    if let Some(reply) = server_request_reply(&msg) {
+                        // Server→client request (numeric or string id).
+                        let body = serde_json::to_vec(&reply).unwrap_or_default();
+                        if !write_owned_frame_with_deadline(
+                            &stdin,
+                            &transport,
+                            &body,
+                            transport.write_timeout(),
+                        )
+                        .await
+                        {
+                            break;
                         }
+                        continue;
+                    }
+                    match (method, id) {
+                        // Requests were answered above.
+                        (Some(_), Some(_)) => {}
                         // Server→client notification.
                         (Some(m), None) => {
                             if m == "textDocument/publishDiagnostics"
@@ -1003,6 +1004,35 @@ fn take_pipe<T>(pipe: &mut Option<T>, kind: &str, name: &str) -> Option<T> {
         tracing::debug!("lsp[{name}]: child did not provide piped {kind}");
         None
     })
+}
+
+/// Most `workspace/configuration` items answered in one reply.
+const MAX_CONFIGURATION_ITEMS: usize = 1024;
+
+/// The reply to a server→client request, or `None` when `msg` is not one.
+///
+/// The id is echoed exactly as sent (JSON-RPC allows numbers and strings).
+/// `workspace/configuration` must answer with one entry per requested item;
+/// every other request gets `null`, since this client declares no
+/// capabilities that would legitimately trigger one.
+fn server_request_reply(msg: &Value) -> Option<Value> {
+    let method = msg.get("method")?.as_str()?;
+    let id = msg.get("id")?;
+    if !(id.is_number() || id.is_string()) {
+        return None;
+    }
+    let result = if method == "workspace/configuration" {
+        let items = msg
+            .get("params")
+            .and_then(|params| params.get("items"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            .min(MAX_CONFIGURATION_ITEMS);
+        Value::Array(vec![Value::Null; items])
+    } else {
+        Value::Null
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 struct PendingRequest {
@@ -1618,6 +1648,30 @@ fn language_id(path: &Path) -> &'static str {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn server_requests_are_answered_with_their_exact_id() {
+        let string_id = server_request_reply(&json!({
+            "jsonrpc": "2.0", "id": "req-7", "method": "window/workDoneProgress/create",
+            "params": {"token": "t"}
+        }))
+        .expect("a string-id request must be answered");
+        assert_eq!(string_id["id"], "req-7");
+        assert_eq!(string_id["result"], Value::Null);
+
+        let configuration = server_request_reply(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "workspace/configuration",
+            "params": {"items": [{"section": "a"}, {"section": "b"}, {}]}
+        }))
+        .unwrap();
+        assert_eq!(configuration["id"], 3);
+        assert_eq!(configuration["result"], json!([null, null, null]));
+
+        // Notifications and responses are not requests.
+        assert!(server_request_reply(&json!({"method": "window/logMessage"})).is_none());
+        assert!(server_request_reply(&json!({"id": 1, "result": {}})).is_none());
+        assert!(server_request_reply(&json!({"id": null, "method": "x"})).is_none());
+    }
 
     #[tokio::test]
     async fn document_reads_stop_at_the_sync_limit_before_allocating_the_full_input() {
