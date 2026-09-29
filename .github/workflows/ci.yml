@@ -212,8 +212,12 @@ jobs:
           python3 -m unittest scripts.tests.test_check_workspace_boundaries
           python3 scripts/check_workspace_boundaries.py
 
+  # Runs on pushes as well as pull requests: work lands directly on main, so a
+  # pull-request-only gate left the eval and the Gym smoke unexercised for
+  # weeks (mini-agent-5casv). Only a documentation-only change or the Windows
+  # sandbox dispatch scope skips it; neither step reads pull-request context.
   harness-regression:
-    if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
     runs-on: ubuntu-latest
     steps:
@@ -223,7 +227,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       # The deterministic five-task suite uses scripted providers and bounded
-      # per-fixture turn/tool/token budgets, so it is cheap enough to gate PRs.
+      # per-fixture turn/tool/token budgets, so it is cheap enough to gate
+      # every push and pull request.
       - name: Run bounded deterministic harness evaluation
         run: |
           cargo test --locked harness_regression_eval -- --ignored --nocapture
@@ -2347,7 +2352,7 @@ jobs:
   # workflow's verify-ci job both key on this job name, so it needs every other
   # job in this workflow and runs even when one of them failed. It passes only
   # when each dependency succeeded or was skipped by design (a
-  # documentation-only change, or a pull-request-only job on another event);
+  # documentation-only change);
   # scripts/ci_success.py owns that decision and its tests. Adding a job to this
   # workflow without adding it here fails scripts.tests.test_phase6_ci_workflow.
   ci-success:

@@ -764,8 +764,6 @@ class CiSuccessPolicyTests(unittest.TestCase):
         default = "success" if code == "true" else "skipped"
         for job in ("test", "clippy", "windows-msi", "harness-regression"):
             jobs[job] = {"result": default, "outputs": {}}
-        if code == "true":
-            jobs["harness-regression"]["result"] = "skipped"
         for job, result in results.items():
             jobs.setdefault(job.replace("_", "-"), {"outputs": {}})["result"] = result
         return jobs
@@ -776,11 +774,9 @@ class CiSuccessPolicyTests(unittest.TestCase):
         return ci_success.evaluate(needs, event)
 
     def test_full_matrix_success_passes(self) -> None:
-        self.assertEqual([], self.evaluate(self.needs("true")))
-        self.assertEqual(
-            [],
-            self.evaluate(self.needs("true", harness_regression="success"), "pull_request"),
-        )
+        for event in ("push", "pull_request", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertEqual([], self.evaluate(self.needs("true"), event))
 
     def test_documentation_only_change_accepts_skipped_matrix(self) -> None:
         self.assertEqual([], self.evaluate(self.needs("false")))
@@ -790,9 +786,19 @@ class CiSuccessPolicyTests(unittest.TestCase):
         errors = self.evaluate(self.needs("true", test="skipped"))
         self.assertEqual(["test finished with 'skipped'"], errors)
 
-    def test_pull_request_only_job_must_run_on_pull_requests(self) -> None:
-        errors = self.evaluate(self.needs("true"), "pull_request")
-        self.assertEqual(["harness-regression finished with 'skipped'"], errors)
+    def test_harness_regression_must_run_whenever_code_changed(self) -> None:
+        # harness-regression (the deterministic eval and the only Gym
+        # entrypoint smoke) runs on every event, so skipping it on a push is
+        # a failure rather than a by-design skip (mini-agent-5casv).
+        for event in ("push", "pull_request", "workflow_dispatch"):
+            with self.subTest(event=event):
+                errors = self.evaluate(
+                    self.needs("true", harness_regression="skipped"), event
+                )
+                self.assertEqual(["harness-regression finished with 'skipped'"], errors)
+        self.assertEqual(
+            [], self.evaluate(self.needs("false", harness_regression="skipped"), "push")
+        )
 
     def test_failed_or_cancelled_jobs_fail_even_for_documentation(self) -> None:
         for result in ("failure", "cancelled"):

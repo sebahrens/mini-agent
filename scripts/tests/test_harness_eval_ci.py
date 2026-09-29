@@ -21,7 +21,27 @@ class HarnessEvalCiTests(unittest.TestCase):
         job = workflow.split("  harness-regression:", 1)[1].split(
             "\n  package-compliance-smoke:", 1
         )[0]
-        self.assertIn("github.event_name == 'pull_request'", job)
+        condition = job.splitlines()[1].strip()
+        self.assertTrue(condition.startswith("if: "), condition)
+        # Work lands directly on main, so a pull-request-only gate never ran
+        # (mini-agent-5casv). The job must run for pull requests and pushes
+        # alike, skipping only documentation-only changes and the Windows
+        # sandbox dispatch scope.
+        self.assertNotIn("== 'pull_request'", condition)
+        self.assertNotIn("== 'push'", condition)
+        self.assertNotIn("!= 'push'", condition)
+        self.assertNotIn("!= 'pull_request'", condition)
+        self.assertIn("needs.changes.outputs.code == 'true'", condition)
+        self.assertIn("inputs.scope != 'windows-general-sandbox'", condition)
+        self.assertIn("needs: changes", job)
+        # The deterministic eval and the Gym smoke both live in this job, and
+        # neither may depend on pull-request-only context.
+        self.assertIn("name: Smoke the Gym entrypoints", job)
+        self.assertIn("--install-learned-skill-seeds", job)
+        self.assertIn("bash -n scripts/gym/setup.sh", job)
+        self.assertNotIn("github.event.pull_request", job)
+        self.assertNotIn("github.base_ref", job)
+        self.assertNotIn("github.head_ref", job)
         self.assertIn("cargo test --locked harness_regression_eval", job)
         self.assertIn("--ignored --nocapture", job)
         self.assertIn("task_json_library_axis_uses_real_store_and_records_oracles", job)

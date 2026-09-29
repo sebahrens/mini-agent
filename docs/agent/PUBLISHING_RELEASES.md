@@ -169,9 +169,9 @@ A release is built and published only from a commit CI has passed:
 
 - `.github/workflows/ci.yml` ends with the `ci-success` aggregate job. It needs every other CI job,
   runs even when one of them failed, and passes only when each dependency succeeded or was skipped
-  by design: a documentation-only change skips the build, lint, and test jobs, and
-  `harness-regression` runs on pull requests only. When code changed, every other job must
-  succeed; `failure` and `cancelled` are never accepted. `scripts/ci_success.py` owns that decision.
+  by design: a documentation-only change skips the build, lint, and test jobs. When code changed,
+  every other job must succeed on every event (including `harness-regression`, which runs on pushes
+  as well as pull requests); `failure` and `cancelled` are never accepted. `scripts/ci_success.py` owns that decision.
   Adding a CI job without adding it to `ci-success` fails the workflow policy tests.
 - The release workflow's first job, `verify-ci`, runs before any build. It fails unless the tagged
   commit is an ancestor of `origin/main`, then waits (up to 150 minutes, polling every 30 seconds)
