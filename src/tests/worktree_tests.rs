@@ -4485,12 +4485,14 @@ wait
         assert!(!git_stdout(repo.path(), ["stash", "list"]).is_empty());
     }
 
+    /// One timed-out checkout attempt. Returns whether the post-checkout hook
+    /// had started, i.e. whether the switch deadline fired during the hook
+    /// rather than inside Git's own checkout.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn timed_out_post_checkout_hook_restores_branch_before_stash_pop() {
+    async fn timed_out_post_checkout_attempt(attempt: usize, deadline: Duration) -> bool {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("timed checkout hook");
+        let repo = TempRepo::new(&format!("timed checkout hook {attempt}"));
         let remote = repo.path().with_extension("timed checkout bare remote");
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, ["init", "--bare"]);
@@ -4507,8 +4509,27 @@ wait
         git(repo.path(), ["branch", "feature"]);
         git(repo.path(), ["branch", "target"]);
         std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        // Each hook run appends the HEAD Git just checked out, using only
+        // shell builtins so the record is written as soon as the hook starts.
+        // The rollback switch back to `main` runs the hook too, so only a
+        // `target` record proves the timed switch itself reached its hook;
+        // only that run then outlives every deadline.
+        let quote =
+            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let hook_log = repo.path().with_extension("post-checkout log");
         let hook = repo.path().join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r head < {head}\n\
+                 printf '%s\\n' \"$head\" >> {log}\n\
+                 case \"$head\" in 'ref: refs/heads/target') exec sleep 30 ;; esac\n",
+                head = quote(&repo.path().join(".git/HEAD")),
+                log = quote(&hook_log),
+            ),
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&hook, permissions).unwrap();
@@ -4518,22 +4539,67 @@ wait
             main_repo_path: repo.path().to_path_buf(),
         };
 
-        let (_state, outcome) = try_merge_with_switch_limits_for_test(
-            &info,
-            "target",
-            test_limits(Duration::from_millis(100)),
-        )
-        .await;
+        let (_state, outcome) =
+            try_merge_with_switch_limits_for_test(&info, "target", test_limits(deadline)).await;
 
+        let MergeOutcome::Error(error) = outcome else {
+            panic!("a timed-out checkout must fail the merge");
+        };
         assert!(
-            matches!(outcome, MergeOutcome::Error(error) if error.contains("checkout failed") && error.contains("timed out"))
+            error.contains("checkout failed") && error.contains("timed out"),
+            "{error}"
         );
+        // The branch is restored before any stash pop in every case.
         assert_eq!(current_branch(repo.path()).await.as_deref(), Some("main"));
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
-            "dirty\n"
+        let hook_runs = std::fs::read_to_string(&hook_log).unwrap_or_default();
+        if hook_runs
+            .lines()
+            .any(|head| head == "ref: refs/heads/target")
+        {
+            // Git ran post-checkout only after finishing the checkout and
+            // releasing the index lock, so rollback succeeds and the
+            // stashed change comes back.
+            assert_eq!(
+                std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+                "dirty\n",
+                "{error}"
+            );
+            let stash = git_stdout(repo.path(), ["stash", "list"]);
+            assert!(stash.is_empty(), "{error}; stash {stash:?}");
+            return true;
+        }
+        // Under load the deadline can fire inside Git's own checkout, which
+        // may leave its index lock behind. The merge must then keep the stash
+        // rather than pop it onto an unverified tree, or pop it after a clean
+        // rollback; it must never lose the change.
+        let stash = git_stdout(repo.path(), ["stash", "list"]);
+        let tracked = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
+        assert!(
+            (stash.is_empty() && tracked == "dirty\n")
+                || (!stash.is_empty() && error.contains("rollback failed")),
+            "change lost after an early timeout: {error}; stash {stash:?}; tracked {tracked:?}"
         );
-        assert!(git_stdout(repo.path(), ["stash", "list"]).is_empty());
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_post_checkout_hook_restores_branch_before_stash_pop() {
+        // The hook for the timed switch never finishes, but on a loaded host
+        // Git itself can take longer than a short deadline before it runs the
+        // hook. Such an attempt tests a different (still checked) path, so
+        // retry with a fresh repository and a doubled deadline until the
+        // deadline lands inside the hook: 100 ms normally, 12.8 s at most.
+        const ATTEMPTS: u32 = 8;
+        for attempt in 0..ATTEMPTS {
+            let deadline = Duration::from_millis(100) * 2u32.pow(attempt);
+            if timed_out_post_checkout_attempt(attempt as usize, deadline).await {
+                return;
+            }
+        }
+        panic!(
+            "the switch deadline never fired inside the post-checkout hook in {ATTEMPTS} attempts"
+        );
     }
 
     #[test]
