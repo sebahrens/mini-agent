@@ -2227,7 +2227,8 @@ async fn run_headless_goal_rounds(
                     };
                     driver::Verification {
                         checks,
-                        judge: judged,
+                        judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                        judge: judged.map(|call| call.outcome),
                         ..driver::Verification::default()
                     }
                 })

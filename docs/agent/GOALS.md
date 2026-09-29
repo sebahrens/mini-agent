@@ -84,10 +84,14 @@ session's own model in a fresh context. That last fallback means a single-model 
 second opinion from something that did not just do the work — weaker than a distinct model, and
 `/goal status` labels it as such. `[goal] judge = "off"` turns the tier off.
 
-The judge gets no tools and no workspace: only the objective and a bounded tail of the conversation,
-fenced as untrusted data. If it cannot be reached, the goal keeps working rather than completing or
-ending; three consecutive failures on completion claims park the goal so an outage cannot pass for
-verification.
+The judge gets no tools and no workspace: only the objective, a bounded tail of the conversation, and
+the result of any checks the harness ran that round, all fenced as untrusted data. If it cannot be
+reached, the goal keeps working rather than completing or ending; three consecutive failures on
+completion claims park the goal so an outage cannot pass for verification.
+
+The judge's tokens are the goal's tokens: `/goal status`, the headless `goal` object and the
+`max_tokens` bound count them alongside the agent's, whichever provider the judge is on. The
+session's own cost counters do not yet include them.
 
 ## Statuses
 

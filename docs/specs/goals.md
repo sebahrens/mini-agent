@@ -210,6 +210,14 @@ long the agent worked, not how long the user took to answer. Every surface measu
 terminal around its own prompt, an editor by subtracting what the client spent deciding, and a
 headless run by the round's wall clock, since nothing there can prompt.
 
+`max_tokens` and the goal's token total count the whole round: the agent's usage, including any
+mid-round reminder it was sent, plus the judge call that adjudicated it. A judge is counted in input
+plus output tokens as its provider reported them for the call that returned an answer, parseable or
+not, on whichever provider it runs. A call that failed, was interrupted, or was retried away before a
+final response reported nothing and adds nothing. Tokens, not cost, are what the bound measures, so a
+judge on a cheaper model counts the same per token. The session's cost counters do not include judge
+calls.
+
 The wrap-up round runs on an agent capped to `wrap_up_max_agent_turns`, so the bound the harness
 announces is the bound the round gets. It is issued once per exhaustion and re-armed by resuming or
 raising a bound.

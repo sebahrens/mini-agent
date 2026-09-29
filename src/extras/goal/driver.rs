@@ -767,6 +767,9 @@ pub struct Verification {
     pub request: Option<super::gate::VerifyRequest>,
     pub checks: Option<super::gate::CheckOutcome>,
     pub judge: Option<super::gate::JudgeOutcome>,
+    /// Tokens the judge call spent. They count toward the goal's token total
+    /// and its `max_tokens` bound like the agent's own.
+    pub judge_tokens: u64,
     /// The operator stopped the work while the tiers were running.
     ///
     /// That is not a verdict on the claim — a cancelled check has proved
@@ -885,6 +888,9 @@ where
                 summary.end = super::gate::RoundEnd::Cancelled;
                 (super::gate::gate_interrupted(), Verification::default())
             } else {
+                summary.tokens_used = summary
+                    .tokens_used
+                    .saturating_add(verification.judge_tokens);
                 let decision = super::gate::gate_post(
                     &goal,
                     &summary,
@@ -1142,6 +1148,41 @@ mod settle_tests {
             }
             other => panic!("expected a stop, got {other:?}"),
         }
+    }
+
+    /// The judge's tokens are the goal's tokens: they count in the total and
+    /// against `max_tokens` (mini-agent-9ztz6).
+    #[tokio::test]
+    async fn judge_tokens_count_toward_the_goal_total_and_its_budget() {
+        let _paths = isolated_paths();
+        let store = GoalStore::default();
+        let mut goal = Goal::new("finish the job", Vec::new()).unwrap();
+        goal.judge = JudgePolicy::Session;
+        goal.bounds.max_tokens = Some(1_000);
+        store.set(goal, false).unwrap();
+        report(&store, ReportStatus::Met);
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            tokens_used: 300,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        let outcome = settle_round(&store, summary, |_request| async {
+            Verification {
+                judge: Some(crate::extras::goal::gate::JudgeOutcome::Verdict {
+                    outcome: crate::extras::goal::Outcome::NotYet,
+                    reason: "the tests are missing".into(),
+                }),
+                judge_tokens: 800,
+                ..Verification::default()
+            }
+        })
+        .await;
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.progress.tokens_used, 1_100, "agent 300 plus judge 800");
+        // The judge's share exhausted the budget, so the rejection does not
+        // buy an ordinary further round: the bounded wrap-up is issued.
+        assert!(goal.progress.wrap_up_issued, "{outcome:?}");
     }
 
     #[tokio::test]

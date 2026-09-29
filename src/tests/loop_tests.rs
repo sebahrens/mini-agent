@@ -274,6 +274,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
             verified: vec![crate::extras::goal::VerificationKind::Checks],
         }),
         judge: None,
+        judge_tokens: 0,
         interrupted: false,
     };
     assert!(

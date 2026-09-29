@@ -649,7 +649,8 @@ async fn start_goal_verification(
                 crate::event::GoalVerificationEvent {
                     operation_id,
                     checks,
-                    judge: judged,
+                    judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                    judge: judged.map(|call| call.outcome),
                     interrupted,
                 },
             )))
@@ -694,6 +695,10 @@ pub(crate) async fn handle_goal_verification_event(
         return Ok(false);
     };
     run.is_running = false;
+    // The judge's tokens are part of the round's cost, so the goal's token
+    // total and its budget see them before the gate decides.
+    let mut summary = pending.summary;
+    summary.tokens_used = summary.tokens_used.saturating_add(event.judge_tokens);
     let decision = {
         let Some(goal) = ui.session.goal_store.snapshot() else {
             return Ok(false);
@@ -722,7 +727,7 @@ pub(crate) async fn handle_goal_verification_event(
         } else {
             crate::extras::goal::gate::gate_post(
                 &goal,
-                &pending.summary,
+                &summary,
                 &pending.request,
                 event.checks.as_ref(),
                 event.judge.as_ref(),
@@ -733,12 +738,13 @@ pub(crate) async fn handle_goal_verification_event(
         renderer,
         run,
         ui,
-        pending.summary,
+        summary,
         decision,
         crate::extras::goal::driver::Verification {
             request: Some(pending.request),
             checks: event.checks,
             judge: event.judge,
+            judge_tokens: event.judge_tokens,
             interrupted: false,
         },
     ))

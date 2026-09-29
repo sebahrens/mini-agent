@@ -1428,6 +1428,52 @@ fn an_interrupt_during_the_judge_leaves_the_goal_active() {
     }
 }
 
+/// The judge's own tokens are counted in the goal's token total, next to the
+/// agent's (mini-agent-9ztz6).
+#[cfg(all(unix, feature = "goal"))]
+#[test]
+fn a_goal_counts_the_judges_tokens() {
+    let root = TempRoot::new();
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "tool_calls":[{"index":0, "id":"report-met", "type":"function", "function":{
+                    "name":"goal_report",
+                    "arguments": serde_json::json!({"status":"met", "evidence":"it shipped"}).to_string()
+                }}]}),
+                "tool_calls",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"done"}),
+                "stop",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"VERDICT: met\nREASON: it shipped"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut command = root.provider_command("read");
+    command.args(["--goal", "ship it", "-p", "start"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert_eq!(bodies.len(), 3, "{stderr}");
+    assert!(output.status.success(), "{stderr}");
+
+    let session = root.saved_session();
+    let goal = &session["goal_store"];
+    assert_eq!(goal["status"], "met", "{goal}");
+    // Each scripted completion reports 100 input and 20 output tokens: two
+    // for the agent's round and one for the judge.
+    assert_eq!(goal["progress"]["tokens_used"], 360, "{goal}");
+}
+
 /// `--no-session` leaves nothing of the run behind: no session file, and no
 /// goal round records for a session that was never saved (mini-agent-x0rcr).
 #[cfg(unix)]

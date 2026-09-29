@@ -501,6 +501,23 @@ pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
     Err("no VERDICT line and no JSON verdict object".to_string())
 }
 
+/// One judge call: what it answered and what it cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeCall {
+    pub outcome: JudgeOutcome,
+    /// Input plus output tokens the provider reported for the call that
+    /// produced an answer, whether or not that answer parsed. Zero when no
+    /// call completed or the provider reported no usage; attempts the retry
+    /// policy discarded before a final response report none.
+    pub tokens: u64,
+}
+
+impl JudgeCall {
+    fn unmetered(outcome: JudgeOutcome) -> Self {
+        Self { outcome, tokens: 0 }
+    }
+}
+
 /// Ask the judge.
 ///
 /// Failures fail open: the caller receives [`JudgeOutcome::Unavailable`] and the
@@ -514,11 +531,11 @@ pub async fn ask_with_transcript(
     transcript: &str,
     cfg: &crate::config::Config,
     checks: Option<&CheckOutcome>,
-) -> JudgeOutcome {
+) -> JudgeCall {
     if !request.run_judge {
-        return JudgeOutcome::Unavailable {
+        return JudgeCall::unmetered(JudgeOutcome::Unavailable {
             reason: "no judge configured".into(),
-        };
+        });
     }
 
     // A judge may be a `quick_models` entry on an entirely different provider.
@@ -542,9 +559,9 @@ pub async fn ask_with_transcript(
             }
             Err(error) => {
                 tracing::warn!(%error, provider = %resolved.provider, "goal: judge provider unavailable");
-                return JudgeOutcome::Unavailable {
+                return JudgeCall::unmetered(JudgeOutcome::Unavailable {
                     reason: format!("judge provider {} unavailable: {error}", resolved.provider),
-                };
+                });
             }
         }
     };
@@ -566,20 +583,23 @@ pub async fn ask_with_transcript(
         )
         .await
     {
-        Ok(raw) => match parse_verdict(&raw) {
-            Ok((outcome, reason)) => JudgeOutcome::Verdict { outcome, reason },
-            Err(error) => {
-                tracing::warn!(%error, "goal: judge verdict could not be parsed");
-                JudgeOutcome::Unavailable {
-                    reason: format!("verdict could not be parsed: {error}"),
+        Ok((raw, usage)) => JudgeCall {
+            outcome: match parse_verdict(&raw) {
+                Ok((outcome, reason)) => JudgeOutcome::Verdict { outcome, reason },
+                Err(error) => {
+                    tracing::warn!(%error, "goal: judge verdict could not be parsed");
+                    JudgeOutcome::Unavailable {
+                        reason: format!("verdict could not be parsed: {error}"),
+                    }
                 }
-            }
+            },
+            tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         },
         Err(error) => {
             tracing::warn!(%error, "goal: judge call failed");
-            JudgeOutcome::Unavailable {
+            JudgeCall::unmetered(JudgeOutcome::Unavailable {
                 reason: error.to_string(),
-            }
+            })
         }
     }
 }

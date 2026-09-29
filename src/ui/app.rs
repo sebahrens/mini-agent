@@ -3778,6 +3778,7 @@ mod input_reader_lifecycle_tests {
                         verified: Vec::new(),
                     }),
                     judge: None,
+                    judge_tokens: 0,
                     interrupted: false,
                 }))
             };
