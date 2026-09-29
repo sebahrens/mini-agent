@@ -482,8 +482,10 @@ struct HookRootClaims {
     active: StdMutex<HashMap<std::path::PathBuf, usize>>,
     /// Publishes the shared fallback root: `Some` for a single active
     /// workspace, `None` for several.
-    publish: Box<dyn Fn(Option<&Path>) + Send + Sync>,
+    publish: HookRootPublisher,
 }
+
+type HookRootPublisher = Box<dyn Fn(Option<&Path>) + Send + Sync>;
 
 impl Default for HookRootClaims {
     fn default() -> Self {
