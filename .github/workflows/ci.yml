@@ -39,9 +39,9 @@ jobs:
   #
   # A documentation-only commit used to trigger the whole matrix: 13 test rows
   # on two platforms, nine strict Clippy rows, the VS Code extension smoke, and
-  # the packaging smoke. None of that can be affected by editing Markdown, so
-  # the expensive jobs below take `needs: changes` and run only when a code
-  # path moved. `fmt` stays unconditional because it also runs the repository
+  # the packaging smoke. None of that can be affected by editing Markdown that
+  # nothing embeds or reads, so the expensive jobs below take `needs: changes`
+  # and run only when a code path (including embedded or test-read docs) moved. `fmt` stays unconditional because it also runs the repository
   # policy scripts, which guard workflow and documentation policy and finish in
   # seconds.
   #
@@ -102,7 +102,18 @@ jobs:
           echo "$changed" | sed 's/^/  /'
 
           # Anything outside this documentation set is treated as code.
-          if echo "$changed" | grep -qvE '^(docs/|\.beads/|[^/]*\.md$|LICENSE|editors/vscode/.*\.md$)'; then
+          docs_only='^(docs/|\.beads/|[^/]*\.md$|editors/vscode/.*\.md$)'
+          # Documentation that the binary embeds or tests read is code too, or a
+          # docs-only change could merge green and break the next code change:
+          # docs/agent/ and docs/vscode-acp-setup.md are embedded by src/docs.rs,
+          # docs/specs/ is include_str!'d and read by tests, docs/benchmarks/
+          # holds a test baseline, non-Markdown files under docs/ are data, and
+          # SOURCE.md and LICENSE ship in every release archive.
+          consumed_docs='^(docs/agent/|docs/specs/|docs/benchmarks/|docs/vscode-acp-setup\.md$|SOURCE\.md$|LICENSE)'
+          docs_data=$(echo "$changed" | grep -E '^docs/' | grep -vE '\.md$')
+          if echo "$changed" | grep -qvE "$docs_only" \
+            || echo "$changed" | grep -qE "$consumed_docs" \
+            || [ -n "$docs_data" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "Code paths changed; running the full matrix."
           else
@@ -139,6 +150,9 @@ jobs:
 
       - name: Test VS Code CI policy
         run: python3 -m unittest scripts.tests.test_vscode_ci_workflow
+
+      - name: Test CI documentation-only filter
+        run: python3 -m unittest scripts.tests.test_ci_docs_filter
 
       - name: Test release workflow policy
         run: |
