@@ -198,6 +198,7 @@ pub(crate) fn refresh_display(
     // the size the input is about to occupy (avoids a stale separator when the
     // input shrinks, or chat text hidden under it when the input grows).
     renderer.sync_input_height(&input.buffer)?;
+    input.set_wrap_width(renderer.input_wrap_width());
     renderer.set_activity(if run.is_running {
         crate::ui::terminal::AgentActivity::Working
     } else {
@@ -691,6 +692,10 @@ pub(crate) fn rewind_targets(session: &Session) -> Vec<(usize, String)> {
 }
 
 pub(crate) fn classify_submission(is_running: bool, text: &str) -> SubmitAction {
+    // Whitespace-only input is never a prompt: providers reject it.
+    if text.trim().is_empty() {
+        return SubmitAction::Ignore;
+    }
     // Idle, or a whitelisted parallel-safe command → let it through to its
     // handler. Everything else, while running, is gated.
     if !is_running || allowed_while_running(text) {

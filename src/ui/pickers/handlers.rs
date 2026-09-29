@@ -21,7 +21,7 @@ const BACKSPACE: KeyEvent = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE
 /// Replace the `@<query>` span that starts at byte offset `at` with
 /// `replacement` and return the byte cursor just after the inserted text.
 ///
-/// Every offset here is a byte offset: `at` comes from `str::rfind`, and
+/// Every offset here is a byte offset: `at` comes from [`mention_start`], and
 /// `query_len` is `picker.query.len()` (bytes). Slicing by chars with these
 /// values corrupted any buffer containing multi-byte text before the `@`.
 fn replace_at_span(
@@ -40,6 +40,20 @@ fn replace_at_span(
     at + replacement.len()
 }
 
+/// Byte offset of the `@` that opened the file picker. The picker mirrors its
+/// query into the buffer right before the caret, so the mention being
+/// completed is `@<query>` ending at `cursor`; searching the whole buffer for
+/// the last `@` would edit a later mention instead.
+fn mention_start(buffer: &str, cursor: usize, query: &str) -> Option<usize> {
+    let cursor = cursor.min(buffer.len());
+    let exact = cursor.checked_sub(query.len() + 1).filter(|&at| {
+        buffer
+            .get(at..cursor)
+            .is_some_and(|span| span.strip_prefix('@') == Some(query))
+    });
+    exact.or_else(|| buffer.get(..cursor)?.rfind('@'))
+}
+
 pub fn handle_file_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -55,7 +69,7 @@ pub fn handle_file_key(
                 *cursor = prev_char_boundary(buffer, *cursor);
                 buffer.remove(*cursor);
             } else {
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
@@ -93,7 +107,7 @@ pub fn handle_file_key(
                 buffer.remove(*cursor);
                 true
             } else {
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
@@ -116,7 +130,7 @@ pub fn handle_file_key(
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(path) = picker.selected_path() {
                 let path_str = path.to_string_lossy().to_string();
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, picker.query.len(), &path_str);
                 }
             }
@@ -124,7 +138,7 @@ pub fn handle_file_key(
             true
         }
         KeyCode::Esc => {
-            if let Some(at) = buffer.rfind('@') {
+            if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                 *cursor = replace_at_span(buffer, at, picker.query.len(), "");
             }
             picker.deactivate();
@@ -141,6 +155,8 @@ pub struct CommandPickerCtx<'a> {
     pub quick_model_names: &'a [String],
     pub live_model_names: &'a [String],
     pub provider_names: &'a [String],
+    /// The session's current model, marked in the `/model` picker.
+    pub current_model: Option<String>,
     /// The active security mode, or `None` when no permission system is
     /// running (then `/mode` has no picker and submits as text).
     pub security_mode: Option<crate::permission::SecurityMode>,
@@ -178,7 +194,9 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
     match command {
         "/prompt" => !ctx.prompt_names.is_empty(),
         "/agent" => !ctx.agent_names.is_empty(),
-        "/models" => !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty()),
+        "/model" | "/models" => {
+            !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty())
+        }
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
         "/queue" => true,
@@ -214,8 +232,13 @@ fn accept_command(
         if opens_sub_picker(&selected, ctx) {
             picker.deactivate();
             let sub = match selected.as_str() {
-                "/models" => {
-                    let mut mp = ModelsPicker::new();
+                "/model" | "/models" => {
+                    let prefix = if selected == "/model" {
+                        "/model "
+                    } else {
+                        "/models "
+                    };
+                    let mut mp = ModelsPicker::for_command(prefix, ctx.current_model.clone());
                     mp.set_groups(
                         ctx.quick_model_names.to_vec(),
                         ctx.live_model_names.to_vec(),
@@ -330,6 +353,10 @@ pub fn handle_command_key(
                     && buffer.as_str() == cmd
                     && !opens_sub_picker(cmd, ctx)
             });
+            // A hidden alias typed in full runs as typed, too.
+            let alias_in_full = buffer.strip_prefix('/') == Some(picker.query.as_str())
+                && super::list::is_command_alias(buffer.as_str());
+            let typed_in_full = typed_in_full || alias_in_full;
             if typed_in_full {
                 picker.deactivate();
                 return (false, None);
@@ -483,7 +510,7 @@ pub fn handle_models_key(
     picker: &mut ModelsPicker,
     key: KeyEvent,
 ) -> bool {
-    let prefix = "/models ";
+    let prefix = picker.prefix;
     let prefix_len = prefix.len();
     match key.code {
         KeyCode::Char(c)
