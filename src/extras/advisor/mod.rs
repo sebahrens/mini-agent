@@ -463,9 +463,12 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
         format!("[{role}]: {}", msg.content)
     }
 
-    // Collect head (oldest messages)
+    // Collect head (oldest messages). The oldest message is the task origin;
+    // when it alone exceeds the head budget it is kept head+tail truncated
+    // rather than dropped.
     let mut head_end = 0usize;
     let mut head_chars = 0usize;
+    let mut head_truncated = None;
     for (i, msg) in msgs.iter().enumerate() {
         let line = format_line(msg);
         let needed = if head_chars > 0 {
@@ -474,15 +477,23 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
             line.len()
         };
         if head_chars + needed > per_side {
+            if i == 0
+                && let Some(truncated) = truncate_middle(&line, per_side)
+            {
+                head_truncated = Some(truncated);
+                head_end = 1;
+            }
             break;
         }
         head_chars += needed;
         head_end = i + 1;
     }
 
-    // Collect tail (newest messages)
+    // Collect tail (newest messages). The newest message is the most relevant
+    // context; when it alone exceeds the tail budget it is kept truncated.
     let mut tail_start = msgs.len();
     let mut tail_chars = 0usize;
+    let mut tail_truncated = None;
     for (i, msg) in msgs.iter().enumerate().rev() {
         let line = format_line(msg);
         let needed = if tail_chars > 0 {
@@ -491,6 +502,12 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
             line.len()
         };
         if tail_chars + needed > per_side {
+            if i + 1 == msgs.len()
+                && let Some(truncated) = truncate_middle(&line, per_side)
+            {
+                tail_truncated = Some(truncated);
+                tail_start = i;
+            }
             break;
         }
         tail_chars += needed;
@@ -508,7 +525,10 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
         if i > 0 {
             result.push_str("\n\n");
         }
-        result.push_str(&format_line(msg));
+        match (&head_truncated, i) {
+            (Some(truncated), 0) => result.push_str(truncated),
+            _ => result.push_str(&format_line(msg)),
+        }
     }
 
     // Omission marker if there is a gap
@@ -524,10 +544,37 @@ pub(crate) fn format_conversation(msgs: &[SessionMessage], kilobytes_limit: u32)
         if i > tail_begin {
             result.push_str("\n\n");
         }
-        result.push_str(&format_line(msg));
+        match &tail_truncated {
+            Some(truncated) if i + 1 == msgs.len() => result.push_str(truncated),
+            _ => result.push_str(&format_line(msg)),
+        }
     }
 
     result
+}
+
+/// Keep the start and end of `line` within `budget` bytes, marking the
+/// omitted middle. `None` when the budget cannot hold the marker.
+fn truncate_middle(line: &str, budget: usize) -> Option<String> {
+    let marker = |omitted: usize| format!("\n[... {omitted} bytes omitted ...]\n");
+    let keep = budget.checked_sub(marker(line.len()).len())?;
+    if keep == 0 {
+        return None;
+    }
+    let mut head_end = keep / 2;
+    while !line.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = line.len() - (keep - keep / 2);
+    while !line.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    Some(format!(
+        "{}{}{}",
+        &line[..head_end],
+        marker(tail_start - head_end),
+        &line[tail_start..]
+    ))
 }
 
 async fn advisor_call<M>(

@@ -2197,7 +2197,10 @@ messages and completed tool results from the current request. It sees the same
 bounded tool output as the main model. Concurrent requests keep separate
 transcripts; each model call refreshes its snapshot from the current history.
 Images, audio, video, and documents appear as placeholders, and provider
-reasoning blocks are excluded from this text transcript.
+reasoning blocks are excluded from this text transcript. The context limit is
+split between the oldest and newest messages; if the oldest or the newest
+message alone exceeds its half, it is kept with its start and end and a marker
+for the omitted middle rather than dropped.
 
 Advisor model names use the same quick-model aliases at startup and in
 `/advisor model <name>`. An alias selects its configured provider and model;
