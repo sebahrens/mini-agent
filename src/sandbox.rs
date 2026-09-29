@@ -737,6 +737,7 @@ pub(crate) fn classify_bwrap_preflight_stderr(stderr: &[u8]) -> &'static str {
 /// Read at most `BWRAP_PROBE_STDERR_LIMIT` bytes already buffered on an exited probe's stderr
 /// pipe without blocking: a descendant that kept the pipe open cannot stall the caller.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(crate) fn read_exited_probe_stderr(stderr: Option<std::process::ChildStderr>) -> Vec<u8> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
