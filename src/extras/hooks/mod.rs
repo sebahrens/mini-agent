@@ -3,6 +3,7 @@ pub(crate) mod decorator;
 pub(crate) mod dispatcher;
 pub(crate) mod envelope;
 pub(crate) mod normalize;
+pub(crate) mod pins;
 pub(crate) mod settings;
 pub(crate) mod subprocess;
 pub(crate) mod trust;
@@ -171,6 +172,26 @@ pub(crate) fn init_dispatcher(dispatcher: dispatcher::HookDispatcher) {
 
 pub(crate) fn get_dispatcher() -> Option<std::sync::Arc<dispatcher::HookDispatcher>> {
     DISPATCHER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Workspace-relative paths of the hook files the installed dispatcher has
+/// content-bound. File tools refuse to modify them: a rewrite would only make
+/// the hook fail closed until restart.
+pub(crate) fn pinned_hook_files() -> Vec<std::path::PathBuf> {
+    get_dispatcher()
+        .map(|dispatcher| dispatcher.pinned_workspace_paths())
+        .unwrap_or_default()
+}
+
+/// True when `relative` (a workspace-relative spelling) names one of `pinned`.
+/// Compared case-insensitively with `/` and `\` as equal separators, so a
+/// case-insensitive volume cannot be used to spell around the protection.
+pub(crate) fn is_pinned_hook_file(pinned: &[std::path::PathBuf], relative: &str) -> bool {
+    let normalize = |text: &str| text.replace('\\', "/").to_lowercase();
+    let relative = normalize(relative.trim_start_matches("./"));
+    pinned
+        .iter()
+        .any(|path| normalize(&path.to_string_lossy()) == relative)
 }
 
 /// Test-only: clears the process-global dispatcher so a test that installed one

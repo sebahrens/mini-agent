@@ -470,6 +470,44 @@ pub fn resolve_startup_prompt_mode(
 /// Auto-deny regex patterns that are always active regardless of config.
 /// These are appended to the end of each relevant tool's rules, so they
 /// take precedence over user-configured allow/ask entries.
+/// Best-effort recognizer for destructive shell commands that `yolo` still
+/// asks about when no configured rule matched the script. Each command of the
+/// script (split on newlines, `;`, `&`, and `|`, with leading `sudo`/`env`/
+/// `command`/`exec` wrappers removed) is checked. Shell syntax can always
+/// reshape a command, so this is a workflow guard rail, not containment.
+pub(crate) fn is_destructive_shell_script(script: &str) -> bool {
+    static DESTRUCTIVE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"^(?:",
+            // rm with a recursive or force flag, in any flag spelling.
+            r"rm\s+(?:\S+\s+)*-(?:-recursive|-force|[A-Za-z]*[rRf][A-Za-z]*)\b",
+            r"|(?:dd|shred|wipefs|mkswap|fdisk|sfdisk|parted)\b",
+            r"|mkfs(?:\.\w+)?\b",
+            r"|find\b.*\s-delete\b",
+            r"|(?:chmod|chown)\s+(?:\S+\s+)*-(?:-recursive|[A-Za-z]*R[A-Za-z]*)\b",
+            r"|git\s+(?:\S+\s+)*(?:push\s+(?:.*\s)?(?:--force\S*|-f\b|--delete\b|:\S)|reset\s+(?:.*\s)?--hard\b|clean\s+(?:.*\s)?-[A-Za-z]*f|branch\s+(?:.*\s)?-D\b)",
+            r")"
+        ))
+        .expect("trusted destructive-command regex must compile")
+    });
+    script
+        .split(['\n', ';', '&', '|'])
+        .map(|command| {
+            let mut command = command.trim().trim_start_matches(['(', '{', '!', ' ']);
+            loop {
+                let stripped = ["sudo ", "env ", "command ", "exec ", "nohup ", "time "]
+                    .iter()
+                    .find_map(|wrapper| command.strip_prefix(wrapper));
+                match stripped {
+                    Some(rest) => command = rest.trim_start(),
+                    None => break,
+                }
+            }
+            command
+        })
+        .any(|command| DESTRUCTIVE.is_match(command))
+}
+
 pub fn default_deny_regex_rules() -> Vec<(/* tool */ &'static str, /* regex */ &'static str)> {
     vec![("bash", r"^rm\s+.*\*")]
 }

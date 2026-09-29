@@ -7,6 +7,7 @@ use regex::Regex;
 use super::channel::{ChannelResult, interpret_hook_output};
 use super::envelope::{EventFields, build_envelope};
 use super::normalize::canonical_tool_name;
+use super::pins::HookContentPins;
 use super::settings::{HookHandler, HooksConfig};
 use super::subprocess::{
     HookOutput, HookPolicy, HookStatus, run_hook_with_policy_at_root, run_shell_condition_at_root,
@@ -188,6 +189,10 @@ pub(crate) struct HookDispatcher {
     /// event so distinct argv, conditions, environments, and trust policies
     /// never consume one another's once slot.
     once_ran: Arc<Mutex<HashSet<(String, HookHandler)>>>,
+    /// Content digests of workspace-resident hook files, captured once when
+    /// the dispatcher is bound to its project root. `None` only for unbound
+    /// test dispatchers; a bound dispatcher verifies every launch.
+    content_pins: Option<HashMap<HookHandler, Arc<HookContentPins>>>,
 }
 
 impl HookDispatcher {
@@ -244,6 +249,19 @@ impl HookDispatcher {
             }
             events.insert(event.clone(), entries);
         }
+        let content_pins = project_root.as_deref().map(|root| {
+            events
+                .values()
+                .flatten()
+                .flat_map(|entry: &MatcherEntry| entry.handlers.iter())
+                .map(|handler| {
+                    (
+                        handler.clone(),
+                        Arc::new(HookContentPins::capture(root, handler)),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        });
         let execution_root = match project_root.as_deref() {
             Some(root) => match ValidatedExecutionRoot::capture(root) {
                 Ok(root) => ExecutionRootBinding::Valid(Box::new(root)),
@@ -260,7 +278,29 @@ impl HookDispatcher {
                 binding: execution_root,
             })),
             once_ran: Arc::new(Mutex::new(HashSet::new())),
+            content_pins,
         })
+    }
+
+    /// The content binding for `handler`; a bound dispatcher never launches
+    /// a handler without one (an unknown handler gets an empty binding, which
+    /// denies every workspace-resident file).
+    fn content_pins_for(&self, handler: &HookHandler) -> Option<Arc<HookContentPins>> {
+        let pins = self.content_pins.as_ref()?;
+        Some(pins.get(handler).cloned().unwrap_or_default())
+    }
+
+    /// Workspace-relative paths of every content-bound hook file.
+    pub(crate) fn pinned_workspace_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .content_pins
+            .iter()
+            .flat_map(|pins| pins.values())
+            .flat_map(|pins| pins.workspace_paths().map(Path::to_path_buf))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Rebind hook execution after a validated UI/session workspace switch.
@@ -561,9 +601,11 @@ impl HookDispatcher {
                 let execution_root = execution_root.clone();
                 let sandbox_backend = self.sandbox_backend.clone();
                 let once_ran = Arc::clone(&self.once_ran);
+                let content_pins = self.content_pins_for(&handler);
                 std::mem::drop(crate::agent::runner::spawn_async_scoped(async move {
                     let policy =
-                        HookPolicy::new(handler.trust, &sandbox_backend, handler.env.clone());
+                        HookPolicy::new(handler.trust, &sandbox_backend, handler.env.clone())
+                            .with_content_pins(content_pins);
                     if let Some(condition) = &handler.condition {
                         let cond_timeout = std::time::Duration::from_secs(
                             handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
@@ -639,7 +681,8 @@ impl HookDispatcher {
 
             if let Some(condition) = &handler.condition {
                 let policy =
-                    HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
+                    HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
+                        .with_content_pins(self.content_pins_for(handler));
                 let cond_timeout =
                     std::time::Duration::from_secs(handler.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
                 let cond_output = run_shell_condition_at_root(
@@ -695,7 +738,8 @@ impl HookDispatcher {
             let project_dir = project_dir.to_string();
             let execution_root = execution_root.clone();
             let args = handler.args.clone();
-            let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone());
+            let policy = HookPolicy::new(handler.trust, &self.sandbox_backend, handler.env.clone())
+                .with_content_pins(self.content_pins_for(handler));
             let diagnostics = policy.diagnostics();
             let trust = handler.trust;
             let audit_event = event.to_string();
