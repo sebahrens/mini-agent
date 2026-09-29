@@ -703,3 +703,38 @@ async fn hook_subprocess_policy_denies_relative_program_escape() {
     assert!(!project.join("escaped").exists());
     let _ = std::fs::remove_dir_all(parent);
 }
+
+/// Regression for mini-agent-fw5i2: the Windows AppContainer backend has no
+/// direct-exec hook path, so an available AppContainer must be reported to
+/// sandboxed hooks as requested-but-unavailable instead of
+/// required-and-available followed by a misleading `bwrap` launch failure.
+#[test]
+fn hook_containment_reports_unsupported_backends_as_unavailable() {
+    use crate::extras::hooks::subprocess::effective_hook_policy;
+    use crate::sandbox::{SandboxPolicy, hook_containment_supported};
+
+    assert!(!hook_containment_supported("appcontainer"));
+    assert!(!hook_containment_supported("restricted-token"));
+    for backend in ["bwrap", "seatbelt", "zerobox"] {
+        assert_eq!(hook_containment_supported(backend), cfg!(unix), "{backend}");
+    }
+
+    assert_eq!(
+        effective_hook_policy(SandboxPolicy::RequiredAndAvailable, false),
+        SandboxPolicy::RequiredButUnavailable
+    );
+    assert_eq!(
+        effective_hook_policy(SandboxPolicy::RequiredAndAvailable, true),
+        SandboxPolicy::RequiredAndAvailable
+    );
+    assert_eq!(
+        effective_hook_policy(SandboxPolicy::Disabled, false),
+        SandboxPolicy::Disabled
+    );
+
+    let policy = HookPolicy::new(HookTrust::Sandboxed, "appcontainer", BTreeMap::new());
+    assert_eq!(
+        policy.diagnostics().containment,
+        "requested-but-unavailable; launch-denied"
+    );
+}

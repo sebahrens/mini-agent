@@ -563,7 +563,10 @@ Accepted top-level keys:
 
 The macOS general-command Seatbelt profile permits reads from ordinary
 host-readable paths needed by developer tools, but explicitly denies the
-resolved mini-agent configuration and credential directories. It therefore
+resolved mini-agent configuration and credential directories. Each is denied
+under both its configured spelling and its symlink-resolved spelling (for
+example `/tmp` versus `/private/tmp`, or a symlinked `~/.mini-agent`), because
+Seatbelt matches only resolved paths. It therefore
 protects mini-agent's own stored API keys and MCP OAuth tokens, but does not
 claim universal filesystem confidentiality. Linux and macOS expose only the dedicated
 `<cache_dir>/sandbox-runtime` subtree to general sandboxed commands.
@@ -708,7 +711,9 @@ workspace and application cache as writable, a minimal runtime filesystem,
 and no IP network. On macOS, Seatbelt allows host-readable files, limits writes
 to the workspace, application cache, temporary directory, and `/dev/null`, and
 denies network. Other backends have only their reported backend-defined
-guarantees. `"trusted"` has ambient filesystem and network access by explicit
+guarantees. The Windows AppContainer backend has no direct-exec hook path, so
+on Windows `"sandboxed"` hooks report `requested-but-unavailable` and are
+denied at launch; use `"trusted"` to opt out explicitly. `"trusted"` has ambient filesystem and network access by explicit
 configuration consent, while retaining direct argv, canonical cwd, minimal
 environment, timeout/output bounds, cancellation, and tree cleanup. Audit logs
 name the event, executable, trust choice, containment request/availability,
