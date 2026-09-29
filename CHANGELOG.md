@@ -35,6 +35,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded
   read timeout and reassembles a split request line.
+- The GPL Corresponding Source archive now includes every npm package tarball pinned by the VS Code
+  extension's `package-lock.json` (whose runtime dependencies are bundled into the VSIX's
+  `dist/extension.js`), verified against the lockfile integrity hashes, with offline rebuild steps
+  in `SOURCE.md`; the archive is now written reproducibly (sorted entries, fixed timestamps).
 
 ## [1.9.4] - 2026-09-29
 

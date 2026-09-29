@@ -42,9 +42,14 @@ Every release also includes five platform VSIX candidates, the dual-purpose
 `mini-agent-windows-x64.msi`, their checksum manifests, and
 `mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
 made from the exact tagged commit and adds the complete locked Cargo dependency graph under
-`vendor/` plus a generated `.cargo/config.toml`. CI validates that Cargo can resolve the bundle with
-`--locked --offline`, includes the source archive in `SHA256SUMS`, and publishes it in the same
-GitHub release as the binaries. Never delete a source asset while any matching binary asset remains
+`vendor/` plus a generated `.cargo/config.toml`, and every npm tarball pinned by
+`editors/vscode/package-lock.json` under `vendor-npm/` with a `npm-sources.json` manifest of their
+lockfile integrity hashes (the VSIX's `dist/extension.js` bundles npm dependencies). The packager
+needs the pinned Node and npm (`editors/vscode/.nvmrc`, `packageManager`) and fails if npm is
+missing. CI validates that Cargo can resolve the bundle with `--locked --offline`, verifies every
+npm tarball against the lockfile and rebuilds `dist/extension.js` with `npm ci --offline`, writes
+the archive reproducibly (sorted entries, the tagged commit's timestamp), includes the source
+archive in `SHA256SUMS`, and publishes it in the same GitHub release as the binaries. Never delete a source asset while any matching binary asset remains
 available.
 
 ## Product identity matrix

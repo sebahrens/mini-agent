@@ -915,6 +915,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'for required in LICENSE NOTICE SOURCE.md Cargo.toml Cargo.lock rust-toolchain.toml Cross.toml .cargo/config.toml; do',
             'tar tzf "$STAGING_DIR/$ARCHIVE_NAME" > "$ARCHIVE_LISTING"',
             'grep -Eq -- "^$ESCAPED_SOURCE_ROOT/vendor/',
+            'python3 "$SCRIPT_DIR/corresponding_source.py" vendor-npm',
+            '"$NPM_BIN" ci --offline --ignore-scripts --no-audit --no-fund',
+            "npm is required to vendor the VS Code extension's locked npm sources",
+            'python3 "$SCRIPT_DIR/corresponding_source.py" tar',
         ),
         "scripts/smoke-package-compliance.py": (
             'CHANNELS = ("aur", "conda-bin", "conda-source", "homebrew")',

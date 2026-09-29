@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Build a tag-named GPL Corresponding Source archive with locked Cargo sources.
+# Build a tag-named GPL Corresponding Source archive with locked Cargo sources
+# and the VS Code extension's locked npm dependency tarballs.
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $# -lt 2 ]]; then
     echo "Usage: package-corresponding-source.sh <vX.Y.Z> <output-dir> [git-ref] [--allow-untagged-label] [--compliance-docs <dir>]" >&2
@@ -75,6 +78,16 @@ elif [[ "$ALLOW_UNTAGGED_LABEL" != true ]]; then
     echo "Error: release tag does not exist: ${RELEASE_TAG}" >&2
     exit 2
 fi
+NPM_BIN="${NPM:-npm}"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required to assemble the Corresponding Source archive" >&2
+    exit 2
+fi
+if ! command -v "$NPM_BIN" >/dev/null 2>&1 || ! "$NPM_BIN" --version >/dev/null 2>&1; then
+    echo "Error: npm is required to vendor the VS Code extension's locked npm sources into the Corresponding Source archive; install the Node version in editors/vscode/.nvmrc and the npm named by packageManager in editors/vscode/package.json (npm command: ${NPM_BIN})" >&2
+    exit 2
+fi
+SOURCE_EPOCH=$(git show -s --format=%ct "$SOURCE_COMMIT")
 SOURCE_ROOT="${BINARY_NAME}-${RELEASE_TAG}-source"
 ARCHIVE_NAME="${SOURCE_ROOT}.tar.gz"
 STAGING_DIR=$(mktemp -d)
@@ -105,7 +118,38 @@ mkdir -p "$STAGING_DIR/$SOURCE_ROOT/.cargo"
     cargo metadata --locked --offline --format-version 1 > /dev/null
 )
 
-tar czf "$STAGING_DIR/$ARCHIVE_NAME" -C "$STAGING_DIR" "$SOURCE_ROOT"
+# The VSIX bundles npm dependencies into dist/extension.js, so the archive
+# carries every tarball pinned by the extension's package-lock.json, verified
+# against its integrity hashes, and proves that the bundle rebuilds offline.
+NPM_LOCKFILE="editors/vscode/package-lock.json"
+NPM_VENDOR_DIR="vendor-npm"
+VENDORED_NPM=false
+if [[ -f "$STAGING_DIR/$SOURCE_ROOT/$NPM_LOCKFILE" ]]; then
+    python3 "$SCRIPT_DIR/corresponding_source.py" vendor-npm \
+        "$STAGING_DIR/$SOURCE_ROOT/$NPM_LOCKFILE" \
+        "$STAGING_DIR/$SOURCE_ROOT/$NPM_VENDOR_DIR" \
+        --npm "$NPM_BIN" --mtime "$SOURCE_EPOCH"
+    NPM_CHECK_DIR="$STAGING_DIR/npm-offline-check"
+    mkdir -p "$NPM_CHECK_DIR"
+    cp -R "$STAGING_DIR/$SOURCE_ROOT/editors/vscode" "$NPM_CHECK_DIR/extension"
+    "$NPM_BIN" cache add --cache "$NPM_CHECK_DIR/cache" \
+        "$STAGING_DIR/$SOURCE_ROOT/$NPM_VENDOR_DIR"/*.tgz > /dev/null
+    (
+        cd "$NPM_CHECK_DIR/extension"
+        "$NPM_BIN" ci --offline --ignore-scripts --no-audit --no-fund \
+            --cache "$NPM_CHECK_DIR/cache" > /dev/null
+        "$NPM_BIN" run build --offline > /dev/null
+        test -s dist/extension.js
+    )
+    rm -rf "$NPM_CHECK_DIR"
+    VENDORED_NPM=true
+elif [[ -f "$STAGING_DIR/$SOURCE_ROOT/editors/vscode/package.json" ]]; then
+    echo "Error: editors/vscode/package.json exists without $NPM_LOCKFILE; npm sources cannot be vendored" >&2
+    exit 2
+fi
+
+python3 "$SCRIPT_DIR/corresponding_source.py" tar \
+    "$STAGING_DIR" "$SOURCE_ROOT" "$STAGING_DIR/$ARCHIVE_NAME" --mtime "$SOURCE_EPOCH"
 ARCHIVE_LISTING="$STAGING_DIR/archive-contents.txt"
 tar tzf "$STAGING_DIR/$ARCHIVE_NAME" > "$ARCHIVE_LISTING"
 for required in LICENSE NOTICE SOURCE.md Cargo.toml Cargo.lock rust-toolchain.toml Cross.toml .cargo/config.toml; do
@@ -113,6 +157,12 @@ for required in LICENSE NOTICE SOURCE.md Cargo.toml Cargo.lock rust-toolchain.to
 done
 ESCAPED_SOURCE_ROOT=${SOURCE_ROOT//./\\.}
 grep -Eq -- "^$ESCAPED_SOURCE_ROOT/vendor/[^/]+/Cargo\\.toml$" "$ARCHIVE_LISTING"
+if [[ "$VENDORED_NPM" == true ]]; then
+    for required in "$NPM_LOCKFILE" "$NPM_VENDOR_DIR/npm-sources.json"; do
+        grep -Fxq -- "$SOURCE_ROOT/$required" "$ARCHIVE_LISTING"
+    done
+    grep -Eq -- "^$ESCAPED_SOURCE_ROOT/$NPM_VENDOR_DIR/[^/]+\\.tgz$" "$ARCHIVE_LISTING"
+fi
 mv "$STAGING_DIR/$ARCHIVE_NAME" "$OUTPUT_DIR/$ARCHIVE_NAME"
 
 echo "$OUTPUT_DIR/$ARCHIVE_NAME"

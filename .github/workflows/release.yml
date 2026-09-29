@@ -278,6 +278,17 @@ jobs:
         with:
           toolchain: "1.96.0"
 
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: editors/vscode/.nvmrc
+
+      - name: Install and verify pinned npm
+        working-directory: editors/vscode
+        run: |
+          npm install --global "$(node --print "require('./package.json').packageManager")"
+          test "npm@$(npm --version)" = "$(node --print "require('./package.json').packageManager")"
+
       - name: Assemble and validate Corresponding Source
         run: bash scripts/package-corresponding-source.sh "$GITHUB_REF_NAME" . HEAD
 
