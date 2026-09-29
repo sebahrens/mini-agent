@@ -29,6 +29,7 @@ OPTIONAL_PACKAGE_OWNERS = {
     "rmcp": "mcp",
     "rquickjs": "js",
     "rusqlite": "skills",
+    "sse-stream": "mcp",
     "tokio-native-tls": "acp",
     "url": "lsp",
     "which": "lsp",
@@ -46,7 +47,7 @@ SKILLS_PACKAGES = JS_PACKAGES | {
     "rusqlite",
 }
 ACP_PACKAGES = frozenset({"agent-client-protocol", "blocking"})
-MCP_PACKAGES = frozenset({"process-wrap", "rmcp"})
+MCP_PACKAGES = frozenset({"process-wrap", "rmcp", "sse-stream"})
 LSP_PACKAGES = frozenset({"lsp-types", "process-wrap", "url", "which"})
 EMBED_PACKAGES = SKILLS_PACKAGES | {"fastembed", "ort"}
 

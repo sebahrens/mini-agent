@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- URL (streamable-HTTP) MCP servers can no longer exhaust memory with oversized responses: JSON
+  bodies and individual SSE events are read incrementally under the same 16 MiB cap as stdio
+  protocol lines (OAuth servers included), an oversized SSE answer fails its request with an error
+  naming the cap instead of hanging until the timeout, and at most 4 KiB of a non-2xx body reaches
+  the error text (mini-agent-f2wne).
 - The permission prompt can no longer show a different command than the one that runs: bidi
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed

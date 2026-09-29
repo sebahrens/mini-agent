@@ -38,6 +38,7 @@ mcp = [
     "rmcp?/transport-child-process",
     "rmcp?/transport-streamable-http-client-reqwest",
     "rmcp?/auth",
+    "dep:sse-stream",
     "dep:which",
 ]
 acp = ["dep:agent-client-protocol", "dep:blocking", "dep:native-tls", "dep:tokio-native-tls"]
@@ -74,6 +75,9 @@ rmcp = { version = "2.0", optional = true, default-features = false, features = 
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
+# The same SSE parser rmcp's streamable-HTTP client links; the bounded MCP HTTP
+# transport feeds it a size-capped response byte stream.
+sse-stream = { version = "0.2", optional = true }
 process-wrap = { version = "9", optional = true, default-features = true, features = ["tokio1"] }
 which = { version = "8", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
