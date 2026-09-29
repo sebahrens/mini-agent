@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,8 +17,8 @@ use rmcp::service::{
     Peer, PeerRequestOptions, RoleClient, RunningService, RxJsonRpcMessage, ServiceError,
     TxJsonRpcMessage, serve_client,
 };
+use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
-use rmcp::transport::{Transport, which_command};
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
@@ -333,6 +333,7 @@ impl McpClientHandle {
                     inherit_env,
                     sandbox.as_deref(),
                     *network,
+                    std::env::var_os("PATH").as_deref(),
                 )
                 .map_err(|error| {
                     bounded_stdio_error(
@@ -679,12 +680,8 @@ fn stdio_command(
     inherit_env: &[String],
     sandbox_backend: Option<&str>,
     network: McpStdioNetwork,
+    search_path: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<Command> {
-    // Resolve against the parent's PATH before clearing the child's ambient
-    // environment. The immutable absolute identity is what is ultimately
-    // passed to exec; the child does not need PATH merely to locate itself.
-    let resolved = which_command(command)?;
-    let program = PathBuf::from(resolved.as_std().get_program());
     let cwd = match configured_cwd {
         Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
         Some(cwd) => workspace.join(cwd),
@@ -696,6 +693,18 @@ fn stdio_command(
             cwd.display()
         )
     })?;
+    // Resolve against the absolute entries of the parent's PATH before
+    // clearing the child's ambient environment; relative/empty entries would
+    // resolve against the workspace. A relative command with a directory
+    // component is anchored only by an explicitly configured `cwd`. The
+    // immutable absolute identity is what is ultimately passed to exec; the
+    // child does not need PATH merely to locate itself.
+    let program = crate::extras::executable_search::resolve_service_executable(
+        command,
+        search_path,
+        configured_cwd.map(|_| cwd.as_path()),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let delegated = delegated_environment(inherit_env, env)?;
 
@@ -987,10 +996,56 @@ mod tests {
             &[],
             None,
             super::McpStdioNetwork::Inherit,
+            std::env::var_os("PATH").as_deref(),
         )
         .unwrap();
 
         assert!(std::path::Path::new(command.as_std().get_program()).is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_command_ignores_relative_and_empty_path_entries() {
+        use crate::extras::executable_search::PlantedExecutables;
+        let fixture = PlantedExecutables::new("mcp");
+        let resolve =
+            |command: &str, cwd: Option<&std::path::Path>, search: Option<&std::ffi::OsStr>| {
+                stdio_command(
+                    command,
+                    &[],
+                    &fixture.workspace,
+                    cwd,
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    super::McpStdioNetwork::Inherit,
+                    search,
+                )
+            };
+        PlantedExecutables::plant(&fixture.workspace, "mcp-server");
+        for search in fixture.hostile_search_paths() {
+            let error = resolve("mcp-server", None, Some(search.as_os_str()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not found"), "{error}");
+        }
+        let trusted = PlantedExecutables::plant(&fixture.bin, "mcp-server");
+        for search in fixture.hostile_search_paths() {
+            let command = resolve("mcp-server", None, Some(search.as_os_str())).unwrap();
+            assert_eq!(
+                std::path::Path::new(command.as_std().get_program()),
+                trusted
+            );
+        }
+
+        // A relative command with a directory needs an explicit `cwd` anchor.
+        let error = resolve("./mcp-server", None, None).unwrap_err().to_string();
+        assert!(error.contains("directory component"), "{error}");
+        let command = resolve("./mcp-server", Some(std::path::Path::new(".")), None).unwrap();
+        assert_eq!(
+            std::path::Path::new(command.as_std().get_program()),
+            fixture.workspace.join("mcp-server")
+        );
     }
 
     #[test]

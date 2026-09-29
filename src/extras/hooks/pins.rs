@@ -202,22 +202,6 @@ fn handler_search_path(handler: &HookHandler) -> Option<std::ffi::OsString> {
         .or_else(|| std::env::var_os("PATH"))
 }
 
-/// Keeps only absolute `PATH` entries. A relative or empty entry would
-/// otherwise resolve a bare hook command against the workspace.
-pub(crate) fn absolute_search_path(
-    search_path: Option<&std::ffi::OsStr>,
-) -> Option<std::ffi::OsString> {
-    let search_path = search_path?;
-    let absolute: Vec<PathBuf> = std::env::split_paths(search_path)
-        .filter(|entry| entry.is_absolute())
-        .collect();
-    // An empty search string would itself mean "the current directory".
-    if absolute.is_empty() {
-        return None;
-    }
-    std::env::join_paths(absolute).ok()
-}
-
 /// Resolves a configured hook executable exactly as a launch does: relative
 /// paths with a directory component from `project_dir` (never escaping it),
 /// bare names through the absolute entries of `search_path`, absolute paths
@@ -237,7 +221,7 @@ pub(crate) fn resolve_hook_program(
             )),
         }
     } else if program_path.components().count() == 1 && program_path.is_relative() {
-        let search_path = absolute_search_path(search_path);
+        let search_path = crate::extras::executable_search::absolute_search_path(search_path);
         which::which_in(program, search_path.as_deref(), project_dir)
             .map_err(|error| format!("failed to resolve hook executable {program:?}: {error}"))
     } else {

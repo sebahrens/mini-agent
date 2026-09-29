@@ -1651,9 +1651,14 @@ permission:
 
 When compiled with MCP support, `mcp_servers` accepts local stdio and remote
 URL-based servers. A local stdio entry launches `command` directly and passes
-`args` without shell parsing. `command` may be an executable available on
-`PATH` or an absolute executable path; zerostack resolves platform shims such
-as Windows `.cmd`/`.exe` launchers to an absolute identity before spawn.
+`args` without shell parsing. `command` may be a bare executable name or an
+absolute executable path; zerostack resolves platform shims such as Windows
+`.cmd`/`.exe` launchers to an absolute identity before spawn. Bare names are
+searched only through the absolute entries of `PATH`: empty and relative
+entries (such as `.` or `::`) are ignored, so an executable planted in the
+workspace is never picked up by a bare name. A relative `command` with a
+directory component (`./server`, `bin/server`) resolves from the configured
+`cwd` and must stay inside it; without an explicit `cwd` it is rejected.
 
 MCP connections are capability-driven. `--no-tools` never connects configured
 servers. An exact `--tools` allowlist containing only built-in tool names also
@@ -2574,8 +2579,11 @@ clangd, bash-language-server, lua-language-server.
 
 Behavior notes:
 
-- Executables are resolved once through the launcher's PATH (or an absolute
-  configured path); zerostack never auto-installs a language server. A missing
+- Executables are resolved once through the absolute entries of the
+  launcher's PATH (or an absolute configured path); empty and relative PATH
+  entries are ignored, so a workspace-planted server binary is never selected.
+  A relative `command` with a directory component (`./my-ls`) is rejected; use
+  an absolute path. zerostack never auto-installs a language server. A missing
   binary is skipped with a debug log.
 - Servers start lazily on the first edit touching one of their extensions
   using the canonical session cwd for both process cwd and `rootUri`.

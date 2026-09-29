@@ -38,7 +38,7 @@ mcp = [
     "rmcp?/transport-child-process",
     "rmcp?/transport-streamable-http-client-reqwest",
     "rmcp?/auth",
-    "rmcp?/which-command",
+    "dep:which",
 ]
 acp = ["dep:agent-client-protocol", "dep:blocking", "dep:native-tls", "dep:tokio-native-tls"]
 memory = []

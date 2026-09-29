@@ -22,6 +22,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `filter.<name>.clean`/`.process` command, and run with every configured driver emptied.
   Previously an auto-allowed `status` could execute a clean filter the model had written into
   `.git/config` and `.gitattributes`.
+- Language servers and stdio MCP servers now resolve bare executable names only through absolute
+  `PATH` entries, as hooks already did: an empty or relative entry (`::`, `.`) can no longer make a
+  workspace-planted `rust-analyzer`, `gopls` or MCP server binary run unsandboxed. A relative
+  command with a directory component is rejected for LSP and needs an explicit `cwd` for MCP.
 
 ### Added
 
