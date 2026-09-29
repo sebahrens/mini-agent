@@ -1715,15 +1715,7 @@ impl Sandbox {
                 "sandbox backend 'zerobox' is not a trusted system executable — refusing to run unsandboxed"
                     .to_string()
             })?;
-            let mut cmd = Command::new(zerobox);
-            cmd.arg("--allow-write");
-            cmd.arg(cwd.as_os_str());
-            cmd.arg("--");
-            cmd.arg(&self.shell);
-            cmd.arg(&self.shell_command_arg);
-            cmd.arg(command);
-            cmd.current_dir(&cwd);
-            configure_model_child_lifetime(&mut cmd);
+            let mut cmd = self.build_zerobox_shell_command(zerobox, command, &cwd);
             self.bind_workspace_cwd(&mut cmd)?;
             return Ok(cmd);
         }
@@ -1755,6 +1747,28 @@ impl Sandbox {
         let mut command = self.build_bwrap_command(bwrap, command, &cwd, &cache_dir);
         self.bind_workspace_cwd(&mut command)?;
         Ok(command)
+    }
+
+    /// Builds the model-action shell command under the `zerobox` backend.
+    ///
+    /// Like every other model-action arm, the ambient environment is cleared
+    /// and only the non-credential allow-list is restored, so provider API
+    /// keys never reach model-authored commands.
+    fn build_zerobox_shell_command(&self, zerobox: &Path, command: &str, cwd: &Path) -> Command {
+        let mut cmd = Command::new(zerobox);
+        cmd.arg("--allow-write");
+        cmd.arg(cwd.as_os_str());
+        cmd.arg("--");
+        cmd.arg(&self.shell);
+        cmd.arg(&self.shell_command_arg);
+        cmd.arg(command);
+        cmd.current_dir(cwd);
+        cmd.env_clear();
+        for (key, value) in self.get_essential_env() {
+            cmd.env(key, value);
+        }
+        configure_model_child_lifetime(&mut cmd);
+        cmd
     }
 
     /// Builds a direct-exec command under the general workspace policy.
@@ -5779,6 +5793,37 @@ printf {pass_token}
                 "credential read through {} escaped Seatbelt: {:?}",
                 target.display(),
                 output
+            );
+        }
+    }
+
+    /// Regression for mini-agent-0j5vz: the zerobox model-action arm must not
+    /// inherit the parent environment (provider API keys).
+    #[cfg(unix)]
+    #[test]
+    fn zerobox_shell_command_clears_ambient_environment() {
+        let sandbox = Sandbox::new(true, "zerobox");
+        let cwd = std::env::temp_dir();
+        let command = sandbox.build_zerobox_shell_command(
+            Path::new("/usr/local/bin/zerobox"),
+            "echo hi",
+            &cwd,
+        );
+        let rendered = format!("{command:?}");
+        assert!(
+            rendered.contains("env -i"),
+            "zerobox command must clear the ambient environment: {rendered}"
+        );
+        let expected: std::collections::BTreeSet<_> = sandbox
+            .get_essential_env()
+            .iter()
+            .map(|(key, _)| std::ffi::OsStr::new(*key))
+            .collect();
+        for (key, value) in command.as_std().get_envs() {
+            assert!(value.is_some(), "unexpected env removal for {key:?}");
+            assert!(
+                expected.contains(key),
+                "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
     }
