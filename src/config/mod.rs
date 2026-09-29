@@ -442,17 +442,30 @@ impl Config {
         model_id: &str,
         qm: &HashMap<String, types::QuickModelConfig>,
     ) -> u64 {
+        self.known_context_window(provider, model_id, qm)
+            .unwrap_or(128_000)
+    }
+
+    /// [`Self::resolve_context_window`] without the 128k fallback: the pinned
+    /// `context_window`, then a quick model's, then the catalog's, or `None`
+    /// when none of them knows the model.
+    pub fn known_context_window(
+        &self,
+        provider: &str,
+        model_id: &str,
+        qm: &HashMap<String, types::QuickModelConfig>,
+    ) -> Option<u64> {
         if let Some(cw) = self.context_window {
-            return cw;
+            return Some(cw);
         }
         for qmc in qm.values() {
             if qmc.model.as_str() == model_id
                 && let Some(cw) = qmc.context_window
             {
-                return cw;
+                return Some(cw);
             }
         }
-        Self::catalog_context_window(provider, model_id).unwrap_or(128_000)
+        Self::catalog_context_window(provider, model_id)
     }
 
     /// The model's context window straight from the static catalog, or `None`

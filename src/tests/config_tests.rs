@@ -1132,3 +1132,49 @@ fn normalized_usage_charges_gemini_thinking_as_output() {
     };
     assert_eq!(cfg.normalize_usage("openai", openai_report), openai_report);
 }
+
+// mini-agent-ycu8b: a resumed session re-derives its window in the same order
+// a new session does, and keeps its saved value only when nothing knows it.
+#[test]
+fn known_context_window_orders_pin_quick_model_then_catalog() {
+    let mut qm = std::collections::HashMap::new();
+    qm.insert(
+        "pro".to_string(),
+        crate::config::types::QuickModelConfig {
+            provider: compact_str::CompactString::new("openrouter"),
+            model: compact_str::CompactString::new("deepseek/deepseek-v4-pro"),
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            reserve_tokens: None,
+            temperature: None,
+            extra_body: None,
+            context_window: Some(64_000),
+        },
+    );
+    let none = std::collections::HashMap::new();
+    let unpinned = Config::default();
+    assert_eq!(
+        unpinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &qm),
+        Some(64_000),
+        "a quick model's window beats the catalog"
+    );
+    assert_eq!(
+        unpinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &none),
+        Config::catalog_context_window("openrouter", "deepseek/deepseek-v4-pro")
+    );
+    assert_eq!(
+        unpinned.known_context_window("ollama", "llama3.1", &none),
+        None,
+        "unknown models keep the saved window"
+    );
+    let pinned: Config = serde_json::from_str(r#"{ "context_window": 32000 }"#).unwrap();
+    assert_eq!(
+        pinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &qm),
+        Some(32_000),
+        "a pinned window is applied to resumed sessions too"
+    );
+    assert_eq!(
+        pinned.known_context_window("ollama", "llama3.1", &none),
+        Some(32_000)
+    );
+}

@@ -762,11 +762,12 @@ impl Startup {
 
         // A resumed session persisted its context_window when first saved, which can
         // be stale if the model's catalog entry has changed since (e.g. a model that
-        // grew from 128k to 1M). Re-derive it from the catalog for the session's own
-        // model, unless the user pinned `context_window` in config (then that wins).
-        if cfg.context_window.is_none()
-            && let Some(cw) =
-                Config::catalog_context_window(session.provider.as_str(), session.model.as_str())
+        // grew from 128k to 1M) or the user has since pinned one. Re-derive it for
+        // the session's own model in the same order a new session uses — pinned
+        // `context_window`, then the quick model's, then the catalog's — and keep
+        // the saved value only when none of them knows the model (mini-agent-ycu8b).
+        if let Some(cw) =
+            cfg.known_context_window(session.provider.as_str(), session.model.as_str(), &qm_map)
         {
             session.update_context_window(cw);
         }
