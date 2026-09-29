@@ -247,9 +247,12 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         );
         return Ok(());
     }
-    // Default the model to something valid for the new provider BEFORE rebuilding,
-    // since rebuild_agent_with_client reads session.model. Otherwise the old id
-    // (e.g. an OpenRouter id) is carried onto a provider where it is invalid.
+    // Create the client first: a failure must not leave the session's model
+    // or costs switched to the new provider while the old one stays active.
+    ctx.switch_client(new_provider)?;
+    // Default the model to something valid for the new provider. Otherwise
+    // the old id (e.g. an OpenRouter id) is carried onto a provider where it
+    // is invalid.
     if let Some((model, costs)) = crate::provider::default_model_for_provider(new_provider, ctx.cfg)
     {
         ctx.session.model = compact_str::CompactString::new(&model);
@@ -258,9 +261,7 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             ctx.session.output_token_cost = outc;
         }
     }
-    ctx.rebuild_agent_with_client(new_provider, *ctx.reasoning_enabled)
-        .await?;
-    ctx.session.provider = compact_str::CompactString::new(new_provider);
+    ctx.rebuild_agent().await;
     ctx.session
         .update_context_window(ctx.cfg.resolve_context_window(
             new_provider,
@@ -334,10 +335,8 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
     if parts.len() >= 2 && !refresh {
         let arg = parts[1].trim();
         if let Some(q) = qm.get(arg) {
-            ctx.rebuild_agent_with_client(&q.provider, *ctx.reasoning_enabled)
-                .await?;
+            ctx.switch_client(&q.provider)?;
             apply_model(ctx, &q.model).await;
-            ctx.session.provider = compact_str::CompactString::new(&q.provider);
             // preserve v1.4.x pricing/cost tracking
             ctx.session.input_token_cost = q.input_token_cost;
             ctx.session.output_token_cost = q.output_token_cost;

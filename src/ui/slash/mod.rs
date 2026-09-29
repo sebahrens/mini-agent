@@ -171,26 +171,22 @@ impl SlashCtx<'_> {
         Ok(())
     }
 
-    pub async fn rebuild_agent_with_client(
-        &mut self,
-        provider: &str,
-        new_reasoning: bool,
-    ) -> Result<(), anyhow::Error> {
-        *self.client = crate::provider::create_client(
+    /// Switch the provider client and `session.provider` together. The client
+    /// is created first, so on failure nothing changes; on success the caller
+    /// sets the model and rebuilds the agent (no await point can fail between).
+    pub fn switch_client(&mut self, provider: &str) -> anyhow::Result<()> {
+        let client = crate::provider::create_client(
             provider,
             self.cli.api_key.as_deref(),
             &self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
+        *self.client = client;
+        self.session.provider = compact_str::CompactString::new(provider);
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(provider, self.client.clone());
         }
-        let new_agent = self
-            .agent_build_ctx()
-            .rebuild_agent(&self.session.model, new_reasoning)
-            .await;
-        *self.agent = Some(new_agent);
         Ok(())
     }
 
@@ -212,39 +208,31 @@ impl SlashCtx<'_> {
         let new_model = compact_str::CompactString::from(&*qmc.model);
         let provider_changed = qmc.provider != self.session.provider;
 
-        // Update model before rebuild so the agent is built with it.
-        self.session.model = new_model.clone();
-
+        // Create the new provider's client before touching the session: a
+        // failure must leave provider, model and agent consistent.
         if provider_changed {
-            match self
-                .rebuild_agent_with_client(&qmc.provider, *self.reasoning_enabled)
-                .await
-            {
-                Ok(()) => {
-                    self.session.provider = compact_str::CompactString::from(&*qmc.provider);
-                }
-                Err(e) => {
-                    let _ = self.renderer.write_line(
-                        &format!(
-                            "failed to switch provider for prompt '{}': {}",
-                            prompt_name, e
-                        ),
-                        C_ERROR,
-                    );
-                    return false;
-                }
+            if let Err(e) = self.switch_client(&qmc.provider) {
+                let _ = self.renderer.write_line(
+                    &format!(
+                        "failed to switch provider for prompt '{}': {}",
+                        prompt_name, e
+                    ),
+                    C_ERROR,
+                );
+                return false;
             }
         } else {
             #[cfg(feature = "advisor")]
             {
                 crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
             }
-            let new_agent = self
-                .agent_build_ctx()
-                .rebuild_agent(&new_model, *self.reasoning_enabled)
-                .await;
-            *self.agent = Some(new_agent);
         }
+        self.session.model = new_model.clone();
+        let new_agent = self
+            .agent_build_ctx()
+            .rebuild_agent(&new_model, *self.reasoning_enabled)
+            .await;
+        *self.agent = Some(new_agent);
 
         self.session.input_token_cost = qmc.input_token_cost;
         self.session.output_token_cost = qmc.output_token_cost;
@@ -289,8 +277,8 @@ pub(crate) async fn apply_prompt_model(
     let new_model = compact_str::CompactString::from(&*qmc.model);
     let provider_changed = qmc.provider != ui.session.provider;
 
-    ui.session.model = new_model.clone();
-
+    // The model is assigned only after the provider client exists, so a
+    // failed switch leaves the session's provider and model matching.
     if provider_changed {
         match crate::provider::create_client(
             &qmc.provider,
@@ -316,6 +304,7 @@ pub(crate) async fn apply_prompt_model(
         }
     }
 
+    ui.session.model = new_model.clone();
     #[cfg(feature = "advisor")]
     {
         crate::extras::advisor::update_client(&ui.session.provider, ui.client.clone());
