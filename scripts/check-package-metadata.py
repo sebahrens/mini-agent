@@ -59,21 +59,25 @@ APPROVED_RELEASE_ACTIONS = {
 }
 DISTRIBUTION_NOTICE_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "packaging/homebrew/zerostack.rb": (
-        'pkgshare.install "LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"',
+        'pkgshare.install "LICENSE", "NOTICE", "SOURCE.md"',
+        'pkgshare.install "THIRD_PARTY_LICENSES" if File.exist?("THIRD_PARTY_LICENSES")',
     ),
     "packaging/aur/PKGBUILD": (
         'install -Dm644 NOTICE "${pkgdir}/usr/share/doc/${pkgname}/NOTICE"',
         'install -Dm644 SOURCE.md "${pkgdir}/usr/share/doc/${pkgname}/SOURCE.md"',
+        "if [ -f THIRD_PARTY_LICENSES ]; then",
         'install -Dm644 THIRD_PARTY_LICENSES "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES"',
     ),
     "packaging/conda/zerostack-bin/build.sh": (
         'install -Dm644 "${SRC_DIR}/NOTICE" "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
         'install -Dm644 "${SRC_DIR}/SOURCE.md" "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+        'if [[ -f "${SRC_DIR}/THIRD_PARTY_LICENSES" ]]; then',
         'install -Dm644 "${SRC_DIR}/THIRD_PARTY_LICENSES" "${PREFIX}/share/licenses/${PKG_NAME}/THIRD_PARTY_LICENSES"',
     ),
     "packaging/conda/zerostack/build.sh": (
         'install -Dm644 NOTICE "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
         'install -Dm644 SOURCE.md "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+        "if [[ -f scripts/third_party_licenses.py ]]; then",
         "python3 scripts/third_party_licenses.py generate",
         'install -Dm644 THIRD_PARTY_LICENSES "${PREFIX}/share/doc/${PKG_NAME}/THIRD_PARTY_LICENSES"',
     ),
@@ -993,6 +997,10 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'cp "${TMPDIR}/${BINARY_NAME}" "$STAGED"',
             'mv -f "$STAGED" "$TARGET"',
             'REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md" "THIRD_PARTY_LICENSES")',
+            'FIRST_INVENTORY_RELEASE="1.9.5"',
+            "this release predates the bundled third-party licence inventory",
+            "required third-party licence inventory",
+            'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
             'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
         ),
         "NOTICE": (
@@ -1078,8 +1086,9 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'source "$RECIPE"; package',
             '"info/licenses/LICENSE": payload / "LICENSE"',
             'INVENTORY = "THIRD_PARTY_LICENSES"',
-            '"usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY',
-            'f"share/zerostack/{INVENTORY}": payload / INVENTORY',
+            '"usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES", payload / INVENTORY',
+            'assert_inventory(stage, f"share/zerostack/{INVENTORY}", payload / INVENTORY)',
+            'for variant, with_inventory in (("with-inventory", True), ("without-inventory", False)):',
         ),
         "packaging/homebrew/zerostack.rb": (
             f'homepage "{CANONICAL_REPOSITORY_URL}"',
@@ -1113,15 +1122,12 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
             f"- {binary} --help",
             f"- {binary} --version",
-            "    - THIRD_PARTY_LICENSES",
         ),
         "packaging/conda/zerostack/meta.yaml": (
             f"repository: {CANONICAL_REPOSITORY_URL}",
             f"- {binary} --help",
             f"- {binary} --version",
             "- test -f ${PREFIX}/THIRDPARTY.yml",
-            "- test -f ${PREFIX}/share/doc/zerostack/THIRD_PARTY_LICENSES",
-            "    - THIRD_PARTY_LICENSES",
         ),
         "packaging/conda/zerostack/build.sh": (
             'install -Dm644 THIRDPARTY.yml "${PREFIX}/THIRDPARTY.yml"',
@@ -1197,6 +1203,8 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'for document in LICENSE NOTICE SOURCE.md; do',
             '"${INSTALL_ROOT}/share/doc/mini-agent/${document}"',
             '"${INSTALL_ROOT}/share/doc/mini-agent/THIRD_PARTY_LICENSES"',
+            'eval "$(sed -n \'/^version_predates()/,/^}/p\' "${ROOT_DIR}/install.sh")"',
+            'git -C "$ROOT_DIR" show "${RELEASE_TAG}:${document}"',
         ),
         ".github/workflows/pages.yml": ("https://sebahrens.github.io/mini-agent",),
         ".github/workflows/ci.yml": (

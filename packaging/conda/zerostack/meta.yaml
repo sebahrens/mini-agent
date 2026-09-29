@@ -26,7 +26,6 @@ test:
     - mini-agent --help
     - mini-agent --version
     - test -f ${PREFIX}/THIRDPARTY.yml
-    - test -f ${PREFIX}/share/doc/zerostack/THIRD_PARTY_LICENSES
 
 about:
   home: https://github.com/sebahrens/mini-agent
@@ -35,7 +34,6 @@ about:
   license_file:
     - LICENSE
     - THIRDPARTY.yml
-    - THIRD_PARTY_LICENSES
   documentation: https://github.com/sebahrens/mini-agent
   repository: https://github.com/sebahrens/mini-agent
 

@@ -132,9 +132,15 @@ Path(args[args.index("--output") + 1]).write_text(
 """
 
 
-def make_payload(root: Path) -> tuple[Path, Path]:
+def make_payload(root: Path, *, with_inventory: bool = True) -> tuple[Path, Path]:
+    """Stage an extracted release archive.
+
+    Without the inventory it matches an archive published before the
+    inventory existed (1.9.4 and earlier), which the recipes must still install.
+    """
+
     payload = root / "payload"
-    payload.mkdir()
+    payload.mkdir(parents=True)
     binary = payload / "mini-agent"
     binary.write_text(
         "#!/bin/sh\n"
@@ -150,9 +156,10 @@ def make_payload(root: Path) -> tuple[Path, Path]:
         raise RuntimeError("LICENSE is not the canonical GPL-3.0-only text")
     for document in DOCUMENTS:
         shutil.copyfile(ROOT / document, payload / document)
-    (payload / INVENTORY).write_text(
-        INVENTORY_FIXTURE.format(target="x86_64-unknown-linux-musl"), encoding="utf-8"
-    )
+    if with_inventory:
+        (payload / INVENTORY).write_text(
+            INVENTORY_FIXTURE.format(target="x86_64-unknown-linux-musl"), encoding="utf-8"
+        )
     return payload, binary
 
 
@@ -172,6 +179,15 @@ def assert_files(stage: Path, expected: dict[str, Path]) -> None:
             raise RuntimeError(f"staged package changed {relative}")
 
 
+def assert_inventory(stage: Path, relative: str, source: Path) -> None:
+    """Require the inventory exactly when the input ships one."""
+
+    if source.is_file():
+        assert_files(stage, {relative: source})
+    elif (stage / relative).exists():
+        raise RuntimeError(f"staged package invented {relative}")
+
+
 def stage_aur(root: Path, payload: Path, binary: Path, tools: Path) -> None:
     stage = root / "aur"
     env = recipe_env(
@@ -189,10 +205,12 @@ def stage_aur(root: Path, payload: Path, binary: Path, tools: Path) -> None:
         {
             "usr/bin/mini-agent": binary,
             "usr/share/licenses/zerostack-bin/LICENSE": payload / "LICENSE",
-            "usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY,
             "usr/share/doc/zerostack-bin/NOTICE": payload / "NOTICE",
             "usr/share/doc/zerostack-bin/SOURCE.md": payload / "SOURCE.md",
         },
+    )
+    assert_inventory(
+        stage, "usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES", payload / INVENTORY
     )
 
 
@@ -209,19 +227,17 @@ def stage_conda_binary(root: Path, payload: Path, binary: Path, tools: Path) -> 
         cwd=payload,
         env=env,
     )
-    meta = (ROOT / "packaging/conda/zerostack-bin/meta.yaml").read_text(encoding="utf-8")
-    for license_file in ("LICENSE", INVENTORY):
-        if f"    - {license_file}" not in meta:
-            raise RuntimeError(f"Conda binary recipe omits license_file {license_file}")
     assert_files(
         stage,
         {
             "bin/mini-agent": binary,
             "share/licenses/zerostack-bin/LICENSE": payload / "LICENSE",
-            "share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY,
             "share/doc/zerostack-bin/NOTICE": payload / "NOTICE",
             "share/doc/zerostack-bin/SOURCE.md": payload / "SOURCE.md",
         },
+    )
+    assert_inventory(
+        stage, "share/licenses/zerostack-bin/THIRD_PARTY_LICENSES", payload / INVENTORY
     )
 
 
@@ -230,14 +246,17 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
     source = root / "conda-source-input"
     shutil.copytree(payload, source)
     # A source tarball has no prebuilt inventory; the recipe generates it with
-    # the repository's generator, stubbed here like cargo.
-    (source / INVENTORY).unlink()
-    (source / "scripts").mkdir()
-    (source / "scripts/third_party_licenses.py").write_text(
-        f"INVENTORY_FIXTURE = {INVENTORY_FIXTURE!r}\n"
-        + INVENTORY_GENERATOR_STUB.split("\n", 1)[1],
-        encoding="utf-8",
-    )
+    # the repository's generator, stubbed here like cargo. A payload without
+    # an inventory stands for a source archive that predates the generator.
+    generates_inventory = (source / INVENTORY).is_file()
+    if generates_inventory:
+        (source / INVENTORY).unlink()
+        (source / "scripts").mkdir()
+        (source / "scripts/third_party_licenses.py").write_text(
+            f"INVENTORY_FIXTURE = {INVENTORY_FIXTURE!r}\n"
+            + INVENTORY_GENERATOR_STUB.split("\n", 1)[1],
+            encoding="utf-8",
+        )
     env = recipe_env(
         tools,
         PREFIX=str(stage),
@@ -256,7 +275,7 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
         raise RuntimeError("Conda source recipe test cannot find PREFIX/THIRDPARTY.yml")
 
     meta = (ROOT / "packaging/conda/zerostack/meta.yaml").read_text(encoding="utf-8")
-    for license_file in ("LICENSE", "THIRDPARTY.yml", INVENTORY):
+    for license_file in ("LICENSE", "THIRDPARTY.yml"):
         if f"    - {license_file}" not in meta:
             raise RuntimeError(f"Conda source recipe omits license_file {license_file}")
         license_dir = stage / "info/licenses"
@@ -271,12 +290,13 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
             "info/licenses/LICENSE": payload / "LICENSE",
             "share/doc/zerostack/NOTICE": payload / "NOTICE",
             "share/doc/zerostack/SOURCE.md": payload / "SOURCE.md",
-            f"share/doc/zerostack/{INVENTORY}": source / INVENTORY,
         },
     )
-    inventory = (stage / f"share/doc/zerostack/{INVENTORY}").read_text(encoding="utf-8")
-    if f"Target: {SOURCE_BUILD_TARGET}\n" not in inventory:
-        raise RuntimeError("Conda source recipe did not generate the host-target inventory")
+    assert_inventory(stage, f"share/doc/zerostack/{INVENTORY}", source / INVENTORY)
+    if generates_inventory:
+        inventory = (stage / f"share/doc/zerostack/{INVENTORY}").read_text(encoding="utf-8")
+        if f"Target: {SOURCE_BUILD_TARGET}\n" not in inventory:
+            raise RuntimeError("Conda source recipe did not generate the host-target inventory")
 
 
 HOMEBREW_HARNESS = r"""
@@ -330,9 +350,9 @@ def stage_homebrew(root: Path, payload: Path, binary: Path, tools: Path) -> None
             "share/zerostack/LICENSE": payload / "LICENSE",
             "share/zerostack/NOTICE": payload / "NOTICE",
             "share/zerostack/SOURCE.md": payload / "SOURCE.md",
-            f"share/zerostack/{INVENTORY}": payload / INVENTORY,
         },
     )
+    assert_inventory(stage, f"share/zerostack/{INVENTORY}", payload / INVENTORY)
 
 
 STAGERS = {
@@ -358,12 +378,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     with tempfile.TemporaryDirectory(prefix="mini-agent-package-compliance-") as temporary:
-        root = Path(temporary)
-        payload, binary = make_payload(root)
-        tools = controlled_tools(root, binary)
-        for channel in dict.fromkeys(args.channel):
-            STAGERS[channel](root, payload, binary, tools)
-            print(f"package compliance smoke passed: {channel}")
+        # Every recipe must install archives that ship the third-party
+        # inventory (1.9.5 and later) and still install the pinned older
+        # archives that predate it.
+        for variant, with_inventory in (("with-inventory", True), ("without-inventory", False)):
+            root = Path(temporary) / variant
+            payload, binary = make_payload(root, with_inventory=with_inventory)
+            tools = controlled_tools(root, binary)
+            for channel in dict.fromkeys(args.channel):
+                STAGERS[channel](root, payload, binary, tools)
+                print(f"package compliance smoke passed: {channel} ({variant})")
     return 0
 
 

@@ -14,6 +14,11 @@ REPO="sebahrens/mini-agent"
 BINARY_NAME="mini-agent"
 DEFAULT_DIR="${HOME}/.local/bin"
 REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md" "THIRD_PARTY_LICENSES")
+# THIRD_PARTY_LICENSES (the generated third-party licence inventory) is first
+# shipped by this release. Archives of older releases predate it and install
+# without it, with a warning; from this version on it is required.
+INVENTORY_DOCUMENT="THIRD_PARTY_LICENSES"
+FIRST_INVENTORY_RELEASE="1.9.5"
 
 usage() {
     local status="${1:-0}"
@@ -391,11 +396,50 @@ if [[ ! -f "${TMPDIR}/${BINARY_NAME}" ]]; then
     echo "Error: archive does not contain the canonical ${BINARY_NAME} executable." >&2
     exit 1
 fi
+# Succeeds only when version $1 (major.minor.patch; a pre-release or build
+# suffix is ignored) is a well-formed version strictly older than $2. An
+# unparseable version is never treated as older.
+version_predates() {
+    local have want i
+    have="${1%%[-+]*}"
+    want="$2"
+    [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a have <<< "$have"
+    IFS=. read -r -a want <<< "$want"
+    for i in 0 1 2; do
+        if ((10#${have[i]} < 10#${want[i]})); then return 0; fi
+        if ((10#${have[i]} > 10#${want[i]})); then return 1; fi
+    done
+    return 1
+}
+
+# The release version of the verified archive: the requested --release, or
+# for "latest" the version the verified executable reports. Empty when it
+# cannot be determined, in which case every document stays required.
+ARCHIVE_VERSION="$RELEASE_VERSION"
+if [[ -z "$ARCHIVE_VERSION" ]]; then
+    ARCHIVE_VERSION="$("${TMPDIR}/${BINARY_NAME}" --version 2>/dev/null \
+        | sed -n "s/^${BINARY_NAME} \([0-9][0-9A-Za-z.+-]*\)\$/\1/p" | head -1 || true)"
+fi
+
+INSTALL_DOCUMENTS=()
 for document in "${REQUIRED_DOCUMENTS[@]}"; do
-    if [[ ! -f "${TMPDIR}/${document}" ]]; then
-        echo "Error: archive does not contain required GPL document ${document}." >&2
+    if [[ -f "${TMPDIR}/${document}" ]]; then
+        INSTALL_DOCUMENTS+=("$document")
+        continue
+    fi
+    if [[ "$document" == "$INVENTORY_DOCUMENT" ]]; then
+        if version_predates "$ARCHIVE_VERSION" "$FIRST_INVENTORY_RELEASE"; then
+            echo "Warning: ${BINARY_NAME} ${ARCHIVE_VERSION} does not include ${document}:" \
+                "this release predates the bundled third-party licence inventory" \
+                "(first shipped in ${FIRST_INVENTORY_RELEASE})." >&2
+            continue
+        fi
+        echo "Error: archive does not contain the required third-party licence inventory ${document}." >&2
         exit 1
     fi
+    echo "Error: archive does not contain required GPL document ${document}." >&2
+    exit 1
 done
 
 if [[ "$(basename "$INSTALL_DIR")" == "bin" ]]; then
@@ -404,7 +448,7 @@ else
     DOC_DIR="${INSTALL_DIR}/share/doc/${BINARY_NAME}"
 fi
 mkdir -p "$DOC_DIR"
-for document in "${REQUIRED_DOCUMENTS[@]}"; do
+for document in "${INSTALL_DOCUMENTS[@]}"; do
     cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"
 done
 

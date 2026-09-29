@@ -63,8 +63,21 @@ shell installer installs the inventory to `share/doc/mini-agent/`, Homebrew to `
 the Conda binary recipe to `share/licenses/<package>/` (Conda also lists it as a `license_file`),
 the Conda source recipe generates it for its host target, the MSI installs it as
 `THIRD_PARTY_LICENSES.txt`, and each VSIX carries it next to its native binary as
-`bin/<target>/THIRD_PARTY_LICENSES`. Releases published before this inventory existed do not contain
-it, so the installer and the binary recipes require a release that ships it.
+`bin/<target>/THIRD_PARTY_LICENSES`.
+
+The first release that ships the inventory is 1.9.5 (`FIRST_INVENTORY_RELEASE` in `install.sh`).
+Until then the latest published release and the checked-in Homebrew, AUR, and Conda recipes still
+point at archives without it, so the rollout is guarded: `install.sh` requires the inventory only
+for archives of 1.9.5 or later (the requested `--release`, or for `latest` the version the verified
+executable reports; an unreadable version keeps it required) and otherwise installs with the
+warning "this release predates the bundled third-party licence inventory";
+`scripts/smoke-canonical-installer.sh` applies the same rule; and the recipes install the file only
+when the archive contains it (the Conda source recipe generates it only when the source archive
+contains `scripts/third_party_licenses.py`), so neither Conda recipe lists it as a `license_file` or
+tests for it yet. `scripts/smoke-package-compliance.py` stages every recipe with and without the
+inventory. Once 1.9.5 has shipped and every recipe pins it or later, drop these guards: make the
+recipe installs unconditional, restore the Conda `license_file` and `test -f` entries, and remove
+the version tolerance from the installer and the canonical installer smoke.
 
 The manually dispatched `Windows release archive smoke` workflow is the non-publishing audit path
 for the Windows default-feature archive. It builds the documented target, transfers the exact

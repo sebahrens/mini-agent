@@ -88,7 +88,8 @@ Notable changes to mini-agent are documented in this file. The format follows
   archive ships a generated `THIRD_PARTY_LICENSES` naming each package of its target's locked
   dependency resolution with its license and verbatim license texts, the installer, Homebrew, AUR,
   Conda, MSI and VSIX install it, and `NOTICE` now credits QuickJS and rquickjs with their MIT texts.
-  Installing a release published before this change with `install.sh` now fails for want of it.
+  Releases before 1.9.5 predate the inventory: `install.sh` and the package recipes still install
+  them, and the installer warns that the inventory is absent.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

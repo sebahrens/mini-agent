@@ -54,12 +54,13 @@ class InstallScriptTests(unittest.TestCase):
         *,
         include_notice: bool = True,
         os_name: str = "Darwin",
+        version_output: str = "mini-agent 1.7.2",
     ) -> tuple[Path, Path]:
         root = Path(directory)
         release = root / "release"
         release.mkdir()
         binary = root / "mini-agent"
-        binary.write_text("#!/bin/sh\necho mini-agent 1.7.2\n", encoding="utf-8")
+        binary.write_text(f"#!/bin/sh\necho {version_output}\n", encoding="utf-8")
         binary.chmod(0o755)
         target = {"Darwin": "apple-darwin", "Linux": "unknown-linux-musl"}[os_name]
         archive = release / f"mini-agent-aarch64-{target}.tar.gz"
@@ -258,30 +259,73 @@ fi
                 ),
             )
 
-    def test_missing_third_party_inventory_fails_before_installing_binary(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            release, stub_bin = self.make_fixture(directory)
-            archive = next(release.glob("*.tar.gz"))
-            with tarfile.open(archive, "r:gz") as packaged:
-                members = [
-                    (member, packaged.extractfile(member).read())
-                    for member in packaged.getmembers()
-                    if member.name != "THIRD_PARTY_LICENSES"
-                ]
-            with tarfile.open(archive, "w:gz") as repacked:
-                for member, contents in members:
-                    repacked.addfile(member, io.BytesIO(contents))
-            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            (release / "SHA256SUMS").write_text(
-                f"{digest}  {archive.name}\n", encoding="utf-8"
-            )
+    def drop_inventory(self, release: Path) -> None:
+        archive = next(release.glob("*.tar.gz"))
+        with tarfile.open(archive, "r:gz") as packaged:
+            members = [
+                (member, packaged.extractfile(member).read())
+                for member in packaged.getmembers()
+                if member.name != "THIRD_PARTY_LICENSES"
+            ]
+        with tarfile.open(archive, "w:gz") as repacked:
+            for member, contents in members:
+                repacked.addfile(member, io.BytesIO(contents))
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (release / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
 
-            result = self.run_installer(root, release, stub_bin)
+    def test_release_predating_the_inventory_installs_with_a_warning(self) -> None:
+        # (requested --release, version the archived executable reports)
+        for requested, reported in (("1.9.4", "1.9.4"), (None, "1.9.4"), (None, "1.9.4-rc.1")):
+            with self.subTest(requested=requested, reported=reported):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    release, stub_bin = self.make_fixture(
+                        directory, version_output=f"mini-agent {reported}"
+                    )
+                    self.drop_inventory(release)
 
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("THIRD_PARTY_LICENSES", result.stderr)
-            self.assertFalse((root / "prefix/bin/mini-agent").exists())
+                    result = self.run_installer(
+                        root, release, stub_bin, release_version=requested
+                    )
+
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn(
+                        "this release predates the bundled third-party licence inventory",
+                        result.stderr,
+                    )
+                    self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+                    documents = root / "prefix/share/doc/mini-agent"
+                    for document in ("LICENSE", "NOTICE", "SOURCE.md"):
+                        self.assertTrue((documents / document).is_file())
+                    self.assertFalse((documents / "THIRD_PARTY_LICENSES").exists())
+
+    def test_release_shipping_the_inventory_requires_it(self) -> None:
+        for requested, reported in (
+            ("1.9.5", "1.9.5"),
+            (None, "1.9.5"),
+            (None, "1.10.0-rc.1"),
+            # A version that cannot be read never relaxes the requirement.
+            (None, "unexpected output"),
+        ):
+            with self.subTest(requested=requested, reported=reported):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    release, stub_bin = self.make_fixture(
+                        directory, version_output=f"mini-agent {reported}"
+                    )
+                    self.drop_inventory(release)
+
+                    result = self.run_installer(
+                        root, release, stub_bin, release_version=requested
+                    )
+
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn(
+                        "required third-party licence inventory THIRD_PARTY_LICENSES",
+                        result.stderr,
+                    )
+                    self.assertNotIn("predates", result.stderr)
+                    self.assertFalse((root / "prefix/bin/mini-agent").exists())
 
     def test_missing_notice_fails_before_installing_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

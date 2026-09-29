@@ -23,14 +23,11 @@ test:
   commands:
     - mini-agent --help
     - mini-agent --version
-    - test -f ${PREFIX}/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES
 
 about:
   home: https://github.com/sebahrens/mini-agent
   license: GPL-3.0-only
-  license_file:
-    - LICENSE
-    - THIRD_PARTY_LICENSES
+  license_file: LICENSE
   summary: Minimalistic coding agent written in Rust, optimized for memory footprint and performance
   # conda has no optional-dependency field, and the sandbox only trusts a root-owned system
   # bubblewrap, so the prerequisite is documented rather than declared under requirements.

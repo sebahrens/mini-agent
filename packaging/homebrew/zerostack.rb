@@ -26,7 +26,9 @@ class Zerostack < Formula
 
   def install
     bin.install "mini-agent"
-    pkgshare.install "LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"
+    pkgshare.install "LICENSE", "NOTICE", "SOURCE.md"
+    # Archives before 1.9.5 predate the third-party licence inventory.
+    pkgshare.install "THIRD_PARTY_LICENSES" if File.exist?("THIRD_PARTY_LICENSES")
   end
 
   test do
