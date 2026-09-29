@@ -104,6 +104,32 @@ fn save_and_find_session_by_prefix() {
     drop(env);
 }
 
+// mini-agent-p73n1: a session save reaches stable storage (file, then its
+// directory entry) before it reports success.
+#[test]
+fn saving_a_session_is_durable() {
+    let env = setup_test_env();
+    let mut s = Session::new("openai", "gpt-4", 128000, "");
+    s.add_message(MessageRole::User, "hello");
+    // The first save also creates the session's lock file.
+    save_session(&s).unwrap();
+    s.add_message(MessageRole::User, "again");
+    let before = crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get);
+    save_session(&s).unwrap();
+    let syncs = crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get) - before;
+    let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        2
+    } else {
+        1
+    };
+    assert_eq!(syncs, expected);
+    assert_eq!(
+        load_session_exact(&s.id).unwrap().unwrap().messages.len(),
+        2
+    );
+    drop(env);
+}
+
 #[test]
 fn recent_session_lookup_is_scoped_to_the_captured_workspace() {
     let env = setup_test_env();

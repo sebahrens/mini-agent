@@ -100,7 +100,7 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         );
         emit(
             false,
-            "  /share                 share session as a secret GitHub gist",
+            "  /share                 share session as a secret GitHub gist (asks to confirm)",
         );
     }
     emit(

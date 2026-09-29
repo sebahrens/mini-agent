@@ -58,7 +58,10 @@ pub(crate) fn config_path() -> PathBuf {
 }
 
 /// Write `content` privately and atomically via a same-directory temporary
-/// file. A crash mid-write leaves the previous version intact.
+/// file. A crash mid-write leaves the previous version intact, and once this
+/// returns `Ok` the new version is durable: the temporary file is `fsync`ed
+/// before the rename and the directory after it (mini-agent-p73n1), so a
+/// power loss cannot leave an undecodable session for `--continue` to skip.
 pub fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         crate::paths::ensure_private_directory(parent)?;

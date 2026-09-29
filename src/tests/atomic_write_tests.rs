@@ -758,3 +758,62 @@ async fn expecting_write_rejects_a_same_length_rewrite() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "bbbb");
     assert_eq!(temp_residue(dir.path()), 0);
 }
+
+/// Syncs the persistence entry points performed on this thread while `write`
+/// ran: one for the file on every platform, one more for its directory where
+/// a directory can be synced.
+fn durable_syncs_during(write: impl FnOnce()) -> usize {
+    let before = crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get);
+    write();
+    crate::fs::DURABLE_SYNCS.with(std::cell::Cell::get) - before
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SYNCS_PER_DURABLE_WRITE: usize = 2;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SYNCS_PER_DURABLE_WRITE: usize = 1;
+
+// mini-agent-p73n1: the persistence entry points fsync the temp file before
+// the rename and the directory after it, so a crash cannot lose or truncate
+// the session `--continue` would pick.
+#[test]
+fn persistence_writes_are_durable() {
+    let dir = TempDir::new("durable");
+    let target = dir.join("state.json");
+    assert_eq!(
+        durable_syncs_during(|| crate::fs::atomic_write_sync(&target, b"{}").unwrap()),
+        SYNCS_PER_DURABLE_WRITE
+    );
+    assert_eq!(
+        durable_syncs_during(|| crate::fs::atomic_write_sync(&target, b"{\"v\":2}").unwrap()),
+        SYNCS_PER_DURABLE_WRITE
+    );
+    assert_eq!(
+        durable_syncs_during(|| atomic_create_sync(&dir.join("new.json"), b"{}").unwrap()),
+        SYNCS_PER_DURABLE_WRITE
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"{\"v\":2}");
+    assert_eq!(temp_residue(dir.path()), 0);
+}
+
+// The private (0600, no-follow) wrapper used for sessions and config keeps its
+// guarantees and gains the durability.
+#[cfg(unix)]
+#[test]
+fn private_persistence_writes_are_durable_and_stay_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("durable_private");
+    let target = dir.join("config.toml");
+    assert_eq!(
+        durable_syncs_during(|| crate::fs::private_atomic_write_sync(&target, b"a = 1\n").unwrap()),
+        SYNCS_PER_DURABLE_WRITE
+    );
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let link = dir.join("link.toml");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(crate::fs::private_atomic_write_sync(&link, b"a = 2\n").is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"a = 1\n");
+}

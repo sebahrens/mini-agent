@@ -517,3 +517,45 @@ fn html_title_falls_back_to_session_id() {
         "unnamed sessions get an id-based title: {html}"
     );
 }
+
+// mini-agent-p73n1: the gist client is bounded, so an unresponsive GitHub
+// endpoint ends `/share` with an error instead of blocking the UI forever.
+#[tokio::test(start_paused = true)]
+async fn gist_upload_times_out_against_a_server_that_never_answers() {
+    assert!(crate::extras::export::GIST_CONNECT_TIMEOUT <= std::time::Duration::from_secs(30));
+    assert!(crate::extras::export::GIST_REQUEST_TIMEOUT <= std::time::Duration::from_secs(120));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // Accept and hold the connection without ever answering.
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        }
+    });
+    let client = crate::extras::export::gist_client().unwrap();
+    // With the clock paused, a client without a timeout would let this outer
+    // guard fire instead; the client's own timeout must fire first.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        crate::extras::export::upload_gist(
+            &client,
+            &format!("http://{address}/gists"),
+            "test-token",
+            "session.html",
+            "<html></html>",
+            "test",
+        ),
+    )
+    .await
+    .expect("the gist client must time out on its own");
+    server.abort();
+    let error = result.expect_err("an unanswered upload must fail");
+    let timed_out = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(reqwest::Error::is_timeout);
+    assert!(timed_out, "{error:#}");
+}

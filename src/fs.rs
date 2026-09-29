@@ -833,6 +833,56 @@ enum AtomicWriteMode {
     CreateNew,
 }
 
+/// Whether an atomic write must be on stable storage when it reports success
+/// (mini-agent-p73n1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteDurability {
+    /// Flush userspace buffers only. The rename is still atomic, but a crash
+    /// or power loss shortly afterwards may leave the previous version (or,
+    /// on some filesystems, an empty file). Used for workspace edits made by
+    /// tools, which the user's own tooling already treats as ordinary writes.
+    Flush,
+    /// `fsync` the temporary file before the rename and the parent directory
+    /// after it, so both the new contents and the directory entry naming them
+    /// survive a crash or power loss once the call returns. Used for the
+    /// application's own state (sessions, config, memory, credentials).
+    Sync,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Count of durable syncs performed on this thread, so tests can prove
+    /// the persistence entry points actually reach stable storage.
+    pub(crate) static DURABLE_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn record_durable_sync() {
+    #[cfg(test)]
+    DURABLE_SYNCS.with(|count| count.set(count.get() + 1));
+}
+
+/// `fsync` a directory so a rename inside it is durable. Filesystems that
+/// cannot sync a directory report `EINVAL`/`ENOTSUP`; nothing more can be done
+/// there, so that is not an error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sync_directory(directory: &std::fs::File) -> std::io::Result<()> {
+    match directory.sync_all() {
+        Ok(()) => {
+            record_durable_sync();
+            Ok(())
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOTSUP)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Cooperative stop signal for descriptor-relative atomic writes. Cancellation and the final
 /// publication-start decision share one atomic state transition: cancellation which wins prevents
 /// rename, while an already-approved syscall may finish under an ambiguous caller result.
@@ -1140,8 +1190,10 @@ pub(crate) async fn open_stable_file(path: &Path) -> std::io::Result<tokio::fs::
 /// random name and mode `0600`, then renamed over the target in the same
 /// directory.
 ///
-/// The helper intentionally flushes userspace buffers but does not `fsync`;
-/// this preserves the existing atomicity (not power-loss durability) contract.
+/// This test entry point, like the tool-facing `atomic_write_resolved*` family,
+/// flushes userspace buffers but does not `fsync`: atomicity, not power-loss
+/// durability. The persistence entry points ([`atomic_write_sync`],
+/// [`atomic_create_sync`]) are durable; see [`AtomicWriteDurability`].
 ///
 /// Other platforms use a conservative no-symlink fallback. Because their
 /// standard library APIs cannot provide equivalent descriptor-relative replace
@@ -1236,6 +1288,7 @@ async fn atomic_write_resolved_inner(
             approved_parent.as_ref(),
             expected_content.as_ref(),
             AtomicWriteMode::Replace,
+            AtomicWriteDurability::Flush,
             AtomicWriteFailure::None,
             &cancellation,
         )
@@ -1282,6 +1335,7 @@ pub(crate) async fn atomic_create_resolved_checked_cancellable(
             Some(&approved_parent),
             None,
             AtomicWriteMode::CreateNew,
+            AtomicWriteDurability::Flush,
             AtomicWriteFailure::None,
             &cancellation,
         )
@@ -1291,6 +1345,13 @@ pub(crate) async fn atomic_create_resolved_checked_cancellable(
 }
 
 /// Synchronous entry point for config/session/memory persistence.
+///
+/// Durable (mini-agent-p73n1): the temporary file is `fsync`ed before the
+/// rename and the parent directory after it, so once this returns `Ok` the new
+/// contents survive a crash or power loss. Before this change the write was
+/// only atomic, and a crash could leave a session `--continue` would pick
+/// undecodable. The no-follow, private-mode and identity guarantees are
+/// unchanged.
 pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let root = path
         .parent()
@@ -1303,12 +1364,14 @@ pub(crate) fn atomic_write_sync(path: &Path, contents: &[u8]) -> std::io::Result
         None,
         None,
         AtomicWriteMode::Replace,
+        AtomicWriteDurability::Sync,
         AtomicWriteFailure::None,
         &AtomicWriteCancellation::default(),
     )
 }
 
-/// Synchronous create-only variant used for randomly named tool output.
+/// Synchronous create-only variant used for randomly named tool output and
+/// private state files. Durable like [`atomic_write_sync`].
 pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let root = path
         .parent()
@@ -1321,6 +1384,7 @@ pub(crate) fn atomic_create_sync(path: &Path, contents: &[u8]) -> std::io::Resul
         None,
         None,
         AtomicWriteMode::CreateNew,
+        AtomicWriteDurability::Sync,
         AtomicWriteFailure::None,
         &AtomicWriteCancellation::default(),
     )
@@ -1339,6 +1403,7 @@ pub(crate) fn atomic_write_within_sync(
         None,
         None,
         AtomicWriteMode::Replace,
+        AtomicWriteDurability::Sync,
         AtomicWriteFailure::None,
         &AtomicWriteCancellation::default(),
     )
@@ -1358,6 +1423,7 @@ pub(crate) fn atomic_write_with_failure_sync(
         None,
         None,
         AtomicWriteMode::Replace,
+        AtomicWriteDurability::Sync,
         if fail_rename {
             AtomicWriteFailure::Rename
         } else {
@@ -1438,6 +1504,7 @@ fn atomic_write_within_sync_impl(
     approved_parent: Option<&CheckedMetadata>,
     expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
+    durability: AtomicWriteDurability,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
@@ -1479,6 +1546,7 @@ fn atomic_write_within_sync_impl(
             approved_parent,
             expected_content,
             mode,
+            durability,
             failure,
             cancellation,
         ),
@@ -1515,6 +1583,7 @@ fn atomic_write_platform(
     approved_parent: Option<&CheckedMetadata>,
     expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
+    durability: AtomicWriteDurability,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
@@ -1840,7 +1909,12 @@ fn atomic_write_platform(
             return Err(std::io::Error::other("injected atomic-write failure"));
         }
         atomic_write_stage("platform_temp_write", temp.write_all(contents))?;
-        atomic_write_stage("platform_temp_flush", temp.flush())
+        atomic_write_stage("platform_temp_flush", temp.flush())?;
+        if durability == AtomicWriteDurability::Sync {
+            atomic_write_stage("platform_temp_sync", temp.sync_all())?;
+            record_durable_sync();
+        }
+        Ok(())
     })();
     if let Err(error) = write_result {
         drop(temp);
@@ -1998,6 +2072,11 @@ fn atomic_write_platform(
         return Err(error);
     }
     drop(temp);
+    if durability == AtomicWriteDurability::Sync {
+        // The contents were synced before the rename; the new directory entry
+        // is durable only once the directory itself is.
+        atomic_write_stage("platform_directory_sync", sync_directory(&directory))?;
+    }
     Ok(())
 }
 
@@ -2012,6 +2091,7 @@ fn atomic_write_platform(
     approved_parent: Option<&CheckedMetadata>,
     expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
+    durability: AtomicWriteDurability,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
@@ -2298,7 +2378,19 @@ fn atomic_write_platform(
         delete_open_file(&file);
         return Err(std::io::Error::other("injected atomic-write failure"));
     }
-    if let Err(error) = file.write_all(contents).and_then(|()| file.flush()) {
+    // NTFS journals the rename itself; syncing the contents first makes the
+    // published file durable (FlushFileBuffers).
+    let write_result = file
+        .write_all(contents)
+        .and_then(|()| file.flush())
+        .and_then(|()| {
+            if durability == AtomicWriteDurability::Sync {
+                file.sync_all().inspect(|_| record_durable_sync())
+            } else {
+                Ok(())
+            }
+        });
+    if let Err(error) = write_result {
         delete_open_file(&file);
         return Err(error);
     }
@@ -2384,6 +2476,7 @@ fn atomic_write_platform(
     approved_parent: Option<&CheckedMetadata>,
     expected_content: Option<&ContentDigest>,
     mode: AtomicWriteMode,
+    durability: AtomicWriteDurability,
     failure: AtomicWriteFailure,
     cancellation: &AtomicWriteCancellation,
 ) -> std::io::Result<()> {
@@ -2453,6 +2546,13 @@ fn atomic_write_platform(
         remove_if_owned(&temp, &temp_identity);
         return Err(error);
     }
+    if durability == AtomicWriteDurability::Sync
+        && let Err(error) = file.sync_all()
+    {
+        drop(file);
+        remove_if_owned(&temp, &temp_identity);
+        return Err(error);
+    }
     if let Err(error) = cancellation.check() {
         drop(file);
         remove_if_owned(&temp, &temp_identity);
@@ -2497,6 +2597,10 @@ fn atomic_write_platform(
     if let Err(error) = cancellation.publish(|| std::fs::rename(&temp, &target)) {
         remove_if_owned(&temp, &temp_identity);
         return Err(error);
+    }
+    if durability == AtomicWriteDurability::Sync {
+        // Best effort: not every platform can open a directory to sync it.
+        let _ = std::fs::File::open(&parent).and_then(|directory| directory.sync_all());
     }
     Ok(())
 }

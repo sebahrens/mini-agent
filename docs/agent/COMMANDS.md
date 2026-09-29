@@ -26,7 +26,8 @@ All slash commands are available from the TUI input prompt.
 | `/history` | Show global chat history (last 10 entries across sessions). |
 | `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Quote a file name that contains spaces. Requires the `export` feature (default-on). |
 | `/import <file>` | Import a session from a versioned zerostack JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
-| `/share` | Upload the HTML export as a secret GitHub gist and print the URL. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
+| `/share` | Show what sharing would publish: the HTML export's size, how many tool outputs it contains (tool output can include file contents and secrets such as `.env` values), and that a secret gist is readable by anyone with the link. Nothing is uploaded. |
+| `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). |
 | `/queue clear` | Empty the queue. |
 | `/queue pop` | Remove the last queued input. |
@@ -374,6 +375,8 @@ tree before accepting the next command.
 In `--print` mode, `Ctrl+C` or Unix `SIGTERM` cancels the explicit shell command
 and waits for its owned process group to terminate, the direct child to be reaped,
 and the command audit to finish before exiting with a nonzero interruption error.
+That wait is bounded: a second `Ctrl+C`/`SIGTERM`, or 10 seconds without the cleanup
+finishing, stops waiting and exits with status 130.
 
 | Example | Description |
 | ------- | ----------- |

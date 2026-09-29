@@ -504,3 +504,130 @@ async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent(
     assert_eq!(ctx.session.provider, "openrouter");
     assert!(matches!(ctx.client, AnyClient::OpenRouter(_)));
 }
+
+/// mini-agent-p73n1: `/share` never uploads on its own. It states the size,
+/// the number of tool outputs and that the gist is readable by anyone with
+/// the link, and only `/share confirm` uploads.
+#[cfg(feature = "export")]
+#[tokio::test]
+async fn share_requires_confirmation_before_uploading() {
+    let root = FixtureRoot(
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-share-confirm-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&root.0).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.0).unwrap());
+    let cli = Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--api-key",
+        "unused-test-key",
+        "--no-sandbox",
+    ]);
+    let cfg = Config::default();
+    let mut context = ContextFiles {
+        workspace_root: workspace.root().to_path_buf(),
+        agents: None,
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    let mut client = AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .build()
+            .unwrap(),
+    );
+    let mut session = Session::new("openrouter", "current-model", 128_000, "prompt-model");
+    session.add_message(MessageRole::User, "show me the env file");
+    session.add_tool_call_with_id("read-env", "read", &json!({"path": ".env"}));
+    let _ = session.add_tool_result_with_id("read-env", "read", "API_KEY=secret");
+    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut agent = None;
+    let mut renderer = Renderer::new().unwrap();
+    let mut input = InputEditor::new();
+    let mut terminal_guard = TerminalGuard::detached_for_test();
+    let invalidated = std::sync::atomic::AtomicBool::new(false);
+    let mut show_reasoning = false;
+    let mut reasoning_enabled = false;
+    let mut is_running = false;
+    let mut todo_tools_enabled = true;
+    #[cfg(feature = "skills")]
+    let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+    let mut ctx = SlashCtx {
+        prebuild_invalidated: &invalidated,
+        agent: &mut agent,
+        client: &mut client,
+        renderer: &mut renderer,
+        session: &mut session,
+        cli: &cli,
+        cfg: &cfg,
+        context: &mut context,
+        workspace: &workspace,
+        show_reasoning: &mut show_reasoning,
+        reasoning_enabled: &mut reasoning_enabled,
+        is_running: &mut is_running,
+        input: &mut input,
+        permission: &None,
+        ask_tx: &None,
+        todo_tools_enabled: &mut todo_tools_enabled,
+        sandbox: &sandbox,
+        terminal_guard: &mut terminal_guard,
+        #[cfg(feature = "skills")]
+        skill_services: &skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager: None,
+    };
+
+    fn rendered_text(renderer: &Renderer) -> String {
+        let width = 4096;
+        let line_count = renderer.feed().line_count(width);
+        if line_count == 0 {
+            return String::new();
+        }
+        renderer
+            .feed()
+            .selected_text(width, 0, line_count - 1)
+            .unwrap()
+    }
+
+    session::handle(&["/share"], &mut ctx).await.unwrap();
+    let shown = rendered_text(ctx.renderer);
+    let html_bytes = crate::extras::export::session_to_html(ctx.session).len();
+    assert!(
+        shown.contains("readable by anyone with the link"),
+        "{shown}"
+    );
+    assert!(shown.contains("1 tool output,"), "{shown}");
+    assert!(
+        shown.contains(&crate::agent::tools::list_dir::format_size(
+            html_bytes as u64
+        )),
+        "{shown}"
+    );
+    assert!(shown.contains("/share confirm"), "{shown}");
+    // Nothing was attempted: no upload, no token lookup.
+    assert!(!shown.contains("share failed"), "{shown}");
+    assert!(!shown.contains("shared as secret gist"), "{shown}");
+
+    // Any other argument is not a confirmation either.
+    session::handle(&["/share", "yes"], &mut ctx).await.unwrap();
+    let shown = rendered_text(ctx.renderer);
+    assert!(shown.contains("usage: /share"), "{shown}");
+    assert!(!shown.contains("share failed"), "{shown}");
+}

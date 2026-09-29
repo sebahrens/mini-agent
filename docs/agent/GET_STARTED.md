@@ -296,7 +296,10 @@ During headless agent turns (`-p` and `--loop`), Ctrl+C or Unix SIGTERM cancels 
 waits and active work, waits for registered tool and hook cleanup, then saves completed
 tool records and observed usage before exiting nonzero. An interrupted `-p --output json`
 turn reports `"stop_reason":"failed"` with its partial result. Completion verification
-is interrupted through the same cleanup path.
+is interrupted through the same cleanup path. The wait after the first signal is bounded:
+a second Ctrl+C/SIGTERM, or 10 seconds without the turn and its cleanup settling, saves
+whatever the turn returned and exits with status 130 without
+waiting for the stalled work.
 
 `files_changed` combines workspace paths whose bounded Git status changed during the invocation
 with `write` and `edit` targets visible in the provider transcript. It is empty when no

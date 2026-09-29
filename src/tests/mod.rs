@@ -98,6 +98,8 @@ mod grep_tests;
 mod harness_eval_tests;
 #[cfg(test)]
 mod headless_ask_tests;
+#[cfg(all(test, unix))]
+mod headless_forced_stop_tests;
 #[cfg(all(test, feature = "hooks"))]
 mod hooks;
 #[cfg(test)]
