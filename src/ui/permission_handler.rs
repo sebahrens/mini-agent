@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::event::UserEvent;
 use crate::permission::checker::PromptGrantOffer;
+use crate::ui::events::sanitize_output;
 use crate::ui::renderer::Renderer;
 use crate::ui::state::{AgentRunState, UiContext};
 use crate::ui::utils::suggest_pattern;
@@ -70,8 +71,61 @@ fn defer_during_prompt(event: &UserEvent) -> bool {
     matches!(event, UserEvent::Resize | UserEvent::Paste(_))
 }
 
-/// Show `header` and `options`, then wait for one recognised key. Resize and
-/// paste events are deferred; a closed input channel aborts.
+/// Transcript navigation that stays available while a prompt waits, so the
+/// request's context (and a long command's full text) can be reviewed
+/// before answering. The prompt claims none of these keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptScroll {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+fn prompt_scroll(event: &UserEvent) -> Option<PromptScroll> {
+    match event {
+        UserEvent::ScrollUp => Some(PromptScroll::LineUp),
+        UserEvent::ScrollDown => Some(PromptScroll::LineDown),
+        UserEvent::Key(key) => match key.code {
+            KeyCode::Up => Some(PromptScroll::LineUp),
+            KeyCode::Down => Some(PromptScroll::LineDown),
+            KeyCode::PageUp => Some(PromptScroll::PageUp),
+            KeyCode::PageDown => Some(PromptScroll::PageDown),
+            KeyCode::Home => Some(PromptScroll::Top),
+            KeyCode::End => Some(PromptScroll::Bottom),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn apply_prompt_scroll(renderer: &mut Renderer, scroll: PromptScroll) -> std::io::Result<()> {
+    match scroll {
+        PromptScroll::LineUp => renderer.scroll_line_up(),
+        PromptScroll::LineDown => renderer.scroll_line_down(),
+        PromptScroll::PageUp => renderer.scroll_page_up(),
+        PromptScroll::PageDown => renderer.scroll_page_down(),
+        PromptScroll::Top => renderer.scroll_to_top(),
+        PromptScroll::Bottom => renderer.scroll_to_bottom()?,
+    }
+    Ok(())
+}
+
+/// Paint the transcript and the prompt for the current geometry. The input
+/// height is reconciled first so the transcript is sized around the
+/// prompt's (possibly multi-row) layout.
+fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
+    renderer.sync_input_height("")?;
+    renderer.render_viewport()?;
+    renderer.draw_bottom("", 0, &[], 0, false)
+}
+
+/// Show `header` and `options`, then wait for one recognised key. The
+/// transcript scrolls (wheel, arrows, PageUp/PageDown, Home/End) while the
+/// prompt waits. Resize repaints the prompt and is also deferred, as is paste;
+/// a closed input channel or a quit request aborts.
 async fn read_prompt_input(
     header: &str,
     options: &str,
@@ -80,31 +134,55 @@ async fn read_prompt_input(
     deferred_user_events: &mut VecDeque<UserEvent>,
     accept: impl Fn(PromptInput) -> bool,
 ) -> anyhow::Result<PromptInput> {
-    renderer.write_line(header, C_PERM)?;
+    let header = sanitize_output(header);
+    let was_at_bottom = !renderer.is_scrolling();
+    renderer.write_line(&header, C_PERM)?;
     renderer.write_line(options, C_PERM)?;
     renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
-        tool: header.into(),
+        tool: header,
         options: options.into(),
     });
-    renderer.render_viewport()?;
-    renderer.draw_bottom("", 0, &[], 0, false)?;
+    renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
+    draw_prompt(renderer)?;
 
     let input = loop {
-        match user_rx.recv().await {
-            Some(UserEvent::Key(key)) => {
+        let Some(event) = user_rx.recv().await else {
+            break PromptInput::Abort;
+        };
+        if let Some(scroll) = prompt_scroll(&event) {
+            apply_prompt_scroll(renderer, scroll)?;
+            draw_prompt(renderer)?;
+            continue;
+        }
+        match event {
+            UserEvent::Key(key) => {
                 let input = classify_prompt_key(key);
                 if input != PromptInput::Ignore && accept(input) {
                     break input;
                 }
             }
-            Some(event) if defer_during_prompt(&event) => {
+            UserEvent::Quit => {
+                // Refuse the request, then let the main loop quit.
+                deferred_user_events.push_back(UserEvent::Quit);
+                break PromptInput::Abort;
+            }
+            UserEvent::Resize => {
+                renderer.resize();
+                renderer.invalidate();
+                draw_prompt(renderer)?;
+                deferred_user_events.push_back(UserEvent::Resize);
+            }
+            event if defer_during_prompt(&event) => {
                 deferred_user_events.push_back(event);
             }
-            Some(_) => {}
-            None => break PromptInput::Abort,
+            _ => {}
         }
     };
     renderer.permission_prompt = None;
+    if was_at_bottom {
+        // Reviewing the transcript was a detour: follow the output again.
+        renderer.scroll_to_bottom()?;
+    }
     Ok(input)
 }
 
@@ -181,7 +259,11 @@ pub async fn handle_permission_request(
         }
     }
 
-    let header = format!("[permission] {}: {}", ask_req.tool, ask_req.input);
+    let header = format!(
+        "[permission] {}: {}",
+        ask_req.tool,
+        sanitize_output(&ask_req.input)
+    );
     let options = permission_options(folder.as_deref());
     let has_folder = folder.is_some();
     let input = read_prompt_input(
@@ -290,6 +372,37 @@ mod tests {
             classify_prompt_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT)),
             PromptInput::Ignore
         );
+    }
+
+    #[test]
+    fn the_transcript_scrolls_while_a_prompt_waits() {
+        let key = |code| UserEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            prompt_scroll(&UserEvent::ScrollUp),
+            Some(PromptScroll::LineUp)
+        );
+        assert_eq!(
+            prompt_scroll(&UserEvent::ScrollDown),
+            Some(PromptScroll::LineDown)
+        );
+        assert_eq!(
+            prompt_scroll(&key(KeyCode::PageUp)),
+            Some(PromptScroll::PageUp)
+        );
+        assert_eq!(
+            prompt_scroll(&key(KeyCode::PageDown)),
+            Some(PromptScroll::PageDown)
+        );
+        assert_eq!(prompt_scroll(&key(KeyCode::Home)), Some(PromptScroll::Top));
+        assert_eq!(
+            prompt_scroll(&key(KeyCode::End)),
+            Some(PromptScroll::Bottom)
+        );
+        // Answer keys are never swallowed by navigation.
+        for answer in ['y', 'a', 'f', 'n'] {
+            assert_eq!(prompt_scroll(&key(KeyCode::Char(answer))), None);
+        }
+        assert_eq!(prompt_scroll(&key(KeyCode::Esc)), None);
     }
 
     #[test]

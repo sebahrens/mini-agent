@@ -61,8 +61,8 @@ struct ChatSnapshot {
     visible_rows: usize,
     scroll_offset: usize,
     selection_active: bool,
-    selection_start: Option<usize>,
-    selection_end: Option<usize>,
+    selection_start: Option<SelectionPoint>,
+    selection_end: Option<SelectionPoint>,
     partial: CompactString,
     partial_style: BlockStyle,
     chat_bg: Option<Color>,
@@ -101,6 +101,8 @@ pub(crate) struct BottomSnapshot {
     pub(crate) monochrome: bool,
     pub(crate) input_bg: Option<Color>,
     pub(crate) status_bg: Option<Color>,
+    /// Text of the transient notice shown on the status line, if any.
+    pub(crate) notice: Option<CompactString>,
 }
 
 /// How much of the bottom region a `draw_bottom` call must repaint.
@@ -142,6 +144,91 @@ pub(crate) fn scroll_percent(offset: usize, total: usize, visible: usize) -> usi
     ((range - offset).saturating_mul(100) / range).min(100)
 }
 
+/// One end of a transcript selection: a laid-out chat line and a display
+/// column within that line's text (the chat margin excluded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelectionPoint {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl SelectionPoint {
+    pub fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+/// Byte index of the character covering display column `col` in `text`, or
+/// `text.len()` when the column lies past the end of the text.
+fn byte_at_display_col(text: &str, col: usize) -> usize {
+    let mut width = 0usize;
+    for (index, ch) in text.char_indices() {
+        let char_width = char_display_width(ch);
+        if col < width + char_width.max(1) {
+            return index;
+        }
+        width += char_width;
+    }
+    text.len()
+}
+
+/// Byte range of `text` (laid-out line `line`) covered by the selection
+/// between `a` and `b`, in either order. Both ends are inclusive of the
+/// character under the pointer; lines strictly inside the selection are
+/// covered whole. `None` when the line is outside the selection.
+pub(crate) fn selection_byte_range(
+    text: &str,
+    line: usize,
+    a: SelectionPoint,
+    b: SelectionPoint,
+) -> Option<(usize, usize)> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    if line < lo.line || line > hi.line {
+        return None;
+    }
+    let start = if line == lo.line {
+        byte_at_display_col(text, lo.col)
+    } else {
+        0
+    };
+    let end = if line == hi.line {
+        let at = byte_at_display_col(text, hi.col);
+        text[at..]
+            .chars()
+            .next()
+            .map_or(at, |ch| at + ch.len_utf8())
+    } else {
+        text.len()
+    };
+    Some((start, end.max(start)))
+}
+
+/// Marker painted at the top-right of the chat viewport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryIndicator {
+    /// The view is scrolled back: position as a percentage.
+    Scrolled(String),
+    /// Following the output, but earlier transcript exists above the view.
+    Above(String),
+}
+
+/// Which viewport marker to show: the scroll position while scrolled back,
+/// otherwise a dim count of the lines above the view whenever the transcript
+/// is taller than the viewport, so there is always a cue that history can be
+/// scrolled to (terminal scrollback is unavailable on the alternate screen).
+pub(crate) fn history_indicator(
+    offset: usize,
+    total: usize,
+    visible: usize,
+) -> Option<HistoryIndicator> {
+    if offset > 0 {
+        let pct = scroll_percent(offset, total, visible);
+        return Some(HistoryIndicator::Scrolled(format!(" SCROLL {pct}% ")));
+    }
+    let above = total.saturating_sub(visible);
+    (above > 0).then(|| HistoryIndicator::Above(format!(" ↑ {above} ")))
+}
+
 /// First terminal row of the input box for a terminal with `rows` rows,
 /// `reserve` rows kept for the status line, and an input `visible_line_count`
 /// rows tall. Saturating: terminals shorter than the reserved area yield row 1
@@ -151,6 +238,84 @@ pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) 
     rows.saturating_sub(reserve)
         .saturating_sub(input_rows)
         .saturating_add(1)
+}
+
+/// Most rows a permission/chain prompt may take from a bottom area with
+/// `available_rows` rows above the status line: enough to read a wrapped
+/// path or the start of a script, never so many that the transcript
+/// disappears.
+pub(crate) fn prompt_max_rows(available_rows: usize) -> usize {
+    (available_rows * 2 / 5).clamp(2, 12)
+}
+
+/// Lay out a permission (or chain) prompt as terminal rows: the sanitized
+/// `header` hard-wrapped to `width`, then the `options`, in at most
+/// `max_rows` rows. Nothing is ever written raw: a multi-line header (a
+/// heredoc, a `node -e` script) shows its first lines and a note counting
+/// the rest, and a single over-long line (a deep path) is elided in the
+/// middle so its file name stays visible. The full request is also in the
+/// transcript, which can be scrolled while the prompt waits.
+pub(crate) fn prompt_block_rows(
+    header: &str,
+    options: &str,
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    use crate::ui::utils::{compact_multiline, middle_elide, wrap_to_width};
+
+    let width = width.max(1);
+    let max_rows = max_rows.max(2);
+    let header = crate::ui::events::sanitize_output(header);
+    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
+    let mut option_rows = wrap_to_width(&options, width);
+    option_rows.truncate(max_rows - 1);
+    let budget = max_rows - option_rows.len();
+    let lines: Vec<&str> = header.split('\n').collect();
+
+    let fit = |line: &str, rows: usize| {
+        let mut wrapped = wrap_to_width(line, width);
+        if wrapped.len() > rows {
+            wrapped = wrap_to_width(&middle_elide(line, rows * width), width);
+            wrapped.truncate(rows);
+        }
+        wrapped
+    };
+
+    let mut rows = Vec::with_capacity(max_rows);
+    if lines.len() == 1 {
+        rows = fit(&header, budget);
+    } else if budget == 1 {
+        rows.push(middle_elide(
+            &compact_multiline(&header, header.len()),
+            width,
+        ));
+    } else {
+        let content_budget = budget - 1;
+        let mut shown = 0usize;
+        for line in &lines {
+            let room = content_budget - rows.len();
+            if room == 0 {
+                break;
+            }
+            let wrapped = wrap_to_width(line, width);
+            let complete = wrapped.len() <= room;
+            rows.extend(if complete { wrapped } else { fit(line, room) });
+            if !complete {
+                break;
+            }
+            shown += 1;
+        }
+        let hidden = lines.len() - shown;
+        if hidden > 0 {
+            let note = format!(
+                "… {hidden} more line(s), {} chars in total: scroll up (PgUp / wheel) to review the full request",
+                header.chars().count()
+            );
+            rows.push(crate::ui::utils::display_prefix(&note, width).to_string());
+        }
+    }
+    rows.extend(option_rows);
+    rows
 }
 
 pub struct Renderer {
@@ -177,8 +342,8 @@ pub struct Renderer {
     input_bg: Option<Color>,
     status_bg: Option<Color>,
     pub selection_active: bool,
-    pub selection_start: Option<usize>,
-    pub selection_end: Option<usize>,
+    pub selection_start: Option<SelectionPoint>,
+    pub selection_end: Option<SelectionPoint>,
     /// Set once the pointer moved while the button was held. A plain click
     /// (press + release without movement) never copies.
     pub selection_dragged: bool,
@@ -203,7 +368,24 @@ pub struct Renderer {
     /// Screen position of the input caret after the last full bottom draw;
     /// `None` when the caret is hidden (permission/chain prompts).
     bottom_cursor: Option<(u16, u16)>,
+    /// Transient status-line message (e.g. a copy result) that must not
+    /// become a permanent transcript entry.
+    notice: Option<Notice>,
+    /// Report agent activity in the terminal title (config `terminal_title`).
+    title_status: bool,
+    /// Activity last written to the title, so unchanged frames write nothing.
+    title_activity: Option<crate::ui::terminal::AgentActivity>,
 }
+
+/// A status-line message that disappears on its own.
+struct Notice {
+    text: CompactString,
+    color: Color,
+    until: std::time::Instant,
+}
+
+/// How long a transient notice stays on the status line.
+pub(crate) const NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Renderer {
     pub fn new() -> io::Result<Self> {
@@ -246,6 +428,9 @@ impl Renderer {
             #[cfg(test)]
             statusline_builds: 0,
             bottom_cursor: None,
+            notice: None,
+            title_status: false,
+            title_activity: None,
         })
     }
 
@@ -279,6 +464,54 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn statusline_builds(&self) -> usize {
         self.statusline_builds
+    }
+
+    /// Enable activity reporting through the terminal title.
+    pub fn set_title_status(&mut self, enabled: bool) {
+        self.title_status = enabled;
+    }
+
+    /// Announce `activity` in the terminal title when it changed. A no-op
+    /// unless title reporting is enabled.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: crate::ui::terminal::AgentActivity,
+    ) -> io::Result<()> {
+        if !self.title_status || self.title_activity == Some(activity) {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        stdout.write_all(crate::ui::terminal::title_sequence(activity).as_bytes())?;
+        stdout.flush()?;
+        self.title_activity = Some(activity);
+        Ok(())
+    }
+
+    /// Show `text` on the status line for [`NOTICE_DURATION`] instead of
+    /// adding it to the transcript.
+    pub(crate) fn show_notice(&mut self, text: &str, color: Color) {
+        self.notice = Some(Notice {
+            text: CompactString::from(text),
+            color,
+            until: std::time::Instant::now() + NOTICE_DURATION,
+        });
+    }
+
+    /// When the current notice expires, so the UI loop can repaint then.
+    pub(crate) fn notice_deadline(&self) -> Option<std::time::Instant> {
+        self.notice.as_ref().map(|notice| notice.until)
+    }
+
+    /// Text of the notice currently shown, if it has not expired.
+    #[cfg(test)]
+    pub(crate) fn notice_text(&self) -> Option<&str> {
+        self.active_notice().map(|notice| notice.text.as_str())
+    }
+
+    fn active_notice(&self) -> Option<&Notice> {
+        self.notice
+            .as_ref()
+            .filter(|notice| notice.until > std::time::Instant::now())
     }
 
     /// Rows reserved at the bottom: statusline lines + separator + input baseline.
@@ -415,6 +648,12 @@ impl Renderer {
         self.bottom_dirty = true;
     }
 
+    /// Forget the announced title activity: a suspended and resumed terminal
+    /// restored the pre-attach title, so the next frame announces again.
+    pub(crate) fn forget_title(&mut self) {
+        self.title_activity = None;
+    }
+
     /// The separator row above the input: the first row, counting down, that a
     /// picker overlay must leave alone. Tracks the statusline height and the
     /// current input height, so a taller bottom region lifts the overlay.
@@ -437,12 +676,43 @@ impl Renderer {
     /// Number of rows the input area will occupy for the given content. Kept in
     /// sync with the height logic used while drawing the input in `draw_bottom`.
     fn input_visible_height(&self, input_line: &str, rows: u16) -> usize {
-        if self.permission_prompt.is_some() || self.chain_prompt.is_some() {
-            return 2;
+        if let Some(prompt_rows) = self.overlay_prompt_rows(self.terminal_size().0, rows) {
+            return prompt_rows.len();
         }
         let available_rows = rows.saturating_sub(self.statusline_reserve()) as usize;
         let max_input_rows = available_rows.min((available_rows * 3 / 10).max(5));
         input_line.split('\n').count().min(max_input_rows).max(1)
+    }
+
+    /// Options row of the chain prompt for its current mode.
+    fn chain_options(&self) -> &'static str {
+        if self.chain_but_mode {
+            "[Enter] send  [Esc] cancel"
+        } else {
+            "[Y] Yes  [N] No  [B] yes, But (add instruction)"
+        }
+    }
+
+    /// Rows of the active permission or chain prompt laid out for a
+    /// `cols` x `rows` terminal, or `None` when the input editor is shown.
+    fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<Vec<String>> {
+        let (header, options) = if let Some(pp) = &self.permission_prompt {
+            (pp.tool.as_str(), pp.options.as_str())
+        } else if let Some(cp) = &self.chain_prompt {
+            (cp.question.as_str(), self.chain_options())
+        } else {
+            return None;
+        };
+        let available = rows.saturating_sub(self.statusline_reserve()) as usize;
+        // One column short of the edge: a full-width row leaves the terminal
+        // in its pending-wrap state, where clearing to end of line misbehaves.
+        let width = (cols as usize).saturating_sub(1).max(1);
+        Some(prompt_block_rows(
+            header,
+            options,
+            width,
+            prompt_max_rows(available),
+        ))
     }
 
     /// Recompute the input height and reconcile `prev_input_height` before the
@@ -509,27 +779,28 @@ impl Renderer {
         None
     }
 
+    /// Map a mouse column to a display column within a chat line's text.
+    pub fn chat_text_col(&self, col: u16) -> usize {
+        col.saturating_sub(self.chat_margin) as usize
+    }
+
+    /// The selected text, sliced at the selection's columns: partial first
+    /// and last lines, whole lines between them.
     pub fn selected_text(&self) -> Option<String> {
-        let (start, end) = match (self.selection_start, self.selection_end) {
-            (Some(s), Some(e)) if s <= e => (s, e),
-            (Some(s), Some(e)) => (e, s),
-            _ => return None,
+        let (Some(a), Some(b)) = (self.selection_start, self.selection_end) else {
+            return None;
         };
         let lines = self.chat_lines(self.max_line_width());
-        let mut result = String::new();
-        for i in start..=end {
-            if let Some(entry) = lines.get(i) {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(&entry.text);
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        let (lo, hi) = (a.min(b).line, a.max(b).line);
+        let pieces: Vec<&str> = (lo..=hi)
+            .filter_map(|line| {
+                let text: &str = &lines.get(line)?.text;
+                let (start, end) = selection_byte_range(text, line, a, b)?;
+                Some(&text[start..end])
+            })
+            .collect();
+        let result = pieces.join("\n");
+        (!result.is_empty()).then_some(result)
     }
 
     fn commit_partial(&mut self) {
@@ -724,26 +995,29 @@ impl Renderer {
 
             stdout.execute(MoveTo(0, visual_row))?;
 
-            let is_selected = self.selection_active
-                && if let (Some(s), Some(e)) = (self.selection_start, self.selection_end) {
-                    let lo = s.min(e);
-                    let hi = s.max(e);
-                    buf_idx >= lo && buf_idx <= hi
-                } else {
-                    false
-                };
+            let selected = match (
+                self.selection_active,
+                self.selection_start,
+                self.selection_end,
+            ) {
+                (true, Some(a), Some(b)) => selection_byte_range(chunk, buf_idx, a, b),
+                _ => None,
+            };
 
             if let Some(bg) = self.chat_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
             self.write_chat_margin(&mut stdout)?;
-            if is_selected {
-                write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
-            }
             write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-            write!(stdout, "{}", wrap_urls_osc8(chunk))?;
-            if is_selected {
-                write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
+            match selected {
+                Some((start, end)) => {
+                    write!(stdout, "{}", wrap_urls_osc8(&chunk[..start]))?;
+                    write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
+                    write!(stdout, "{}", wrap_urls_osc8(&chunk[start..end]))?;
+                    write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
+                    write!(stdout, "{}", wrap_urls_osc8(&chunk[end..]))?;
+                }
+                None => write!(stdout, "{}", wrap_urls_osc8(chunk))?,
             }
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;
@@ -762,20 +1036,18 @@ impl Renderer {
             visual_row += 1;
         }
 
-        if self.scroll_offset > 0 {
-            let pct = scroll_percent(self.scroll_offset, total, visible);
-            let indicator = format!(" SCROLL {}% ", pct);
-            let x = cols.saturating_sub(indicator.len() as u16);
+        if let Some(indicator) = history_indicator(self.scroll_offset, total, visible) {
+            let (text, color) = match &indicator {
+                HistoryIndicator::Scrolled(text) => (text, Color::DarkYellow),
+                HistoryIndicator::Above(text) => (text, Color::DarkGrey),
+            };
+            let x = cols.saturating_sub(display_width(text) as u16);
             stdout.execute(MoveTo(x, 0))?;
             if let Some(bg) = self.chat_bg {
                 write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkYellow))
-            )?;
-            write!(stdout, "{}", indicator)?;
+            write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
+            write!(stdout, "{}", text)?;
             write!(stdout, "{}", ResetColor)?;
         }
 
@@ -801,6 +1073,39 @@ impl Renderer {
         self.commit_partial();
         let style = style_from_color(color);
         self.feed.push_block(style, text);
+        self.chat_dirty = true;
+        if self.scroll_offset == 0 {
+            self.render_viewport()?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Renderer::write_line`], and later lines can be placed under
+    /// this one with [`Renderer::write_line_after`] using the same `anchor`.
+    pub fn write_line_anchored(
+        &mut self,
+        anchor: &str,
+        text: &str,
+        color: Color,
+    ) -> io::Result<()> {
+        self.commit_partial();
+        self.feed
+            .push_anchored_block(anchor, style_from_color(color), text);
+        self.chat_dirty = true;
+        if self.scroll_offset == 0 {
+            self.render_viewport()?;
+        }
+        Ok(())
+    }
+
+    /// Place a line directly under the line written with `anchor` (a tool
+    /// result under its own call), or at the end when that line is gone.
+    pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {
+        self.commit_partial();
+        let style = style_from_color(color);
+        if !self.feed.insert_after_anchor(anchor, style, text) {
+            self.feed.push_block(style, text);
+        }
         self.chat_dirty = true;
         if self.scroll_offset == 0 {
             self.render_viewport()?;
@@ -914,13 +1219,22 @@ impl Renderer {
             let screen_row = rows.saturating_sub(h - row_idx);
             let empty: Vec<StatusSpan> = Vec::new();
             let spans = statusline.get(row_idx as usize).unwrap_or(&empty);
-            // Scroll indicator on the top statusline row only.
-            let prefix = if is_scrolling && row_idx == 0 {
-                "-- SCROLL -- "
-            } else {
-                ""
+            // A transient notice, else the scroll indicator, on the top
+            // statusline row only.
+            let notice = self
+                .active_notice()
+                .map(|notice| (format!("{}  ", notice.text), notice.color));
+            let prefix = match (row_idx, notice) {
+                (0, Some((text, color))) => Some((text, color)),
+                (0, None) if is_scrolling => Some(("-- SCROLL -- ".to_string(), Color::DarkYellow)),
+                _ => None,
             };
-            self.draw_statusline_row(screen_row, spans, prefix, cols)?;
+            self.draw_statusline_row(
+                screen_row,
+                spans,
+                prefix.as_ref().map(|(text, color)| (text.as_str(), *color)),
+                cols,
+            )?;
         }
         Ok(())
     }
@@ -929,7 +1243,7 @@ impl Renderer {
         &self,
         screen_row: u16,
         spans: &[StatusSpan],
-        prefix: &str,
+        prefix: Option<(&str, Color)>,
         cols: u16,
     ) -> io::Result<()> {
         let mut stdout = io::stdout();
@@ -946,12 +1260,8 @@ impl Renderer {
         let total = cols as usize;
         let mut budget = total;
 
-        if !prefix.is_empty() {
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkYellow))
-            )?;
+        if let Some((prefix, color)) = prefix {
+            write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
             let take = crate::ui::utils::display_prefix(prefix, budget);
             budget -= display_width(take);
             write!(stdout, "{}", take)?;
@@ -1055,6 +1365,7 @@ impl Renderer {
             monochrome: self.monochrome,
             input_bg: self.input_bg,
             status_bg: self.status_bg,
+            notice: self.active_notice().map(|notice| notice.text.clone()),
         }
     }
 
@@ -1089,7 +1400,8 @@ impl Renderer {
             && next.input_bg == prev.input_bg
             && next.status_bg == prev.status_bg
             && (next.statusline_key != prev.statusline_key
-                || next.scroll_indicator != prev.scroll_indicator)
+                || next.scroll_indicator != prev.scroll_indicator
+                || next.notice != prev.notice)
         {
             BottomRedrawPlan::StatuslineOnly
         } else {
@@ -1129,6 +1441,9 @@ impl Renderer {
         is_running: bool,
     ) -> io::Result<()> {
         let (cols, rows) = crossterm::terminal::size()?;
+        if self.notice.is_some() && self.active_notice().is_none() {
+            self.notice = None;
+        }
         let snapshot = self.bottom_snapshot(
             input_line,
             cursor_pos,
@@ -1154,13 +1469,9 @@ impl Renderer {
         let reserve = self.statusline_reserve();
         let mut stdout = io::stdout();
 
-        if let Some(ref pp) = self.permission_prompt {
-            let perm_lines = [pp.tool.as_str(), pp.options.as_str()];
-            let line_count = 2usize;
-            let input_top = rows
-                .saturating_sub(reserve)
-                .saturating_sub(line_count as u16)
-                .saturating_add(1);
+        if let Some(prompt_rows) = self.overlay_prompt_rows(cols, rows) {
+            let line_count = prompt_rows.len();
+            let input_top = input_top_row(rows, reserve, line_count);
             let sep_above = input_top.saturating_sub(1);
 
             self.clear_shrunk_rows(self.prev_input_height, line_count)?;
@@ -1170,62 +1481,14 @@ impl Renderer {
                 self.draw_separator(sep_above, cols)?;
             }
 
-            let perm_color = self.color(Color::DarkYellow);
-            for (i, line) in perm_lines.iter().enumerate() {
-                let render_row = input_top + i as u16;
+            let prompt_color = self.color(Color::DarkYellow);
+            for (i, line) in prompt_rows.iter().enumerate() {
+                let render_row = input_top.saturating_add(i as u16);
                 stdout.execute(MoveTo(0, render_row))?;
                 if let Some(bg) = self.input_bg {
                     write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
                 }
-                write!(stdout, "{}", SetForegroundColor(perm_color))?;
-                write!(stdout, "{}", line)?;
-                write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
-                write!(stdout, "{}", ResetColor)?;
-            }
-
-            let sep_below = rows.saturating_sub(reserve.saturating_sub(1));
-            if sep_below < rows.saturating_sub(1) {
-                self.draw_separator(sep_below, cols)?;
-            }
-
-            self.draw_statusline(statusline, cols, false)?;
-            write!(stdout, "{}", Hide)?;
-            stdout.flush()?;
-            self.bottom_cursor = None;
-            self.record_bottom_drawn(snapshot);
-            return Ok(());
-        }
-
-        if let Some(ref cp) = self.chain_prompt {
-            let question = cp.question.as_str();
-            let options = if self.chain_but_mode {
-                "[Enter] send  [Esc] cancel"
-            } else {
-                "[Y] Yes  [N] No  [B] yes, But (add instruction)"
-            };
-            let line_count = 2usize;
-            let input_top = rows
-                .saturating_sub(reserve)
-                .saturating_sub(line_count as u16)
-                .saturating_add(1);
-            let sep_above = input_top.saturating_sub(1);
-
-            self.clear_shrunk_rows(self.prev_input_height, line_count)?;
-            self.prev_input_height = line_count;
-
-            if sep_above < input_top {
-                self.draw_separator(sep_above, cols)?;
-            }
-
-            let chain_color = self.color(Color::DarkYellow);
-            let render_lines = [question, options];
-            for (i, line) in render_lines.iter().enumerate() {
-                let render_row = input_top + i as u16;
-                stdout.execute(MoveTo(0, render_row))?;
-                if let Some(bg) = self.input_bg {
-                    write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
-                }
-                write!(stdout, "{}", SetForegroundColor(chain_color))?;
+                write!(stdout, "{}", SetForegroundColor(prompt_color))?;
                 write!(stdout, "{}", line)?;
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
                 write!(stdout, "{}", ResetColor)?;
@@ -1424,6 +1687,19 @@ impl Renderer {
         drawn.input_vscroll_offset = self.input_vscroll_offset;
         self.record_bottom_drawn(drawn);
         Ok(())
+    }
+
+    /// Paint chat content that a throttled streaming update left undrawn,
+    /// then put the caret back. Called from the running UI tick so the last
+    /// tokens of a burst always appear even when no further token arrives.
+    /// Returns whether anything was painted.
+    pub(crate) fn paint_pending_chat(&mut self) -> io::Result<bool> {
+        if !self.chat_needs_redraw() {
+            return Ok(false);
+        }
+        self.render_viewport()?;
+        self.restore_bottom_cursor()?;
+        Ok(true)
     }
 
     /// Advance only the running prompt's spinner cell. The 100 ms UI tick uses

@@ -26,8 +26,8 @@ use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{
-    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, copy_to_clipboard,
-    read_from_clipboard,
+    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
+    copy_to_clipboard, read_from_clipboard,
 };
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
 use crate::ui::state::{
@@ -68,7 +68,11 @@ async fn read_worktree_choice(
     while let Some(event) = user_rx.recv().await {
         let UserEvent::Key(key) = event else {
             // Background completions and other input still belong to the main loop.
+            let quit = matches!(event, UserEvent::Quit);
             deferred.push_back(event);
+            if quit {
+                return WorktreePromptChoice::Abort;
+            }
             continue;
         };
         if key.kind != crossterm::event::KeyEventKind::Press {
@@ -172,7 +176,7 @@ pub(crate) fn clipboard_shortcut(
 
 /// Whether releasing the left button should copy the transcript selection.
 /// Only a real drag copies; a plain click (no movement, one line) does not.
-fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> bool {
+fn mouse_up_copies<P: PartialEq>(dragged: bool, start: Option<P>, end: Option<P>) -> bool {
     match (start, end) {
         (Some(start), Some(end)) => dragged || start != end,
         _ => false,
@@ -181,15 +185,17 @@ fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> b
 
 #[cfg(test)]
 mod mouse_selection_tests {
-    use super::mouse_up_copies;
+    use super::{SelectionPoint, mouse_up_copies};
 
     #[test]
     fn plain_click_does_not_copy_but_a_drag_does() {
-        assert!(!mouse_up_copies(false, Some(4), Some(4)));
-        assert!(mouse_up_copies(true, Some(4), Some(4)));
-        assert!(mouse_up_copies(false, Some(4), Some(6)));
-        assert!(mouse_up_copies(true, Some(6), Some(4)));
-        assert!(!mouse_up_copies(true, None, None));
+        let at = |line, col| Some(SelectionPoint::new(line, col));
+        assert!(!mouse_up_copies(false, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(true, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(false, at(4, 3), at(6, 0)));
+        assert!(mouse_up_copies(false, at(4, 3), at(4, 9)));
+        assert!(mouse_up_copies(true, at(6, 0), at(4, 3)));
+        assert!(!mouse_up_copies::<SelectionPoint>(true, None, None));
     }
 }
 
@@ -561,7 +567,10 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
-        let terminal_guard = TerminalGuard::new(ui.cfg.resolve_mouse_capture())?;
+        let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
+            mouse_capture: ui.cfg.resolve_mouse_capture(),
+            title_status: ui.cfg.resolve_terminal_title(),
+        })?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -572,6 +581,7 @@ impl<'a> App<'a> {
         let mut renderer = Renderer::new()?;
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
+        renderer.set_title_status(ui.cfg.resolve_terminal_title());
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
         if let Some(ref theme_name) = ui.context.current_theme_name {
             if let Some(content) = ui.context.themes.get(theme_name.as_str()) {
@@ -804,6 +814,7 @@ impl<'a> App<'a> {
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
+        super::spawn_termination_listener(user_tx.clone());
 
         let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
@@ -1033,7 +1044,18 @@ impl<'a> App<'a> {
                     self.handle_btw_event(bev)?;
                     self.refresh()?;
                 }
+                _ = tokio::time::sleep_until(
+                    self.renderer.notice_deadline().map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+                ), if self.renderer.notice_deadline().is_some() => {
+                    // A transient notice expired; the redraw clears it.
+                    self.refresh()?;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
+                    if self.renderer.paint_pending_chat()?
+                        && self.input.picker.as_ref().is_some_and(|picker| picker.active())
+                    {
+                        self.refresh()?;
+                    }
                     self.renderer.tick_spinner()?;
                 }
                 // The @ file picker fills from a background walk; repaint as
@@ -1156,25 +1178,28 @@ impl<'a> App<'a> {
                             }
                         });
                     } else {
+                        let point = SelectionPoint::new(idx, self.renderer.chat_text_col(col));
                         self.renderer.selection_active = true;
-                        self.renderer.selection_start = Some(idx);
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_start = Some(point);
+                        self.renderer.selection_end = Some(point);
                         self.renderer.selection_dragged = false;
                     }
                 }
             }
-            UserEvent::MouseDrag { row } => {
+            UserEvent::MouseDrag { row, col } => {
                 if self.renderer.selection_active {
                     self.renderer.selection_dragged = true;
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                 }
             }
-            UserEvent::MouseUp { row } => {
+            UserEvent::MouseUp { row, col } => {
                 if self.renderer.selection_active {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                     if mouse_up_copies(
                         self.renderer.selection_dragged,
@@ -1187,6 +1212,17 @@ impl<'a> App<'a> {
                         self.renderer.clear_selection();
                     }
                 }
+            }
+            UserEvent::Quit => {
+                // The terminal may already be gone (SIGHUP): drawing can fail,
+                // but stopping the run and saving must still happen.
+                if self.run.is_running
+                    && let Err(error) = self.abort_main_run().await
+                {
+                    tracing::warn!(%error, "run cleanup on quit failed");
+                }
+                let _ = self.save_session();
+                return Ok(ControlFlow::Break(()));
             }
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
@@ -1277,18 +1313,20 @@ impl<'a> App<'a> {
             return Ok(());
         };
         match copy_to_clipboard(&text).await {
+            // The outcome is a transient status-line notice: copying must not
+            // grow the transcript it is copying from.
             Ok(ClipboardCopyOutcome::Confirmed) => {
-                self.renderer.write_line("copied selection", Color::Green)?;
+                self.renderer.show_notice("copied selection", Color::Green);
                 self.renderer.clear_selection();
             }
             Ok(ClipboardCopyOutcome::FallbackRequested) => {
                 self.renderer
-                    .write_line("copy requested through terminal", Color::Green)?;
+                    .show_notice("copy requested through terminal", Color::Green);
                 self.renderer.clear_selection();
             }
             Err(error) => {
                 self.renderer
-                    .write_line(&format!("copy to clipboard failed: {error}"), C_ERROR)?;
+                    .show_notice(&format!("copy to clipboard failed: {error}"), C_ERROR);
                 self.renderer.clear_selection();
             }
         }
@@ -2698,6 +2736,9 @@ impl<'a> App<'a> {
                     );
                     if interrupt {
                         cancellation.cancel();
+                    } else if matches!(event, UserEvent::Quit) {
+                        cancellation.cancel();
+                        self.deferred_user_events.push_back(event);
                     } else {
                         self.deferred_user_events.push_back(event);
                     }
@@ -2888,6 +2929,7 @@ impl<'a> App<'a> {
         self.pause_event_thread();
         // Terminal resumption clears the screen even when the draft is unchanged.
         self.renderer.invalidate();
+        self.renderer.forget_title();
         self.running = Arc::new(AtomicBool::new(true));
         // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(
