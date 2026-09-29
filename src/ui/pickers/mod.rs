@@ -68,6 +68,22 @@ pub(crate) fn fuzzy_score(item: &str, query: &str) -> Option<i32> {
     Some(score)
 }
 
+/// A picker entry made safe to write to the terminal: file names, gateway
+/// model ids and history entries are untrusted, so every control character
+/// (ESC, CR, LF, ...) is shown as U+FFFD instead of reaching the terminal.
+/// Only the drawn text changes; accepting an entry inserts it unchanged.
+pub(crate) fn display_safe(entry: &str) -> std::borrow::Cow<'_, str> {
+    if entry.chars().any(char::is_control) {
+        entry
+            .chars()
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect::<String>()
+            .into()
+    } else {
+        entry.into()
+    }
+}
+
 /// Where a list overlay sits: rows `top_row..floor_row` show
 /// `matches[start..end]`, scrolled to keep the selection in view.
 #[derive(Debug, PartialEq, Eq)]
@@ -155,7 +171,8 @@ pub(crate) fn draw_picker_list(
             Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
 
-        let truncated = crate::ui::utils::display_prefix(item, cols.saturating_sub(3) as usize);
+        let item = display_safe(item);
+        let truncated = crate::ui::utils::display_prefix(&item, cols.saturating_sub(3) as usize);
 
         if i == selected {
             write!(

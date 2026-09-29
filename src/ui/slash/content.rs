@@ -188,19 +188,14 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             let default_model = ctx.cli.resolve_model(ctx.cfg);
             let default_provider = ctx.cli.resolve_provider(ctx.cfg);
             let provider_changed = default_provider != ctx.session.provider;
-            ctx.session.model = default_model;
-            if provider_changed {
-                if let Err(e) = ctx
-                    .rebuild_agent_with_client(&default_provider, *ctx.reasoning_enabled)
-                    .await
-                {
+            match provider_changed.then(|| ctx.switch_client(&default_provider)) {
+                Some(Err(e)) => {
+                    // Keep the current provider with its own model.
                     write_error(ctx.renderer, format!("failed to revert provider: {}", e));
-                } else {
-                    ctx.session.provider = default_provider;
                 }
-            } else {
-                ctx.rebuild_agent().await;
+                Some(Ok(())) | None => ctx.session.model = default_model,
             }
+            ctx.rebuild_agent().await;
             write_ok(ctx.renderer, "prompt cleared (back to default)");
         }
     } else {

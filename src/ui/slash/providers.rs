@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::cli::Cli;
 use crate::config::{self, Config};
@@ -68,11 +70,83 @@ async fn handle_subagent_model_command(
 static MODEL_CACHE: LazyLock<Mutex<HashMap<String, Arc<[ModelEntry]>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Bumped whenever [`MODEL_CACHE`] gains or replaces an entry, so the UI can
+/// pick up a background warm without re-reading the list on every event.
+static MODEL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Providers whose last listing failed, and when. A failed listing is not
+/// retried implicitly until [`LISTING_FAILURE_TTL`] passes (an explicit
+/// `/models refresh` always retries), so an unreachable gateway cannot stall
+/// every slash command.
+static LISTING_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Providers with a background warm in flight.
+static WARMING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const LISTING_FAILURE_TTL: Duration = Duration::from_secs(300);
+
+/// Credentials a model listing needs, owned so a background task can use them.
+#[derive(Clone)]
+pub(crate) struct ListingCredentials {
+    api_key: Option<String>,
+    custom_providers: HashMap<String, crate::config::CustomProviderConfig>,
+    api_keys: Option<HashMap<String, String>>,
+}
+
+impl ListingCredentials {
+    pub(crate) fn new(cli: &Cli, cfg: &Config) -> Self {
+        Self {
+            api_key: cli.api_key.clone(),
+            custom_providers: cfg.custom_providers_map(),
+            api_keys: cfg.api_keys.clone(),
+        }
+    }
+}
+
+fn cache_insert(provider: &str, models: Arc<[ModelEntry]>) {
+    MODEL_CACHE
+        .lock()
+        .unwrap()
+        .insert(provider.to_string(), models);
+    LISTING_FAILURES.lock().unwrap().remove(provider);
+    MODEL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether a listing for `provider` failed within the TTL (as of `now`).
+fn recently_failed(provider: &str, now: Instant) -> bool {
+    LISTING_FAILURES
+        .lock()
+        .unwrap()
+        .get(provider)
+        .is_some_and(|failed| now.saturating_duration_since(*failed) < LISTING_FAILURE_TTL)
+}
+
+/// The cached listing or the baked catalog, without any network access.
+fn cached_or_baked(provider: &str, is_custom: bool) -> Option<Arc<[ModelEntry]>> {
+    if let Some(hit) = MODEL_CACHE.lock().unwrap().get(provider) {
+        return Some(Arc::clone(hit)); // guard dropped here, NOT across any await
+    }
+    // No cache yet: serve the baked catalog for built-in providers — no network.
+    let entries = (!is_custom)
+        .then(|| crate::models_catalog::catalog_entries(provider))
+        .flatten()?;
+    let models: Vec<ModelEntry> = entries
+        .iter()
+        .filter(|m| crate::provider::is_agent_model(m))
+        .cloned()
+        .collect();
+    let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
+    cache_insert(provider, Arc::clone(&arc));
+    Some(arc)
+}
+
 /// Returns the provider's models.
 ///
 /// Network is only touched on `refresh`, for custom gateways, or for built-in
 /// providers that aren't baked (e.g. ollama). Baked built-ins are served from
 /// the embedded catalog with no network call — this is what keeps startup instant.
+/// A recent failure is returned without a new request unless `refresh` is set.
 pub(crate) async fn fetch_models_cached(
     provider: &str,
     is_custom: bool,
@@ -82,30 +156,55 @@ pub(crate) async fn fetch_models_cached(
     refresh: bool,
 ) -> anyhow::Result<Arc<[ModelEntry]>> {
     if !refresh {
-        if let Some(hit) = MODEL_CACHE.lock().unwrap().get(provider) {
-            return Ok(Arc::clone(hit)); // guard dropped here, NOT across any await
+        if let Some(hit) = cached_or_baked(provider, is_custom) {
+            return Ok(hit);
         }
-        // No cache yet: serve the baked catalog for built-in providers — no network.
-        if !is_custom && let Some(entries) = crate::models_catalog::catalog_entries(provider) {
-            let models: Vec<ModelEntry> = entries
-                .iter()
-                .filter(|m| crate::provider::is_agent_model(m))
-                .cloned()
-                .collect();
-            let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
-            MODEL_CACHE
-                .lock()
-                .unwrap()
-                .insert(provider.to_string(), Arc::clone(&arc));
-            return Ok(arc);
+        if recently_failed(provider, Instant::now()) {
+            anyhow::bail!(
+                "model listing for {provider} failed recently; run /models refresh to retry"
+            );
         }
     }
+    fetch_and_cache(
+        provider,
+        is_custom,
+        client,
+        &ListingCredentials::new(cli, cfg),
+    )
+    .await
+}
+
+async fn fetch_and_cache(
+    provider: &str,
+    is_custom: bool,
+    client: &AnyClient,
+    creds: &ListingCredentials,
+) -> anyhow::Result<Arc<[ModelEntry]>> {
+    let result = fetch_uncached(provider, is_custom, client, creds).await;
+    match &result {
+        Ok(models) => cache_insert(provider, Arc::clone(models)),
+        Err(_) => {
+            LISTING_FAILURES
+                .lock()
+                .unwrap()
+                .insert(provider.to_string(), Instant::now());
+        }
+    }
+    result
+}
+
+async fn fetch_uncached(
+    provider: &str,
+    is_custom: bool,
+    client: &AnyClient,
+    creds: &ListingCredentials,
+) -> anyhow::Result<Arc<[ModelEntry]>> {
     let mut models = if is_custom {
         list_models_manual(
             provider,
-            cli.api_key.as_deref(),
-            &cfg.custom_providers_map(),
-            cfg.api_keys.as_ref(),
+            creds.api_key.as_deref(),
+            &creds.custom_providers,
+            creds.api_keys.as_ref(),
         )
         .await?
     } else {
@@ -115,9 +214,9 @@ pub(crate) async fn fetch_models_cached(
 
     if provider == "openrouter" {
         match crate::provider::fetch_openrouter_pricing(
-            cli.api_key.as_deref(),
-            &cfg.custom_providers_map(),
-            cfg.api_keys.as_ref(),
+            creds.api_key.as_deref(),
+            &creds.custom_providers,
+            creds.api_keys.as_ref(),
         )
         .await
         {
@@ -135,12 +234,7 @@ pub(crate) async fn fetch_models_cached(
         }
     }
 
-    let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
-    MODEL_CACHE
-        .lock()
-        .unwrap()
-        .insert(provider.to_string(), Arc::clone(&arc));
-    Ok(arc)
+    Ok(Arc::from(models.into_boxed_slice()))
 }
 
 /// sync read for the picker (no await)
@@ -153,16 +247,42 @@ pub(crate) fn cached_model_ids(provider: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// best-effort warm; returns id list (empty on failure, never errors)
-pub(crate) async fn warm_model_cache(
+/// The cache generation; changes whenever a listing lands in the cache.
+pub(crate) fn model_cache_generation() -> u64 {
+    MODEL_CACHE_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Make sure `provider`'s models get cached without blocking the caller: a
+/// cached or baked list is used as is, a recent failure is not retried, and
+/// otherwise one background task per provider fetches the list. Read the
+/// result with [`cached_model_ids`] once [`model_cache_generation`] changes.
+pub(crate) fn warm_model_cache(
     provider: &str,
     is_custom: bool,
     client: &AnyClient,
     cli: &Cli,
     cfg: &Config,
-) -> Vec<String> {
-    let _ = fetch_models_cached(provider, is_custom, client, cli, cfg, false).await;
-    cached_model_ids(provider)
+) {
+    if cached_or_baked(provider, is_custom).is_some()
+        || recently_failed(provider, Instant::now())
+        || !WARMING.lock().unwrap().insert(provider.to_string())
+    {
+        return;
+    }
+    // Outside a runtime (never in the app) there is nothing to spawn on.
+    if tokio::runtime::Handle::try_current().is_err() {
+        WARMING.lock().unwrap().remove(provider);
+        return;
+    }
+    let provider = provider.to_string();
+    let client = client.clone();
+    let creds = ListingCredentials::new(cli, cfg);
+    tokio::spawn(async move {
+        if let Err(error) = fetch_and_cache(&provider, is_custom, &client, &creds).await {
+            tracing::debug!("background model listing for {provider} failed: {error}");
+        }
+        WARMING.lock().unwrap().remove(&provider);
+    });
 }
 
 fn lookup_pricing_from_cache(provider: &str, model_id: &str) -> Option<(f64, f64)> {
@@ -247,9 +367,12 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         );
         return Ok(());
     }
-    // Default the model to something valid for the new provider BEFORE rebuilding,
-    // since rebuild_agent_with_client reads session.model. Otherwise the old id
-    // (e.g. an OpenRouter id) is carried onto a provider where it is invalid.
+    // Create the client first: a failure must not leave the session's model
+    // or costs switched to the new provider while the old one stays active.
+    ctx.switch_client(new_provider)?;
+    // Default the model to something valid for the new provider. Otherwise
+    // the old id (e.g. an OpenRouter id) is carried onto a provider where it
+    // is invalid.
     if let Some((model, costs)) = crate::provider::default_model_for_provider(new_provider, ctx.cfg)
     {
         ctx.session.model = compact_str::CompactString::new(&model);
@@ -258,9 +381,7 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
             ctx.session.output_token_cost = outc;
         }
     }
-    ctx.rebuild_agent_with_client(new_provider, *ctx.reasoning_enabled)
-        .await?;
-    ctx.session.provider = compact_str::CompactString::new(new_provider);
+    ctx.rebuild_agent().await;
     ctx.session
         .update_context_window(ctx.cfg.resolve_context_window(
             new_provider,
@@ -277,49 +398,69 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     Ok(())
 }
 
+/// `/model` is the single model selector: `/model` shows the current model,
+/// `/model <name>` switches to a quick-model alias, else to a raw model id on
+/// the current provider. `/models <name>` does the same for compatibility.
 async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
         write_ok(
             ctx.renderer,
-            format!("current model: {}", ctx.session.model),
+            format!(
+                "current model: {} ({})",
+                ctx.session.model, ctx.session.provider
+            ),
+        );
+        write_result(
+            ctx.renderer,
+            "  /model <alias|id> switches (Tab in the picker toggles quick aliases and provider models); /models lists them",
         );
         return Ok(());
     }
-    let new_model = compact_str::CompactString::new(parts[1].trim());
-    let new_agent = ctx
-        .agent_build_ctx()
-        .rebuild_agent(&new_model, *ctx.reasoning_enabled)
-        .await;
-    *ctx.agent = Some(new_agent);
-    ctx.session.model = new_model.clone();
-    ctx.session
-        .update_context_window(ctx.cfg.resolve_context_window(
-            &ctx.session.provider,
-            &new_model,
-            &crate::config::quick_models_map(ctx.cfg),
-        ));
-    if let Some((input, output)) = lookup_pricing_from_cache(&ctx.session.provider, &new_model) {
-        ctx.session.input_token_cost = input;
-        ctx.session.output_token_cost = output;
-    } else if ctx.session.provider == "openrouter"
-        && let Ok(prices) = crate::provider::fetch_openrouter_pricing(
-            ctx.cli.api_key.as_deref(),
-            &ctx.cfg.custom_providers_map(),
-            ctx.cfg.api_keys.as_ref(),
-        )
-        .await
-        && let Some(info) = prices.get(&*new_model)
-    {
-        ctx.session.input_token_cost = info.input_cost;
-        ctx.session.output_token_cost = info.output_cost;
-        if ctx.cfg.context_window.is_none()
-            && crate::config::Config::catalog_context_window("openrouter", &new_model).is_none()
-            && let Some(cw) = info.context_length
-        {
-            ctx.session.update_context_window(cw);
-        }
+    switch_model(ctx, parts[1].trim()).await
+}
+
+/// How `/model <arg>` resolves its argument.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ModelTarget<'a> {
+    /// A `[quick_models]` alias (it may also switch provider).
+    Quick(&'a str),
+    /// A raw model id on the current provider.
+    Raw(&'a str),
+}
+
+/// Aliases win over raw ids, so a quick model named like a model id selects
+/// the alias's provider and pricing.
+pub(crate) fn resolve_model_target<'a>(
+    arg: &'a str,
+    quick: &HashMap<String, config::QuickModelConfig>,
+) -> ModelTarget<'a> {
+    if quick.contains_key(arg) {
+        ModelTarget::Quick(arg)
+    } else {
+        ModelTarget::Raw(arg)
     }
-    write_ok(ctx.renderer, format!("switched to model: {}", new_model));
+}
+
+async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
+    let qm = config::quick_models_map(ctx.cfg);
+    match resolve_model_target(arg, &qm) {
+        ModelTarget::Quick(name) => {
+            let q = &qm[name];
+            ctx.switch_client(&q.provider)?;
+            apply_model(ctx, &q.model).await;
+            // preserve v1.4.x pricing/cost tracking
+            ctx.session.input_token_cost = q.input_token_cost;
+            ctx.session.output_token_cost = q.output_token_cost;
+            write_result(
+                ctx.renderer,
+                format!(
+                    "  quick model {} — ${:.4}/M in  ${:.4}/M out",
+                    name, q.input_token_cost, q.output_token_cost
+                ),
+            );
+        }
+        ModelTarget::Raw(id) => apply_model(ctx, id).await,
+    }
     Ok(())
 }
 
@@ -330,28 +471,9 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 
     let refresh = parts.get(1).map(|s| s.trim()) == Some("refresh");
 
-    // /models <name-or-id> — quick-model name first, else raw model id for current provider
+    // /models <name-or-id> — same as /model <name-or-id>.
     if parts.len() >= 2 && !refresh {
-        let arg = parts[1].trim();
-        if let Some(q) = qm.get(arg) {
-            ctx.rebuild_agent_with_client(&q.provider, *ctx.reasoning_enabled)
-                .await?;
-            apply_model(ctx, &q.model).await;
-            ctx.session.provider = compact_str::CompactString::new(&q.provider);
-            // preserve v1.4.x pricing/cost tracking
-            ctx.session.input_token_cost = q.input_token_cost;
-            ctx.session.output_token_cost = q.output_token_cost;
-            write_result(
-                ctx.renderer,
-                format!(
-                    "  quick model {} — ${:.4}/M in  ${:.4}/M out",
-                    arg, q.input_token_cost, q.output_token_cost
-                ),
-            );
-            return Ok(());
-        }
-        apply_model(ctx, arg).await;
-        return Ok(());
+        return switch_model(ctx, parts[1].trim()).await;
     }
 
     // ---- list mode (+ optional refresh) ----
@@ -663,6 +785,104 @@ mod subagent_command_tests {
     #[test]
     fn disabled_message_names_the_feature() {
         assert!(SUBAGENTS_DISABLED.contains("'subagents' feature"));
+    }
+}
+
+/// mini-agent-bgg91: failed listings are cached so slash commands never wait
+/// on an unreachable gateway again within the TTL, and warming never blocks.
+#[cfg(test)]
+mod model_cache_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn fixtures() -> (AnyClient, Cli, Config) {
+        let client = AnyClient::OpenRouter(
+            rig::providers::openrouter::Client::builder()
+                .api_key("unused-test-key")
+                .build()
+                .unwrap(),
+        );
+        (
+            client,
+            Cli::parse_from(["mini-agent", "--api-key", "unused-test-key"]),
+            Config::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_not_retried_until_refresh_or_ttl() {
+        let (client, cli, cfg) = fixtures();
+        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
+        let first = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(!first.to_string().contains("failed recently"), "{first}");
+        assert!(recently_failed(&provider, Instant::now()));
+
+        let cached = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(cached.to_string().contains("failed recently"), "{cached}");
+
+        let refreshed = fetch_models_cached(&provider, true, &client, &cli, &cfg, true)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(!refreshed.to_string().contains("failed recently"));
+
+        let later = Instant::now() + LISTING_FAILURE_TTL + Duration::from_secs(1);
+        assert!(!recently_failed(&provider, later), "the TTL expires");
+    }
+
+    #[tokio::test]
+    async fn warming_returns_immediately_and_skips_known_failures() {
+        let (client, cli, cfg) = fixtures();
+        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
+        LISTING_FAILURES
+            .lock()
+            .unwrap()
+            .insert(provider.clone(), Instant::now());
+        warm_model_cache(&provider, true, &client, &cli, &cfg);
+        assert!(!WARMING.lock().unwrap().contains(&provider));
+
+        // A baked built-in catalog warms synchronously, with no task.
+        let before = model_cache_generation();
+        warm_model_cache("anthropic", false, &client, &cli, &cfg);
+        if crate::models_catalog::catalog_entries("anthropic").is_some() {
+            assert!(!cached_model_ids("anthropic").is_empty());
+            assert!(model_cache_generation() >= before);
+        }
+        assert!(!WARMING.lock().unwrap().contains("anthropic"));
+    }
+}
+
+#[cfg(test)]
+mod model_target_tests {
+    use super::{ModelTarget, resolve_model_target};
+    use crate::config::QuickModelConfig;
+    use std::collections::HashMap;
+
+    /// mini-agent-9rbwc: `/model` resolves a quick alias before a raw id.
+    #[test]
+    fn aliases_resolve_before_raw_ids() {
+        let quick: HashMap<String, QuickModelConfig> = serde_json::from_value(serde_json::json!({
+            "fast": {"provider": "openrouter", "model": "org/fast-model"}
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_model_target("fast", &quick),
+            ModelTarget::Quick("fast")
+        );
+        assert_eq!(
+            resolve_model_target("org/fast-model", &quick),
+            ModelTarget::Raw("org/fast-model")
+        );
+        assert_eq!(
+            resolve_model_target("fast", &HashMap::new()),
+            ModelTarget::Raw("fast")
+        );
     }
 }
 

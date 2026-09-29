@@ -24,7 +24,7 @@ All slash commands are available from the TUI input prompt.
 | `/sessions delete <id-or-name>` | Delete a session by its ID prefix or name. |
 | `/rename <name>` | Rename the current session. |
 | `/history` | Show global chat history (last 10 entries across sessions). |
-| `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Requires the `export` feature (default-on). |
+| `/export [file]` | Export the current session to a standalone HTML page (default `zerostack-session-<id>.html`), or to JSONL when the file ends in `.jsonl`. Quote a file name that contains spaces. Requires the `export` feature (default-on). |
 | `/import <file>` | Import a session from a versioned zerostack JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports are limited to 16 MiB and 10,000 messages, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
 | `/share` | Upload the HTML export as a secret GitHub gist and print the URL. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). |
@@ -48,10 +48,11 @@ fields remain importable and replay their tool records as labeled transcript tex
 | ------- | ----------- |
 | `/provider` | Show the current provider. |
 | `/provider <name>` | Switch to a different provider. |
-| `/model` | Show the current model. |
-| `/model <name>` | Switch to a different model. |
-| `/models` | List all quick models defined in config. |
-| `/models <name>` | Switch to a named quick model. |
+| `/model` | Show the current model. From the command picker, Enter on `/model` opens the model picker: Tab switches between quick aliases and the provider's models, and the current model is marked `(current)`. |
+| `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. |
+| `/models` | List quick models and the provider's available models. |
+| `/models refresh` | Re-fetch the provider's model list (also retries a listing that failed recently). |
+| `/models <name>` | Same as `/model <name>`, kept for compatibility. |
 | `/models-add <name> <provider> <model>` | Save a new quick model to the config file. |
 
 ## Context Files
@@ -59,8 +60,8 @@ fields remain importable and replay their tool records as labeled transcript tex
 | Command | Description |
 | ------- | ----------- |
 | `/add` | List files currently added to context (with sizes). |
-| `/add <path>` | Add a file to the agent's context (absolute or relative path). |
-| `/drop <path>` | Remove a file from the agent's context. |
+| `/add <path>...` | Add one or more files to the agent's context (absolute or relative paths). Quote a path that contains spaces (`/add "my notes.md" src/lib.rs`). |
+| `/drop <path>...` | Remove one or more files (or pending media indexes) from the agent's context. |
 | `/drop-all` | Remove all added files from the agent's context. |
 
 Files added with `/add` are included alongside the conversation in each request,
@@ -152,7 +153,7 @@ You are in read-only mode. Only read files and explore.
 | `/editsys similarity` | Use SEARCH/REPLACE with fuzzy matching for edits (default). |
 | `/editsys hashedit` | Use CRC-32 tag-based edits (token-efficient, CAS-guarded). |
 | `/btw <message>` | Ask a quick side question in parallel, without touching the main conversation. It forks the current context (including the main agent's in-flight turn, if any), answers using read-only tools (read/grep/find_files/list_dir, no writes or shell), and prints the answer inline. Works even while the main agent is running. Nothing is written to history; its token cost is shown separately as `btw:$…`. Ctrl-C cancels an in-flight `/btw` without disturbing the main agent. |
-| `/reasoning` | Toggle LLM reasoning on/off (requires model support). |
+| `/reasoning [on\|off]` | Turn LLM reasoning on or off, or toggle it without an argument (requires model support). |
 | `/thinking` | Alias for `/reasoning`. |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
@@ -467,8 +468,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | -------- | ------ |
 | `Enter` | Send message. |
 | `Shift+Enter` or `Alt+Enter` | Insert newline. |
-| `Ctrl+C` | Cancel the current agent response, validation, or shell command; quit when idle. |
-| `Ctrl+D` | Same interrupt/quit behavior as `Ctrl+C`. |
+| `Ctrl+C` | Cancel the current agent response, validation, or shell command. When idle it clears a non-empty draft (Ctrl+Y brings it back) and quits on an empty input. |
+| `Ctrl+D` | Same interrupt behavior as `Ctrl+C` while something runs. When idle it deletes the character under the cursor in a non-empty draft and quits on an empty input. |
 | `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |
 | `Ctrl+V` | Paste Unicode clipboard text at the cursor on Windows. |
 | `Ctrl+W` | Delete word backwards. |
@@ -476,23 +477,27 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Ctrl+K` | Delete everything after the cursor. |
 | `Ctrl+A` / `Ctrl+E` | Move to the start/end of the current input line; pressing again at the edge stays put. |
 | `Ctrl+B` / `Ctrl+F` | Move one character left/right. |
-| `Alt+B` / `Alt+F` | Move one word left/right. |
+| `Alt+B` / `Alt+F`, `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right` | Move one word left/right. Words are separated by any whitespace, including newlines. |
 | `Alt+D` | Delete the next word. |
+| `Alt+Backspace` | Delete the previous word (like `Ctrl+W`). |
 | Other `Ctrl`/`Alt` letters | Ignored in the input and pickers; they never type the plain letter. With macOS Option-as-Meta enabled, Option-layer characters such as `@` on a German layout arrive as `Alt`+letter, so disable Option-as-Meta (or use the right Option key without it) to type them. |
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
-| `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
+| `Ctrl+O` | Launch `lazygit` (git TUI) in the project directory. (It was `Ctrl+H`, which many terminals send for Backspace; `Ctrl+H` is now always backspace.) |
 | `Ctrl+R` | Toggle reasoning visibility. |
-| `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. |
+| `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. Backspace on an empty argument (for example after `/theme `) deletes the space and reopens completion on the command, as does deleting back to a bare `/command` word. Compatibility aliases (`/compact`, `/exit`, `/thinking`, `/tutorial`) are not suggested, but typing one in full and pressing Enter still runs it. |
 | `@<query>` | Activate the file picker when `@` starts a word (input start, or after whitespace, a newline, `(` or a quote, including a pasted trailing `@`); Tab or Enter inserts the highlighted path, a space keeps the typed text and closes the picker, Ctrl+W deletes the query, and Escape closes it. |
 | `Tab` | Insert two spaces when no picker is active. |
-| `Up / Down` | Move vertically in multiline input; at an edge, navigate command history (a recalled prompt puts the cursor at its end). |
+| `Up / Down` | Move vertically in multiline input, one visual row at a time (long lines soft-wrap at the terminal width, breaking after whitespace where possible); at the first or last row, navigate command history (a recalled prompt puts the cursor at its end). |
 | `PageUp / PageDown` | Scroll viewport. |
 | `Home / End` | Move to the start/end of the current input line. With an empty input (or while a picker is open) they jump to the top/bottom of chat history instead. |
 | `Ctrl+Home / Ctrl+End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
-| Mouse drag | Select transcript lines and copy them on release. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's native selection. |
+| `Left / Right / Delete` in a picker | Close the picker (the typed text stays) and move or delete as in plain text. Clicking elsewhere in the input does the same. |
+| Paste | Bracketed paste and `Ctrl+V` insert at the cursor. Pasted `\r` and `\r\n` line endings become newlines, tabs become four spaces, and escape sequences and other control characters are dropped. |
+| Mouse drag | Select transcript text from the press point to the release point (partial first and last lines) and copy it on release; the result is shown briefly on the status line rather than added to the transcript. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's (or multiplexer's) native selection. |
 | Mouse scroll | Scroll chat history. |
+| Permission prompt | While a `[permission]` prompt waits, the mouse wheel, `Up`/`Down`, `PageUp`/`PageDown` and `Home`/`End` scroll the transcript so the request's context can be reviewed; the answer keys (`y`, `a`, `f`, `n`, `Esc`) are unchanged. A long path wraps (a path too long for the prompt area is shortened in the middle, keeping the file name); a multi-line command shows its first lines and a count of the rest, and its full text is in the transcript above. Transcript tool-call lines show only the first line of a multi-line script, followed by `(+N lines, M chars)`. |
 
 Learned-skill feedback can be inspected and corrected by the authenticated local
 OS-account owner (requires `skills`):

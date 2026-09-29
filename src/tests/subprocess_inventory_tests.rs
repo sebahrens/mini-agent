@@ -1067,6 +1067,18 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox/worker/macos.rs",
+        "let mut piped = Command::new(sandbox_exec)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut child = Command::new(sandbox_exec)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
         "let spawned = Command::new(path)",
         1,
         "TC-BROKER-JS-WORKER",
@@ -3374,7 +3386,13 @@ const MIXED_SITES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/worker/macos.rs",
         ".spawn()",
-        &["TC-BROKER-JS-WORKER", "TEST-ONLY", "TEST-ONLY"],
+        &[
+            "TC-BROKER-JS-WORKER",
+            "TEST-ONLY",
+            "TEST-ONLY",
+            "TEST-ONLY",
+            "TEST-ONLY",
+        ],
     ),
     (
         "src/sandbox.rs",
@@ -3518,6 +3536,18 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/worker/macos.rs",
         "let child = std::process::Command::new(\"/bin/sleep\")",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut piped = Command::new(sandbox_exec)",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox/worker/macos.rs",
+        "let mut child = Command::new(sandbox_exec)",
         1,
         "TEST-ONLY",
     ),
@@ -3930,7 +3960,13 @@ const EXACT_MIXED_SITE_CLASSES: &[(&str, &str, &[&str])] = &[
     (
         "src/sandbox/worker/macos.rs",
         ".spawn()",
-        &["TC-BROKER-JS-WORKER", "TEST-ONLY", "TEST-ONLY"],
+        &[
+            "TC-BROKER-JS-WORKER",
+            "TEST-ONLY",
+            "TEST-ONLY",
+            "TEST-ONLY",
+            "TEST-ONLY",
+        ],
     ),
     (
         "src/sandbox.rs",

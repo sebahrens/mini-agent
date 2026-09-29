@@ -26,8 +26,8 @@ use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{
-    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, copy_to_clipboard,
-    read_from_clipboard,
+    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
+    copy_to_clipboard, read_from_clipboard,
 };
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
 use crate::ui::state::{
@@ -68,7 +68,11 @@ async fn read_worktree_choice(
     while let Some(event) = user_rx.recv().await {
         let UserEvent::Key(key) = event else {
             // Background completions and other input still belong to the main loop.
+            let quit = matches!(event, UserEvent::Quit);
             deferred.push_back(event);
+            if quit {
+                return WorktreePromptChoice::Abort;
+            }
             continue;
         };
         if key.kind != crossterm::event::KeyEventKind::Press {
@@ -172,7 +176,7 @@ pub(crate) fn clipboard_shortcut(
 
 /// Whether releasing the left button should copy the transcript selection.
 /// Only a real drag copies; a plain click (no movement, one line) does not.
-fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> bool {
+fn mouse_up_copies<P: PartialEq>(dragged: bool, start: Option<P>, end: Option<P>) -> bool {
     match (start, end) {
         (Some(start), Some(end)) => dragged || start != end,
         _ => false,
@@ -181,21 +185,27 @@ fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> b
 
 #[cfg(test)]
 mod mouse_selection_tests {
-    use super::mouse_up_copies;
+    use super::{SelectionPoint, mouse_up_copies};
 
     #[test]
     fn plain_click_does_not_copy_but_a_drag_does() {
-        assert!(!mouse_up_copies(false, Some(4), Some(4)));
-        assert!(mouse_up_copies(true, Some(4), Some(4)));
-        assert!(mouse_up_copies(false, Some(4), Some(6)));
-        assert!(mouse_up_copies(true, Some(6), Some(4)));
-        assert!(!mouse_up_copies(true, None, None));
+        let at = |line, col| Some(SelectionPoint::new(line, col));
+        assert!(!mouse_up_copies(false, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(true, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(false, at(4, 3), at(6, 0)));
+        assert!(mouse_up_copies(false, at(4, 3), at(4, 9)));
+        assert!(mouse_up_copies(true, at(6, 0), at(4, 3)));
+        assert!(!mouse_up_copies::<SelectionPoint>(true, None, None));
     }
 }
 
-fn is_ctrl_h(key: KeyEvent) -> bool {
-    (matches!(key.code, KeyCode::Char('h' | 'H')) && key.modifiers.contains(KeyModifiers::CONTROL))
-        || key.code == KeyCode::Char('\u{8}')
+/// The lazygit shortcut, Ctrl+O. It used to be Ctrl+H, but many terminals
+/// send `^H` for Backspace and crossterm cannot tell the two apart, so Ctrl+H
+/// stays backspace in the editor and pickers.
+fn is_lazygit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('o' | 'O'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,23 +277,52 @@ mod home_end_tests {
 }
 
 #[cfg(test)]
-mod ctrl_h_tests {
+mod lazygit_key_tests {
     use super::*;
 
     #[test]
-    fn accepts_disambiguated_and_raw_control_h_without_arming_backspace() {
-        assert!(is_ctrl_h(KeyEvent::new(
-            KeyCode::Char('h'),
+    fn lazygit_is_ctrl_o_and_ctrl_h_stays_backspace() {
+        assert!(is_lazygit_key(KeyEvent::new(
+            KeyCode::Char('o'),
             KeyModifiers::CONTROL
         )));
-        assert!(is_ctrl_h(KeyEvent::new(
-            KeyCode::Char('\u{8}'),
-            KeyModifiers::NONE
-        )));
-        assert!(!is_ctrl_h(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::NONE
-        )));
+        for key in [
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        ] {
+            assert!(!is_lazygit_key(key), "{key:?}");
+        }
+        // Idle Ctrl+C clears a draft first; Ctrl+D forward-deletes in it.
+        assert_eq!(idle_interrupt(false, false), IdleInterrupt::ClearDraft);
+        assert_eq!(idle_interrupt(true, false), IdleInterrupt::EditorKey);
+        assert_eq!(idle_interrupt(false, true), IdleInterrupt::Exit);
+        assert_eq!(idle_interrupt(true, true), IdleInterrupt::Exit);
+        let mut input = InputEditor::new();
+        input.load_text("draft");
+        input.discard_draft();
+        assert_eq!(input.buffer, "");
+        input.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer, "draft", "Ctrl+Y recovers a cleared draft");
+        input.set_cursor(0);
+        input.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer, "raft", "Ctrl+D deletes forward");
+
+        // Nothing is warmed after /quit or /exit (mini-agent-bgg91).
+        assert!(is_quit_command("/quit"));
+        assert!(is_quit_command(" /exit now"));
+        assert!(!is_quit_command("/quiet"));
+        assert!(!is_quit_command("/model x"));
+
+        // Ctrl+H reaches the editor as backspace.
+        let mut input = InputEditor::new();
+        input.load_text("ab");
+        assert_eq!(
+            input.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(input.buffer, "a");
     }
 }
 
@@ -497,6 +536,31 @@ mod git_status_refresh_tests {
     }
 }
 
+/// What an idle Ctrl+C / Ctrl+D (nothing to interrupt) does to the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleInterrupt {
+    /// Ctrl+C with a draft: clear it (recoverable with Ctrl+Y); a second
+    /// press on the now empty input quits.
+    ClearDraft,
+    /// Ctrl+D with a draft: forward-delete in the editor, as in a shell.
+    EditorKey,
+    /// Empty input: quit.
+    Exit,
+}
+
+pub(crate) fn idle_interrupt(is_ctrl_d: bool, draft_empty: bool) -> IdleInterrupt {
+    match (draft_empty, is_ctrl_d) {
+        (true, _) => IdleInterrupt::Exit,
+        (false, true) => IdleInterrupt::EditorKey,
+        (false, false) => IdleInterrupt::ClearDraft,
+    }
+}
+
+/// `/quit` and `/exit` leave the app; nothing needs warming after them.
+fn is_quit_command(text: &str) -> bool {
+    matches!(text.split_whitespace().next(), Some("/quit" | "/exit"))
+}
+
 pub(crate) fn interrupt_target(
     btw_inflight: usize,
     validation_active: bool,
@@ -550,6 +614,8 @@ pub(crate) struct App<'a> {
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
+    /// Last model-cache generation handed to the model picker.
+    model_cache_generation: u64,
 }
 
 impl<'a> App<'a> {
@@ -561,7 +627,10 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
-        let terminal_guard = TerminalGuard::new(ui.cfg.resolve_mouse_capture())?;
+        let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
+            mouse_capture: ui.cfg.resolve_mouse_capture(),
+            title_status: ui.cfg.resolve_terminal_title(),
+        })?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -572,6 +641,7 @@ impl<'a> App<'a> {
         let mut renderer = Renderer::new()?;
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
+        renderer.set_title_status(ui.cfg.resolve_terminal_title());
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
         if let Some(ref theme_name) = ui.context.current_theme_name {
             if let Some(content) = ui.context.themes.get(theme_name.as_str()) {
@@ -663,11 +733,9 @@ impl<'a> App<'a> {
         {
             let provider = ui.session.provider.to_string();
             let is_custom = ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
-                &provider, is_custom, &ui.client, ui.cli, ui.cfg,
-            )
-            .await;
-            input.set_live_model_names(ids);
+            // Non-blocking: an unreachable gateway must not stall startup.
+            crate::ui::slash::warm_model_cache(&provider, is_custom, &ui.client, ui.cli, ui.cfg);
+            input.set_live_model_names(crate::ui::slash::cached_model_ids(&provider));
         }
 
         #[cfg(feature = "git-worktree")]
@@ -804,6 +872,7 @@ impl<'a> App<'a> {
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
+        super::spawn_termination_listener(user_tx.clone());
 
         let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
@@ -925,6 +994,7 @@ impl<'a> App<'a> {
             event_handle,
             prebuild,
             terminal_guard,
+            model_cache_generation: crate::ui::slash::model_cache_generation(),
         };
         app.request_git_status_refresh();
         Ok(app)
@@ -1033,7 +1103,18 @@ impl<'a> App<'a> {
                     self.handle_btw_event(bev)?;
                     self.refresh()?;
                 }
+                _ = tokio::time::sleep_until(
+                    self.renderer.notice_deadline().map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+                ), if self.renderer.notice_deadline().is_some() => {
+                    // A transient notice expired; the redraw clears it.
+                    self.refresh()?;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
+                    if self.renderer.paint_pending_chat()?
+                        && self.input.picker.as_ref().is_some_and(|picker| picker.active())
+                    {
+                        self.refresh()?;
+                    }
                     self.renderer.tick_spinner()?;
                 }
                 // The @ file picker fills from a background walk; repaint as
@@ -1107,7 +1188,23 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Hand the model picker the current provider's cached ids when a
+    /// background listing has landed since the last sync (or when `force`).
+    fn sync_live_model_names(&mut self, force: bool) {
+        let generation = crate::ui::slash::model_cache_generation();
+        self.input
+            .set_current_model(Some(self.ui.session.model.to_string()));
+        if force || generation != self.model_cache_generation {
+            self.model_cache_generation = generation;
+            self.input
+                .set_live_model_names(crate::ui::slash::cached_model_ids(
+                    &self.ui.session.provider,
+                ));
+        }
+    }
+
     fn refresh(&mut self) -> io::Result<()> {
+        self.sync_live_model_names(false);
         refresh_display(
             &mut self.renderer,
             &mut self.input,
@@ -1156,25 +1253,28 @@ impl<'a> App<'a> {
                             }
                         });
                     } else {
+                        let point = SelectionPoint::new(idx, self.renderer.chat_text_col(col));
                         self.renderer.selection_active = true;
-                        self.renderer.selection_start = Some(idx);
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_start = Some(point);
+                        self.renderer.selection_end = Some(point);
                         self.renderer.selection_dragged = false;
                     }
                 }
             }
-            UserEvent::MouseDrag { row } => {
+            UserEvent::MouseDrag { row, col } => {
                 if self.renderer.selection_active {
                     self.renderer.selection_dragged = true;
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                 }
             }
-            UserEvent::MouseUp { row } => {
+            UserEvent::MouseUp { row, col } => {
                 if self.renderer.selection_active {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                     if mouse_up_copies(
                         self.renderer.selection_dragged,
@@ -1187,6 +1287,17 @@ impl<'a> App<'a> {
                         self.renderer.clear_selection();
                     }
                 }
+            }
+            UserEvent::Quit => {
+                // The terminal may already be gone (SIGHUP): drawing can fail,
+                // but stopping the run and saving must still happen.
+                if self.run.is_running
+                    && let Err(error) = self.abort_main_run().await
+                {
+                    tracing::warn!(%error, "run cleanup on quit failed");
+                }
+                let _ = self.save_session();
+                return Ok(ControlFlow::Break(()));
             }
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
@@ -1250,7 +1361,15 @@ impl<'a> App<'a> {
                         InterruptTarget::Validation | InterruptTarget::MainRun => {
                             self.abort_main_run().await?;
                         }
-                        InterruptTarget::Exit => return Ok(ControlFlow::Break(())),
+                        InterruptTarget::Exit => {
+                            match idle_interrupt(is_ctrl_d, self.input.buffer.is_empty()) {
+                                IdleInterrupt::Exit => return Ok(ControlFlow::Break(())),
+                                IdleInterrupt::ClearDraft => self.input.discard_draft(),
+                                IdleInterrupt::EditorKey => {
+                                    self.handle_key_event(key).await?;
+                                }
+                            }
+                        }
                     }
                     self.refresh()?;
                     return Ok(ControlFlow::Continue(()));
@@ -1277,18 +1396,20 @@ impl<'a> App<'a> {
             return Ok(());
         };
         match copy_to_clipboard(&text).await {
+            // The outcome is a transient status-line notice: copying must not
+            // grow the transcript it is copying from.
             Ok(ClipboardCopyOutcome::Confirmed) => {
-                self.renderer.write_line("copied selection", Color::Green)?;
+                self.renderer.show_notice("copied selection", Color::Green);
                 self.renderer.clear_selection();
             }
             Ok(ClipboardCopyOutcome::FallbackRequested) => {
                 self.renderer
-                    .write_line("copy requested through terminal", Color::Green)?;
+                    .show_notice("copy requested through terminal", Color::Green);
                 self.renderer.clear_selection();
             }
             Err(error) => {
                 self.renderer
-                    .write_line(&format!("copy to clipboard failed: {error}"), C_ERROR)?;
+                    .show_notice(&format!("copy to clipboard failed: {error}"), C_ERROR);
                 self.renderer.clear_selection();
             }
         }
@@ -1396,7 +1517,7 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if is_ctrl_h(key) {
+        if is_lazygit_key(key) {
             self.run_lazygit().await?;
             return Ok(());
         }
@@ -2299,18 +2420,19 @@ impl<'a> App<'a> {
             return result;
         }
 
-        {
+        // The provider may have changed: warm its model list in the
+        // background (never blocking the command) and show what is cached.
+        if !is_quit_command(text) {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
+            crate::ui::slash::warm_model_cache(
                 &provider,
                 is_custom,
                 &self.ui.client,
                 self.ui.cli,
                 self.ui.cfg,
-            )
-            .await;
-            self.input.set_live_model_names(ids);
+            );
+            self.sync_live_model_names(true);
         }
 
         self.handle_slash_result(result).await?;
@@ -2698,6 +2820,9 @@ impl<'a> App<'a> {
                     );
                     if interrupt {
                         cancellation.cancel();
+                    } else if matches!(event, UserEvent::Quit) {
+                        cancellation.cancel();
+                        self.deferred_user_events.push_back(event);
                     } else {
                         self.deferred_user_events.push_back(event);
                     }
@@ -2888,6 +3013,7 @@ impl<'a> App<'a> {
         self.pause_event_thread();
         // Terminal resumption clears the screen even when the draft is unchanged.
         self.renderer.invalidate();
+        self.renderer.forget_title();
         self.running = Arc::new(AtomicBool::new(true));
         // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(

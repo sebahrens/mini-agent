@@ -74,17 +74,19 @@ pub fn render_session(
                 }
             }
             MessageRole::ToolCall => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::Tool, format!("◈ {}", line));
-                }
+                feed.push_line(
+                    BlockStyle::Tool,
+                    format!("◈ {}", replayed_tool_call(&msg.content)),
+                );
             }
             MessageRole::ToolResult => {
                 render_tool_result_to_feed(feed, &msg.content, cfg)?;
             }
             MessageRole::SubagentToolCall => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::Tool, format!("⌥ {}", line));
-                }
+                feed.push_line(
+                    BlockStyle::Tool,
+                    format!("⌥ {}", replayed_tool_call(&msg.content)),
+                );
             }
         }
         feed.push_line(BlockStyle::Plain, "");
@@ -240,7 +242,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     feed.push_line(BlockStyle::Plain, "");
     feed.push_line(BlockStyle::Tool, "  Keybindings:");
     feed.push_line(BlockStyle::Plain, "    Ctrl+G     Open input in $EDITOR");
-    feed.push_line(BlockStyle::Plain, "    Ctrl+H     Launch lazygit");
+    feed.push_line(BlockStyle::Plain, "    Ctrl+O     Launch lazygit");
     feed.push_line(
         BlockStyle::Plain,
         "    /command   Command picker (Tab inserts, Enter runs)",
@@ -262,29 +264,183 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A stored tool-call summary replayed as one transcript row: a multi-line
+/// script shows its first line and a line/char count, like the live view.
+fn replayed_tool_call(content: &str) -> String {
+    crate::ui::utils::compact_multiline(&sanitize_output(content), 240)
+}
+
+/// Spaces a tab expands to. A raw tab moves the cursor to the terminal's next
+/// tab stop, which desynchronises the renderer's width accounting.
+const TAB_SPACES: &str = "    ";
+
+/// Make untrusted text safe to paint: remove every terminal control sequence
+/// and control character so model or tool output can never move the cursor,
+/// retitle the window, emit hyperlinks or queries, or hide text.
+///
+/// Parsing follows ECMA-48: CSI sequences run to their final byte, OSC/DCS/
+/// SOS/PM/APC strings run to BEL or ST (and, for display robustness, to the
+/// end of the line), `ESC` + intermediates + final is consumed whole, and the
+/// 8-bit C1 introducers are treated like their 7-bit forms. `\r\n` becomes
+/// `\n`; a lone `\r` becomes a line break rather than silently overwriting (and
+/// hiding) what preceded it; a `\r` ending the chunk is dropped because a
+/// streamed CRLF may be split across chunks. Tabs expand to spaces.
 pub fn sanitize_output(text: &str) -> CompactString {
     let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.next() {
-                Some('[') | Some(']') => {
-                    for next in &mut chars {
-                        if next.is_ascii_alphabetic() || next == '~' {
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {}
-                None => break,
+        match c {
+            '\n' => result.push('\n'),
+            '\r' => match chars.peek() {
+                Some('\n') | None => {}
+                Some(_) => result.push('\n'),
+            },
+            '\t' => result.push_str(TAB_SPACES),
+            '\x1b' => skip_escape(&mut chars),
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => {
+                skip_control_string(&mut chars);
             }
-        } else if c.is_ascii_control() && c != '\n' && c != '\t' && c != '\r' {
-            continue;
-        } else {
-            result.push(c);
+            // C0 controls, DEL and the remaining C1 controls.
+            c if c.is_control() => {}
+            c => result.push(c),
         }
     }
     CompactString::from(result)
+}
+
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+fn in_range(c: char, lo: u8, hi: u8) -> bool {
+    (u32::from(lo)..=u32::from(hi)).contains(&u32::from(c))
+}
+
+/// Consume the rest of an escape sequence whose `ESC` was just read.
+fn skip_escape(chars: &mut Chars<'_>) {
+    let Some(&next) = chars.peek() else {
+        return;
+    };
+    match next {
+        '[' => {
+            chars.next();
+            skip_csi(chars);
+        }
+        ']' | 'P' | 'X' | '^' | '_' => {
+            chars.next();
+            skip_control_string(chars);
+        }
+        c if in_range(c, 0x20, 0x2f) => {
+            // nF: intermediates, then one final byte (e.g. `ESC ( B`).
+            while chars.peek().is_some_and(|&c| in_range(c, 0x20, 0x2f)) {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|&c| in_range(c, 0x30, 0x7e)) {
+                chars.next();
+            }
+        }
+        // Two-character Fp/Fe/Fs escapes (`ESC 7`, `ESC M`, `ESC c`, ...).
+        c if in_range(c, 0x30, 0x7e) => {
+            chars.next();
+        }
+        // A lone ESC: drop it and keep the following character.
+        _ => {}
+    }
+}
+
+/// Consume CSI parameter and intermediate bytes through the final byte. A
+/// character outside the CSI grammar ends the (malformed) sequence and is
+/// processed normally.
+fn skip_csi(chars: &mut Chars<'_>) {
+    while let Some(&c) = chars.peek() {
+        if in_range(c, 0x20, 0x3f) {
+            chars.next();
+        } else if in_range(c, 0x40, 0x7e) {
+            chars.next();
+            return;
+        } else {
+            return;
+        }
+    }
+}
+
+/// Consume an OSC/DCS/SOS/PM/APC payload through its terminator: BEL, ST
+/// (`ESC \` or U+009C), or a line break, which is kept.
+fn skip_control_string(chars: &mut Chars<'_>) {
+    while let Some(&c) = chars.peek() {
+        match c {
+            '\x07' | '\u{9c}' => {
+                chars.next();
+                return;
+            }
+            '\x1b' => {
+                chars.next();
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                }
+                return;
+            }
+            '\n' | '\r' => return,
+            _ => {
+                chars.next();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_output;
+
+    #[test]
+    fn csi_sequences_are_removed_through_their_final_byte() {
+        assert_eq!(sanitize_output("a\x1b[31;1mred\x1b[0m b"), "ared b");
+        assert_eq!(sanitize_output("\x1b[<35;10;5M\x1b[97;5u"), "");
+        assert_eq!(sanitize_output("x\x1b[?1049hy"), "xy");
+        assert_eq!(sanitize_output("\u{9b}2Jvisible"), "visible");
+    }
+
+    #[test]
+    fn osc_strings_are_removed_whole_including_titles_and_hyperlinks() {
+        assert_eq!(sanitize_output("\x1b]0;evil title\x07after"), "after");
+        assert_eq!(
+            sanitize_output("\x1b]8;;https://x.test/a\x1b\\link\x1b]8;;\x1b\\"),
+            "link"
+        );
+        assert_eq!(sanitize_output("\x1b]52;c;aGk=\x07ok"), "ok");
+        assert_eq!(sanitize_output("\u{9d}2;t\u{9c}ok"), "ok");
+        assert_eq!(sanitize_output("\x1bPq#0;1\x1b\\ok"), "ok");
+    }
+
+    #[test]
+    fn unterminated_strings_stop_at_the_line_end() {
+        assert_eq!(sanitize_output("\x1b]0;title\nnext line"), "\nnext line");
+    }
+
+    #[test]
+    fn short_escapes_drop_only_their_own_bytes() {
+        assert_eq!(sanitize_output("a\x1b7b\x1b(Bc"), "abc");
+        assert_eq!(sanitize_output("a\x1b\u{e9}"), "a\u{e9}");
+        assert_eq!(sanitize_output("trailing\x1b"), "trailing");
+    }
+
+    #[test]
+    fn c0_c1_and_del_controls_are_removed() {
+        assert_eq!(sanitize_output("a\x07b\x08c\x7fd\u{85}e\u{9a}f"), "abcdef");
+    }
+
+    #[test]
+    fn carriage_returns_and_tabs_cannot_corrupt_rows() {
+        assert_eq!(sanitize_output("one\r\ntwo"), "one\ntwo");
+        assert_eq!(sanitize_output("rm -rf /\rsafe"), "rm -rf /\nsafe");
+        assert_eq!(sanitize_output("split\r"), "split");
+        assert_eq!(sanitize_output("a\tb"), "a    b");
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        let text = "héllo 世界 — `code` [link](https://x.test)\n";
+        assert_eq!(sanitize_output(text), text);
+    }
 }
 
 #[cfg(test)]

@@ -681,7 +681,7 @@ mod tests {
         let sandbox = include_str!("../sandbox.rs");
         let direct = sandbox
             .split("pub(crate) fn wrap_direct_command")
-            .nth(2)
+            .nth(1)
             .unwrap()
             .split("fn build_seatbelt_command")
             .next()

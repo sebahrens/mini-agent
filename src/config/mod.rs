@@ -275,6 +275,12 @@ pub struct Config {
     /// its native selection works. Default: true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_capture: Option<bool>,
+    /// Report agent activity in the terminal/window title (`mini-agent:
+    /// working`, `waiting for approval`, `idle`) so terminal multiplexers and
+    /// tab bars can show it; the previous title is restored on exit.
+    /// Default: true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_title: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
@@ -563,6 +569,10 @@ impl Config {
 
     pub fn resolve_mouse_capture(&self) -> bool {
         self.mouse_capture.unwrap_or(true)
+    }
+
+    pub fn resolve_terminal_title(&self) -> bool {
+        self.terminal_title.unwrap_or(true)
     }
 
     /// Resolves temperature: CLI `--temperature` > quick-model `temperature` >
@@ -1048,6 +1058,15 @@ mod tests {
     fn resolve_prompt_model_returns_none_for_empty_map() {
         let cfg = make_config(HashMap::new());
         assert_eq!(cfg.resolve_prompt_model("plan"), None);
+    }
+
+    #[test]
+    fn toml_terminal_title_defaults_on_and_can_be_disabled() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.resolve_terminal_title());
+        let cfg: Config = toml::from_str("terminal_title = false\n").unwrap();
+        assert_eq!(cfg.terminal_title, Some(false));
+        assert!(!cfg.resolve_terminal_title());
     }
 
     #[test]
