@@ -182,7 +182,9 @@ An ACP client sets a goal through `_meta.goal` on a `session/prompt` request:
 `{"clear": true}` drops the goal. Those four fields are the whole schema, and
 anything else is refused: checks, the judge and the bounds come from this
 installation's configuration, never from the client, so an editor cannot
-configure a gate and cannot switch one off.
+configure a gate and cannot switch one off. The goal is applied only after the
+prompt is admitted: a prompt rejected because the session already has an active
+turn leaves that turn's goal untouched.
 
 One prompt is one round. The client sends the next prompt to run the next
 round, which is how an editor already works. Each round's decision comes back

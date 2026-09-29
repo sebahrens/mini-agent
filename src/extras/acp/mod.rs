@@ -1081,21 +1081,13 @@ fn acp_session_sandbox(
 /// reason `/goal` refuses it: the rounds and verdicts on it are the record of
 /// the work done so far.
 #[cfg(feature = "goal")]
-async fn apply_meta_goal(
-    state: &Arc<AcpState>,
-    session_id: &SessionId,
+fn apply_meta_goal(
+    state: &AcpState,
+    store: &crate::extras::goal::GoalStore,
     meta: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
     let Some(spec) = meta.get("goal") else {
         return Ok(());
-    };
-    let store = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(session_id)
-            .ok_or_else(|| "unknown ACP session".to_string())?
-            .goal_store
-            .clone()
     };
     let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
 
@@ -1195,17 +1187,6 @@ async fn handle_prompt(
 
     let prompt_text = render_prompt_blocks(&req.prompt)?;
 
-    // A client sets or clears the session's goal through the request's `_meta`
-    // rather than through prompt text: the objective is a long-lived
-    // instruction channel, and a text directive would let anything that reaches
-    // the prompt install one.
-    #[cfg(feature = "goal")]
-    if let Some(meta) = req.meta.as_ref()
-        && let Err(error) = apply_meta_goal(&state, &session_id, meta).await
-    {
-        return Err(agent_client_protocol::Error::new(-32602, error));
-    }
-
     let snapshot = {
         let sessions = state.sessions.lock().await;
         let sess = sessions
@@ -1265,6 +1246,20 @@ async fn handle_prompt(
         control,
         registration,
     } = snapshot;
+
+    // A client sets or clears the session's goal through the request's `_meta`
+    // rather than through prompt text: the objective is a long-lived
+    // instruction channel, and a text directive would let anything that reaches
+    // the prompt install one. It is applied only once this prompt has been
+    // admitted, so a prompt rejected because another turn is active cannot
+    // clear or replace the goal that turn is being judged against. A refused
+    // goal drops `registration`, which settles the just-admitted generation.
+    #[cfg(feature = "goal")]
+    if let Some(meta) = req.meta.as_ref()
+        && let Err(error) = apply_meta_goal(&state, &goal_store, meta)
+    {
+        return Err(agent_client_protocol::Error::new(-32602, error));
+    }
 
     control.attach_sandbox(sandbox.clone());
 
@@ -3582,6 +3577,103 @@ mod protocol_tests {
                 .expect("a new generation must start after cancellation")?;
                 assert_eq!(next.stop_reason, StopReason::EndTurn);
                 assert_eq!(next_started.load(Ordering::Acquire), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "goal")]
+    #[tokio::test]
+    async fn rejected_prompt_does_not_touch_the_active_turns_goal() {
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let blocked_started = blocked_started.clone();
+            Arc::new(move |prompt, _history| {
+                let blocked_started = blocked_started.clone();
+                Box::pin(async move {
+                    if prompt == "blocked" {
+                        blocked_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let state = fixture_state(fixture);
+        let observed = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let with_goal = |session: SessionId, text: &str, goal: serde_json::Value| {
+            let mut request = prompt(session, text);
+            let mut meta = serde_json::Map::new();
+            meta.insert("goal".to_string(), goal);
+            request.meta = Some(meta);
+            request
+        };
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let first_cx = cx.clone();
+                let first = with_goal(
+                    session.clone(),
+                    "blocked",
+                    serde_json::json!({"objective": "keep this objective"}),
+                );
+                let blocked =
+                    tokio::spawn(async move { first_cx.send_request(first).block_task().await });
+                tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+                    .await
+                    .expect("the first turn should start");
+
+                for goal in [
+                    serde_json::json!({"clear": true}),
+                    serde_json::json!({"objective": "hijack", "replace": true}),
+                ] {
+                    assert!(
+                        cx.send_request(with_goal(session.clone(), "concurrent", goal))
+                            .block_task()
+                            .await
+                            .is_err(),
+                        "a concurrent prompt must be rejected"
+                    );
+                    let objective = observed
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session)
+                        .and_then(|s| s.goal_store.snapshot())
+                        .map(|goal| goal.objective.clone());
+                    assert_eq!(
+                        objective.as_deref(),
+                        Some("keep this objective"),
+                        "a rejected prompt must not change the active turn's goal"
+                    );
+                }
+
+                cx.send_notification(CancelNotification::new(session))?;
+                let blocked = tokio::time::timeout(Duration::from_secs(5), blocked)
+                    .await
+                    .expect("cancellation must release the active turn")
+                    .unwrap()?;
+                assert_eq!(blocked.stop_reason, StopReason::Cancelled);
                 Ok(())
             })
             .await
