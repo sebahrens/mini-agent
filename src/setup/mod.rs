@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use compact_str::CompactString;
 use crossterm::ExecutableCommand;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 
@@ -342,7 +342,12 @@ fn render_main_menu(ctx: &Ctx) -> io::Result<()> {
     write_line(row, 2, "L) Launch agent", Color::White)?;
     write_line(row, 28, "A) Launch using environment", Color::White)?;
     row += 1;
-    write_line(row, 2, "Q) Quit", Color::White)?;
+    write_line(
+        row,
+        2,
+        "Q) Quit (Ctrl-C quits from any screen)",
+        Color::White,
+    )?;
 
     if let Some(msg) = &ctx.message {
         write_line(row + 2, 2, msg, Color::DarkYellow)?;
@@ -871,6 +876,20 @@ fn apply_key_result(ctx: &mut Ctx, result: KeyResult) -> Option<(SetupOutcome, C
 }
 
 fn handle_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    // Raw mode delivers Ctrl-C as a key instead of SIGINT. Treat it as quit
+    // from any screen (like `q` on the main menu: explicitly saved entries are
+    // kept, unsaved field edits are dropped), and never let another
+    // Control-modified character act as a command or be typed into a field.
+    // Control together with Alt is AltGr on Windows and still types text.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && let KeyCode::Char(c) = key.code
+    {
+        if c.eq_ignore_ascii_case(&'c') {
+            return Ok(KeyResult::Outcome(SetupOutcome::Quit, ctx.cfg.clone()));
+        }
+        return Ok(KeyResult::Screen(ctx.screen.clone()));
+    }
     match &ctx.screen {
         Screen::MainMenu => handle_main_menu_key(ctx, key),
         Screen::ManageProviders {
@@ -1695,7 +1714,6 @@ fn handle_model_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyResult
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
 
     fn wizard(cfg: Config) -> Ctx {
         Ctx {
@@ -1779,6 +1797,62 @@ mod tests {
                 .as_ref()
                 .is_some_and(|providers| providers.contains_key("local-vllm"))
         );
+    }
+
+    fn press_with(
+        ctx: &mut Ctx,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<(SetupOutcome, Config)> {
+        let result = handle_key(ctx, KeyEvent::new(code, modifiers)).expect("key handled");
+        apply_key_result(ctx, result)
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_a_field_editor_without_typing_c() {
+        let mut ctx = wizard(Config::default());
+        assert!(press(&mut ctx, KeyCode::Char('p')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('a')).is_none());
+        assert!(press(&mut ctx, KeyCode::Enter).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('x')).is_none());
+
+        // Other Control chords are ignored rather than inserted.
+        assert!(press_with(&mut ctx, KeyCode::Char('u'), KeyModifiers::CONTROL).is_none());
+        match &ctx.screen {
+            Screen::ProviderDetail {
+                editing: Some(editor),
+                ..
+            } => assert_eq!(editor.confirmed(), "x"),
+            _ => panic!("field editor must stay open"),
+        }
+
+        let (outcome, _) = press_with(&mut ctx, KeyCode::Char('c'), KeyModifiers::CONTROL)
+            .expect("Ctrl-C must end the wizard");
+        assert!(matches!(outcome, SetupOutcome::Quit));
+    }
+
+    #[test]
+    fn control_chords_do_not_trigger_menu_commands_but_altgr_text_still_types() {
+        let mut ctx = wizard(Config::default());
+        assert!(press_with(&mut ctx, KeyCode::Char('l'), KeyModifiers::CONTROL).is_none());
+        assert!(matches!(ctx.screen, Screen::MainMenu));
+        let (outcome, _) = press_with(&mut ctx, KeyCode::Char('C'), KeyModifiers::CONTROL)
+            .expect("Ctrl-C on the main menu quits");
+        assert!(matches!(outcome, SetupOutcome::Quit));
+
+        let mut ctx = wizard(Config::default());
+        assert!(press(&mut ctx, KeyCode::Char('p')).is_none());
+        assert!(press(&mut ctx, KeyCode::Char('a')).is_none());
+        assert!(press(&mut ctx, KeyCode::Enter).is_none());
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(press_with(&mut ctx, KeyCode::Char('@'), altgr).is_none());
+        match &ctx.screen {
+            Screen::ProviderDetail {
+                editing: Some(editor),
+                ..
+            } => assert_eq!(editor.confirmed(), "@"),
+            _ => panic!("field editor must stay open"),
+        }
     }
 
     #[test]

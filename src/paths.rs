@@ -1773,6 +1773,16 @@ pub fn artifact_disabled(artifact: &'static str) -> bool {
         .is_some_and(|disabled| disabled.contains(artifact))
 }
 
+/// Suppress the per-run records that belong to a session.
+///
+/// `--no-session` promises that the run leaves no session behind. A goal's
+/// round transcripts are that session's audit trail, written as the rounds
+/// settle, so they are switched off with it rather than left as an orphaned
+/// directory for a session that was never saved.
+pub fn disable_session_artifacts() {
+    disable_artifact("goal transcripts");
+}
+
 fn disable_artifact(artifact: &'static str) {
     let disabled = DISABLED_ARTIFACTS.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut disabled) = disabled.lock() {

@@ -17,6 +17,7 @@ Memory is plain Markdown on disk — no database, no indexing service. All stora
 ```
 <data_dir>/memory/
 ├── MEMORY.md                        # Global long-term memory (shared across projects)
+├── .memory.lock                     # Advisory lock serializing writes/edits across sessions
 └── projects/
     └── <project-slug>/
         ├── SCRATCHPAD.md            # Per-project checklist
@@ -27,6 +28,8 @@ Memory is plain Markdown on disk — no database, no indexing service. All stora
             ├── auth.md              # Reference notes (never auto-injected)
             └── deployment.md
 ```
+
+Every `memory_write`/`memory_edit` holds an exclusive advisory lock on `.memory.lock` for its read-modify-write, so concurrent sessions appending to the shared `MEMORY.md` (or the same daily log) never lose each other's updates.
 
 ### Project Slug
 
@@ -114,8 +117,10 @@ At each user-turn boundary, `context_block()` rebuilds the candidate `<memory>` 
 ```
 
 Rules:
-- Output is hard-capped at `MAX_INJECT_BYTES` (32 KiB): sections are included whole while they fit the remaining budget, in priority order; the first section that doesn't fit whole is tail-truncated to consume exactly what's left (`…[section truncated: <title>]`), and every lower-priority section after it is omitted entirely (`…[section omitted: <title>]`) rather than displacing a higher-priority section that already fit whole. A final whole-string `truncate_cjk` pass is kept as a hard backstop against unexpected overrun.
+- Output is hard-capped at `MAX_INJECT_BYTES` (32 KiB): sections are included whole while they fit the remaining budget, in priority order; the first section that doesn't fit whole is truncated to consume exactly what's left: MEMORY.md and the scratchpad keep their beginning (`…[section truncated: <title>]`), while an append-only daily log keeps its newest entries at the end (`…[section truncated: <title>; older entries omitted]`), and every lower-priority section after it is omitted entirely (`…[section omitted: <title>]`) rather than displacing a higher-priority section that already fit whole. A final whole-string `truncate_cjk` pass is kept as a hard backstop against unexpected overrun.
 - Missing or empty files are silently skipped
+- MEMORY.md is read up to 128 KiB; a larger file is still injected (its beginning, marked and logged as a warning) rather than dropped
+- `memory_read` of a daily log likewise keeps the newest 32 KiB of an oversized log
 - If nothing exists, returns `None` (zero trace in the prompt)
 - Notes are deliberately excluded; daily-log selection is limited to the two most recent non-empty logs (see Write Targets)
 - The XML attribute warns the model that memory is reference, not instructions
@@ -270,6 +275,7 @@ Appends the `<memory>...</memory>` block to the system prompt preamble, separate
 |---|---|---|
 | `MAX_INJECT_BYTES` | 32,768 (32 KiB) | Hard cap on context-block and search-render output |
 | `MAX_WRITE_BYTES` | 65,536 (64 KiB) | Per-call content cap for memory_write (truncated with warning) |
+| `MAX_LONG_TERM_READ_BYTES` | 131,072 (128 KiB) | Largest MEMORY.md prefix read for the context block |
 
 ---
 

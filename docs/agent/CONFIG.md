@@ -162,7 +162,12 @@ import then writes that digest into `<data-dir>/agent-skills/<name>/ACTIVE`, so
 the newly imported version is the one selected from that point on. Re-importing
 a tree that is already installed skips the copy but still repoints `ACTIVE`.
 Already-running TUI and ACP sessions notice both the new tree and the moved
-pointer through the per-turn catalog signature.
+pointer through the per-turn catalog signature. Before publishing a second
+digest for a package installed without `ACTIVE`, the import first pins the
+existing digest, so an import killed mid-way leaves the old version active.
+Each import also removes working trees older than one hour that killed imports
+left behind (`<cache-dir>/import-staging/agent-skill-*` and
+`<data-dir>/agent-skills/<name>/.import-*`). Superseded digests are kept.
 
 `SKILL.md` is capped at 48 KiB at import — one whole turn's instruction budget.
 A larger file is refused by the import command instead of installing, ranking
@@ -533,7 +538,7 @@ Accepted top-level keys:
 | `terminal_title`          | boolean | Report agent activity in the terminal/window title (OSC 0): `mini-agent: working` while a run is active, `mini-agent: waiting for approval` while a permission prompt waits, and `mini-agent: idle` otherwise. Terminal multiplexers and tab bars that show pane or window titles (tmux `#{pane_title}`, zellij, herdr, terminal tabs) can surface it. The title is saved on start and restored on exit (XTWINOPS title stack; terminals without it fall back to their default title). The text is fixed, never model or tool output. Set `false` to leave the title alone. Default: `true`. |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
-| `wt-base-dir`             | path    | Base directory for CLI-created worktrees; requires `git-worktree`. |
+| `wt-base-dir`             | path    | Base directory for CLI-created worktrees (default: parent of the repository toplevel; targets inside a checkout are rejected); requires `git-worktree`. |
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. |

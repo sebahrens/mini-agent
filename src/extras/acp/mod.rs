@@ -2001,13 +2001,17 @@ async fn settle_acp_goal_round(
                             &client,
                             &transcript,
                             cfg,
+                            checks.as_ref(),
                         )
                         .await,
                     ),
                     // Fail open, like every other judge failure: an editor
                     // without a reachable judge still gets its checks.
-                    Err(error) => Some(crate::extras::goal::gate::JudgeOutcome::Unavailable {
-                        reason: error.to_string(),
+                    Err(error) => Some(crate::extras::goal::judge::JudgeCall {
+                        outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                            reason: error.to_string(),
+                        },
+                        tokens: 0,
                     }),
                 }
             }
@@ -2015,7 +2019,8 @@ async fn settle_acp_goal_round(
         };
         driver::Verification {
             checks,
-            judge: judged,
+            judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+            judge: judged.map(|call| call.outcome),
             ..driver::Verification::default()
         }
     })

@@ -370,6 +370,111 @@ fn oversized_case_never_exceeds_inject_cap() {
 }
 
 #[test]
+fn concurrent_appends_from_separate_handles_keep_every_update() {
+    let m = fresh("concurrent");
+    let writers = 8;
+    let per_writer = 25;
+    std::thread::scope(|scope| {
+        for writer in 0..writers {
+            // Separate handles model separate sessions sharing MEMORY.md.
+            let handle = Mem {
+                root: m.root.clone(),
+                project: m.project.clone(),
+                today: m.today.clone(),
+            };
+            scope.spawn(move || {
+                for entry in 0..per_writer {
+                    handle
+                        .write(
+                            WriteTarget::LongTerm,
+                            &format!("fact-{writer}-{entry}"),
+                            WriteMode::Append,
+                            None,
+                        )
+                        .unwrap();
+                    handle
+                        .write(
+                            WriteTarget::Daily,
+                            &format!("log-{writer}-{entry}"),
+                            WriteMode::Append,
+                            None,
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let long_term = fs::read_to_string(memory_md(&m)).unwrap();
+    let daily_log = fs::read_to_string(daily(&m, &m.today)).unwrap();
+    for writer in 0..writers {
+        for entry in 0..per_writer {
+            assert!(
+                long_term.contains(&format!("fact-{writer}-{entry}\n")),
+                "lost long-term append fact-{writer}-{entry}"
+            );
+            assert!(
+                daily_log.contains(&format!("log-{writer}-{entry}\n")),
+                "lost daily append log-{writer}-{entry}"
+            );
+        }
+    }
+    assert!(m.list().iter().all(|name| !name.contains("lock")));
+    cleanup(&m);
+}
+
+#[test]
+fn long_term_over_read_limit_is_truncated_not_dropped() {
+    let m = fresh("lt-huge");
+    let huge = format!("FIRSTFACT\n{}", "B".repeat(200 * 1024));
+    fs::write(memory_md(&m), huge).unwrap();
+
+    let b = m
+        .context_block()
+        .expect("oversized MEMORY.md is still injected");
+    assert!(b.contains("FIRSTFACT"));
+    assert!(b.contains("…[section truncated: Long-term memory (MEMORY.md)]"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+    cleanup(&m);
+}
+
+#[test]
+fn oversized_daily_log_keeps_its_newest_entries() {
+    let m = fresh("daily-tail");
+    let log = format!(
+        "### 09:00 — OLDESTENTRY\n{}\n### 18:00 — NEWESTENTRY\n",
+        "x".repeat(40 * 1024)
+    );
+    fs::write(daily(&m, &m.today), &log).unwrap();
+
+    let b = m.context_block().unwrap();
+    assert!(b.contains("NEWESTENTRY"), "newest daily entry must survive");
+    assert!(!b.contains("OLDESTENTRY"));
+    assert!(b.contains("older entries omitted"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+
+    let read = Mem::read_capped_tail(&daily(&m, &m.today));
+    assert!(read.contains("NEWESTENTRY"));
+    assert!(!read.contains("OLDESTENTRY"));
+    assert!(read.starts_with("…[memory truncated: older entries omitted]"));
+    cleanup(&m);
+}
+
+#[test]
+fn oversized_daily_log_tail_respects_character_boundaries() {
+    let m = fresh("daily-tail-cjk");
+    fs::write(
+        daily(&m, &m.today),
+        format!("{}END", "記憶實作".repeat(MAX_INJECT_BYTES / 4)),
+    )
+    .unwrap();
+    let b = m.context_block().unwrap(); // must not panic mid-character
+    assert!(b.contains("END"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+    cleanup(&m);
+}
+
+#[test]
 fn notes_never_injected_but_searchable() {
     let m = fresh("note");
     m.write(

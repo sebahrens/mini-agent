@@ -166,6 +166,15 @@ pub(crate) fn render_status(goal: &Goal) -> String {
                 _ => "resolved when the next round runs".to_string(),
             })
     ));
+    if !goal.history.is_empty() {
+        out.push_str("recent rounds:\n");
+        for entry in &goal.history {
+            out.push_str(&format!(
+                "  round {} attempt {}: {}\n",
+                entry.round, entry.attempt, entry.summary
+            ));
+        }
+    }
     if let Some(verdict) = &goal.last_verdict {
         out.push_str(&format!("last check: {}\n", verdict.reason));
         if goal.met_unverified() {
@@ -458,6 +467,28 @@ mod tests {
             paused.contains("no progress"),
             "the pause reason must be visible: {paused}"
         );
+    }
+
+    /// `/goal status` lists recent rounds, attempts included, rather than only
+    /// the latest verdict (mini-agent-2jqy9).
+    #[test]
+    fn status_lists_recent_rounds_and_their_attempts() {
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        assert!(!render_status(&goal).contains("recent rounds"));
+        goal.push_history(1, "not yet (round 1) — keep going");
+        goal.push_history(2, "interrupted during verification");
+        goal.push_history(2, "met after 2 round(s) — checks passed");
+        let rendered = render_status(&goal);
+        assert!(rendered.contains("recent rounds:"), "{rendered}");
+        assert!(
+            rendered.contains("round 1 attempt 1: not yet"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("round 2 attempt 1: interrupted during verification"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("round 2 attempt 2: met"), "{rendered}");
     }
 
     #[test]

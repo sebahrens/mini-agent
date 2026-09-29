@@ -106,6 +106,27 @@ impl AgentSkillCatalog {
         Ok(())
     }
 
+    /// Record the implicit active digest of a legacy package (exactly one
+    /// digest and no ACTIVE pointer). Import calls this before publishing a
+    /// second digest, so a process killed between that publication and the new
+    /// pointer leaves the old version active instead of an ambiguous package
+    /// the catalog omits.
+    pub(crate) fn pin_legacy_active(&self, name: &str) -> Result<(), CatalogError> {
+        let name_root = self.root.join(name);
+        match fs::symlink_metadata(name_root.join("ACTIVE")) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match select_active_digest(&name_root) {
+            Ok(Some(digest)) => self.activate(name, &digest),
+            // Nothing installed yet, or already ambiguous: the import's own
+            // activation is what resolves it.
+            Ok(None) | Err(CatalogError::AmbiguousActiveDigest(..)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Scan installed immutable trees, batch metadata embeddings, and construct one generation.
     pub fn refresh(&mut self, embedder: &Embedder) -> Result<AgentSkillIndex, CatalogError> {
         // Capture the tree before scanning. An import racing this build changes

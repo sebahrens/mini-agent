@@ -1226,3 +1226,417 @@ fn headless_session_end_hook_runs_after_a_failed_turn() {
     assert!(!output.status.success(), "{stderr}");
     assert!(marker.exists(), "SessionEnd did not run: {stderr}");
 }
+
+/// A headless run never stops on the ARCHITECTURE.md offer (mini-agent-e3rp2).
+///
+/// The prompt reads a line from stdin. With context files enabled, a `-p` run
+/// in a directory without the file used to print `Create one? [y/N]` and wait,
+/// consuming piped input meant for the run, and recording the directory as
+/// asked without anyone having answered. `--loop-max 0` runs nothing and is
+/// answered before any prompt at all.
+#[cfg(feature = "archmd")]
+#[test]
+fn headless_runs_do_not_offer_to_create_architecture_md() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    #[allow(unused_mut)]
+    let mut cases: Vec<(Option<&'static str>, Vec<&'static str>)> =
+        vec![(Some("plain"), vec!["-p", "start"])];
+    #[cfg(feature = "loop")]
+    cases.push((
+        None,
+        vec!["--loop", "--loop-prompt", "resume work", "--loop-max", "0"],
+    ));
+
+    for (outcome, args) in cases {
+        let root = TempRoot::new();
+        let server = outcome.map(|outcome| root.local_provider(outcome));
+        let mut command = root.command();
+        command
+            .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+            .env("OPENROUTER_API_KEY", "archmd-startup-test-key")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args(["--no-sandbox", "--no-session", "--tools", "read"]);
+        if server.is_some() {
+            command.args(["--provider", "local-test", "--model", "test"]);
+        }
+        let mut child = command
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start headless run");
+        // Keep the pipe open, without an answer or EOF, until the child exits.
+        let _stdin = child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let exited = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop stalled run");
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = child.wait_with_output().expect("reap headless run");
+        if let Some(server) = server {
+            server.join().unwrap().unwrap();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(exited, "{args:?} waited on stdin: {stderr}");
+        assert!(output.status.success(), "{args:?} failed: {stderr}");
+        assert!(
+            !stderr.contains("ARCHITECTURE.md"),
+            "{args:?} offered to create ARCHITECTURE.md: {stderr}"
+        );
+        assert!(!root.0.join("ARCHITECTURE.md").exists());
+        fn recorded(dir: &std::path::Path) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().any(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .is_some_and(|name| name == "dirs_asked_architecture.txt")
+                    || (path.is_dir() && recorded(&path))
+            })
+        }
+        assert!(
+            !recorded(&root.0),
+            "{args:?} recorded the directory as asked"
+        );
+    }
+}
+
+/// One scripted provider reply.
+#[cfg(all(unix, feature = "goal"))]
+enum ScriptedReply {
+    /// Stream this completion.
+    Stream(serde_json::Value, &'static str),
+    /// Mark `provider.waiting` and hold the request open until the client
+    /// abandons it.
+    Hang,
+}
+
+/// A local provider that answers each request from a script, in order, and
+/// hands every request body back for inspection.
+#[cfg(all(unix, feature = "goal"))]
+fn scripted_provider(
+    root: &TempRoot,
+    extra_config: &str,
+    replies: Vec<ScriptedReply>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<serde_json::Value>>> {
+    use std::io::{self, Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        root.0.join("config.toml"),
+        format!(
+            "{extra_config}\n\
+             [custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n\
+             [custom_providers.judge-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"HEADLESS_LOCAL_TEST_KEY\"\napi_style=\"completions\"\n"
+        ),
+    )
+    .unwrap();
+    let waiting = root.0.join("provider.waiting");
+    std::thread::spawn(move || -> io::Result<Vec<serde_json::Value>> {
+        let mut bodies = Vec::new();
+        for reply in replies {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            socket.set_nonblocking(false)?;
+            socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                if headers.len() >= 64 * 1024 {
+                    return Err(io::Error::other("request headers too large"));
+                }
+                let mut byte = [0];
+                socket.read_exact(&mut byte)?;
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).map_err(io::Error::other)?;
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .ok_or_else(|| io::Error::other("missing content length"))?;
+            let mut body = vec![0; length.min(1024 * 1024)];
+            socket.read_exact(&mut body)?;
+            bodies.push(serde_json::from_slice(&body).map_err(io::Error::other)?);
+            match reply {
+                ScriptedReply::Hang => {
+                    std::fs::write(&waiting, "ready")?;
+                    let mut byte = [0];
+                    return match socket.read(&mut byte) {
+                        Ok(0) => Ok(bodies),
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => Ok(bodies),
+                        _ => Err(io::Error::other("abandoned request did not close")),
+                    };
+                }
+                ScriptedReply::Stream(delta, finish) => {
+                    let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+                        serde_json::json!({
+                            "id":"scripted", "object":"chat.completion.chunk", "created":0, "model":"test",
+                            "choices":[{"index":0, "delta":delta, "finish_reason":finish}]
+                        })
+                    };
+                    let mut last = chunk(serde_json::json!({}), serde_json::json!(finish));
+                    last["usage"] = serde_json::json!({"prompt_tokens":100,"completion_tokens":20,"total_tokens":120});
+                    let body = format!(
+                        "data: {}\n\ndata: {last}\n\ndata: [DONE]\n\n",
+                        chunk(delta, serde_json::Value::Null)
+                    );
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )?;
+                }
+            }
+        }
+        Ok(bodies)
+    })
+}
+
+/// Ctrl-C while the completion judge is waiting on its provider ends the run
+/// with the goal still active and the round uncounted, for a judge on the
+/// session's own model and for one on another provider (mini-agent-e3nb6).
+///
+/// The judge call used to be a plain await: the interrupt was ignored until
+/// the provider answered, and a late `met` then completed the goal.
+#[cfg(all(unix, feature = "goal"))]
+#[test]
+fn an_interrupt_during_the_judge_leaves_the_goal_active() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for (extra_config, judge_model) in [
+        ("", "test"),
+        (
+            "[quick_models.goal_judge]\nprovider=\"judge-test\"\nmodel=\"judge-model\"\n",
+            "judge-model",
+        ),
+    ] {
+        let root = TempRoot::new();
+        let server = scripted_provider(
+            &root,
+            extra_config,
+            vec![
+                ScriptedReply::Stream(
+                    serde_json::json!({"role":"assistant", "tool_calls":[{"index":0, "id":"report-met", "type":"function", "function":{
+                        "name":"goal_report",
+                        "arguments": serde_json::json!({"status":"met", "evidence":"it shipped"}).to_string()
+                    }}]}),
+                    "tool_calls",
+                ),
+                ScriptedReply::Stream(
+                    serde_json::json!({"role":"assistant", "content":"done"}),
+                    "stop",
+                ),
+                ScriptedReply::Hang,
+            ],
+        );
+        let mut command = root.provider_command("read");
+        command.args(["--goal", "ship it", "-p", "start"]);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start headless goal");
+        let waiting = root.0.join("provider.waiting");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !waiting.exists() {
+            if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reached_judge = waiting.exists();
+        if reached_judge {
+            kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settled = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            reached_judge,
+            "{judge_model}: never asked the judge: {stderr}"
+        );
+        assert!(
+            settled,
+            "{judge_model}: the interrupt did not stop a waiting judge: {stderr}"
+        );
+        let bodies = server
+            .join()
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{judge_model}: {error}: {stderr}"));
+        assert_eq!(bodies.len(), 3, "{judge_model}: {stderr}");
+        assert_eq!(bodies[2]["model"], judge_model, "the judge was asked");
+        assert_eq!(output.status.signal(), None, "{stderr}");
+        assert!(
+            stderr.contains("goal: interrupted during verification"),
+            "{judge_model}: {stderr}"
+        );
+
+        let session = root.saved_session();
+        let goal = &session["goal_store"];
+        assert_eq!(goal["objective"], "ship it", "{session}");
+        assert_eq!(goal["status"], "active", "{judge_model}: {goal}");
+        assert_eq!(
+            goal["progress"]["rounds"], 0,
+            "{judge_model}: the interrupted round is uncounted: {goal}"
+        );
+    }
+}
+
+/// The judge's own tokens are counted in the goal's token total, next to the
+/// agent's (mini-agent-9ztz6).
+#[cfg(all(unix, feature = "goal"))]
+#[test]
+fn a_goal_counts_the_judges_tokens() {
+    let root = TempRoot::new();
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "tool_calls":[{"index":0, "id":"report-met", "type":"function", "function":{
+                    "name":"goal_report",
+                    "arguments": serde_json::json!({"status":"met", "evidence":"it shipped"}).to_string()
+                }}]}),
+                "tool_calls",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"done"}),
+                "stop",
+            ),
+            ScriptedReply::Stream(
+                serde_json::json!({"role":"assistant", "content":"VERDICT: met\nREASON: it shipped"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut command = root.provider_command("read");
+    command.args(["--goal", "ship it", "-p", "start"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert_eq!(bodies.len(), 3, "{stderr}");
+    assert!(output.status.success(), "{stderr}");
+
+    let session = root.saved_session();
+    let goal = &session["goal_store"];
+    assert_eq!(goal["status"], "met", "{goal}");
+    // Each scripted completion reports 100 input and 20 output tokens: two
+    // for the agent's round and one for the judge.
+    assert_eq!(goal["progress"]["tokens_used"], 360, "{goal}");
+}
+
+/// `--no-session` leaves nothing of the run behind: no session file, and no
+/// goal round records for a session that was never saved (mini-agent-x0rcr).
+#[cfg(unix)]
+#[test]
+fn no_session_writes_no_session_and_no_goal_records() {
+    #[allow(unused_mut)]
+    let mut cases: Vec<(&'static str, Vec<&'static str>)> = vec![("plain", vec!["-p", "start"])];
+    #[cfg(feature = "goal")]
+    cases.push((
+        "goal_rounds",
+        vec![
+            "--goal",
+            "ship the parser",
+            "--goal-max-rounds",
+            "1",
+            "-p",
+            "start",
+        ],
+    ));
+    #[cfg(feature = "loop")]
+    cases.push((
+        "validation_read_only",
+        vec![
+            "--shell",
+            "/bin/sh",
+            "--loop",
+            "--loop-prompt",
+            "finish",
+            "--loop-max",
+            "1",
+            "--loop-run",
+            "true",
+        ],
+    ));
+
+    for (outcome, args) in cases {
+        let root = TempRoot::new();
+        let server = root.local_provider(outcome);
+        let mut cli = root.provider_command("read");
+        cli.arg("--no-session").args(&args);
+        let output = bounded_output(cli);
+        server.join().unwrap().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A goal that stops on its budget exits with its own code; the point
+        // here is what the run left on disk, not how it ended.
+        assert!(
+            output.status.code().is_some(),
+            "{outcome}: the run finished: {stderr}"
+        );
+
+        let sessions: Vec<_> = std::fs::read_dir(root.0.join("sessions"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(
+            sessions.is_empty(),
+            "{outcome}: --no-session saved a session: {sessions:?}"
+        );
+        let goals: Vec<_> = std::fs::read_dir(root.0.join("goals"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            goals.is_empty(),
+            "{outcome}: --no-session wrote goal round records: {goals:?} ({stderr})"
+        );
+    }
+}

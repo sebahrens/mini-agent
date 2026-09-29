@@ -68,6 +68,13 @@ else
     INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_DIR}}"
 fi
 
+# A typed or quoted "~" is not expanded by the shell; expand the current
+# user's home so "~/bin" never becomes a literal "./~/bin" directory.
+case "$INSTALL_DIR" in
+    \~) INSTALL_DIR="$HOME" ;;
+    \~/*) INSTALL_DIR="${HOME}/${INSTALL_DIR#\~/}" ;;
+esac
+
 # ---- detect platform ----
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -114,6 +121,39 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 curl -fsSL --max-time 300 -o "${TMPDIR}/${ARCHIVE_FILE}" "${BASE_URL}/${ARCHIVE_FILE}"
 curl -fsSL --max-time 60   -o "${TMPDIR}/SHA256SUMS"     "${BASE_URL}/SHA256SUMS"
+
+# ---- reject non-release responses before checksum parsing ----
+#
+# A sign-in or error page served with HTTP 200 (for example when the release
+# is private or the request needs authentication) passes curl -f. Detect it
+# here so the failure names the real cause instead of a missing checksum.
+download_error() {
+    local what="$1"
+    echo "Error: the downloaded ${what} is not a release asset (received $2)." >&2
+    echo "  URL: ${BASE_URL}" >&2
+    echo "  The release may not exist for this platform, or the repository may be" >&2
+    echo "  private and require authentication. For a private repository, download" >&2
+    echo "  the assets with an authenticated client, for example:" >&2
+    echo "    gh release download --repo ${REPO} --pattern '${ARCHIVE_FILE}' --pattern SHA256SUMS" >&2
+    exit 1
+}
+
+is_html() {
+    local prefix
+    prefix="$(head -c 512 "$1" | tr -d '\000' | tr '[:upper:]' '[:lower:]')"
+    [[ "$prefix" == *"<!doctype html"* || "$prefix" == *"<html"* ]]
+}
+
+ARCHIVE_MAGIC="$(head -c 2 "${TMPDIR}/${ARCHIVE_FILE}" | od -An -tx1 | tr -d ' \n')"
+if [[ "$ARCHIVE_MAGIC" != "1f8b" ]]; then
+    if is_html "${TMPDIR}/${ARCHIVE_FILE}"; then
+        download_error "archive ${ARCHIVE_FILE}" "an HTML page"
+    fi
+    download_error "archive ${ARCHIVE_FILE}" "data that is not gzip"
+fi
+if is_html "${TMPDIR}/SHA256SUMS"; then
+    download_error "checksum manifest SHA256SUMS" "an HTML page"
+fi
 
 # ---- verify checksum before extraction ----
 #
@@ -172,6 +212,8 @@ fi
 
 # ---- install ----
 mkdir -p "$INSTALL_DIR"
+# Use an absolute path without a trailing slash for the PATH checks below.
+INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
 
 tar xzf "${TMPDIR}/${ARCHIVE_FILE}" -C "$TMPDIR"
 
@@ -195,18 +237,52 @@ mkdir -p "$DOC_DIR"
 for document in "${REQUIRED_DOCUMENTS[@]}"; do
     cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"
 done
-cp "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
-echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
+# Stage the new binary beside the target and rename it into place. Writing
+# over the existing file would reuse its inode: Linux refuses that while a
+# session is running (ETXTBSY), macOS kills a rewritten signed executable, and
+# an interrupted copy would leave a truncated binary. A rename replaces the
+# directory entry atomically and leaves running processes on the old inode.
+TARGET="${INSTALL_DIR}/${BINARY_NAME}"
+STAGED="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+trap 'rm -rf "$TMPDIR"; rm -f "$STAGED"' EXIT
+cp "${TMPDIR}/${BINARY_NAME}" "$STAGED"
+chmod +x "$STAGED"
+mv -f "$STAGED" "$TARGET"
+
+echo "Installed ${BINARY_NAME} to ${TARGET}"
 echo "Installed license and source notices to ${DOC_DIR}"
 
 # ---- path hint ----
-if ! echo "$PATH" | grep -qF "$INSTALL_DIR"; then
+INSTALL_DIR_ON_PATH=0
+IFS=':' read -r -a PATH_ENTRIES <<< "$PATH"
+for entry in "${PATH_ENTRIES[@]}"; do
+    # Compare whole entries, ignoring a trailing slash, so /usr/local/bin2
+    # does not count as /usr/local/bin.
+    while [[ "$entry" == */ && "$entry" != "/" ]]; do
+        entry="${entry%/}"
+    done
+    if [[ "$entry" == "$INSTALL_DIR" ]]; then
+        INSTALL_DIR_ON_PATH=1
+        break
+    fi
+done
+
+if [[ "$INSTALL_DIR_ON_PATH" -eq 0 ]]; then
     echo
     echo "Note: ${INSTALL_DIR} is not in your PATH."
     echo "Add it with:"
     echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
     echo
     echo "To make it permanent, add that line to your shell rc file (~/.bashrc, ~/.zshrc, etc.)."
+else
+    RESOLVED="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
+    if [[ -n "$RESOLVED" && "$RESOLVED" != "$TARGET" ]]; then
+        echo
+        echo "Warning: '${BINARY_NAME}' on your PATH resolves to a different binary."
+        echo "  Resolves to: ${RESOLVED}"
+        echo "  Installed:   ${TARGET}"
+        echo "Move ${INSTALL_DIR} earlier in PATH (or remove the other binary), then run"
+        echo "'hash -r' or open a new shell."
+    fi
 fi

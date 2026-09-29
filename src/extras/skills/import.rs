@@ -242,13 +242,14 @@ pub fn import_agent_skill(
 
     let staging_parent = app_paths.cache_dir.join("import-staging");
     secure_fs::ensure_private_directory(&staging_parent)?;
-    let staging_path = staging_parent.join(format!("agent-skill-{}", uuid::Uuid::new_v4()));
+    let staging_path = staging_parent.join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4()));
     let mut staging_cleanup = CleanupDirectory::new(staging_path.clone());
     materialize(&staging_path, &tree)?;
     verify_materialized(&staging_path, &identity.digest)?;
 
     let install_root = app_paths.data_dir.join("agent-skills");
     secure_fs::ensure_private_directory(&install_root)?;
+    sweep_stale_import_leftovers(&staging_parent, &install_root, std::time::SystemTime::now());
     let name_root = install_root.join(&manifest.name);
     portable::ensure_no_link_traversal(&install_root, &name_root)?;
     secure_fs::ensure_private_directory(&name_root)?;
@@ -267,14 +268,22 @@ pub fn import_agent_skill(
         });
     }
 
-    let publication_path = name_root.join(format!(".import-{}", uuid::Uuid::new_v4()));
+    AgentSkillCatalog::new(app_paths)
+        .pin_legacy_active(&manifest.name)
+        .map_err(catalog_import_error)?;
+
+    let publication_path = name_root.join(format!("{PUBLICATION_PREFIX}{}", uuid::Uuid::new_v4()));
     let mut publication_cleanup = CleanupDirectory::new(publication_path.clone());
     materialize(&publication_path, &tree)?;
     verify_materialized(&publication_path, &identity.digest)?;
     make_tree_read_only(&publication_path)?;
 
     match fs::rename(&publication_path, &install_path) {
-        Ok(()) => publication_cleanup.disarm(),
+        Ok(()) => {
+            publication_cleanup.disarm();
+            #[cfg(test)]
+            tests::interpose_after_publication()?;
+        }
         Err(_rename_error) if fs::symlink_metadata(&install_path).is_ok() => {
             validate_existing(&install_path, &manifest.name, &identity.digest)?;
             publication_cleanup.remove_now()?;
@@ -309,10 +318,69 @@ pub fn import_agent_skill(
 fn activate_installed(app_paths: &AppPaths, name: &str, digest: &str) -> Result<(), ImportError> {
     AgentSkillCatalog::new(app_paths)
         .activate(name, digest)
-        .map_err(|error| match error {
-            CatalogError::Io(error) => ImportError::Io(error),
-            other => ImportError::Activation(other.to_string()),
-        })
+        .map_err(catalog_import_error)
+}
+
+fn catalog_import_error(error: CatalogError) -> ImportError {
+    match error {
+        CatalogError::Io(error) => ImportError::Io(error),
+        other => ImportError::Activation(other.to_string()),
+    }
+}
+
+/// Name prefixes of an import's private working trees. Each import removes its
+/// own on success or unwind, but a killed process leaves them behind.
+const STAGING_PREFIX: &str = "agent-skill-";
+const PUBLICATION_PREFIX: &str = ".import-";
+/// Leftovers older than this cannot belong to an import still in progress.
+const STALE_IMPORT_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Best-effort removal of working trees leaked by killed imports: staging
+/// copies in the cache and unpublished `.import-*` trees in each package.
+/// Installed digests and ACTIVE pointers are never touched.
+fn sweep_stale_import_leftovers(
+    staging_parent: &Path,
+    install_root: &Path,
+    now: std::time::SystemTime,
+) {
+    sweep_stale_children(staging_parent, STAGING_PREFIX, now);
+    let Ok(packages) = fs::read_dir(install_root) else {
+        return;
+    };
+    for package in packages.flatten() {
+        if package.file_type().is_ok_and(|kind| kind.is_dir()) {
+            sweep_stale_children(&package.path(), PUBLICATION_PREFIX, now);
+        }
+    }
+}
+
+fn sweep_stale_children(directory: &Path, prefix: &str, now: std::time::SystemTime) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_IMPORT_AGE);
+        if !stale {
+            continue;
+        }
+        if let Err(error) = remove_tree_no_follow(&path) {
+            tracing::debug!(
+                "could not remove stale Agent Skill import leftover {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Refuse a `SKILL.md` larger than one turn's whole instruction budget.
@@ -984,6 +1052,105 @@ mod tests {
         if let Some(action) = action {
             action();
         }
+    }
+
+    thread_local! {
+        static FAIL_AFTER_PUBLICATION: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(false)
+        };
+    }
+
+    /// Simulates a process killed between publishing a digest and writing ACTIVE.
+    pub(super) fn interpose_after_publication() -> Result<(), ImportError> {
+        if FAIL_AFTER_PUBLICATION.with(|flag| flag.replace(false)) {
+            return Err(ImportError::Io(std::io::Error::other(
+                "simulated crash after publication",
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn crash_after_publication_keeps_a_legacy_package_resolvable() {
+        let temp = TempRoot::new();
+        let marker = temp.0.join("executed");
+        let directory = write_directory_skill(&temp.0, "legacy-skill", &marker);
+        let name_root = temp
+            .paths()
+            .data_dir
+            .join("agent-skills")
+            .join("legacy-skill");
+        let first = import_agent_skill(&directory, &temp.paths()).unwrap();
+        // A package installed before ACTIVE pointers existed.
+        fs::remove_file(name_root.join("ACTIVE")).unwrap();
+
+        fs::write(
+            directory.join("SKILL.md"),
+            b"---\nname: legacy-skill\ndescription: A second version of the legacy skill.\n---\n\n# V2\n",
+        )
+        .unwrap();
+        FAIL_AFTER_PUBLICATION.with(|flag| flag.set(true));
+        import_agent_skill(&directory, &temp.paths())
+            .expect_err("the simulated crash interrupts the import");
+
+        let digests = fs::read_dir(&name_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().len() == 64)
+            .count();
+        assert_eq!(digests, 2, "the new digest was published before the crash");
+        assert_eq!(
+            fs::read_to_string(name_root.join("ACTIVE")).unwrap().trim(),
+            first.identity.digest,
+            "the implicit legacy digest must be pinned before a second one is published"
+        );
+
+        let second = import_agent_skill(&directory, &temp.paths()).unwrap();
+        assert!(second.reimported);
+        assert_eq!(
+            fs::read_to_string(name_root.join("ACTIVE")).unwrap().trim(),
+            second.identity.digest
+        );
+    }
+
+    #[test]
+    fn stale_import_leftovers_are_swept_without_touching_installed_digests() {
+        let temp = TempRoot::new();
+        let marker = temp.0.join("executed");
+        let directory = write_directory_skill(&temp.0, "swept-skill", &marker);
+        let paths = temp.paths();
+        let installed = import_agent_skill(&directory, &paths).unwrap();
+        let staging_parent = paths.cache_dir.join("import-staging");
+        let install_root = paths.data_dir.join("agent-skills");
+        let name_root = install_root.join("swept-skill");
+
+        let staging = staging_parent.join(format!("{STAGING_PREFIX}leaked"));
+        fs::create_dir_all(staging.join("nested")).unwrap();
+        fs::write(staging.join("nested").join("file"), b"x").unwrap();
+        let publication = name_root.join(format!("{PUBLICATION_PREFIX}leaked"));
+        fs::create_dir_all(&publication).unwrap();
+        fs::write(publication.join("SKILL.md"), b"x").unwrap();
+        make_tree_read_only(&publication).unwrap();
+        let unrelated = staging_parent.join("keep-me");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        // Fresh leftovers may belong to an import in progress.
+        sweep_stale_import_leftovers(&staging_parent, &install_root, std::time::SystemTime::now());
+        assert!(staging.exists() && publication.exists());
+
+        let later = std::time::SystemTime::now() + STALE_IMPORT_AGE * 2;
+        sweep_stale_import_leftovers(&staging_parent, &install_root, later);
+        assert!(!staging.exists(), "stale staging tree must be removed");
+        assert!(
+            !publication.exists(),
+            "stale publication tree must be removed"
+        );
+        assert!(unrelated.exists());
+        assert!(installed.install_path.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read_to_string(name_root.join("ACTIVE")).unwrap().trim(),
+            installed.identity.digest
+        );
     }
 
     struct ReadInterpositionGuard;

@@ -1329,6 +1329,61 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn default_worktree_base_is_the_parent_of_the_checkout_not_the_cwd() {
+        let repo = TempRepo::new("default base");
+        let subdirectory = repo.path().join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        let expected = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("feat-default");
+
+        let (worktree, info) = create(&subdirectory, "feat-default", None)
+            .await
+            .expect("create from a repository subdirectory");
+
+        assert_eq!(worktree, expected);
+        assert!(!subdirectory.join("feat-default").exists());
+        assert!(!repo.path().join("feat-default").exists());
+        assert_eq!(info.branch, "feat-default");
+        cleanup_worktree(&worktree, "feat-default", repo.path(), true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_targets_inside_a_checkout_are_rejected() {
+        let repo = TempRepo::new("nested target");
+        let inside = repo.path().join("nested-base");
+        std::fs::create_dir(&inside).unwrap();
+
+        let error = create(repo.path(), "nested", Some(&inside))
+            .await
+            .expect_err("a worktree nested in the checkout must be rejected");
+        assert!(error.contains("inside the checkout"), "{error}");
+        assert!(!inside.join("nested").exists());
+        assert!(!optional_test_ref_exists(repo.path(), "refs/heads/nested"));
+
+        // From a linked worktree, the main worktree is also off limits.
+        let base = repo.path().with_extension("linked base");
+        std::fs::create_dir_all(&base).unwrap();
+        let (linked, _) = create(repo.path(), "linked", Some(&base))
+            .await
+            .expect("create linked worktree");
+        let error = create(&linked, "nested-main", Some(repo.path()))
+            .await
+            .expect_err("a worktree nested in the main checkout must be rejected");
+        assert!(error.contains("inside the checkout"), "{error}");
+        assert!(!repo.path().join("nested-main").exists());
+        cleanup_worktree(&linked, "linked", repo.path(), true)
+            .await
+            .unwrap();
+    }
+
     #[cfg(unix)]
     mod concurrency {
         use super::*;

@@ -398,7 +398,7 @@ impl AnyClient {
         preamble: String,
         max_output_tokens: u64,
         retry_config: &RetryConfig,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, rig::completion::Usage)> {
         let model = self.completion_model(model_name.to_string());
         summarize_with_model(
             model,
@@ -450,6 +450,7 @@ impl AnyClient {
                             retry_config,
                         )
                         .await
+                        .map(|(summary, _usage)| summary)
                     }
                 },
             ),
@@ -977,7 +978,7 @@ async fn summarize_with_model(
     preamble: String,
     max_output_tokens: u64,
     retry_config: RetryConfig,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, rig::completion::Usage)> {
     match model {
         AnyModel::OpenRouter(m, _) => {
             run_summarizer(m, prompt, preamble, max_output_tokens, &retry_config).await
@@ -1008,7 +1009,7 @@ async fn run_summarizer<M>(
     preamble: String,
     max_output_tokens: u64,
     retry_config: &RetryConfig,
-) -> anyhow::Result<String>
+) -> anyhow::Result<(String, rig::completion::Usage)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
@@ -1032,6 +1033,8 @@ where
     .map_err(|e| anyhow::anyhow!("Compression failed: {}", e))?;
 
     let mut response = String::new();
+    // Zero when the provider reports none, which is how rig spells "unknown".
+    let mut usage = rig::completion::Usage::new();
     use futures::StreamExt;
     while let Some(item) = stream.next().await {
         match item {
@@ -1039,6 +1042,7 @@ where
                 rig::streaming::StreamedAssistantContent::Text(text),
             )) => response.push_str(&text.text),
             Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
+                usage = res.usage();
                 response = res.output.to_string();
                 break;
             }
@@ -1051,7 +1055,7 @@ where
         anyhow::bail!("Compression returned empty response");
     }
 
-    Ok(response)
+    Ok((response, usage))
 }
 
 fn summarizer_preamble() -> String {

@@ -60,6 +60,16 @@ With no checks configured the only evidence is the model's own account, and `/go
 verification: self-report only (add /goal check <command> to verify)
 ```
 
+`/goal status` also lists the last ten rounds, one line each. A round evaluated twice — for example
+because you interrupted its verification, which does not count the round — shows both attempts:
+
+```
+recent rounds:
+  round 1 attempt 1: not yet (round 1) — the migration is missing
+  round 2 attempt 1: interrupted
+  round 2 attempt 2: met after 2 round(s) — checks passed
+```
+
 A completion that no command proved is labelled:
 
 ```
@@ -84,10 +94,14 @@ session's own model in a fresh context. That last fallback means a single-model 
 second opinion from something that did not just do the work — weaker than a distinct model, and
 `/goal status` labels it as such. `[goal] judge = "off"` turns the tier off.
 
-The judge gets no tools and no workspace: only the objective and a bounded tail of the conversation,
-fenced as untrusted data. If it cannot be reached, the goal keeps working rather than completing or
-ending; three consecutive failures on completion claims park the goal so an outage cannot pass for
-verification.
+The judge gets no tools and no workspace: only the objective, a bounded tail of the conversation, and
+the result of any checks the harness ran that round, all fenced as untrusted data. If it cannot be
+reached, the goal keeps working rather than completing or ending; three consecutive failures on
+completion claims park the goal so an outage cannot pass for verification.
+
+The judge's tokens are the goal's tokens: `/goal status`, the headless `goal` object and the
+`max_tokens` bound count them alongside the agent's, whichever provider the judge is on. The
+session's own cost counters do not yet include them.
 
 ## Statuses
 
