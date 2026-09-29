@@ -6,6 +6,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- The model-facing Git tool no longer runs workspace-defined filter drivers: `status`, `diff`,
+  `stage`, `unstage` and `commit` (including their before/after snapshots) refuse with an error
+  naming the `filter` attribute when a tracked path is bound to a repository-configured
+  `filter.<name>.clean`/`.process` command, and run with every configured driver emptied.
+  Previously an auto-allowed `status` could execute a clean filter the model had written into
+  `.git/config` and `.gitattributes`.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

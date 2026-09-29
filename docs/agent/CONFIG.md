@@ -1449,6 +1449,15 @@ shell commands, remotes, or network operations. Git receives literal-pathspec mo
 metacharacters cannot expand to other repository paths. Successful commit results include the new
 commit ID, and binary diffs report that files differ without embedding binary patch payloads.
 
+Git filter drivers (`filter.<name>.clean`/`.process` in repository config) never run through the
+Git tool. `status`, `diff`, `stage`, `unstage`, and `commit` read working-tree content, so when the
+repository configures a filter driver they first check every tracked path and refuse with an error
+naming the `filter` attribute and driver if any path is bound to it; they also run with every
+configured driver emptied. Repositories that use such a filter (for example Git LFS installed with
+`--local`) need a plain `git` command, which goes through the Bash permission model, for these
+operations. `stage` additionally refuses paths with any `filter` or `working-tree-encoding`
+attribute.
+
 Bash uses a fail-closed, opaque full-script permission model. The exact string
 passed to `bash -c` is also the permission key. An `allow` entry authorizes Bash
 only when the entry is byte-for-byte equal to the complete script; glob and
