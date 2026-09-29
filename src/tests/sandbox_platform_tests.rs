@@ -4,13 +4,14 @@
 //! helper launches as test-only rather than production sites.
 
 use crate::sandbox::*;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 
 /// Unique scratch directory removed on drop.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 struct ScratchDir(PathBuf);
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 impl ScratchDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("mini-agent-sbx-{}", uuid::Uuid::new_v4()));
@@ -23,7 +24,7 @@ impl ScratchDir {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -121,10 +122,11 @@ fn terminate_process_group_does_not_block_current_thread_executor() {
     let observed = runtime.block_on({
         let ticks = ticks.clone();
         async move {
+            let ticker_ticks = ticks.clone();
             let ticker = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ticker_ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
             // A non-helper process never opens the cancellation event, so
