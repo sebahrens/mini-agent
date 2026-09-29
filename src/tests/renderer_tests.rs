@@ -863,6 +863,19 @@ mod dirty {
         assert!(!std::sync::Arc::ptr_eq(&second, &third));
         assert_eq!(renderer.statusline_builds(), 2);
     }
+
+    /// mini-agent-c3kvx: the permission prompt repaints with the statusline
+    /// the last frame built instead of blank rows.
+    #[test]
+    fn last_statusline_is_the_most_recently_built_one() {
+        let mut renderer = Renderer::new().unwrap();
+        let (key, empty) = renderer.last_statusline();
+        assert_eq!((key, empty.len()), (0, 0));
+        let built = renderer.cached_statusline(9, || vec![Vec::new(), Vec::new()]);
+        let (key, last) = renderer.last_statusline();
+        assert_eq!(key, 9);
+        assert!(std::sync::Arc::ptr_eq(&built, &last));
+    }
 }
 
 // --- scroll / input-row arithmetic must never underflow ---

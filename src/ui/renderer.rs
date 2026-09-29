@@ -461,6 +461,17 @@ impl Renderer {
         lines
     }
 
+    /// The statusline most recently built for a frame, with its cache key,
+    /// or an empty statusline before the first frame. Modal prompts that
+    /// repaint the bottom region outside the main frame use it so the
+    /// statusline stays visible while they wait.
+    pub(crate) fn last_statusline(&self) -> (u64, Arc<Vec<Vec<StatusSpan>>>) {
+        match &self.statusline_cache {
+            Some(cache) => (cache.key, Arc::clone(&cache.lines)),
+            None => (0, Arc::new(Vec::new())),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn statusline_builds(&self) -> usize {
         self.statusline_builds

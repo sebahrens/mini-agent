@@ -115,11 +115,13 @@ fn apply_prompt_scroll(renderer: &mut Renderer, scroll: PromptScroll) -> std::io
 
 /// Paint the transcript and the prompt for the current geometry. The input
 /// height is reconciled first so the transcript is sized around the
-/// prompt's (possibly multi-row) layout.
+/// prompt's (possibly multi-row) layout. The statusline keeps showing what
+/// the last frame built (model, mode, context), not blank rows.
 fn draw_prompt(renderer: &mut Renderer) -> std::io::Result<()> {
     renderer.sync_input_height("")?;
     renderer.render_viewport()?;
-    renderer.draw_bottom("", 0, &[], 0, false)
+    let (statusline_key, statusline) = renderer.last_statusline();
+    renderer.draw_bottom("", 0, &statusline, statusline_key, false)
 }
 
 /// Show `header` and `options`, then wait for one recognised key. The
