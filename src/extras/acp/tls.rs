@@ -125,44 +125,60 @@ pub(super) async fn accept_tls_peer(
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let api_key: Arc<str> = api_key.into();
-    let mut pending = tokio::task::JoinSet::new();
+    let mut pending: tokio::task::JoinSet<PeerOutcome> = tokio::task::JoinSet::new();
     loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (tcp, peer_addr) = accepted?;
+        let event = tokio::select! {
+            accepted = listener.accept() => PeerEvent::Accepted(accepted?),
+            Some(joined) = pending.join_next(), if !pending.is_empty() => PeerEvent::Settled(joined),
+        };
+        match event {
+            PeerEvent::Accepted((tcp, peer_addr)) => {
                 if pending.len() >= max_pending {
                     tracing::warn!("ACP TLS peer rejected because authentication capacity is full");
                     continue;
                 }
-                let api_key = api_key.clone();
-                let tls = tls.clone();
-                pending.spawn(async move {
-                    let result = tokio::time::timeout(TLS_AUTH_TIMEOUT, async {
-                        let mut stream = tls
-                            .acceptor
-                            .accept(tcp)
-                            .await
-                            .map_err(|_| AuthError::Invalid)?;
-                        authenticate_tls_peer(&mut stream, &api_key, &tls.certificate_sha256)
-                            .await?;
-                        Ok::<_, AuthError>(stream)
-                    })
-                    .await
-                    .unwrap_or(Err(AuthError::Timeout));
-                    (result, peer_addr)
-                });
+                let authentication =
+                    authenticate_connection(tcp, peer_addr, api_key.clone(), tls.clone());
+                pending.spawn(authentication);
             }
-            Some(joined) = pending.join_next(), if !pending.is_empty() => {
-                match joined {
-                    Ok((Ok(stream), peer_addr)) => return Ok((stream, peer_addr)),
-                    Ok((Err(_), peer_addr)) => {
-                        tracing::warn!("ACP TLS peer authentication rejected for {}", peer_addr);
-                    }
-                    Err(error) => tracing::warn!("ACP TLS authentication task failed: {error}"),
-                }
+            PeerEvent::Settled(Ok((Ok(stream), peer_addr))) => return Ok((stream, peer_addr)),
+            PeerEvent::Settled(Ok((Err(_), peer_addr))) => {
+                tracing::warn!("ACP TLS peer authentication rejected for {}", peer_addr);
+            }
+            PeerEvent::Settled(Err(error)) => {
+                tracing::warn!("ACP TLS authentication task failed: {error}");
             }
         }
     }
+}
+
+type PeerOutcome = (Result<TlsStream, AuthError>, SocketAddr);
+
+enum PeerEvent {
+    Accepted((tokio::net::TcpStream, SocketAddr)),
+    Settled(Result<PeerOutcome, tokio::task::JoinError>),
+}
+
+/// TLS handshake plus channel-bound challenge-response for one connection,
+/// bounded by [`TLS_AUTH_TIMEOUT`].
+async fn authenticate_connection(
+    tcp: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    api_key: Arc<str>,
+    tls: Arc<AcpTlsConfig>,
+) -> PeerOutcome {
+    let result = tokio::time::timeout(TLS_AUTH_TIMEOUT, async {
+        let mut stream = tls
+            .acceptor
+            .accept(tcp)
+            .await
+            .map_err(|_| AuthError::Invalid)?;
+        authenticate_tls_peer(&mut stream, &api_key, &tls.certificate_sha256).await?;
+        Ok::<_, AuthError>(stream)
+    })
+    .await
+    .unwrap_or(Err(AuthError::Timeout));
+    (result, peer_addr)
 }
 
 /// Adapts a Tokio byte stream to the `futures` I/O traits the ACP transport
