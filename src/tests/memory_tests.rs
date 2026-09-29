@@ -370,6 +370,57 @@ fn oversized_case_never_exceeds_inject_cap() {
 }
 
 #[test]
+fn long_term_over_read_limit_is_truncated_not_dropped() {
+    let m = fresh("lt-huge");
+    let huge = format!("FIRSTFACT\n{}", "B".repeat(200 * 1024));
+    fs::write(memory_md(&m), huge).unwrap();
+
+    let b = m
+        .context_block()
+        .expect("oversized MEMORY.md is still injected");
+    assert!(b.contains("FIRSTFACT"));
+    assert!(b.contains("…[section truncated: Long-term memory (MEMORY.md)]"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+    cleanup(&m);
+}
+
+#[test]
+fn oversized_daily_log_keeps_its_newest_entries() {
+    let m = fresh("daily-tail");
+    let log = format!(
+        "### 09:00 — OLDESTENTRY\n{}\n### 18:00 — NEWESTENTRY\n",
+        "x".repeat(40 * 1024)
+    );
+    fs::write(daily(&m, &m.today), &log).unwrap();
+
+    let b = m.context_block().unwrap();
+    assert!(b.contains("NEWESTENTRY"), "newest daily entry must survive");
+    assert!(!b.contains("OLDESTENTRY"));
+    assert!(b.contains("older entries omitted"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+
+    let read = Mem::read_capped_tail(&daily(&m, &m.today));
+    assert!(read.contains("NEWESTENTRY"));
+    assert!(!read.contains("OLDESTENTRY"));
+    assert!(read.starts_with("…[memory truncated: older entries omitted]"));
+    cleanup(&m);
+}
+
+#[test]
+fn oversized_daily_log_tail_respects_character_boundaries() {
+    let m = fresh("daily-tail-cjk");
+    fs::write(
+        daily(&m, &m.today),
+        format!("{}END", "記憶實作".repeat(MAX_INJECT_BYTES / 4)),
+    )
+    .unwrap();
+    let b = m.context_block().unwrap(); // must not panic mid-character
+    assert!(b.contains("END"));
+    assert!(b.len() <= MAX_INJECT_BYTES + 128);
+    cleanup(&m);
+}
+
+#[test]
 fn notes_never_injected_but_searchable() {
     let m = fresh("note");
     m.write(

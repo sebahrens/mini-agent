@@ -67,6 +67,59 @@ fn normalize_line(line: &str) -> String {
 
 const MEMORY_TRUNCATED_MARKER: &str = "\n…[memory truncated]";
 
+/// Largest MEMORY.md prefix read for the injected context. Larger files are
+/// still injected (their prefix, marked) rather than silently dropped.
+const MAX_LONG_TERM_READ_BYTES: usize = 128 * 1024;
+
+/// Keep the last `max` bytes of `s` on a UTF-8 char boundary, prefixing
+/// `marker`. Daily logs are append-only, so their newest entries are at the end
+/// and must survive truncation.
+fn truncate_keep_tail(s: &str, max: usize, marker: &str) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut out = String::with_capacity(marker.len() + s.len() - start);
+    out.push_str(marker);
+    out.push_str(&s[start..]);
+    out
+}
+
+/// Read at most `MAX_LONG_TERM_READ_BYTES` of MEMORY.md. Returns the text and
+/// whether the file was longer than that. A file that is not valid UTF-8 (other
+/// than a character split by the read limit) reads as absent, as before.
+fn read_long_term_prefix(path: &Path) -> Option<(String, bool)> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LONG_TERM_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let oversized = bytes.len() > MAX_LONG_TERM_READ_BYTES;
+    bytes.truncate(MAX_LONG_TERM_READ_BYTES);
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if oversized && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(_) => return None,
+    };
+    if oversized {
+        tracing::warn!(
+            "{} exceeds {} KiB; only its beginning is injected into context",
+            path.display(),
+            MAX_LONG_TERM_READ_BYTES / 1024
+        );
+    }
+    Some((text, oversized))
+}
+
 fn escape_memory_closing_tag_with_budget(value: &str) -> String {
     const CLOSING: &str = "</memory>";
     const ESCAPED: &str = "&lt;/memory&gt;";
@@ -192,6 +245,8 @@ struct DailyLog {
 struct Section {
     title: String,
     body: String,
+    /// Append-only logs keep their newest (tail) content when truncated.
+    keep_tail: bool,
 }
 
 impl Mem {
@@ -324,6 +379,20 @@ impl Mem {
         match fs::read_to_string(p) {
             Ok(s) if s.is_empty() => "(empty)".to_string(),
             Ok(s) => truncate_cjk(&s, MAX_INJECT_BYTES, "\n…[memory truncated]"),
+            Err(_) => "(empty)".to_string(),
+        }
+    }
+
+    /// Like `read_capped`, but an oversized append-only daily log keeps its
+    /// newest entries (the tail) instead of its oldest.
+    pub(crate) fn read_capped_tail(p: &Path) -> String {
+        match fs::read_to_string(p) {
+            Ok(s) if s.is_empty() => "(empty)".to_string(),
+            Ok(s) => truncate_keep_tail(
+                &s,
+                MAX_INJECT_BYTES,
+                "…[memory truncated: older entries omitted]\n",
+            ),
             Err(_) => "(empty)".to_string(),
         }
     }
@@ -607,6 +676,10 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
         format!("\n…[section truncated: {title}]")
     }
 
+    fn truncated_head_marker(title: &str) -> String {
+        format!("…[section truncated: {title}; older entries omitted]\n")
+    }
+
     fn omitted_marker(title: &str) -> String {
         format!("\n\n…[section omitted: {title}]")
     }
@@ -619,19 +692,23 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     /// the two daily logs are chosen. Notes are deliberately excluded.
     ///
     /// Sections are included whole while they fit within `MAX_INJECT_BYTES`;
-    /// the first section that doesn't fit whole is tail-truncated to consume
-    /// exactly what's left (marked `…[section truncated: <title>]`), and every
+    /// the first section that doesn't fit whole is truncated to consume
+    /// exactly what's left (marked `…[section truncated: <title>]`; daily logs
+    /// keep their newest tail rather than their oldest head), and every
     /// section after that is omitted entirely (marked
     /// `…[section omitted: <title>]`) rather than displacing a higher-priority
     /// section that already fit. A final whole-string `truncate_cjk` pass is
     /// kept as a hard backstop against unexpected overrun.
     pub fn context_block(&self) -> Option<String> {
         let mut m = String::new();
-        if let Ok(meta) = std::fs::metadata(self.memory_md())
-            && meta.len() <= 128 * 1024
-            && let Ok(content) = fs::read_to_string(self.memory_md())
-        {
+        if let Some((content, oversized)) = read_long_term_prefix(&self.memory_md()) {
             m = content;
+            if oversized {
+                m.push_str(&format!(
+                    "\n…[MEMORY.md exceeds {} KiB; the rest was not read]",
+                    MAX_LONG_TERM_READ_BYTES / 1024
+                ));
+            }
         }
 
         let mut scratch = String::new();
@@ -653,24 +730,28 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
             sections.push(Section {
                 title: "Scratchpad (open items)".to_string(),
                 body: scratch,
+                keep_tail: false,
             });
         }
         if let Some(log) = logs.first() {
             sections.push(Section {
                 title: Self::daily_title(&log.date, &self.today),
                 body: log.content.clone(),
+                keep_tail: true,
             });
         }
         if !m.trim().is_empty() {
             sections.push(Section {
                 title: "Long-term memory (MEMORY.md)".to_string(),
                 body: m,
+                keep_tail: false,
             });
         }
         if let Some(log) = logs.get(1) {
             sections.push(Section {
                 title: Self::daily_title(&log.date, &self.today),
                 body: log.content.clone(),
+                keep_tail: true,
             });
         }
 
@@ -697,7 +778,11 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
                 continue;
             }
             boundary_hit = true;
-            let marker = Self::truncated_marker(title);
+            let marker = if section.keep_tail {
+                Self::truncated_head_marker(title)
+            } else {
+                Self::truncated_marker(title)
+            };
             let trailing_overhead: usize = sections[i + 1..]
                 .iter()
                 .map(|s| Self::omitted_marker(&s.title).len())
@@ -707,7 +792,11 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
                 .saturating_sub(marker.len())
                 .saturating_sub(trailing_overhead);
             out.push_str(&header);
-            out.push_str(&truncate_cjk(body, cut_len, &marker));
+            if section.keep_tail {
+                out.push_str(&truncate_keep_tail(body, cut_len, &marker));
+            } else {
+                out.push_str(&truncate_cjk(body, cut_len, &marker));
+            }
         }
 
         out = truncate_cjk(&out, MAX_INJECT_BYTES, MEMORY_TRUNCATED_MARKER);
@@ -1257,7 +1346,7 @@ daily (name=YYYY-MM-DD, omit for today), note (name=<stem>), or list (enumerate 
                         "invalid daily date name (expected YYYY-MM-DD)".into(),
                     ));
                 }
-                Mem::read_capped(&m.daily_file(date))
+                Mem::read_capped_tail(&m.daily_file(date))
             }
             "note" => {
                 let name = args
