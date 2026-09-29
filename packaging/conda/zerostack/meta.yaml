@@ -1,9 +1,9 @@
 package:
   name: zerostack
-  version: 1.8.0
+  version: 1.9.3
 
 source:
-  url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-v1.8.0-source.tar.gz
+  url: https://github.com/sebahrens/mini-agent/releases/download/v1.9.3/mini-agent-v1.9.3-source.tar.gz
   sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:

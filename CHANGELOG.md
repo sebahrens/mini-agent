@@ -6,6 +6,92 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-09-29
+
+Versions 1.9.0 to 1.9.2 were not published from this repository.
+
+### Security
+
+- Workspace hook scripts and executables are now bound to their content: a hook file the agent
+  rewrites is blocked (not run) until it is re-approved on the next start, and file tools refuse to
+  edit pinned hook files. Bare hook commands resolve only through absolute `PATH` entries.
+- Permission rules are stricter and deterministic: `external_directory` rules no longer depend on
+  hash-map order, relative allow rules such as `**/*.rs` no longer grant writes outside the
+  workspace, deny rules also match case variants on macOS and Windows, and "always allow" grants
+  match exactly. `"*": ask` now applies to unmatched in-workspace edits in standard mode, and
+  `--yolo` asks before recognisably destructive shell commands (denied in headless runs).
+- Sandboxed commands on macOS can no longer read stored API keys or OAuth tokens when the mini-agent
+  home or config directory is reached through a symlink or `/tmp`/`/var`. The `zerobox` backend no
+  longer passes provider API keys to model commands. The JS worker's macOS profile no longer allows
+  opening arbitrary named FIFOs.
+- Model and tool output can no longer inject terminal escape sequences: output, status-line values
+  and picker entries are sanitised, and pasted text is normalised.
+- ACP refuses non-loopback TCP binds unless `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1` is set. The
+  advisor keeps `store=false`, zero-retention routing and other provider settings. MCP stdio output
+  lines are capped at 16 MiB and an oversized line stops the server.
+- Oversized `AGENTS.md`/`CLAUDE.md` files are truncated to the context budget instead of being loaded
+  whole, and the completion judge only accepts an exact `met`, `not_yet` or `impossible` verdict.
+
+### Fixed
+
+- Terminal: exiting (including repeated Ctrl+C, `kill`, SIGHUP or closing the terminal) restores the
+  terminal cleanly, shows the cursor and saves the session; no stray escape sequences are printed.
+  Long streamed paragraphs repaint live.
+- Permission prompts wrap long paths, summarise multi-line scripts, and the transcript can be
+  scrolled while a prompt is waiting. Long scripts appear as one summarised line in the transcript.
+- Input: long lines soft-wrap; Alt/Ctrl+arrows move by word and Alt+Backspace deletes a word;
+  Ctrl+H is always backspace (lazygit moved to Ctrl+O); idle Ctrl+C clears a draft before quitting;
+  whitespace-only input is never sent. Pickers no longer crash or desync when the caret moves, `@`
+  completion edits the right mention, and backing out of an argument picker restores command
+  completion.
+- Slash commands: `/add` accepts several and quoted paths, `/reasoning on|off` is explicit, `/toggle`
+  validates its argument, `/rename` respects `--no-session`, failed provider or prompt-model switches
+  leave the session consistent, and an unreachable gateway no longer freezes every command.
+- Goals and loops: a `goal_report` followed by no closing text completes the round; Ctrl-C stops a
+  pending completion judge; `/goal pause` during verification is no longer overwritten; the judge
+  sees which checks passed; judge tokens count toward the goal budget; `--no-session` writes no goal
+  records; headless runs never stop on the ARCHITECTURE.md offer and `--loop-max 0` exits at once;
+  `/loop` reads `LOOP_PLAN.md` from the workspace (capped at 32 KiB); JSONL export/import keeps the
+  goal and session totals.
+- Headless: `--output json` prints one clean JSON line whose `result` is the final answer; piping into
+  `head` no longer panics or loses the session; SessionEnd hooks run on every exit.
+- Providers and sessions: `--provider X` uses X's default model, `OPENROUTER_MODEL` only applies to
+  OpenRouter, Gemini thinking tokens are billed, resumed sessions respect pinned or quick-model
+  context windows, `--session NAME` prefers an exact name, compaction and memory no longer send the
+  same summary twice, and custom MCP servers named like a built-in survive config saves.
+- ACP: the `task` tool works; `--quick-model`, `--api-key` and `[retry]` are honoured; internal
+  failures return JSON-RPC errors and failed tools are reported as failed; editor-supplied stdio MCP
+  servers are connected; `_meta.goal` is not applied to a rejected prompt; with hooks configured,
+  concurrent prompts in different workspaces are refused rather than sharing one hook root.
+- MCP and LSP: denying OAuth ends the wait immediately; binary results appear as placeholders; LSP
+  evicts old documents with `didClose` instead of silently stopping, and answers string-id requests
+  and `workspace/configuration` correctly. The advisor keeps the newest message when it is oversized.
+- Subagents: a report that breaks the output contract gets one repair turn before the host fallback;
+  task output accounting no longer cuts the closing fence or misreports partial results; `/agent`
+  and the `task` schema state that personas do not change tools or permissions.
+- The structured `git` tool's `log` returns correct fields, including root commits. `--worktree`
+  creates worktrees next to the repository from subdirectories and refuses to nest them.
+- Memory keeps the newest daily-log entries, truncates (rather than drops) a large `MEMORY.md`, and
+  locks concurrent writes. Skill imports are crash-safe and clean up leftovers. Ctrl-C quits the
+  setup wizard.
+- Installer: upgrades replace the binary atomically, private-repo or authentication failures are
+  reported as such, PATH entries are matched exactly with a warning for shadowing binaries, and `~`
+  is expanded in the install directory.
+- Windows: sandboxed hooks are reported unavailable with an accurate message instead of a misleading
+  bwrap error, and cancelling or timing out a command no longer stalls the app.
+- CI runs the full test matrix when documentation embedded in the binary or tests changes.
+
+### Added
+
+- Terminal title shows `mini-agent: working`, `waiting for approval` or `idle` for multiplexers such
+  as herdr (`terminal_title = false` disables it).
+- Tool results appear directly under their tool call; mouse selection copies exactly the dragged text
+  with a transient notice; a `↑ N` marker shows history above the viewport; the status line can
+  show the reasoning effort.
+- `/model` is the single model selector (quick aliases, then provider models); compatibility aliases
+  are hidden from completion. `--resume` and `/sessions` show a title for each session. `/goal status`
+  lists the last ten rounds and attempts.
+
 ### Changed
 
 - Delivered the 2026-09-05 harness review amendments across brokered JavaScript containment,
@@ -185,5 +271,6 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 Thanks to sebahrens and platon2001 for the release work.
 
-[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/sebahrens/mini-agent/compare/v1.9.3...HEAD
+[1.9.3]: https://github.com/sebahrens/mini-agent/compare/v1.8.0...v1.9.3
 [1.8.0]: https://github.com/sebahrens/mini-agent/compare/v1.7.2...v1.8.0

@@ -1,13 +1,13 @@
 package:
   name: zerostack-bin
-  version: 1.8.0
+  version: 1.9.3
 
 source:
-  - url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-x86_64-unknown-linux-musl.tar.gz  # [linux and x86_64]
+  - url: https://github.com/sebahrens/mini-agent/releases/download/v1.9.3/mini-agent-x86_64-unknown-linux-musl.tar.gz  # [linux and x86_64]
     sha256: 0000000000000000000000000000000000000000000000000000000000000000
-  - url: https://github.com/sebahrens/mini-agent/releases/download/v1.8.0/mini-agent-aarch64-unknown-linux-musl.tar.gz  # [linux and aarch64]
+  - url: https://github.com/sebahrens/mini-agent/releases/download/v1.9.3/mini-agent-aarch64-unknown-linux-musl.tar.gz  # [linux and aarch64]
     sha256: 0000000000000000000000000000000000000000000000000000000000000000
-  - url: https://raw.githubusercontent.com/sebahrens/mini-agent/v1.8.0/LICENSE
+  - url: https://raw.githubusercontent.com/sebahrens/mini-agent/v1.9.3/LICENSE
     sha256: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 
 build:

@@ -692,6 +692,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // AgentRunState has private fields in some feature builds, so it cannot be
+    // built with `..Default::default()` in every CI row.
+    #[allow(clippy::field_reassign_with_default)]
     async fn ui_merge_cleanup_waits_for_workspace_owner_and_preserves_worktree_on_timeout() {
         use futures::FutureExt;
         for expire in [false, true] {
