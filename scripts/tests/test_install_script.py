@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -35,14 +36,21 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("Usage: install.sh", result.stdout)
 
-    def make_fixture(self, directory: str, *, include_notice: bool = True) -> tuple[Path, Path]:
+    def make_fixture(
+        self,
+        directory: str,
+        *,
+        include_notice: bool = True,
+        os_name: str = "Darwin",
+    ) -> tuple[Path, Path]:
         root = Path(directory)
         release = root / "release"
         release.mkdir()
         binary = root / "mini-agent"
         binary.write_text("#!/bin/sh\necho mini-agent 1.7.2\n", encoding="utf-8")
         binary.chmod(0o755)
-        archive = release / "mini-agent-aarch64-apple-darwin.tar.gz"
+        target = {"Darwin": "apple-darwin", "Linux": "unknown-linux-musl"}[os_name]
+        archive = release / f"mini-agent-aarch64-{target}.tar.gz"
 
         if include_notice:
             subprocess.run(
@@ -144,9 +152,9 @@ exit 2
         gh.chmod(0o755)
         uname = stub_bin / "uname"
         uname.write_text(
-            """#!/bin/sh
+            f"""#!/bin/sh
 if [ "$1" = "-s" ]; then
-    echo Darwin
+    echo {os_name}
 else
     echo arm64
 fi
@@ -167,6 +175,7 @@ fi
         home: Path | None = None,
         extra_env: dict[str, str] | None = None,
         release_version: str | None = "1.7.2",
+        system_path: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         # A developer's real credentials and gh login must never reach the
@@ -177,11 +186,12 @@ fi
         env.update(extra_env or {})
         # Keep any real mini-agent on the developer's PATH from influencing
         # the PATH-resolution checks.
-        system_path = os.pathsep.join(
-            entry
-            for entry in env["PATH"].split(os.pathsep)
-            if entry and not (Path(entry) / "mini-agent").exists()
-        )
+        if system_path is None:
+            system_path = os.pathsep.join(
+                entry
+                for entry in env["PATH"].split(os.pathsep)
+                if entry and not (Path(entry) / "mini-agent").exists()
+            )
         prefix = "".join(f"{entry}:" for entry in path_prefix or [])
         env["PATH"] = f"{prefix}{stub_bin}:{system_path}"
         env["INSTALL_TEST_RELEASE"] = str(release)
@@ -424,6 +434,73 @@ fi
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertNotIn("is not in your PATH", result.stdout)
             self.assertNotIn("different binary", result.stdout)
+
+    # ---- Linux bubblewrap prerequisite ----
+
+    # Everything install.sh and the stubs execute, so PATH can be built without
+    # any host bwrap (CI Linux runners have one in /usr/bin).
+    INSTALLER_TOOLS = (
+        "awk", "basename", "bash", "cat", "chmod", "cp", "dirname", "grep",
+        "gzip", "head", "mkdir", "mktemp", "mv", "od", "rm", "sh", "sha256sum",
+        "shasum", "tar", "tr",
+    )
+
+    def tools_without_bwrap(self, root: Path) -> str:
+        tools = root / "tools"
+        tools.mkdir()
+        for name in self.INSTALLER_TOOLS:
+            resolved = shutil.which(name)
+            if resolved is not None:
+                (tools / name).symlink_to(resolved)
+        self.assertIsNone(shutil.which("bwrap", path=str(tools)))
+        return str(tools)
+
+    BWRAP_WARNING = "Warning: bubblewrap ('bwrap') was not found on your PATH."
+
+    def test_linux_install_warns_when_bwrap_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory, os_name="Linux")
+
+            result = self.run_installer(
+                root, release, stub_bin, system_path=self.tools_without_bwrap(root)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            self.assertIn(self.BWRAP_WARNING, result.stdout)
+            self.assertIn("sudo apt install bubblewrap", result.stdout)
+            self.assertIn("AppArmor", result.stdout)
+            self.assertIn(
+                "https://github.com/sebahrens/mini-agent#linux-prerequisites",
+                result.stdout,
+            )
+
+    def test_linux_install_is_quiet_when_bwrap_is_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory, os_name="Linux")
+            (stub_bin / "bwrap").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (stub_bin / "bwrap").chmod(0o755)
+
+            result = self.run_installer(
+                root, release, stub_bin, system_path=self.tools_without_bwrap(root)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("bubblewrap", result.stdout)
+
+    def test_macos_install_never_warns_about_bwrap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+
+            result = self.run_installer(
+                root, release, stub_bin, system_path=self.tools_without_bwrap(root)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("bubblewrap", result.stdout)
 
     # ---- authenticated fallbacks (GITHUB_TOKEN / gh) ----
 

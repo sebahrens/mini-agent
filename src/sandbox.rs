@@ -693,13 +693,111 @@ fn bwrap_path() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// Closed diagnostic recorded when the cached bubblewrap preflight fails. It is set at most once,
+/// alongside `BWRAP_AVAILABLE`, and only ever holds one of the `BWRAP_*_DIAGNOSTIC` constants:
+/// preflight stderr is classified, never echoed.
+#[cfg(target_os = "linux")]
+static BWRAP_DIAGNOSTIC: OnceLock<&'static str> = OnceLock::new();
+
+/// Upper bound on preflight stderr read for classification; bubblewrap reports one short line.
+#[cfg(target_os = "linux")]
+const BWRAP_PROBE_STDERR_LIMIT: usize = 4096;
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const BWRAP_MISSING_DIAGNOSTIC: &str = "bubblewrap (bwrap) is not installed as a trusted system executable; install it (for example `sudo apt install bubblewrap`) — see the Linux prerequisites in README.md";
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const BWRAP_APPARMOR_USERNS_DIAGNOSTIC: &str = "bubblewrap could not set up its user namespace (setting up uid map: Permission denied); on Ubuntu 23.10+/24.04 AppArmor restricts unprivileged user namespaces — install an AppArmor profile that grants `userns` to /usr/bin/bwrap, or set the sysctl kernel.apparmor_restrict_unprivileged_userns=0 (this lifts the restriction for every program) — see the Linux prerequisites in README.md";
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const BWRAP_USERNS_DISABLED_DIAGNOSTIC: &str = "bubblewrap could not create an unprivileged user namespace; the kernel or a security module (AppArmor on Ubuntu, or kernel.unprivileged_userns_clone=0) forbids it — see the Linux prerequisites in README.md";
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC: &str = "bubblewrap preflight failed; run `bwrap --unshare-user --ro-bind / / true` to see why — see the Linux prerequisites in README.md";
+
+/// Map bubblewrap preflight stderr to a closed, operator-actionable diagnostic. The raw stderr is
+/// never returned, so a hostile or noisy child cannot inject text into logs or errors.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn classify_bwrap_preflight_stderr(stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let denied = text.contains("permission denied") || text.contains("operation not permitted");
+    // Ubuntu's `apparmor_restrict_unprivileged_userns` lets the namespace be created but
+    // denies writing the uid map (or, on some kernels, configuring the loopback interface).
+    if denied && (text.contains("uid map") || text.contains("rtm_newaddr")) {
+        return BWRAP_APPARMOR_USERNS_DIAGNOSTIC;
+    }
+    if text.contains("no permissions to create new namespace")
+        || (text.contains("creating new namespace failed") && denied)
+    {
+        return BWRAP_USERNS_DISABLED_DIAGNOSTIC;
+    }
+    BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC
+}
+
+/// Read at most `BWRAP_PROBE_STDERR_LIMIT` bytes already buffered on an exited probe's stderr
+/// pipe without blocking: a descendant that kept the pipe open cannot stall the caller.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_exited_probe_stderr(stderr: Option<std::process::ChildStderr>) -> Vec<u8> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let Some(mut stderr) = stderr else {
+        return Vec::new();
+    };
+    let fd = stderr.as_raw_fd();
+    // SAFETY: `fd` is owned by `stderr` for the duration of both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above; only O_NONBLOCK is added to the existing status flags.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0_u8; BWRAP_PROBE_STDERR_LIMIT];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stderr.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    buffer.truncate(filled);
+    buffer
+}
+
+/// The closed reason the cached bubblewrap preflight failed, if it ran and failed.
+#[cfg(target_os = "linux")]
+pub(crate) fn bwrap_unavailable_diagnostic() -> Option<&'static str> {
+    if bwrap_exists() {
+        return None;
+    }
+    BWRAP_DIAGNOSTIC.get().copied()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn bwrap_unavailable_diagnostic() -> Option<&'static str> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn probe_bwrap() -> bool {
+    match run_bwrap_probe() {
+        Ok(()) => true,
+        Err(diagnostic) => {
+            let _ = BWRAP_DIAGNOSTIC.set(diagnostic);
+            tracing::warn!(diagnostic, "bubblewrap sandbox preflight failed");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_bwrap_probe() -> Result<(), &'static str> {
     let Some(bwrap) = bwrap_path() else {
-        return false;
+        return Err(BWRAP_MISSING_DIAGNOSTIC);
     };
     let Some(probe_executable) = find_trusted_system_executable("true") else {
-        return false;
+        return Err(BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC);
     };
     let mut command = std::process::Command::new(bwrap);
     command
@@ -721,8 +819,14 @@ fn probe_bwrap() -> bool {
         .arg(probe_executable)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    bounded_backend_probe(command)
+        .stderr(Stdio::piped());
+    match bounded_backend_probe(command) {
+        Ok(()) => Ok(()),
+        Err(Some(stderr)) => Err(classify_bwrap_preflight_stderr(&read_exited_probe_stderr(
+            Some(stderr),
+        ))),
+        Err(None) => Err(BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -770,25 +874,31 @@ fn probe_seatbelt() -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    bounded_backend_probe(command)
+    bounded_backend_probe(command).is_ok()
 }
 
+/// Run a backend probe for at most three seconds. A probe that exits unsuccessfully returns its
+/// stderr pipe (when the command piped one) so the caller can classify the failure; a spawn
+/// failure or timeout returns `Err(None)`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn bounded_backend_probe(mut command: std::process::Command) -> bool {
+fn bounded_backend_probe(
+    mut command: std::process::Command,
+) -> Result<(), Option<std::process::ChildStderr>> {
     let Ok(mut child) = command.spawn_guarded() else {
-        return false;
+        return Err(None);
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(child.stderr.take()),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err(None);
             }
         }
     }
@@ -1203,6 +1313,20 @@ impl Sandbox {
             _ => false,
         };
         self.policy_from_backend_availability(available)
+    }
+
+    /// Closed, operator-actionable reason this backend's preflight failed, when known.
+    pub(crate) fn unavailable_diagnostic(&self) -> Option<&'static str> {
+        match self.backend.as_str() {
+            "bwrap" => bwrap_unavailable_diagnostic(),
+            _ => None,
+        }
+    }
+
+    fn unavailable_diagnostic_suffix(&self) -> String {
+        self.unavailable_diagnostic()
+            .map(|diagnostic| format!(": {diagnostic}"))
+            .unwrap_or_default()
     }
 
     fn policy_from_backend_availability(&self, available: bool) -> SandboxPolicy {
@@ -1680,8 +1804,9 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredButUnavailable => {
                 return Err(format!(
-                    "sandbox backend '{}' is not available — refusing to run unsandboxed (requested-but-unavailable)",
-                    self.backend
+                    "sandbox backend '{}' is not available — refusing to run unsandboxed (requested-but-unavailable){}",
+                    self.backend,
+                    self.unavailable_diagnostic_suffix()
                 ));
             }
             SandboxPolicy::RequiredAndAvailable => {}
@@ -1798,8 +1923,9 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredButUnavailable => {
                 return Err(format!(
-                    "sandbox backend '{}' is not available — refusing to run hook unsandboxed (requested-but-unavailable)",
-                    self.backend
+                    "sandbox backend '{}' is not available — refusing to run hook unsandboxed (requested-but-unavailable){}",
+                    self.backend,
+                    self.unavailable_diagnostic_suffix()
                 ));
             }
             SandboxPolicy::RequiredAndAvailable => {}
@@ -1932,8 +2058,9 @@ impl Sandbox {
             }
             SandboxPolicy::RequiredButUnavailable => {
                 return Err(format!(
-                    "sandbox backend '{}' is not available — refusing workspace-service launch (requested-but-unavailable)",
-                    self.backend
+                    "sandbox backend '{}' is not available — refusing workspace-service launch (requested-but-unavailable){}",
+                    self.backend,
+                    self.unavailable_diagnostic_suffix()
                 ));
             }
             SandboxPolicy::RequiredAndAvailable => {}
@@ -3908,6 +4035,61 @@ mod sandbox_tests {
 
     fn unavailable() -> Sandbox {
         Sandbox::new(true, "__no_such_backend_exists__")
+    }
+
+    #[test]
+    fn bwrap_preflight_uid_map_denial_names_apparmor_and_its_fix() {
+        // Verbatim stderr from bubblewrap on stock Ubuntu 24.04, where
+        // kernel.apparmor_restrict_unprivileged_userns=1.
+        let diagnostic =
+            classify_bwrap_preflight_stderr(b"bwrap: setting up uid map: Permission denied\n");
+        assert_eq!(diagnostic, BWRAP_APPARMOR_USERNS_DIAGNOSTIC);
+        assert!(diagnostic.contains("AppArmor"));
+        assert!(diagnostic.contains("kernel.apparmor_restrict_unprivileged_userns=0"));
+        assert!(diagnostic.contains("userns"));
+        assert!(diagnostic.contains("Linux prerequisites"));
+
+        assert_eq!(
+            classify_bwrap_preflight_stderr(
+                b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n"
+            ),
+            BWRAP_APPARMOR_USERNS_DIAGNOSTIC
+        );
+    }
+
+    #[test]
+    fn bwrap_preflight_other_failures_map_to_closed_diagnostics_without_echoing_stderr() {
+        assert_eq!(
+            classify_bwrap_preflight_stderr(
+                b"bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n"
+            ),
+            BWRAP_USERNS_DISABLED_DIAGNOSTIC
+        );
+        assert_eq!(
+            classify_bwrap_preflight_stderr(
+                b"bwrap: Creating new namespace failed: Operation not permitted\n"
+            ),
+            BWRAP_USERNS_DISABLED_DIAGNOSTIC
+        );
+        let injected = b"bwrap: \x1b[2Jsecret-token-123: No such file or directory\n";
+        let diagnostic = classify_bwrap_preflight_stderr(injected);
+        assert_eq!(diagnostic, BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC);
+        assert!(!diagnostic.contains("secret-token-123"));
+        assert_eq!(
+            classify_bwrap_preflight_stderr(b""),
+            BWRAP_PREFLIGHT_FAILED_DIAGNOSTIC
+        );
+        assert!(BWRAP_MISSING_DIAGNOSTIC.contains("apt install bubblewrap"));
+    }
+
+    #[test]
+    fn unavailable_launch_errors_keep_their_prefix_when_no_diagnostic_is_known() {
+        let error = unavailable().wrap_command("true").unwrap_err();
+        assert!(
+            error.contains("requested-but-unavailable") && !error.contains("bubblewrap"),
+            "unknown backends carry no bubblewrap diagnostic: {error}"
+        );
+        assert_eq!(unavailable().unavailable_diagnostic(), None);
     }
 
     #[test]

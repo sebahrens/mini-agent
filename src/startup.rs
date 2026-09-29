@@ -823,8 +823,12 @@ impl Startup {
         if sandbox.policy() == SandboxPolicy::RequiredButUnavailable
             && unavailable_sandbox_must_fail(&self.cli, &self.cfg, cfg!(target_os = "windows"))
         {
+            let reason = sandbox
+                .unavailable_diagnostic()
+                .map(|diagnostic| format!("\n{diagnostic}"))
+                .unwrap_or_default();
             anyhow::bail!(
-                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly)"
+                "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}"
             );
         }
         Ok(())

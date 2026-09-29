@@ -40,6 +40,45 @@ Do not run `cargo install mini-agent`: the crates.io package with that name is a
 The repository retains a Homebrew formula for package-channel compatibility, but no canonical
 `sebahrens` tap is published yet, so this guide does not advertise a tap command that cannot work.
 
+### Linux prerequisites
+
+On Linux, the default subprocess sandbox and the JavaScript runtime both use bubblewrap (`bwrap`),
+which release archives do not bundle. Install it as a root-owned system executable (a `bwrap` in a
+user-writable directory is ignored):
+
+```
+sudo apt install bubblewrap      # Debian, Ubuntu
+sudo dnf install bubblewrap      # Fedora
+sudo pacman -S bubblewrap        # Arch
+```
+
+Ubuntu 23.10 and later (including 24.04) set `kernel.apparmor_restrict_unprivileged_userns=1`,
+which stops bubblewrap from creating its user namespace. `bwrap --unshare-user --ro-bind / / true`
+then fails with `setting up uid map: Permission denied`. Choose one fix:
+
+- Per-binary AppArmor profile (recommended): write `/etc/apparmor.d/bwrap` containing
+
+  ```
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile bwrap /usr/bin/bwrap flags=(unconfined) {
+    userns,
+    include if exists <local/bwrap>
+  }
+  ```
+
+  and load it with `sudo apparmor_parser -r /etc/apparmor.d/bwrap`. Only `bwrap` gains user
+  namespaces; the restriction still applies to every other program.
+- System-wide sysctl: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, persisted in
+  `/etc/sysctl.d/`. Simpler, but it re-exposes the kernel's unprivileged-user-namespace attack
+  surface to every program, which is what Ubuntu's default guards against.
+
+When `bwrap` is missing or blocked, mini-agent's diagnostic (the startup or launch error, and the
+logged preflight warning) names the cause, including the AppArmor restriction and its fixes. General subprocesses then follow the sandbox policy in
+[Feature contract](#6-feature-contract), and the `js` tool is reported unavailable because it has
+no uncontained fallback. The shell installer prints a warning when `bwrap` is not on `PATH`.
+
 ## 2. Setting up the provider
 
 mini-agent defaults to **OpenRouter**, which gives access to hundreds of models through a single API key, without needing per-provider signup; OpenRouter also provides free models that can be used to complete this setup.

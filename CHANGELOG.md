@@ -28,9 +28,19 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `SECURITY.md` documents private vulnerability reporting through GitHub, supported versions,
   response targets and scope; the README and the new-issue page point security reports there, and
   `CONTRIBUTING.md` describes the build, test, documentation and beads workflow.
+- Linux prerequisites are documented in the README and Getting started guide: installing
+  bubblewrap, and the Ubuntu 23.10+/24.04 AppArmor user-namespace restriction with a per-binary
+  profile or the `kernel.apparmor_restrict_unprivileged_userns=0` sysctl (and its trade-off). The
+  AUR package lists `bubblewrap` in `optdepends`, and `install.sh` warns on Linux when `bwrap` is
+  not on `PATH`.
 
 ### Fixed
 
+- A failed Linux bubblewrap preflight now says why. A missing `bwrap`, and the AppArmor
+  `setting up uid map: Permission denied` refusal on Ubuntu 23.10+/24.04, each produce a
+  diagnostic that names the cause and the fix, both in sandbox startup and launch errors and in
+  the JS runtime's "unavailable" reason. Previously the sandbox or `js` tool was reported
+  unavailable with no explanation.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

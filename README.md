@@ -289,6 +289,54 @@ cd mini-agent
 cargo install --path . --debug
 ```
 
+### Linux prerequisites
+
+On Linux, both the default subprocess sandbox and the JavaScript runtime use
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). Release archives do not bundle
+it; install it from your distribution as a root-owned system executable (mini-agent ignores a
+`bwrap` in a user-writable directory):
+
+```bash
+sudo apt install bubblewrap      # Debian, Ubuntu
+sudo dnf install bubblewrap      # Fedora
+sudo pacman -S bubblewrap        # Arch (the AUR package lists it as an optional dependency)
+```
+
+Ubuntu 23.10 and later (including 24.04) restrict unprivileged user namespaces through AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`), which bubblewrap needs. Check with
+`bwrap --unshare-user --ro-bind / / true`; if it prints
+`setting up uid map: Permission denied`, pick one of:
+
+- **Per-binary AppArmor profile (recommended).** Allow user namespaces for `bwrap` only:
+
+  ```bash
+  sudo tee /etc/apparmor.d/bwrap <<'EOF'
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile bwrap /usr/bin/bwrap flags=(unconfined) {
+    userns,
+    include if exists <local/bwrap>
+  }
+  EOF
+  sudo apparmor_parser -r /etc/apparmor.d/bwrap
+  ```
+
+  Any local program can then create user namespaces *through bwrap*, but the restriction stays in
+  place for everything else.
+- **Disable the restriction system-wide.** `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+  (persist it in `/etc/sysctl.d/`). This is simpler but re-exposes the kernel's
+  unprivileged-user-namespace attack surface to every program, which is what Ubuntu's default
+  guards against.
+
+Without a working `bwrap`, mini-agent cannot enforce its Linux sandbox. Its diagnostic (the
+startup or launch error, and the logged preflight warning) names the cause: a missing `bwrap`, or
+the AppArmor restriction above with both fixes. What mini-agent then does for ordinary
+subprocesses follows the sandbox policy in
+[Feature contract](docs/agent/GET_STARTED.md#6-feature-contract): an explicit `--sandbox` refuses
+to start, while an implicit default warns. The `js` tool is always reported unavailable, since
+it has no uncontained fallback. The shell installer warns when `bwrap` is not on `PATH`.
+
 Configure a provider interactively, then start a session:
 
 ```bash

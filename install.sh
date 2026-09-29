@@ -423,6 +423,20 @@ mv -f "$STAGED" "$TARGET"
 echo "Installed ${BINARY_NAME} to ${TARGET}"
 echo "Installed license and source notices to ${DOC_DIR}"
 
+# ---- Linux sandbox prerequisite ----
+# bubblewrap backs the default Linux subprocess sandbox and the JS runtime but
+# is not bundled. Only warn: the binary itself runs without it.
+if [[ "$OS" == "unknown-linux-musl" ]] && ! command -v bwrap >/dev/null 2>&1; then
+    echo
+    echo "Warning: bubblewrap ('bwrap') was not found on your PATH."
+    echo "  ${BINARY_NAME} uses it for the default Linux sandbox and the JS runtime;"
+    echo "  without it the sandbox cannot be enforced and the js tool is unavailable."
+    echo "  Install it with your package manager, for example:"
+    echo "    sudo apt install bubblewrap"
+    echo "  On Ubuntu 23.10+/24.04, AppArmor must also allow bwrap's user namespaces; see"
+    echo "  https://github.com/${REPO}#linux-prerequisites"
+fi
+
 # ---- path hint ----
 INSTALL_DIR_ON_PATH=0
 IFS=':' read -r -a PATH_ENTRIES <<< "$PATH"

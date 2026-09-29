@@ -29,6 +29,14 @@ about:
   license: GPL-3.0-only
   license_file: LICENSE
   summary: Minimalistic coding agent written in Rust, optimized for memory footprint and performance
+  # conda has no optional-dependency field, and the sandbox only trusts a root-owned system
+  # bubblewrap, so the prerequisite is documented rather than declared under requirements.
+  description: |
+    Linux prerequisite: the default subprocess sandbox and the JS runtime use the system
+    bubblewrap (bwrap) executable, installed by the OS package manager (for example
+    `sudo apt install bubblewrap`), not from conda. On Ubuntu 23.10+/24.04, AppArmor's
+    unprivileged user-namespace restriction must also allow bwrap. See "Linux prerequisites"
+    in https://github.com/sebahrens/mini-agent#linux-prerequisites
 
 extra:
   recipe-maintainers:
