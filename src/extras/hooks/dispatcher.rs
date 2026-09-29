@@ -334,6 +334,7 @@ impl HookDispatcher {
     /// to their own root are unaffected) until a later valid rebind. Used while
     /// concurrent ACP turns in different workspaces leave no single correct
     /// shared root, so any dispatch outside a turn scope fails closed.
+    #[cfg(any(feature = "acp", test))]
     pub(crate) fn invalidate_shared_execution_root(&self, reason: &str) {
         let mut state = self
             .execution_root

@@ -95,6 +95,7 @@ pub(crate) fn set_active_workspace(path: &std::path::Path) {
 /// outside a turn bound to its own root: `Some(root)` rebinds it, `None`
 /// disables it (fail-closed) because concurrent turns in different
 /// workspaces leave no single correct shared root.
+#[cfg(feature = "acp")]
 pub(crate) fn bind_shared_execution_root(root: Option<&std::path::Path>) {
     match root {
         Some(root) => set_active_workspace(root),

@@ -727,7 +727,7 @@ impl AgentWorkScope {
 
     /// Binds hook dispatch inside this scope to `root`. The first binding
     /// wins; a scope's hook root never changes once set.
-    #[cfg(feature = "hooks")]
+    #[cfg(all(feature = "hooks", any(feature = "acp", test)))]
     pub(crate) fn set_hook_execution_root(&self, root: &std::path::Path) {
         let _ = self.hook_execution_root.set(root.to_path_buf());
     }
@@ -1020,7 +1020,6 @@ pub(crate) fn take_tool_failure(internal_call_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(feature = "mcp")]
 #[cfg(feature = "hooks")]
 fn inherited_hook_execution_root() -> std::sync::OnceLock<std::path::PathBuf> {
     let lock = std::sync::OnceLock::new();
@@ -1039,6 +1038,7 @@ pub(crate) fn current_hook_execution_root() -> Option<std::path::PathBuf> {
         .flatten()
 }
 
+#[cfg(feature = "mcp")]
 pub(crate) fn current_work_scope_is_cancelled() -> bool {
     AGENT_WORK_SCOPE
         .try_with(|scope| scope.is_cancelled())
