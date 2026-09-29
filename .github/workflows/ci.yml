@@ -625,6 +625,11 @@ jobs:
           cargo test --locked \
             sandbox::sandbox_tests::bound_bwrap_model_process_has_no_authority_fd_or_terminal_stdin \
             -- --exact --ignored --nocapture
+          # Sandboxed commands cannot rewrite .git config, hooks, info, or
+          # modules (bubblewrap --ro-bind-fd), while add and commit still work.
+          cargo test --locked \
+            sandbox::sandbox_tests::bwrap_workspace_git_metadata_is_read_only \
+            -- --exact --ignored --nocapture
           # Hooks are not a default feature. script(1) gives the test process a
           # controlling terminal, so the hook's failing /dev/tty open is a real
           # proof that sandboxed hooks and workspace services start detached.

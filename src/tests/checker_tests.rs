@@ -581,6 +581,72 @@ fn standard_path_tools_in_cwd_without_rules_are_allowed() {
 }
 
 #[test]
+fn standard_asks_before_file_tools_rewrite_git_config_or_hooks() {
+    let scratch = std::env::temp_dir().join(format!("mini-agent-perm-{}", uuid::Uuid::new_v4()));
+    for directory in [".git/hooks", ".git/info", "src", "hooks"] {
+        std::fs::create_dir_all(scratch.join(directory)).unwrap();
+    }
+    std::fs::write(scratch.join(".git/config"), "").unwrap();
+    let workspace = scratch.canonicalize().unwrap();
+    let path = |relative: &str| workspace.join(relative).to_string_lossy().into_owned();
+    let checker_for = |mode: SecurityMode, configs: &PermissionConfigs| {
+        PermissionChecker::new(configs, mode, Some(workspace.clone()), default_modes())
+            .expect("valid permission test configuration")
+    };
+
+    let mut checker = checker_for(SecurityMode::Standard, &PermissionConfigs::default());
+    for tool in ["write", "edit", "js/write_file"] {
+        for relative in [
+            ".git/config",
+            ".git/hooks/post-checkout",
+            ".git/hooks/nested/x",
+        ] {
+            assert_eq!(
+                checker.check_path(tool, &path(relative)),
+                CheckResult::Ask,
+                "{tool} {relative}"
+            );
+        }
+    }
+    // Reads and ordinary .git or workspace writes keep the Standard default.
+    assert_eq!(
+        checker.check_path("read", &path(".git/config")),
+        CheckResult::Allowed
+    );
+    for relative in [
+        ".git/info/exclude",
+        ".git/COMMIT_EDITMSG",
+        "src/config",
+        "hooks/x",
+    ] {
+        assert_eq!(
+            checker.check_path("write", &path(relative)),
+            CheckResult::Allowed,
+            "{relative}"
+        );
+    }
+
+    // An explicit rule still decides, and other modes are unchanged.
+    let config = PermissionConfig {
+        write: Some(ToolPerm::Granular(
+            [(".git/**".to_string(), Action::Allow)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut configured = checker_for(SecurityMode::Standard, &configs_from(config));
+    assert_eq!(
+        configured.check_path("write", &path(".git/config")),
+        CheckResult::Allowed
+    );
+    let mut yolo = checker_for(SecurityMode::Yolo, &PermissionConfigs::default());
+    assert_eq!(
+        yolo.check_path("write", &path(".git/hooks/post-checkout")),
+        CheckResult::Allowed
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
 fn standard_respects_deny_rules_for_path_tools_in_cwd() {
     // Config rules are more dominant than mode defaults, so explicit Deny rules win.
     // Use ** pattern to match paths with slashes.

@@ -59,7 +59,7 @@ fn macos_seatbelt_denies_symlinked_credential_reads() {
     .unwrap();
     let workspace = std::fs::canonicalize(root.path()).unwrap();
     let workspace_str = seatbelt_string_literal(&workspace, "working directory").unwrap();
-    let profile = seatbelt_shell_profile(&workspace_str, &workspace_str, &denies, true);
+    let profile = seatbelt_shell_profile(&workspace_str, &workspace_str, &denies, "", true);
 
     for target in [
         canonical_secret.clone(),

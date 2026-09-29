@@ -614,6 +614,23 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             linux.index("bwrap_hook_has_no_controlling_terminal"),
         )
 
+    def test_linux_sandbox_policy_proves_workspace_git_metadata_is_read_only(
+        self,
+    ) -> None:
+        linux = job_body(self.workflow, "linux-sandbox-policy")
+        # The ignored real-bwrap probe runs a sandboxed `git config` and hook
+        # write that must fail while `git add`/`git commit` still succeed.
+        self.assertIn(
+            "cargo test --locked \\\n"
+            "            sandbox::sandbox_tests::bwrap_workspace_git_metadata_is_read_only \\\n"
+            "            -- --exact --ignored --nocapture",
+            linux,
+        )
+        self.assertLess(
+            linux.index("bash scripts/install-ci-bubblewrap.sh"),
+            linux.index("bwrap_workspace_git_metadata_is_read_only"),
+        )
+
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("bash scripts/install-ci-bubblewrap.sh", linux)

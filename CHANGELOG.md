@@ -41,6 +41,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   protocol lines (OAuth servers included), an oversized SSE answer fails its request with an error
   naming the cap instead of hanging until the timeout, and at most 4 KiB of a non-2xx body reaches
   the error text (mini-agent-f2wne).
+- Sandboxed commands, JS `spawn`, sandboxed hooks, and workspace services can no longer rewrite the
+  workspace's `.git/config`, `hooks`, `info`, `modules`, `config.worktree`, `commondir`, or a
+  linked worktree's gitfile (so they cannot plant `core.fsmonitor`, hooks, or filter drivers), nor
+  rename `.git`; `git add`/`git commit` inside the sandbox still work. On Linux this needs
+  bubblewrap 0.8.0 or later (older versions log a warning) and covers entries that exist at launch. In `standard` mode the write/edit tools now also ask before
+  changing `.git/config` or anything under `.git/hooks` unless a configured rule decides.
 - The permission prompt can no longer show a different command than the one that runs: bidi
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed
