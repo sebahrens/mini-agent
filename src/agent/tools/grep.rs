@@ -574,10 +574,7 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            Self::new_in(&std::env::temp_dir(), tag)
-        }
-
-        fn new_in(parent: &Path, tag: &str) -> Self {
+            let parent = std::env::temp_dir();
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(
@@ -775,28 +772,44 @@ mod tests {
         ));
     }
 
+    fn grep_args(pattern: &str, path: Option<&str>, include: Option<&str>) -> GrepArgs {
+        GrepArgs {
+            pattern: pattern.to_string(),
+            path: path.map(str::to_string),
+            include: include.map(str::to_string),
+            context_lines: None,
+            case_insensitive: false,
+            files_only: false,
+            count: false,
+        }
+    }
+
+    // Fixtures live in an injected temp workspace, never the process working
+    // directory: the crate root is a git checkout, and a fixture left there by
+    // a failed or killed run could be committed (mini-agent-863fb).
     #[tokio::test]
     async fn grep_external_path_permission_keeps_local_relative_searches() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = TempDir::new_in(&cwd, "local-relative");
+        let workspace = TempDir::new("local-relative");
+        std::fs::create_dir_all(workspace.path().join("nested")).unwrap();
         let marker = "grep_local_relative_marker";
-        std::fs::write(dir.path().join("marker.txt"), marker).unwrap();
-        let relative_root = dir.path().strip_prefix(&cwd).unwrap();
+        std::fs::write(workspace.path().join("nested").join("marker.txt"), marker).unwrap();
 
-        let output = GrepTool::new(Some(standard_permission(&cwd)), None, 10)
-            .call(GrepArgs {
-                pattern: marker.to_string(),
-                path: Some(relative_root.to_string_lossy().into_owned()),
-                include: None,
-                context_lines: None,
-                case_insensitive: false,
-                files_only: false,
-                count: false,
-            })
+        let found = GrepTool::new(Some(standard_permission(workspace.path())), None, 10)
+            .with_workspace(workspace.path())
+            .call(grep_args(marker, Some("nested"), None))
             .await
             .unwrap();
+        assert!(found.contains(marker), "{found}");
 
-        assert!(output.contains(marker));
+        // Without a workspace binding a relative root resolves against the
+        // process working directory. Search an existing source directory for
+        // this test's own text instead of creating a fixture there.
+        let cwd = std::env::current_dir().unwrap();
+        let found = GrepTool::new(Some(standard_permission(&cwd)), None, 10)
+            .call(grep_args(marker, Some("src/agent/tools"), Some("grep.rs")))
+            .await
+            .unwrap();
+        assert!(found.contains("grep.rs"), "{found}");
     }
 
     #[tokio::test]
@@ -1111,25 +1124,25 @@ mod tests {
 
     #[tokio::test]
     async fn grep_external_path_permission_omitted_root_searches_cwd() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = TempDir::new_in(&cwd, "omitted-root");
+        let workspace = TempDir::new("omitted-root");
         let marker = "grep_omitted_root_marker";
-        std::fs::write(dir.path().join("marker.txt"), marker).unwrap();
+        std::fs::write(workspace.path().join("marker.txt"), marker).unwrap();
 
-        let output = GrepTool::new(Some(standard_permission(&cwd)), None, 10)
-            .call(GrepArgs {
-                pattern: marker.to_string(),
-                path: None,
-                include: None,
-                context_lines: None,
-                case_insensitive: false,
-                files_only: false,
-                count: false,
-            })
+        let found = GrepTool::new(Some(standard_permission(workspace.path())), None, 10)
+            .with_workspace(workspace.path())
+            .call(grep_args(marker, None, None))
             .await
             .unwrap();
+        assert!(found.contains("marker.txt"), "{found}");
 
-        assert!(output.contains(marker));
+        // Unbound: the omitted root is the process working directory (the
+        // crate root under `cargo test`), which already contains this source.
+        let cwd = std::env::current_dir().unwrap();
+        let found = GrepTool::new(Some(standard_permission(&cwd)), None, 10)
+            .call(grep_args(marker, None, Some("grep.rs")))
+            .await
+            .unwrap();
+        assert!(found.contains("grep.rs"), "{found}");
     }
 
     #[tokio::test]

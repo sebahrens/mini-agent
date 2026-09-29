@@ -1282,10 +1282,7 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            Self::new_in(&std::env::temp_dir(), tag)
-        }
-
-        fn new_in(parent: &Path, tag: &str) -> Self {
+            let parent = std::env::temp_dir();
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = parent.join(format!(
@@ -1403,23 +1400,38 @@ mod tests {
         ));
     }
 
+    // Fixtures live in an injected temp workspace, never the process working
+    // directory: the crate root is a git checkout, and a fixture left there by
+    // a failed or killed run could be committed (mini-agent-863fb).
     #[tokio::test]
     async fn find_files_external_path_permission_keeps_local_relative_searches() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = TempDir::new_in(&cwd, "local_relative");
+        let workspace = TempDir::new("local_relative");
+        std::fs::create_dir_all(workspace.path().join("nested")).unwrap();
         let marker = "find_files_local_relative_marker.txt";
-        std::fs::write(dir.path().join(marker), "").unwrap();
-        let relative_root = dir.path().strip_prefix(&cwd).unwrap();
+        std::fs::write(workspace.path().join("nested").join(marker), "").unwrap();
 
-        let output = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
+        let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
+            .with_workspace(workspace.path())
             .call(FindFilesArgs {
                 pattern: format!("^{marker}$"),
-                path: Some(relative_root.to_string_lossy().into_owned()),
+                path: Some("nested".to_string()),
             })
             .await
             .unwrap();
+        assert!(found.contains(marker), "{found}");
 
-        assert!(output.contains(marker));
+        // Without a workspace binding a relative root resolves against the
+        // process working directory. Search an existing source directory
+        // instead of creating a fixture there.
+        let cwd = std::env::current_dir().unwrap();
+        let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
+            .call(FindFilesArgs {
+                pattern: r"^find_files\.rs$".to_string(),
+                path: Some("src/agent/tools".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(found.contains("find_files.rs"), "{found}");
     }
 
     #[tokio::test]
@@ -1645,20 +1657,31 @@ mod tests {
 
     #[tokio::test]
     async fn find_files_external_path_permission_omitted_root_searches_cwd() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = TempDir::new_in(&cwd, "omitted_root");
+        let workspace = TempDir::new("omitted_root");
         let marker = "find_files_omitted_root_marker.txt";
-        std::fs::write(dir.path().join(marker), "").unwrap();
+        std::fs::write(workspace.path().join(marker), "").unwrap();
 
-        let output = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
+        let found = FindFilesTool::new(Some(standard_permission(workspace.path())), None, 10)
+            .with_workspace(workspace.path())
             .call(FindFilesArgs {
                 pattern: format!("^{marker}$"),
                 path: None,
             })
             .await
             .unwrap();
+        assert!(found.contains(marker), "{found}");
 
-        assert!(output.contains(marker));
+        // Unbound: the omitted root is the process working directory (the
+        // crate root under `cargo test`), which already contains this source.
+        let cwd = std::env::current_dir().unwrap();
+        let found = FindFilesTool::new(Some(standard_permission(&cwd)), None, 10)
+            .call(FindFilesArgs {
+                pattern: r"^find_files\.rs$".to_string(),
+                path: None,
+            })
+            .await
+            .unwrap();
+        assert!(found.contains("find_files.rs"), "{found}");
     }
 
     #[tokio::test]

@@ -2041,12 +2041,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/agent/tools/find_files.rs",
-        "assert!(output.contains(marker));",
-        2,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/find_files.rs",
         "assert!(output.starts_with(\"100 files found:\\n\"));",
         1,
         "NON-PROCESS",
@@ -2085,12 +2079,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
         "src/agent/tools/grep.rs",
         "assert!(output.contains(\"unknown number of additional matches\"));",
         1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/agent/tools/grep.rs",
-        "assert!(output.contains(marker));",
-        2,
         "NON-PROCESS",
     ),
     (
@@ -2703,10 +2691,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
                 1,
             ),
             (
-                "ae8fedde9b6e8bece82821b0de38178334b0c1ca387c872260b80d2e138c6e06",
-                2,
-            ),
-            (
                 "f25fa463789bdff96f2ac1db892cb80aa2acf858cae6fce6207f6faa70bc85b8",
                 1,
             ),
@@ -2782,10 +2766,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             (
                 "99092c71e9e39b0963c34a3241c195133962a8db5ec43f09bb6cd66917665b9b",
                 1,
-            ),
-            (
-                "ae8fedde9b6e8bece82821b0de38178334b0c1ca387c872260b80d2e138c6e06",
-                2,
             ),
             (
                 "ddc400f7816d0659ba5fe6e89b565e7e22473e6551c6c5be7a2ee53dca51c0ab",
