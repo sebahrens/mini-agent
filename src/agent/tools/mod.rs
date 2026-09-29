@@ -598,6 +598,42 @@ pub(crate) async fn check_perm_canonical_path(
     }
 }
 
+/// Per-entry deny filter for a walking tool (`grep`, `find_files`,
+/// `list_dir`). Authorising the walk root does not authorise every path
+/// beneath it: an entry matched by a deny rule for `tool` (or, for these
+/// read-class walkers, for `read`) is hidden and a denied directory is
+/// pruned. `workspace_root` is the bound workspace root for workspace walks,
+/// whose entries are checked by their workspace-relative spelling; external
+/// walks pass `None` and are checked by their canonical absolute path.
+/// Returns `None` when no permission checker or no deny rule applies.
+pub(crate) fn walk_deny_filter(
+    permission: &Option<PermCheck>,
+    tool: &str,
+    workspace_root: Option<&Path>,
+) -> Option<find_files::PathFilter> {
+    let probe = {
+        let guard = permission
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.path_deny_probe(tool)
+    };
+    if probe.is_empty() {
+        return None;
+    }
+    let workspace_root = workspace_root.map(Path::to_path_buf);
+    Some(std::sync::Arc::new(
+        move |path: &Path, _is_directory: bool| {
+            let subject = workspace_root
+                .as_deref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .unwrap_or(path);
+            probe.is_denied(subject)
+        },
+    ))
+}
+
 pub(crate) async fn check_perm_bound_path(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,

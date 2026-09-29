@@ -42,6 +42,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   workflow builds and publishes nothing until the tagged commit is on `main` and its tag CI run
   reports `ci-success`; publication runs in the `release` environment, and `just release` /
   `just add-tag` run `cargo test --locked` before tagging.
+- `grep`, `find_files` and `list_dir` now honour per-file path `deny` rules while walking: files and
+  directories denied to `read` (or to the walking tool itself, or by an `external_directory` deny)
+  are skipped, so `grep` over `.` can no longer return the contents, and `find_files`/`list_dir` the
+  names, of files the user denied to `read`. Previously only the search root was checked.
 
 ### Added
 

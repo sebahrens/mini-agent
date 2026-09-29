@@ -1611,6 +1611,20 @@ every case variant, so `read .ENV` or `read Secrets/key` cannot bypass a
 `.env` or `secrets/**` deny. Bash scripts are checked as a whole and line by line
 against deny rules: a deny that matches any line denies the entire script.
 
+Path `deny` rules also cover the walking tools. `grep`, `find_files`, and
+`list_dir` check their search root as usual, and then check every file and
+directory they encounter against the `deny` rules for that tool and for
+`read` (plus `external_directory` denies outside the workspace): a denied
+file is skipped, so its contents and name never appear in results, and a
+denied directory is not descended into. Entries are checked by the same
+spellings as `read` would check them (workspace-relative and absolute inside
+the workspace, canonical absolute outside it), with the same case folding on
+macOS and Windows. With `read = { "config/secrets/**" = "deny" }`, `grep`
+over `.` never returns lines from `config/secrets/`, and `find_files` and
+`list_dir` never list its files. This per-entry filter evaluates only `deny`
+rules; it never asks, and `ask` or `allow` rules on entries beneath an
+authorised root do not affect the walk.
+
 Outside the working directory, a tool `allow` rule only counts when it names
 an absolute location (`/opt/data/**`, `~/notes/**`, or a regex starting with
 `^/`). Relative or match-anything allows such as `**/*.rs`, `src/**`, or

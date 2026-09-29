@@ -430,7 +430,13 @@ impl Tool for GrepTool {
         {
             let logical = workspace.logical_relative_path(relative)?;
             let directory = workspace.open_relative_directory_file(relative)?;
-            let bound = BoundDirectory::from_file(&logical, directory)?;
+            let bound = BoundDirectory::from_file(&logical, directory)?.with_hidden_filter(
+                crate::agent::tools::walk_deny_filter(
+                    &self.permission,
+                    "grep",
+                    Some(workspace.root()),
+                ),
+            );
             let coaching =
                 check_perm_bound_path(&self.permission, &self.ask_tx, "grep", workspace, relative)
                     .await?;
@@ -438,7 +444,10 @@ impl Tool for GrepTool {
         } else {
             let traversal_root = tokio::fs::canonicalize(&search_path).await?;
             let authorized_metadata = crate::fs::stable_path_metadata(&traversal_root).await?;
-            let bound = BoundDirectory::open(&traversal_root, &authorized_metadata)?;
+            let bound =
+                BoundDirectory::open(&traversal_root, &authorized_metadata)?.with_hidden_filter(
+                    crate::agent::tools::walk_deny_filter(&self.permission, "grep", None),
+                );
             let coaching = check_perm_path(
                 &self.permission,
                 &self.ask_tx,
@@ -1427,5 +1436,112 @@ mod tests {
             "{output}"
         );
         assert!(output.starts_with("3 results"), "{output}");
+    }
+
+    fn standard_permission_with(working_dir: &Path, config: PermissionConfig) -> PermCheck {
+        Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(working_dir.to_path_buf()),
+                None,
+            )
+            .expect("valid permission test configuration"),
+        ))
+    }
+
+    // mini-agent-06im2: authorising the walk root must not expose files the
+    // user denied to `read`, whether the walk is bound to the workspace,
+    // addressed by absolute path, or rooted outside the workspace.
+    #[tokio::test]
+    async fn grep_skips_files_matching_read_deny_rules() {
+        let container = TempDir::new("read-deny");
+        let container_path = container.path().canonicalize().unwrap();
+        let workspace = container_path.join("workspace");
+        let external = container_path.join("external");
+        for root in [&workspace, &external] {
+            std::fs::create_dir_all(root.join("config/secrets")).unwrap();
+            std::fs::write(root.join("config/secrets/key.txt"), "TOKEN=hunter2\n").unwrap();
+            std::fs::write(root.join("config/app.txt"), "TOKEN=public\n").unwrap();
+        }
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("config/secrets/**".to_string(), Action::Deny),
+                    (
+                        format!("{}/config/secrets/**", external.display()),
+                        Action::Deny,
+                    ),
+                ]
+                .into(),
+            )),
+            external_directory: Some(
+                [
+                    (external.display().to_string(), Action::Allow),
+                    (format!("{}/**", external.display()), Action::Allow),
+                ]
+                .into(),
+            ),
+            ..PermissionConfig::default()
+        };
+        let permission = standard_permission_with(&workspace, config);
+        let tool = GrepTool::new(Some(permission), None, 50).with_workspace(&workspace);
+
+        let workspace_absolute = workspace.to_string_lossy().into_owned();
+        let external_absolute = external.to_string_lossy().into_owned();
+        for path in [
+            None,
+            Some("."),
+            Some("config"),
+            Some(workspace_absolute.as_str()),
+            Some(external_absolute.as_str()),
+        ] {
+            let found = tool.call(grep_args("TOKEN", path, None)).await.unwrap();
+            assert!(found.contains("TOKEN=public"), "{path:?}: {found}");
+            assert!(!found.contains("hunter2"), "{path:?}: {found}");
+            assert!(!found.contains("key.txt"), "{path:?}: {found}");
+        }
+
+        let mut files_only = grep_args("TOKEN", None, None);
+        files_only.files_only = true;
+        let found = tool.call(files_only).await.unwrap();
+        assert!(!found.contains("key.txt"), "{found}");
+
+        // Searching inside the denied tree finds nothing rather than
+        // leaking its contents.
+        let found = tool
+            .call(grep_args("TOKEN", Some("config/secrets"), None))
+            .await
+            .unwrap();
+        assert!(!found.contains("hunter2"), "{found}");
+    }
+
+    #[tokio::test]
+    async fn grep_skips_directories_matching_grep_deny_rules() {
+        let workspace = TempDir::new("grep-dir-deny");
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("vendor/nested")).unwrap();
+        std::fs::write(root.join("vendor/nested/lib.txt"), "MARKER vendored\n").unwrap();
+        std::fs::write(root.join("main.txt"), "MARKER main\n").unwrap();
+        // `vendor` names only the directory: its files are hidden solely
+        // because the denied directory is pruned from the walk.
+        let config = PermissionConfig {
+            grep: Some(ToolPerm::Granular(
+                [("vendor".to_string(), Action::Deny)].into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let tool = GrepTool::new(Some(standard_permission_with(&root, config)), None, 50)
+            .with_workspace(&root);
+        let found = tool.call(grep_args("MARKER", None, None)).await.unwrap();
+        assert!(found.contains("MARKER main"), "{found}");
+        assert!(!found.contains("vendored"), "{found}");
+
+        // The directory itself stays denied as a search root.
+        let denied = tool
+            .call(grep_args("MARKER", Some("vendor"), None))
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("Permission denied"), "{denied}");
     }
 }
