@@ -636,7 +636,8 @@ impl Startup {
 
         // Load context first so prompts/themes are available early.
         let no_context_files = cli.resolve_no_context_files(&cfg);
-        let context =
+        #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
+        let mut context =
             context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
 
         let mut provider = cli.resolve_provider(&cfg);
@@ -767,6 +768,15 @@ impl Startup {
             cfg.known_context_window(session.provider.as_str(), session.model.as_str(), &qm_map)
         {
             session.update_context_window(cw);
+        }
+
+        // A resumed session replays its compaction summary as a recap; the
+        // memory block must not carry the daily log's copy of it as well
+        // (mini-agent-vx0yg).
+        #[cfg(feature = "memory")]
+        if let Some(reference) = session.active_compaction_ref() {
+            context.memory =
+                crate::extras::memory::Mem::open().context_block_excluding(Some(reference));
         }
 
         // The invocation's captured workspace is authoritative until an

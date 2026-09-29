@@ -687,7 +687,11 @@ pub(crate) async fn start_main_run(
     #[allow(unused_mut)]
     let mut pending_turn = PendingMainTurn::capture(ui.session, text);
     #[cfg(feature = "memory")]
-    if ui.context.refresh_memory_if_changed().await {
+    if ui
+        .context
+        .refresh_memory_if_changed(ui.session.active_compaction_ref().map(str::to_string))
+        .await
+    {
         // A queued result still owns services; retire it before rebuilding.
         run.agent = None;
         if let Some(stale) = prebuild.take() {

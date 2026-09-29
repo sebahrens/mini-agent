@@ -460,6 +460,23 @@ pub struct Compaction {
     pub summarized_count: usize,
     pub token_savings: u64,
     pub created_at: CompactString,
+    /// [`compaction_ref`] of the summarizer's text, which also tags the copy
+    /// written to the daily memory log. `None` for compactions saved before
+    /// the tag existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_ref: Option<CompactString>,
+}
+
+/// A short, stable tag for one compaction summary.
+///
+/// The daily memory log and the session's recap carry the same summary; the
+/// tag lets the memory block leave out the copy the session already replays
+/// (mini-agent-vx0yg). It is computed from the summarizer's own text, before
+/// todo or goal context is appended to the session's copy.
+pub fn compaction_ref(summary: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(summary.trim().as_bytes());
+    crate::hex::encode_lower(&digest[..8])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1596,6 +1613,13 @@ impl Session {
         self.context_window = cw;
     }
 
+    /// The [`compaction_ref`] of the summary this session currently replays
+    /// as its recap, if it has one.
+    pub fn active_compaction_ref(&self) -> Option<&str> {
+        self.compacted_context().0?;
+        self.compactions.last()?.memory_ref.as_deref()
+    }
+
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         let c = match self.compactions.last() {
             Some(c) => c,
@@ -1612,6 +1636,7 @@ impl Session {
     }
 
     pub fn compress(&mut self, mut summary: String, first_kept_index: usize, token_savings: u64) {
+        let memory_ref = CompactString::new(compaction_ref(&summary));
         if let Some(todo_context) = self.todos.critical_context() {
             summary.push_str("\n\n");
             summary.push_str(&todo_context);
@@ -1651,6 +1676,7 @@ impl Session {
             summarized_count,
             token_savings,
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+            memory_ref: Some(memory_ref),
         });
 
         // Compaction reindexes messages, so the calibration anchor no longer

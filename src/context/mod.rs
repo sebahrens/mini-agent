@@ -241,10 +241,21 @@ impl ContextFiles {
 
     /// Refresh persistent-memory prompt context without destabilizing the
     /// provider cache when its rendered content is byte-identical.
+    ///
+    /// `exclude_compaction` is the session's
+    /// [`crate::session::Session::active_compaction_ref`]: that summary is
+    /// already replayed as the session's recap, so its daily-log copy is left
+    /// out of the block.
     #[cfg(feature = "memory")]
-    pub(crate) async fn refresh_memory_if_changed(&mut self) -> bool {
-        match tokio::task::spawn_blocking(|| crate::extras::memory::Mem::open().context_block())
-            .await
+    pub(crate) async fn refresh_memory_if_changed(
+        &mut self,
+        exclude_compaction: Option<String>,
+    ) -> bool {
+        match tokio::task::spawn_blocking(move || {
+            crate::extras::memory::Mem::open()
+                .context_block_excluding(exclude_compaction.as_deref())
+        })
+        .await
         {
             Ok(memory) => self.replace_memory_if_changed(memory),
             Err(error) => {
