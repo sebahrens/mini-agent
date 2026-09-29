@@ -73,7 +73,8 @@ class CiDocsFilterTests(unittest.TestCase):
                 HEAD_SHA=HEAD,
             )
             result = subprocess.run(
-                ["bash", "-c", self.script],
+                # GitHub Actions runs `run:` steps as `bash -e -o pipefail`.
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.script],
                 env=env,
                 capture_output=True,
                 text=True,

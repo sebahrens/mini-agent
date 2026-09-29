@@ -110,7 +110,8 @@ jobs:
           # holds a test baseline, non-Markdown files under docs/ are data, and
           # SOURCE.md and LICENSE ship in every release archive.
           consumed_docs='^(docs/agent/|docs/specs/|docs/benchmarks/|docs/vscode-acp-setup\.md$|SOURCE\.md$|LICENSE)'
-          docs_data=$(echo "$changed" | grep -E '^docs/' | grep -vE '\.md$')
+          # grep exits 1 when nothing matches; under `-o pipefail` that would fail the step.
+          docs_data=$(echo "$changed" | grep -E '^docs/' | grep -vE '\.md$' || true)
           if echo "$changed" | grep -qvE "$docs_only" \
             || echo "$changed" | grep -qE "$consumed_docs" \
             || [ -n "$docs_data" ]; then
