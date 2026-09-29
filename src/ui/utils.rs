@@ -43,6 +43,89 @@ pub(crate) fn display_prefix(s: &str, max_width: usize) -> &str {
     &s[..end]
 }
 
+/// Longest UTF-8 suffix of `s` that fits in `max_width` terminal columns.
+pub(crate) fn display_suffix(s: &str, max_width: usize) -> &str {
+    let mut width = 0usize;
+    let mut start = s.len();
+    for (index, ch) in s.char_indices().rev() {
+        let char_width = char_display_width(ch);
+        if width.saturating_add(char_width) > max_width {
+            break;
+        }
+        width = width.saturating_add(char_width);
+        start = index;
+    }
+    &s[start..]
+}
+
+/// Hard-wrap `s` into rows of at most `width` terminal columns, preserving
+/// every character (no whitespace collapsing), so an exact command or path
+/// can be reviewed row by row. An empty string is one empty row.
+pub(crate) fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for ch in s.chars() {
+        let char_width = char_display_width(ch);
+        if row_width + char_width > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        row.push(ch);
+        row_width += char_width;
+    }
+    rows.push(row);
+    rows
+}
+
+/// Shorten `s` to at most `max_width` columns by replacing its middle with
+/// `…`, keeping the head and a longer tail: for a path, the file name at the
+/// end is what identifies the target.
+pub(crate) fn middle_elide(s: &str, max_width: usize) -> String {
+    if display_width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let budget = max_width - 1; // the ellipsis
+    let head_width = budget / 3;
+    let head = display_prefix(s, head_width);
+    let tail = display_suffix(&s[head.len()..], budget - display_width(head));
+    format!("{head}…{tail}")
+}
+
+/// One-line form of a possibly multi-line value for transcript summaries:
+/// the first non-empty line, and `(+N lines, M chars)` when more follows.
+/// The first line itself is capped at `max_bytes`.
+pub(crate) fn compact_multiline(value: &str, max_bytes: usize) -> String {
+    let (first, rest) = compact_parts(value, max_bytes);
+    first + &rest
+}
+
+/// `compact_multiline` split into the (capped) first line and the
+/// `" (+N lines, M chars)"` suffix, which is empty for a single line.
+fn compact_parts(value: &str, max_bytes: usize) -> (String, String) {
+    let total_lines = value.lines().count();
+    let first = value
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim_end();
+    let shown = truncate_cjk(first, max_bytes, "...");
+    let rest = if total_lines > 1 {
+        format!(
+            " (+{} lines, {} chars)",
+            total_lines - 1,
+            value.chars().count()
+        )
+    } else {
+        String::new()
+    };
+    (shown, rest)
+}
+
 /// Resolves a color based on monochrome mode.
 #[inline]
 pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
@@ -155,14 +238,46 @@ pub(crate) fn parse_color(s: &str) -> Option<Color> {
 }
 
 /// Formats a tool call showing only the primary file/command parameter.
+/// This exact form is persisted as the session's tool-call text; a bash
+/// command is kept whole. The transcript uses
+/// [`format_tool_call_display`] instead.
 pub(crate) fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
+    tool_call_summary(name, args, false)
+}
+
+/// One-line transcript form of a tool call: like
+/// [`format_tool_call_summary`], but a multi-line value (a heredoc, a
+/// `node -e` script, JavaScript source) shows only its first line plus
+/// `(+N lines, M chars)`, and a bash command is capped like other values.
+/// The complete input stays in the session and in the permission request.
+pub(crate) fn format_tool_call_display(name: &str, args: &serde_json::Value) -> String {
+    tool_call_summary(name, args, true)
+}
+
+fn compact_value(val: &str, quote: bool) -> String {
+    let (first, rest) = compact_parts(val, TOOL_SUMMARY_MAX);
+    if quote {
+        format!("\"{first}\"{rest}")
+    } else {
+        first + &rest
+    }
+}
+
+fn tool_call_summary(name: &str, args: &serde_json::Value, compact: bool) -> String {
+    let show = |val: &str| {
+        if compact {
+            compact_value(val, true)
+        } else {
+            display_value(val)
+        }
+    };
     let obj = match args {
         serde_json::Value::Object(map) => map,
         _ => return name.to_string(),
     };
 
     if name == "task" {
-        return format_task_summary(obj);
+        return format_task_summary(obj, &show);
     }
 
     let primary_keys: &[&str] = match name {
@@ -176,10 +291,10 @@ pub(crate) fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> 
     let mut shown = Vec::new();
     for key in primary_keys {
         if let Some(serde_json::Value::String(val)) = obj.get(*key) {
-            let display_val = if name == "bash" {
-                val.clone()
-            } else {
-                display_value(val)
+            let display_val = match (name, compact) {
+                ("bash", false) => val.clone(),
+                ("bash", true) => compact_value(val, false),
+                _ => show(val),
             };
             shown.push(display_val);
         }
@@ -187,7 +302,7 @@ pub(crate) fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> 
 
     if shown.is_empty() {
         if let Some((_, serde_json::Value::String(val))) = obj.iter().next() {
-            format!("{} {}", name, display_value(val))
+            format!("{} {}", name, show(val))
         } else {
             name.to_string()
         }
@@ -196,7 +311,10 @@ pub(crate) fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> 
     }
 }
 
-fn format_task_summary(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+fn format_task_summary(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    show: &dyn Fn(&str) -> String,
+) -> String {
     let prompts = match obj.get("prompts") {
         Some(serde_json::Value::Array(arr)) => arr,
         _ => return "task".to_string(),
@@ -204,7 +322,7 @@ fn format_task_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Stri
     let parts: Vec<String> = prompts
         .iter()
         .filter_map(|v| v.as_str())
-        .map(display_value)
+        .map(show)
         .collect();
     if parts.is_empty() {
         "task".to_string()
@@ -254,7 +372,72 @@ fn descendant_pattern(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_prefix, display_width, suggest_pattern};
+    use super::{
+        compact_multiline, display_prefix, display_suffix, display_width, format_tool_call_display,
+        format_tool_call_summary, middle_elide, suggest_pattern, wrap_to_width,
+    };
+
+    #[test]
+    fn wrap_to_width_keeps_every_character_within_the_width() {
+        assert_eq!(wrap_to_width("abcdefg", 3), ["abc", "def", "g"]);
+        assert_eq!(wrap_to_width("a  b", 2), ["a ", " b"]);
+        assert_eq!(wrap_to_width("", 5), [""]);
+        let rows = wrap_to_width("界界界", 3);
+        assert_eq!(rows, ["界", "界", "界"]);
+        assert!(rows.iter().all(|row| display_width(row) <= 3));
+    }
+
+    #[test]
+    fn middle_elide_keeps_the_file_name_tail() {
+        let path = "/home/user/projects/very/deeply/nested/directory/structure/main.rs";
+        let elided = middle_elide(path, 30);
+        assert!(display_width(&elided) <= 30, "{elided}");
+        assert!(elided.starts_with("/home"), "{elided}");
+        assert!(elided.ends_with("structure/main.rs"), "{elided}");
+        assert!(elided.contains('…'));
+        assert_eq!(middle_elide("short", 30), "short");
+        assert_eq!(display_suffix("ab界", 2), "界");
+    }
+
+    #[test]
+    fn compact_multiline_shows_the_first_line_and_a_count() {
+        assert_eq!(compact_multiline("ls -la", 200), "ls -la");
+        assert_eq!(
+            compact_multiline("cat <<'EOF' > f\nline\nEOF", 200),
+            "cat <<'EOF' > f (+2 lines, 24 chars)"
+        );
+        assert_eq!(
+            compact_multiline("\n\nnode -e '1'\nx", 200),
+            "node -e '1' (+3 lines, 15 chars)"
+        );
+    }
+
+    #[test]
+    fn transcript_tool_lines_compact_scripts_but_the_session_keeps_them() {
+        let script = "node -e '\nconst a = 1;\nconsole.log(a);\n'";
+        let args = serde_json::json!({ "command": script });
+        assert_eq!(
+            format_tool_call_summary("bash", &args),
+            format!("bash {script}")
+        );
+        assert_eq!(
+            format_tool_call_display("bash", &args),
+            "bash node -e ' (+3 lines, 40 chars)"
+        );
+        let long = "x".repeat(500);
+        let long_args = serde_json::json!({ "command": long });
+        assert!(format_tool_call_display("bash", &long_args).len() < 220);
+        let js = serde_json::json!({ "code": "const x = 1;\nreturn x;" });
+        assert_eq!(
+            format_tool_call_display("js", &js),
+            "js \"const x = 1;\" (+1 lines, 22 chars)"
+        );
+        let read = serde_json::json!({ "path": "/a/b.rs" });
+        assert_eq!(
+            format_tool_call_display("read", &read),
+            format_tool_call_summary("read", &read)
+        );
+    }
 
     #[test]
     fn display_prefix_respects_terminal_columns_and_utf8_boundaries() {

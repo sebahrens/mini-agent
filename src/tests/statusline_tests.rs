@@ -8,6 +8,7 @@ fn ctx() -> StatusContext<'static> {
         loop_label: None,
         goal_label: None,
         prompt_name: None,
+        reasoning_effort: None,
         perm_mode: None,
         chain_label: None,
         background_jobs: 0,
@@ -339,6 +340,20 @@ fn provider_model_short_message_count() {
 }
 
 #[test]
+fn external_item_values_cannot_drive_the_terminal_or_break_the_row() {
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("session_name"), seg("separator"), seg("git_branch")],
+        }],
+    };
+    let mut session = Session::new("openrouter", "m", 1000, "");
+    session.name = "evil\x1b]0;pwned\x07name\nsecond".into();
+    session.git_branch = Some("feat\x1b[2Jx".into());
+    let text = line_text(&statusline::build_lines(&spec, &session, &ctx())[0]);
+    assert_eq!(text, "evilname second featx");
+}
+
+#[test]
 fn reasoning_shows_only_when_enabled() {
     let spec = StatusLineConfig {
         lines: vec![StatusLineLine {
@@ -446,4 +461,49 @@ fn the_goal_item_shows_progress_and_a_parked_status() {
     let mut parked = ctx();
     parked.goal_label = Some("goal 7/50 paused");
     assert!(line_text(&statusline::build_lines(&spec, &session, &parked)[0]).contains("paused"));
+}
+
+#[test]
+fn goal_changes_refresh_the_cached_statusline() {
+    let session = Session::new("anthropic", "claude", 200_000, "");
+    let mut running = ctx();
+    running.goal_label = Some("goal 3/50");
+    let mut paused = ctx();
+    paused.goal_label = Some("goal 3/50 paused");
+    let cleared = ctx();
+    let keys = [
+        statusline::cache_key(&session, &running),
+        statusline::cache_key(&session, &paused),
+        statusline::cache_key(&session, &cleared),
+    ];
+    assert_ne!(keys[0], keys[1], "pause must rebuild the statusline");
+    assert_ne!(keys[1], keys[2], "clear must rebuild the statusline");
+    assert_ne!(keys[0], keys[2]);
+}
+
+#[test]
+fn reasoning_effort_sits_next_to_the_model_when_configured() {
+    let session = Session::new("openai", "gpt-5", 400_000, "");
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("reasoning_effort")],
+        }],
+    };
+    assert!(line_text(&statusline::build_lines(&spec, &session, &ctx())[0]).is_empty());
+    let mut high = ctx();
+    high.reasoning_effort = Some("high");
+    assert_eq!(
+        line_text(&statusline::build_lines(&spec, &session, &high)[0]),
+        "effort:high"
+    );
+    let default_line =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &high)[0]);
+    assert!(default_line.contains("gpt-5 effort:high"), "{default_line}");
+    let unset_default =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(!unset_default.contains("effort"), "{unset_default}");
+    assert_ne!(
+        statusline::cache_key(&session, &ctx()),
+        statusline::cache_key(&session, &high)
+    );
 }
