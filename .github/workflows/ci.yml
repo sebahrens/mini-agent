@@ -53,7 +53,8 @@ jobs:
   # nothing embeds or reads, so the expensive jobs below take `needs: changes`
   # and run only when a code path (including embedded or test-read docs) moved. `fmt` stays unconditional because it also runs the repository
   # policy scripts, which guard workflow and documentation policy and finish in
-  # seconds.
+  # seconds. The multi-minute GPL Corresponding Source assembly lives in its own
+  # code-gated `corresponding-source` job for the same reason.
   #
   # This fails open. Tag pushes, scheduled runs, and any event whose base
   # revision cannot be resolved (a first push, a force push, a shallow clone)
@@ -200,8 +201,42 @@ jobs:
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 
-      # The Corresponding Source archive vendors the VS Code extension's
-      # locked npm tarballs and rebuilds dist/extension.js offline from them.
+      - name: Verify production and research workspace boundaries
+        run: |
+          python3 -m unittest scripts.tests.test_check_workspace_boundaries
+          python3 scripts/check_workspace_boundaries.py
+
+  # Assembles the GPL Corresponding Source archive exactly as release.yml does:
+  # Cargo sources vendored and resolved --offline, every npm tarball pinned by
+  # editors/vscode/package-lock.json vendored and verified against its
+  # integrity hash, dist/extension.js rebuilt offline from them, and the
+  # assembled archive re-checked against the lockfile (mini-agent-yiodv).
+  #
+  # Two measures keep this off the fast path. It is code-gated (`needs:
+  # changes`), so a documentation-only push skips it like the build matrix
+  # (Markdown cannot break assembly; LICENSE, NOTICE and SOURCE.md, which the
+  # packager checks, count as code in the filter), while every code change,
+  # tag push and full dispatch still assembles the archive. It used to sit in
+  # the unconditional `fmt` job and cost several minutes on every docs push.
+  # And the ~500 npm tarballs (~195 MB) are cached across runs under the
+  # SHA-256 of package-lock.json (restoring the newest older entry when the
+  # lockfile changed), so `npm pack` runs only for packages a lockfile change
+  # newly pins. The cache is untrusted input: the
+  # packager reuses a cached tarball only when its bytes match the lockfile
+  # integrity and re-packs anything else, so a cached run produces the same
+  # vendor-npm/ manifest and archive bytes as an uncached one. release.yml
+  # does not use this cache and always packs from the registry.
+  corresponding-source:
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
       - name: Set up pinned Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -213,18 +248,25 @@ jobs:
           npm install --global "$(node --print "require('./package.json').packageManager")"
           test "npm@$(npm --version)" = "$(node --print "require('./package.json').packageManager")"
 
+      - name: Hash the npm lockfile for the vendored tarball cache
+        id: npm-lock
+        run: echo "sha256=$(sha256sum editors/vscode/package-lock.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vendored npm tarballs
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/npm-vendor-cache
+          key: corresponding-source-npm-${{ steps.npm-lock.outputs.sha256 }}
+          restore-keys: corresponding-source-npm-
+
       - name: Assemble GPL Corresponding Source offline
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           bash scripts/package-corresponding-source.sh \
-            "v${version}-ci" "$RUNNER_TEMP" HEAD --allow-untagged-label
+            "v${version}-ci" "$RUNNER_TEMP" HEAD --allow-untagged-label \
+            --npm-vendor-cache "$RUNNER_TEMP/npm-vendor-cache"
           MINI_AGENT_SOURCE_ARCHIVE="$RUNNER_TEMP/mini-agent-v${version}-ci-source.tar.gz" \
             python3 -m unittest scripts.tests.test_package_corresponding_source
-
-      - name: Verify production and research workspace boundaries
-        run: |
-          python3 -m unittest scripts.tests.test_check_workspace_boundaries
-          python3 scripts/check_workspace_boundaries.py
 
   # Runs on pushes as well as pull requests: work lands directly on main, so a
   # pull-request-only gate left the eval and the Gym smoke unexercised for
@@ -2494,6 +2536,7 @@ jobs:
       - windows-msi
       - package
       - dependency-policy
+      - corresponding-source
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -101,7 +101,11 @@ needs the pinned Node and npm (`editors/vscode/.nvmrc`, `packageManager`) and fa
 missing. CI validates that Cargo can resolve the bundle with `--locked --offline`, verifies every
 npm tarball against the lockfile and rebuilds `dist/extension.js` with `npm ci --offline`, writes
 the archive reproducibly (sorted entries, the tagged commit's timestamp), includes the source
-archive in `SHA256SUMS`, and publishes it in the same GitHub release as the binaries. Never delete a source asset while any matching binary asset remains
+archive in `SHA256SUMS`, and publishes it in the same GitHub release as the binaries. The CI
+`corresponding-source` job assembles the same archive for every code change (documentation-only
+pushes skip it) with `--npm-vendor-cache <dir>`, which reuses a previously fetched npm tarball only
+when its bytes match the lockfile integrity, so the result is byte-identical to an uncached run; the
+release workflow does not use that cache. Never delete a source asset while any matching binary asset remains
 available.
 
 ## Product identity matrix

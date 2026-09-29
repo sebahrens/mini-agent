@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: package-corresponding-source.sh <vX.Y.Z> <output-dir> [git-ref] [--allow-untagged-label] [--compliance-docs <dir>]" >&2
+    echo "Usage: package-corresponding-source.sh <vX.Y.Z> <output-dir> [git-ref] [--allow-untagged-label] [--compliance-docs <dir>] [--npm-vendor-cache <dir>]" >&2
     exit 2
 fi
 
@@ -16,6 +16,7 @@ shift 2
 SOURCE_REF=""
 ALLOW_UNTAGGED_LABEL=false
 COMPLIANCE_DOCS=""
+NPM_VENDOR_CACHE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --allow-untagged-label)
@@ -28,6 +29,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             COMPLIANCE_DOCS="$2"
+            shift 2
+            ;;
+        --npm-vendor-cache)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --npm-vendor-cache requires a directory" >&2
+                exit 2
+            fi
+            NPM_VENDOR_CACHE="$2"
             shift 2
             ;;
         --*)
@@ -121,14 +130,21 @@ mkdir -p "$STAGING_DIR/$SOURCE_ROOT/.cargo"
 # The VSIX bundles npm dependencies into dist/extension.js, so the archive
 # carries every tarball pinned by the extension's package-lock.json, verified
 # against its integrity hashes, and proves that the bundle rebuilds offline.
+# --npm-vendor-cache lets CI reuse tarballs from an earlier run: each one is
+# reused only when its bytes match the lockfile integrity, so the vendored set
+# and the archive are identical to an uncached run.
 NPM_LOCKFILE="editors/vscode/package-lock.json"
 NPM_VENDOR_DIR="vendor-npm"
 VENDORED_NPM=false
+NPM_VENDOR_ARGS=(--npm "$NPM_BIN" --mtime "$SOURCE_EPOCH")
+if [[ -n "$NPM_VENDOR_CACHE" ]]; then
+    NPM_VENDOR_ARGS+=(--cache "$NPM_VENDOR_CACHE")
+fi
 if [[ -f "$STAGING_DIR/$SOURCE_ROOT/$NPM_LOCKFILE" ]]; then
     python3 "$SCRIPT_DIR/corresponding_source.py" vendor-npm \
         "$STAGING_DIR/$SOURCE_ROOT/$NPM_LOCKFILE" \
         "$STAGING_DIR/$SOURCE_ROOT/$NPM_VENDOR_DIR" \
-        --npm "$NPM_BIN" --mtime "$SOURCE_EPOCH"
+        "${NPM_VENDOR_ARGS[@]}"
     NPM_CHECK_DIR="$STAGING_DIR/npm-offline-check"
     mkdir -p "$NPM_CHECK_DIR"
     cp -R "$STAGING_DIR/$SOURCE_ROOT/editors/vscode" "$NPM_CHECK_DIR/extension"

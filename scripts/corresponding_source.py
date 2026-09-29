@@ -5,6 +5,8 @@
 extension's locked npm dependency tarballs, to verify them against
 ``editors/vscode/package-lock.json``, and to write a byte-reproducible
 ``.tar.gz`` (sorted entries, fixed mtimes, normalized ownership and modes).
+``vendor-npm --cache DIR`` reuses integrity-verified tarballs from an earlier
+run so CI only runs ``npm pack`` for packages the lockfile newly pins.
 """
 
 from __future__ import annotations
@@ -186,20 +188,38 @@ def manifest_for(lockfile: Path, packages: list[LockedPackage]) -> dict[str, obj
     }
 
 
-def vendor_npm(
-    lockfile: Path,
-    destination: Path,
-    npm: str,
-    mtime: int,
-    jobs: int = PACK_JOBS,
-) -> list[LockedPackage]:
-    """Fetch every locked npm tarball with ``npm pack`` and verify its integrity."""
-    packages = locked_packages(lockfile)
-    by_file = unique_tarballs(packages)
-    by_url = {package.resolved: package for package in by_file.values()}
-    if destination.exists():
-        raise SourceError(f"npm vendor destination already exists: {destination}")
+def reuse_cached_tarballs(
+    by_file: dict[str, LockedPackage], cache: Path, destination: Path
+) -> set[str]:
+    """Copy every cached tarball whose bytes match its lockfile integrity.
 
+    The cache is untrusted input: a file is reused only after its content hash
+    matches ``package-lock.json``, anything else in the cache is ignored, and
+    the finished vendor directory is verified again before it is used.
+    """
+    reused: set[str] = set()
+    if not cache.is_dir():
+        return reused
+    for file, package in sorted(by_file.items()):
+        cached = cache / file
+        if cached.is_symlink() or not cached.is_file():
+            continue
+        # Hash the copy, not the cache entry, so the verified bytes are the used ones.
+        shutil.copyfile(cached, destination / file)
+        if matches_integrity(destination / file, package.integrity):
+            reused.add(file)
+        else:
+            (destination / file).unlink()
+    return reused
+
+
+def pack_tarballs(
+    by_file: dict[str, LockedPackage], destination: Path, npm: str, jobs: int
+) -> None:
+    """Fetch ``by_file``'s tarballs with ``npm pack`` into ``destination``."""
+    if not by_file:
+        return
+    by_url = {package.resolved: package for package in by_file.values()}
     with tempfile.TemporaryDirectory(prefix="npm-pack-") as scratch:
         scratch_root = Path(scratch)
         urls = sorted(by_url)
@@ -217,7 +237,6 @@ def vendor_npm(
             for future in futures:
                 future.result()
 
-        destination.mkdir(parents=True)
         # npm names downloaded tarballs from their embedded package.json, so
         # match them to lockfile entries by content hash, never by file name.
         remaining = {
@@ -242,6 +261,49 @@ def vendor_npm(
             missing = ", ".join(sorted(remaining.values()))
             raise SourceError(f"npm pack did not produce locked tarballs: {missing}")
 
+
+def refresh_cache(destination: Path, cache: Path) -> None:
+    """Replace ``cache`` with the verified tarballs of ``destination``."""
+    staging = cache.with_name(f"{cache.name}.tmp-{os.getpid()}")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    for entry in sorted(destination.iterdir()):
+        if entry.name != MANIFEST_NAME:
+            shutil.copyfile(entry, staging / entry.name)
+    if cache.is_symlink() or cache.is_file():
+        cache.unlink()
+    elif cache.exists():
+        shutil.rmtree(cache)
+    staging.rename(cache)
+
+
+def vendor_npm(
+    lockfile: Path,
+    destination: Path,
+    npm: str,
+    mtime: int,
+    jobs: int = PACK_JOBS,
+    cache: Path | None = None,
+) -> list[LockedPackage]:
+    """Vendor every locked npm tarball and verify it against the lockfile.
+
+    With ``cache``, tarballs already in that directory are reused when their
+    content matches the lockfile integrity, only the rest are fetched with
+    ``npm pack``, and the cache is then refreshed to hold exactly the vendored
+    set. Reused and packed tarballs are the same registry bytes, so the vendor
+    directory (and the archive built from it) is identical either way.
+    """
+    packages = locked_packages(lockfile)
+    by_file = unique_tarballs(packages)
+    if destination.exists():
+        raise SourceError(f"npm vendor destination already exists: {destination}")
+
+    destination.mkdir(parents=True)
+    reused = reuse_cached_tarballs(by_file, cache, destination) if cache is not None else set()
+    missing = {file: package for file, package in by_file.items() if file not in reused}
+    pack_tarballs(missing, destination, npm, jobs)
+
     manifest = destination / MANIFEST_NAME
     manifest.write_text(
         json.dumps(manifest_for(lockfile, packages), indent=2, sort_keys=True) + "\n",
@@ -250,6 +312,13 @@ def vendor_npm(
     for entry in [destination, *destination.iterdir()]:
         os.utime(entry, (mtime, mtime))
     verify_npm(lockfile, destination)
+    if cache is not None:
+        print(
+            f"reused {len(reused)} cached npm tarballs and packed {len(missing)}",
+            file=sys.stderr,
+        )
+        if missing or not cache.is_dir():
+            refresh_cache(destination, cache)
     return packages
 
 
@@ -338,6 +407,11 @@ def main(argv: list[str] | None = None) -> int:
     vendor.add_argument("--npm", default="npm")
     vendor.add_argument("--mtime", type=int, required=True)
     vendor.add_argument("--jobs", type=int, default=PACK_JOBS)
+    vendor.add_argument(
+        "--cache",
+        type=Path,
+        help="reuse integrity-verified tarballs from this directory and refresh it afterwards",
+    )
 
     verify = commands.add_parser("verify-npm", help="verify vendored npm tarballs")
     verify.add_argument("lockfile", type=Path)
@@ -358,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.npm,
                 arguments.mtime,
                 arguments.jobs,
+                arguments.cache,
             )
             print(f"vendored {len(unique_tarballs(packages))} npm tarballs for {len(packages)} locked packages")
         elif arguments.command == "verify-npm":

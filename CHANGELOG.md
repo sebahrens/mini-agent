@@ -224,6 +224,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   persisted checkout credentials, and dispatches CI for its pull request. Dependabot now also watches
   the VS Code extension's npm dependencies.
 
+### Changed
+
+- CI assembles the GPL Corresponding Source archive in its own code-gated job, so documentation-only
+  pushes no longer spend minutes vendoring ~500 npm tarballs, and caches those tarballs by the
+  `package-lock.json` hash. `package-corresponding-source.sh --npm-vendor-cache <dir>` reuses a cached
+  tarball only when it matches the lockfile integrity, producing a byte-identical archive; release
+  builds do not use the cache.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but
