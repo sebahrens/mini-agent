@@ -1183,6 +1183,15 @@ mod slash_picker_contract {
     }
 
     #[test]
+    fn picker_entries_are_drawn_without_control_characters() {
+        use crate::ui::pickers::display_safe;
+        assert_eq!(display_safe("src/main.rs"), "src/main.rs");
+        assert_eq!(display_safe("evil\x1b[2Jname"), "evil\u{fffd}[2Jname");
+        assert_eq!(display_safe("two\nlines\r"), "two\u{fffd}lines\u{fffd}");
+        assert_eq!(display_safe("日本\u{9b}x"), "日本\u{fffd}x");
+    }
+
+    #[test]
     fn picker_window_ends_above_the_floor_and_follows_the_selection() {
         let window = |top_row, start, end| PickerWindow {
             top_row,
