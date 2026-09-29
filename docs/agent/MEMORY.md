@@ -17,6 +17,7 @@ Memory is plain Markdown on disk — no database, no indexing service. All stora
 ```
 <data_dir>/memory/
 ├── MEMORY.md                        # Global long-term memory (shared across projects)
+├── .memory.lock                     # Advisory lock serializing writes/edits across sessions
 └── projects/
     └── <project-slug>/
         ├── SCRATCHPAD.md            # Per-project checklist
@@ -27,6 +28,8 @@ Memory is plain Markdown on disk — no database, no indexing service. All stora
             ├── auth.md              # Reference notes (never auto-injected)
             └── deployment.md
 ```
+
+Every `memory_write`/`memory_edit` holds an exclusive advisory lock on `.memory.lock` for its read-modify-write, so concurrent sessions appending to the shared `MEMORY.md` (or the same daily log) never lose each other's updates.
 
 ### Project Slug
 

@@ -370,6 +370,60 @@ fn oversized_case_never_exceeds_inject_cap() {
 }
 
 #[test]
+fn concurrent_appends_from_separate_handles_keep_every_update() {
+    let m = fresh("concurrent");
+    let writers = 8;
+    let per_writer = 25;
+    std::thread::scope(|scope| {
+        for writer in 0..writers {
+            // Separate handles model separate sessions sharing MEMORY.md.
+            let handle = Mem {
+                root: m.root.clone(),
+                project: m.project.clone(),
+                today: m.today.clone(),
+            };
+            scope.spawn(move || {
+                for entry in 0..per_writer {
+                    handle
+                        .write(
+                            WriteTarget::LongTerm,
+                            &format!("fact-{writer}-{entry}"),
+                            WriteMode::Append,
+                            None,
+                        )
+                        .unwrap();
+                    handle
+                        .write(
+                            WriteTarget::Daily,
+                            &format!("log-{writer}-{entry}"),
+                            WriteMode::Append,
+                            None,
+                        )
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let long_term = fs::read_to_string(memory_md(&m)).unwrap();
+    let daily_log = fs::read_to_string(daily(&m, &m.today)).unwrap();
+    for writer in 0..writers {
+        for entry in 0..per_writer {
+            assert!(
+                long_term.contains(&format!("fact-{writer}-{entry}\n")),
+                "lost long-term append fact-{writer}-{entry}"
+            );
+            assert!(
+                daily_log.contains(&format!("log-{writer}-{entry}\n")),
+                "lost daily append log-{writer}-{entry}"
+            );
+        }
+    }
+    assert!(m.list().iter().all(|name| !name.contains("lock")));
+    cleanup(&m);
+}
+
+#[test]
 fn long_term_over_read_limit_is_truncated_not_dropped() {
     let m = fresh("lt-huge");
     let huge = format!("FIRSTFACT\n{}", "B".repeat(200 * 1024));

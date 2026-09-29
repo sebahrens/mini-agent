@@ -65,6 +65,10 @@ fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Advisory lock file at the store root; not a `.md` file, so it never appears
+/// in listings, search, or the injected context.
+const STORE_LOCK_FILE: &str = ".memory.lock";
+
 const MEMORY_TRUNCATED_MARKER: &str = "\n…[memory truncated]";
 
 /// Largest MEMORY.md prefix read for the injected context. Larger files are
@@ -408,6 +412,21 @@ impl Mem {
         &s[..cut]
     }
 
+    /// Serialize read-modify-write mutations across sessions and processes.
+    /// MEMORY.md is shared by every session, and appends rewrite the whole
+    /// file, so two unsynchronized writers would each drop the other's update.
+    /// The advisory lock covers the whole store and is released on drop.
+    fn lock_store(&self) -> std::io::Result<fs::File> {
+        fs::create_dir_all(&self.root)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.root.join(STORE_LOCK_FILE))?;
+        file.lock()?;
+        Ok(file)
+    }
+
     pub fn write(
         &self,
         target: WriteTarget,
@@ -421,6 +440,7 @@ impl Mem {
                 "memory is disabled by a legacy-path conflict",
             ));
         }
+        let _store_lock = self.lock_store()?;
         let original_len = content.len();
         tracing::debug!(
             "memory write: target={:?}, bytes={}, mode={:?}",
@@ -574,6 +594,7 @@ impl Mem {
                 "memory is disabled by a legacy-path conflict",
             ));
         }
+        let _store_lock = self.lock_store()?;
         tracing::debug!(
             "memory edit: target={:?}, has_old={}",
             target,
