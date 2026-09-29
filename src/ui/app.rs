@@ -3905,6 +3905,7 @@ mod input_reader_lifecycle_tests {
                     }),
                     judge: None,
                     judge_tokens: 0,
+                    judge_charge: None,
                     interrupted: false,
                 }))
             };

@@ -628,6 +628,7 @@ async fn start_goal_verification(
     );
     let transcript = crate::extras::goal::judge::transcript_tail(ui.session);
     let client = ui.client.clone();
+    let session_prices = (ui.session.input_token_cost, ui.session.output_token_cost);
 
     run.goal_gate_generation = run
         .goal_gate_generation
@@ -659,6 +660,7 @@ async fn start_goal_verification(
         // before it looks at the judge: asking anyway spends a model call on
         // an answer nobody reads.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
+        let mut judge_charge = None;
         let judged = match judge {
             Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
                 // The judge is cancelled like a check: an interrupt or a
@@ -682,6 +684,13 @@ async fn start_goal_verification(
                 )
                 .await;
                 interrupted = verdict.is_none();
+                judge_charge = verdict.as_ref().and_then(|call| {
+                    call.charge(
+                        &resolved,
+                        &cfg,
+                        crate::extras::goal::judge::judge_prices(&resolved, &cfg, session_prices),
+                    )
+                });
                 verdict
             }
             _ => None,
@@ -692,6 +701,7 @@ async fn start_goal_verification(
                     operation_id,
                     checks,
                     judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                    judge_charge,
                     judge: judged.map(|call| call.outcome),
                     interrupted,
                 },
@@ -759,6 +769,21 @@ pub(crate) async fn handle_goal_verification_event(
     run: &mut AgentRunState,
     ui: &mut UiContext<'_>,
 ) -> anyhow::Result<bool> {
+    // The judge's tokens were spent whatever happens to its verdict, so the
+    // session is charged for them at the judge model's own prices before a
+    // stale or set-aside result is dropped (mini-agent-kfsup).
+    if let Some(charge) = event.judge_charge.as_ref() {
+        let first_unpriced = ui.session.unpriced_judge_tokens == 0;
+        if !ui.session.charge_judge_call(charge) && first_unpriced {
+            renderer.write_line(
+                &format!(
+                    "goal: no known price for judge model {}; its tokens are counted without cost",
+                    charge.model
+                ),
+                C_AGENT,
+            )?;
+        }
+    }
     // A result from a superseded round is ignored: its generation no longer
     // matches the one in flight.
     let Some(pending) = run

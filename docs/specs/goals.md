@@ -218,12 +218,21 @@ headless run by the round's wall clock, since nothing there can prompt.
 `max_tokens` and the goal's token total count the whole round: the agent's usage, including any
 mid-round reminder it was sent, plus the judge call that adjudicated it. The agent's usage is
 normalised once per provider report on every surface (terminal, headless and editor alike), so a
-provider that reports reasoning tokens beside its output (Gemini) has them counted as output. A judge is counted in input
-plus output tokens as its provider reported them for the call that returned an answer, parseable or
-not, on whichever provider it runs. A call that failed, was interrupted, or was retried away before a
-final response reported nothing and adds nothing. Tokens, not cost, are what the bound measures, so a
-judge on a cheaper model counts the same per token. The session's cost counters do not include judge
-calls.
+provider that reports reasoning tokens beside its output (Gemini) has them counted as output. A
+judge is counted in input plus output tokens as its provider reported them (normalised the same
+way) for the call that returned an answer, parseable or not, on whichever provider it runs. A call
+that failed, was interrupted, or was retried away before a final response reported nothing and adds
+nothing. Tokens, not cost, are what the bound measures, so a judge on a cheaper model counts the
+same per token.
+
+The terminal and headless surfaces also charge each judge call to the session's token and cost
+counters, at the judge model's own prices: the session's prices when the judge is the session
+model, otherwise its `quick_models` entry's, then the model catalog's. A judge model with no known
+non-zero price has its tokens added without cost and counted as `unpriced_judge_tokens` in the
+session; the first such call says so (in the transcript, or on stderr headless) and `/goal status`
+shows the running count. The charge is made even when the verdict itself is set aside. An editor
+(ACP) session keeps no cost counters, so there is nothing to charge there. `--output json`'s `cost`
+remains the agent turn's own.
 
 The wrap-up round runs on an agent capped to `wrap_up_max_agent_turns`, so the bound the harness
 announces is the bound the round gets. It is issued once per exhaustion and re-armed by resuming or

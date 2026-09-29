@@ -2029,12 +2029,11 @@ async fn settle_acp_goal_round(
                     ),
                     // Fail open, like every other judge failure: an editor
                     // without a reachable judge still gets its checks.
-                    Err(error) => Some(crate::extras::goal::judge::JudgeCall {
-                        outcome: crate::extras::goal::gate::JudgeOutcome::Unavailable {
+                    Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
+                        crate::extras::goal::gate::JudgeOutcome::Unavailable {
                             reason: error.to_string(),
                         },
-                        tokens: 0,
-                    }),
+                    )),
                 }
             }
             _ => None,

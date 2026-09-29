@@ -467,6 +467,10 @@ pub struct Compaction {
     pub memory_ref: Option<CompactString>,
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Longest derived session title shown in `--resume` and `/sessions`.
 pub const SESSION_TITLE_CHARS: usize = 48;
 
@@ -528,6 +532,10 @@ pub struct Session {
     #[serde(default)]
     pub total_real_input_tokens: u64,
     pub total_cost: f64,
+    /// Goal completion-judge tokens charged to the totals above without a
+    /// cost, because the judge model's price is unknown (mini-agent-kfsup).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub unpriced_judge_tokens: u64,
     pub total_estimated_tokens: u64,
     #[serde(default)]
     pub calibrated_tokens: u64,
@@ -727,6 +735,7 @@ impl Session {
             total_cache_creation_input_tokens: 0,
             total_real_input_tokens: 0,
             total_cost: 0.0,
+            unpriced_judge_tokens: 0,
             total_estimated_tokens: 0,
             calibrated_tokens: 0,
             calibrated_msg_count: 0,
@@ -1117,6 +1126,50 @@ impl Session {
     /// total. Terminal responses are deliberately absent from this API so UI
     /// and headless callers cannot charge an aggregate a second time.
     pub fn charge_usage_delta(&mut self, usage: crate::event::UsageDelta, anthropic_native: bool) {
+        self.charge_usage_delta_at(
+            usage,
+            anthropic_native,
+            self.input_token_cost,
+            self.output_token_cost,
+        );
+    }
+
+    /// Charge a goal completion-judge call at the judge model's own prices
+    /// (mini-agent-kfsup). Its tokens always join the session totals; with no
+    /// known price they add no cost and are counted in
+    /// [`Self::unpriced_judge_tokens`] instead. Returns false when unpriced.
+    #[cfg(feature = "goal")]
+    pub fn charge_judge_call(&mut self, charge: &crate::extras::goal::judge::JudgeCharge) -> bool {
+        match charge.prices {
+            Some((input_cost, output_cost)) => {
+                self.charge_usage_delta_at(
+                    charge.usage,
+                    charge.anthropic_native,
+                    input_cost,
+                    output_cost,
+                );
+                true
+            }
+            None => {
+                self.charge_usage_delta_at(charge.usage, charge.anthropic_native, 0.0, 0.0);
+                self.unpriced_judge_tokens = self.unpriced_judge_tokens.saturating_add(
+                    charge
+                        .usage
+                        .input_tokens
+                        .saturating_add(charge.usage.output_tokens),
+                );
+                false
+            }
+        }
+    }
+
+    fn charge_usage_delta_at(
+        &mut self,
+        usage: crate::event::UsageDelta,
+        anthropic_native: bool,
+        input_token_cost: f64,
+        output_token_cost: f64,
+    ) {
         self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
         self.total_cached_input_tokens = self
@@ -1143,8 +1196,8 @@ impl Session {
                 usage.cache_creation_input_tokens,
             ),
             usage.output_tokens,
-            self.input_token_cost,
-            self.output_token_cost,
+            input_token_cost,
+            output_token_cost,
         );
     }
 
@@ -1895,6 +1948,50 @@ mod shell_interaction_tests {
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
+
+    /// Judge calls are charged at the judge model's prices; an unknown price
+    /// records the tokens without cost and counts them (mini-agent-kfsup).
+    #[cfg(feature = "goal")]
+    #[test]
+    fn judge_calls_are_charged_at_the_judge_models_prices() {
+        let mut session = Session::new("openai", "big", 128_000, "");
+        session.input_token_cost = 100.0;
+        session.output_token_cost = 100.0;
+        let usage = crate::event::UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            total_tokens: 1_100,
+            ..crate::event::UsageDelta::default()
+        };
+        let priced = crate::extras::goal::judge::JudgeCharge {
+            usage,
+            anthropic_native: false,
+            prices: Some((2.0, 10.0)),
+            model: "cheap/judge".into(),
+        };
+        assert!(session.charge_judge_call(&priced));
+        assert!(
+            (session.total_cost - 0.003).abs() < 1e-12,
+            "not the session's $100/M"
+        );
+        assert_eq!(session.total_input_tokens, 1_000);
+        assert_eq!(session.unpriced_judge_tokens, 0);
+
+        let unpriced = crate::extras::goal::judge::JudgeCharge {
+            prices: None,
+            ..priced
+        };
+        assert!(!session.charge_judge_call(&unpriced));
+        assert!((session.total_cost - 0.003).abs() < 1e-12, "no cost added");
+        assert_eq!(session.total_input_tokens, 2_000);
+        assert_eq!(session.total_output_tokens, 200);
+        assert_eq!(session.unpriced_judge_tokens, 1_100);
+
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["unpriced_judge_tokens"], 1_100);
+        let fresh = serde_json::to_value(Session::new("openai", "big", 1, "")).unwrap();
+        assert!(fresh.get("unpriced_judge_tokens").is_none());
+    }
 
     #[test]
     fn active_compaction_gates_use_cold_or_calibrated_context_at_the_budget_boundary() {

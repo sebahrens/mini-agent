@@ -2092,6 +2092,12 @@ async fn run_headless_goal_rounds(
             let verification_interrupted =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let interrupt_flag = verification_interrupted.clone();
+            // The judge call's usage, priced at the judge model's own rates,
+            // comes back out of the closure so the session is charged for it
+            // before the round is persisted (mini-agent-kfsup).
+            let judge_charge_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let judge_charge_out = judge_charge_slot.clone();
+            let session_prices = (session.input_token_cost, session.output_token_cost);
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     // An operator who interrupts must not wait for a check;
@@ -2158,6 +2164,18 @@ async fn run_headless_goal_rounds(
                                     ..driver::Verification::default()
                                 };
                             };
+                            *judge_charge_out
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = verdict
+                                .charge(
+                                    &resolved,
+                                    &cfg_for_judge,
+                                    crate::extras::goal::judge::judge_prices(
+                                        &resolved,
+                                        &cfg_for_judge,
+                                        session_prices,
+                                    ),
+                                );
                             Some(verdict)
                         }
                         _ => None,
@@ -2170,6 +2188,19 @@ async fn run_headless_goal_rounds(
                     }
                 })
                 .await;
+            let judge_charge = judge_charge_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(charge) = judge_charge {
+                let first_unpriced = session.unpriced_judge_tokens == 0;
+                if !session.charge_judge_call(&charge) && first_unpriced {
+                    eprintln!(
+                        "goal: no known price for judge model {}; its tokens are counted without cost",
+                        charge.model
+                    );
+                }
+            }
             // The round that just ran is history for whatever comes next, and its
             // work has to survive an interrupt, so it is persisted before the
             // gate's decision is acted on rather than only on a relaunch.

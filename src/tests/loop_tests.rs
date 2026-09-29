@@ -274,15 +274,35 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
             verified: vec![crate::extras::goal::VerificationKind::Checks],
         }),
         judge: None,
-        judge_tokens: 0,
+        judge_tokens: 1_100,
+        // A judge call's tokens were spent even when its result is stale, so
+        // the session is charged at the judge model's prices (mini-agent-kfsup).
+        judge_charge: Some(crate::extras::goal::judge::JudgeCharge {
+            usage: crate::event::UsageDelta {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                total_tokens: 1_100,
+                ..crate::event::UsageDelta::default()
+            },
+            anthropic_native: false,
+            prices: Some((2.0, 10.0)),
+            model: "judge/model".into(),
+        }),
         interrupted: false,
     };
+    let cost_before = ui.session.total_cost;
     assert!(
         !handle_goal_verification_event(Box::new(superseded), &mut renderer, &mut run, &mut ui)
             .await
             .unwrap(),
         "a result from another round must not be applied"
     );
+    assert!(
+        (ui.session.total_cost - cost_before - 0.003).abs() < 1e-12,
+        "1000 in at $2/M plus 100 out at $10/M"
+    );
+    assert_eq!(ui.session.total_output_tokens, 100);
+    assert_eq!(ui.session.unpriced_judge_tokens, 0);
     assert_eq!(
         ui.session.goal_store.snapshot().unwrap().status,
         crate::extras::goal::GoalStatus::Active,

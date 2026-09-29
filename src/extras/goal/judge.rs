@@ -510,12 +510,82 @@ pub struct JudgeCall {
     /// call completed or the provider reported no usage; attempts the retry
     /// policy discarded before a final response report none.
     pub tokens: u64,
+    /// The same call's usage in full, normalised for the judge's provider, so
+    /// it can be priced at the judge model's own rates.
+    pub usage: crate::event::UsageDelta,
 }
 
 impl JudgeCall {
-    fn unmetered(outcome: JudgeOutcome) -> Self {
-        Self { outcome, tokens: 0 }
+    pub fn unmetered(outcome: JudgeOutcome) -> Self {
+        Self {
+            outcome,
+            tokens: 0,
+            usage: crate::event::UsageDelta::default(),
+        }
     }
+
+    /// What this call charges to the session, priced at `prices` (the judge
+    /// model's own, from [`judge_prices`]). `None` when it reported no usage.
+    pub fn charge(
+        &self,
+        resolved: &ResolvedJudge,
+        cfg: &crate::config::Config,
+        prices: Option<(f64, f64)>,
+    ) -> Option<JudgeCharge> {
+        self.usage.has_values().then(|| JudgeCharge {
+            usage: self.usage,
+            anthropic_native: cfg.is_anthropic_native(&resolved.provider),
+            prices,
+            model: compact_str::format_compact!("{}/{}", resolved.provider, resolved.model),
+        })
+    }
+}
+
+/// A judge call's usage as the session is charged for it (mini-agent-kfsup).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgeCharge {
+    pub usage: crate::event::UsageDelta,
+    /// Whether the judge's provider reports input exclusive of cache reads.
+    pub anthropic_native: bool,
+    /// Input and output price per million tokens of the judge model, or
+    /// `None` when no price is known: the tokens are recorded without cost.
+    pub prices: Option<(f64, f64)>,
+    /// `provider/model` of the judge, for saying which model went unpriced.
+    pub model: compact_str::CompactString,
+}
+
+/// The judge model's own input and output prices.
+///
+/// A judge on the session's model is priced like the session (whose prices
+/// may have been refreshed from the provider since startup); any other judge
+/// by its `quick_models` entry, then the model catalog. A model with no
+/// known, non-zero price yields `None` rather than being charged at someone
+/// else's rates.
+pub fn judge_prices(
+    resolved: &ResolvedJudge,
+    cfg: &crate::config::Config,
+    session_prices: (f64, f64),
+) -> Option<(f64, f64)> {
+    let known = |prices: (f64, f64)| (prices.0 > 0.0 || prices.1 > 0.0).then_some(prices);
+    if resolved.same_as_session
+        && let Some(prices) = known(session_prices)
+    {
+        return Some(prices);
+    }
+    let quick = crate::config::quick_models_map(cfg);
+    let matches = |entry: &crate::config::types::QuickModelConfig| {
+        entry.provider == resolved.provider && entry.model == resolved.model
+    };
+    quick
+        .get(resolved.label.as_str())
+        .filter(|entry| matches(entry))
+        .into_iter()
+        .chain(quick.values().filter(|entry| matches(entry)))
+        .find_map(|entry| known((entry.input_token_cost, entry.output_token_cost)))
+        .or_else(|| {
+            crate::config::Config::catalog_input_output_cost(&resolved.provider, &resolved.model)
+                .and_then(known)
+        })
 }
 
 /// Ask the judge.
@@ -583,18 +653,23 @@ pub async fn ask_with_transcript(
         )
         .await
     {
-        Ok((raw, usage)) => JudgeCall {
-            outcome: match parse_verdict(&raw) {
-                Ok((outcome, reason)) => JudgeOutcome::Verdict { outcome, reason },
-                Err(error) => {
-                    tracing::warn!(%error, "goal: judge verdict could not be parsed");
-                    JudgeOutcome::Unavailable {
-                        reason: format!("verdict could not be parsed: {error}"),
+        Ok((raw, usage)) => {
+            // Priced and counted in one shape whatever the judge's provider.
+            let usage = cfg.normalize_usage(&resolved.provider, usage.into());
+            JudgeCall {
+                outcome: match parse_verdict(&raw) {
+                    Ok((outcome, reason)) => JudgeOutcome::Verdict { outcome, reason },
+                    Err(error) => {
+                        tracing::warn!(%error, "goal: judge verdict could not be parsed");
+                        JudgeOutcome::Unavailable {
+                            reason: format!("verdict could not be parsed: {error}"),
+                        }
                     }
-                }
-            },
-            tokens: usage.input_tokens.saturating_add(usage.output_tokens),
-        },
+                },
+                tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+                usage,
+            }
+        }
         Err(error) => {
             tracing::warn!(%error, "goal: judge call failed");
             JudgeCall::unmetered(JudgeOutcome::Unavailable {
@@ -1019,6 +1094,99 @@ mod tests {
         assert!(
             transcript_for_round(&sessionless, &[]).is_empty(),
             "nothing to show is shown as nothing, not as an empty fence"
+        );
+    }
+
+    /// A judge is priced at its own model's rates: the session's for the
+    /// session model, its quick_models entry's, then the catalog's, and
+    /// nothing at all when none is known (mini-agent-kfsup).
+    #[test]
+    fn judge_prices_are_the_judge_models_own() {
+        let mut cfg = cfg_with(&[("cheap", "anthropic", "small"), ("free", "local", "tiny")]);
+        let quick = cfg.quick_models.as_mut().unwrap();
+        let cheap = quick.get_mut("cheap").unwrap();
+        cheap.input_token_cost = 0.25;
+        cheap.output_token_cost = 1.25;
+
+        let session = resolve(&JudgePolicy::Session, &cfg, "openai", "big").unwrap();
+        assert_eq!(judge_prices(&session, &cfg, (5.0, 15.0)), Some((5.0, 15.0)));
+        // An unpriced session model is not charged at a guess.
+        assert_eq!(judge_prices(&session, &cfg, (0.0, 0.0)), None);
+
+        let named = resolve(
+            &JudgePolicy::QuickModel("cheap".into()),
+            &cfg,
+            "openai",
+            "big",
+        )
+        .unwrap();
+        assert_eq!(
+            judge_prices(&named, &cfg, (5.0, 15.0)),
+            Some((0.25, 1.25)),
+            "the judge's own rates, not the session's"
+        );
+
+        let unpriced = resolve(
+            &JudgePolicy::QuickModel("free".into()),
+            &cfg,
+            "openai",
+            "big",
+        )
+        .unwrap();
+        assert_eq!(judge_prices(&unpriced, &cfg, (5.0, 15.0)), None);
+
+        let catalogued = crate::models_catalog::catalog_entries("anthropic")
+            .and_then(|entries| {
+                entries.iter().find_map(|entry| {
+                    entry
+                        .input_price
+                        .zip(entry.output_price)
+                        .filter(|(input, output)| *input > 0.0 || *output > 0.0)
+                        .map(|prices| (entry.id.clone(), prices))
+                })
+            })
+            .expect("the embedded catalog prices some anthropic model");
+        let from_catalog = ResolvedJudge {
+            label: "goal_judge".into(),
+            provider: "anthropic".into(),
+            model: catalogued.0.as_str().into(),
+            same_provider_as_session: false,
+            same_as_session: false,
+        };
+        assert_eq!(
+            judge_prices(&from_catalog, &cfg, (5.0, 15.0)),
+            Some(catalogued.1)
+        );
+    }
+
+    #[test]
+    fn a_judge_charge_carries_its_usage_prices_and_model() {
+        let cfg = cfg_with(&[]);
+        let session = resolve(&JudgePolicy::Session, &cfg, "anthropic", "big").unwrap();
+        let call = JudgeCall {
+            outcome: JudgeOutcome::Unavailable {
+                reason: "unparsed".into(),
+            },
+            tokens: 1_100,
+            usage: crate::event::UsageDelta {
+                input_tokens: 1_000,
+                output_tokens: 100,
+                total_tokens: 1_100,
+                ..crate::event::UsageDelta::default()
+            },
+        };
+        let charge = call.charge(&session, &cfg, Some((3.0, 15.0))).unwrap();
+        assert_eq!(charge.usage, call.usage);
+        assert!(charge.anthropic_native);
+        assert_eq!(charge.prices, Some((3.0, 15.0)));
+        assert_eq!(charge.model, "anthropic/big");
+        assert_eq!(
+            JudgeCall::unmetered(JudgeOutcome::Unavailable {
+                reason: "down".into()
+            })
+            .charge(&session, &cfg, Some((3.0, 15.0))),
+            None,
+            "a call that reported nothing charges nothing"
         );
     }
 }
