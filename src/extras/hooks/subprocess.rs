@@ -7,12 +7,20 @@ use tokio::process::Child;
 
 use crate::process_creation::TokioCommandCreationExt;
 use crate::sandbox::{
-    HOOK_SANDBOX_READY_MARKER, ProcessGroupGuard, Sandbox, SandboxPolicy, kill_process_group,
+    HOOK_SANDBOX_READY_MARKER, ProcessGroupGuard, Sandbox, SandboxPolicy,
+    hook_containment_supported, kill_process_group,
 };
 #[cfg(unix)]
 use crate::sandbox::{PROCESS_GROUP_DRAIN_BUDGET, await_drained_process_group};
 
 use super::settings::HookTrust;
+
+pub(crate) fn effective_hook_policy(policy: SandboxPolicy, supported: bool) -> SandboxPolicy {
+    match policy {
+        SandboxPolicy::RequiredAndAvailable if !supported => SandboxPolicy::RequiredButUnavailable,
+        policy => policy,
+    }
+}
 
 enum HookLaunchError {
     InvalidRoot(String),
@@ -31,6 +39,7 @@ pub(crate) struct HookDiagnostics {
 pub(crate) struct HookPolicy {
     trust: HookTrust,
     sandbox: Sandbox,
+    containment_supported: bool,
     env: std::collections::BTreeMap<String, String>,
 }
 
@@ -43,12 +52,21 @@ impl HookPolicy {
         Self {
             trust,
             sandbox: Sandbox::new(trust == HookTrust::Sandboxed, sandbox_backend),
+            containment_supported: hook_containment_supported(sandbox_backend),
             env,
         }
     }
 
+    /// The sandbox policy as it applies to hooks: an available backend that
+    /// cannot contain direct-exec hooks on this platform (Windows
+    /// AppContainer) is reported as requested-but-unavailable, matching the
+    /// launch-time denial.
+    fn hook_sandbox_policy(&self) -> SandboxPolicy {
+        effective_hook_policy(self.sandbox.policy(), self.containment_supported)
+    }
+
     pub(crate) fn diagnostics(&self) -> HookDiagnostics {
-        match (self.trust, self.sandbox.policy()) {
+        match (self.trust, self.hook_sandbox_policy()) {
             (HookTrust::Trusted, _) => HookDiagnostics {
                 containment: "trusted-bypass; sandbox-not-requested",
                 environment: "minimal-explicit",
@@ -81,7 +99,7 @@ impl HookPolicy {
 
     fn launch_denied_diagnostics(&self) -> HookDiagnostics {
         HookDiagnostics {
-            containment: match (self.trust, self.sandbox.policy()) {
+            containment: match (self.trust, self.hook_sandbox_policy()) {
                 (HookTrust::Sandboxed, SandboxPolicy::RequiredButUnavailable) => {
                     "requested-but-unavailable; launch-denied"
                 }
@@ -431,7 +449,7 @@ async fn run_hook_with_policy_and_limits(
     let mut cmd =
         match policy
             .sandbox
-            .wrap_direct_command(&program, &args, &project_dir, &explicit_env)
+            .wrap_hook_command(&program, &args, &project_dir, &explicit_env)
         {
             Ok(command) => command,
             Err(message) => {

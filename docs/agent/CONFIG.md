@@ -711,7 +711,9 @@ workspace and application cache as writable, a minimal runtime filesystem,
 and no IP network. On macOS, Seatbelt allows host-readable files, limits writes
 to the workspace, application cache, temporary directory, and `/dev/null`, and
 denies network. Other backends have only their reported backend-defined
-guarantees. `"trusted"` has ambient filesystem and network access by explicit
+guarantees. The Windows AppContainer backend has no direct-exec hook path, so
+on Windows `"sandboxed"` hooks report `requested-but-unavailable` and are
+denied at launch; use `"trusted"` to opt out explicitly. `"trusted"` has ambient filesystem and network access by explicit
 configuration consent, while retaining direct argv, canonical cwd, minimal
 environment, timeout/output bounds, cancellation, and tree cleanup. Audit logs
 name the event, executable, trust choice, containment request/availability,

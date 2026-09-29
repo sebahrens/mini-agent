@@ -1777,7 +1777,7 @@ impl Sandbox {
     /// The child always starts in `cwd` with a cleared environment containing
     /// only the standard non-credential allow-list plus `explicit_env`.
     #[cfg(feature = "hooks")]
-    pub(crate) fn wrap_direct_command(
+    pub(crate) fn wrap_hook_command(
         &self,
         program: &str,
         args: &[String],
@@ -1803,6 +1803,12 @@ impl Sandbox {
                 ));
             }
             SandboxPolicy::RequiredAndAvailable => {}
+        }
+        if !hook_containment_supported(&self.backend) {
+            return Err(format!(
+                "sandbox backend '{}' cannot contain direct-exec hooks on this platform — refusing to run hook unsandboxed (use trust = \"trusted\" to opt out explicitly)",
+                self.backend
+            ));
         }
 
         if self.backend == "zerobox" {
@@ -3015,6 +3021,15 @@ impl Sandbox {
 }
 
 #[cfg(feature = "hooks")]
+/// Whether `trust: sandboxed` hooks can be launched under `backend` on this
+/// platform. Hook containment needs a Unix wrapper plus a trusted `sh`
+/// readiness launcher; the Windows AppContainer backend has no direct-exec
+/// hook path, so sandboxed hooks there are reported unavailable and denied.
+#[cfg(feature = "hooks")]
+pub(crate) fn hook_containment_supported(backend: &str) -> bool {
+    cfg!(unix) && matches!(backend, "bwrap" | "seatbelt" | "zerobox")
+}
+
 fn hook_readiness_shell() -> Result<PathBuf, String> {
     find_trusted_system_executable("sh").ok_or_else(|| {
         "sandbox: no trusted system `sh` is available for the hook readiness launcher".to_string()
