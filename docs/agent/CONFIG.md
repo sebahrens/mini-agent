@@ -162,7 +162,12 @@ import then writes that digest into `<data-dir>/agent-skills/<name>/ACTIVE`, so
 the newly imported version is the one selected from that point on. Re-importing
 a tree that is already installed skips the copy but still repoints `ACTIVE`.
 Already-running TUI and ACP sessions notice both the new tree and the moved
-pointer through the per-turn catalog signature.
+pointer through the per-turn catalog signature. Before publishing a second
+digest for a package installed without `ACTIVE`, the import first pins the
+existing digest, so an import killed mid-way leaves the old version active.
+Each import also removes working trees older than one hour that killed imports
+left behind (`<cache-dir>/import-staging/agent-skill-*` and
+`<data-dir>/agent-skills/<name>/.import-*`). Superseded digests are kept.
 
 `SKILL.md` is capped at 48 KiB at import — one whole turn's instruction budget.
 A larger file is refused by the import command instead of installing, ranking
