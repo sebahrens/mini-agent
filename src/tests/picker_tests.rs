@@ -865,6 +865,115 @@ mod slash_picker_contract {
         }
     }
 
+    /// mini-agent-o6zkz: backing out of an argument picker returns to slash
+    /// completion for the command instead of leaving a dead `/command `.
+    #[test]
+    fn backspace_out_of_an_argument_picker_reopens_command_completion() {
+        let mut input = InputEditor::new();
+        input.set_theme_names(vec!["dark".to_string(), "light".to_string()]);
+        typed(&mut input, "/theme");
+        press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/theme ")) if p.active));
+        typed(&mut input, "d");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/theme ");
+
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/theme");
+        assert_eq!(input.cursor, input.buffer.len());
+        assert!(command_picker_open(&input));
+        assert_eq!(highlighted(&input).as_deref(), Some("/theme"));
+
+        // Further Backspaces edit the command query, down to the bare slash.
+        for _ in 0.."theme".len() {
+            press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        assert_eq!(input.buffer, "/");
+        assert!(command_picker_open(&input));
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "");
+        assert!(!command_picker_open(&input));
+    }
+
+    /// mini-agent-9rbwc: `/model` is the selector: its picker groups quick
+    /// aliases and provider models, marks the current model, and inserts
+    /// the choice as `/model <name>`.
+    #[test]
+    fn model_opens_the_grouped_model_picker_with_the_current_model() {
+        let mut input = InputEditor::new();
+        input.set_quick_model_names(vec!["fast".to_string(), "smart".to_string()]);
+        input.set_live_model_names(vec!["org/a".to_string(), "org/b".to_string()]);
+        input.set_current_model(Some("smart".to_string()));
+        typed(&mut input, "/model");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/model ");
+        let Some(Picker::Models(picker)) = input.picker.as_ref() else {
+            panic!("/model opens the model picker");
+        };
+        assert_eq!(picker.prefix, "/model ");
+        assert_eq!(picker.selected_name(), Some("smart"));
+        assert!(
+            picker
+                .display_rows()
+                .contains(&"smart  (current)".to_string())
+        );
+
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        typed(&mut input, "b");
+        assert_eq!(input.buffer, "/model b");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/model org/b");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("/model org/b")
+        );
+
+        // Typing the argument after a closed picker opens the same picker.
+        input.load_text("/model ");
+        typed(&mut input, "f");
+        assert!(matches!(
+            input.picker.as_ref(),
+            Some(Picker::Models(p)) if p.active && p.prefix == "/model " && p.query == "f"
+        ));
+    }
+
+    /// mini-agent-lqq0c: aliases are not suggested but still run in one Enter.
+    #[test]
+    fn hidden_aliases_are_not_suggested_but_run_when_typed_in_full() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/comp");
+        let Some(Picker::Command(picker)) = input.picker.as_ref() else {
+            panic!("command picker open");
+        };
+        assert_eq!(picker.matches, ["/compress"]);
+        for alias in ["/exit", "/compact", "/thinking", "/tutorial"] {
+            let mut input = InputEditor::new();
+            typed(&mut input, alias);
+            assert_eq!(
+                press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+                Some(alias)
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_after_an_inserted_command_reopens_completion() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/hel");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/help ");
+        assert!(!command_picker_open(&input));
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.buffer, "/help");
+        assert!(command_picker_open(&input));
+        assert_eq!(highlighted(&input).as_deref(), Some("/help"));
+        // Plain prose with a space never reopens it.
+        let mut input = InputEditor::new();
+        input.load_text("/help me x");
+        press(&mut input, KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(!command_picker_open(&input));
+    }
+
     #[test]
     fn backspace_with_a_query_keeps_the_slash_and_the_picker() {
         let mut input = InputEditor::new();
@@ -1071,6 +1180,15 @@ mod slash_picker_contract {
         assert_eq!(commands, sorted);
         #[cfg(feature = "goal")]
         assert!(commands.contains(&"/goal"));
+    }
+
+    #[test]
+    fn picker_entries_are_drawn_without_control_characters() {
+        use crate::ui::pickers::display_safe;
+        assert_eq!(display_safe("src/main.rs"), "src/main.rs");
+        assert_eq!(display_safe("evil\x1b[2Jname"), "evil\u{fffd}[2Jname");
+        assert_eq!(display_safe("two\nlines\r"), "two\u{fffd}lines\u{fffd}");
+        assert_eq!(display_safe("日本\u{9b}x"), "日本\u{fffd}x");
     }
 
     #[test]
@@ -1439,5 +1557,134 @@ mod picker_chords {
         assert_eq!(input.buffer, "@main and more");
         assert_eq!(input.cursor, input.buffer.len());
         assert!(!picker_open(&input));
+    }
+}
+
+/// Caret keys while a query picker is open (mini-agent-v45ts): the picker
+/// mirrors its query into the buffer, so moving or deleting at the caret
+/// behind its back must close it first, and nothing may panic inside a
+/// multi-byte character.
+mod caret_keys_close_query_pickers {
+    use super::*;
+    use compact_str::CompactString;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(input: &mut InputEditor, code: KeyCode) -> Option<CompactString> {
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if input.picker.as_ref().is_some_and(Picker::active) && input.handle_picker_key(key) {
+            return None;
+        }
+        input.handle_key(key)
+    }
+
+    fn typed(input: &mut InputEditor, text: &str) {
+        for c in text.chars() {
+            press(input, KeyCode::Char(c));
+        }
+    }
+
+    fn picker_open(input: &InputEditor) -> bool {
+        input.picker.as_ref().is_some_and(Picker::active)
+    }
+
+    #[test]
+    fn left_in_the_command_picker_then_typing_and_delete_stay_coherent() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/é");
+        assert!(picker_open(&input));
+        press(&mut input, KeyCode::Left);
+        assert!(!picker_open(&input), "Left closes the picker");
+        assert_eq!(input.cursor, 1);
+        typed(&mut input, "x");
+        assert_eq!(input.buffer, "/xé");
+        assert_eq!(input.cursor, 2);
+        // Used to panic: the caret sat inside 'é'.
+        press(&mut input, KeyCode::Delete);
+        assert_eq!(input.buffer, "/x");
+        assert_eq!(input.cursor, 2);
+    }
+
+    #[test]
+    fn caret_keys_close_every_query_picker_and_edit_as_plain_text() {
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Delete] {
+            let mut input = InputEditor::new();
+            input.set_prompt_names(vec!["café".to_string()]);
+            typed(&mut input, "/prompt");
+            press(&mut input, KeyCode::Enter);
+            typed(&mut input, "ca");
+            assert!(picker_open(&input));
+            press(&mut input, code);
+            assert!(!picker_open(&input), "{code:?}");
+            typed(&mut input, "é");
+            assert!(input.buffer.is_char_boundary(input.cursor));
+            let expected = match code {
+                KeyCode::Left => "/prompt céa",
+                _ => "/prompt caé",
+            };
+            assert_eq!(input.buffer, expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn caret_keys_close_the_file_picker() {
+        let mut input = InputEditor::new();
+        let mut picker = FilePicker::new();
+        picker.test_set_cache(vec![PathBuf::from("README.md")]);
+        picker.activate();
+        input.buffer = "see @".into();
+        input.cursor = input.buffer.len();
+        input.picker = Some(Picker::File(picker));
+        typed(&mut input, "rea");
+        press(&mut input, KeyCode::Left);
+        assert!(!picker_open(&input));
+        typed(&mut input, "d");
+        assert_eq!(input.buffer, "see @reda");
+    }
+
+    #[test]
+    fn a_click_that_moves_the_caret_closes_the_picker() {
+        let mut input = InputEditor::new();
+        typed(&mut input, "/mo");
+        input.set_cursor(3);
+        assert!(picker_open(&input), "a click at the caret changes nothing");
+        input.set_cursor(1);
+        assert!(!picker_open(&input));
+        typed(&mut input, "x");
+        assert_eq!(input.buffer, "/xmo");
+    }
+
+    /// mini-agent-mr5xb: completing an earlier `@` mention must edit that
+    /// mention, not the last `@` in the buffer.
+    #[test]
+    fn completing_an_earlier_mention_leaves_later_mentions_alone() {
+        for (query, key, expected, caret) in [
+            ("rea", KeyCode::Enter, "fix README.md and @b", 13),
+            ("rea", KeyCode::Tab, "fix README.md and @b", 13),
+            ("rea", KeyCode::Esc, "fix  and @b", 4),
+            ("", KeyCode::Backspace, "fix  and @b", 4),
+        ] {
+            let mut input = InputEditor::new();
+            input.load_text("fix  and @b");
+            input.set_cursor(4);
+            typed(&mut input, "@");
+            let Some(Picker::File(picker)) = input.picker.as_mut() else {
+                panic!("@ after a space opens the file picker");
+            };
+            picker.test_set_cache(vec![PathBuf::from("README.md")]);
+            typed(&mut input, query);
+            press(&mut input, key);
+            assert_eq!(input.buffer, expected, "{key:?}");
+            assert_eq!(input.cursor, caret, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_caret_inside_a_character_is_clamped_before_editing() {
+        let mut input = InputEditor::new();
+        input.buffer = "aé".into();
+        input.cursor = 2; // inside 'é'
+        press(&mut input, KeyCode::Delete);
+        assert_eq!(input.buffer, "a");
+        assert_eq!(input.cursor, 1);
     }
 }

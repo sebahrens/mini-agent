@@ -241,7 +241,7 @@ impl FilePicker {
             )?;
 
             let path = &self.matches[i];
-            let mut display = path.to_string_lossy().to_string();
+            let mut display = super::display_safe(&path.to_string_lossy()).into_owned();
             if Path::new(&path).is_dir() {
                 display.push('/');
             }

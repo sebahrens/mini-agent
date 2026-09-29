@@ -49,8 +49,11 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
 /// Every line `/help` prints, in order; `true` marks a section heading.
 pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(true, "commands:");
-    emit(false, "  /add [path]            add file(s) to context");
-    emit(false, "  /drop <path>           remove file from context");
+    emit(false, "  /add [path...]         add file(s) to context");
+    emit(
+        false,
+        "  /drop <path...>        remove file(s) from context",
+    );
     emit(
         false,
         "  /drop-all              remove all added files from context",
@@ -65,13 +68,19 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(false, "  /clear [/new]          clear the current session");
     emit(false, "  /provider [name]       show or switch provider");
-    emit(false, "  /model [name]          show or switch model");
+    emit(
+        false,
+        "  /model [alias|id]      show or switch model (quick alias, else raw id)",
+    );
     emit(
         false,
         "  /agent [name]          show or switch the main-agent persona",
     );
-    emit(false, "  /models                list quick models");
-    emit(false, "  /models <name>         switch to a quick model");
+    emit(
+        false,
+        "  /models [refresh]      list quick and provider models (or refresh)",
+    );
+    emit(false, "  /models <name>         same as /model <name>");
     emit(false, "  /models-add <n> <p> <m> save a quick model");
     emit(false, "  /sessions              list recent sessions");
     emit(
@@ -96,7 +105,7 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     }
     emit(
         false,
-        "  /reasoning             toggle LLM reasoning ability",
+        "  /reasoning [on|off]    set or toggle LLM reasoning",
     );
     emit(false, "  /thinking              alias for /reasoning");
     emit(
@@ -317,22 +326,29 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(false, "  Ctrl+R                 toggle reasoning");
     emit(false, "  Ctrl+G                 edit input in $EDITOR");
-    emit(false, "  Ctrl+H                 launch lazygit");
+    emit(false, "  Ctrl+O                 launch lazygit");
     emit(
         false,
         "  Ctrl+W/U/K             delete word/before/after cursor",
     );
     emit(false, "  Ctrl+A/E/B/F           move line edge/character");
     emit(false, "  Alt+B/F/D              move word/delete next word");
+    emit(
+        false,
+        "  Alt/Ctrl+Left/Right    move word; Alt+Backspace deletes word",
+    );
     emit(false, "  Ctrl+Y / Alt+Y         yank/rotate kill ring");
-    emit(false, "  Ctrl+C / Ctrl+D        interrupt/quit");
+    emit(
+        false,
+        "  Ctrl+C / Ctrl+D        interrupt; idle: clear draft/delete, quit when empty",
+    );
     emit(false, "  mouse scroll           scroll chat");
 }
 
 #[cfg(test)]
 mod tests {
     use super::help_lines;
-    use crate::ui::pickers::list::available_commands;
+    use crate::ui::pickers::list::{COMMAND_ALIASES, available_commands, is_command_alias};
 
     /// Command names `/help` mentions, skipping lines that describe a feature
     /// this build does not include.
@@ -368,11 +384,32 @@ mod tests {
         assert!(named.contains(&"/help".to_string()));
         let missing: Vec<&String> = named
             .iter()
-            .filter(|name| !offered.contains(&name.as_str()))
+            .filter(|name| !offered.contains(&name.as_str()) && !is_command_alias(name))
             .collect();
         assert!(
             missing.is_empty(),
             "slash picker is missing commands that /help lists: {missing:?}"
         );
+    }
+
+    /// mini-agent-lqq0c: aliases are hidden from completion, but each one
+    /// names an offered canonical command and `/help` still mentions it.
+    #[test]
+    fn aliases_are_hidden_from_completion_and_documented_in_help() {
+        let offered = available_commands();
+        let named = commands_named_in_help();
+        for (alias, canonical) in COMMAND_ALIASES {
+            assert!(!offered.contains(alias), "{alias} must not be offered");
+            if canonical.starts_with("/subagent") && !cfg!(feature = "subagents") {
+                continue;
+            }
+            assert!(offered.contains(canonical), "{canonical} must be offered");
+            if !alias.contains("subagent") {
+                assert!(
+                    named.iter().any(|n| n == alias),
+                    "/help must mention {alias}"
+                );
+            }
+        }
     }
 }

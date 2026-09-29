@@ -199,9 +199,13 @@ mod mouse_selection_tests {
     }
 }
 
-fn is_ctrl_h(key: KeyEvent) -> bool {
-    (matches!(key.code, KeyCode::Char('h' | 'H')) && key.modifiers.contains(KeyModifiers::CONTROL))
-        || key.code == KeyCode::Char('\u{8}')
+/// The lazygit shortcut, Ctrl+O. It used to be Ctrl+H, but many terminals
+/// send `^H` for Backspace and crossterm cannot tell the two apart, so Ctrl+H
+/// stays backspace in the editor and pickers.
+fn is_lazygit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('o' | 'O'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,23 +277,52 @@ mod home_end_tests {
 }
 
 #[cfg(test)]
-mod ctrl_h_tests {
+mod lazygit_key_tests {
     use super::*;
 
     #[test]
-    fn accepts_disambiguated_and_raw_control_h_without_arming_backspace() {
-        assert!(is_ctrl_h(KeyEvent::new(
-            KeyCode::Char('h'),
+    fn lazygit_is_ctrl_o_and_ctrl_h_stays_backspace() {
+        assert!(is_lazygit_key(KeyEvent::new(
+            KeyCode::Char('o'),
             KeyModifiers::CONTROL
         )));
-        assert!(is_ctrl_h(KeyEvent::new(
-            KeyCode::Char('\u{8}'),
-            KeyModifiers::NONE
-        )));
-        assert!(!is_ctrl_h(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::NONE
-        )));
+        for key in [
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        ] {
+            assert!(!is_lazygit_key(key), "{key:?}");
+        }
+        // Idle Ctrl+C clears a draft first; Ctrl+D forward-deletes in it.
+        assert_eq!(idle_interrupt(false, false), IdleInterrupt::ClearDraft);
+        assert_eq!(idle_interrupt(true, false), IdleInterrupt::EditorKey);
+        assert_eq!(idle_interrupt(false, true), IdleInterrupt::Exit);
+        assert_eq!(idle_interrupt(true, true), IdleInterrupt::Exit);
+        let mut input = InputEditor::new();
+        input.load_text("draft");
+        input.discard_draft();
+        assert_eq!(input.buffer, "");
+        input.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer, "draft", "Ctrl+Y recovers a cleared draft");
+        input.set_cursor(0);
+        input.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer, "raft", "Ctrl+D deletes forward");
+
+        // Nothing is warmed after /quit or /exit (mini-agent-bgg91).
+        assert!(is_quit_command("/quit"));
+        assert!(is_quit_command(" /exit now"));
+        assert!(!is_quit_command("/quiet"));
+        assert!(!is_quit_command("/model x"));
+
+        // Ctrl+H reaches the editor as backspace.
+        let mut input = InputEditor::new();
+        input.load_text("ab");
+        assert_eq!(
+            input.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(input.buffer, "a");
     }
 }
 
@@ -503,6 +536,31 @@ mod git_status_refresh_tests {
     }
 }
 
+/// What an idle Ctrl+C / Ctrl+D (nothing to interrupt) does to the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleInterrupt {
+    /// Ctrl+C with a draft: clear it (recoverable with Ctrl+Y); a second
+    /// press on the now empty input quits.
+    ClearDraft,
+    /// Ctrl+D with a draft: forward-delete in the editor, as in a shell.
+    EditorKey,
+    /// Empty input: quit.
+    Exit,
+}
+
+pub(crate) fn idle_interrupt(is_ctrl_d: bool, draft_empty: bool) -> IdleInterrupt {
+    match (draft_empty, is_ctrl_d) {
+        (true, _) => IdleInterrupt::Exit,
+        (false, true) => IdleInterrupt::EditorKey,
+        (false, false) => IdleInterrupt::ClearDraft,
+    }
+}
+
+/// `/quit` and `/exit` leave the app; nothing needs warming after them.
+fn is_quit_command(text: &str) -> bool {
+    matches!(text.split_whitespace().next(), Some("/quit" | "/exit"))
+}
+
 pub(crate) fn interrupt_target(
     btw_inflight: usize,
     validation_active: bool,
@@ -556,6 +614,8 @@ pub(crate) struct App<'a> {
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
+    /// Last model-cache generation handed to the model picker.
+    model_cache_generation: u64,
 }
 
 impl<'a> App<'a> {
@@ -673,11 +733,9 @@ impl<'a> App<'a> {
         {
             let provider = ui.session.provider.to_string();
             let is_custom = ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
-                &provider, is_custom, &ui.client, ui.cli, ui.cfg,
-            )
-            .await;
-            input.set_live_model_names(ids);
+            // Non-blocking: an unreachable gateway must not stall startup.
+            crate::ui::slash::warm_model_cache(&provider, is_custom, &ui.client, ui.cli, ui.cfg);
+            input.set_live_model_names(crate::ui::slash::cached_model_ids(&provider));
         }
 
         #[cfg(feature = "git-worktree")]
@@ -936,6 +994,7 @@ impl<'a> App<'a> {
             event_handle,
             prebuild,
             terminal_guard,
+            model_cache_generation: crate::ui::slash::model_cache_generation(),
         };
         app.request_git_status_refresh();
         Ok(app)
@@ -1129,7 +1188,23 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Hand the model picker the current provider's cached ids when a
+    /// background listing has landed since the last sync (or when `force`).
+    fn sync_live_model_names(&mut self, force: bool) {
+        let generation = crate::ui::slash::model_cache_generation();
+        self.input
+            .set_current_model(Some(self.ui.session.model.to_string()));
+        if force || generation != self.model_cache_generation {
+            self.model_cache_generation = generation;
+            self.input
+                .set_live_model_names(crate::ui::slash::cached_model_ids(
+                    &self.ui.session.provider,
+                ));
+        }
+    }
+
     fn refresh(&mut self) -> io::Result<()> {
+        self.sync_live_model_names(false);
         refresh_display(
             &mut self.renderer,
             &mut self.input,
@@ -1286,7 +1361,15 @@ impl<'a> App<'a> {
                         InterruptTarget::Validation | InterruptTarget::MainRun => {
                             self.abort_main_run().await?;
                         }
-                        InterruptTarget::Exit => return Ok(ControlFlow::Break(())),
+                        InterruptTarget::Exit => {
+                            match idle_interrupt(is_ctrl_d, self.input.buffer.is_empty()) {
+                                IdleInterrupt::Exit => return Ok(ControlFlow::Break(())),
+                                IdleInterrupt::ClearDraft => self.input.discard_draft(),
+                                IdleInterrupt::EditorKey => {
+                                    self.handle_key_event(key).await?;
+                                }
+                            }
+                        }
                     }
                     self.refresh()?;
                     return Ok(ControlFlow::Continue(()));
@@ -1434,7 +1517,7 @@ impl<'a> App<'a> {
             return Ok(());
         }
 
-        if is_ctrl_h(key) {
+        if is_lazygit_key(key) {
             self.run_lazygit().await?;
             return Ok(());
         }
@@ -2337,18 +2420,19 @@ impl<'a> App<'a> {
             return result;
         }
 
-        {
+        // The provider may have changed: warm its model list in the
+        // background (never blocking the command) and show what is cached.
+        if !is_quit_command(text) {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
+            crate::ui::slash::warm_model_cache(
                 &provider,
                 is_custom,
                 &self.ui.client,
                 self.ui.cli,
                 self.ui.cfg,
-            )
-            .await;
-            self.input.set_live_model_names(ids);
+            );
+            self.sync_live_model_names(true);
         }
 
         self.handle_slash_result(result).await?;
