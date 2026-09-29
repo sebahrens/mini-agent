@@ -328,7 +328,7 @@ impl Feed {
         self.prune_completed_prefix();
     }
 
-    /// Push a completed block that [`Feed::insert_after_anchor`] can later
+    /// Push a completed block that [`Feed::place_after_anchor`] can later
     /// place blocks after. An empty anchor is no anchor.
     pub fn push_anchored_block(
         &mut self,
@@ -346,35 +346,20 @@ impl Feed {
 
     /// Insert a completed block directly after the most recent block
     /// anchored at `anchor`, after any blocks already inserted there, so
-    /// results read in call order under their calls. Returns `false`, and
-    /// inserts nothing, when no such block is retained or when inserting
-    /// would shift a still-running block whose index a producer tracks;
-    /// the caller then appends instead.
-    pub fn insert_after_anchor(
+    /// results read in call order under their calls. When no such block is
+    /// retained, or inserting would shift a still-running block whose index
+    /// a producer tracks, the block is appended instead. Returns whether it
+    /// was placed under the anchor.
+    pub fn place_after_anchor(
         &mut self,
         anchor: &str,
         style: BlockStyle,
         text: impl Into<String>,
     ) -> bool {
-        if anchor.is_empty() {
-            return false;
-        }
-        let Some(anchor_index) = self
-            .blocks
-            .iter()
-            .rposition(|block| block.anchor.as_deref() == Some(anchor))
-        else {
+        let Some(position) = self.anchor_insert_position(anchor) else {
+            self.push_block(style, text);
             return false;
         };
-        let mut position = anchor_index + 1;
-        while self.blocks.get(position).is_some_and(|block| {
-            block.anchor.is_none() && block.attached_to.as_deref() == Some(anchor)
-        }) {
-            position += 1;
-        }
-        if self.blocks.iter().skip(position).any(|block| block.running) {
-            return false;
-        }
         let mut block = Block::new(style, text);
         block.attached_to = Some(CompactString::from(anchor));
         self.generation += 1;
@@ -382,6 +367,40 @@ impl Feed {
         self.blocks.insert(position, block);
         self.prune_completed_prefix();
         true
+    }
+
+    /// Like [`Feed::place_after_anchor`], but inserts nothing when the block
+    /// cannot go under the anchor.
+    #[cfg(test)]
+    pub fn insert_after_anchor(
+        &mut self,
+        anchor: &str,
+        style: BlockStyle,
+        text: impl Into<String>,
+    ) -> bool {
+        self.anchor_insert_position(anchor).is_some()
+            && self.place_after_anchor(anchor, style, text)
+    }
+
+    /// Where a block placed under `anchor` goes, or `None` when it cannot.
+    fn anchor_insert_position(&self, anchor: &str) -> Option<usize> {
+        if anchor.is_empty() {
+            return None;
+        }
+        let anchor_index = self
+            .blocks
+            .iter()
+            .rposition(|block| block.anchor.as_deref() == Some(anchor))?;
+        let mut position = anchor_index + 1;
+        while self.blocks.get(position).is_some_and(|block| {
+            block.anchor.is_none() && block.attached_to.as_deref() == Some(anchor)
+        }) {
+            position += 1;
+        }
+        if self.blocks.iter().skip(position).any(|block| block.running) {
+            return None;
+        }
+        Some(position)
     }
 
     /// Push an empty block that a producer will append to incrementally

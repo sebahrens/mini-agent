@@ -58,39 +58,7 @@ pub fn render_session(
         );
         feed.push_line(BlockStyle::Plain, "");
     }
-    for msg in &session.messages {
-        match msg.role {
-            MessageRole::User => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::User, format!("> {}", line));
-                }
-            }
-            MessageRole::Assistant => {
-                feed.push_block(BlockStyle::Agent, msg.content.to_string());
-            }
-            MessageRole::System => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::System, format!("# {}", line));
-                }
-            }
-            MessageRole::ToolCall => {
-                feed.push_line(
-                    BlockStyle::Tool,
-                    format!("◈ {}", replayed_tool_call(&msg.content)),
-                );
-            }
-            MessageRole::ToolResult => {
-                render_tool_result_to_feed(feed, &msg.content, cfg)?;
-            }
-            MessageRole::SubagentToolCall => {
-                feed.push_line(
-                    BlockStyle::Tool,
-                    format!("⌥ {}", replayed_tool_call(&msg.content)),
-                );
-            }
-        }
-        feed.push_line(BlockStyle::Plain, "");
-    }
+    push_session_messages(feed, &session.messages, cfg);
     if session.messages.is_empty() {
         let cwd = &context.workspace_root;
         let cwd_str = cwd.file_name().and_then(|n| n.to_str()).unwrap_or(".");
@@ -120,6 +88,57 @@ pub fn render_session(
     Ok(())
 }
 
+/// Replay stored messages into the feed. A tool result is placed directly
+/// under its own call (matched by tool-call id), as the live view does, so a
+/// response that issued several calls before any result replays as
+/// call/result pairs instead of all calls followed by all results. Results
+/// without a retained call are appended in stored order.
+pub(crate) fn push_session_messages(
+    feed: &mut crate::ui::feed::Feed,
+    messages: &[crate::session::SessionMessage],
+    cfg: &Config,
+) {
+    for msg in messages {
+        match msg.role {
+            MessageRole::User => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::User, format!("> {}", line));
+                }
+            }
+            MessageRole::Assistant => {
+                feed.push_block(BlockStyle::Agent, msg.content.to_string());
+            }
+            MessageRole::System => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::System, format!("# {}", line));
+                }
+            }
+            MessageRole::ToolCall => {
+                feed.push_anchored_block(
+                    msg.tool_call_id.as_deref().unwrap_or(""),
+                    BlockStyle::Tool,
+                    format!("◈ {}", replayed_tool_call(&msg.content)),
+                );
+            }
+            MessageRole::ToolResult => {
+                let text = tool_result_text(&msg.content, cfg);
+                let anchor = msg.tool_call_id.as_deref().unwrap_or("");
+                if feed.place_after_anchor(anchor, BlockStyle::ToolResult, text) {
+                    // Sits under its call, before the call's own spacer.
+                    continue;
+                }
+            }
+            MessageRole::SubagentToolCall => {
+                feed.push_line(
+                    BlockStyle::Tool,
+                    format!("⌥ {}", replayed_tool_call(&msg.content)),
+                );
+            }
+        }
+        feed.push_line(BlockStyle::Plain, "");
+    }
+}
+
 /// Announce a JavaScript runtime / learned-skill subsystem the worker
 /// containment preflight refused, so the startup banner carries the signal an
 /// operator would otherwise only get from `/toggle` or `--print-config`.
@@ -136,11 +155,9 @@ fn push_runtime_availability(
     }
 }
 
-fn render_tool_result_to_feed(
-    feed: &mut crate::ui::feed::Feed,
-    content: &str,
-    cfg: &Config,
-) -> anyhow::Result<()> {
+/// The transcript text for a stored tool result, shortened per
+/// `show_tool_details` like the live view.
+fn tool_result_text(content: &str, cfg: &Config) -> String {
     let output = content
         .split_once(":\n")
         .map(|(_, output)| output)
@@ -151,45 +168,30 @@ fn render_tool_result_to_feed(
         .map(|s| s.resolve())
         .unwrap_or(ResolvedShowToolDetails::Limited(3));
     match show_details {
-        ResolvedShowToolDetails::Off => {
-            feed.push_line(
-                BlockStyle::ToolResult,
-                "◈ result hidden by show_tool_details=false",
-            );
-        }
+        ResolvedShowToolDetails::Off => "◈ result hidden by show_tool_details=false".to_string(),
         ResolvedShowToolDetails::Limited(max_lines) => {
             let sanitized = sanitize_output(output);
             let char_count = sanitized.chars().count();
             let lines: Vec<&str> = sanitized.lines().collect();
             if lines.len() > max_lines {
                 let shown = lines[..max_lines].join("\n");
-                feed.push_line(
-                    BlockStyle::ToolResult,
-                    format!(
-                        "◈ result ({} chars, {} lines, showing {}):\n{}",
-                        char_count,
-                        lines.len(),
-                        max_lines,
-                        shown
-                    ),
-                );
+                format!(
+                    "◈ result ({} chars, {} lines, showing {}):\n{}",
+                    char_count,
+                    lines.len(),
+                    max_lines,
+                    shown
+                )
             } else {
-                feed.push_line(
-                    BlockStyle::ToolResult,
-                    format!("◈ result ({} chars):\n{}", char_count, sanitized),
-                );
+                format!("◈ result ({} chars):\n{}", char_count, sanitized)
             }
         }
         ResolvedShowToolDetails::Unlimited => {
             let sanitized = sanitize_output(output);
             let char_count = sanitized.chars().count();
-            feed.push_line(
-                BlockStyle::ToolResult,
-                format!("◈ result ({} chars):\n{}", char_count, sanitized),
-            );
+            format!("◈ result ({} chars):\n{}", char_count, sanitized)
         }
     }
-    Ok(())
 }
 
 pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
@@ -491,5 +493,63 @@ mod tests {
             line.contains(REASON),
             "the reason must reach the banner: {line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::push_session_messages;
+    use crate::config::Config;
+    use crate::session::Session;
+    use crate::ui::feed::Feed;
+
+    fn texts(feed: &Feed) -> Vec<String> {
+        (0..feed.block_count())
+            .map(|index| feed.block_text(index).unwrap().to_string())
+            .collect()
+    }
+
+    /// mini-agent-mfebw: a replayed session shows each result under its own
+    /// call, as the live feed does, not all calls followed by all results.
+    #[test]
+    fn replay_places_each_tool_result_under_its_call() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        let args = serde_json::json!({ "path": "x" });
+        session.add_tool_call_with_id("a", "read", &args);
+        session.add_tool_call_with_id("b", "grep", &args);
+        session.add_tool_result_with_id("b", "grep", "result-b");
+        session.add_tool_result_with_id("a", "read", "result-a");
+        let mut feed = Feed::new();
+        push_session_messages(&mut feed, &session.messages, &Config::default());
+
+        let rows = texts(&feed);
+        let find = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {rows:?}"))
+        };
+        let (call_a, call_b) = (find("◈ read"), find("◈ grep"));
+        let (result_a, result_b) = (find("result-a"), find("result-b"));
+        assert_eq!(result_a, call_a + 1, "{rows:?}");
+        assert_eq!(result_b, call_b + 1, "{rows:?}");
+        assert!(call_a < call_b);
+        // One spacer per call/result pair, none between a call and its result.
+        assert_eq!(rows[result_a + 1], "");
+        assert_eq!(rows.len(), 6, "{rows:?}");
+    }
+
+    /// Results without an id (legacy sessions) keep their stored order.
+    #[test]
+    fn replay_appends_results_without_a_matching_call() {
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_tool_call("read", &serde_json::json!({}));
+        session.add_tool_result("read", "legacy-result");
+        let mut feed = Feed::new();
+        push_session_messages(&mut feed, &session.messages, &Config::default());
+        let rows = texts(&feed);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[0].starts_with("◈ read"), "{rows:?}");
+        assert_eq!(rows[1], "");
+        assert!(rows[2].contains("legacy-result"), "{rows:?}");
     }
 }

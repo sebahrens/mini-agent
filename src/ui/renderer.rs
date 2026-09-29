@@ -1099,9 +1099,7 @@ impl Renderer {
     pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {
         self.commit_partial();
         let style = style_from_color(color);
-        if !self.feed.insert_after_anchor(anchor, style, text) {
-            self.feed.push_block(style, text);
-        }
+        self.feed.place_after_anchor(anchor, style, text);
         self.chat_dirty = true;
         if self.scroll_offset == 0 {
             self.render_viewport()?;
