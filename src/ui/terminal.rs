@@ -217,6 +217,88 @@ pub(crate) fn title_sequence(activity: AgentActivity) -> String {
     )
 }
 
+/// Opt-in escape sequences emitted when the agent activity changes (config
+/// `terminal_notify`, `terminal_prompt_marks`), besides the title.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActivitySignals {
+    pub notify: crate::config::TerminalNotify,
+    pub prompt_marks: bool,
+}
+
+impl ActivitySignals {
+    pub(crate) fn any(self) -> bool {
+        self.notify != crate::config::TerminalNotify::Off || self.prompt_marks
+    }
+}
+
+/// Make `text` safe as an OSC string payload: control characters (which
+/// could end the sequence and start another) and `;` (the field separator
+/// of OSC 777) are dropped. Payloads are fixed product text today; this
+/// keeps them safe if anything variable is ever added.
+fn osc_payload(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && *c != ';')
+        .collect()
+}
+
+/// Desktop notification announcing `body` in the configured style.
+fn notification_sequence(style: crate::config::TerminalNotify, body: &str) -> String {
+    use crate::config::TerminalNotify;
+    let title = osc_payload(crate::product::PUBLIC_NAME);
+    let body = osc_payload(body);
+    match style {
+        TerminalNotify::Off => String::new(),
+        TerminalNotify::Osc9 => format!("\x1b]9;{title}: {body}\x07"),
+        TerminalNotify::Osc777 => format!("\x1b]777;notify;{title};{body}\x07"),
+    }
+}
+
+const PROMPT_START: &str = "\x1b]133;A\x07";
+const INPUT_START: &str = "\x1b]133;B\x07";
+const COMMAND_START: &str = "\x1b]133;C\x07";
+const COMMAND_END: &str = "\x1b]133;D\x07";
+
+/// The opt-in sequences for a change of activity from `previous` to
+/// `next` (empty when nothing changed or nothing is enabled).
+///
+/// Notifications: a run that ends (to idle) announces "turn finished", and
+/// a permission prompt announces "waiting for approval"; the first frame
+/// announces nothing. Prompt marks (OSC 133): waiting for input (idle or a
+/// permission prompt) is a prompt (`A`, `B`), a run is a command (`C`), and
+/// a run ending closes it (`D`) before the next prompt. The text is fixed,
+/// never model or tool output.
+pub(crate) fn activity_sequences(
+    previous: Option<AgentActivity>,
+    next: AgentActivity,
+    signals: ActivitySignals,
+) -> String {
+    if previous == Some(next) {
+        return String::new();
+    }
+    let mut out = String::new();
+    if signals.prompt_marks {
+        match next {
+            AgentActivity::Working => out.push_str(COMMAND_START),
+            AgentActivity::Idle | AgentActivity::WaitingForApproval => {
+                if next == AgentActivity::Idle && previous.is_some() {
+                    out.push_str(COMMAND_END);
+                }
+                out.push_str(PROMPT_START);
+                out.push_str(INPUT_START);
+            }
+        }
+    }
+    let body = match (previous, next) {
+        (Some(_), AgentActivity::Idle) => Some("turn finished"),
+        (Some(_), AgentActivity::WaitingForApproval) => Some("waiting for approval"),
+        _ => None,
+    };
+    if let Some(body) = body {
+        out.push_str(&notification_sequence(signals.notify, body));
+    }
+    out
+}
+
 /// Best effort: discard bytes the terminal already queued on stdin. Failure
 /// (stdin redirected, not a tty) leaves nothing to discard.
 #[cfg(unix)]
@@ -844,6 +926,87 @@ mod tests {
         let mut buffer = [0u8; 64];
         let read = slave.read(&mut buffer).unwrap();
         assert_eq!(&buffer[..read], b"Z");
+    }
+
+    fn notify(style: crate::config::TerminalNotify) -> ActivitySignals {
+        ActivitySignals {
+            notify: style,
+            prompt_marks: false,
+        }
+    }
+
+    /// mini-agent-qfrps: a finished turn and a waiting prompt notify in the
+    /// configured style; the first frame and unchanged frames do not.
+    #[test]
+    fn notifications_follow_the_configured_style() {
+        use crate::config::TerminalNotify;
+        use AgentActivity::*;
+        let name = crate::product::PUBLIC_NAME;
+        assert_eq!(
+            activity_sequences(Some(Working), Idle, notify(TerminalNotify::Osc9)),
+            format!("\x1b]9;{name}: turn finished\x07")
+        );
+        assert_eq!(
+            activity_sequences(
+                Some(Working),
+                WaitingForApproval,
+                notify(TerminalNotify::Osc777)
+            ),
+            format!("\x1b]777;notify;{name};waiting for approval\x07")
+        );
+        assert_eq!(
+            activity_sequences(None, Idle, notify(TerminalNotify::Osc9)),
+            ""
+        );
+        assert_eq!(
+            activity_sequences(Some(Idle), Working, notify(TerminalNotify::Osc9)),
+            ""
+        );
+        assert_eq!(
+            activity_sequences(Some(Idle), Idle, notify(TerminalNotify::Osc9)),
+            ""
+        );
+        for (previous, next) in [(Some(Working), Idle), (Some(Idle), WaitingForApproval)] {
+            assert_eq!(
+                activity_sequences(previous, next, ActivitySignals::default()),
+                "",
+                "everything is off by default"
+            );
+        }
+        assert!(!ActivitySignals::default().any());
+    }
+
+    #[test]
+    fn prompt_marks_bracket_each_run() {
+        use AgentActivity::*;
+        let marks = ActivitySignals {
+            notify: crate::config::TerminalNotify::Off,
+            prompt_marks: true,
+        };
+        assert_eq!(
+            activity_sequences(None, Idle, marks),
+            "\x1b]133;A\x07\x1b]133;B\x07"
+        );
+        assert_eq!(
+            activity_sequences(Some(Idle), Working, marks),
+            "\x1b]133;C\x07"
+        );
+        assert_eq!(
+            activity_sequences(Some(Working), WaitingForApproval, marks),
+            "\x1b]133;A\x07\x1b]133;B\x07"
+        );
+        assert_eq!(
+            activity_sequences(Some(Working), Idle, marks),
+            "\x1b]133;D\x07\x1b]133;A\x07\x1b]133;B\x07"
+        );
+    }
+
+    #[test]
+    fn osc_payloads_cannot_break_out_of_their_sequence() {
+        assert_eq!(osc_payload("a\x07b\x1b]0;x\x1b\\c;d\ne"), "ab]0x\\cde");
+        let sequence = notification_sequence(crate::config::TerminalNotify::Osc777, "x\x07;y");
+        assert_eq!(sequence.matches('\x07').count(), 1);
+        assert_eq!(sequence.matches('\x1b').count(), 1);
     }
 
     #[test]

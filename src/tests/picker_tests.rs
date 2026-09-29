@@ -1015,6 +1015,71 @@ mod slash_picker_contract {
         assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/queue ")) if p.active));
     }
 
+    /// mini-agent-pfej7: a space after `/model` or `/models` opens the model
+    /// picker instead of going into the command query.
+    #[test]
+    fn space_after_a_full_command_opens_its_argument_picker() {
+        for (command, prefix) in [("/model", "/model "), ("/models", "/models ")] {
+            let mut input = InputEditor::new();
+            input.set_quick_model_names(vec!["fast".to_string()]);
+            input.set_live_model_names(vec!["org/a".to_string()]);
+            typed(&mut input, command);
+            assert!(command_picker_open(&input));
+            typed(&mut input, " ");
+            assert_eq!(input.buffer, prefix);
+            assert_eq!(input.cursor, prefix.len());
+            assert!(matches!(
+                input.picker.as_ref(),
+                Some(Picker::Models(p)) if p.active && p.prefix == prefix && p.query.is_empty()
+            ));
+            typed(&mut input, "org");
+            assert_eq!(input.buffer, format!("{prefix}org"));
+        }
+    }
+
+    /// A space after a command without an argument picker (or after a hidden
+    /// alias) closes completion and types the space, like Tab would.
+    #[test]
+    fn space_after_a_full_command_without_argument_picker_closes_completion() {
+        for command in ["/help", "/exit"] {
+            let mut input = InputEditor::new();
+            typed(&mut input, command);
+            typed(&mut input, " x");
+            assert_eq!(input.buffer, format!("{command} x"));
+            assert!(!input.picker.as_ref().is_some_and(Picker::active));
+        }
+        // A partial command keeps the space in the query, as before.
+        let mut input = InputEditor::new();
+        typed(&mut input, "/mod ");
+        assert!(command_picker_open(&input));
+        assert_eq!(input.buffer, "/mod ");
+    }
+
+    /// mini-agent-cuux6: argument pickers opened from the command picker
+    /// inherit monochrome mode.
+    #[test]
+    fn sub_pickers_inherit_monochrome_mode() {
+        let mut input = InputEditor::new();
+        input.set_monochrome(true);
+        input.set_theme_names(vec!["dark".to_string()]);
+        typed(&mut input, "/theme");
+        press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        let Some(Picker::Prefixed(picker, "/theme ")) = input.picker.as_ref() else {
+            panic!("/theme opens its argument picker");
+        };
+        assert!(picker.is_monochrome());
+
+        let mut input = InputEditor::new();
+        input.set_monochrome(true);
+        input.set_quick_model_names(vec!["fast".to_string()]);
+        typed(&mut input, "/model");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        let Some(Picker::Models(picker)) = input.picker.as_ref() else {
+            panic!("/model opens the model picker");
+        };
+        assert!(picker.is_monochrome());
+    }
+
     fn input_with_mode(mode: crate::permission::SecurityMode) -> InputEditor {
         use crate::permission::PermissionConfigs;
         use crate::permission::checker::PermissionChecker;

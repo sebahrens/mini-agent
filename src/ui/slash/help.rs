@@ -316,6 +316,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  mouse drag             select text (copies to clipboard on release)",
     );
+    emit(
+        false,
+        "  mouse double-click     select and copy the word under the pointer",
+    );
     emit(false, "  Esc (while selected)   clear selection (no copy)");
     #[cfg(windows)]
     emit(false, "  Ctrl+Shift+C           copy selected text");
@@ -389,6 +393,19 @@ mod tests {
         assert!(
             missing.is_empty(),
             "slash picker is missing commands that /help lists: {missing:?}"
+        );
+    }
+
+    /// mini-agent-5bvrb: the lazygit key stays discoverable from /help.
+    #[test]
+    fn help_names_the_lazygit_key() {
+        let mut lines = Vec::new();
+        help_lines(&mut |_, line| lines.push(line.to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Ctrl+O") && line.contains("lazygit")),
+            "{lines:?}"
         );
     }
 

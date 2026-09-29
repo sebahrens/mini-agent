@@ -863,6 +863,19 @@ mod dirty {
         assert!(!std::sync::Arc::ptr_eq(&second, &third));
         assert_eq!(renderer.statusline_builds(), 2);
     }
+
+    /// mini-agent-c3kvx: the permission prompt repaints with the statusline
+    /// the last frame built instead of blank rows.
+    #[test]
+    fn last_statusline_is_the_most_recently_built_one() {
+        let mut renderer = Renderer::new().unwrap();
+        let (key, empty) = renderer.last_statusline();
+        assert_eq!((key, empty.len()), (0, 0));
+        let built = renderer.cached_statusline(9, || vec![Vec::new(), Vec::new()]);
+        let (key, last) = renderer.last_statusline();
+        assert_eq!(key, 9);
+        assert!(std::sync::Arc::ptr_eq(&built, &last));
+    }
 }
 
 // --- scroll / input-row arithmetic must never underflow ---
@@ -940,7 +953,10 @@ fn history_above_the_view_is_always_signalled() {
 }
 
 mod permission_prompt_layout_tests {
-    use crate::ui::renderer::{prompt_block_rows, prompt_max_rows};
+    use crate::ui::renderer::{
+        PROMPT_COLLAPSE_HINT, PROMPT_EXPAND_HINT, expanded_prompt_max_rows, permission_prompt_rows,
+        prompt_block_rows, prompt_max_rows,
+    };
     use crate::ui::utils::display_width;
 
     const OPTIONS: &str = "  (y) allow once  (n) deny";
@@ -998,10 +1014,144 @@ mod permission_prompt_layout_tests {
         assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
     }
 
+    fn script_header(lines: usize) -> String {
+        let script = (1..=lines)
+            .map(|n| format!("echo line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("[permission] bash: sh -c '\n{script}\n'")
+    }
+
+    /// mini-agent-wb29a: a shortened request offers `(e)`, and expanding it
+    /// shows the whole script when the screen has room.
+    #[test]
+    fn a_shortened_request_offers_expansion_and_expands_in_full() {
+        let header = script_header(12);
+        let collapsed = permission_prompt_rows(&header, OPTIONS, 80, 20, false);
+        assert_eq!(collapsed.len(), prompt_max_rows(20), "{collapsed:?}");
+        assert!(
+            collapsed.last().unwrap().ends_with(PROMPT_EXPAND_HINT),
+            "{collapsed:?}"
+        );
+        assert!(collapsed.iter().any(|row| row.contains("more line(s)")));
+
+        let expanded = permission_prompt_rows(&header, OPTIONS, 80, 20, true);
+        assert!(expanded.len() <= expanded_prompt_max_rows(20));
+        assert!(
+            expanded.last().unwrap().ends_with(PROMPT_COLLAPSE_HINT),
+            "{expanded:?}"
+        );
+        assert!(!expanded.iter().any(|row| row.contains("more line(s)")));
+        assert_eq!(expanded[..expanded.len() - 1].join("\n"), header);
+    }
+
+    #[test]
+    fn an_elided_path_offers_expansion_and_wraps_in_full_when_expanded() {
+        let header = format!("[permission] edit: /{}/Input.tsx", "deep/".repeat(60));
+        let collapsed = permission_prompt_rows(&header, OPTIONS, 60, 10, false);
+        assert!(collapsed[..collapsed.len() - 1].concat().contains('…'));
+        assert!(collapsed.last().unwrap().ends_with(PROMPT_EXPAND_HINT));
+
+        let expanded = permission_prompt_rows(&header, OPTIONS, 60, 40, true);
+        assert_eq!(expanded[..expanded.len() - 1].concat(), header);
+    }
+
+    #[test]
+    fn a_request_that_fits_has_no_expansion_hint() {
+        let rows = permission_prompt_rows("[permission] read: /a.rs", OPTIONS, 80, 20, false);
+        assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
+        assert_eq!(expanded_prompt_max_rows(1), 2);
+        assert_eq!(expanded_prompt_max_rows(30), 29);
+    }
+
     #[test]
     fn the_prompt_never_takes_most_of_the_screen() {
         assert_eq!(prompt_max_rows(3), 2);
         assert_eq!(prompt_max_rows(20), 8);
         assert_eq!(prompt_max_rows(200), 12);
+    }
+}
+
+/// mini-agent-3h2wv: double-click selects the word under the pointer.
+mod word_selection_tests {
+    use crate::ui::renderer::{
+        ClickAt, DOUBLE_CLICK_WINDOW, SelectionPoint, is_double_click, selection_byte_range,
+        word_cols_at,
+    };
+    use std::time::{Duration, Instant};
+
+    fn word(text: &str, col: usize) -> Option<&str> {
+        let (start, end) = word_cols_at(text, col)?;
+        let (a, b) = selection_byte_range(
+            text,
+            0,
+            SelectionPoint::new(0, start),
+            SelectionPoint::new(0, end),
+        )?;
+        Some(&text[a..b])
+    }
+
+    #[test]
+    fn a_word_is_taken_whole_from_any_of_its_columns() {
+        let text = "see src/ui/app.rs:120 now.";
+        for col in 4..=20 {
+            assert_eq!(word(text, col), Some("src/ui/app.rs:120"), "col {col}");
+        }
+        assert_eq!(word(text, 0), Some("see"));
+        assert_eq!(word(text, 23), Some("now"), "sentence dot excluded");
+        assert_eq!(word(text, 3), None, "space is no word");
+        assert_eq!(word(text, 99), None, "past the end");
+        assert_eq!(word("snake_case-name", 2), Some("snake_case-name"));
+        assert_eq!(word("(value)", 3), Some("value"));
+    }
+
+    #[test]
+    fn wide_characters_map_by_display_column() {
+        let text = "中文 word";
+        assert_eq!(word(text, 0), Some("中文"));
+        assert_eq!(word(text, 3), Some("中文"));
+        assert_eq!(word(text, 4), None);
+        assert_eq!(word(text, 6), Some("word"));
+    }
+
+    #[test]
+    fn a_double_click_is_a_quick_second_press_in_place() {
+        let t0 = Instant::now();
+        let prev = Some(ClickAt {
+            at: t0,
+            row: 5,
+            col: 10,
+        });
+        assert!(is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            10
+        ));
+        assert!(is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            11
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            12
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            6,
+            10
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + DOUBLE_CLICK_WINDOW + Duration::from_millis(1),
+            5,
+            10
+        ));
+        assert!(!is_double_click(None, t0, 5, 10));
     }
 }

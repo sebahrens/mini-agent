@@ -46,6 +46,9 @@ pub struct LineEntry {
 pub struct PermissionPrompt {
     pub tool: CompactString,
     pub options: CompactString,
+    /// Whether `e` expanded the prompt to show as much of the request as
+    /// the screen allows instead of the compact summary.
+    pub expanded: bool,
 }
 
 pub struct ChainPrompt {
@@ -76,6 +79,7 @@ pub(crate) enum PromptSnapshot {
     Permission {
         tool: CompactString,
         options: CompactString,
+        expanded: bool,
     },
     Chain {
         question: CompactString,
@@ -209,6 +213,68 @@ pub(crate) fn selection_byte_range(
     Some((start, end.max(start)))
 }
 
+/// Longest gap between two presses that still counts as a double-click.
+pub(crate) const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Where and when the left button last went down in the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClickAt {
+    pub at: std::time::Instant,
+    pub row: u16,
+    pub col: u16,
+}
+
+/// Whether a press at `(row, col)` at `now` completes a double-click with
+/// the `previous` press: same row, at most one column apart (a hand
+/// wobble), within [`DOUBLE_CLICK_WINDOW`].
+pub(crate) fn is_double_click(
+    previous: Option<ClickAt>,
+    now: std::time::Instant,
+    row: u16,
+    col: u16,
+) -> bool {
+    previous.is_some_and(|prev| {
+        prev.row == row
+            && prev.col.abs_diff(col) <= 1
+            && now.saturating_duration_since(prev.at) <= DOUBLE_CLICK_WINDOW
+    })
+}
+
+/// Characters a double-click word extends over besides letters and digits,
+/// so a path, identifier or `file.rs:12` location is taken whole.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | ':')
+}
+
+/// The word under display column `col` of `text`, as inclusive display
+/// columns `(start, end)`. Trailing `.` and `:` (sentence punctuation) are
+/// not part of it. `None` when the column holds no word character.
+pub(crate) fn word_cols_at(text: &str, col: usize) -> Option<(usize, usize)> {
+    let mut cells: Vec<(usize, char)> = Vec::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        cells.push((width, ch));
+        width += char_display_width(ch);
+    }
+    let hit = cells.iter().rposition(|&(start, _)| start <= col)?;
+    let (hit_start, hit_char) = cells[hit];
+    if !is_word_char(hit_char) || col >= hit_start + char_display_width(hit_char).max(1) {
+        return None;
+    }
+    let mut first = hit;
+    while first > 0 && is_word_char(cells[first - 1].1) {
+        first -= 1;
+    }
+    let mut last = hit;
+    while last + 1 < cells.len() && is_word_char(cells[last + 1].1) {
+        last += 1;
+    }
+    while last > hit && matches!(cells[last].1, '.' | ':') {
+        last -= 1;
+    }
+    Some((cells[first].0, cells[last].0))
+}
+
 /// Marker painted at the top-right of the chat viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryIndicator {
@@ -252,6 +318,62 @@ pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) 
 /// disappears.
 pub(crate) fn prompt_max_rows(available_rows: usize) -> usize {
     (available_rows * 2 / 5).clamp(2, 12)
+}
+
+/// Most rows an expanded permission prompt may take: everything above the
+/// status line except one transcript row.
+pub(crate) fn expanded_prompt_max_rows(available_rows: usize) -> usize {
+    available_rows.saturating_sub(1).max(2)
+}
+
+/// Options hint of a permission prompt whose request was shortened.
+pub(crate) const PROMPT_EXPAND_HINT: &str = "(e) show full request";
+/// Options hint of an expanded permission prompt.
+pub(crate) const PROMPT_COLLAPSE_HINT: &str = "(e) collapse";
+
+/// Lay out a permission prompt in a bottom area of `available_rows` rows.
+/// Collapsed, it is the compact [`prompt_block_rows`] layout, and when that
+/// had to shorten the request the options gain an `(e)` hint to expand it.
+/// Expanded, the request gets every row but one of the area, so a long
+/// path wraps in full and a script shows as many lines as fit.
+pub(crate) fn permission_prompt_rows(
+    header: &str,
+    options: &str,
+    width: usize,
+    available_rows: usize,
+    expanded: bool,
+) -> Vec<String> {
+    if expanded {
+        let options = format!("{options}  {PROMPT_COLLAPSE_HINT}");
+        return prompt_block_rows(
+            header,
+            &options,
+            width,
+            expanded_prompt_max_rows(available_rows),
+        );
+    }
+    let max_rows = prompt_max_rows(available_rows);
+    let rows = prompt_block_rows(header, options, width, max_rows);
+    if !prompt_header_shortened(header, options, width, &rows) {
+        return rows;
+    }
+    let options = format!("{options}  {PROMPT_EXPAND_HINT}");
+    prompt_block_rows(header, &options, width, max_rows)
+}
+
+/// Whether the header rows of a [`prompt_block_rows`] layout differ from
+/// the full request wrapped to `width` (lines hidden or a path elided).
+fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[String]) -> bool {
+    use crate::ui::utils::wrap_to_width;
+    let width = width.max(1);
+    let header = crate::ui::events::sanitize_output(header);
+    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
+    let option_rows = wrap_to_width(&options, width).len().min(rows.len());
+    let full: Vec<String> = header
+        .split('\n')
+        .flat_map(|line| wrap_to_width(line, width))
+        .collect();
+    rows[..rows.len() - option_rows] != full[..]
 }
 
 /// Lay out a permission (or chain) prompt as terminal rows: the sanitized
@@ -350,6 +472,11 @@ pub struct Renderer {
     /// Set once the pointer moved while the button was held. A plain click
     /// (press + release without movement) never copies.
     pub selection_dragged: bool,
+    /// The selection is a double-clicked word: releasing the button copies
+    /// it as selected instead of moving its end to the pointer.
+    pub selection_word: bool,
+    /// The last transcript press, for double-click detection.
+    last_click: Option<ClickAt>,
     prev_input_height: usize,
     /// Number of statusline rows (1-3), fixed by the statusline config at startup.
     statusline_height: usize,
@@ -378,6 +505,11 @@ pub struct Renderer {
     title_status: bool,
     /// Activity last written to the title, so unchanged frames write nothing.
     title_activity: Option<crate::ui::terminal::AgentActivity>,
+    /// Opt-in notification and prompt-mark sequences (config
+    /// `terminal_notify`, `terminal_prompt_marks`).
+    activity_signals: crate::ui::terminal::ActivitySignals,
+    /// Activity of the last frame, for the transitions those signals report.
+    last_activity: Option<crate::ui::terminal::AgentActivity>,
 }
 
 /// A status-line message that disappears on its own.
@@ -414,6 +546,8 @@ impl Renderer {
             selection_start: None,
             selection_end: None,
             selection_dragged: false,
+            selection_word: false,
+            last_click: None,
             prev_input_height: 0,
             statusline_height: 1,
             chat_margin: 0,
@@ -431,6 +565,8 @@ impl Renderer {
             notice: None,
             title_status: false,
             title_activity: None,
+            activity_signals: crate::ui::terminal::ActivitySignals::default(),
+            last_activity: None,
         })
     }
 
@@ -461,6 +597,17 @@ impl Renderer {
         lines
     }
 
+    /// The statusline most recently built for a frame, with its cache key,
+    /// or an empty statusline before the first frame. Modal prompts that
+    /// repaint the bottom region outside the main frame use it so the
+    /// statusline stays visible while they wait.
+    pub(crate) fn last_statusline(&self) -> (u64, Arc<Vec<Vec<StatusSpan>>>) {
+        match &self.statusline_cache {
+            Some(cache) => (cache.key, Arc::clone(&cache.lines)),
+            None => (0, Arc::new(Vec::new())),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn statusline_builds(&self) -> usize {
         self.statusline_builds
@@ -471,19 +618,41 @@ impl Renderer {
         self.title_status = enabled;
     }
 
-    /// Announce `activity` in the terminal title when it changed. A no-op
-    /// unless title reporting is enabled.
+    /// Enable the opt-in notification and prompt-mark sequences.
+    pub(crate) fn set_activity_signals(&mut self, signals: crate::ui::terminal::ActivitySignals) {
+        self.activity_signals = signals;
+    }
+
+    /// Announce `activity` in the terminal title when it changed, and emit
+    /// the enabled notification and prompt-mark sequences for the change.
+    /// A no-op unless one of them is enabled.
     pub(crate) fn set_activity(
         &mut self,
         activity: crate::ui::terminal::AgentActivity,
     ) -> io::Result<()> {
-        if !self.title_status || self.title_activity == Some(activity) {
+        let mut out = if self.activity_signals.any() {
+            crate::ui::terminal::activity_sequences(
+                self.last_activity,
+                activity,
+                self.activity_signals,
+            )
+        } else {
+            String::new()
+        };
+        self.last_activity = Some(activity);
+        let title_changed = self.title_status && self.title_activity != Some(activity);
+        if title_changed {
+            out.push_str(&crate::ui::terminal::title_sequence(activity));
+        }
+        if out.is_empty() {
             return Ok(());
         }
         let mut stdout = io::stdout();
-        stdout.write_all(crate::ui::terminal::title_sequence(activity).as_bytes())?;
+        stdout.write_all(out.as_bytes())?;
         stdout.flush()?;
-        self.title_activity = Some(activity);
+        if title_changed {
+            self.title_activity = Some(activity);
+        }
         Ok(())
     }
 
@@ -706,23 +875,28 @@ impl Renderer {
     /// Rows of the active permission or chain prompt laid out for a
     /// `cols` x `rows` terminal, or `None` when the input editor is shown.
     fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<Vec<String>> {
-        let (header, options) = if let Some(pp) = &self.permission_prompt {
-            (pp.tool.as_str(), pp.options.as_str())
-        } else if let Some(cp) = &self.chain_prompt {
-            (cp.question.as_str(), self.chain_options())
-        } else {
-            return None;
-        };
         let available = rows.saturating_sub(self.statusline_reserve()) as usize;
         // One column short of the edge: a full-width row leaves the terminal
         // in its pending-wrap state, where clearing to end of line misbehaves.
         let width = (cols as usize).saturating_sub(1).max(1);
-        Some(prompt_block_rows(
-            header,
-            options,
-            width,
-            prompt_max_rows(available),
-        ))
+        if let Some(pp) = &self.permission_prompt {
+            Some(permission_prompt_rows(
+                &pp.tool,
+                &pp.options,
+                width,
+                available,
+                pp.expanded,
+            ))
+        } else {
+            self.chain_prompt.as_ref().map(|cp| {
+                prompt_block_rows(
+                    &cp.question,
+                    self.chain_options(),
+                    width,
+                    prompt_max_rows(available),
+                )
+            })
+        }
     }
 
     /// Recompute the input height and reconcile `prev_input_height` before the
@@ -771,6 +945,40 @@ impl Renderer {
         self.selection_start = None;
         self.selection_end = None;
         self.selection_dragged = false;
+        self.selection_word = false;
+    }
+
+    /// Record a transcript press at `(row, col)` and report whether it
+    /// completes a double-click. A double-click is consumed, so a third
+    /// press starts over.
+    pub(crate) fn register_click(&mut self, row: u16, col: u16) -> bool {
+        let now = std::time::Instant::now();
+        if is_double_click(self.last_click, now, row, col) {
+            self.last_click = None;
+            return true;
+        }
+        self.last_click = Some(ClickAt { at: now, row, col });
+        false
+    }
+
+    /// Select the word under display column `col` of laid-out chat line
+    /// `line`. Returns `false`, selecting nothing, when there is no word
+    /// there.
+    pub(crate) fn select_word_at(&mut self, line: usize, col: usize) -> bool {
+        let lines = self.chat_lines(self.max_line_width());
+        let Some((start, end)) = lines
+            .get(line)
+            .and_then(|entry| word_cols_at(&entry.text, col))
+        else {
+            return false;
+        };
+        self.selection_active = true;
+        self.selection_start = Some(SelectionPoint::new(line, start));
+        self.selection_end = Some(SelectionPoint::new(line, end));
+        self.selection_dragged = false;
+        self.selection_word = true;
+        self.chat_dirty = true;
+        true
     }
 
     pub fn link_url_at(&self, buf_idx: usize, col: u16) -> Option<String> {
@@ -1061,6 +1269,7 @@ impl Renderer {
             self.selection_start = None;
             self.selection_end = None;
             self.selection_dragged = false;
+            self.selection_word = false;
             self.chat_dirty = true;
         }
     }
@@ -1099,9 +1308,7 @@ impl Renderer {
     pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {
         self.commit_partial();
         let style = style_from_color(color);
-        if !self.feed.insert_after_anchor(anchor, style, text) {
-            self.feed.push_block(style, text);
-        }
+        self.feed.place_after_anchor(anchor, style, text);
         self.chat_dirty = true;
         if self.scroll_offset == 0 {
             self.render_viewport()?;
@@ -1337,6 +1544,7 @@ impl Renderer {
             PromptSnapshot::Permission {
                 tool: pp.tool.clone(),
                 options: pp.options.clone(),
+                expanded: pp.expanded,
             }
         } else if let Some(ref cp) = self.chain_prompt {
             PromptSnapshot::Chain {
