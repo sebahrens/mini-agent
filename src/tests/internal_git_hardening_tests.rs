@@ -179,6 +179,121 @@ async fn undo_stash_uses_hardened_runner() {
     assert_not_run(&markers);
 }
 
+/// Plant a model-written repository at `<outer>/<relative>` with a committed
+/// file and a clean filter (configured in the nested repository's own
+/// `.git/config`) selected for every file, and record it in the outer index
+/// as a gitlink. Returns the filter marker.
+fn plant_nested_repository(fixture: &Fixture, outer: &Path, relative: &str, name: &str) -> PathBuf {
+    let nested = outer.join(relative);
+    std::fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "--quiet", "-b", "main"]);
+    git(
+        &nested,
+        &["config", "user.email", "mini-agent@example.invalid"],
+    );
+    git(&nested, &["config", "user.name", "Mini Agent Test"]);
+    std::fs::write(nested.join("payload.txt"), "nested\n").unwrap();
+    std::fs::write(nested.join(".gitattributes"), "* filter=nested\n").unwrap();
+    git(&nested, &["add", "."]);
+    git(&nested, &["commit", "--quiet", "-m", "nested"]);
+    let (clean, marker) = fixture.marker_script(name);
+    git(
+        &nested,
+        &["config", "filter.nested.clean", clean.to_str().unwrap()],
+    );
+    git(&nested, &["config", "filter.nested.required", "true"]);
+    // Adding an untracked nested repository records a gitlink without
+    // descending into it.
+    git(outer, &["add", relative]);
+    git(outer, &["commit", "--quiet", "-m", "embed"]);
+    marker
+}
+
+/// Give the nested file a new mtime with unchanged content, so any Git that
+/// descends into the nested repository must re-hash it through the filter.
+fn touch_nested(fixture: &Fixture, relative: &str) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(fixture.repo.join(relative).join("payload.txt"))
+        .unwrap();
+    // A distinct, past timestamp per call (2020-01-01 plus a minute each).
+    static TOUCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let minutes = TOUCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800 + minutes * 60);
+    file.set_modified(at).unwrap();
+}
+
+/// A nested repository the model created inside the workspace cannot supply
+/// executable config that Git consults when a worktree mutation descends
+/// into it (mini-agent-jj4qw).
+#[cfg(feature = "git-worktree")]
+#[tokio::test]
+async fn worktree_auto_commit_neutralises_nested_repository_filters() {
+    let fixture = Fixture::new("nested-auto-commit");
+    let marker = plant_nested_repository(&fixture, &fixture.repo, "vendor/inner", "nested-clean");
+    // A second level: the nested repository embeds its own repository.
+    let inner = fixture.repo.join("vendor/inner");
+    let deep_marker = plant_nested_repository(&fixture, &inner, "deeper", "deep-clean");
+    std::fs::write(fixture.repo.join("tracked.txt"), "changed by the model\n").unwrap();
+    touch_nested(&fixture, "vendor/inner");
+    touch_nested(&fixture, "vendor/inner/deeper");
+    // The unhardened fixture commits may have run the filters already.
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&deep_marker);
+
+    crate::extras::git_worktree::worktree_auto_commit_all(&fixture.repo)
+        .await
+        .expect("auto-commit succeeds with the nested repository");
+    assert_not_run(&[marker.clone(), deep_marker.clone()]);
+
+    // The status query every merge flow starts with descends as well.
+    touch_nested(&fixture, "vendor/inner");
+    touch_nested(&fixture, "vendor/inner/deeper");
+    let dirty = crate::extras::git_worktree::worktree_has_uncommitted(&fixture.repo)
+        .await
+        .expect("status with the nested repository");
+    assert!(!dirty, "only timestamps changed");
+    assert_not_run(&[marker.clone(), deep_marker.clone()]);
+
+    // The fixture is live: an unhardened status descends and runs both.
+    touch_nested(&fixture, "vendor/inner");
+    touch_nested(&fixture, "vendor/inner/deeper");
+    let _ = StdCommand::new("git")
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["status", "--porcelain"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(marker.exists(), "fixture nested filter was not configured");
+    assert!(
+        deep_marker.exists(),
+        "fixture deep filter was not configured"
+    );
+}
+
+/// The undo stash is a workspace mutation too and probes nested repositories
+/// like the worktree flows; the stash itself must still work with one.
+#[tokio::test]
+async fn undo_stash_neutralises_nested_repository_filters() {
+    let fixture = Fixture::new("nested-undo-stash");
+    let marker = plant_nested_repository(&fixture, &fixture.repo, "inner", "nested-clean");
+    std::fs::write(fixture.repo.join("tracked.txt"), "changed by the model\n").unwrap();
+    touch_nested(&fixture, "inner");
+    let _ = std::fs::remove_file(&marker);
+
+    crate::ui::git_stash_in_workspace(&fixture.repo)
+        .await
+        .expect("hardened stash succeeds");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("tracked.txt")).unwrap(),
+        "initial\n",
+        "the change was stashed"
+    );
+    assert_not_run(std::slice::from_ref(&marker));
+}
+
 #[tokio::test]
 async fn internal_git_env_excludes_provider_credentials() {
     let fixture = Fixture::new("environment");

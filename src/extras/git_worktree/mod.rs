@@ -267,8 +267,17 @@ async fn lock_process_workspace() -> OwnedMutexGuard<()> {
         .await
 }
 
+/// The hardened runner for every Git command this module issues. Worktree
+/// flows run `status`, `add --all`, `commit`, `stash`, and `merge` in
+/// workspaces the model writes to, and those descend into nested
+/// repositories, so their executable configuration is probed as well
+/// (mini-agent-jj4qw).
+fn worktree_runner() -> GitRunner {
+    GitRunner::default().probing_nested_repositories()
+}
+
 async fn acquire_repository(repo_path: &Path) -> Result<OwnedMutexGuard<()>, String> {
-    GitRunner::default().acquire_mutation(repo_path).await
+    worktree_runner().acquire_mutation(repo_path).await
 }
 
 fn trim_line(bytes: &[u8]) -> &[u8] {
@@ -299,7 +308,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    GitRunner::default()
+    worktree_runner()
         .run(repo_path, operation, args, QUERY_LIMITS)
         .await
 }
@@ -313,7 +322,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    GitRunner::default()
+    worktree_runner()
         .run(repo_path, operation, args, LOCAL_MUTATION_LIMITS)
         .await
 }
@@ -327,13 +336,13 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    GitRunner::default()
+    worktree_runner()
         .run_network(repo_path, operation, args, NETWORK_LIMITS)
         .await
 }
 
 async fn current_branch_at(repo_path: &Path) -> Result<Option<String>, String> {
-    let output = GitRunner::default()
+    let output = worktree_runner()
         .run_allow_exit(
             repo_path,
             "current-branch",
@@ -633,7 +642,7 @@ async fn create_transaction(
     .into_bytes();
     match await_create_step(
         response_tx,
-        GitRunner::default().run_with_input(
+        worktree_runner().run_with_input(
             &state.repo_path,
             "create-branch-ref",
             ["update-ref", "--stdin"],
@@ -658,7 +667,7 @@ async fn create_transaction(
     }
     await_create_step(
         response_tx,
-        GitRunner::default().run(
+        worktree_runner().run(
             &state.repo_path,
             "worktree-add",
             [
@@ -724,7 +733,7 @@ async fn delete_owned_ref(
     expected_oid: &str,
     operation: &'static str,
 ) -> Result<CommandOutput, String> {
-    GitRunner::default()
+    worktree_runner()
         .run(
             repo_path,
             operation,
@@ -896,7 +905,7 @@ async fn delete_create_refs(
         "start\noption no-deref\ndelete {branch_ref} {expected_oid}\ndelete {ownership_ref} {expected_oid}\nprepare\ncommit\n"
     )
     .into_bytes();
-    GitRunner::default()
+    worktree_runner()
         .run_with_input(
             repo_path,
             "rollback-created-refs",
@@ -1218,7 +1227,7 @@ async fn try_merge_transaction(
     state.branch_switch_attempted = true;
     match await_merge_step(
         response_tx,
-        GitRunner::default().run(
+        worktree_runner().run(
             &main_repo_path,
             "checkout",
             ["switch", "--", target],
@@ -1717,7 +1726,7 @@ async fn compare_and_set_direct_ref(
     expected_old_oid: &str,
     operation: &'static str,
 ) -> Result<(), String> {
-    GitRunner::default()
+    worktree_runner()
         .run(
             repo_path,
             operation,
@@ -1772,7 +1781,7 @@ async fn create_and_publish_stash(
         gate.resume.notified().await;
     }
 
-    GitRunner::default()
+    worktree_runner()
         .run(
             repo_path,
             "publish-created-stash",
@@ -1858,7 +1867,7 @@ async fn verify_applied_stash_exact(repo_path: &Path, stash_oid: &str) -> Result
         );
     }
     let expected_worktree = revision_oid(repo_path, &format!("{stash_oid}^{{tree}}")).await?;
-    let worktree = GitRunner::default()
+    let worktree = worktree_runner()
         .run_allow_exit(
             repo_path,
             "verify-restored-stash-worktree",
@@ -2249,7 +2258,7 @@ async fn verify_target_and_delete_source(
         "start\noption no-deref\nverify {target_ref} {expected_target_oid}\ndelete {source_ref} {expected_source_oid}\nprepare\ncommit\n"
     )
     .into_bytes();
-    GitRunner::default()
+    worktree_runner()
         .run_with_input(
             repo_path,
             "verify-target-and-delete-source",
@@ -2442,7 +2451,7 @@ pub(crate) async fn run_git_with_limits_for_test(
     limits: CommandLimits,
 ) -> Result<CommandOutput, String> {
     let repo_path = canonical_path(repo_path, "test repository")?;
-    GitRunner::default()
+    worktree_runner()
         .run(&repo_path, "test", args, limits)
         .await
 }
@@ -2455,7 +2464,7 @@ pub(crate) async fn run_locked_git_with_limits_for_test(
 ) -> Result<CommandOutput, String> {
     let repo_path = canonical_path(repo_path, "test repository")?;
     let _guard = acquire_repository(&repo_path).await?;
-    GitRunner::default()
+    worktree_runner()
         .run(&repo_path, "locked-test", args, limits)
         .await
 }

@@ -171,7 +171,9 @@ request explicit. On non-Windows hosts, if the sandbox was enabled only by the d
 backend is absent, startup continues unsandboxed in a degraded state (`SandboxResolution::DegradedUnavailable`)
 that is never silent and never keeps exec-capable auto-allows:
 
-- a notice naming the backend and the remedies (install the backend, `--sandbox` to fail closed,
+- a notice naming the backend, the closed preflight cause when one was recorded
+  (`Sandbox::unavailable_diagnostic`, e.g. bubblewrap missing or Ubuntu's AppArmor `userns`
+  restriction), and the remedies (install the backend, `--sandbox` to fail closed,
   `--no-sandbox` to opt out deliberately) is written directly to stderr once per process, bypassing
   `tracing` filters, so headless print, loop and ACP runs report it even with `RUST_LOG=off`;
 - the TUI restates the notice in the chat before the first turn and shows a persistent red

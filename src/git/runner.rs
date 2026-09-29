@@ -89,6 +89,10 @@ fn repository_mutation_lock(repository_key: &Path) -> Arc<Mutex<()>> {
 pub(crate) struct GitRunner {
     program: Arc<PathBuf>,
     identity: Arc<crate::fs::CheckedMetadata>,
+    /// Whether internal commands also neutralise the executable
+    /// configuration of repositories nested in the work tree (see
+    /// [`GitRunner::probing_nested_repositories`]).
+    nested_repositories: bool,
 }
 
 impl Default for GitRunner {
@@ -128,6 +132,7 @@ impl GitRunner {
         Ok(Self {
             program: Arc::new(program),
             identity: Arc::new(identity),
+            nested_repositories: false,
         })
     }
 
@@ -138,7 +143,20 @@ impl GitRunner {
         Ok(Self {
             program: Arc::new(PathBuf::new()),
             identity: Arc::new(identity),
+            nested_repositories: false,
         })
+    }
+
+    /// Also probe every repository nested in the work tree (populated
+    /// gitlinks, recursively) before each internal command and override its
+    /// repository-scoped filter/diff/merge commands. Workspace mutations
+    /// (the worktree stash/commit/merge flows and the undo stash) opt in:
+    /// they descend into nested repositories that the model may have
+    /// created. Callers that pass `--ignore-submodules` never descend and
+    /// skip the extra `ls-files` per command.
+    pub(crate) fn probing_nested_repositories(mut self) -> Self {
+        self.nested_repositories = true;
+        self
     }
 
     #[cfg(feature = "git-worktree")]
@@ -221,6 +239,12 @@ impl GitRunner {
                 self.repository_config_overrides(repo_path, operation, profile)
                     .await?,
             );
+            if self.nested_repositories {
+                let nested = self
+                    .nested_repository_overrides(repo_path, operation, &config)
+                    .await?;
+                config.extend(nested);
+            }
         }
         Ok(self.build_internal_command(repo_path, args, profile, &config))
     }
@@ -262,6 +286,17 @@ impl GitRunner {
         operation: &str,
         profile: InternalProfile,
     ) -> Result<Vec<(String, String)>, String> {
+        let entries = self.executable_config_entries(repo_path, operation).await?;
+        untrusted_config_overrides(&entries, profile)
+    }
+
+    /// Every command-executing key the configuration visible from
+    /// `repo_path` sets, with its scope.
+    async fn executable_config_entries(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+    ) -> Result<Vec<ScopedConfigEntry>, String> {
         let command = self.build_internal_command(
             repo_path,
             [
@@ -282,11 +317,133 @@ impl GitRunner {
             return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
         }
         match output.exit_status.and_then(|status| status.code()) {
-            Some(0) => untrusted_config_overrides(&parse_scoped_config(&output.stdout), profile),
+            Some(0) => Ok(parse_scoped_config(&output.stdout)),
             // `git config --get-regexp` exits 1 when no key matches.
             Some(1) => Ok(Vec::new()),
             _ => Err(command_failure(operation, &output)),
         }
+    }
+
+    /// Overrides for repositories nested in the work tree.
+    ///
+    /// When an outer operation (`status`, `add`, `commit`, `diff-files`, ...)
+    /// meets a gitlink whose directory holds a repository, Git spawns itself
+    /// inside that repository to check whether it is dirty. The child
+    /// inherits the command-scope overrides (`GIT_CONFIG_COUNT`), so hooks,
+    /// fsmonitor, and every key [`hardened_config`] fixes stay neutralised,
+    /// but the nested repository's own `.git/config` can name *different*
+    /// filter and driver keys that the outer probe never saw. The model can
+    /// create such a repository (and have it recorded as a gitlink by an
+    /// auto-commit), so every populated gitlink reachable from the index is
+    /// probed, recursively, and its repository-scoped filter/diff/merge
+    /// commands are overridden too. Too many or too deeply nested
+    /// repositories refuse the operation instead.
+    async fn nested_repository_overrides(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+        existing: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut overrides: Vec<(String, String)> = Vec::new();
+        let mut visited: Vec<PathBuf> = Vec::new();
+        let mut pending = self
+            .populated_gitlinks(repo_path, operation)
+            .await?
+            .into_iter()
+            .map(|path| (path, 1usize))
+            .collect::<Vec<_>>();
+        while let Some((nested, depth)) = pending.pop() {
+            let refuse = |reason: &str| {
+                format!(
+                    "refusing git {operation}: nested repository {} {reason}; \
+                     remove it from the index (`git rm --cached`) or commit it separately",
+                    nested.display()
+                )
+            };
+            let canonical = nested
+                .canonicalize()
+                .map_err(|_| refuse("cannot be resolved"))?;
+            if visited.contains(&canonical) {
+                continue;
+            }
+            if depth > MAX_NESTED_REPOSITORY_DEPTH {
+                return Err(refuse(&format!(
+                    "is nested more than {MAX_NESTED_REPOSITORY_DEPTH} levels deep"
+                )));
+            }
+            if visited.len() >= MAX_NESTED_REPOSITORIES {
+                return Err(refuse(&format!(
+                    "exceeds the limit of {MAX_NESTED_REPOSITORIES} nested repositories"
+                )));
+            }
+            visited.push(canonical);
+            let entries = self
+                .executable_config_entries(&nested, operation)
+                .await
+                .map_err(|error| refuse(&format!("has unreadable configuration ({error})")))?;
+            // Transport and credential keys are never consulted by a dirty
+            // check inside a nested repository; resetting them here could
+            // only disturb the outer operation's own (e.g. network) values.
+            let nested_overrides = untrusted_config_overrides(&entries, InternalProfile::Local)?;
+            for (key, value) in nested_overrides {
+                if nested_override_applies(&key)
+                    && !existing
+                        .iter()
+                        .chain(overrides.iter())
+                        .any(|(present, _)| *present == key)
+                {
+                    overrides.push((key, value));
+                }
+            }
+            pending.extend(
+                self.populated_gitlinks(&nested, operation)
+                    .await
+                    .map_err(|error| refuse(&format!("cannot be listed ({error})")))?
+                    .into_iter()
+                    .map(|path| (path, depth + 1)),
+            );
+        }
+        Ok(overrides)
+    }
+
+    /// Work-tree paths of gitlinks in `repo_path`'s index (every stage) whose
+    /// directory holds a `.git`, i.e. repositories Git would descend into.
+    /// `ls-files` reads only the index; it runs under the fixed hardened
+    /// configuration so reading the index cannot start a fsmonitor.
+    async fn populated_gitlinks(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut command = self.build_internal_command(
+            repo_path,
+            ["ls-files", "--stage", "-z", "--", ":(top)"],
+            InternalProfile::Local,
+            &hardened_config(InternalProfile::Local, false),
+        );
+        // `:(top)` lists the whole index even when `repo_path` is a
+        // subdirectory; paths stay relative to `repo_path`.
+        command.env("GIT_LITERAL_PATHSPECS", "0");
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, GITLINK_PROBE_LIMITS)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))?;
+        if output.status != CommandStatus::Completed {
+            return command_result(operation, GITLINK_PROBE_LIMITS, output).map(|_| Vec::new());
+        }
+        if !output.exit_status.is_some_and(|status| status.success()) {
+            // No index Git could read (not a repository, a bare one, or a
+            // corrupt index): the operation itself cannot descend either.
+            return Ok(Vec::new());
+        }
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for relative in parse_gitlinks(&output.stdout) {
+            let path = repo_path.join(relative);
+            if path.join(".git").symlink_metadata().is_ok() && !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
     }
 
     #[cfg(any(test, feature = "git-worktree"))]
@@ -936,6 +1093,54 @@ const EXECUTABLE_CONFIG_PATTERN: &str = "^(core\\.(sshcommand|askpass|gitproxy|a
 |merge\\..*\\.driver\
 |gpg\\.(.*\\.)?program)$";
 
+/// Bounds for the nested-repository probe: nested repositories beyond these
+/// refuse the operation rather than run unprobed.
+const MAX_NESTED_REPOSITORIES: usize = 64;
+const MAX_NESTED_REPOSITORY_DEPTH: usize = 8;
+
+/// `ls-files --stage` prints one record per index entry, so the output limit
+/// is sized for large repositories rather than for a status query.
+const GITLINK_PROBE_LIMITS: CommandLimits = CommandLimits {
+    timeout: Duration::from_secs(30),
+    stdout_bytes: 64 * 1024 * 1024,
+    stderr_bytes: 64 * 1024,
+    combined_bytes: 64 * 1024 * 1024 + 64 * 1024,
+};
+
+/// Paths of gitlink (mode `160000`) entries in `git ls-files --stage -z`
+/// output: `<mode> SP <oid> SP <stage> TAB <path> NUL` per entry.
+fn parse_gitlinks(bytes: &[u8]) -> Vec<PathBuf> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            let (meta, path) = (&record[..tab], &record[tab + 1..]);
+            if !meta.starts_with(b"160000 ") || path.is_empty() {
+                return None;
+            }
+            Some(output_path_bytes(path))
+        })
+        .collect()
+}
+
+fn output_path_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Nested repositories contribute only the keys a dirty check inside them
+/// can execute: content filters and diff/merge drivers.
+fn nested_override_applies(key: &str) -> bool {
+    key.starts_with("filter.") || key.starts_with("diff.") || key.starts_with("merge.")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ScopedConfigEntry {
     scope: String,
@@ -1481,6 +1686,44 @@ mod tests {
                 untrusted_config_overrides(&user_first, InternalProfile::Network),
                 Ok(Vec::new())
             );
+        }
+    }
+
+    #[test]
+    fn gitlinks_are_parsed_from_every_stage_and_nothing_else() {
+        let listing = b"100644 e79c5e8f964493290a409888d5413a737e8e5dd5 0\ttracked.txt\0\
+160000 1cf00f1ef18823225a1d454284e344b2e4e92d17 0\t../vendor/inner\0\
+120000 1cf00f1ef18823225a1d454284e344b2e4e92d17 0\tlink\0\
+160000 1cf00f1ef18823225a1d454284e344b2e4e92d17 2\tname with\ttab\0\
+160000 malformed-without-tab\0";
+        assert_eq!(
+            parse_gitlinks(listing),
+            vec![
+                PathBuf::from("../vendor/inner"),
+                PathBuf::from("name with\ttab")
+            ]
+        );
+        assert!(parse_gitlinks(b"").is_empty());
+    }
+
+    #[test]
+    fn nested_repositories_contribute_only_filters_and_drivers() {
+        for key in [
+            "filter.x.clean",
+            "filter.x.required",
+            "diff.d.textconv",
+            "merge.m.driver",
+        ] {
+            assert!(nested_override_applies(key), "{key}");
+        }
+        for key in [
+            "credential.helper",
+            "core.sshcommand",
+            "core.askpass",
+            "remote.origin.uploadpack",
+            "gpg.program",
+        ] {
+            assert!(!nested_override_applies(key), "{key}");
         }
     }
 
