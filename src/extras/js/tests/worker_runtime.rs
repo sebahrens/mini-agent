@@ -442,6 +442,81 @@ async fn worker_runtime_allows_exactly_the_effect_limit() {
     supervisor.shutdown_for_test().await.unwrap();
 }
 
+/// Returns results whose `EffectResponse` frames exceed `MAX_FRAME_BYTES` once JSON-escaped.
+#[derive(Clone, Default)]
+struct OversizedEffects;
+
+impl InvocationEffectHandler for OversizedEffects {
+    fn handle_effect(
+        &mut self,
+        request: EffectRequest,
+        _cancellation: PermCancellation,
+    ) -> EffectFuture<'_> {
+        // 2 MiB of NUL escapes to 12 MiB on the wire.
+        let oversized = "\0".repeat(2 * 1024 * 1024);
+        Box::pin(async move {
+            match request.operation {
+                EffectOperation::Spawn { .. } => EffectResult::Spawn {
+                    stdout: oversized,
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                EffectOperation::ReadFile { path } if path == "small" => EffectResult::ReadFile {
+                    content: "small".into(),
+                },
+                _ => EffectResult::ReadFile { content: oversized },
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn worker_supervisor_oversized_read_only_effect_result_is_bounded_too_large() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let result = supervisor
+        .execute(
+            RunStep::new(
+                "let outcome; try { read_file('big'); outcome = 'delivered'; } catch (_) { outcome = 'rejected'; } outcome + ':' + read_file('small')".into(),
+            )
+            .with_model_grant(grant_id),
+            OversizedEffects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect("an unframeable read-only result must not become a protocol fault");
+
+    assert_eq!(result.outcome, StepOutcome::Value("rejected:small".into()));
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_supervisor_oversized_mutating_effect_result_is_outcome_unknown() {
+    let supervisor =
+        JsWorkerSupervisor::with_launcher_for_test(TestWorkerLauncher::internal_worker_process());
+    let grant_id = GrantId::new(uuid::Uuid::from_u128(1)).unwrap();
+    let error = supervisor
+        .execute(
+            RunStep::new("spawn('sh', ['-c', 'true']); 'done'".into())
+                .with_model_grant(grant_id)
+                .with_spawn_available(true),
+            OversizedEffects,
+            PermCancellation::new(),
+        )
+        .await
+        .expect_err("an executed spawn whose result cannot be framed has an unknown outcome");
+
+    assert!(
+        matches!(error, WorkerError::EffectOutcomeUnknown),
+        "expected EffectOutcomeUnknown, got {error:?}"
+    );
+    supervisor.shutdown_for_test().await.unwrap();
+}
+
 #[tokio::test]
 async fn worker_runtime_read_files_uses_one_ordered_effect_request() {
     let supervisor =

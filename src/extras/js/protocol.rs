@@ -1002,6 +1002,38 @@ impl Write for BoundedPayload {
     }
 }
 
+/// Byte counter that stops serialization as soon as a frame would exceed [`MAX_FRAME_BYTES`].
+struct FrameSizeProbe {
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl Write for FrameSizeProbe {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > MAX_FRAME_BYTES.saturating_sub(self.bytes) {
+            self.exceeded = true;
+            return Err(io::Error::other("wire frame limit exceeded"));
+        }
+        self.bytes += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether [`write_frame`] would reject `frame` with [`FrameError::FrameTooLarge`]. The payload is
+/// counted, not buffered, so callers can check a response before committing to send it.
+pub(crate) fn frame_exceeds_limit<M: Serialize>(frame: &M) -> bool {
+    let mut probe = FrameSizeProbe {
+        bytes: 0,
+        exceeded: false,
+    };
+    let _ = serde_json::to_writer(&mut probe, frame);
+    probe.exceeded
+}
+
 pub(crate) fn write_frame<W: Write, M: Serialize>(
     writer: &mut W,
     frame: &M,

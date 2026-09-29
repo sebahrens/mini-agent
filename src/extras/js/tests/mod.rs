@@ -483,6 +483,42 @@ async fn test_spawn_captures_output_and_exit_code() {
     );
 }
 
+/// Regression for mini-agent-wp7t6: raw-capped control-byte output expands six-fold when
+/// JSON-escaped. An executed command must come back as a truncated result, never as a worker
+/// protocol fault that invites the model to replay a possibly mutating command.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_spawn_escape_heavy_output_is_truncated_not_a_protocol_fault() {
+    let audit_dirs = TestTempDir::new("js-test-audits");
+    use rig::tool::Tool;
+    let tool = make_test_tool(&audit_dirs);
+
+    let result = tool
+        .call(crate::extras::js::tool::JsArgs {
+            code: r#"const r = spawn("sh", ["-c", "head -c 1048576 /dev/zero; head -c 600000 /dev/zero >&2"]);
+JSON.stringify({
+  stdout_ok: r.stdout.length > 0 && r.stdout.length < 1048576 && /^\0+$/.test(r.stdout),
+  stderr_ok: r.stderr.length > 0 && /^\0*$/.test(r.stderr),
+  stdout_truncated: r.stdout_truncated,
+  stderr_truncated: r.stderr_truncated,
+  code: r.code,
+})"#
+            .to_string(),
+        })
+        .await
+        .expect("spawn call failed");
+
+    assert!(
+        !result.contains("protocol"),
+        "escape-heavy spawn output became a protocol fault: {result}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&result)
+        .unwrap_or_else(|error| panic!("unexpected tool output {result:?}: {error}"));
+    assert_eq!(value["stdout_ok"], true, "{result}");
+    assert_eq!(value["stderr_ok"], true, "{result}");
+    assert_eq!(value["stdout_truncated"], true, "{result}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_spawn_uses_configured_sandbox_wrapper() {

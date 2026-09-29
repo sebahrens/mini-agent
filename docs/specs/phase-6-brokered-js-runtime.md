@@ -328,7 +328,11 @@ only decode JavaScript values, call those services, and encode their closed resu
 File services preserve stable path identity across authorization and I/O; fetch preserves exact
 origin and public-address checks plus an outer deadline; spawn passes structured argv to the
 general command sandbox. Capped spawn streams drop an incomplete trailing UTF-8 scalar before
-lossy decoding, so a byte-cap split does not manufacture replacement characters. Spawn permission
+lossy decoding, so a byte-cap split does not manufacture replacement characters. Each decoded
+stream is then cut at a character boundary so its JSON string encoding stays within 3 MiB and the
+matching `*_truncated` flag is set: the raw 1 MiB/1 MiB/1.5 MiB caps alone do not bound the frame,
+because control bytes escape to six-byte `\u00XX` sequences. Two streams at that bound plus the
+response envelope always fit the 8 MiB frame limit. Spawn permission
 identity is versioned canonical JSON containing the
 program and argument array, so argument boundaries are never collapsed into a shell-like string.
 The broker `SkillProposalDraft` carries the complete bounded identity-v2 proposal shape: source,
@@ -1088,6 +1092,15 @@ can reuse that generation. All report paths use this gate. Admission treats fail
 infrastructure outages, preserving the candidate identity for a later retry. The real-process verification contract matrix covers
 missing, extra, duplicate, reordered, and unrelated cases, version skew, contradictory verdicts,
 and recovery on a fresh generation.
+
+An effect result is sized against the wire frame limit before its `EffectResponse` is sent. Effect
+services bound their own results (file and discovery encoded budgets, spawn's escape-aware stream
+cut above), so this is a backstop: an already-executed, already-audited effect whose response
+would exceed 8 MiB is never reported as a worker protocol fault, which would read as a pre-effect
+failure and invite replay. A possibly mutating effect (`write_file`, `fetch`, `spawn`,
+`propose_skill`) is instead answered with `outcome_unknown` and follows the rules below; a
+read-only effect is answered with the catchable closed `too_large` code and the invocation
+continues. The durable audit completion already written for the effect is unchanged.
 
 An unavailable audit prevents broker construction and therefore sends no request to a worker. An
 effect whose durable completion is `outcome_unknown` immediately erases invocation authority,

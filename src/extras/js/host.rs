@@ -2764,6 +2764,13 @@ pub(crate) fn register_proposal_global(
 pub(crate) const SPAWN_STDOUT_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const SPAWN_STDERR_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_COMBINED_MAX_BYTES: usize = 1536 * 1024;
+/// Per-stream bound on the JSON-encoded size of a decoded spawn stream. Raw caps alone do not
+/// bound the wire frame: serde_json escapes control bytes as six-byte `\u00XX` sequences, so
+/// 1.5 MiB of NUL output would encode to ~9 MiB and exceed the 8 MiB worker frame limit after the
+/// command already executed. Two streams at this bound plus the response envelope stay well
+/// below [`crate::extras::js::protocol::MAX_FRAME_BYTES`]; ordinary text (at most 2x escaping at
+/// the raw caps) is never cut by it.
+const SPAWN_STREAM_ENCODED_MAX_BYTES: usize = 3 * 1024 * 1024;
 
 /// Parent-side structured process service. Permission identity and execution
 /// consume the same program/argument vector; no shell-like joining occurs.
@@ -3294,9 +3301,11 @@ impl SpawnEffectService {
             CommandStatus::OutputLimitExceeded(CommandOutputLimit::Stderr)
                 | CommandStatus::OutputLimitExceeded(CommandOutputLimit::Combined)
         );
+        let (stdout, stdout_truncated) = bound_spawn_stream(&output.stdout, stdout_truncated);
+        let (stderr, stderr_truncated) = bound_spawn_stream(&output.stderr, stderr_truncated);
         Ok(SpawnResult {
-            stdout: decode_spawn_stream(&output.stdout, stdout_truncated),
-            stderr: decode_spawn_stream(&output.stderr, stderr_truncated),
+            stdout,
+            stderr,
             code: output
                 .exit_status
                 .and_then(|status| status.code())
@@ -3318,6 +3327,33 @@ fn decode_spawn_stream(bytes: &[u8], truncated: bool) -> String {
         bytes
     };
     String::from_utf8_lossy(visible).into_owned()
+}
+
+/// Decode one captured stream and cut it at a character boundary so its JSON string encoding
+/// never exceeds [`SPAWN_STREAM_ENCODED_MAX_BYTES`]. The returned flag is the byte-cap truncation
+/// flag, additionally set when the escape-aware bound removed content.
+fn bound_spawn_stream(bytes: &[u8], truncated: bool) -> (String, bool) {
+    let mut text = decode_spawn_stream(bytes, truncated);
+    // Two bytes for the enclosing quotes of the JSON string.
+    let mut encoded = 2_usize;
+    for (index, ch) in text.char_indices() {
+        let next = encoded.saturating_add(json_escaped_char_len(ch));
+        if next > SPAWN_STREAM_ENCODED_MAX_BYTES {
+            text.truncate(index);
+            return (text, true);
+        }
+        encoded = next;
+    }
+    (text, truncated)
+}
+
+/// Exact byte length serde_json emits for `ch` inside a JSON string.
+const fn json_escaped_char_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+        '\u{00}'..='\u{1f}' => 6,
+        _ => ch.len_utf8(),
+    }
 }
 
 fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
@@ -4690,6 +4726,84 @@ mod tests {
     use crate::permission::ask::{AskSender, UserDecision};
     use crate::permission::checker::{PermCheck, PermissionChecker};
     use crate::permission::{Action, PermissionConfig, PermissionConfigs, SecurityMode, ToolPerm};
+
+    #[test]
+    fn json_escaped_char_len_matches_serde_json_encoding() {
+        let samples = (0_u32..0x80)
+            .filter_map(char::from_u32)
+            .chain(['\u{7f}', 'é', '\u{2028}', '\u{fffd}', '😀']);
+        for ch in samples {
+            let encoded = serde_json::to_string(&ch.to_string()).unwrap();
+            assert_eq!(
+                json_escaped_char_len(ch) + 2,
+                encoded.len(),
+                "escape length mismatch for U+{:04X}",
+                ch as u32
+            );
+        }
+    }
+
+    #[test]
+    fn bound_spawn_stream_cuts_escape_heavy_output_at_its_encoded_budget() {
+        let nul = vec![0_u8; SPAWN_STDOUT_MAX_BYTES];
+        let (text, truncated) = bound_spawn_stream(&nul, false);
+        assert!(truncated);
+        let encoded = serde_json::to_string(&text).unwrap().len();
+        assert!(encoded <= SPAWN_STREAM_ENCODED_MAX_BYTES, "{encoded}");
+        assert!(encoded > SPAWN_STREAM_ENCODED_MAX_BYTES - 6, "{encoded}");
+
+        // Ordinary text at the raw cap, even quote-heavy, is never cut by the encoded bound.
+        let quotes = vec![b'"'; SPAWN_STDOUT_MAX_BYTES];
+        let (text, truncated) = bound_spawn_stream(&quotes, false);
+        assert!(!truncated);
+        assert_eq!(text.len(), SPAWN_STDOUT_MAX_BYTES);
+        let (_, truncated) = bound_spawn_stream(b"plain", true);
+        assert!(truncated, "byte-cap truncation flag is preserved");
+    }
+
+    #[test]
+    fn worst_case_spawn_response_encodes_below_the_worker_frame_limit() {
+        use crate::extras::js::protocol::{
+            BuildIdentity, EffectResponse, MAX_FRAME_BYTES, ParentFrame, WireFrame, write_frame,
+        };
+
+        // All-NUL (6x escaping) and all-invalid-UTF-8 (3-byte U+FFFD each) streams at both
+        // per-stream raw caps; the combined cap is ignored here to over-approximate.
+        for byte in [0_u8, 0x01, 0xff] {
+            let (stdout, stdout_truncated) =
+                bound_spawn_stream(&vec![byte; SPAWN_STDOUT_MAX_BYTES], true);
+            let (stderr, stderr_truncated) =
+                bound_spawn_stream(&vec![byte; SPAWN_STDERR_MAX_BYTES], true);
+            let frame = WireFrame::invocation(
+                BuildIdentity::current(),
+                crate::extras::js::protocol::InvocationId::new(format!(
+                    "invocation-{}",
+                    "x".repeat(100)
+                ))
+                .unwrap(),
+                u64::MAX - 1,
+                ParentFrame::EffectResponse(EffectResponse {
+                    effect_ordinal: u32::MAX,
+                    result: EffectResult::Spawn {
+                        stdout,
+                        stderr,
+                        exit_code: i32::MIN,
+                        timed_out: true,
+                        stdout_truncated,
+                        stderr_truncated,
+                    },
+                }),
+            );
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, &frame)
+                .unwrap_or_else(|error| panic!("byte {byte:#04x}: {error:?}"));
+            assert!(
+                encoded.len() < MAX_FRAME_BYTES,
+                "byte {byte:#04x}: {}",
+                encoded.len()
+            );
+        }
+    }
 
     #[test]
     fn truncated_spawn_stream_drops_only_an_incomplete_trailing_utf8_scalar() {
@@ -6293,6 +6407,114 @@ mod tests {
             .unwrap();
         assert_eq!(output.status, CommandStatus::Completed);
         assert_eq!(output.stdout, b"elf-snapshot");
+    }
+
+    /// mini-agent-wp7t6: control-byte output at the raw caps escapes six-fold on the wire. The
+    /// executed command must come back as a truncated Spawn result whose response frame fits,
+    /// never as an unframeable result that the supervisor would report as a protocol fault.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend"]
+    async fn linux_spawn_escape_heavy_output_is_truncated_within_the_frame_limit() {
+        use crate::extras::js::protocol::{
+            BuildIdentity, EffectResponse, MAX_FRAME_BYTES, ParentFrame, WireFrame, write_frame,
+        };
+
+        let directory = TempDir::new();
+        let permission =
+            host_permission(directory.path().to_path_buf(), Action::Allow, Action::Allow);
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel(1);
+        let approvals = tokio::spawn(async move {
+            while let Some(prompt) = ask_rx.recv().await {
+                let _ = prompt.reply.send(UserDecision::AllowOnce);
+            }
+        });
+        let owner = PermissionBridgeOwner::new(Some(permission), Some(ask_tx), STEP_TIMEOUT);
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(directory.path()),
+                Duration::from_secs(1),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(true, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(30),
+            ),
+        );
+        let invocation = InvocationId::new("spawn-escape-heavy-output").unwrap();
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: "spawn-escape-heavy-output".into(),
+            },
+            BTreeSet::from([HostCapability::Spawn]),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let request = EffectRequest {
+            effect_ordinal: 0,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation: EffectOperation::Spawn {
+                program: "sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    "head -c 1048576 /dev/zero; head -c 600000 /dev/zero >&2".into(),
+                ],
+            },
+        };
+        let audit_root = directory.path().join("audit-spawn-escape-heavy-output");
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let mut broker = InvocationBroker::new(
+            invocation.clone(),
+            vec![grant],
+            BTreeSet::from([HostCapability::Spawn]),
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        let result = broker
+            .dispatch(request, PermCancellation::new())
+            .await
+            .expect("escape-heavy spawn should complete");
+        drop(broker);
+        drop(owner);
+        approvals.abort();
+
+        let EffectResult::Spawn {
+            stdout,
+            stdout_truncated,
+            ..
+        } = &result
+        else {
+            panic!("expected a Spawn result, got {result:?}");
+        };
+        assert!(*stdout_truncated);
+        assert!(!stdout.is_empty() && stdout.bytes().all(|byte| byte == 0));
+        let frame = WireFrame::invocation(
+            BuildIdentity::current(),
+            invocation,
+            1,
+            ParentFrame::EffectResponse(EffectResponse {
+                effect_ordinal: 0,
+                result,
+            }),
+        );
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &frame).expect("spawn response must fit one worker frame");
+        assert!(encoded.len() < MAX_FRAME_BYTES);
     }
 
     #[cfg(target_os = "linux")]
