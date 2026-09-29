@@ -262,7 +262,10 @@ esac
 STUB_CURL
 chmod +x "${STUB_BIN}/uname" "${STUB_BIN}/curl"
 
-if PATH="${STUB_BIN}:$PATH" \
+# Keep a developer's real GITHUB_TOKEN and gh login away from the installer.
+if env -u GITHUB_TOKEN -u GH_TOKEN \
+    MINI_AGENT_INSTALL_NO_GH=1 \
+    PATH="${STUB_BIN}:$PATH" \
     INSTALLER_REQUEST_LOG="$REQUEST_LOG" \
     INSTALLER_MANIFEST="${FIXTURE}/SHA256SUMS" \
     INSTALLER_ARCHIVE="${FIXTURE}/${ARCHIVE}" \

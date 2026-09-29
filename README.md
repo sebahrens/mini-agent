@@ -267,6 +267,13 @@ Install the latest checksum-verified release on Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
+If the anonymous download fails or returns a sign-in page (for example, a private fork), the
+installer retries with credentials: first with `GITHUB_TOKEN` through the GitHub REST API (sent
+as a header, never on the command line), then with `gh release download` when the GitHub CLI is
+installed and `gh auth status` succeeds. Assets fetched either way pass the same `SHA256SUMS`
+verification. Set `MINI_AGENT_INSTALL_NO_TOKEN=1` or `MINI_AGENT_INSTALL_NO_GH=1` to disable a
+fallback.
+
 On x86-64 Windows, the same release publishes
 `mini-agent-windows-x64.msi` plus `MSI_SHA256SUMS`. After verifying the
 checksum, open the MSI for a per-user, no-admin install; it also attempts to

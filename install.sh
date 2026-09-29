@@ -25,6 +25,10 @@ Options:
   --release <version>
                  Install an exact release (for example, 1.7.2). Defaults to latest.
   --help         Show this message
+
+Private releases: if the anonymous download fails, the installer retries with
+GITHUB_TOKEN (GitHub REST API) and then with an authenticated 'gh' CLI. Set
+MINI_AGENT_INSTALL_NO_TOKEN=1 or MINI_AGENT_INSTALL_NO_GH=1 to disable either.
 EOF
     exit "$status"
 }
@@ -119,24 +123,25 @@ echo "  -> ${BASE_URL}/${ARCHIVE_FILE}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-curl -fsSL --max-time 300 -o "${TMPDIR}/${ARCHIVE_FILE}" "${BASE_URL}/${ARCHIVE_FILE}"
-curl -fsSL --max-time 60   -o "${TMPDIR}/SHA256SUMS"     "${BASE_URL}/SHA256SUMS"
+ARCHIVE_PATH="${TMPDIR}/${ARCHIVE_FILE}"
+MANIFEST="${TMPDIR}/SHA256SUMS"
 
-# ---- reject non-release responses before checksum parsing ----
+# Authenticated fallbacks for private or access-restricted releases. They run
+# only after the anonymous download fails or returns a non-release page, and
+# whatever they fetch goes through the same checksum verification below.
 #
-# A sign-in or error page served with HTTP 200 (for example when the release
-# is private or the request needs authentication) passes curl -f. Detect it
-# here so the failure names the real cause instead of a missing checksum.
-download_error() {
-    local what="$1"
-    echo "Error: the downloaded ${what} is not a release asset (received $2)." >&2
-    echo "  URL: ${BASE_URL}" >&2
-    echo "  The release may not exist for this platform, or the repository may be" >&2
-    echo "  private and require authentication. For a private repository, download" >&2
-    echo "  the assets with an authenticated client, for example:" >&2
-    echo "    gh release download --repo ${REPO} --pattern '${ARCHIVE_FILE}' --pattern SHA256SUMS" >&2
-    exit 1
-}
+#   GITHUB_TOKEN                   sent as an Authorization header to the GitHub
+#                                  REST API (from a 0600 file, never in argv)
+#   gh                             `gh release download`, used only when gh is
+#                                  installed and `gh auth status` succeeds
+#   MINI_AGENT_INSTALL_NO_TOKEN=1  ignore GITHUB_TOKEN
+#   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh
+API_BASE="https://api.github.com"
+if [[ -n "$RELEASE_VERSION" ]]; then
+    API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/tags/v${RELEASE_VERSION}"
+else
+    API_RELEASE_URL="${API_BASE}/repos/${REPO}/releases/latest"
+fi
 
 is_html() {
     local prefix
@@ -144,23 +149,188 @@ is_html() {
     [[ "$prefix" == *"<!doctype html"* || "$prefix" == *"<html"* ]]
 }
 
-ARCHIVE_MAGIC="$(head -c 2 "${TMPDIR}/${ARCHIVE_FILE}" | od -An -tx1 | tr -d ' \n')"
-if [[ "$ARCHIVE_MAGIC" != "1f8b" ]]; then
-    if is_html "${TMPDIR}/${ARCHIVE_FILE}"; then
-        download_error "archive ${ARCHIVE_FILE}" "an HTML page"
+clear_assets() {
+    rm -f "$ARCHIVE_PATH" "$MANIFEST"
+}
+
+# ---- reject non-release responses before checksum parsing ----
+#
+# A sign-in or error page served with HTTP 200 (for example when the release
+# is private or the request needs authentication) passes curl -f. Detect it
+# here so the failure names the real cause instead of a missing checksum.
+# Sets ASSET_WHAT and ASSET_PROBLEM and returns non-zero when the downloaded
+# files are not release assets.
+check_assets() {
+    ASSET_WHAT=""
+    ASSET_PROBLEM=""
+    if [[ ! -f "$ARCHIVE_PATH" ]]; then
+        ASSET_WHAT="archive ${ARCHIVE_FILE}"
+        ASSET_PROBLEM="missing"
+        return 1
     fi
-    download_error "archive ${ARCHIVE_FILE}" "data that is not gzip"
-fi
-if is_html "${TMPDIR}/SHA256SUMS"; then
-    download_error "checksum manifest SHA256SUMS" "an HTML page"
+    local magic
+    magic="$(head -c 2 "$ARCHIVE_PATH" | od -An -tx1 | tr -d ' \n')"
+    if [[ "$magic" != "1f8b" ]]; then
+        ASSET_WHAT="archive ${ARCHIVE_FILE}"
+        if is_html "$ARCHIVE_PATH"; then
+            ASSET_PROBLEM="an HTML page"
+        else
+            ASSET_PROBLEM="data that is not gzip"
+        fi
+        return 1
+    fi
+    ASSET_WHAT="checksum manifest SHA256SUMS"
+    if [[ ! -f "$MANIFEST" ]]; then
+        ASSET_PROBLEM="missing"
+        return 1
+    fi
+    if is_html "$MANIFEST"; then
+        ASSET_PROBLEM="an HTML page"
+        return 1
+    fi
+    ASSET_WHAT=""
+    return 0
+}
+
+fetch_anonymous() {
+    if ! curl -fsSL --max-time 300 -o "$ARCHIVE_PATH" "${BASE_URL}/${ARCHIVE_FILE}"; then
+        rm -f "$ARCHIVE_PATH"
+        return 1
+    fi
+    if ! curl -fsSL --max-time 60 -o "$MANIFEST" "${BASE_URL}/SHA256SUMS"; then
+        rm -f "$MANIFEST"
+        return 1
+    fi
+}
+
+# Print the REST API download URL of the named asset from a release JSON
+# document. Each asset object lists its "url" before its "name"; only URLs of
+# this repository's release assets are accepted, so the token is never sent to
+# any other endpoint.
+release_asset_url() {
+    local url
+    url="$(grep -oE '"(url|name)"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | awk -v target="$2" '
+        /^"url"/ {
+            url = $0
+            sub(/^"url"[[:space:]]*:[[:space:]]*"/, "", url)
+            sub(/"$/, "", url)
+            if (url !~ /\/releases\/assets\/[0-9]+$/) url = ""
+            next
+        }
+        /^"name"/ {
+            name = $0
+            sub(/^"name"[[:space:]]*:[[:space:]]*"/, "", name)
+            sub(/"$/, "", name)
+            if (name == target && url != "") { print url; exit }
+        }')"
+    if [[ "$url" != "${API_BASE}/repos/${REPO}/releases/assets/"* ]]; then
+        return 1
+    fi
+    printf '%s\n' "$url"
+}
+
+fetch_with_token() {
+    local header="${TMPDIR}/.auth-header" meta="${TMPDIR}/.release.json"
+    local archive_url manifest_url status=1
+    # Keep the token out of argv (visible in ps) by handing curl a header file.
+    (umask 077 && printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$header")
+    if curl -fsSL --max-time 60 -H "@${header}" \
+        -H "Accept: application/vnd.github+json" \
+        -o "$meta" "$API_RELEASE_URL" \
+        && archive_url="$(release_asset_url "$meta" "$ARCHIVE_FILE")" \
+        && manifest_url="$(release_asset_url "$meta" SHA256SUMS)" \
+        && curl -fsSL --max-time 300 -H "@${header}" \
+            -H "Accept: application/octet-stream" \
+            -o "$ARCHIVE_PATH" "$archive_url" \
+        && curl -fsSL --max-time 60 -H "@${header}" \
+            -H "Accept: application/octet-stream" \
+            -o "$MANIFEST" "$manifest_url"; then
+        status=0
+    fi
+    rm -f "$header" "$meta"
+    return "$status"
+}
+
+gh_usable() {
+    [[ "${MINI_AGENT_INSTALL_NO_GH:-}" != "1" ]] \
+        && command -v gh >/dev/null 2>&1 \
+        && gh auth status >/dev/null 2>&1
+}
+
+fetch_with_gh() {
+    local dir="${TMPDIR}/gh-download"
+    rm -rf "$dir"
+    mkdir "$dir"
+    if [[ -n "$RELEASE_VERSION" ]]; then
+        gh release download "v${RELEASE_VERSION}" --repo "$REPO" \
+            --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
+    else
+        gh release download --repo "$REPO" \
+            --pattern "$ARCHIVE_FILE" --pattern SHA256SUMS --dir "$dir" || return 1
+    fi
+    [[ -f "${dir}/${ARCHIVE_FILE}" && -f "${dir}/SHA256SUMS" ]] || return 1
+    mv -f "${dir}/${ARCHIVE_FILE}" "$ARCHIVE_PATH"
+    mv -f "${dir}/SHA256SUMS" "$MANIFEST"
+}
+
+download_error() {
+    local what="$1" problem="$2" tried="$3"
+    if [[ "$problem" == "missing" ]]; then
+        echo "Error: could not download the ${what}." >&2
+    else
+        echo "Error: the downloaded ${what} is not a release asset (received ${problem})." >&2
+    fi
+    echo "  URL: ${BASE_URL}" >&2
+    if [[ -n "$tried" ]]; then
+        echo "  Authenticated retries also failed:${tried}." >&2
+    fi
+    echo "  The release may not exist for this platform, or the repository may be" >&2
+    echo "  private and require authentication. For a private repository, set" >&2
+    echo "  GITHUB_TOKEN or sign in with 'gh auth login' and rerun the installer," >&2
+    echo "  or download the assets with an authenticated client, for example:" >&2
+    echo "    gh release download --repo ${REPO} --pattern '${ARCHIVE_FILE}' --pattern SHA256SUMS" >&2
+    exit 1
+}
+
+# ---- download, with authenticated fallbacks ----
+DOWNLOAD_SOURCE=""
+fetch_anonymous || true
+if check_assets; then
+    DOWNLOAD_SOURCE="anonymous"
+else
+    FIRST_WHAT="$ASSET_WHAT"
+    FIRST_PROBLEM="$ASSET_PROBLEM"
+    TRIED=""
+    if [[ -n "${GITHUB_TOKEN:-}" && "${MINI_AGENT_INSTALL_NO_TOKEN:-}" != "1" ]]; then
+        echo "Anonymous download failed; retrying with GITHUB_TOKEN..." >&2
+        clear_assets
+        if fetch_with_token && check_assets; then
+            DOWNLOAD_SOURCE="GITHUB_TOKEN"
+        else
+            TRIED="${TRIED} GITHUB_TOKEN"
+        fi
+    fi
+    if [[ -z "$DOWNLOAD_SOURCE" ]] && gh_usable; then
+        echo "Retrying with the authenticated GitHub CLI (gh release download)..." >&2
+        clear_assets
+        if fetch_with_gh && check_assets; then
+            DOWNLOAD_SOURCE="gh"
+        else
+            TRIED="${TRIED} gh"
+        fi
+    fi
+    if [[ -z "$DOWNLOAD_SOURCE" ]]; then
+        download_error "$FIRST_WHAT" "$FIRST_PROBLEM" "$TRIED"
+    fi
+    echo "Downloaded release assets with ${DOWNLOAD_SOURCE}."
 fi
 
 # ---- verify checksum before extraction ----
 #
 # Parse the single line for this exact archive from the manifest.
 # Fail closed for: missing manifest, no entry, duplicate entries,
-# wrong filename, or hash mismatch.
-MANIFEST="${TMPDIR}/SHA256SUMS"
+# wrong filename, or hash mismatch. This applies equally to assets fetched
+# anonymously, with GITHUB_TOKEN, or with gh.
 
 if [[ ! -s "$MANIFEST" ]]; then
     echo "Error: checksum manifest is missing or empty." >&2

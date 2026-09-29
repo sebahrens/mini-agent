@@ -249,7 +249,14 @@ pub fn import_agent_skill(
 
     let install_root = app_paths.data_dir.join("agent-skills");
     secure_fs::ensure_private_directory(&install_root)?;
-    sweep_stale_import_leftovers(&staging_parent, &install_root, std::time::SystemTime::now());
+    let now = std::time::SystemTime::now();
+    sweep_stale_import_leftovers(&staging_parent, &install_root, now);
+    // Runs before this import repoints ACTIVE; see `retention` for the policy.
+    super::retention::prune_superseded_digests(
+        &install_root,
+        &super::retention::lease_root(&app_paths.data_dir),
+        now,
+    );
     let name_root = install_root.join(&manifest.name);
     portable::ensure_no_link_traversal(&install_root, &name_root)?;
     secure_fs::ensure_private_directory(&name_root)?;
@@ -987,7 +994,20 @@ impl Drop for CleanupDirectory {
     }
 }
 
-fn remove_tree_no_follow(path: &Path) -> std::io::Result<()> {
+/// Let an installed digest directory itself be renamed or modified.
+pub(super) fn make_directory_writable(path: &Path) -> std::io::Result<()> {
+    make_writable(path, true)
+}
+
+/// Restore the read-only mode an installed digest directory is published with.
+pub(super) fn make_directory_read_only(path: &Path) -> std::io::Result<()> {
+    set_read_only(path, true).map_err(|error| match error {
+        ImportError::Io(error) => error,
+        other => std::io::Error::other(other.to_string()),
+    })
+}
+
+pub(super) fn remove_tree_no_follow(path: &Path) -> std::io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
