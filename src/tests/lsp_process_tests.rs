@@ -200,6 +200,11 @@ fn main() {
             if mode == "close-stdin" {
                 break;
             }
+        } else if body.contains("\"method\":\"textDocument/didClose\"") {
+            if let Some(path) = env::var_os("LSP_FIXTURE_SYNC_LOG") {
+                let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+                writeln!(file, "{body}").unwrap();
+            }
         } else if body.contains("\"method\":\"textDocument/didOpen\"")
             || body.contains("\"method\":\"textDocument/didChange\"")
         {
@@ -890,27 +895,40 @@ async fn lsp_process_sync_capacity_preserves_updates_to_tracked_documents() {
         fs::write(&source, "document").unwrap();
         accepted.push(manager.notify_changed(&source).await.is_some());
     }
-    let first = workspace.join("document-0.probe");
+    let last = workspace.join(format!("document-{cap}.probe"));
     // Replacing a tracked file must release its old identity and keep the slot.
-    fs::rename(&first, workspace.join("original.probe")).unwrap();
-    fs::write(&first, "replacement").unwrap();
-    let baseline = manager.notify_changed(&first).await;
-    let updated = manager.diagnostics_block_for_edit(&first, baseline).await;
+    fs::rename(&last, workspace.join("original.probe")).unwrap();
+    fs::write(&last, "replacement").unwrap();
+    let baseline = manager.notify_changed(&last).await;
+    let updated = manager.diagnostics_block_for_edit(&last, baseline).await;
     // The update reply is also a barrier for all preceding protocol frames.
     let log = fs::read_to_string(&sync_log).unwrap();
     manager.shutdown().await;
     drop(manager);
     fixture.cleanup().await;
-    assert!(accepted[..cap].iter().all(|accepted| *accepted));
     assert!(
-        !accepted[cap],
-        "new document accepted above the sync ceiling"
+        accepted.iter().all(|accepted| *accepted),
+        "a new document above the ceiling must evict, not be silently dropped"
     );
     assert!(baseline.is_some());
     assert!(updated.unwrap().contains("fixture diagnostic version 2"));
-    assert_eq!(log.matches("textDocument/didOpen").count(), cap);
+    assert_eq!(log.matches("textDocument/didOpen").count(), cap + 1);
     assert_eq!(log.matches("textDocument/didChange").count(), 1);
-    assert!(!log.contains(&format!("/document-{cap}.probe")));
+    let closes: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("textDocument/didClose"))
+        .collect();
+    assert_eq!(closes.len(), 1, "{log}");
+    assert!(
+        closes[0].contains("/document-0.probe"),
+        "the least recently synced document is closed: {}",
+        closes[0]
+    );
+    let close_at = log.find("textDocument/didClose").unwrap();
+    let reopen_at = log
+        .find(&format!("/document-{cap}.probe"))
+        .expect("the new document is opened");
+    assert!(close_at < reopen_at, "didClose precedes the new didOpen");
 }
 
 #[tokio::test]

@@ -2290,8 +2290,10 @@ already-authorized file handle. Oversized or invalid UTF-8 documents are omitted
 without advancing the document version, and workspace-relative reads use the
 asynchronous file reader too.
 Each server tracks at most 128 synchronized documents, retaining the identity
-of the authorized read handle for each. Further new documents are omitted until
-the server restarts; updates to tracked documents continue at the limit. A reply
+of the authorized read handle for each. At the limit, a new document evicts
+the least recently synchronized one: the server receives `textDocument/didClose`
+for it before the new `didOpen`, and its cached diagnostics are dropped. A later
+change to an evicted file reopens it. A reply
 is rejected if the source has been replaced since synchronization, including
 when its protocol version matches. Accepted cache entries share the synchronized
 identity, so a replacement racing cache insertion also invalidates the result.

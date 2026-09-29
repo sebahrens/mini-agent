@@ -241,6 +241,10 @@ pub(crate) struct SyncedDocument {
     pub(crate) allow_versionless: bool,
     pub(crate) identity: crate::fs::CheckedMetadata,
     pub(crate) content: crate::fs::ContentDigest,
+    /// URI the server knows this document by, for `didClose` on eviction.
+    pub(crate) wire_uri: String,
+    /// Recency stamp; the least recently synced document is evicted first.
+    pub(crate) last_used: u64,
 }
 
 impl SyncedDocument {
@@ -851,19 +855,34 @@ impl LspClient {
                 Open,
                 Change(i64),
             }
-            let (action, baseline) = {
+            let (action, baseline, evicted) = {
                 let mut open = self.open.lock().unwrap();
                 // Match the diagnostic cache ceiling and bound retained source
-                // handles. Existing documents can still advance at capacity.
-                if !open.contains_key(&uri) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
-                    return Ok(None);
-                }
+                // handles. At capacity a new document evicts the least
+                // recently synced one, which is closed on the server, so
+                // syncing never silently stops.
+                let evicted =
+                    if !open.contains_key(&uri) && open.len() >= MAX_DIAGNOSTIC_FILES_PER_SERVER {
+                        open.iter()
+                            .min_by_key(|(_, document)| document.last_used)
+                            .map(|(evicted, _)| evicted.clone())
+                            .and_then(|evicted| open.remove_entry(&evicted))
+                    } else {
+                        None
+                    };
+                let last_used = open
+                    .values()
+                    .map(|document| document.last_used)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
                 let action = match open.get_mut(&uri) {
                     Some(document) => {
                         document.version += 1;
                         document.allow_versionless = false;
                         document.identity = identity;
                         document.content = content;
+                        document.last_used = last_used;
                         Sync::Change(document.version)
                     }
                     None => {
@@ -874,6 +893,8 @@ impl LspClient {
                                 allow_versionless: true,
                                 identity,
                                 content,
+                                wire_uri: wire_uri.clone(),
+                                last_used,
                             },
                         );
                         Sync::Open
@@ -881,13 +902,22 @@ impl LspClient {
                 };
                 // Match the reader's open-then-diags lock order; a publication
                 // from the previous epoch cannot satisfy this sync's wait.
-                let baseline = self
-                    .diags
-                    .lock()
-                    .unwrap()
-                    .get(&uri)
-                    .map_or(0, |diagnostics| diagnostics.version);
-                (action, baseline)
+                let mut diags = self.diags.lock().unwrap();
+                // A closed document's diagnostics are no longer maintained by
+                // the server; drop them so they cannot be reported as current.
+                if let Some((evicted_uri, _)) = &evicted
+                    && diags
+                        .get(evicted_uri)
+                        .is_some_and(|entry| entry.server == self.name)
+                {
+                    diags.remove(evicted_uri);
+                }
+                let baseline = diags.get(&uri).map_or(0, |diagnostics| diagnostics.version);
+                (
+                    action,
+                    baseline,
+                    evicted.map(|(_, document)| document.wire_uri),
+                )
             }; // State locks are released before writing; stdin stays locked.
             #[cfg(test)]
             if let Some((advanced, release)) = probe {
@@ -918,6 +948,15 @@ impl LspClient {
             .map_err(std::io::Error::other)?;
             if self.transport.is_closing() {
                 return Ok(None);
+            }
+            if let Some(evicted) = evicted {
+                let close = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didClose",
+                    "params": { "textDocument": { "uri": evicted } },
+                }))
+                .map_err(std::io::Error::other)?;
+                rpc::write_frame(write.writer(), &close).await?;
             }
             rpc::write_frame(write.writer(), &body).await?;
             Ok::<_, std::io::Error>(Some(baseline))
