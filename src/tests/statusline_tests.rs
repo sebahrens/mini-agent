@@ -15,6 +15,7 @@ fn ctx() -> StatusContext<'static> {
         btw_cost: 0.0,
         btw_in: 0,
         btw_out: 0,
+        sandbox_label: None,
     }
 }
 
@@ -505,5 +506,66 @@ fn reasoning_effort_sits_next_to_the_model_when_configured() {
     assert_ne!(
         statusline::cache_key(&session, &ctx()),
         statusline::cache_key(&session, &high)
+    );
+}
+
+/// cfib7: a degraded default sandbox is visible for the whole session, in the
+/// built-in layout and in custom layouts that never mention `sandbox`.
+#[test]
+fn degraded_sandbox_sets_a_persistent_red_status_segment() {
+    use crate::sandbox::Sandbox;
+
+    let degraded = Sandbox::new(false, "bwrap").with_unavailable_default_fallback();
+    let label = statusline::sandbox_label(&degraded);
+    assert_eq!(label, Some(statusline::SANDBOX_OFF_LABEL));
+    // A deliberate `--no-sandbox` is not a degraded state.
+    assert_eq!(
+        statusline::sandbox_label(&Sandbox::new(false, "bwrap")),
+        None
+    );
+
+    let session = Session::new("openai", "gpt-5", 400_000, "");
+    let mut off = ctx();
+    off.sandbox_label = label;
+
+    let contained =
+        line_text(&statusline::build_lines(&statusline::default_spec(), &session, &ctx())[0]);
+    assert!(!contained.contains("sandbox"), "{contained}");
+    let default_spans = &statusline::build_lines(&statusline::default_spec(), &session, &off)[0];
+    assert!(
+        default_spans.iter().any(|span| matches!(
+            span,
+            StatusSpan::Text { text, fg: Some(crossterm::style::Color::Red), .. }
+                if text == "sandbox:off"
+        )),
+        "{default_spans:?}"
+    );
+    assert_eq!(line_text(default_spans).matches("sandbox:off").count(), 1);
+
+    let custom = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("model")],
+        }],
+    };
+    assert_eq!(
+        line_text(&statusline::build_lines(&custom, &session, &off)[0]),
+        "gpt-5 sandbox:off"
+    );
+    assert_eq!(
+        line_text(&statusline::build_lines(&custom, &session, &ctx())[0]),
+        "gpt-5"
+    );
+    let placed = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("sandbox"), seg("model")],
+        }],
+    };
+    assert_eq!(
+        line_text(&statusline::build_lines(&placed, &session, &off)[0]),
+        "sandbox:offgpt-5"
+    );
+    assert_ne!(
+        statusline::cache_key(&session, &ctx()),
+        statusline::cache_key(&session, &off)
     );
 }

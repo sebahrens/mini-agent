@@ -244,6 +244,7 @@ pub(crate) fn refresh_display(
         btw_cost: btw.cost,
         btw_in: btw.input,
         btw_out: btw.output,
+        sandbox_label: crate::ui::statusline::sandbox_label(&ui.sandbox),
     };
     let statusline_key = crate::ui::statusline::cache_key(ui.session, &statusline_ctx);
     let statusline = renderer.cached_statusline(statusline_key, || {

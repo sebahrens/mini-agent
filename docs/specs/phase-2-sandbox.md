@@ -168,7 +168,25 @@ The general subprocess sandbox is enabled by default. `--no-sandbox` disables it
 disables it and `sandbox = true` explicitly requires it. While sandboxing remains enabled,
 selecting a backend through `--sandbox-backend` or the `sandbox-backend` config key also makes the
 request explicit. On non-Windows hosts, if the sandbox was enabled only by the default and its
-backend is absent, startup warns and continues unsandboxed. An explicitly required missing backend
+backend is absent, startup continues unsandboxed in a degraded state (`SandboxResolution::DegradedUnavailable`)
+that is never silent and never keeps exec-capable auto-allows:
+
+- a notice naming the backend and the remedies (install the backend, `--sandbox` to fail closed,
+  `--no-sandbox` to opt out deliberately) is written directly to stderr once per process, bypassing
+  `tracing` filters, so headless print, loop and ACP runs report it even with `RUST_LOG=off`;
+- the TUI restates the notice in the chat before the first turn and shows a persistent red
+  `sandbox:off` status-bar segment, appended to custom `[statusline]` layouts that do not place the
+  `sandbox` item themselves;
+- the built-in `bash` allows that execute workspace-controlled code or configuration
+  (`git status`, `cargo check`/`build`/`test`/`fmt`/`clippy`, `pip list`) are withheld, so they
+  resolve like any unmatched script (`ask` in `standard` and `guarded`, fail-closed without a
+  prompt channel). Built-in denies and the inert `pwd` allow are unchanged, and an explicit
+  `--no-sandbox` keeps the historical allows.
+
+Linux deliberately does not fail closed by default (decision recorded for mini-agent-cfib7): stock
+distributions such as Ubuntu 24.04 restrict unprivileged user namespaces, so a fail-closed default
+would make the default install unusable, while the mitigations above remove the silent
+auto-allowed execution path that made the fallback dangerous. An explicitly required missing backend
 fails closed, and Windows always fails closed while its enabled backend is unavailable. Backend
 absence or setup failure never masquerades as isolation, and this fallback policy is never
 permission for an uncontained JS worker.

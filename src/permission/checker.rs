@@ -228,11 +228,35 @@ impl PermissionChecker {
         Ok(rules)
     }
 
+    /// Test convenience: a checker for a contained (sandbox-enforced)
+    /// session. Production code states the resolved sandbox explicitly
+    /// through [`Self::new_for_sandbox`].
+    #[cfg(test)]
     pub fn new(
         configs: &PermissionConfigs,
         mode: SecurityMode,
         working_dir: Option<std::path::PathBuf>,
         permission_modes: Option<Vec<String>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_for_sandbox(
+            configs,
+            mode,
+            working_dir,
+            permission_modes,
+            crate::permission::SandboxResolution::Enforced,
+        )
+    }
+
+    /// Build a checker whose built-in `bash` defaults match the session's
+    /// resolved sandbox. After an unavailable-default fallback the
+    /// exec-capable built-in allows are withheld (see
+    /// [`crate::permission::default_bash_rules_for`]).
+    pub(crate) fn new_for_sandbox(
+        configs: &PermissionConfigs,
+        mode: SecurityMode,
+        working_dir: Option<std::path::PathBuf>,
+        permission_modes: Option<Vec<String>>,
+        sandbox: crate::permission::SandboxResolution,
     ) -> anyhow::Result<Self> {
         let default_action = configs
             .glob
@@ -285,7 +309,7 @@ impl PermissionChecker {
 
         if !rules.contains_key("shell") {
             let mut defaults = Vec::new();
-            for (pat, action) in crate::permission::default_bash_rules() {
+            for (pat, action) in crate::permission::default_bash_rules_for(sandbox) {
                 defaults.push((Pattern::new(pat), action));
             }
             rules.insert("shell".to_string(), defaults.clone());

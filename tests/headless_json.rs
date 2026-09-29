@@ -1309,6 +1309,55 @@ fn headless_runs_do_not_offer_to_create_architecture_md() {
     }
 }
 
+/// cfib7: when the implicit default backend is unavailable a headless `-p`
+/// run still says so on stderr, even with every tracing filter turned off.
+/// Linux resolves `bwrap` from `PATH`, so an empty `PATH` makes the default
+/// backend deterministically unavailable without touching the host.
+#[cfg(target_os = "linux")]
+#[test]
+fn headless_print_reports_a_degraded_default_sandbox_on_stderr() {
+    let root = TempRoot::new();
+    let empty_path = root.0.join("empty-bin");
+    std::fs::create_dir(&empty_path).unwrap();
+    let server = root.local_provider("plain");
+    let mut command = root.command();
+    command
+        .env("PATH", &empty_path)
+        .env("RUST_LOG", "off")
+        .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .args([
+            "--log-level",
+            "off",
+            "--no-session",
+            "--no-context-files",
+            "--tools",
+            "shell",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+            "-p",
+            "start",
+        ]);
+    let output = bounded_output(command);
+    server.join().unwrap().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("sandbox backend 'bwrap' is unavailable")
+            && stderr.contains("UNSANDBOXED")
+            && stderr.contains("--no-sandbox"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("UNSANDBOXED").count(), 1, "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("UNSANDBOXED"),
+        "the notice must not pollute stdout"
+    );
+}
+
 /// One scripted provider reply.
 #[cfg(all(unix, feature = "goal"))]
 enum ScriptedReply {

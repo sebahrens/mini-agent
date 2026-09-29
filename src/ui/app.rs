@@ -738,6 +738,13 @@ impl<'a> App<'a> {
                 tracing::warn!("failed to write welcome marker (welcome will show again): {e}");
             }
         }
+        // The stderr warning is overdrawn once the TUI owns the screen; restate
+        // the degraded sandbox in the chat before the first turn. The status
+        // bar keeps a persistent `sandbox:off` segment for the whole session.
+        if let Some(notice) = crate::permission::degraded_sandbox_notice_for(&ui.sandbox) {
+            renderer.write_line(&format!("[sandbox] {notice}"), C_ERROR)?;
+            renderer.write_line("", Color::White)?;
+        }
         refresh_display(
             &mut renderer,
             &mut input,

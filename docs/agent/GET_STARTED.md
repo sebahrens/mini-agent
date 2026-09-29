@@ -283,8 +283,15 @@ requires its cached native production preflight. That probe has a five-second ru
 by up to five seconds for whole-tree reaping and a fresh five-second profile/ACL recovery window.
 Before a new probe, a separate five-second bounded sweep recovers exact private roots preserved by
 an interrupted earlier process; malformed or active roots fail closed without deletion. Failure is cached and
-remains closed unless `--no-sandbox` explicitly opts out. Other implicitly selected unavailable defaults warn and start
-unsandboxed. While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
+remains closed unless `--no-sandbox` explicitly opts out. On Linux and macOS an implicitly selected
+default backend that is unavailable (for example `bwrap` missing, or blocked by Ubuntu 24.04's
+AppArmor user-namespace restriction) still starts, but visibly and with reduced trust: a notice is
+printed on stderr (even with `RUST_LOG=off`), the TUI repeats it in the chat before the first turn
+and keeps a red `sandbox:off` status-bar segment for the whole session, and the built-in auto-allows
+for commands that run workspace code (`cargo build`/`test`/`check`/`clippy`/`fmt`, `pip list`,
+`git status`) are withheld so those commands ask first. Install bubblewrap to restore containment,
+pass `--sandbox` (or set `sandbox = true`) to refuse to start instead, or pass `--no-sandbox` to run
+unsandboxed deliberately (which keeps the built-in allows). While sandboxing remains enabled, explicit `--sandbox`, `sandbox = true`, or selecting
 a backend through `--sandbox-backend` or `sandbox-backend` remains fail-closed. This general
 subprocess policy is distinct from the mandatory, stricter JavaScript worker containment below.
 

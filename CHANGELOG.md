@@ -22,6 +22,14 @@ Notable changes to mini-agent are documented in this file. The format follows
   `filter.<name>.clean`/`.process` command, and run with every configured driver emptied.
   Previously an auto-allowed `status` could execute a clean filter the model had written into
   `.git/config` and `.gitattributes`.
+- When the default sandbox backend is unavailable on Linux or macOS and the session falls back to
+  running unsandboxed, the built-in auto-allows for commands that run workspace code (`cargo
+  build`/`test`/`check`/`clippy`/`fmt`, `pip list`, `git status`) are withheld and ask first. The
+  fallback is now always visible: a stderr notice in every mode (even with `RUST_LOG=off`), a chat
+  notice before the first TUI turn, and a persistent red `sandbox:off` status-bar segment.
+  Decision: Linux keeps starting in this degraded state rather than failing closed like Windows,
+  because stock Ubuntu 24.04 blocks `bwrap` by default; use `--sandbox` to fail closed or
+  `--no-sandbox` to opt out deliberately (mini-agent-cfib7).
 
 ### Added
 
