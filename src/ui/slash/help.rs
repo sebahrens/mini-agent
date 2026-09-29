@@ -316,6 +316,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
         false,
         "  mouse drag             select text (copies to clipboard on release)",
     );
+    emit(
+        false,
+        "  mouse double-click     select and copy the word under the pointer",
+    );
     emit(false, "  Esc (while selected)   clear selection (no copy)");
     #[cfg(windows)]
     emit(false, "  Ctrl+Shift+C           copy selected text");
