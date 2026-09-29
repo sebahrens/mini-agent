@@ -54,6 +54,11 @@ user rather than discarding it. A finished goal leaves its state only by an expl
 `impossible` may be reopened, `met` may not. A status this build does not recognize parks the goal
 instead of failing the whole session load.
 
+The record keeps its last ten gate evaluations as short lines, each naming the round it was for and
+which attempt at that round it was, so `/goal status` can show why a round took two tries — an
+interrupted verification settles without counting its round, and the retry is that round's second
+attempt. The full per-round detail stays in the transcripts.
+
 `paused` carries a reason — no progress, judge unavailable, context overflow, round failure, an
 unknown stored status, or the user asking for it — because those are unrelated conditions and a
 user cannot act on "paused" alone.

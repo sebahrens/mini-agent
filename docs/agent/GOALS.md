@@ -60,6 +60,16 @@ With no checks configured the only evidence is the model's own account, and `/go
 verification: self-report only (add /goal check <command> to verify)
 ```
 
+`/goal status` also lists the last ten rounds, one line each. A round evaluated twice — for example
+because you interrupted its verification, which does not count the round — shows both attempts:
+
+```
+recent rounds:
+  round 1 attempt 1: not yet (round 1) — the migration is missing
+  round 2 attempt 1: interrupted
+  round 2 attempt 2: met after 2 round(s) — checks passed
+```
+
 A completion that no command proved is labelled:
 
 ```

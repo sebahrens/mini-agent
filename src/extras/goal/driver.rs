@@ -898,9 +898,14 @@ pub fn apply_decision(
     let checks = verification.checks.as_ref();
     let judge = verification.judge.as_ref();
     let line = match store.with_mut(|goal| {
+        // The round being evaluated, whether or not the gate ends up counting
+        // it: an interrupted evaluation is an attempt at the same round.
+        let round = goal.progress.current_round();
         super::gate::apply(goal, summary, &decision, judge, verification.cause());
         super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
-        decision_line(goal, &decision)
+        let line = decision_line(goal, &decision);
+        goal.push_history(round, line.strip_prefix("goal: ").unwrap_or(&line));
+        line
     }) {
         Some(line) => line,
         None => return RoundOutcome::Inactive,
@@ -1254,6 +1259,42 @@ mod settle_tests {
         // The judge's share exhausted the budget, so the rejection does not
         // buy an ordinary further round: the bounded wrap-up is issued.
         assert!(goal.progress.wrap_up_issued, "{outcome:?}");
+    }
+
+    /// Every evaluation lands in the round history: an interrupted one as an
+    /// attempt at the round it did not count, the retry as that round's next
+    /// attempt (mini-agent-2jqy9).
+    #[tokio::test]
+    async fn settled_rounds_and_interrupted_attempts_are_recorded_in_history() {
+        let _paths = isolated_paths();
+        let store = store();
+        report(&store, ReportStatus::Progress);
+        let working = || RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        settle_round(&store, working(), no_verification).await;
+        settle_round(
+            &store,
+            RoundSummary {
+                end: RoundEnd::Cancelled,
+                ..RoundSummary::completed()
+            },
+            no_verification,
+        )
+        .await;
+        settle_round(&store, working(), no_verification).await;
+
+        let goal = store.snapshot().unwrap();
+        let attempts: Vec<_> = goal.history.iter().map(|e| (e.round, e.attempt)).collect();
+        assert_eq!(attempts, vec![(1, 1), (2, 1), (2, 2)], "{:?}", goal.history);
+        assert!(goal.history[0].summary.starts_with("not yet"));
+        assert!(
+            goal.history[1].summary.contains("interrupt"),
+            "{:?}",
+            goal.history[1]
+        );
     }
 
     #[tokio::test]
