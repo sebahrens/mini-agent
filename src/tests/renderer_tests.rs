@@ -1071,3 +1071,87 @@ mod permission_prompt_layout_tests {
         assert_eq!(prompt_max_rows(200), 12);
     }
 }
+
+/// mini-agent-3h2wv: double-click selects the word under the pointer.
+mod word_selection_tests {
+    use crate::ui::renderer::{
+        ClickAt, DOUBLE_CLICK_WINDOW, SelectionPoint, is_double_click, selection_byte_range,
+        word_cols_at,
+    };
+    use std::time::{Duration, Instant};
+
+    fn word(text: &str, col: usize) -> Option<&str> {
+        let (start, end) = word_cols_at(text, col)?;
+        let (a, b) = selection_byte_range(
+            text,
+            0,
+            SelectionPoint::new(0, start),
+            SelectionPoint::new(0, end),
+        )?;
+        Some(&text[a..b])
+    }
+
+    #[test]
+    fn a_word_is_taken_whole_from_any_of_its_columns() {
+        let text = "see src/ui/app.rs:120 now.";
+        for col in 4..=20 {
+            assert_eq!(word(text, col), Some("src/ui/app.rs:120"), "col {col}");
+        }
+        assert_eq!(word(text, 0), Some("see"));
+        assert_eq!(word(text, 23), Some("now"), "sentence dot excluded");
+        assert_eq!(word(text, 3), None, "space is no word");
+        assert_eq!(word(text, 99), None, "past the end");
+        assert_eq!(word("snake_case-name", 2), Some("snake_case-name"));
+        assert_eq!(word("(value)", 3), Some("value"));
+    }
+
+    #[test]
+    fn wide_characters_map_by_display_column() {
+        let text = "中文 word";
+        assert_eq!(word(text, 0), Some("中文"));
+        assert_eq!(word(text, 3), Some("中文"));
+        assert_eq!(word(text, 4), None);
+        assert_eq!(word(text, 6), Some("word"));
+    }
+
+    #[test]
+    fn a_double_click_is_a_quick_second_press_in_place() {
+        let t0 = Instant::now();
+        let prev = Some(ClickAt {
+            at: t0,
+            row: 5,
+            col: 10,
+        });
+        assert!(is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            10
+        ));
+        assert!(is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            11
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            5,
+            12
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + Duration::from_millis(200),
+            6,
+            10
+        ));
+        assert!(!is_double_click(
+            prev,
+            t0 + DOUBLE_CLICK_WINDOW + Duration::from_millis(1),
+            5,
+            10
+        ));
+        assert!(!is_double_click(None, t0, 5, 10));
+    }
+}

@@ -213,6 +213,68 @@ pub(crate) fn selection_byte_range(
     Some((start, end.max(start)))
 }
 
+/// Longest gap between two presses that still counts as a double-click.
+pub(crate) const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Where and when the left button last went down in the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClickAt {
+    pub at: std::time::Instant,
+    pub row: u16,
+    pub col: u16,
+}
+
+/// Whether a press at `(row, col)` at `now` completes a double-click with
+/// the `previous` press: same row, at most one column apart (a hand
+/// wobble), within [`DOUBLE_CLICK_WINDOW`].
+pub(crate) fn is_double_click(
+    previous: Option<ClickAt>,
+    now: std::time::Instant,
+    row: u16,
+    col: u16,
+) -> bool {
+    previous.is_some_and(|prev| {
+        prev.row == row
+            && prev.col.abs_diff(col) <= 1
+            && now.saturating_duration_since(prev.at) <= DOUBLE_CLICK_WINDOW
+    })
+}
+
+/// Characters a double-click word extends over besides letters and digits,
+/// so a path, identifier or `file.rs:12` location is taken whole.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | ':')
+}
+
+/// The word under display column `col` of `text`, as inclusive display
+/// columns `(start, end)`. Trailing `.` and `:` (sentence punctuation) are
+/// not part of it. `None` when the column holds no word character.
+pub(crate) fn word_cols_at(text: &str, col: usize) -> Option<(usize, usize)> {
+    let mut cells: Vec<(usize, char)> = Vec::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        cells.push((width, ch));
+        width += char_display_width(ch);
+    }
+    let hit = cells.iter().rposition(|&(start, _)| start <= col)?;
+    let (hit_start, hit_char) = cells[hit];
+    if !is_word_char(hit_char) || col >= hit_start + char_display_width(hit_char).max(1) {
+        return None;
+    }
+    let mut first = hit;
+    while first > 0 && is_word_char(cells[first - 1].1) {
+        first -= 1;
+    }
+    let mut last = hit;
+    while last + 1 < cells.len() && is_word_char(cells[last + 1].1) {
+        last += 1;
+    }
+    while last > hit && matches!(cells[last].1, '.' | ':') {
+        last -= 1;
+    }
+    Some((cells[first].0, cells[last].0))
+}
+
 /// Marker painted at the top-right of the chat viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryIndicator {
@@ -410,6 +472,11 @@ pub struct Renderer {
     /// Set once the pointer moved while the button was held. A plain click
     /// (press + release without movement) never copies.
     pub selection_dragged: bool,
+    /// The selection is a double-clicked word: releasing the button copies
+    /// it as selected instead of moving its end to the pointer.
+    pub selection_word: bool,
+    /// The last transcript press, for double-click detection.
+    last_click: Option<ClickAt>,
     prev_input_height: usize,
     /// Number of statusline rows (1-3), fixed by the statusline config at startup.
     statusline_height: usize,
@@ -474,6 +541,8 @@ impl Renderer {
             selection_start: None,
             selection_end: None,
             selection_dragged: false,
+            selection_word: false,
+            last_click: None,
             prev_input_height: 0,
             statusline_height: 1,
             chat_margin: 0,
@@ -847,6 +916,40 @@ impl Renderer {
         self.selection_start = None;
         self.selection_end = None;
         self.selection_dragged = false;
+        self.selection_word = false;
+    }
+
+    /// Record a transcript press at `(row, col)` and report whether it
+    /// completes a double-click. A double-click is consumed, so a third
+    /// press starts over.
+    pub(crate) fn register_click(&mut self, row: u16, col: u16) -> bool {
+        let now = std::time::Instant::now();
+        if is_double_click(self.last_click, now, row, col) {
+            self.last_click = None;
+            return true;
+        }
+        self.last_click = Some(ClickAt { at: now, row, col });
+        false
+    }
+
+    /// Select the word under display column `col` of laid-out chat line
+    /// `line`. Returns `false`, selecting nothing, when there is no word
+    /// there.
+    pub(crate) fn select_word_at(&mut self, line: usize, col: usize) -> bool {
+        let lines = self.chat_lines(self.max_line_width());
+        let Some((start, end)) = lines
+            .get(line)
+            .and_then(|entry| word_cols_at(&entry.text, col))
+        else {
+            return false;
+        };
+        self.selection_active = true;
+        self.selection_start = Some(SelectionPoint::new(line, start));
+        self.selection_end = Some(SelectionPoint::new(line, end));
+        self.selection_dragged = false;
+        self.selection_word = true;
+        self.chat_dirty = true;
+        true
     }
 
     pub fn link_url_at(&self, buf_idx: usize, col: u16) -> Option<String> {
@@ -1137,6 +1240,7 @@ impl Renderer {
             self.selection_start = None;
             self.selection_end = None;
             self.selection_dragged = false;
+            self.selection_word = false;
             self.chat_dirty = true;
         }
     }

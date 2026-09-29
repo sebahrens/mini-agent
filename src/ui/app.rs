@@ -1253,16 +1253,23 @@ impl<'a> App<'a> {
                             }
                         });
                     } else {
-                        let point = SelectionPoint::new(idx, self.renderer.chat_text_col(col));
-                        self.renderer.selection_active = true;
-                        self.renderer.selection_start = Some(point);
-                        self.renderer.selection_end = Some(point);
-                        self.renderer.selection_dragged = false;
+                        let text_col = self.renderer.chat_text_col(col);
+                        let double = self.renderer.register_click(row, col);
+                        if !(double && self.renderer.select_word_at(idx, text_col)) {
+                            let point = SelectionPoint::new(idx, text_col);
+                            self.renderer.selection_active = true;
+                            self.renderer.selection_start = Some(point);
+                            self.renderer.selection_end = Some(point);
+                            self.renderer.selection_dragged = false;
+                            self.renderer.selection_word = false;
+                        }
                     }
                 }
             }
             UserEvent::MouseDrag { row, col } => {
                 if self.renderer.selection_active {
+                    // Dragging after a double-click extends from the word.
+                    self.renderer.selection_word = false;
                     self.renderer.selection_dragged = true;
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
                         self.renderer.selection_end =
@@ -1272,12 +1279,14 @@ impl<'a> App<'a> {
             }
             UserEvent::MouseUp { row, col } => {
                 if self.renderer.selection_active {
-                    if let Some(idx) = self.renderer.buffer_line_at_row(row) {
+                    if !self.renderer.selection_word
+                        && let Some(idx) = self.renderer.buffer_line_at_row(row)
+                    {
                         self.renderer.selection_end =
                             Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                     if mouse_up_copies(
-                        self.renderer.selection_dragged,
+                        self.renderer.selection_dragged || self.renderer.selection_word,
                         self.renderer.selection_start,
                         self.renderer.selection_end,
                     ) {
