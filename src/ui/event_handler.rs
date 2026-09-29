@@ -55,6 +55,25 @@ pub async fn ensure_agent(
     );
 }
 
+/// Minimum spacing between streamed-token repaints once a segment is large.
+pub(crate) const STREAM_REPAINT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(40);
+
+/// Whether a streamed token should repaint the chat now. Small segments and
+/// tokens that complete a line (markdown structure changes at line
+/// boundaries) always repaint; otherwise repaints are spaced by
+/// [`STREAM_REPAINT_INTERVAL`]. Never "only at newlines": a paragraph with no
+/// line break must not appear frozen.
+pub(crate) fn stream_repaint_due(
+    segment_len: usize,
+    completes_line: bool,
+    since_last_paint: Option<std::time::Duration>,
+) -> bool {
+    completes_line
+        || segment_len < 200
+        || since_last_paint.is_none_or(|elapsed| elapsed >= STREAM_REPAINT_INTERVAL)
+}
+
 pub async fn handle_agent_event(
     event: AgentEvent,
     renderer: &mut Renderer,
@@ -123,15 +142,22 @@ pub async fn handle_agent_event(
             };
             renderer.feed_mut().append_to(idx, &safe);
 
-            // Throttle repaints: redraw when a line completed (markdown
-            // structure changes at line boundaries) or while the buffer is
-            // small. The final full parse happens in handle_agent_done.
-            if run.response_buf.len() >= 200 && !run.response_buf.ends_with('\n') {
+            // Throttle repaints by time, not by size: a long paragraph without
+            // a newline must keep appearing. Anything skipped here is painted
+            // by the next token past the interval or by the UI tick. The
+            // final full parse happens in handle_agent_done.
+            let now = std::time::Instant::now();
+            run.agent_line_started = true;
+            if !stream_repaint_due(
+                run.response_buf.len(),
+                safe.contains('\n'),
+                run.last_stream_paint.map(|last| now.duration_since(last)),
+            ) {
                 return Ok(());
             }
 
             renderer.render_viewport()?;
-            run.agent_line_started = true;
+            run.last_stream_paint = Some(now);
         }
         AgentEvent::ToolCall { id, name, args } => {
             run.was_reasoning = false;
@@ -844,9 +870,26 @@ fn finalize_response_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_usage_delta, should_auto_compact_between_turns};
+    use super::{
+        STREAM_REPAINT_INTERVAL, apply_usage_delta, should_auto_compact_between_turns,
+        stream_repaint_due,
+    };
     use crate::event::UsageDelta;
     use crate::session::Session;
+    use std::time::Duration;
+
+    #[test]
+    fn long_streamed_paragraphs_keep_repainting_without_newlines() {
+        let just_now = Some(Duration::from_millis(5));
+        let a_while_ago = Some(STREAM_REPAINT_INTERVAL);
+        // Small segments and completed lines always repaint.
+        assert!(stream_repaint_due(50, false, just_now));
+        assert!(stream_repaint_due(5_000, true, just_now));
+        // A large segment without a newline is throttled, not frozen.
+        assert!(!stream_repaint_due(5_000, false, just_now));
+        assert!(stream_repaint_due(5_000, false, a_while_ago));
+        assert!(stream_repaint_due(5_000, false, None));
+    }
 
     #[test]
     fn loop_iterations_allow_between_turn_compaction() {

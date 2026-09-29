@@ -1042,6 +1042,11 @@ impl<'a> App<'a> {
                     self.refresh()?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
+                    if self.renderer.paint_pending_chat()?
+                        && self.input.picker.as_ref().is_some_and(|picker| picker.active())
+                    {
+                        self.refresh()?;
+                    }
                     self.renderer.tick_spinner()?;
                 }
                 // The @ file picker fills from a background walk; repaint as

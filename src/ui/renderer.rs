@@ -1426,6 +1426,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// Paint chat content that a throttled streaming update left undrawn,
+    /// then put the caret back. Called from the running UI tick so the last
+    /// tokens of a burst always appear even when no further token arrives.
+    /// Returns whether anything was painted.
+    pub(crate) fn paint_pending_chat(&mut self) -> io::Result<bool> {
+        if !self.chat_needs_redraw() {
+            return Ok(false);
+        }
+        self.render_viewport()?;
+        self.restore_bottom_cursor()?;
+        Ok(true)
+    }
+
     /// Advance only the running prompt's spinner cell. The 100 ms UI tick uses
     /// this after an ordinary full draw has established the input geometry.
     pub(crate) fn tick_spinner(&mut self) -> io::Result<()> {
