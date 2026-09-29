@@ -826,6 +826,8 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
+    ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",
@@ -3539,6 +3541,8 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         1,
         "NON-PROCESS",
     ),
+    // Small-stack thread for the turn-spawn stack regression (mini-agent-ood0d).
+    ("src/agent/runner.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     (
         "src/extras/acp/mod.rs",
         "let output = command.output().await.unwrap();",
