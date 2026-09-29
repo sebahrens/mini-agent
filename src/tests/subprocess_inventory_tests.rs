@@ -1302,6 +1302,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/sandbox.rs",
+        "let mut hook = command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut trusted = Command::new(\"/bin/sleep\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut sandboxed = Command::new(\"/bin/sleep\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
         "let mut isolated = std::process::Command::new(current_exe);",
         1,
         "TEST-ONLY",
@@ -3812,6 +3830,24 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox.rs",
         "let mut child = child_command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut hook = command.spawn().unwrap();",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut trusted = Command::new(\"/bin/sleep\");",
+        1,
+        "TEST-ONLY",
+    ),
+    (
+        "src/sandbox.rs",
+        "let mut sandboxed = Command::new(\"/bin/sleep\");",
         1,
         "TEST-ONLY",
     ),

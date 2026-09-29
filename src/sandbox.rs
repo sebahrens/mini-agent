@@ -298,15 +298,49 @@ fn shell_candidates(
 /// Transfers a direct-exec workspace service and every descendant into one
 /// owned lifecycle boundary. Wrapper order is significant on Windows because
 /// `JobObject` observes the inner `KillOnDrop` marker.
+///
+/// On Unix every workspace service, sandboxed or trusted, starts in a fresh
+/// session with no controlling terminal (see
+/// [`configure_new_session_child_lifetime`]); the session leader is also its
+/// process-group leader, so the tree is still owned and signalled by pgid.
 #[cfg(any(feature = "mcp", feature = "lsp"))]
 pub(crate) fn owned_workspace_service_tree(command: Command) -> CommandWrap {
     let mut command = CommandWrap::from(command);
     command.wrap(KillOnDrop);
     #[cfg(unix)]
-    command.wrap(ProcessGroup::leader());
+    command.wrap(NewSessionGroupLeader(ProcessGroup::leader()));
     #[cfg(windows)]
     command.wrap(JobObject);
     command
+}
+
+/// `process-wrap` process-group ownership for a child that makes itself a
+/// session leader before exec.
+///
+/// `ProcessGroup::leader` would call `setpgid(0, 0)` ahead of every pre-exec
+/// hook, and `setsid` then fails with `EPERM` for a process-group leader. This
+/// wrapper instead installs the idempotent new-session pre-exec step (a
+/// sandboxed command from [`Sandbox::wrap_workspace_service`] already carries
+/// it) and reuses `ProcessGroup`'s child wrapper, which signals and reaps the
+/// group whose id equals the child's pid.
+#[cfg(all(unix, any(feature = "mcp", feature = "lsp")))]
+#[derive(Debug)]
+struct NewSessionGroupLeader(ProcessGroup);
+
+#[cfg(all(unix, any(feature = "mcp", feature = "lsp")))]
+impl process_wrap::tokio::CommandWrapper for NewSessionGroupLeader {
+    fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> std::io::Result<()> {
+        configure_new_session_child_lifetime(command);
+        Ok(())
+    }
+
+    fn wrap_child(
+        &mut self,
+        inner: Box<dyn process_wrap::tokio::ChildWrapper>,
+        core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+        self.0.wrap_child(inner, core)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1799,7 +1833,7 @@ impl Sandbox {
                 for (key, value) in self.get_essential_env() {
                     cmd.env(key, value);
                 }
-                configure_model_child_lifetime(&mut cmd);
+                configure_new_session_child_lifetime(&mut cmd);
                 self.bind_workspace_cwd(&mut cmd)?;
                 return Ok(cmd);
             }
@@ -1893,7 +1927,7 @@ impl Sandbox {
         for (key, value) in self.get_essential_env() {
             cmd.env(key, value);
         }
-        configure_model_child_lifetime(&mut cmd);
+        configure_new_session_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -1902,6 +1936,11 @@ impl Sandbox {
     /// Unlike [`Self::wrap_command`], no shell parses `program` or `args`.
     /// The child always starts in `cwd` with a cleared environment containing
     /// only the standard non-credential allow-list plus `explicit_env`.
+    ///
+    /// Every arm, including the trusted (sandbox-disabled) one, starts the
+    /// hook in a fresh Unix session: hooks never own mini-agent's controlling
+    /// terminal, so they cannot read it, write escape sequences to it, or
+    /// inject keystrokes into the TUI with `TIOCSTI`.
     #[cfg(feature = "hooks")]
     pub(crate) fn wrap_hook_command(
         &self,
@@ -1919,7 +1958,7 @@ impl Sandbox {
                     cmd.env(key, value);
                 }
                 cmd.envs(explicit_env);
-                configure_child_lifetime(&mut cmd);
+                configure_new_session_child_lifetime(&mut cmd);
                 return Ok(cmd);
             }
             SandboxPolicy::RequiredButUnavailable => {
@@ -1959,7 +1998,7 @@ impl Sandbox {
                 cmd.env(key, value);
             }
             cmd.envs(explicit_env);
-            configure_child_lifetime(&mut cmd);
+            configure_new_session_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
 
@@ -1985,7 +2024,7 @@ impl Sandbox {
                 cmd.env(key, value);
             }
             cmd.envs(explicit_env).env("TMPDIR", "/private/tmp");
-            configure_child_lifetime(&mut cmd);
+            configure_new_session_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
 
@@ -1994,8 +2033,33 @@ impl Sandbox {
                 .to_string()
         })?;
         let readiness_shell = hook_readiness_shell()?;
+        Ok(self.build_hook_bwrap_command(
+            bwrap,
+            &readiness_shell,
+            program,
+            args,
+            &cwd,
+            &cache_dir,
+            explicit_env,
+        ))
+    }
+
+    /// Builds the bubblewrap arm of [`Self::wrap_hook_command`] from already
+    /// resolved trusted paths.
+    #[cfg(feature = "hooks")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_hook_bwrap_command(
+        &self,
+        bwrap: &Path,
+        readiness_shell: &Path,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        cache_dir: &Path,
+        explicit_env: &std::collections::BTreeMap<String, String>,
+    ) -> Command {
         let mut cmd = Command::new(bwrap);
-        cmd.current_dir(&cwd).env_clear();
+        cmd.current_dir(cwd).env_clear();
         for (key, value) in self.get_essential_env() {
             cmd.env(key, value);
         }
@@ -2009,11 +2073,11 @@ impl Sandbox {
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
             .arg("--bind")
-            .arg(&cwd)
-            .arg(&cwd)
+            .arg(cwd)
+            .arg(cwd)
             .arg("--bind")
-            .arg(cache_dir.as_path())
-            .arg(cache_dir.as_path())
+            .arg(cache_dir)
+            .arg(cache_dir)
             .args([
                 "--unshare-user",
                 "--unshare-ipc",
@@ -2025,15 +2089,17 @@ impl Sandbox {
                 "/",
                 "--chdir",
             ])
-            .arg(&cwd)
-            .args(["--die-with-parent", "--"])
+            .arg(cwd)
+            // `--dev` exposes a /dev/tty node; a fresh session (here and in
+            // the pre-exec lifetime) leaves the hook no controlling terminal.
+            .args(["--new-session", "--die-with-parent", "--"])
             .arg(readiness_shell)
             .arg("-c")
             .arg(HOOK_SANDBOX_READY_SCRIPT)
             .arg(program)
             .args(args);
-        configure_child_lifetime(&mut cmd);
-        Ok(cmd)
+        configure_new_session_child_lifetime(&mut cmd);
+        cmd
     }
 
     /// Build a direct-exec workspace service boundary.
@@ -2044,6 +2110,9 @@ impl Sandbox {
     /// such as MCP stdio or LSP servers, not for the broker-only JS worker
     /// profile.
     /// The supplied environment is the complete delegated environment.
+    /// Every Unix arm starts the service in a fresh session with no
+    /// controlling terminal, and bubblewrap additionally requests
+    /// `--new-session`.
     #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
     pub(crate) fn wrap_workspace_service(
         &self,
@@ -2114,7 +2183,7 @@ impl Sandbox {
                 cmd.arg(assignment);
             }
             cmd.arg(program).args(args).current_dir(&cwd);
-            configure_child_lifetime(&mut cmd);
+            configure_new_session_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
 
@@ -2138,7 +2207,7 @@ impl Sandbox {
                 .arg(program)
                 .args(args)
                 .current_dir(&cwd);
-            configure_child_lifetime(&mut cmd);
+            configure_new_session_child_lifetime(&mut cmd);
             return Ok(cmd);
         }
 
@@ -2146,6 +2215,29 @@ impl Sandbox {
             "sandbox backend 'bwrap' is not a trusted system executable — refusing workspace-service launch"
                 .to_string()
         })?;
+        Ok(Self::build_workspace_service_bwrap_command(
+            bwrap,
+            program,
+            args,
+            &cwd,
+            &cache_dir,
+            env,
+            deny_network,
+        ))
+    }
+
+    /// Builds the bubblewrap arm of [`Self::wrap_workspace_service`] from an
+    /// already resolved trusted `bwrap`.
+    #[cfg(any(feature = "mcp", feature = "lsp", feature = "git-worktree", test))]
+    fn build_workspace_service_bwrap_command(
+        bwrap: &Path,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        cache_dir: &Path,
+        env: &[(OsString, OsString)],
+        deny_network: bool,
+    ) -> Command {
         let mut cmd = Command::new(bwrap);
         cmd.env_clear();
         cmd.arg("--clearenv");
@@ -2162,10 +2254,8 @@ impl Sandbox {
             cmd.args(["--ro-bind-try", path, path]);
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-        cmd.arg("--bind").arg(&cwd).arg(&cwd);
-        cmd.arg("--bind")
-            .arg(cache_dir.as_path())
-            .arg(cache_dir.as_path());
+        cmd.arg("--bind").arg(cwd).arg(cwd);
+        cmd.arg("--bind").arg(cache_dir).arg(cache_dir);
         cmd.args([
             "--unshare-user",
             "--unshare-ipc",
@@ -2179,13 +2269,17 @@ impl Sandbox {
         cmd.arg("--remount-ro")
             .arg("/")
             .arg("--chdir")
-            .arg(&cwd)
+            .arg(cwd)
+            // `--dev` exposes a /dev/tty node; a fresh session (here and in
+            // the pre-exec lifetime) leaves the service no controlling
+            // terminal.
+            .arg("--new-session")
             .arg("--die-with-parent")
             .arg("--")
             .arg(program)
             .args(args);
-        configure_child_lifetime(&mut cmd);
-        Ok(cmd)
+        configure_new_session_child_lifetime(&mut cmd);
+        cmd
     }
 
     /// Validate that a direct executable can cross the exact bound workspace
@@ -2279,7 +2373,7 @@ impl Sandbox {
             .arg(&self.shell_command_arg)
             .arg(command);
         cmd.current_dir(cwd);
-        configure_model_child_lifetime(&mut cmd);
+        configure_new_session_child_lifetime(&mut cmd);
         Ok(cmd)
     }
 
@@ -2310,7 +2404,7 @@ impl Sandbox {
                 .arg(&self.shell_command_arg)
                 .arg(command);
         }
-        configure_model_child_lifetime(&mut cmd);
+        configure_new_session_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -2344,7 +2438,7 @@ impl Sandbox {
             SNAPSHOT_EXECUTABLE_PATH,
         ]);
         cmd.args(arguments);
-        configure_model_child_lifetime(&mut cmd);
+        configure_new_session_child_lifetime(&mut cmd);
         cmd
     }
 
@@ -3676,22 +3770,53 @@ pub(crate) async fn await_drained_process_group(pid: u32, budget: std::time::Dur
     }
 }
 
+/// Owns a child as its own Unix process group while it deliberately stays in
+/// mini-agent's session, so it keeps mini-agent's controlling terminal.
+///
+/// Reserve this for trusted children that are meant to share the terminal
+/// with the user, never for model-, repository-, or configuration-authored
+/// code that runs behind a sandbox boundary. Its callers are:
+/// - `Sandbox::status_support_command` (interactive support utilities such as
+///   lazygit, which inherit the terminal's stdio);
+/// - `Sandbox::output_support_command` (short trusted utility probes that run
+///   beside the same terminal);
+/// - the Unix clipboard helper in `ui::renderer` (fixed `wl-copy`/`xclip`/
+///   `pbcopy` argv);
+/// - `git::runner`'s trusted internal Git constructor (closed mini-agent
+///   grammar, not the contained workspace-service launch);
+/// - the Windows AppContainer helper, where Unix sessions do not exist.
+///
+/// Sandboxed hooks, workspace services (MCP/LSP/contained Git), and model
+/// commands use [`configure_new_session_child_lifetime`] instead.
 pub(crate) fn configure_child_lifetime(cmd: &mut Command) {
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
 }
 
+/// Owns a child that runs code mini-agent does not author or that crosses a
+/// sandbox boundary: it starts in a fresh Unix session with no controlling
+/// terminal.
+///
+/// `setsid` makes the child both a session and process-group leader, so
+/// `pid == pgid` and `killpg` cleanup is unchanged, while the child can no
+/// longer open `/dev/tty` to read the user's terminal, write escape
+/// sequences to it, or inject keystrokes with `TIOCSTI`. The pre-exec step is
+/// idempotent: a child that is already a session leader (because an earlier
+/// wrapper created the session) is left as it is.
 #[cfg_attr(unix, allow(unsafe_code))]
-fn configure_model_child_lifetime(cmd: &mut Command) {
+fn configure_new_session_child_lifetime(cmd: &mut Command) {
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // A fresh session both preserves pid-as-process-group ownership for
-        // killpg and prevents access to mini-agent's controlling terminal.
+        // SAFETY: the closure only calls the async-signal-safe `getpid`,
+        // `getsid`, and `setsid` and does not allocate.
         unsafe {
             cmd.as_std_mut().pre_exec(|| {
+                if libc::getsid(0) == libc::getpid() {
+                    return Ok(());
+                }
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -5383,6 +5508,309 @@ mod sandbox_tests {
         assert_eq!(command_status, CommandStatus::Completed);
         assert!(exit_succeeded);
         assert!(stderr.is_empty(), "{stderr:?}");
+    }
+
+    fn command_argv(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The production source of `sandbox.rs` from the first `start` marker up
+    /// to the next `end` marker.
+    fn sandbox_source_between(start: &str, end: &str) -> &'static str {
+        let source = include_str!("sandbox.rs");
+        let from = source.find(start).expect("start marker");
+        let to = from + source[from..].find(end).expect("end marker");
+        &source[from..to]
+    }
+
+    fn assert_new_session_before_separator(args: &[String]) {
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("bubblewrap argv ends its options with --");
+        let new_session = args
+            .iter()
+            .position(|arg| arg == "--new-session")
+            .expect("bubblewrap must request --new-session");
+        assert!(
+            new_session < separator,
+            "--new-session must be a bubblewrap option, not a child argument: {args:?}"
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[test]
+    fn hook_command_argv_requests_new_session() {
+        let sandbox = Sandbox::new(true, "bwrap");
+        let command = sandbox.build_hook_bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/bin/sh"),
+            "/usr/bin/hook",
+            &["--flag".to_string()],
+            Path::new("/workspace"),
+            Path::new("/cache/mini-agent"),
+            &std::collections::BTreeMap::new(),
+        );
+        let args = command_argv(&command);
+        assert_new_session_before_separator(&args);
+        for flag in ["--dev", "--die-with-parent", "--unshare-pid"] {
+            assert!(args.iter().any(|arg| arg == flag), "missing {flag}");
+        }
+
+        // Every arm, including the trusted one, uses the new-session
+        // lifetime; none keeps the shared-terminal process group.
+        let wrap = sandbox_source_between(
+            "    pub(crate) fn wrap_hook_command(",
+            "    fn build_hook_bwrap_command(",
+        );
+        assert!(!wrap.contains("configure_child_lifetime("));
+        assert_eq!(
+            wrap.matches("configure_new_session_child_lifetime(&mut cmd);")
+                .count(),
+            3,
+            "the disabled, zerobox, and Seatbelt hook arms"
+        );
+        assert!(wrap.contains("self.build_hook_bwrap_command("));
+        let bwrap = sandbox_source_between(
+            "    fn build_hook_bwrap_command(",
+            "    /// Build a direct-exec workspace service boundary.",
+        );
+        assert!(!bwrap.contains("configure_child_lifetime("));
+        assert!(bwrap.contains("configure_new_session_child_lifetime(&mut cmd);"));
+    }
+
+    #[test]
+    fn workspace_service_argv_requests_new_session() {
+        for deny_network in [true, false] {
+            let command = Sandbox::build_workspace_service_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/usr/bin/service"),
+                &["--stdio".to_string()],
+                Path::new("/workspace"),
+                Path::new("/cache/mini-agent"),
+                &[(OsString::from("PATH"), OsString::from("/usr/bin"))],
+                deny_network,
+            );
+            let args = command_argv(&command);
+            assert_new_session_before_separator(&args);
+            assert_eq!(args.iter().any(|arg| arg == "--unshare-net"), deny_network);
+        }
+
+        let wrap = sandbox_source_between(
+            "    pub(crate) fn wrap_workspace_service(",
+            "    fn build_workspace_service_bwrap_command(",
+        );
+        assert!(!wrap.contains("configure_child_lifetime("));
+        assert_eq!(
+            wrap.matches("configure_new_session_child_lifetime(&mut cmd);")
+                .count(),
+            2,
+            "the Seatbelt and zerobox workspace-service arms"
+        );
+        let bwrap = sandbox_source_between(
+            "    fn build_workspace_service_bwrap_command(",
+            "    /// Validate that a direct executable can cross the exact bound workspace",
+        );
+        assert!(!bwrap.contains("configure_child_lifetime("));
+        assert!(bwrap.contains("configure_new_session_child_lifetime(&mut cmd);"));
+    }
+
+    /// Asserts that `pid` leads its own session and process group, i.e. it
+    /// has no access to mini-agent's controlling terminal while `killpg(pid)`
+    /// still owns its whole tree.
+    #[cfg(all(unix, any(feature = "hooks", feature = "mcp", feature = "lsp")))]
+    fn assert_new_session_leader(pid: u32) {
+        use nix::unistd::{Pid, getpgid, getsid};
+        let pid = Pid::from_raw(i32::try_from(pid).unwrap());
+        assert_eq!(getsid(Some(pid)), Ok(pid), "child must lead a new session");
+        assert_eq!(
+            getpgid(Some(pid)),
+            Ok(pid),
+            "killpg ownership needs pid == pgid"
+        );
+        assert_ne!(getsid(None), Ok(pid));
+    }
+
+    #[cfg(all(unix, feature = "hooks"))]
+    #[tokio::test]
+    async fn trusted_hook_command_starts_a_new_session() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = disabled()
+            .wrap_hook_command(
+                "/bin/sleep",
+                &["30".to_string()],
+                &cwd,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut hook = command.spawn_guarded().unwrap();
+        let pid = hook.id().unwrap();
+        let session = std::panic::catch_unwind(|| assert_new_session_leader(pid));
+        let _ = hook.start_kill();
+        let _ = hook.wait().await;
+        if let Err(panic) = session {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(all(unix, any(feature = "mcp", feature = "lsp")))]
+    #[tokio::test]
+    async fn owned_workspace_service_tree_starts_a_new_session() {
+        // A trusted service carries no pre-exec step of its own; a sandboxed
+        // one already requests a session, which must stay idempotent.
+        let mut trusted = Command::new("/bin/sleep");
+        trusted.arg("30");
+        let mut sandboxed = Command::new("/bin/sleep");
+        sandboxed.arg("30");
+        configure_new_session_child_lifetime(&mut sandboxed);
+        for command in [trusted, sandboxed] {
+            let mut command = owned_workspace_service_tree(command);
+            command
+                .command_mut()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut service =
+                crate::process_creation::CommandWrapCreationExt::spawn_guarded(&mut command)
+                    .unwrap();
+            let pid = service.id().unwrap();
+            let session = std::panic::catch_unwind(|| assert_new_session_leader(pid));
+            let _ = Box::into_pin(service.kill()).await;
+            let _ = service.wait().await;
+            if let Err(panic) = session {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    /// Whether this test process itself can open its controlling terminal.
+    /// Without one, a "cannot open /dev/tty" result proves nothing.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "hooks"))]
+    fn test_process_has_controlling_terminal() -> bool {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
+    }
+
+    /// Hook/service body that fails with the `open(2)` error for `/dev/tty`,
+    /// after proving the device node itself is visible.
+    #[cfg(all(target_os = "linux", feature = "hooks"))]
+    const OPEN_TTY_PROBE: &str = "test -c /dev/tty || exit 90; exec 3<>/dev/tty";
+    /// The Seatbelt profile already denies writes to `/dev/tty` (`EPERM`), so
+    /// the macOS probe opens it read-only, which the profile allows; only the
+    /// missing controlling terminal can then make the open fail.
+    #[cfg(all(target_os = "macos", feature = "hooks"))]
+    const OPEN_TTY_PROBE: &str = "test -c /dev/tty || exit 90; exec 3</dev/tty";
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "hooks"))]
+    fn assert_tty_open_failed_with_enxio(output: &CommandOutput) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let command_status = output.status;
+        assert_eq!(command_status, CommandStatus::Completed, "{stderr}");
+        let code = output.exit_status.and_then(|status| status.code());
+        assert!(
+            code.is_some_and(|code| code != 0 && code != 90),
+            "opening /dev/tty must fail although the node exists (exit {code:?}): {stderr}"
+        );
+        // strerror(ENXIO) on glibc/musl and on macOS respectively.
+        assert!(
+            stderr.contains("No such device or address")
+                || stderr.contains("Device not configured"),
+            "opening /dev/tty must fail with ENXIO: {stderr}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "hooks"))]
+    #[tokio::test]
+    #[ignore = "requires a real Linux bubblewrap backend and a controlling terminal (run under script(1))"]
+    async fn bwrap_hook_has_no_controlling_terminal() {
+        assert!(
+            test_process_has_controlling_terminal(),
+            "run this test under script(1) so the negative /dev/tty probe is meaningful"
+        );
+        let sandbox = Sandbox::new(true, "bwrap");
+        let cwd = std::env::current_dir().unwrap();
+        let command = sandbox
+            .wrap_hook_command(
+                "/bin/sh",
+                &["-c".to_string(), OPEN_TTY_PROBE.to_string()],
+                &cwd,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_tty_open_failed_with_enxio(&output);
+
+        let command = sandbox
+            .wrap_workspace_service(
+                Path::new("/bin/sh"),
+                &["-c".to_string(), OPEN_TTY_PROBE.to_string()],
+                &cwd,
+                &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+                true,
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_tty_open_failed_with_enxio(&output);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "hooks"))]
+    #[tokio::test]
+    async fn seatbelt_hook_has_no_controlling_terminal() {
+        if !seatbelt_exists() {
+            panic!("the supported macOS Seatbelt backend is unavailable");
+        }
+        if !test_process_has_controlling_terminal() {
+            // The probe below still runs, but only a terminal-attached run
+            // (for example under script(1)) makes it a real negative proof.
+            eprintln!("note: no controlling terminal; the /dev/tty denial is vacuous here");
+        }
+        let sandbox = Sandbox::new(true, "seatbelt");
+        let cwd = std::env::current_dir().unwrap();
+        let command = sandbox
+            .wrap_hook_command(
+                "/bin/sh",
+                &["-c".to_string(), OPEN_TTY_PROBE.to_string()],
+                &cwd,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_tty_open_failed_with_enxio(&output);
+
+        let command = sandbox
+            .wrap_workspace_service(
+                Path::new("/bin/sh"),
+                &["-c".to_string(), OPEN_TTY_PROBE.to_string()],
+                &cwd,
+                &[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+                true,
+            )
+            .unwrap();
+        let output = sandbox
+            .output_built_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
+            .await
+            .unwrap();
+        assert_tty_open_failed_with_enxio(&output);
     }
 
     #[test]

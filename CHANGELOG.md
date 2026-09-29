@@ -50,6 +50,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   a third-party `base_url` no longer inherits the vendor key (`OPENAI_API_KEY`, `api_keys.openai`,
   ...); it uses only its own `api_key_env` or `api_keys` entry, unless it points at the vendor's
   own endpoint or sets the new opt-in `inherit_builtin_key = true`.
+- Hooks and workspace services (MCP stdio and LSP servers, contained Git) now start in their own
+  session with no controlling terminal, as sandboxed model commands already did, so they can no
+  longer inject keystrokes into the TUI (`TIOCSTI`) or write escape sequences to your terminal.
 
 ### Added
 
