@@ -209,7 +209,7 @@ invalidates the authorization.
 Headless loops save each iteration's prompt, completed tool calls and results,
 response, and token usage to the resumable session before validation or error
 propagation. A provider failure after a tool effect therefore leaves a record
-for `--continue`. `--no-session` suppresses these saves. If the iteration and
+for `--continue`. `--no-session` suppresses these saves and the goal round records. If the iteration and
 the save both fail, the error reports both failures.
 
 The same wrapper is used for read-only `/btw` and exploration-subagent tool

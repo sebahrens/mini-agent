@@ -636,6 +636,7 @@ async fn start_goal_verification(
 
     let tx = verification_tx.clone();
     let pending_request = request.clone();
+    let goal_id = goal.id.clone();
     // An operator who interrupts must not wait for a check, and the check must
     // actually stop: cancellation terminates the command's process group and
     // reaps it, which dropping this task's future would not.
@@ -665,6 +666,7 @@ async fn start_goal_verification(
                     &client,
                     &transcript,
                     &cfg,
+                    checks.as_ref(),
                 )
                 .await,
             ),
@@ -675,7 +677,8 @@ async fn start_goal_verification(
                 crate::event::GoalVerificationEvent {
                     operation_id,
                     checks,
-                    judge: judged,
+                    judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                    judge: judged.map(|call| call.outcome),
                     interrupted,
                 },
             )))
@@ -687,10 +690,20 @@ async fn start_goal_verification(
     run.pending_goal_gate = Some(crate::ui::state::PendingGoalGate {
         operation_id,
         cancel,
+        goal_id,
         summary,
         request: pending_request,
     });
     Ok(true)
+}
+
+/// Whether a verification result may still settle its round.
+#[cfg(feature = "goal")]
+pub(crate) fn goal_verification_still_applies(
+    goal: &crate::extras::goal::Goal,
+    goal_id: &str,
+) -> bool {
+    goal.status.is_running() && goal.id == goal_id
 }
 
 /// Resume a round whose verification has come back.
@@ -710,10 +723,30 @@ pub(crate) async fn handle_goal_verification_event(
         return Ok(false);
     };
     run.is_running = false;
+    // The judge's tokens are part of the round's cost, so the goal's token
+    // total and its budget see them before the gate decides.
+    let mut summary = pending.summary;
+    summary.tokens_used = summary.tokens_used.saturating_add(event.judge_tokens);
     let decision = {
         let Some(goal) = ui.session.goal_store.snapshot() else {
             return Ok(false);
         };
+        // `/goal pause` is reachable while verification runs. A verdict that
+        // arrives afterwards is set aside, exactly as a round that ends on a
+        // paused goal is: applying it would overwrite the operator's pause
+        // with `met` (a paused goal may still become met by transition) and
+        // count a round the operator stopped. The same holds for a goal that
+        // was cleared or replaced meanwhile.
+        if !goal_verification_still_applies(&goal, &pending.goal_id) {
+            renderer.write_line(
+                &format!(
+                    "goal: verification result set aside — the goal is {}",
+                    goal.status.label()
+                ),
+                C_AGENT,
+            )?;
+            return Ok(false);
+        }
         // An interrupt is not a verdict on the claim. Settling it through the
         // gate's interrupt row leaves the goal untouched and uncounted, which
         // is what the operator asked for.
@@ -722,7 +755,7 @@ pub(crate) async fn handle_goal_verification_event(
         } else {
             crate::extras::goal::gate::gate_post(
                 &goal,
-                &pending.summary,
+                &summary,
                 &pending.request,
                 event.checks.as_ref(),
                 event.judge.as_ref(),
@@ -733,12 +766,13 @@ pub(crate) async fn handle_goal_verification_event(
         renderer,
         run,
         ui,
-        pending.summary,
+        summary,
         decision,
         crate::extras::goal::driver::Verification {
             request: Some(pending.request),
             checks: event.checks,
             judge: event.judge,
+            judge_tokens: event.judge_tokens,
             interrupted: false,
         },
     ))

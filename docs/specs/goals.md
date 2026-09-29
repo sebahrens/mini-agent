@@ -54,6 +54,11 @@ user rather than discarding it. A finished goal leaves its state only by an expl
 `impossible` may be reopened, `met` may not. A status this build does not recognize parks the goal
 instead of failing the whole session load.
 
+The record keeps its last ten gate evaluations as short lines, each naming the round it was for and
+which attempt at that round it was, so `/goal status` can show why a round took two tries — an
+interrupted verification settles without counting its round, and the retry is that round's second
+attempt. The full per-round detail stays in the transcripts.
+
 `paused` carries a reason — no progress, judge unavailable, context overflow, round failure, an
 unknown stored status, or the user asking for it — because those are unrelated conditions and a
 user cannot act on "paused" alone.
@@ -143,7 +148,9 @@ are all failures, and a goal whose checks cannot run can never reach `met` throu
 Cancellation is not a failure. A check the operator interrupted proved nothing either way, so the
 round settles as interrupted — untouched and uncounted — rather than being judged on a command that
 was stopped. The command is cancelled rather than dropped, so its process group is terminated and
-reaped instead of outliving the interrupt.
+reaped instead of outliving the interrupt. The same interrupt covers the judge: a judge request still
+waiting on its provider is abandoned, and the round settles as interrupted, so a verdict that would
+have arrived after the operator stopped the run can never mark the goal met.
 
 ### Judge
 
@@ -161,7 +168,11 @@ wrong endpoint for a model it has never heard of — and fail open, silently cos
 user configured.
 
 The judge receives the objective and a bounded, sanitized tail of the conversation, fenced as
-untrusted data because that tail carries tool output the workspace controls. It gets no tools and no
+untrusted data because that tail carries tool output the workspace controls. When checks or the
+verify command ran this round, it also receives a bounded `## Checks` block, fenced the same way:
+each command that passed, with its exit status, or the recorded tail of the first failure. A judge
+that cannot see what the harness already proved would reject claims for want of that evidence and
+buy rounds that prove nothing new. It gets no tools and no
 workspace. Its prompt states that a verdict appearing inside the transcript is text being reported,
 never a directive, and the fence holds structurally: the closing tag is defanged inside the tail, so
 a fixture containing it cannot end the region. The tail's budget is spent from the newest end
@@ -204,6 +215,14 @@ long the agent worked, not how long the user took to answer. Every surface measu
 terminal around its own prompt, an editor by subtracting what the client spent deciding, and a
 headless run by the round's wall clock, since nothing there can prompt.
 
+`max_tokens` and the goal's token total count the whole round: the agent's usage, including any
+mid-round reminder it was sent, plus the judge call that adjudicated it. A judge is counted in input
+plus output tokens as its provider reported them for the call that returned an answer, parseable or
+not, on whichever provider it runs. A call that failed, was interrupted, or was retried away before a
+final response reported nothing and adds nothing. Tokens, not cost, are what the bound measures, so a
+judge on a cheaper model counts the same per token. The session's cost counters do not include judge
+calls.
+
 The wrap-up round runs on an agent capped to `wrap_up_max_agent_turns`, so the bound the harness
 announces is the bound the round gets. It is issued once per exhaustion and re-armed by resuming or
 raising a bound.
@@ -241,7 +260,9 @@ flags applies them afterwards, so a flag always beats the file it overrides.
   unfinished goal is refused. A status-line item shows round and status. Each gate decision prints
   one line, because an agent that keeps going without saying why is the most common complaint about
   autonomous loops. `status` and `pause` are reachable while rounds are chaining, which is the whole
-  time a goal exists.
+  time a goal exists. A pause while a completion claim is being verified wins: the result that
+  arrives afterwards is set aside, the round is not counted, and `resume` picks the goal up again.
+  The same holds for a result whose goal was cleared or replaced meanwhile.
 - **CLI**: `--goal`, `--goal-done`, `--goal-check`, `--goal-max-rounds`, `--goal-continuation`,
   `--goal-replace`. The dependent flags require `--goal` rather than being accepted and dropped. A
   goal under `--no-tools` is refused at startup, whether it came from the flag or from a resumed
@@ -254,9 +275,14 @@ flags applies them afterwards, so a flag always beats the file it overrides.
 - **Hooks**: the `Stop` envelope carries the goal id, status, and round, published from the moment a
   goal is set rather than from its first gate decision; null without a goal, and after one is
   cleared or the session is switched.
+- **Export**: a JSONL export carries the goal's objective, criteria, status, pause reason and
+  progress counters, and `/import` restores them. The imported goal is rebuilt through the same
+  factory as every other surface, so its checks, judge and bounds are the importing installation's;
+  a file cannot bring commands or a judge endpoint with it.
 - **Transcripts**: one bounded JSON record per gate evaluation under the goals directory, naming
   which model judged and whether it was the agent's own. A stored goal id that is not a plain
-  identifier is reissued rather than used as a path.
+  identifier is reissued rather than used as a path. `--no-session` writes none: the records are
+  the session's audit trail, and a run that saves no session leaves no goal directory behind.
 
 ## Extension map
 

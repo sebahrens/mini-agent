@@ -136,6 +136,9 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
+    if cli.no_session {
+        paths::disable_session_artifacts();
+    }
 
     #[cfg(feature = "js")]
     if cli.js_runtime_check {
@@ -445,6 +448,15 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
             extras::acp::serve(startup.cli, startup.cfg, startup.context)
         })
         .await;
+    }
+
+    // `--loop-max 0` runs nothing. Answer it before feature start-up and the
+    // startup prompts, so asking for no iterations cannot block on a prompt,
+    // read stdin or start servers first.
+    #[cfg(feature = "loop")]
+    if startup.cli.loop_mode && startup.cli.loop_max == Some(0) {
+        eprintln!("[loop] max iterations (0) reached, stopping");
+        return Ok(());
     }
 
     startup.start_openrouter_pricing_refresh();

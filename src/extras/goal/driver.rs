@@ -241,7 +241,7 @@ fn push_context_file(prompt: &mut String, goal: &Goal) {
     let Some(path) = goal.context_file.as_ref() else {
         return;
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Some(contents) = read_context_file(path) else {
         return;
     };
     prompt.push_str(&format!("\n\nCurrent plan ({}):\n", path.display()));
@@ -250,6 +250,41 @@ fn push_context_file(prompt: &mut String, goal: &Goal) {
         "\n\nKeep {} current: mark finished items, add what you discover.",
         path.display()
     ));
+}
+
+/// Most of a plan file carried into one round's instruction.
+///
+/// The plan rides every round's prompt. One that grows without bound — the
+/// agent appending to it round after round, or a large file named as the plan
+/// — would eventually overflow the context and park the goal on
+/// `context_overflow`, which rerunning cannot fix.
+pub(crate) const CONTEXT_FILE_BYTES: usize = 32 * 1024;
+
+/// Read at most [`CONTEXT_FILE_BYTES`] of the plan, clipped on a character
+/// boundary. A file that is not text is absent, like a missing one.
+fn read_context_file(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    // A few bytes past the cap tell a clipped file from one that fits, and
+    // keep a character split by the cap decodable up to the boundary.
+    file.take(CONTEXT_FILE_BYTES as u64 + 4)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        // Only a sequence cut short by the read limit is tolerated.
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
+    Some(crate::extras::truncate::truncate_cjk(
+        text,
+        CONTEXT_FILE_BYTES,
+        "\n…[plan clipped: only its first 32 KiB is shown each round; keep it concise]",
+    ))
 }
 
 fn round_header(goal: &Goal, round: u32) -> String {
@@ -679,6 +714,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A plan that grows without bound cannot grow the round instruction with
+    /// it (mini-agent-3o7sl).
+    #[test]
+    fn a_large_context_file_is_clipped_in_the_round_instruction() {
+        let dir = std::env::temp_dir().join(format!("goal-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("PLAN.md");
+        // Multi-byte characters straddle the cap, so clipping has to find a
+        // boundary rather than split one.
+        let body = "- [ ] 計画 item\n".repeat(20_000);
+        std::fs::write(&plan, format!("FIRST LINE\n{body}LAST LINE\n")).unwrap();
+
+        let mut g = goal();
+        g.context_file = Some(plan.clone());
+        let decision = GateDecision::Continue {
+            instruction: "carry on".into(),
+            wrap_up: false,
+            source: crate::extras::goal::VerdictSource::Structural,
+        };
+        let round = next_round(&g, &decision).expect("relaunch");
+        assert!(round.prompt.contains("FIRST LINE"));
+        assert!(!round.prompt.contains("LAST LINE"));
+        assert!(round.prompt.contains("plan clipped"));
+        assert!(
+            round.prompt.len() < CONTEXT_FILE_BYTES + 4 * 1024,
+            "{} bytes",
+            round.prompt.len()
+        );
+
+        // A file that is not text is absent, as before.
+        std::fs::write(&plan, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let round = next_round(&g, &decision).expect("relaunch");
+        assert!(!round.prompt.contains("Current plan"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An interrupt is the operator stopping the work. Reported as a round
     /// failure it would be retried, which is the opposite of what was asked
     /// for, and the goal would keep spending its budget after the signal.
@@ -770,6 +841,9 @@ pub struct Verification {
     pub request: Option<super::gate::VerifyRequest>,
     pub checks: Option<super::gate::CheckOutcome>,
     pub judge: Option<super::gate::JudgeOutcome>,
+    /// Tokens the judge call spent. They count toward the goal's token total
+    /// and its `max_tokens` bound like the agent's own.
+    pub judge_tokens: u64,
     /// The operator stopped the work while the tiers were running.
     ///
     /// That is not a verdict on the claim — a cancelled check has proved
@@ -786,6 +860,34 @@ impl Verification {
     }
 }
 
+/// Run one verification tier unless the operator interrupts it first.
+///
+/// `None` means the interrupt won. The tier's future is dropped rather than
+/// awaited, so a judge request still waiting on its provider is abandoned
+/// instead of arriving after the operator stopped the run and deciding the
+/// goal anyway. A signal handler that could not be installed is not an
+/// interrupt: the tier then runs to completion as it would have without one.
+pub async fn unless_interrupted<T>(
+    work: impl std::future::Future<Output = T>,
+    interrupt: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Option<T> {
+    tokio::pin!(work);
+    tokio::pin!(interrupt);
+    tokio::select! {
+        // Poll the signal first so its handler is installed before the tier
+        // sends anything.
+        biased;
+        signal = &mut interrupt => match signal {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "goal: verification interrupt handler failed");
+                Some(work.await)
+            }
+        },
+        value = &mut work => Some(value),
+    }
+}
+
 /// Fold an already-decided round into the goal.
 ///
 /// The shared half of [`settle_round`], split out for surfaces that run
@@ -799,9 +901,14 @@ pub fn apply_decision(
     let checks = verification.checks.as_ref();
     let judge = verification.judge.as_ref();
     let line = match store.with_mut(|goal| {
+        // The round being evaluated, whether or not the gate ends up counting
+        // it: an interrupted evaluation is an attempt at the same round.
+        let round = goal.progress.current_round();
         super::gate::apply(goal, summary, &decision, judge, verification.cause());
         super::transcript::save_round(goal, summary, &decision, decision.reason(), checks, judge);
-        decision_line(goal, &decision)
+        let line = decision_line(goal, &decision);
+        goal.push_history(round, line.strip_prefix("goal: ").unwrap_or(&line));
+        line
     }) {
         Some(line) => line,
         None => return RoundOutcome::Inactive,
@@ -860,6 +967,9 @@ where
                 summary.end = super::gate::RoundEnd::Cancelled;
                 (super::gate::gate_interrupted(), Verification::default())
             } else {
+                summary.tokens_used = summary
+                    .tokens_used
+                    .saturating_add(verification.judge_tokens);
                 let decision = super::gate::gate_post(
                     &goal,
                     &summary,
@@ -985,6 +1095,96 @@ mod settle_tests {
         });
     }
 
+    /// A judge still waiting on its provider when the operator interrupts is
+    /// abandoned, not awaited: its late verdict must not decide the goal
+    /// (mini-agent-e3nb6).
+    #[tokio::test]
+    async fn an_interrupt_drops_a_pending_tier_instead_of_awaiting_it() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let judge = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            "met"
+        };
+        let result = unless_interrupted(judge, async { Ok(()) }).await;
+        assert_eq!(result, None);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Without an interrupt the tier's answer comes through.
+        let result = unless_interrupted(async { "met" }, std::future::pending()).await;
+        assert_eq!(result, Some("met"));
+
+        // A signal handler that failed to install is not an interrupt.
+        let result = unless_interrupted(async { "met" }, async {
+            Err(std::io::Error::other("no handler"))
+        })
+        .await;
+        assert_eq!(result, Some("met"));
+    }
+
+    /// An interrupted verification leaves the goal active and the round
+    /// uncounted, whichever tier was running (mini-agent-e3nb6).
+    #[tokio::test]
+    async fn an_interrupted_judge_leaves_the_goal_active_and_uncounted() {
+        let _paths = isolated_paths();
+        let store = GoalStore::default();
+        let mut goal = Goal::new("finish the job", Vec::new()).unwrap();
+        goal.judge = JudgePolicy::Session;
+        store.set(goal, false).unwrap();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked_in_tier = asked.clone();
+        report(&store, ReportStatus::Met);
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        let outcome = settle_round(&store, summary, |request| async move {
+            assert!(request.run_judge, "a met claim with a judge asks it");
+            asked_in_tier.store(true, std::sync::atomic::Ordering::SeqCst);
+            match unless_interrupted(
+                async {
+                    super::super::gate::JudgeOutcome::Verdict {
+                        outcome: super::super::Outcome::Met,
+                        reason: "late".into(),
+                    }
+                },
+                async { Ok(()) },
+            )
+            .await
+            {
+                Some(judge) => Verification {
+                    judge: Some(judge),
+                    ..Verification::default()
+                },
+                None => Verification {
+                    interrupted: true,
+                    ..Verification::default()
+                },
+            }
+        })
+        .await;
+        let completed = match &outcome {
+            RoundOutcome::Stopped { status, .. } => *status == GoalStatus::Met,
+            _ => false,
+        };
+        assert!(!completed, "{outcome:?}");
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(
+            goal.progress.rounds, 0,
+            "the interrupted round is uncounted"
+        );
+    }
+
     #[tokio::test]
     async fn a_working_round_relaunches_with_a_visible_reason() {
         let _paths = isolated_paths();
@@ -1022,6 +1222,77 @@ mod settle_tests {
             }
             other => panic!("expected a stop, got {other:?}"),
         }
+    }
+
+    /// The judge's tokens are the goal's tokens: they count in the total and
+    /// against `max_tokens` (mini-agent-9ztz6).
+    #[tokio::test]
+    async fn judge_tokens_count_toward_the_goal_total_and_its_budget() {
+        let _paths = isolated_paths();
+        let store = GoalStore::default();
+        let mut goal = Goal::new("finish the job", Vec::new()).unwrap();
+        goal.judge = JudgePolicy::Session;
+        goal.bounds.max_tokens = Some(1_000);
+        store.set(goal, false).unwrap();
+        report(&store, ReportStatus::Met);
+        let summary = RoundSummary {
+            mutating_tool_calls: 1,
+            tokens_used: 300,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        let outcome = settle_round(&store, summary, |_request| async {
+            Verification {
+                judge: Some(crate::extras::goal::gate::JudgeOutcome::Verdict {
+                    outcome: crate::extras::goal::Outcome::NotYet,
+                    reason: "the tests are missing".into(),
+                }),
+                judge_tokens: 800,
+                ..Verification::default()
+            }
+        })
+        .await;
+        let goal = store.snapshot().unwrap();
+        assert_eq!(goal.progress.tokens_used, 1_100, "agent 300 plus judge 800");
+        // The judge's share exhausted the budget, so the rejection does not
+        // buy an ordinary further round: the bounded wrap-up is issued.
+        assert!(goal.progress.wrap_up_issued, "{outcome:?}");
+    }
+
+    /// Every evaluation lands in the round history: an interrupted one as an
+    /// attempt at the round it did not count, the retry as that round's next
+    /// attempt (mini-agent-2jqy9).
+    #[tokio::test]
+    async fn settled_rounds_and_interrupted_attempts_are_recorded_in_history() {
+        let _paths = isolated_paths();
+        let store = store();
+        report(&store, ReportStatus::Progress);
+        let working = || RoundSummary {
+            mutating_tool_calls: 1,
+            report: store.snapshot().unwrap().last_report().cloned(),
+            ..RoundSummary::completed()
+        };
+        settle_round(&store, working(), no_verification).await;
+        settle_round(
+            &store,
+            RoundSummary {
+                end: RoundEnd::Cancelled,
+                ..RoundSummary::completed()
+            },
+            no_verification,
+        )
+        .await;
+        settle_round(&store, working(), no_verification).await;
+
+        let goal = store.snapshot().unwrap();
+        let attempts: Vec<_> = goal.history.iter().map(|e| (e.round, e.attempt)).collect();
+        assert_eq!(attempts, vec![(1, 1), (2, 1), (2, 2)], "{:?}", goal.history);
+        assert!(goal.history[0].summary.starts_with("not yet"));
+        assert!(
+            goal.history[1].summary.contains("interrupt"),
+            "{:?}",
+            goal.history[1]
+        );
     }
 
     #[tokio::test]

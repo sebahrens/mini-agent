@@ -1151,9 +1151,13 @@ impl Startup {
             }));
         }
 
-        // ARCHITECTURE.md prompt
+        // ARCHITECTURE.md prompt. It reads a line from stdin, so like the
+        // version prompts it is only offered when a person is at the terminal:
+        // a `-p`, `--goal` or `--loop` run would otherwise stop on it, consume
+        // piped input meant for the run, or record the directory as asked
+        // without anyone having answered.
         #[cfg(feature = "archmd")]
-        let arch_created = if !self.cli.resolve_no_context_files(&self.cfg) {
+        let arch_created = if self.is_interactive && !self.cli.resolve_no_context_files(&self.cfg) {
             let workspace = self.workspace.root();
             if workspace.exists() {
                 crate::extras::archmd::ask_and_create(workspace).unwrap_or_else(|e| {
@@ -2148,13 +2152,17 @@ async fn run_headless_goal_rounds(
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     // An operator who interrupts must not wait for a check;
-                    // a check can run as long as a test suite does.
+                    // a check can run as long as a test suite does. One
+                    // interrupt covers every tier, so a signal landing between
+                    // the checks and the judge is not lost.
+                    let interrupt = crate::print::headless_interrupt();
+                    tokio::pin!(interrupt);
                     let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
                         &goal_for_checks,
                         &request,
                         &sandbox_for_checks,
                         &cfg_for_checks,
-                        crate::print::headless_interrupt(),
+                        interrupt.as_mut(),
                     )
                     .await;
                     if interrupted {
@@ -2182,22 +2190,39 @@ async fn run_headless_goal_rounds(
                     // against the judge's own failure ladder.
                     let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
                     let judged = match judge {
-                        Some(resolved) if request.run_judge && !checks_rejected => Some(
-                            crate::extras::goal::judge::ask_with_transcript(
-                                &goal_for_checks,
-                                &request,
-                                &resolved,
-                                &client_for_judge,
-                                &transcript,
-                                &cfg_for_judge,
+                        Some(resolved) if request.run_judge && !checks_rejected => {
+                            // A judge call can wait on its provider for as long
+                            // as the retry policy allows. An interrupt drops it:
+                            // a verdict arriving after the operator stopped the
+                            // run must not decide the goal.
+                            let verdict = driver::unless_interrupted(
+                                crate::extras::goal::judge::ask_with_transcript(
+                                    &goal_for_checks,
+                                    &request,
+                                    &resolved,
+                                    &client_for_judge,
+                                    &transcript,
+                                    &cfg_for_judge,
+                                    checks.as_ref(),
+                                ),
+                                interrupt.as_mut(),
                             )
-                            .await,
-                        ),
+                            .await;
+                            let Some(verdict) = verdict else {
+                                interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return driver::Verification {
+                                    interrupted: true,
+                                    ..driver::Verification::default()
+                                };
+                            };
+                            Some(verdict)
+                        }
                         _ => None,
                     };
                     driver::Verification {
                         checks,
-                        judge: judged,
+                        judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+                        judge: judged.map(|call| call.outcome),
                         ..driver::Verification::default()
                     }
                 })
