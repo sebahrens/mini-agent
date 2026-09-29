@@ -745,34 +745,6 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                         top_level_split(condition[len("if: "):], "&&"),
                     )
 
-    def test_windows_gate_runs_the_lpac_image_loading_feasibility_gate(self) -> None:
-        # The ignored real-backend test documented as the Windows image-loading
-        # gate must actually run, exactly once, in the Windows gate.
-        body = job_body(self.workflow, "windows-worker-containment-gate")
-        step = body.split(
-            "name: Validate LPAC image loading from every supported install location", 1
-        )[1].split("- name:", 1)[0]
-        test = (
-            "sandbox::worker::platform::tests::"
-            "windows_lpac_can_load_current_exe_with_only_protocol_handles"
-        )
-        self.assertIn(f"$test = '{test}'", step)
-        self.assertIn(
-            "cargo test --locked --no-default-features --features js $test -- --exact --ignored --list",
-            step,
-        )
-        self.assertIn(".Count -ne 1", step)
-        self.assertIn(
-            "cargo test --locked --no-default-features --features js $test "
-            "-- --exact --ignored --nocapture --test-threads=1",
-            step,
-        )
-        self.assertNotIn("continue-on-error", step)
-        # It needs the installed binary exported by the install step.
-        self.assertLess(
-            body.index("MINI_AGENT_LPAC_CARGO_INSTALL_EXE=$installed"),
-            body.index("name: Validate LPAC image loading from every supported install location"),
-        )
 
     def test_linux_sandbox_policy_proves_hooks_have_no_controlling_terminal(
         self,

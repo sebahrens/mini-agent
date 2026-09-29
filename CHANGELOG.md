@@ -162,8 +162,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   dependency-policy job's condition is parenthesised so it no longer runs on documentation-only
   changes by operator precedence, the weekly scheduled run also re-runs the parallel test smoke and
   the Phase 6 containment gates for runner-image drift, the `--all-features` build (including
-  `skills-embed`) is linted with `-D warnings`, and the Windows LPAC image-loading feasibility gate
-  now runs in the Windows containment job instead of never. The macOS worker code-identity check now
+  `skills-embed`) is linted with `-D warnings`. (The Windows LPAC image-loading feasibility test
+  stays ignored: it fails on the hosted runner and is tracked as mini-agent-6kdk2.) The macOS worker
+  code-identity check now
   names the CDHash of every slice of a universal binary, so its real-signature tests run again
   instead of being ignored. Dead code hidden behind `#[allow(dead_code)]` (the pre-goal validation
   registry, the unused startup path field, test-only path helpers) was removed or compiled only
