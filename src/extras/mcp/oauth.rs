@@ -1336,16 +1336,17 @@ pub fn logout(server_name: &str, url: &str, settings: &OAuthSettings) -> anyhow:
 /// caller can tell the user to run `/mcp login`.
 ///
 /// `transport_client` carries the MCP traffic (see
-/// [`super::client::http_client`] for its connect bound). The manager's own
+/// [`super::client::http_client`] for its connect bound); it is the same
+/// body-capped client as unauthenticated URL servers use. The manager's own
 /// OAuth HTTP client keeps rmcp's built-in whole-request timeout, and the
 /// caller bounds this whole function with the initialize timeout because
 /// restoring stored credentials may refresh a token over the network.
-pub async fn build_auth_client(
+pub(crate) async fn build_auth_client(
     server_name: &str,
     url: &str,
     settings: &OAuthSettings,
-    transport_client: reqwest::Client,
-) -> anyhow::Result<AuthClient<reqwest::Client>> {
+    transport_client: super::bounded_http::BoundedHttpClient,
+) -> anyhow::Result<AuthClient<super::bounded_http::BoundedHttpClient>> {
     let mut manager = AuthorizationManager::new(url)
         .await
         .map_err(|e| anyhow::anyhow!("OAuth init failed: {e}"))?;

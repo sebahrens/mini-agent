@@ -1172,6 +1172,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "TC-LSP-SERVICE",
     ),
     (
+        "src/extras/mcp/bounded_http.rs",
+        "response.status()",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/extras/mcp/client.rs",
         "let mut child = command.spawn()?;",
         1,
@@ -3462,6 +3468,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "let restarted = TelemetryDispatcher::spawn(&paths).unwrap();",
         1,
         "TEST-ONLY",
+    ),
+    (
+        "src/extras/mcp/bounded_http.rs",
+        "response.status()",
+        1,
+        "NON-PROCESS",
     ),
     (
         "src/extras/mcp/client.rs",

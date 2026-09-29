@@ -1829,7 +1829,14 @@ others. Every `tools/call` is bounded by `mcp_tool_timeout_secs`
 the model can act on instead of stalling the turn. A stdio server's protocol
 messages are newline-delimited; one line may be at most 16 MiB, and a server
 that writes more without a newline is disconnected and its process tree
-killed rather than buffered without bound. Malformed JSON arguments are
+killed rather than buffered without bound. URL (streamable-HTTP) servers get
+the same 16 MiB bound per protocol message, with or without OAuth: a JSON
+response body larger than 16 MiB fails that request, and a single SSE event
+larger than 16 MiB ends its stream (a request answered over SSE fails with an
+error naming the cap instead of waiting for its timeout). Bodies are read
+incrementally, so an oversized response is never buffered whole. The body of a
+non-2xx response is read under the same cap and at most 4 KiB of it is
+included in the error. Malformed JSON arguments are
 rejected rather than silently converted to an argument-less call. Content
 blocks are joined with newlines; images and binary resources are shown as
 `[image: <mime>, <N> bytes]` / `[resource: <uri>, <mime>, <N> bytes]`

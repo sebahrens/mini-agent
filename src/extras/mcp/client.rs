@@ -23,6 +23,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
+use super::bounded_http::BoundedHttpClient;
 use super::config::{McpServerConfig, McpStdioNetwork, OAuthConfig, TrustedMcpServer};
 use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
@@ -463,7 +464,11 @@ impl McpClientHandle {
             )
             .custom_headers(custom_headers);
         let oauth_settings = oauth.and_then(|o| o.settings());
-        let http_client = http_client(initialize_timeout)?;
+        // Every response body and SSE event is capped (see `bounded_http`).
+        let http_client = BoundedHttpClient::new(
+            http_client(initialize_timeout)?,
+            super::bounded_http::MCP_HTTP_MAX_BODY_BYTES,
+        );
 
         let connect = async {
             if let Some(settings) = oauth_settings {
@@ -471,14 +476,14 @@ impl McpClientHandle {
                     super::oauth::build_auth_client(&server_name, url, &settings, http_client)
                         .await?;
                 type AuthHttpClient = rmcp::transport::StreamableHttpClientTransport<
-                    rmcp::transport::auth::AuthClient<reqwest::Client>,
+                    rmcp::transport::auth::AuthClient<BoundedHttpClient>,
                 >;
                 let transport = AuthHttpClient::with_client(auth_client, cfg);
                 serve_client((), transport).await.map_err(|e| {
                     anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
                 })
             } else {
-                type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+                type HttpClient = rmcp::transport::StreamableHttpClientTransport<BoundedHttpClient>;
                 let transport = HttpClient::with_client(http_client, cfg);
                 serve_client((), transport).await.map_err(|e| {
                     anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
@@ -515,9 +520,10 @@ impl McpClientHandle {
     }
 }
 
-/// Build the reqwest client used for MCP HTTP transports.
+/// Build the reqwest client used for MCP HTTP transports. The transport wraps
+/// it in [`BoundedHttpClient`], which caps response bodies and SSE events.
 ///
-/// Only the connect phase is bounded here. A whole-request timeout would sever
+/// Only the connect phase is time-bounded here. A whole-request timeout would sever
 /// the long-lived SSE stream and legitimate long tool calls; those are bounded
 /// per RPC through [`PeerRequestOptions`] instead.
 pub(crate) fn http_client(connect_timeout: Duration) -> anyhow::Result<reqwest::Client> {
