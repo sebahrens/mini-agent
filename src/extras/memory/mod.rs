@@ -1151,6 +1151,25 @@ fn is_daily_entry_heading(line: &str) -> bool {
         && line[9..].starts_with(" — ")
 }
 
+/// `body` with every line that `is_daily_entry_heading` would accept prefixed
+/// by U+2060, so the body cannot open a new daily-log entry.
+fn fence_daily_entry_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if !body
+        .split('\n')
+        .any(|line| is_daily_entry_heading(line.trim_end_matches('\r')))
+    {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len() + 8);
+    for line in body.split_inclusive('\n') {
+        if is_daily_entry_heading(line.trim_end_matches(['\r', '\n'])) {
+            out.push('\u{2060}');
+        }
+        out.push_str(line);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// `log` without the entry whose heading carries `reference`'s tag. An entry
 /// runs from its heading to the next entry heading, so markdown headings
 /// inside the summary body stay with it.
@@ -1177,13 +1196,19 @@ fn without_compaction_entry(log: &str, reference: &str) -> String {
 /// heading is tagged with the summary's [`crate::session::compaction_ref`] so
 /// the session that replays this summary can leave the copy out of its memory
 /// block.
+///
+/// The summary derives from untrusted history, so it is fenced into one entry:
+/// a body line shaped like an entry heading gets a leading U+2060 WORD JOINER,
+/// which keeps the text but stops it from splitting the summary into a forged,
+/// separately tagged entry of a log injected into later sessions. The tag is
+/// still computed from the summary as given, which is what the session replays.
 pub fn flush_compaction_summary(mem: &Mem, summary: &str, count: Option<usize>) {
     let heading = format!(
         "{} {}",
         compaction_heading(count),
         compaction_tag(&crate::session::compaction_ref(summary))
     );
-    if let Err(e) = mem.append_daily(&heading, summary) {
+    if let Err(e) = mem.append_daily(&heading, &fence_daily_entry_body(summary)) {
         tracing::warn!("memory: failed to persist compaction summary: {e}");
     }
 }

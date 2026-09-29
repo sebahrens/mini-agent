@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Compaction is now injection-isolated: tool output, files or earlier summaries can no longer close
+  the summarizer's `</message>`, `</transcript>`, `</previous_summary>` or `</user_instructions>`
+  fences to forge user turns or contract updates, the summarizer is told fenced history is data, and
+  a summary flushed to the daily memory log can no longer forge a separate log entry.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

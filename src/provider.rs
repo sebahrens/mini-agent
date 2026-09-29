@@ -531,16 +531,26 @@ fn compaction_prompt(
     let (before_conversation, after_conversation) = after_instructions
         .split_once("{conversation}")
         .expect("compaction prompt has conversation placeholder");
-    let previous_summary = previous_summary.unwrap_or(NO_PREVIOUS_SUMMARY);
-    let instructions = instructions.unwrap_or("(none)");
+    // Neither section may close its own fence or forge a later one. The
+    // rolling summary arrives already defanged (see
+    // `summarize_conversation_bounded`), so this adds no bytes to it; the
+    // instructions' growth is part of the fixed overhead measured by
+    // `compaction_payload_budgets`. The conversation is serialized with its
+    // closing tags defanged and carries only the serializer's `</message>`.
+    let previous_summary = defang_closing_tags(
+        previous_summary.unwrap_or(NO_PREVIOUS_SUMMARY),
+        COMPACTION_MESSAGE_TAGS,
+    );
+    let instructions =
+        defang_closing_tags(instructions.unwrap_or("(none)"), COMPACTION_MESSAGE_TAGS);
 
     let mut rendered = String::with_capacity(
         template.len() + previous_summary.len() + instructions.len() + conversation.len(),
     );
     rendered.push_str(before_summary);
-    rendered.push_str(previous_summary);
+    rendered.push_str(&previous_summary);
     rendered.push_str(before_instructions);
-    rendered.push_str(instructions);
+    rendered.push_str(&instructions);
     rendered.push_str(before_conversation);
     rendered.push_str(conversation);
     rendered.push_str(after_conversation);
@@ -702,10 +712,24 @@ where
 {
     let (summary_budget, conversation_budget) =
         compaction_payload_budgets(instructions, prompt_budget_bytes)?;
-    let conversation = bounded_recent_conversation(conversation, conversation_budget)?;
+    // Defang before bounding so every length below measures the bytes that
+    // are actually sent. A transcript from `serialize_message` is already
+    // defanged (its only closing tags are `</message>`), so this is a no-op
+    // there; it guards callers passing raw text.
+    let conversation = defang_closing_tags(conversation, COMPACTION_FENCE_TAGS);
+    let conversation = bounded_recent_conversation(&conversation, conversation_budget)?;
     let mut offset = 0usize;
-    let mut rolling_summary =
-        previous_summary.map(|summary| bound_summary(summary, summary_budget));
+    // Previous and rolling summaries are model output derived from untrusted
+    // history, so they are defanged before `bound_summary`, keeping the
+    // summary partition exact. Truncation cannot rebuild a closing tag: the
+    // marker and the section boundaries it cuts at start with a newline.
+    let bound_untrusted_summary = |summary: &str| {
+        bound_summary(
+            &defang_closing_tags(summary, COMPACTION_MESSAGE_TAGS),
+            summary_budget,
+        )
+    };
+    let mut rolling_summary = previous_summary.map(bound_untrusted_summary);
     let mut made_request = false;
     let mut requests = 0usize;
 
@@ -734,7 +758,7 @@ where
         if next_summary.is_empty() {
             anyhow::bail!("Compression returned empty response");
         }
-        rolling_summary = Some(bound_summary(&next_summary, summary_budget));
+        rolling_summary = Some(bound_untrusted_summary(&next_summary));
         made_request = true;
         requests += 1;
         offset = offset.saturating_add(chunk.len());
@@ -1092,9 +1116,55 @@ pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
     messages.iter().map(serialize_message).collect()
 }
 
-/// One transcript entry. The XML-based format prevents injection: untrusted
-/// content cannot escape the `<message>` tag, and the role attribute is never
-/// injectable.
+/// Closing tags of the compaction prompt's data fences. Untrusted text placed
+/// in any fenced section is defanged against all of them.
+const COMPACTION_FENCE_TAGS: &[&str] = &["previous_summary", "user_instructions", "transcript"];
+/// [`COMPACTION_FENCE_TAGS`] plus the per-entry `message` tag, for content
+/// that lands inside one transcript entry.
+const COMPACTION_MESSAGE_TAGS: &[&str] = &[
+    "message",
+    "previous_summary",
+    "user_instructions",
+    "transcript",
+];
+
+/// Neutralizes every closing tag named in `names` (ASCII case-insensitive) by
+/// inserting U+2060 WORD JOINER between `<` and `/`, as the goal judge does for
+/// its transcript fence. The text stays readable but can no longer end the
+/// section it is fenced in. Idempotent: defanged output contains no match, so
+/// defanging it again adds no bytes. Each match grows the text by three bytes.
+pub(crate) fn defang_closing_tags<'a>(text: &'a str, names: &[&str]) -> Cow<'a, str> {
+    let is_closing_tag = |index: usize| {
+        let rest = &text.as_bytes()[index + 2..];
+        names.iter().any(|name| {
+            rest.get(..name.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name.as_bytes()))
+        })
+    };
+    let mut matches = text
+        .match_indices("</")
+        .map(|(index, _)| index)
+        .filter(|index| is_closing_tag(*index))
+        .peekable();
+    if matches.peek().is_none() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut copied = 0;
+    for index in matches {
+        out.push_str(&text[copied..=index]);
+        out.push('\u{2060}');
+        copied = index + 1;
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// One transcript entry. Untrusted content cannot escape the `<message>` tag
+/// or the surrounding `<transcript>` fence: every closing tag of either (and of
+/// the other compaction fences) inside it is defanged, so the serializer's own
+/// `</message>` is the only one that ends the entry. The role attribute is
+/// never injectable.
 fn serialize_message(msg: &SessionMessage) -> String {
     let role_tag = match msg.role {
         crate::session::MessageRole::User => "user",
@@ -1106,7 +1176,8 @@ fn serialize_message(msg: &SessionMessage) -> String {
     };
     format!(
         "<message role=\"{}\">\n{}\n</message>\n",
-        role_tag, msg.content
+        role_tag,
+        defang_closing_tags(&msg.content, COMPACTION_MESSAGE_TAGS)
     )
 }
 

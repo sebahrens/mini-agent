@@ -253,6 +253,7 @@ Returns `"compaction summary (N msgs)"` (or `"compaction summary"` if no count).
 ### `flush_compaction_summary(mem, summary, count)`
 
 Persists the compaction summary to today's daily log via `append_daily`. Called from the `/compress` slash command before `Session::compress`.
+The summary derives from untrusted history, so it is fenced into a single entry: any body line shaped like an entry heading (`### HH:MM — ...`) is written with a leading U+2060 WORD JOINER, keeping its text but preventing it from starting a forged, separately tagged entry.
 The heading is tagged `[compaction <ref>]`, where `<ref>` is `session::compaction_ref(summary)`; `Session::compress` stores the same tag as `Compaction::memory_ref`.
 
 ### `Mem::context_block_excluding(ref)`
