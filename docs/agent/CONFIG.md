@@ -1556,8 +1556,12 @@ the model can act on instead of stalling the turn. A stdio server's protocol
 messages are newline-delimited; one line may be at most 16 MiB, and a server
 that writes more without a newline is disconnected and its process tree
 killed rather than buffered without bound. Malformed JSON arguments are
-rejected rather than silently converted to an argument-less call. Text, image,
-and embedded resource data from one result share the same model-facing bound as
+rejected rather than silently converted to an argument-less call. Content
+blocks are joined with newlines; images and binary resources are shown as
+`[image: <mime>, <N> bytes]` / `[resource: <uri>, <mime>, <N> bytes]`
+placeholders rather than inlined base64, and host permission notes appear
+outside the `[mcp output begins]` fence that marks server text. Text and
+embedded resource text from one result share the same model-facing bound as
 ordinary tool output: results over 12,000 characters are stored in the private
 tool-output directory and replaced with a 2,000-character head, an omission
 notice with the spill-file path, and an 8,000-character tail. If private
