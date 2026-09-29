@@ -8,6 +8,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- Misspelled or unknown top-level config keys are no longer silently dropped: startup (and
+  `--print-config`) warns with the nearest known key, keys of builds with other Cargo features stay
+  quiet, and every kebab-case key (`permission-deny`, `sandbox-backend`, `permission-modes`,
+  `js-fetch-origins`, ...) now also accepts its snake_case spelling instead of ignoring it (fail-open).
+  TOML parse errors now name the line and column, still without a source excerpt.
 - The permission prompt can no longer show a different command than the one that runs: bidi
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed

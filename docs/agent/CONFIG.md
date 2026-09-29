@@ -308,8 +308,9 @@ private persistence root:
 
 Atomic replacement publishes only a fully written private temporary file and
 revalidates the resulting config file. Save and parse errors report the path
-and error category but omit config source excerpts, which could contain stored
-secrets. Config persistence currently creates no lock or backup file; any
+and error category (for TOML, the line, column and a message with quoted
+values redacted; for YAML/JSON, the line and column) but omit config source
+excerpts, which could contain stored secrets. Config persistence currently creates no lock or backup file; any
 future lock or backup artifact must use the same `0600`/protected-DACL policy.
 
 ## Session-storage privacy
@@ -546,7 +547,6 @@ Accepted top-level keys:
 | `windows-appcontainer-read-roots` | array of paths | Additional Windows AppContainer read/execute roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they are remote, reparse-based, multiply linked, overlap a writable root, or contain the private AppContainer control sibling. Conflict diagnostics expose only fixed root roles and containment direction, never paths. CLI: repeat `--windows-appcontainer-read-root PATH`. |
 | `windows-appcontainer-write-roots` | array of paths | Additional Windows AppContainer read/write roots. Relative paths resolve from the workspace. Zero roots is the safe default. These values are ignored by non-AppContainer backends and rejected if they overlap the read-only cache/configured roots, another writable root, or the private AppContainer control sibling. Deterministic conflicts are rejected before profile/journal creation. CLI: repeat `--windows-appcontainer-write-root PATH`. |
 | `js-fetch-origins`        | array   | Exact origin narrowing list for the sandbox-gated JS `fetch()` global, for example `["https://docs.rs", "https://api.example.com:8443"]`. Absent leaves narrowing to permissions; empty or malformed denies all fetches. |
-
 | `js-fetch-allow-http`     | boolean | Permit public-address HTTP origins for JS `fetch()` in addition to HTTPS. Default: `false`. Private, loopback, link-local, metadata, multicast, and reserved destinations remain denied. |
 | `js-file-base-dir`        | path    | Base used to resolve relative JS file roots. Relative values resolve from the captured startup workspace; absent uses that workspace directly. |
 | `js-read-roots`           | array   | Explicit read roots for brokered JS file effects, resolved from `js-file-base-dir`. |
@@ -2182,12 +2182,42 @@ For more complex configurations, explicit TOML tables provide clear structure:
 "**" = "ask"
 ```
 
-### Key naming in TOML
+### Key naming and unknown keys
 
-All top-level keys use kebab-case when they contain hyphens (e.g.
-`permission-allow`, `allow-all-mcp-calls`). Simple keys use the same name as
-their YAML counterpart. Quoted keys (`"*"`, `"**"`) are required when the key
-contains special characters like `*` or `/`.
+Each top-level key has one canonical spelling, shown in the tables above; the
+same spelling applies in TOML, YAML and JSON. Most keys are snake_case
+(`default_permission_mode`, `accept_all`, `max_tokens`); the permission,
+sandbox, JS, built-in MCP toggle, worktree and auto-update keys are kebab-case
+(`permission-allow`, `permission-ask`, `permission-deny`, `permission-regex`,
+`permission-modes`, `sandbox-backend`, `windows-appcontainer-read-roots`,
+`windows-appcontainer-write-roots`, `js-fetch-origins` and the other `js-*`
+keys, `enable-exa-mcp`, `enable-context7-mcp`, `enable-grepapp-mcp`,
+`wt-auto-merge`, `wt-base-dir`, `auto-update-prompts`, `auto-update-themes`).
+
+Every kebab-case key also accepts its snake_case spelling
+(`permission_deny`, `sandbox_backend`, `permission_modes`,
+`js_fetch_origins`, ...), and `default_permission_mode` and
+`allow_all_mcp_calls` also accept `default-permission-mode` and
+`allow-all-mcp-calls`. An alternative spelling configures exactly what the
+canonical one does, including its project-config trust classification; saving
+the config rewrites it to the canonical spelling. Setting both spellings of one
+key in the same file is an error rather than letting either silently win.
+
+A top-level key that no build of mini-agent knows is ignored with a startup
+warning that names the file, the key and the nearest known key, for example
+``unknown config key `sandbx` is ignored (did you mean `sandbox`?)``.
+`--print-config` repeats these warnings (and the other load warnings, such as
+clamped `[retry]` values) in a `Warnings:` section. A key that belongs to a
+Cargo feature this build was compiled without (for example `mcp_servers` in a
+build without `mcp`) is kept in the file unused and does not warn. Keys nested
+inside tables are not checked by this pass.
+
+A config that fails to parse reports the line and column of the error. The
+message never includes a source excerpt, and quoted values the parser echoes
+are replaced by `…`, since the file can hold credentials.
+
+Quoted keys (`"*"`, `"**"`) are required when the key contains special
+characters like `*` or `/`.
 
 ## Edit System Modes
 
