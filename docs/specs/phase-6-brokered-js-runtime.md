@@ -400,6 +400,21 @@ limit belong to the whole fresh worker runtime request, not to individual nested
 capability tokens, and reset only when that disposable runtime is recycled.
 
 File, fetch, proposal, and command operations retain their owning Phase 1–4 validation and limits.
+The parent file service decides whether a file or discovery target is workspace-bound or ambient
+from the home-expanded path, with the same rule as the built-in file tools
+(`crate::agent::tools::resolve_tool_target`, mini-agent-c1o7m): a `~/` or `$HOME/` target that
+expands to an absolute path is resolved, permission-checked, audited, and reported as that absolute
+path under the ambient path policy; only a path that is still relative after expansion goes through
+the captured workspace capability, and an unexpanded `$FOO/` or `~user/` first component stays a
+literal workspace-relative name. A bound workspace therefore never resolves or creates a literal
+`$HOME` directory. The discovery effects (`list_dir`, `glob`, `grep`) additionally install the
+parent checker's non-prompting deny snapshot (`PermissionChecker::path_deny_probe`) on their
+descriptor-bound walk: an entry matched by the effect's own (`js/list_dir`, `js/glob`, `js/grep`)
+path deny rules or by the `read`/`js/read_file` deny rules (plus `external_directory` denies outside
+the workspace) is omitted, and a denied directory is pruned, for workspace-bound and absolute roots
+alike. The probe evaluates only deny rules; it never prompts, never consults allow rules or the
+session allowlist, and never feeds doom-loop tracking, so it only narrows what the already
+authorized root reveals.
 On Windows, model-authored JS `spawn` uses the separately attested regular-AppContainer general
 command sandbox, which owns and verifies the complete descendant lifetime. LPAC worker containment
 never serves as containment for a brokered command. Learned-skill spawn remains disabled on
@@ -1218,6 +1233,8 @@ bead is closed with its required regression tests, so all items are part of the 
    500 characters around the match. A `truncated` boolean reports any result, byte, or traversal
    cap. Traversal is descriptor-bound, ignores symlinks and unsafe file kinds, honors ignore files,
    and checks the shared invocation cancellation/deadline between entries and file reads.
+   Entries hidden by `read`/`js/read_file` or the effect's own path deny rules are omitted and
+   denied directories pruned (mini-agent-c1o7m; see Capability broker).
 5. **Batched effects** (mini-agent-ae65, delivered). `read_files([paths])` is one effect request carrying one
    intent and one completion record, while every path is narrowed, permission-checked, and bounded
    before any content is read. It accepts 1–256 paths with at most 1 MiB aggregate path text and

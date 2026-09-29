@@ -200,6 +200,26 @@ impl AllowConfig {
         self.workspace_binding.as_ref()
     }
 
+    /// Bound-vs-ambient decision for one JS file effect path
+    /// (mini-agent-c1o7m). Like the built-in file tools it is taken from the
+    /// home-expanded path via [`crate::agent::tools::resolve_tool_target`]:
+    /// a `~/` or `$HOME/` path that expands to an absolute path is ambient and
+    /// is resolved (and reported) as that absolute path; only a path that is
+    /// still relative after expansion goes through the captured workspace
+    /// capability. An unexpanded `$FOO/` or `~user/` first component stays a
+    /// literal workspace-relative name.
+    fn effect_target(&self, path: &str) -> EffectTargetPath<'_> {
+        let resolved =
+            crate::agent::tools::resolve_tool_target(self.workspace_binding.as_ref(), path);
+        match (resolved.bound_relative, self.workspace_binding.as_ref()) {
+            (Some(relative), Some(workspace)) => EffectTargetPath::Bound {
+                workspace,
+                relative,
+            },
+            _ => EffectTargetPath::Ambient(resolved.requested.to_string_lossy().into_owned()),
+        }
+    }
+
     pub(crate) fn with_fetch_settings(self, origins: Option<&[String]>, allow_http: bool) -> Self {
         #[cfg(feature = "sandbox")]
         {
@@ -1899,6 +1919,19 @@ fn file_path_error(error: std::io::Error) -> EffectServiceError {
     }
 }
 
+/// Where a JS file effect path resolves; see [`AllowConfig::effect_target`].
+enum EffectTargetPath<'a> {
+    /// Still relative after home expansion: resolved through the workspace
+    /// capability as `relative`.
+    Bound {
+        workspace: &'a std::sync::Arc<crate::paths::WorkspaceBinding>,
+        relative: PathBuf,
+    },
+    /// Absolute after home expansion, or no workspace is bound: the expanded
+    /// path, resolved by the ambient path policy.
+    Ambient(String),
+}
+
 fn permission_path(path: &Path) -> Result<String, EffectServiceError> {
     path.to_str()
         .map(str::to_owned)
@@ -2144,32 +2177,33 @@ impl FileEffectService {
                 .map(|workspace| workspace.validate())
                 .transpose()
                 .map_err(|_| EffectServiceError::TargetChanged)?;
-            let relative = Path::new(path);
-            if !relative.is_absolute()
-                && !path.starts_with('~')
-                && let Some(workspace) = self.allow_config.workspace_binding()
-            {
-                let file = workspace.open_relative(relative).map_err(file_path_error)?;
-                if let AuthorizationDecision::Denied(reason) =
-                    self.allow_config.authorize_bound_read(relative)
-                {
-                    return Err(file_policy_service_error(reason));
+            let path = match self.allow_config.effect_target(path) {
+                EffectTargetPath::Bound {
+                    workspace,
+                    relative,
+                } => {
+                    let file = workspace
+                        .open_relative(&relative)
+                        .map_err(file_path_error)?;
+                    if let AuthorizationDecision::Denied(reason) =
+                        self.allow_config.authorize_bound_read(&relative)
+                    {
+                        return Err(file_policy_service_error(reason));
+                    }
+                    let logical = workspace
+                        .logical_relative_path(&relative)
+                        .map_err(file_path_error)?;
+                    let permission_path = permission_path(&logical)?;
+                    bridge
+                        .check_bound_path_async("js/read_file", &permission_path)
+                        .await
+                        .map_err(permission_service_error)?;
+                    return Ok(PreparedReadEffect::Bound { relative, file });
                 }
-                let logical = workspace
-                    .logical_relative_path(relative)
-                    .map_err(file_path_error)?;
-                let permission_path = permission_path(&logical)?;
-                bridge
-                    .check_bound_path_async("js/read_file", &permission_path)
-                    .await
-                    .map_err(permission_service_error)?;
-                return Ok(PreparedReadEffect::Bound {
-                    relative: relative.to_path_buf(),
-                    file,
-                });
-            }
+                EffectTargetPath::Ambient(path) => path,
+            };
             let effect_base = self.allow_config.effect_base();
-            let target = resolve_read_target(&effect_base, path).await?;
+            let target = resolve_read_target(&effect_base, &path).await?;
             if let AuthorizationDecision::Denied(reason) =
                 self.allow_config.authorize_read(&target.path)
             {
@@ -2232,18 +2266,35 @@ impl FileEffectService {
                 .map(|workspace| workspace.validate())
                 .transpose()
                 .map_err(|_| EffectServiceError::TargetChanged)?;
-            let relative = Path::new(path);
-            if !relative.is_absolute()
-                && !path.starts_with('~')
-                && let Some(workspace) = self.allow_config.workspace_binding()
+            let (workspace, relative) = match self.allow_config.effect_target(path) {
+                EffectTargetPath::Bound {
+                    workspace,
+                    relative,
+                } => (workspace, relative),
+                EffectTargetPath::Ambient(path) => {
+                    let effect_base = self.allow_config.effect_base();
+                    let target = resolve_write_target(&effect_base, &path).await?;
+                    if let AuthorizationDecision::Denied(reason) =
+                        self.allow_config.authorize_write(&target.path)
+                    {
+                        return Err(file_policy_service_error(reason));
+                    }
+                    let permission_path = permission_path(&target.path)?;
+                    bridge
+                        .check_path_async("js/write_file", &permission_path)
+                        .await
+                        .map_err(permission_service_error)?;
+                    return Ok(PreparedWriteEffect::Path(target));
+                }
+            };
             {
                 if let AuthorizationDecision::Denied(reason) =
-                    self.allow_config.authorize_bound_write(relative)
+                    self.allow_config.authorize_bound_write(&relative)
                 {
                     return Err(file_policy_service_error(reason));
                 }
                 let logical = workspace
-                    .logical_relative_path(relative)
+                    .logical_relative_path(&relative)
                     .map_err(file_path_error)?;
                 let permission_path = permission_path(&logical)?;
                 bridge
@@ -2251,8 +2302,7 @@ impl FileEffectService {
                     .await
                     .map_err(permission_service_error)?;
                 let workspace = workspace.clone();
-                let relative = relative.to_path_buf();
-                return match workspace.open_relative(&relative) {
+                match workspace.open_relative(&relative) {
                     Ok(file) => Ok(PreparedWriteEffect::BoundReplace {
                         workspace,
                         relative,
@@ -2273,21 +2323,8 @@ impl FileEffectService {
                         })
                     }
                     Err(error) => Err(file_path_error(error)),
-                };
+                }
             }
-            let effect_base = self.allow_config.effect_base();
-            let target = resolve_write_target(&effect_base, path).await?;
-            if let AuthorizationDecision::Denied(reason) =
-                self.allow_config.authorize_write(&target.path)
-            {
-                return Err(file_policy_service_error(reason));
-            }
-            let permission_path = permission_path(&target.path)?;
-            bridge
-                .check_path_async("js/write_file", &permission_path)
-                .await
-                .map_err(permission_service_error)?;
-            Ok(PreparedWriteEffect::Path(target))
         };
         tokio::select! {
             result = timeout(self.timeout, call) => result.map_err(|_| EffectServiceError::TimedOut)?,
@@ -3393,6 +3430,17 @@ enum DiscoveryAction {
     },
 }
 
+impl DiscoveryAction {
+    /// Permission tool name the discovery root is checked against.
+    fn permission_tool(&self) -> &'static str {
+        match self {
+            Self::ListDir => "js/list_dir",
+            Self::Glob { .. } => "js/glob",
+            Self::Grep { .. } => "js/grep",
+        }
+    }
+}
+
 struct PreparedDiscoveryEffect {
     directory: BoundDirectory,
     relative: Option<PathBuf>,
@@ -3448,33 +3496,42 @@ async fn prepare_discovery_root(
         .map(|workspace| workspace.validate())
         .transpose()
         .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
-    let relative_path = Path::new(path);
     let output_base = file.allow_config.effect_base();
-    if !relative_path.is_absolute()
-        && !path.starts_with('~')
-        && let Some(workspace) = file.allow_config.workspace_binding()
-    {
-        let logical = workspace
-            .logical_relative_path(relative_path)
-            .map_err(file_path_error)?;
-        let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
-        let root = workspace
-            .open_relative_directory_file(relative_path)
-            .map_err(file_path_error)?;
-        let directory = BoundDirectory::from_file(&logical, root).map_err(file_path_error)?;
-        return Ok((
-            PreparedDiscoveryEffect {
-                directory,
-                relative: Some(relative_path.to_path_buf()),
-                permission_path: logical,
-                output_base,
-                action,
-            },
-            workspace_relative,
-        ));
-    }
+    let tool = action.permission_tool();
+    let expanded = match file.allow_config.effect_target(path) {
+        EffectTargetPath::Bound {
+            workspace,
+            relative,
+        } => {
+            let logical = workspace
+                .logical_relative_path(&relative)
+                .map_err(file_path_error)?;
+            let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
+            let root = workspace
+                .open_relative_directory_file(&relative)
+                .map_err(file_path_error)?;
+            // mini-agent-c1o7m: entries the tool's (and `read`'s) path deny
+            // rules hide are skipped, and denied directories are pruned.
+            let directory = BoundDirectory::from_file(&logical, root)
+                .map_err(file_path_error)?
+                .with_hidden_filter(
+                    file.permission_bridge
+                        .walk_deny_filter(tool, Some(workspace.root())),
+                );
+            return Ok((
+                PreparedDiscoveryEffect {
+                    directory,
+                    relative: Some(relative),
+                    permission_path: logical,
+                    output_base,
+                    action,
+                },
+                workspace_relative,
+            ));
+        }
+        EffectTargetPath::Ambient(expanded) => expanded,
+    };
 
-    let expanded = crate::fs::expand_tilde(path);
     let absolute = absolute_lexical(&output_base, Path::new(&expanded));
     let canonical = tokio::select! {
         result = tokio::fs::canonicalize(absolute) => result.map_err(file_path_error)?,
@@ -3487,7 +3544,9 @@ async fn prepare_discovery_root(
     if !identity.is_dir() {
         return Err(HostEffectError::InvalidTarget);
     }
-    let directory = BoundDirectory::open(&canonical, &identity).map_err(file_path_error)?;
+    let directory = BoundDirectory::open(&canonical, &identity)
+        .map_err(file_path_error)?
+        .with_hidden_filter(file.permission_bridge.walk_deny_filter(tool, None));
     let workspace_relative = workspace_relative_path(&output_base, &canonical)?;
     Ok((
         PreparedDiscoveryEffect {
@@ -3753,27 +3812,31 @@ async fn prepare_parent_read(
         .map(|workspace| workspace.validate())
         .transpose()
         .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
-    let relative = Path::new(path);
-    if !relative.is_absolute()
-        && !path.starts_with('~')
-        && let Some(workspace) = file.allow_config.workspace_binding()
-    {
-        let opened = workspace.open_relative(relative).map_err(file_path_error)?;
-        let logical = workspace
-            .logical_relative_path(relative)
-            .map_err(file_path_error)?;
-        let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
-        return Ok((
-            PreparedReadEffect::Bound {
-                relative: relative.to_path_buf(),
-                file: opened,
-            },
-            workspace_relative,
-        ));
-    }
+    let path = match file.allow_config.effect_target(path) {
+        EffectTargetPath::Bound {
+            workspace,
+            relative,
+        } => {
+            let opened = workspace
+                .open_relative(&relative)
+                .map_err(file_path_error)?;
+            let logical = workspace
+                .logical_relative_path(&relative)
+                .map_err(file_path_error)?;
+            let workspace_relative = workspace_relative_path(workspace.root(), &logical)?;
+            return Ok((
+                PreparedReadEffect::Bound {
+                    relative,
+                    file: opened,
+                },
+                workspace_relative,
+            ));
+        }
+        EffectTargetPath::Ambient(path) => path,
+    };
     let effect_base = file.allow_config.effect_base();
     let target = tokio::select! {
-        result = timeout(file.timeout, resolve_read_target(&effect_base, path)) => {
+        result = timeout(file.timeout, resolve_read_target(&effect_base, &path)) => {
             result.map_err(|_| HostEffectError::EffectTimedOut)?
                 .map_err(HostEffectError::from)?
         }
@@ -4158,53 +4221,54 @@ impl ParentEffectService for ParentHostEffectService {
                         .map(|workspace| workspace.validate())
                         .transpose()
                         .map_err(|_| HostEffectError::from(EffectServiceError::TargetChanged))?;
-                    let relative = Path::new(path);
-                    if !relative.is_absolute()
-                        && !path.starts_with('~')
-                        && let Some(workspace) = self.file.allow_config.workspace_binding()
-                    {
-                        let logical = workspace
-                            .logical_relative_path(relative)
-                            .map_err(file_path_error)?;
-                        let workspace_relative =
-                            workspace_relative_path(workspace.root(), &logical)?;
-                        let workspace = workspace.clone();
-                        let relative = relative.to_path_buf();
-                        let target = match workspace.open_relative(&relative) {
-                            Ok(file) => PreparedWriteEffect::BoundReplace {
-                                workspace,
-                                relative,
-                                expected: crate::fs::checked_file_metadata(&file)
-                                    .map_err(file_path_error)?,
-                            },
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                let parent = relative
-                                    .parent()
-                                    .filter(|parent| !parent.as_os_str().is_empty())
-                                    .unwrap_or_else(|| Path::new("."));
-                                workspace
-                                    .open_dir_relative(parent)
-                                    .map_err(file_path_error)?;
-                                PreparedWriteEffect::BoundCreate {
+                    let path = match self.file.allow_config.effect_target(path) {
+                        EffectTargetPath::Ambient(path) => path,
+                        EffectTargetPath::Bound {
+                            workspace,
+                            relative,
+                        } => {
+                            let workspace = workspace.clone();
+                            let logical = workspace
+                                .logical_relative_path(&relative)
+                                .map_err(file_path_error)?;
+                            let workspace_relative =
+                                workspace_relative_path(workspace.root(), &logical)?;
+                            let target = match workspace.open_relative(&relative) {
+                                Ok(file) => PreparedWriteEffect::BoundReplace {
                                     workspace,
                                     relative,
+                                    expected: crate::fs::checked_file_metadata(&file)
+                                        .map_err(file_path_error)?,
+                                },
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    let parent = relative
+                                        .parent()
+                                        .filter(|parent| !parent.as_os_str().is_empty())
+                                        .unwrap_or_else(|| Path::new("."));
+                                    workspace
+                                        .open_dir_relative(parent)
+                                        .map_err(file_path_error)?;
+                                    PreparedWriteEffect::BoundCreate {
+                                        workspace,
+                                        relative,
+                                    }
                                 }
-                            }
-                            Err(error) => {
-                                return Err(HostEffectError::from(file_path_error(error)));
-                            }
-                        };
-                        self.validated = Some(PreparedParentEffect::Write {
-                            target,
-                            content: content.clone(),
-                        });
-                        return Ok(NormalizedTarget::WriteFile { workspace_relative });
-                    }
+                                Err(error) => {
+                                    return Err(HostEffectError::from(file_path_error(error)));
+                                }
+                            };
+                            self.validated = Some(PreparedParentEffect::Write {
+                                target,
+                                content: content.clone(),
+                            });
+                            return Ok(NormalizedTarget::WriteFile { workspace_relative });
+                        }
+                    };
                     let effect_base = self.file.allow_config.effect_base();
                     let target = tokio::select! {
                         result = timeout(
                             self.file.timeout,
-                            resolve_write_target(&effect_base, path),
+                            resolve_write_target(&effect_base, &path),
                         ) => {
                             result.map_err(|_| HostEffectError::EffectTimedOut)?
                                 .map_err(HostEffectError::from)?
@@ -4369,11 +4433,7 @@ impl ParentEffectService for ParentHostEffectService {
                 }
                 PreparedParentEffect::Discovery(target) => {
                     let bridge = self.file.permission_bridge.for_host_call(cancellation);
-                    let tool = match &target.action {
-                        DiscoveryAction::ListDir => "js/list_dir",
-                        DiscoveryAction::Glob { .. } => "js/glob",
-                        DiscoveryAction::Grep { .. } => "js/grep",
-                    };
+                    let tool = target.action.permission_tool();
                     let call = async {
                         if let Some(relative) = &target.relative {
                             if let AuthorizationDecision::Denied(reason) =
@@ -5913,6 +5973,443 @@ mod tests {
                 .iter()
                 .all(|record| record.capability == "read_file")
         );
+    }
+
+    /// Broker over a workspace-bound file service for the mini-agent-c1o7m
+    /// regressions. `root` holds the audit store, outside the workspace.
+    #[cfg(unix)]
+    fn bound_file_broker(
+        root: &Path,
+        workspace_root: &Path,
+        permission: Option<PermCheck>,
+        tag: &str,
+    ) -> (
+        InvocationBroker<ParentHostEffectService>,
+        InvocationGrant,
+        PermissionBridgeOwner,
+    ) {
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(workspace_root).unwrap());
+        let owner = PermissionBridgeOwner::new(permission, None, Duration::from_millis(200));
+        let service = ParentHostEffectService::new(
+            FileEffectService::new(
+                owner.bridge(),
+                AllowConfig::unrestricted(workspace_root).with_workspace_binding(workspace),
+                Duration::from_secs(2),
+            ),
+            SpawnEffectService::new(
+                Sandbox::new(false, "bwrap"),
+                owner.bridge(),
+                Duration::from_secs(2),
+            ),
+        );
+        let invocation = InvocationId::new(format!("c1o7m-{tag}")).unwrap();
+        let capabilities = BTreeSet::from([HostCapability::ReadFile, HostCapability::WriteFile]);
+        let grant = InvocationGrant::issue(
+            invocation.clone(),
+            GrantPrincipal::ModelAuthored {
+                tool_call_id: format!("c1o7m-{tag}-call"),
+            },
+            capabilities.clone(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let audit_root = root.join(format!("audit-{tag}"));
+        let audit = EffectAudit::open(
+            AppPaths {
+                config_dir: audit_root.join("config"),
+                data_dir: audit_root.join("data"),
+                local_data_dir: audit_root.join("local"),
+                state_dir: audit_root.join("state"),
+                cache_dir: audit_root.join("cache"),
+                credentials_dir: audit_root.join("credentials"),
+                project_dir: None,
+            }
+            .effect_audit(),
+        )
+        .unwrap();
+        let broker = InvocationBroker::new(
+            invocation,
+            vec![grant.clone()],
+            capabilities,
+            service,
+            Arc::new(Mutex::new(audit)),
+        )
+        .unwrap();
+        (broker, grant, owner)
+    }
+
+    #[cfg(unix)]
+    fn c1o7m_request(
+        grant: &InvocationGrant,
+        effect_ordinal: u32,
+        operation: EffectOperation,
+    ) -> EffectRequest {
+        EffectRequest {
+            effect_ordinal,
+            grant_id: grant.grant_id().clone(),
+            advisory: AdvisoryAttribution::default(),
+            operation,
+        }
+    }
+
+    // mini-agent-c1o7m: `$HOME/...` and `~/...` effect targets are decided
+    // bound-vs-ambient from the expanded path, like the built-in file tools,
+    // so a bound workspace never resolves (or gains) a literal `$HOME`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_file_effects_resolve_home_paths_from_the_expanded_path() {
+        let directory = TempDir::new();
+        let base = directory.path().canonicalize().unwrap();
+        let workspace_root = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(workspace_root.join("$FOO")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("in.txt"), "from home").unwrap();
+        let _home = crate::paths::ScopedTestHome::set(&home);
+        let (mut broker, grant, _owner) = bound_file_broker(&base, &workspace_root, None, "home");
+
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        0,
+                        EffectOperation::ReadFile {
+                            path: "$HOME/in.txt".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::ReadFile {
+                content: "from home".into(),
+            })
+        );
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        1,
+                        EffectOperation::ReadFiles {
+                            paths: vec!["$HOME/in.txt".into(), "~/in.txt".into()],
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::ReadFiles {
+                contents: vec!["from home".into(), "from home".into()],
+            })
+        );
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        2,
+                        EffectOperation::WriteFile {
+                            path: "$HOME/out.txt".into(),
+                            content: "to home".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::WriteFile)
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("out.txt")).unwrap(),
+            "to home"
+        );
+        let listed = broker
+            .dispatch(
+                c1o7m_request(
+                    &grant,
+                    3,
+                    EffectOperation::ListDir {
+                        path: "$HOME".into(),
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        let EffectResult::ListDir { entries, .. } = listed else {
+            panic!("unexpected list result: {listed:?}");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["in.txt", "out.txt"]
+        );
+        // Discovery outside the workspace reports the absolute path it read.
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        4,
+                        EffectOperation::Glob {
+                            path: "~".into(),
+                            pattern: "in.*".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::Glob {
+                paths: vec![home.join("in.txt").to_string_lossy().into_owned()],
+                truncated: false,
+            })
+        );
+        // An unexpanded `$FOO` component stays a literal workspace path.
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        5,
+                        EffectOperation::WriteFile {
+                            path: "$FOO/x.txt".into(),
+                            content: "literal".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::WriteFile)
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("$FOO/x.txt")).unwrap(),
+            "literal"
+        );
+        assert!(!workspace_root.join("$HOME").exists());
+        assert!(!workspace_root.join("~").exists());
+
+        // The test-only service entry points share the same decision.
+        let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_root).unwrap());
+        let owner = PermissionBridgeOwner::new(None, None, Duration::from_millis(200));
+        let service = FileEffectService::new(
+            owner.bridge(),
+            AllowConfig::unrestricted(&workspace_root).with_workspace_binding(workspace),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            service
+                .read("$HOME/in.txt", PermCancellation::new())
+                .await
+                .unwrap(),
+            "from home"
+        );
+        service
+            .write(
+                "$HOME/service.txt",
+                "service".into(),
+                PermCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("service.txt")).unwrap(),
+            "service"
+        );
+        assert!(!workspace_root.join("$HOME").exists());
+    }
+
+    // mini-agent-c1o7m: an expanded home target leaves the workspace, so it is
+    // checked by the ambient (absolute-path) policy, not the bound one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_home_path_write_is_checked_against_the_ambient_policy() {
+        let directory = TempDir::new();
+        let base = directory.path().canonicalize().unwrap();
+        let workspace_root = base.join("workspace");
+        let home = base.join("home");
+        // A literal `$HOME` directory in the workspace: the pre-fix raw-path
+        // gate would have written into it through the bound capability.
+        std::fs::create_dir_all(workspace_root.join("$HOME")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::paths::ScopedTestHome::set(&home);
+        let config = PermissionConfig {
+            write: Some(ToolPerm::Granular(
+                [
+                    ("**".to_string(), Action::Allow),
+                    (format!("{}/**", home.display()), Action::Deny),
+                ]
+                .into(),
+            )),
+            external_directory: Some([(format!("{}/**", home.display()), Action::Allow)].into()),
+            doom_loop: Some(Action::Allow),
+            ..PermissionConfig::default()
+        };
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace_root.clone()),
+                Some(vec!["standard".to_string()]),
+            )
+            .unwrap(),
+        ));
+        let (mut broker, grant, _owner) =
+            bound_file_broker(&base, &workspace_root, Some(permission), "ambient");
+        let denied = broker
+            .dispatch(
+                c1o7m_request(
+                    &grant,
+                    0,
+                    EffectOperation::WriteFile {
+                        path: "$HOME/blocked.txt".into(),
+                        content: "no".into(),
+                    },
+                ),
+                PermCancellation::new(),
+            )
+            .await;
+        assert!(denied.is_err(), "absolute-path deny must apply: {denied:?}");
+        assert!(!home.join("blocked.txt").exists());
+        assert!(!workspace_root.join("$HOME/blocked.txt").exists());
+        // Control: the same policy allows an ordinary workspace write.
+        assert_eq!(
+            broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        1,
+                        EffectOperation::WriteFile {
+                            path: "ok.txt".into(),
+                            content: "yes".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await,
+            Ok(EffectResult::WriteFile)
+        );
+    }
+
+    // mini-agent-c1o7m: JS discovery (list_dir, glob, grep) skips entries the
+    // `read` path deny rules hide, for workspace-bound and absolute roots.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_discovery_omits_read_denied_entries() {
+        let directory = TempDir::new();
+        let base = directory.path().canonicalize().unwrap();
+        let workspace_root = base.join("workspace");
+        std::fs::create_dir_all(workspace_root.join("config/secrets")).unwrap();
+        std::fs::write(
+            workspace_root.join("config/secrets/key.txt"),
+            "needle key\n",
+        )
+        .unwrap();
+        std::fs::write(workspace_root.join("config/token.txt"), "needle token\n").unwrap();
+        std::fs::write(workspace_root.join("config/app.txt"), "needle app\n").unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    ("config/secrets/**".to_string(), Action::Deny),
+                    ("config/token.txt".to_string(), Action::Deny),
+                ]
+                .into(),
+            )),
+            doom_loop: Some(Action::Allow),
+            ..PermissionConfig::default()
+        };
+        let permission = Arc::new(Mutex::new(
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace_root.clone()),
+                Some(vec!["standard".to_string()]),
+            )
+            .unwrap(),
+        ));
+        let (mut broker, grant, _owner) =
+            bound_file_broker(&base, &workspace_root, Some(permission), "deny");
+        let absolute = workspace_root.to_string_lossy().into_owned();
+        let mut ordinal = 0;
+        for root in [".", absolute.as_str()] {
+            let config_root = if root == "." {
+                "config".to_string()
+            } else {
+                format!("{root}/config")
+            };
+            let listed = broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        ordinal,
+                        EffectOperation::ListDir { path: config_root },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await
+                .unwrap();
+            ordinal += 1;
+            let EffectResult::ListDir { entries, .. } = listed else {
+                panic!("unexpected list result: {listed:?}");
+            };
+            let names = entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"app.txt"), "{root}: {names:?}");
+            assert!(!names.contains(&"token.txt"), "{root}: {names:?}");
+
+            let globbed = broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        ordinal,
+                        EffectOperation::Glob {
+                            path: root.into(),
+                            pattern: "**/*.txt".into(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await
+                .unwrap();
+            ordinal += 1;
+            assert_eq!(
+                globbed,
+                EffectResult::Glob {
+                    paths: vec!["config/app.txt".into()],
+                    truncated: false,
+                },
+                "{root}"
+            );
+
+            let searched = broker
+                .dispatch(
+                    c1o7m_request(
+                        &grant,
+                        ordinal,
+                        EffectOperation::Grep {
+                            path: root.into(),
+                            pattern: "needle".into(),
+                            options: GrepOptions::default(),
+                        },
+                    ),
+                    PermCancellation::new(),
+                )
+                .await
+                .unwrap();
+            ordinal += 1;
+            let EffectResult::Grep { matches, .. } = searched else {
+                panic!("unexpected grep result: {searched:?}");
+            };
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|matched| matched.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["config/app.txt"],
+                "{root}"
+            );
+        }
     }
 
     #[cfg(feature = "skills")]
