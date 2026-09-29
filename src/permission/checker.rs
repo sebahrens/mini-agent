@@ -751,7 +751,17 @@ impl PermissionChecker {
             }
         }
 
-        let action = self.resolve_check_action(tool, &matched);
+        let mut action = self.resolve_check_action(tool, &matched);
+        // Yolo allows unmatched scripts but still asks before a recognizably
+        // destructive one; a configured rule for the script always decides.
+        if self.mode == SecurityMode::Yolo
+            && tool == "shell"
+            && matched.is_empty()
+            && action == Action::Allow
+            && crate::permission::is_destructive_shell_script(policy_input)
+        {
+            action = Action::Ask;
+        }
         let result = self.doom_loop_check(tool, identity, action);
         // A hook grant suppresses a prompt; it cannot turn a policy denial into an allow.
         #[cfg(feature = "hooks")]
@@ -2817,5 +2827,70 @@ mod exact_session_key_tests {
             CheckResult::Ask
         );
         let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod yolo_destructive_tests {
+    use super::*;
+
+    fn yolo(bash: Option<ToolPerm>) -> PermissionChecker {
+        let workspace = std::env::temp_dir().canonicalize().unwrap();
+        PermissionChecker::new(
+            &PermissionConfigs::from(PermissionConfig {
+                bash,
+                ..PermissionConfig::default()
+            }),
+            SecurityMode::Yolo,
+            Some(workspace),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn yolo_asks_before_destructive_shell_commands_even_with_custom_bash_rules() {
+        let custom = ToolPerm::Granular([("cargo test".to_string(), Action::Allow)].into());
+        for bash in [None, Some(custom)] {
+            let mut checker = yolo(bash);
+            for script in [
+                "rm -rf ~",
+                "rm -fr build",
+                "rm --recursive --force /",
+                "sudo rm -r /var/lib/data",
+                "cd /tmp && rm -rf *",
+                "echo hi; dd if=/dev/zero of=/dev/disk2",
+                "mkfs.ext4 /dev/sdb1",
+                "git push --force origin main",
+                "git reset --hard HEAD~3",
+                "git clean -fdx",
+                "find . -name '*.o' -delete",
+                "chmod -R 777 /",
+            ] {
+                assert_eq!(checker.check("bash", script), CheckResult::Ask, "{script}");
+            }
+            for script in [
+                "ls -la",
+                "rm notes.txt",
+                "cargo test",
+                "git push origin main",
+                "grep -rf x .",
+            ] {
+                assert_eq!(
+                    checker.check("bash", script),
+                    CheckResult::Allowed,
+                    "{script}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_configured_rule_still_decides_destructive_scripts_in_yolo() {
+        let mut checker = yolo(Some(ToolPerm::Granular(
+            [("rm -rf target".to_string(), Action::Allow)].into(),
+        )));
+        assert_eq!(checker.check("bash", "rm -rf target"), CheckResult::Allowed);
+        assert_eq!(checker.check("bash", "rm -rf src"), CheckResult::Ask);
     }
 }

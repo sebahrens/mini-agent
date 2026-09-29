@@ -1391,7 +1391,21 @@ redirects, substitutions, command lists, subshells, or background jobs that
 start with `echo`. Bash `ask` and `deny` entries remain pattern-based as
 best-effort workflow guardrails; shell syntax can reshape equivalent commands,
 so these patterns are not a containment boundary. An unmatched Bash script asks in `guarded` and
-`standard`; `yolo` remains the explicit allow-all mode subject to deny rules.
+`standard`; `yolo` remains the explicit allow-all mode subject to deny rules,
+except that an unmatched script containing a recognizably destructive command
+still asks: `rm` with a recursive or force flag, `dd`, `mkfs`, `shred`,
+`wipefs`, `mkswap`, `fdisk`, `find … -delete`, recursive `chmod`/`chown`, and
+`git push --force`/`--delete`, `git reset --hard`, `git clean -f`, and
+`git branch -D`. Each command separated by a newline, `;`, `&`, or `|` is
+checked after leading `sudo`/`env`/`command`/`exec` wrappers. This check
+applies whether or not `bash` rules are configured, and a configured rule that
+matches the script (for example an exact `"rm -rf target": allow`) decides
+instead. Like other Bash patterns it is a best-effort guard rail, not a
+containment boundary, and in non-interactive runs the ask is refused. Note
+that configuring any `bash` rule replaces the built-in `bash` rule list
+(including its pattern-based denies such as `rm -rf /**` and `dd **`); only
+the built-in `^rm\s+.*\*` deny is always kept, so copy any built-in denies you
+still want into your own rules.
 
 `planwrite` is read-only except for the narrow built-in plan-file exception:
 `write`, `edit`, and `js/write_file` may modify `PLAN*.md` only when the
