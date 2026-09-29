@@ -6,6 +6,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `SECURITY.md` documents private vulnerability reporting through GitHub, supported versions,
+  response targets and scope; the README and the new-issue page point security reports there, and
+  `CONTRIBUTING.md` describes the build, test, documentation and beads workflow.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

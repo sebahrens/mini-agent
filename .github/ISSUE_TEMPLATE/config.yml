@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/sebahrens/mini-agent/security/advisories/new
+    about: Do not open a public issue. Report vulnerabilities privately as described in SECURITY.md.
+  - name: Security policy
+    url: https://github.com/sebahrens/mini-agent/blob/main/SECURITY.md
+    about: Supported versions, response targets and what is in scope.

@@ -60,6 +60,100 @@ class MarkdownLinkValidationTests(unittest.TestCase):
             self.assertIn("nested/nope.md", errors[0])
 
 
+class SecurityPolicyValidationTests(unittest.TestCase):
+    REPORT_URL = "https://github.com/sebahrens/mini-agent/security/advisories/new"
+
+    def write_policy_tree(self, root: Path) -> None:
+        (root / "SECURITY.md").write_text(
+            f"# Security Policy\n\nReport privately: <{self.REPORT_URL}>\n",
+            encoding="utf-8",
+        )
+        (root / "README.md").write_text(
+            "# mini-agent\n\n## Security\n\nSee [SECURITY.md](SECURITY.md#scope).\n",
+            encoding="utf-8",
+        )
+        template_dir = root / ".github" / "ISSUE_TEMPLATE"
+        template_dir.mkdir(parents=True)
+        (template_dir / "config.yml").write_text(
+            "contact_links:\n"
+            "  - name: Report a security vulnerability\n"
+            f"    url: {self.REPORT_URL}\n"
+            "    about: Report privately.\n",
+            encoding="utf-8",
+        )
+
+    def test_linked_policy_with_private_reporting_route_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_policy_tree(root)
+
+            self.assertEqual(
+                [], CHECK_PACKAGE_METADATA.validate_security_policy(root)
+            )
+
+    def test_missing_security_policy_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_policy_tree(root)
+            (root / "SECURITY.md").unlink()
+
+            errors = CHECK_PACKAGE_METADATA.validate_security_policy(root)
+
+            self.assertEqual(1, len(errors))
+            self.assertIn("SECURITY.md is missing", errors[0])
+
+    def test_security_policy_without_private_reporting_channel_is_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_policy_tree(root)
+            (root / "SECURITY.md").write_text(
+                "# Security Policy\n\nOpen a public issue.\n", encoding="utf-8"
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_security_policy(root)
+
+            self.assertEqual(1, len(errors))
+            self.assertIn("private vulnerability reporting", errors[0])
+
+    def test_readme_without_security_link_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_policy_tree(root)
+            (root / "README.md").write_text(
+                "# mini-agent\n\nMentions SECURITY.md only as text.\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_security_policy(root)
+
+            self.assertEqual(["README.md must link to SECURITY.md"], errors)
+
+    def test_issue_routing_must_point_security_reports_to_private_channel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_policy_tree(root)
+            config = root / ".github" / "ISSUE_TEMPLATE" / "config.yml"
+            config.write_text("blank_issues_enabled: true\n", encoding="utf-8")
+
+            errors = CHECK_PACKAGE_METADATA.validate_security_policy(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("contact link", errors[0])
+
+            config.unlink()
+            errors = CHECK_PACKAGE_METADATA.validate_security_policy(root)
+            self.assertEqual(1, len(errors))
+            self.assertIn("config.yml is missing", errors[0])
+
+    def test_checked_in_security_policy_is_linked_and_routed(self) -> None:
+        self.assertEqual(
+            [], CHECK_PACKAGE_METADATA.validate_security_policy(SCRIPT.parents[1])
+        )
+
+
 class ReleaseWorkflowValidationTests(unittest.TestCase):
     def test_reviewed_current_release_action_pins_are_accepted(self) -> None:
         workflow = (
