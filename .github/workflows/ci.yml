@@ -872,6 +872,41 @@ jobs:
           printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
           echo 'PHASE6_NAMED_FIFO=denied' >> "$GITHUB_ENV"
 
+      # The general command sandbox (Sandbox::wrap_command on Seatbelt) and
+      # parent-brokered JS spawn have real-backend tests that return early
+      # when Seatbelt preflight is denied. MINI_AGENT_REQUIRE_REAL_SANDBOX=1
+      # turns that early return into a panic, and any 'skipping' output or a
+      # missing pass also fails the step, so a runner where Seatbelt is
+      # unusable cannot report these tests green (mini-agent-dw9ru).
+      - name: Require the real Seatbelt general command sandbox on this runner
+        shell: bash
+        env:
+          MINI_AGENT_REQUIRE_REAL_SANDBOX: '1'
+        run: |
+          guarded_tests=(
+            'sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend'
+            'tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads'
+            'extras::js::host::tests::spawn_uses_real_macos_seatbelt_write_boundary'
+          )
+          for test_name in "${guarded_tests[@]}"; do
+            status=0
+            output=$(cargo test --locked --no-default-features --features js,sandbox \
+              "$test_name" -- --exact --nocapture --test-threads=1 2>&1) || status=$?
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ]; then
+              echo "$test_name failed with status $status" >&2
+              exit "$status"
+            fi
+            if printf '%s\n' "$output" | grep -qi 'skipping'; then
+              echo "$test_name skipped instead of running under Seatbelt" >&2
+              exit 1
+            fi
+            if ! printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'; then
+              echo "$test_name did not run and pass exactly once" >&2
+              exit 1
+            fi
+          done
+
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
         shell: bash

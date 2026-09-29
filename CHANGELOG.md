@@ -116,6 +116,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   no longer quarantines it immediately. The effect is still denied and audited, but the call is now
   recorded as `threw` (`scope_miss`) telemetry behind the behavioural threshold; only an operation
   outside the skill's declared capabilities is a capability-policy fault that quarantines at once.
+- macOS CI now fails when the real Seatbelt tests for the general command sandbox and JS `spawn`
+  skip because Seatbelt is unusable: they run with `MINI_AGENT_REQUIRE_REAL_SANDBOX=1`, which turns
+  the skip into a failure, instead of silently passing.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

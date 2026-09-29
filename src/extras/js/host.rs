@@ -8838,7 +8838,9 @@ mod tests {
     async fn spawn_uses_real_macos_seatbelt_write_boundary() {
         let sandbox = Sandbox::new(true, "seatbelt");
         if sandbox.policy() == SandboxPolicy::RequiredButUnavailable {
-            eprintln!("skipping real macOS JS spawn test because Seatbelt preflight is denied");
+            crate::sandbox::skip_unusable_real_sandbox_test(
+                "real macOS JS spawn test cannot run because Seatbelt preflight is denied",
+            );
             return;
         }
         let outside_marker = std::env::current_dir()
