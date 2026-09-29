@@ -78,9 +78,15 @@ on a fresh install; an existing legacy install keeps
 `provider = "provider_name"`.
 
 `ZS_MODEL` selects a model through the same CLI field as `--model`. For
-compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback—even
-when another provider is selected—and takes precedence over the config-file
-model. Prefer `ZS_MODEL` for provider-neutral configuration.
+compatibility, `OPENROUTER_MODEL` is also accepted as the next fallback when
+OpenRouter is the provider in effect, and then takes precedence over the
+config-file model; it is ignored for other providers. Prefer `ZS_MODEL` for
+provider-neutral configuration.
+
+The config-file `model` is used only with the provider it belongs to (a quick
+model's own provider, otherwise the configured `provider`). When `--provider`
+or the config's `provider` selects a different one and no model is given,
+that provider's default model is used instead of another provider's model id.
 
 If you are using a provider that's not your default one, use the `--provider` CLI flag:
 
