@@ -1685,6 +1685,11 @@ listed API key environment variable when that variable is set):
 Set `enable-exa-mcp = false` to disable the Exa default without touching
 `mcp_servers`. Set `"mcp_servers": {}` to disable all MCP auto-configuration.
 
+A server you define yourself under a built-in's name (`Exa Web Search`,
+`Context7`, `Grep.app`) is kept whatever the toggle says: the toggles only add
+or omit the built-in registration, and saving the config (including `--setup`)
+never removes a user-defined entry.
+
 In `readonly` and `planwrite` modes, approval-free MCP access is limited to
 immutable built-in registrations and these exact read-only tool names:
 Exa `websearch` and `webfetch`; Context7 `get_context` and `search_docs`; and
