@@ -68,6 +68,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   profile or the `kernel.apparmor_restrict_unprivileged_userns=0` sysctl (and its trade-off). The
   AUR package lists `bubblewrap` in `optdepends`, and `install.sh` warns on Linux when `bwrap` is
   not on `PATH`.
+- The README, Get Started guide, Windows packaging README and release guide now state that the
+  Windows MSI/exe and macOS binaries are unsigned and not notarized, explain the SmartScreen and
+  Gatekeeper prompts, show how to verify downloads with `SHA256SUMS` and `gh attestation verify`,
+  and point AppLocker/WDAC users to hash rules until code signing exists.
 
 ### Fixed
 

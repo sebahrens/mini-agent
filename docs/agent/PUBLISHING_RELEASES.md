@@ -280,6 +280,31 @@ Before treating a release as complete, verify that:
 For an older noncompliant release, attach its exact vendored source bundle, standalone compliance
 documents, and a prominent release-note correction before leaving its binary assets available.
 
+## Code signing status
+
+Release binaries are currently **unsigned**. The repository holds no Authenticode or Apple
+Developer ID certificate, so the release workflow runs no `signtool`, `codesign`, or `notarytool`
+step:
+
+- `mini-agent-windows-x64.msi` and the `mini-agent.exe` it installs have no Authenticode
+  signature. SmartScreen warns on first open (users choose **More info**, then **Run anyway**), and
+  AppLocker/WDAC publisher rules cannot pin a mini-agent signer; managed fleets must use file-hash
+  rules and refresh them each release.
+- The macOS archives' binaries are not Developer ID signed or notarized. Gatekeeper blocks a
+  browser-downloaded binary until the user runs `xattr -d com.apple.quarantine ./mini-agent` or
+  Control-clicks it and chooses **Open**; the `curl`-based shell installer is not quarantined.
+
+User-facing integrity verification is the release's `SHA256SUMS`/`MSI_SHA256SUMS` plus
+`gh attestation verify <asset> --repo sebahrens/mini-agent`. The README, Get Started guide, and
+`packaging/windows/README.md` document these steps; keep them in sync with this section.
+
+TODO (once a signing certificate exists; tracked as a separate deferred bead): sign the MSI and
+`mini-agent.exe` in the `windows-msi` job, then add a release step after the quiet-install smoke that
+runs `Get-AuthenticodeSignature` on both files and fails unless `Status` is `Valid` and the signer
+subject matches the pinned publisher. Add the equivalent `codesign --verify --strict` and
+`spctl --assess` gate for notarized macOS binaries. Do not add these steps before signing exists:
+they would fail every release.
+
 ## Post-release (after CI completes)
 
 Once the GitHub Actions release workflow has finished and all binary assets are attached to the release:
