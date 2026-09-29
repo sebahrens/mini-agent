@@ -136,6 +136,9 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
     let app_paths = paths::AppPaths::from_process(Some(workspace_root))?;
     paths::install_process_paths(&app_paths)?;
     paths::prepare_storage_roots(&app_paths)?;
+    if cli.no_session {
+        paths::disable_session_artifacts();
+    }
 
     #[cfg(feature = "js")]
     if cli.js_runtime_check {

@@ -1131,3 +1131,75 @@ fn a_headless_goal_reports_its_outcome_and_exits_with_it() {
         );
     }
 }
+
+/// `--no-session` leaves nothing of the run behind: no session file, and no
+/// goal round records for a session that was never saved (mini-agent-x0rcr).
+#[cfg(unix)]
+#[test]
+fn no_session_writes_no_session_and_no_goal_records() {
+    #[allow(unused_mut)]
+    let mut cases: Vec<(&'static str, Vec<&'static str>)> = vec![("plain", vec!["-p", "start"])];
+    #[cfg(feature = "goal")]
+    cases.push((
+        "goal_rounds",
+        vec![
+            "--goal",
+            "ship the parser",
+            "--goal-max-rounds",
+            "1",
+            "-p",
+            "start",
+        ],
+    ));
+    #[cfg(feature = "loop")]
+    cases.push((
+        "validation_read_only",
+        vec![
+            "--shell",
+            "/bin/sh",
+            "--loop",
+            "--loop-prompt",
+            "finish",
+            "--loop-max",
+            "1",
+            "--loop-run",
+            "true",
+        ],
+    ));
+
+    for (outcome, args) in cases {
+        let root = TempRoot::new();
+        let server = root.local_provider(outcome);
+        let mut cli = root.provider_command("read");
+        cli.arg("--no-session").args(&args);
+        let output = bounded_output(cli);
+        server.join().unwrap().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A goal that stops on its budget exits with its own code; the point
+        // here is what the run left on disk, not how it ended.
+        assert!(
+            output.status.code().is_some(),
+            "{outcome}: the run finished: {stderr}"
+        );
+
+        let sessions: Vec<_> = std::fs::read_dir(root.0.join("sessions"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(
+            sessions.is_empty(),
+            "{outcome}: --no-session saved a session: {sessions:?}"
+        );
+        let goals: Vec<_> = std::fs::read_dir(root.0.join("goals"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            goals.is_empty(),
+            "{outcome}: --no-session wrote goal round records: {goals:?} ({stderr})"
+        );
+    }
+}

@@ -256,7 +256,8 @@ flags applies them afterwards, so a flag always beats the file it overrides.
   cleared or the session is switched.
 - **Transcripts**: one bounded JSON record per gate evaluation under the goals directory, naming
   which model judged and whether it was the agent's own. A stored goal id that is not a plain
-  identifier is reissued rather than used as a path.
+  identifier is reissued rather than used as a path. `--no-session` writes none: the records are
+  the session's audit trail, and a run that saves no session leaves no goal directory behind.
 
 ## Extension map
 
