@@ -34,6 +34,17 @@ Versions 1.9.0 to 1.9.2 were not published from this repository.
 
 ### Fixed
 
+- Global and managed hooks keep workspace-file digests across sessions (a changed file asks, or
+  fails closed when headless), and `$ZEROSTACK_PROJECT_DIR` paths are content-bound. Each ACP turn
+  runs hooks against its own workspace, so concurrent sessions in different repositories work with
+  hooks. An `external_directory` allow is no longer overridden by `"*": ask` for external reads.
+- ACP goal rounds count Gemini thinking tokens, and ACP no longer repeats its active recap in the
+  memory block. Completion-judge calls are charged at the judge model's own prices (unpriced judge
+  tokens are flagged), `/goal pause` stops a running check and judge, and a running `/loop` follows
+  `/worktree` to the new workspace's `LOOP_PLAN.md`.
+- The permission prompt keeps the status line, replayed sessions show each tool result under its
+  call, a space after a full command such as `/model` opens its picker, and argument pickers follow
+  monochrome mode.
 - Terminal: exiting (including repeated Ctrl+C, `kill`, SIGHUP or closing the terminal) restores the
   terminal cleanly, shows the cursor and saves the session; no stray escape sequences are printed.
   Long streamed paragraphs repaint live.
@@ -79,10 +90,25 @@ Versions 1.9.0 to 1.9.2 were not published from this repository.
   is expanded in the install directory.
 - Windows: sandboxed hooks are reported unavailable with an accurate message instead of a misleading
   bwrap error, and cancelling or timing out a command no longer stalls the app.
-- CI runs the full test matrix when documentation embedded in the binary or tests changes.
+- CI runs the full test matrix when documentation embedded in the binary or tests changes, compiles
+  and runs the hooks rows on Windows, runs strict Clippy on every test row, and records named-FIFO
+  denial on both macOS worker-gate runners.
+- Windows trusted hooks run in a kill-on-close Job, so timeouts and cancellation end their whole
+  process tree without the helper's cooperative wait. Starting an agent turn with the `acp` and
+  `hooks` features no longer overflows the stack, and several load-sensitive process tests are
+  fixed.
 
 ### Added
 
+- ACP TCP can be served over TLS (`MINI_AGENT_ACP_TLS_CERT`/`MINI_AGENT_ACP_TLS_KEY`) with a
+  certificate-bound handshake; editor-supplied stdio MCP servers run in the sandbox by default
+  (`MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` opts out).
+- Opt-in `terminal_notify` (OSC 9/777) and `terminal_prompt_marks` (OSC 133), double-click word
+  selection, `e` to expand a shortened permission request, and opt-in `session_title_model` for
+  generated session titles.
+- The installer retries private releases with `GITHUB_TOKEN` or an authenticated `gh`, still
+  verifying checksums. Superseded Agent Skill versions are pruned once unused (newest two and
+  anything from the last seven days are kept).
 - Terminal title shows `mini-agent: working`, `waiting for approval` or `idle` for multiplexers such
   as herdr (`terminal_title = false` disables it).
 - Tool results appear directly under their tool call; mouse selection copies exactly the dragged text
