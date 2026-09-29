@@ -1165,9 +1165,13 @@ impl Startup {
             }));
         }
 
-        // ARCHITECTURE.md prompt
+        // ARCHITECTURE.md prompt. It reads a line from stdin, so like the
+        // version prompts it is only offered when a person is at the terminal:
+        // a `-p`, `--goal` or `--loop` run would otherwise stop on it, consume
+        // piped input meant for the run, or record the directory as asked
+        // without anyone having answered.
         #[cfg(feature = "archmd")]
-        let arch_created = if !self.cli.resolve_no_context_files(&self.cfg) {
+        let arch_created = if self.is_interactive && !self.cli.resolve_no_context_files(&self.cfg) {
             let workspace = self.workspace.root();
             if workspace.exists() {
                 crate::extras::archmd::ask_and_create(workspace).unwrap_or_else(|e| {

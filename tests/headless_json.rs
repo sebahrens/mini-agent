@@ -1132,6 +1132,88 @@ fn a_headless_goal_reports_its_outcome_and_exits_with_it() {
     }
 }
 
+/// A headless run never stops on the ARCHITECTURE.md offer (mini-agent-e3rp2).
+///
+/// The prompt reads a line from stdin. With context files enabled, a `-p` run
+/// in a directory without the file used to print `Create one? [y/N]` and wait,
+/// consuming piped input meant for the run, and recording the directory as
+/// asked without anyone having answered. `--loop-max 0` runs nothing and is
+/// answered before any prompt at all.
+#[cfg(feature = "archmd")]
+#[test]
+fn headless_runs_do_not_offer_to_create_architecture_md() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    #[allow(unused_mut)]
+    let mut cases: Vec<(Option<&'static str>, Vec<&'static str>)> =
+        vec![(Some("plain"), vec!["-p", "start"])];
+    #[cfg(feature = "loop")]
+    cases.push((
+        None,
+        vec!["--loop", "--loop-prompt", "resume work", "--loop-max", "0"],
+    ));
+
+    for (outcome, args) in cases {
+        let root = TempRoot::new();
+        let server = outcome.map(|outcome| root.local_provider(outcome));
+        let mut command = root.command();
+        command
+            .env("HEADLESS_LOCAL_TEST_KEY", "local-test-key")
+            .env("OPENROUTER_API_KEY", "archmd-startup-test-key")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .args(["--no-sandbox", "--no-session", "--tools", "read"]);
+        if server.is_some() {
+            command.args(["--provider", "local-test", "--model", "test"]);
+        }
+        let mut child = command
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start headless run");
+        // Keep the pipe open, without an answer or EOF, until the child exits.
+        let _stdin = child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let exited = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop stalled run");
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = child.wait_with_output().expect("reap headless run");
+        if let Some(server) = server {
+            server.join().unwrap().unwrap();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(exited, "{args:?} waited on stdin: {stderr}");
+        assert!(output.status.success(), "{args:?} failed: {stderr}");
+        assert!(
+            !stderr.contains("ARCHITECTURE.md"),
+            "{args:?} offered to create ARCHITECTURE.md: {stderr}"
+        );
+        assert!(!root.0.join("ARCHITECTURE.md").exists());
+        fn recorded(dir: &std::path::Path) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().any(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .is_some_and(|name| name == "dirs_asked_architecture.txt")
+                    || (path.is_dir() && recorded(&path))
+            })
+        }
+        assert!(
+            !recorded(&root.0),
+            "{args:?} recorded the directory as asked"
+        );
+    }
+}
+
 /// `--no-session` leaves nothing of the run behind: no session file, and no
 /// goal round records for a session that was never saved (mini-agent-x0rcr).
 #[cfg(unix)]

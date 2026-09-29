@@ -450,6 +450,15 @@ async fn run_inner(cli: cli::Cli) -> anyhow::Result<()> {
         .await;
     }
 
+    // `--loop-max 0` runs nothing. Answer it before feature start-up and the
+    // startup prompts, so asking for no iterations cannot block on a prompt,
+    // read stdin or start servers first.
+    #[cfg(feature = "loop")]
+    if startup.cli.loop_mode && startup.cli.loop_max == Some(0) {
+        eprintln!("[loop] max iterations (0) reached, stopping");
+        return Ok(());
+    }
+
     startup.start_openrouter_pricing_refresh();
     startup.init_features().await?;
     let prompts = startup.resolve_prompts().await;
