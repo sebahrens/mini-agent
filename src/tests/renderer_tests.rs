@@ -548,7 +548,55 @@ fn chat_margin_reduces_content_width() {
 
 mod dirty {
     use crate::ui::feed::{BlockStyle, Feed};
-    use crate::ui::renderer::{BottomRedrawPlan, BottomSnapshot, PromptSnapshot, Renderer};
+    use crate::ui::renderer::{
+        BottomRedrawPlan, BottomSnapshot, PromptSnapshot, Renderer, SelectionPoint,
+    };
+
+    #[test]
+    fn selection_copies_the_dragged_columns_not_whole_lines() {
+        let mut r = Renderer::new().unwrap();
+        r.feed_mut()
+            .push_line(BlockStyle::Plain, "alpha beta gamma");
+        r.feed_mut().push_line(BlockStyle::Plain, "delta epsilon");
+        r.feed_mut().push_line(BlockStyle::Plain, "zeta eta theta");
+        r.selection_active = true;
+        // Same line, dragged right to left: "beta".
+        r.selection_start = Some(SelectionPoint::new(0, 9));
+        r.selection_end = Some(SelectionPoint::new(0, 6));
+        assert_eq!(r.selected_text().as_deref(), Some("beta"));
+        // Across lines: partial first and last, whole middle.
+        r.selection_start = Some(SelectionPoint::new(0, 11));
+        r.selection_end = Some(SelectionPoint::new(2, 3));
+        assert_eq!(
+            r.selected_text().as_deref(),
+            Some("gamma\ndelta epsilon\nzeta")
+        );
+        // Past the end of a line selects to its end.
+        r.selection_start = Some(SelectionPoint::new(1, 6));
+        r.selection_end = Some(SelectionPoint::new(1, 70));
+        assert_eq!(r.selected_text().as_deref(), Some("epsilon"));
+    }
+
+    #[test]
+    fn copy_notices_are_transient_and_never_enter_the_transcript() {
+        let mut r = Renderer::new().unwrap();
+        let before = r.feed().block_count();
+        r.show_notice("copied selection", crossterm::style::Color::Green);
+        assert_eq!(r.feed().block_count(), before);
+        assert_eq!(r.notice_text(), Some("copied selection"));
+        assert!(r.notice_deadline().is_some());
+    }
+
+    #[test]
+    fn a_notice_change_redraws_only_the_statusline() {
+        let prev = bottom_snapshot();
+        let mut next = bottom_snapshot();
+        next.notice = Some("copied selection".into());
+        assert_eq!(
+            Renderer::bottom_redraw_plan(Some(&prev), &next, false),
+            BottomRedrawPlan::StatuslineOnly
+        );
+    }
 
     fn bottom_snapshot() -> BottomSnapshot {
         BottomSnapshot {
@@ -566,6 +614,7 @@ mod dirty {
             monochrome: false,
             input_bg: None,
             status_bg: None,
+            notice: None,
         }
     }
 
@@ -601,8 +650,8 @@ mod dirty {
         r.scroll_line_up();
         assert!(r.is_scrolling());
         r.selection_active = true;
-        r.selection_start = Some(2);
-        r.selection_end = Some(4);
+        r.selection_start = Some(SelectionPoint::new(2, 0));
+        r.selection_end = Some(SelectionPoint::new(4, 3));
         r.feed_mut().push_line(BlockStyle::Plain, "evicts line 0");
 
         r.reconcile_feed_retention();
@@ -654,8 +703,8 @@ mod dirty {
         assert!(!r.chat_needs_redraw());
         // Selection fields are public and mutated directly by callers.
         r.selection_active = true;
-        r.selection_start = Some(0);
-        r.selection_end = Some(0);
+        r.selection_start = Some(SelectionPoint::new(0, 0));
+        r.selection_end = Some(SelectionPoint::new(0, 4));
         assert!(r.chat_needs_redraw());
         r.mark_chat_clean();
         r.clear_selection();
@@ -870,4 +919,89 @@ fn picker_floor_row_rises_with_the_statusline() {
     let one_line = r.picker_floor_row();
     r.set_statusline_height(3);
     assert_eq!(r.picker_floor_row() + 2, one_line);
+}
+
+#[test]
+fn history_above_the_view_is_always_signalled() {
+    use crate::ui::renderer::{HistoryIndicator, history_indicator};
+    // Everything fits: no marker.
+    assert_eq!(history_indicator(0, 10, 20), None);
+    assert_eq!(history_indicator(0, 20, 20), None);
+    // Following the output with history above: a dim line count.
+    assert_eq!(
+        history_indicator(0, 120, 20),
+        Some(HistoryIndicator::Above(" ↑ 100 ".into()))
+    );
+    // Scrolled back: the position, as before.
+    assert_eq!(
+        history_indicator(50, 120, 20),
+        Some(HistoryIndicator::Scrolled(" SCROLL 50% ".into()))
+    );
+}
+
+mod permission_prompt_layout_tests {
+    use crate::ui::renderer::{prompt_block_rows, prompt_max_rows};
+    use crate::ui::utils::display_width;
+
+    const OPTIONS: &str = "  (y) allow once  (n) deny";
+
+    #[test]
+    fn a_long_path_wraps_instead_of_being_clipped() {
+        let header = "[permission] edit: /home/user/projects/app/src/components/forms/Input.tsx";
+        let rows = prompt_block_rows(header, OPTIONS, 30, 6);
+        assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
+        assert_eq!(rows.last().unwrap(), OPTIONS);
+        assert_eq!(rows[..rows.len() - 1].concat(), header);
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_budget_keeps_its_file_name() {
+        let header = format!("[permission] edit: /{}/Input.tsx", "deep/".repeat(60));
+        let rows = prompt_block_rows(&header, OPTIONS, 40, 3);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[..2].concat().ends_with("/Input.tsx"), "{rows:?}");
+        assert!(rows[..2].concat().contains('…'));
+    }
+
+    #[test]
+    fn a_multi_line_script_is_summarised_never_written_raw() {
+        let script = (1..=40)
+            .map(|n| format!("echo line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let header = format!("[permission] bash: cat <<'END'\n{script}\nEND");
+        let rows = prompt_block_rows(&header, OPTIONS, 60, 6);
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(rows.iter().all(|row| !row.contains('\n')));
+        assert!(rows.iter().all(|row| display_width(row) <= 60));
+        assert_eq!(rows[0], "[permission] bash: cat <<'END'");
+        let note = &rows[4];
+        assert!(note.contains("more line(s)"), "{note}");
+        assert!(note.contains("scroll up"), "{note}");
+        assert_eq!(rows[5], OPTIONS);
+    }
+
+    #[test]
+    fn control_sequences_in_a_request_are_stripped() {
+        let rows = prompt_block_rows(
+            "[permission] bash: ls\x1b[2J\x1b]0;x\x07 -la",
+            OPTIONS,
+            80,
+            4,
+        );
+        assert_eq!(rows[0], "[permission] bash: ls -la");
+    }
+
+    #[test]
+    fn a_short_request_keeps_the_classic_two_rows() {
+        let rows = prompt_block_rows("[permission] read: /a.rs", OPTIONS, 80, 6);
+        assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
+    }
+
+    #[test]
+    fn the_prompt_never_takes_most_of_the_screen() {
+        assert_eq!(prompt_max_rows(3), 2);
+        assert_eq!(prompt_max_rows(20), 8);
+        assert_eq!(prompt_max_rows(200), 12);
+    }
 }

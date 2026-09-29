@@ -529,7 +529,8 @@ Accepted top-level keys:
 | `show_reasoning`          | boolean | Show streamed reasoning text in the TUI. Can still be toggled at runtime with `Ctrl+R` or `/reasoning`. Default: `false`. |
 | `statusline`              | table   | Configurable status bar (up to 3 lines of colored segments). When absent, a built-in default layout is used. See Status bar below. |
 | `chat_left_margin`        | integer | Left padding (columns) for the chat area only; input and status rows are unaffected. Default: `0`. |
-| `mouse_capture`           | boolean | Capture mouse events in the TUI: wheel scrolling, click to place the input cursor, click to open links, and drag to select and copy transcript lines. Set `false` to leave the mouse to the terminal so its native text selection works (the in-app mouse features are then unavailable; use `PageUp`/`PageDown` to scroll). Default: `true`. |
+| `mouse_capture`           | boolean | Capture mouse events in the TUI: wheel scrolling, click to place the input cursor, click to open links, and drag to select and copy transcript lines. Set `false` to leave the mouse to the terminal so its native text selection works (the in-app mouse features are then unavailable; use `PageUp`/`PageDown` to scroll). Inside a terminal multiplexer that offers its own selection and copy mode (tmux, zellij, herdr), `false` lets that selection work. Default: `true`. |
+| `terminal_title`          | boolean | Report agent activity in the terminal/window title (OSC 0): `mini-agent: working` while a run is active, `mini-agent: waiting for approval` while a permission prompt waits, and `mini-agent: idle` otherwise. Terminal multiplexers and tab bars that show pane or window titles (tmux `#{pane_title}`, zellij, herdr, terminal tabs) can surface it. The title is saved on start and restored on exit (XTWINOPS title stack; terminals without it fall back to their default title). The text is fixed, never model or tool output. Set `false` to leave the title alone. Default: `true`. |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `wt-auto-merge`           | boolean | Automatically merge a CLI-created worktree on exit; requires `git-worktree`. Default: `false`. |
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees; requires `git-worktree`. |
@@ -563,7 +564,10 @@ Accepted top-level keys:
 
 The macOS general-command Seatbelt profile permits reads from ordinary
 host-readable paths needed by developer tools, but explicitly denies the
-resolved mini-agent configuration and credential directories. It therefore
+resolved mini-agent configuration and credential directories. Each is denied
+under both its configured spelling and its symlink-resolved spelling (for
+example `/tmp` versus `/private/tmp`, or a symlinked `~/.mini-agent`), because
+Seatbelt matches only resolved paths. It therefore
 protects mini-agent's own stored API keys and MCP OAuth tokens, but does not
 claim universal filesystem confidentiality. Linux and macOS expose only the dedicated
 `<cache_dir>/sandbox-runtime` subtree to general sandboxed commands.
@@ -708,7 +712,9 @@ workspace and application cache as writable, a minimal runtime filesystem,
 and no IP network. On macOS, Seatbelt allows host-readable files, limits writes
 to the workspace, application cache, temporary directory, and `/dev/null`, and
 denies network. Other backends have only their reported backend-defined
-guarantees. `"trusted"` has ambient filesystem and network access by explicit
+guarantees. The Windows AppContainer backend has no direct-exec hook path, so
+on Windows `"sandboxed"` hooks report `requested-but-unavailable` and are
+denied at launch; use `"trusted"` to opt out explicitly. `"trusted"` has ambient filesystem and network access by explicit
 configuration consent, while retaining direct argv, canonical cwd, minimal
 environment, timeout/output bounds, cancellation, and tree cleanup. Audit logs
 name the event, executable, trust choice, containment request/availability,
@@ -1252,6 +1258,7 @@ Available items:
 | `compaction`          | Number of compactions (`cmp:<n>`). |
 | `btw`                 | `/btw` side-question token/cost usage. |
 | `reasoning`           | Shows `reasoning` when reasoning is enabled (hidden when off). |
+| `reasoning_effort`    | Configured `[reasoning] effort` (`effort:<level>`; hidden when unset). The built-in default layout shows it after the model. |
 | `message_count`       | Number of messages in the session. |
 | `session_age`         | Time since the session was created (e.g. `5m`, `2h10m`). |
 | `session_updated`     | Time since the last message (same format). |
@@ -1267,6 +1274,9 @@ rendering the last completed result while Git runs, and discards a late result
 after a workspace switch. All other items are read from the session.
 
 ## Status signals
+
+For a signal that needs no socket, the TUI also reports its activity in the
+terminal title; see `terminal_title` above.
 
 Requires the `status-signals` feature (included in the default build). Pass
 `--status-socket <path>` to have zerostack emit `start`, `stop`, and

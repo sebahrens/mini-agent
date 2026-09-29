@@ -87,6 +87,12 @@ pub struct Block {
     md_cache: RefCell<Option<MdCache>>,
     revision: u64,
     render_cache: RefCell<Option<BlockRenderCache>>,
+    /// Producer key (a tool-call id) that later blocks can be placed after,
+    /// so a tool result lands under its own call rather than at the end.
+    anchor: Option<CompactString>,
+    /// The anchor this block was inserted after, keeping several blocks
+    /// inserted for one anchor in insertion order.
+    attached_to: Option<CompactString>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +175,8 @@ impl Block {
             md_cache: RefCell::new(None),
             revision: 0,
             render_cache: RefCell::new(None),
+            anchor: None,
+            attached_to: None,
         }
     }
 }
@@ -318,6 +326,62 @@ impl Feed {
         self.total_bytes = self.total_bytes.saturating_add(block.text.len());
         self.blocks.push_back(block);
         self.prune_completed_prefix();
+    }
+
+    /// Push a completed block that [`Feed::insert_after_anchor`] can later
+    /// place blocks after. An empty anchor is no anchor.
+    pub fn push_anchored_block(
+        &mut self,
+        anchor: &str,
+        style: BlockStyle,
+        text: impl Into<String>,
+    ) {
+        let mut block = Block::new(style, text);
+        block.anchor = (!anchor.is_empty()).then(|| CompactString::from(anchor));
+        self.generation += 1;
+        self.total_bytes = self.total_bytes.saturating_add(block.text.len());
+        self.blocks.push_back(block);
+        self.prune_completed_prefix();
+    }
+
+    /// Insert a completed block directly after the most recent block
+    /// anchored at `anchor`, after any blocks already inserted there, so
+    /// results read in call order under their calls. Returns `false`, and
+    /// inserts nothing, when no such block is retained or when inserting
+    /// would shift a still-running block whose index a producer tracks;
+    /// the caller then appends instead.
+    pub fn insert_after_anchor(
+        &mut self,
+        anchor: &str,
+        style: BlockStyle,
+        text: impl Into<String>,
+    ) -> bool {
+        if anchor.is_empty() {
+            return false;
+        }
+        let Some(anchor_index) = self
+            .blocks
+            .iter()
+            .rposition(|block| block.anchor.as_deref() == Some(anchor))
+        else {
+            return false;
+        };
+        let mut position = anchor_index + 1;
+        while self.blocks.get(position).is_some_and(|block| {
+            block.anchor.is_none() && block.attached_to.as_deref() == Some(anchor)
+        }) {
+            position += 1;
+        }
+        if self.blocks.iter().skip(position).any(|block| block.running) {
+            return false;
+        }
+        let mut block = Block::new(style, text);
+        block.attached_to = Some(CompactString::from(anchor));
+        self.generation += 1;
+        self.total_bytes = self.total_bytes.saturating_add(block.text.len());
+        self.blocks.insert(position, block);
+        self.prune_completed_prefix();
+        true
     }
 
     /// Push an empty block that a producer will append to incrementally

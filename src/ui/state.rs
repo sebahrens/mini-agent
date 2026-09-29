@@ -402,6 +402,8 @@ pub(crate) struct AgentRunState {
     pub agent_line_started: bool,
     pub response_buf: String,
     pub response_start_block: Option<usize>,
+    /// When streamed tokens last repainted the chat (repaint throttling).
+    pub last_stream_paint: Option<std::time::Instant>,
     pub pending_turn: Option<PendingMainTurn>,
     pub was_reasoning: bool,
     pub turn_trace: Vec<compact_str::CompactString>,

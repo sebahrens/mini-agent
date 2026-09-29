@@ -185,10 +185,15 @@ pub enum UserEvent {
     },
     MouseDrag {
         row: u16,
+        col: u16,
     },
     MouseUp {
         row: u16,
+        col: u16,
     },
+    /// Leave the TUI in an orderly way (termination signal, lost terminal):
+    /// stop any run, save the session and restore the terminal.
+    Quit,
     /// An interactive MCP OAuth login finished in a background task. `error` is
     /// `None` on success. Handled by the TUI loop to reconnect the server.
     #[cfg(feature = "mcp")]
