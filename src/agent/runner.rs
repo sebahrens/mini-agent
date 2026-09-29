@@ -696,6 +696,12 @@ pub(crate) struct AgentWorkScope {
     failed_tool_calls: std::sync::Mutex<std::collections::HashSet<String>>,
     cancellation: Notify,
     idle: Notify,
+    /// Workspace root that hook dispatch inside this turn uses instead of
+    /// the process-wide hook execution root, so concurrent turns in different
+    /// workspaces (ACP sessions) each run hooks against their own root. A
+    /// scope created inside another scope inherits it.
+    #[cfg(feature = "hooks")]
+    hook_execution_root: std::sync::OnceLock<std::path::PathBuf>,
     #[cfg(test)]
     blocking_gate: Option<Arc<BlockingTestGate>>,
 }
@@ -712,9 +718,18 @@ impl AgentWorkScope {
             failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
             cancellation: Notify::new(),
             idle: Notify::new(),
+            #[cfg(feature = "hooks")]
+            hook_execution_root: inherited_hook_execution_root(),
             #[cfg(test)]
             blocking_gate: None,
         })
+    }
+
+    /// Binds hook dispatch inside this scope to `root`. The first binding
+    /// wins; a scope's hook root never changes once set.
+    #[cfg(all(feature = "hooks", any(feature = "acp", test)))]
+    pub(crate) fn set_hook_execution_root(&self, root: &std::path::Path) {
+        let _ = self.hook_execution_root.set(root.to_path_buf());
     }
 
     #[cfg(test)]
@@ -740,6 +755,8 @@ impl AgentWorkScope {
                 failed_tool_calls: std::sync::Mutex::new(std::collections::HashSet::new()),
                 cancellation: Notify::new(),
                 idle: Notify::new(),
+                #[cfg(feature = "hooks")]
+                hook_execution_root: inherited_hook_execution_root(),
                 blocking_gate: Some(gate),
             }),
             started_rx,
@@ -1001,6 +1018,24 @@ pub(crate) fn take_tool_failure(internal_call_id: &str) -> bool {
                 .remove(internal_call_id)
         })
         .unwrap_or(false)
+}
+
+#[cfg(feature = "hooks")]
+fn inherited_hook_execution_root() -> std::sync::OnceLock<std::path::PathBuf> {
+    let lock = std::sync::OnceLock::new();
+    if let Some(root) = current_hook_execution_root() {
+        let _ = lock.set(root);
+    }
+    lock
+}
+
+/// The hook execution root bound to the current agent work scope, if any.
+#[cfg(feature = "hooks")]
+pub(crate) fn current_hook_execution_root() -> Option<std::path::PathBuf> {
+    AGENT_WORK_SCOPE
+        .try_with(|scope| scope.hook_execution_root.get().cloned())
+        .ok()
+        .flatten()
 }
 
 #[cfg(feature = "mcp")]

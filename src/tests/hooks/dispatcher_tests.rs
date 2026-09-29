@@ -1106,3 +1106,61 @@ async fn once_handler_runs_on_first_dispatch_and_is_skipped_on_second() {
     let contents = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(contents, "x", "handler with once:true must not run twice");
 }
+
+/// A turn bound to its own hook root (ACP sessions) dispatches against that
+/// workspace even while the shared root names another one or is disabled
+/// (mini-agent-su92b).
+#[tokio::test]
+async fn turn_scoped_hook_root_overrides_the_shared_execution_root() {
+    let base = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "zerostack-hooks-turn-root-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let project_a = base.join("a");
+    let project_b = base.join("b");
+    std::fs::create_dir_all(&project_a).unwrap();
+    std::fs::create_dir_all(&project_b).unwrap();
+    let command = r#"test "$PWD" = "$ZEROSTACK_PROJECT_DIR" && touch ran"#;
+    let config = config_with("PreToolUse", None, vec![handler(command)]);
+    let dispatcher =
+        HookDispatcher::from_config_with_backend_and_root(&config, "unused", &project_a).unwrap();
+
+    let scope_b = crate::agent::runner::AgentWorkScope::new();
+    scope_b.set_hook_execution_root(&project_b);
+    let in_b = scope_b
+        .run(dispatcher.dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({})))
+        .await;
+    assert_eq!(in_b.verdict, Verdict::Defer);
+    assert!(project_b.join("ran").exists());
+    assert!(!project_a.join("ran").exists());
+
+    // A nested scope inherits the turn's root (subagents, advisors).
+    std::fs::remove_file(project_b.join("ran")).unwrap();
+    let nested = scope_b
+        .run(async {
+            let child = crate::agent::runner::AgentWorkScope::new();
+            child
+                .run(dispatcher.dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({})))
+                .await
+        })
+        .await;
+    assert_eq!(nested.verdict, Verdict::Defer);
+    assert!(project_b.join("ran").exists());
+
+    // With several workspaces active the shared root is disabled: a dispatch
+    // outside any bound turn fails closed, while bound turns keep working.
+    dispatcher.invalidate_shared_execution_root("several workspaces");
+    let outside = dispatcher
+        .dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({}))
+        .await;
+    assert_eq!(outside.verdict, Verdict::Deny);
+    assert!(!project_a.join("ran").exists());
+    let scope_a = crate::agent::runner::AgentWorkScope::new();
+    scope_a.set_hook_execution_root(&project_a);
+    let in_a = scope_a
+        .run(dispatcher.dispatch_pre_tool_use(&ctx(), "bash", serde_json::json!({})))
+        .await;
+    assert_eq!(in_a.verdict, Verdict::Defer);
+    assert!(project_a.join("ran").exists());
+    let _ = std::fs::remove_dir_all(base);
+}

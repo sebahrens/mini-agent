@@ -592,8 +592,23 @@ impl PermissionChecker {
                     } else {
                         self.default_action
                     }
-                } else if matched.is_empty() && a == Action::Allow && is_external {
-                    external_action.unwrap_or(Action::Ask)
+                } else if matched.is_empty() && is_external {
+                    // The same call inside the workspace: reads are allowed,
+                    // modifications follow the `"*"` default.
+                    let workspace_equivalent = if self.is_read_tool(tool) {
+                        Action::Allow
+                    } else {
+                        self.default_action
+                    };
+                    match external_action {
+                        // A matching `external_directory` rule decides the
+                        // location, but never grants more than the same call
+                        // would get inside the workspace (so `"*": ask` still
+                        // asks before an external write).
+                        Some(external) => stricter_action(workspace_equivalent, external),
+                        None if a == Action::Allow => Action::Ask,
+                        None => a,
+                    }
                 } else {
                     a
                 }
@@ -1346,6 +1361,20 @@ pub(crate) async fn scope_hook_permission<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     HOOK_PERMISSION_TOKEN.scope(token, future).await
+}
+
+/// The more restrictive of two actions (deny, then ask, then allow).
+fn stricter_action(left: Action, right: Action) -> Action {
+    let rank = |action: Action| match action {
+        Action::Allow => 0,
+        Action::Ask => 1,
+        Action::Deny => 2,
+    };
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
+    }
 }
 
 fn is_path_tool_name(tool: &str) -> bool {
@@ -2543,6 +2572,73 @@ mod external_directory_precedence_tests {
                 CheckResult::Ask
             );
         }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// `"*": ask` is the default for unmatched tools; it must not override an
+    /// `external_directory` allow for external reads, while an external
+    /// modification still gets no more than the same workspace call
+    /// (mini-agent-7jg6d).
+    #[test]
+    fn star_default_does_not_override_external_directory_allow_for_reads() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_ext_star_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("notes.md"), "x").unwrap();
+        let external_file = shared.join("notes.md").to_string_lossy().into_owned();
+        let other_file = base.join("other.md").to_string_lossy().into_owned();
+        let build = |default: Action| {
+            let config = PermissionConfig {
+                default: Some(default),
+                external_directory: Some(
+                    [(format!("{}/**", shared.to_string_lossy()), Action::Allow)].into(),
+                ),
+                ..PermissionConfig::default()
+            };
+            PermissionChecker::new(
+                &PermissionConfigs::from(config),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mut ask = build(Action::Ask);
+        for tool in ["read", "grep", "list_dir"] {
+            assert_eq!(
+                ask.check_path(tool, &external_file),
+                CheckResult::Allowed,
+                "{tool}"
+            );
+        }
+        // Unmatched external locations still ask, and external modifications
+        // follow the `"*": ask` default just like workspace modifications.
+        assert_eq!(ask.check_path("read", &other_file), CheckResult::Ask);
+        assert_eq!(ask.check_path("write", &external_file), CheckResult::Ask);
+        assert_eq!(ask.check_path("edit", "inside.rs"), CheckResult::Ask);
+
+        let mut allow = build(Action::Allow);
+        assert_eq!(
+            allow.check_path("write", &external_file),
+            CheckResult::Allowed
+        );
+        assert_eq!(allow.check_path("write", &other_file), CheckResult::Ask);
+
+        let mut deny = build(Action::Deny);
+        assert!(matches!(
+            deny.check_path("write", &external_file),
+            CheckResult::Denied(_)
+        ));
+        assert!(matches!(
+            deny.check_path("read", &other_file),
+            CheckResult::Denied(_)
+        ));
         let _ = std::fs::remove_dir_all(base);
     }
 }

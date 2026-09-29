@@ -119,7 +119,7 @@ fn managed_settings_path() -> PathBuf {
 /// the plain y/N startup-prompt style used elsewhere (see `main.rs`).
 pub(crate) fn confirm_untrusted_hook(description: &str) -> bool {
     let mut input = String::new();
-    eprint!("Trust project hook: {description}? [y/N] ");
+    eprint!("Trust {description}? [y/N] ");
     let _ = std::io::Write::flush(&mut std::io::stderr());
     if std::io::stdin().read_line(&mut input).is_err() {
         return false;
@@ -212,17 +212,140 @@ fn merge_into(target: &mut HooksConfig, source: HooksConfig) {
     }
 }
 
+/// Trust-store entry prefix for the persisted workspace-file digests of
+/// global and managed hooks. Entries are `hook-content-v1:<binding>:<digest>`
+/// strings inside the same JSON string set as project trust hashes, so older
+/// builds read them as unknown hashes and ignore them.
+const CONTENT_RECORD_PREFIX: &str = "hook-content-v1:";
+
+/// Identity of one global/managed binding in one project: source, project
+/// root, event, matcher, and handler definition.
+fn content_record_binding(
+    source: &str,
+    project_root: &Path,
+    event: &str,
+    matcher: Option<&str>,
+    handler: &HookHandler,
+) -> String {
+    let canonical = serde_json::to_vec(&(
+        source,
+        project_root.to_string_lossy(),
+        event,
+        matcher,
+        handler,
+    ))
+    .expect("serializing hook content records cannot fail");
+    let mut hasher = Sha256::new();
+    hasher.update(b"mini-agent-hook-content-record-v1\0");
+    hasher.update(canonical);
+    crate::hex::encode_lower(hasher.finalize())
+}
+
+/// Records the content binding approved for `handler`. A rejection always
+/// wins, so a handler shared by several bindings stays fail-closed when any
+/// of them was rejected.
+fn record_approved_pins(
+    approved: &mut HashMap<HookHandler, HookContentPins>,
+    handler: &HookHandler,
+    pins: HookContentPins,
+    rejected: bool,
+) {
+    if rejected {
+        approved.insert(handler.clone(), pins);
+    } else {
+        approved.entry(handler.clone()).or_insert(pins);
+    }
+}
+
+/// Persists the workspace-file digests of global and managed hooks across
+/// sessions. Global and managed hooks are trusted by configuration, but a
+/// workspace file they execute (`./guard.sh`) is content the model can
+/// rewrite during one session to take effect in the next. The first time a
+/// binding executes workspace files in a project its digests are recorded
+/// (trust on first use, matching the configured intent). A later session whose
+/// files differ asks interactively; a declined or headless change keeps the
+/// hook installed but denies every launch (fail-closed for `PreToolUse`), so
+/// the guard is never silently replaced nor silently dropped.
+fn pin_configured_hook_content(
+    hooks: &HooksConfig,
+    source: &str,
+    project_root: &Path,
+    store: &mut HashSet<String>,
+    headless: bool,
+    confirm: &dyn Fn(&str) -> bool,
+    approved: &mut HashMap<HookHandler, HookContentPins>,
+) {
+    for (event, groups) in hooks {
+        for group in groups {
+            let matcher = group.matcher.as_deref();
+            for handler in &group.hooks {
+                let pins = HookContentPins::capture(project_root, handler);
+                let binding = content_record_binding(source, project_root, event, matcher, handler);
+                let prefix = format!("{CONTENT_RECORD_PREFIX}{binding}:");
+                let current = format!("{prefix}{}", pins.content_digest());
+                let recorded: Vec<String> = store
+                    .iter()
+                    .filter(|entry| entry.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                if recorded.is_empty() {
+                    if !pins.is_empty() {
+                        store.insert(current);
+                    }
+                    record_approved_pins(approved, handler, pins, false);
+                    continue;
+                }
+                if recorded.len() == 1 && recorded[0] == current {
+                    record_approved_pins(approved, handler, pins, false);
+                    continue;
+                }
+                let accepted = !headless
+                    && confirm(&format!(
+                        "{source} hook whose workspace files changed since they were last approved: {}",
+                        hook_confirmation_description(event, matcher, handler, &pins)
+                    ));
+                if accepted {
+                    for entry in recorded {
+                        store.remove(&entry);
+                    }
+                    if !pins.is_empty() {
+                        store.insert(current);
+                    }
+                    record_approved_pins(approved, handler, pins, false);
+                } else {
+                    tracing::warn!(
+                        "hooks: {source} hook for event {event:?} executes workspace files that \
+                         changed since they were last approved; denying its launches \
+                         (run interactively to review the change)"
+                    );
+                    record_approved_pins(
+                        approved,
+                        handler,
+                        HookContentPins::rejected(format!(
+                            "{source} hook workspace files changed since they were last approved; \
+                             restart interactively to review them"
+                        )),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Filters project-sourced hooks by trust: already-trusted bindings pass
 /// through, headless contexts skip unconfirmed bindings with a warning, and
-/// interactive contexts consult `confirm`, persisting an acceptance.
+/// interactive contexts consult `confirm`, recording an acceptance in
+/// `trusted_hashes`. The content binding each kept handler was approved
+/// with is recorded in `approved`.
 fn filter_trusted_project_hooks(
     hooks: HooksConfig,
     project_root: &Path,
-    trust_store_path: &Path,
+    trusted_hashes: &mut HashSet<String>,
     headless: bool,
     confirm: &dyn Fn(&str) -> bool,
+    approved: &mut HashMap<HookHandler, HookContentPins>,
 ) -> HooksConfig {
-    let mut trusted_hashes = load_trust_store(trust_store_path);
     let mut result: HooksConfig = HashMap::new();
     for (event, groups) in hooks {
         let mut kept_groups = Vec::with_capacity(groups.len());
@@ -238,19 +361,24 @@ fn filter_trusted_project_hooks(
                     &pins,
                 );
                 if trusted_hashes.contains(&hash) {
+                    record_approved_pins(approved, &handler, pins, false);
                     kept_handlers.push(handler);
                 } else if headless {
                     tracing::warn!(
                         "hooks: skipping unconfirmed project hook for event {event:?} \
                          (headless; run interactively once to confirm)"
                     );
-                } else if confirm(&hook_confirmation_description(
-                    &event,
-                    group.matcher.as_deref(),
-                    &handler,
-                    &pins,
+                } else if confirm(&format!(
+                    "project hook: {}",
+                    hook_confirmation_description(
+                        &event,
+                        group.matcher.as_deref(),
+                        &handler,
+                        &pins,
+                    )
                 )) {
                     trusted_hashes.insert(hash);
+                    record_approved_pins(approved, &handler, pins, false);
                     kept_handlers.push(handler);
                 } else {
                     tracing::warn!("hooks: user declined project hook for event {event:?}");
@@ -266,9 +394,6 @@ fn filter_trusted_project_hooks(
         if !kept_groups.is_empty() {
             result.insert(event, kept_groups);
         }
-    }
-    if let Err(error) = save_trust_store(trust_store_path, &trusted_hashes) {
-        tracing::warn!("hooks: {error} (trust decisions won't persist)");
     }
     result
 }
@@ -334,31 +459,64 @@ fn build_dispatcher_from_paths_with_backend(
     }
 
     let mut merged: HooksConfig = HashMap::new();
+    let mut store = load_trust_store(trust_store_path);
+    let loaded_store = store.clone();
+    let mut approved_pins = HashMap::new();
 
     if !disable_non_managed {
+        pin_configured_hook_content(
+            &global.hooks,
+            "global",
+            project_root,
+            &mut store,
+            headless,
+            confirm,
+            &mut approved_pins,
+        );
         merge_into(&mut merged, global.hooks);
         let filtered_project = filter_trusted_project_hooks(
             project.hooks,
             project_root,
-            trust_store_path,
+            &mut store,
             headless,
             confirm,
+            &mut approved_pins,
         );
         merge_into(&mut merged, filtered_project);
     }
 
+    pin_configured_hook_content(
+        &managed.hooks,
+        "managed",
+        project_root,
+        &mut store,
+        headless,
+        confirm,
+        &mut approved_pins,
+    );
     merge_into(&mut merged, managed.hooks);
 
-    HookDispatcher::from_config_with_backend_and_root(&merged, sandbox_backend, project_root)
-        .unwrap_or_else(|e| {
-            tracing::warn!("hooks: invalid merged config, disabling hooks: {e}");
-            HookDispatcher::from_config_with_backend_and_root(
-                &HashMap::new(),
-                sandbox_backend,
-                project_root,
-            )
-            .expect("empty config is always valid")
-        })
+    if store != loaded_store
+        && let Err(error) = save_trust_store(trust_store_path, &store)
+    {
+        tracing::warn!("hooks: {error} (trust decisions won't persist)");
+    }
+
+    HookDispatcher::from_config_with_backend_root_and_pins(
+        &merged,
+        sandbox_backend,
+        project_root,
+        approved_pins,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!("hooks: invalid merged config, disabling hooks: {e}");
+        HookDispatcher::from_config_with_backend_and_root(
+            &HashMap::new(),
+            sandbox_backend,
+            project_root,
+        )
+        .expect("empty config is always valid")
+    })
 }
 
 fn current_project_root(paths: &crate::paths::AppPaths) -> PathBuf {

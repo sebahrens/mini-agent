@@ -211,7 +211,12 @@ impl HookDispatcher {
         config: &HooksConfig,
         sandbox_backend: &str,
     ) -> Result<Self, String> {
-        Self::from_config_with_backend_and_optional_root(config, sandbox_backend, None)
+        Self::from_config_with_backend_and_optional_root(
+            config,
+            sandbox_backend,
+            None,
+            HashMap::new(),
+        )
     }
 
     pub(crate) fn from_config_with_backend_and_root(
@@ -223,6 +228,26 @@ impl HookDispatcher {
             config,
             sandbox_backend,
             Some(project_root.to_path_buf()),
+            HashMap::new(),
+        )
+    }
+
+    /// Like [`Self::from_config_with_backend_and_root`], but uses the content
+    /// bindings the trust layer already approved (or rejected) for a handler
+    /// instead of capturing them again, so the digests that were confirmed
+    /// or compared against the persisted record are exactly the ones every
+    /// launch verifies.
+    pub(crate) fn from_config_with_backend_root_and_pins(
+        config: &HooksConfig,
+        sandbox_backend: &str,
+        project_root: &Path,
+        approved_pins: HashMap<HookHandler, HookContentPins>,
+    ) -> Result<Self, String> {
+        Self::from_config_with_backend_and_optional_root(
+            config,
+            sandbox_backend,
+            Some(project_root.to_path_buf()),
+            approved_pins,
         )
     }
 
@@ -230,6 +255,7 @@ impl HookDispatcher {
         config: &HooksConfig,
         sandbox_backend: &str,
         project_root: Option<PathBuf>,
+        approved_pins: HashMap<HookHandler, HookContentPins>,
     ) -> Result<Self, String> {
         let mut events = HashMap::new();
         for (event, groups) in config {
@@ -255,10 +281,11 @@ impl HookDispatcher {
                 .flatten()
                 .flat_map(|entry: &MatcherEntry| entry.handlers.iter())
                 .map(|handler| {
-                    (
-                        handler.clone(),
-                        Arc::new(HookContentPins::capture(root, handler)),
-                    )
+                    let pins = approved_pins
+                        .get(handler)
+                        .cloned()
+                        .unwrap_or_else(|| HookContentPins::capture(root, handler));
+                    (handler.clone(), Arc::new(pins))
                 })
                 .collect::<HashMap<_, _>>()
         });
@@ -303,6 +330,24 @@ impl HookDispatcher {
         paths
     }
 
+    /// Disables dispatch through the process-wide execution root (turns bound
+    /// to their own root are unaffected) until a later valid rebind. Used while
+    /// concurrent ACP turns in different workspaces leave no single correct
+    /// shared root, so any dispatch outside a turn scope fails closed.
+    #[cfg(any(feature = "acp", test))]
+    pub(crate) fn invalidate_shared_execution_root(&self, reason: &str) {
+        let mut state = self
+            .execution_root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Invalidate outstanding shared leases; an exhausted generation keeps
+        // the sticky invalid binding below, which also refuses them.
+        if let Some(next) = state.generation.checked_add(1) {
+            state.generation = next;
+        }
+        state.binding = ExecutionRootBinding::Invalid(reason.to_string());
+    }
+
     /// Rebind hook execution after a validated UI/session workspace switch.
     /// Failure is sticky and fail-closed until a later valid rebind succeeds.
     pub(crate) fn rebind_execution_root(&self, workspace: &Path) -> Result<(), String> {
@@ -337,6 +382,23 @@ impl HookDispatcher {
         ctx: &HookCtx,
     ) -> Result<(HookCtx, HookExecutionRootLease), String> {
         let mut ctx = ctx.clone();
+        // A turn bound to its own workspace (ACP sessions) dispatches against
+        // that root with a private lease, independent of the process-wide
+        // binding other concurrent turns share or rebind.
+        if let Some(turn_root) = crate::agent::runner::current_hook_execution_root() {
+            let root = ValidatedExecutionRoot::capture(&turn_root)?;
+            let lease = HookExecutionRootLease {
+                state: Arc::new(RwLock::new(ExecutionRootState {
+                    generation: 0,
+                    binding: ExecutionRootBinding::Valid(Box::new(root.clone())),
+                })),
+                generation: 0,
+                root,
+            };
+            let canonical = lease.root.revalidate()?.to_path_buf();
+            ctx.cwd = canonical.to_string_lossy().into_owned();
+            return Ok((ctx, lease));
+        }
         let state = self
             .execution_root
             .read()

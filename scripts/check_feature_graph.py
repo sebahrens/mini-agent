@@ -23,11 +23,13 @@ OPTIONAL_PACKAGE_OWNERS = {
     "hnsw_rs": "skills",
     "lsp-types": "lsp",
     "matrixmultiply": "skills",
+    "native-tls": "acp",
     "ort": "skills-embed",
     "process-wrap": "mcp",
     "rmcp": "mcp",
     "rquickjs": "js",
     "rusqlite": "skills",
+    "tokio-native-tls": "acp",
     "url": "lsp",
     "which": "lsp",
 }
@@ -35,7 +37,7 @@ OPTIONAL_PACKAGES = frozenset(OPTIONAL_PACKAGE_OWNERS)
 # These direct optional dependencies are also present transitively in the base
 # graph, so `cargo tree` cannot prove whether their direct edge is active.
 # `validate_manifest` still verifies their owning feature's semantic closure.
-TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES = frozenset({"url", "which"})
+TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES = frozenset({"native-tls", "tokio-native-tls", "url", "which"})
 ACTIVATION_PACKAGES = OPTIONAL_PACKAGES - TRANSITIVELY_PRESENT_OPTIONAL_PACKAGES
 JS_PACKAGES = frozenset({"rquickjs"})
 SKILLS_PACKAGES = JS_PACKAGES | {

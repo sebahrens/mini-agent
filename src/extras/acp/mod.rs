@@ -1,4 +1,5 @@
 pub mod config;
+mod tls;
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -490,54 +491,81 @@ impl Drop for TurnRegistration {
     }
 }
 
-/// The workspace root that every active ACP turn shares while hooks are
-/// configured.
+/// Workspace roots of the active ACP turns while hooks are configured.
 ///
-/// Hook dispatch (the `HookedTool` context and the dispatcher's execution
-/// root) is process-wide: each prompt rebinds it to that session's workspace.
-/// Two concurrent turns in different workspaces would therefore run each
-/// other's hooks against the wrong repository. Until hook execution carries a
-/// per-turn root, a turn whose workspace differs from the one active turns
-/// already hold is refused instead.
-#[derive(Default)]
+/// Each turn dispatches hooks against its own session workspace through its
+/// agent work scope (`AgentWorkScope::set_hook_execution_root`), so concurrent
+/// turns in different workspaces run with hooks. The process-wide hook
+/// execution root remains only as the fallback for a dispatch that happens
+/// outside a workspace-bound turn: it names the single active workspace, and
+/// is disabled (fail-closed) while turns in several workspaces are active so
+/// such a dispatch can never run against another session's repository.
 struct HookRootClaims {
-    active: StdMutex<Option<(std::path::PathBuf, usize)>>,
+    active: StdMutex<HashMap<std::path::PathBuf, usize>>,
+    /// Publishes the shared fallback root: `Some` for a single active
+    /// workspace, `None` for several.
+    publish: HookRootPublisher,
 }
 
-/// One active turn's hold on the shared hook root; released on drop.
+type HookRootPublisher = Box<dyn Fn(Option<&Path>) + Send + Sync>;
+
+impl Default for HookRootClaims {
+    fn default() -> Self {
+        Self::with_publisher(|root| {
+            #[cfg(feature = "hooks")]
+            crate::extras::hooks::bind_shared_execution_root(root);
+            #[cfg(not(feature = "hooks"))]
+            let _ = root;
+        })
+    }
+}
+
+/// One active turn's hold on its hook root; released on drop.
 struct HookRootLease {
     claims: Arc<HookRootClaims>,
+    root: std::path::PathBuf,
 }
 
 impl HookRootClaims {
-    fn try_acquire(self: &Arc<Self>, root: &Path) -> Result<HookRootLease, String> {
-        let mut active = lock_unpoisoned(&self.active);
-        match active.as_mut() {
-            Some((held, count)) if held.as_path() == root => *count += 1,
-            Some((held, _)) => {
-                return Err(format!(
-                    "hooks are configured and another ACP session is running a prompt in '{}'; \
-                     hooks run against one workspace at a time, so this prompt in '{}' was refused \
-                     (retry when that prompt finishes)",
-                    held.display(),
-                    root.display()
-                ));
-            }
-            None => *active = Some((root.to_path_buf(), 1)),
+    fn with_publisher(publish: impl Fn(Option<&Path>) + Send + Sync + 'static) -> Self {
+        Self {
+            active: StdMutex::new(HashMap::new()),
+            publish: Box::new(publish),
         }
-        Ok(HookRootLease {
+    }
+
+    fn acquire(self: &Arc<Self>, root: &Path) -> HookRootLease {
+        let mut active = lock_unpoisoned(&self.active);
+        let count = active.entry(root.to_path_buf()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            self.publish_locked(&active);
+        }
+        HookRootLease {
             claims: Arc::clone(self),
-        })
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Called with the claims lock held whenever the set of active roots
+    /// changed, so publications are ordered like the changes themselves.
+    fn publish_locked(&self, active: &HashMap<std::path::PathBuf, usize>) {
+        match active.len() {
+            0 => {}
+            1 => (self.publish)(active.keys().next().map(std::path::PathBuf::as_path)),
+            _ => (self.publish)(None),
+        }
     }
 }
 
 impl Drop for HookRootLease {
     fn drop(&mut self) {
         let mut active = lock_unpoisoned(&self.claims.active);
-        if let Some((_, count)) = active.as_mut() {
+        if let Some(count) = active.get_mut(&self.root) {
             *count -= 1;
             if *count == 0 {
-                *active = None;
+                active.remove(&self.root);
+                self.claims.publish_locked(&active);
             }
         }
     }
@@ -558,14 +586,15 @@ struct AcpState {
     sessions: Mutex<HashMap<SessionId, SessionState>>,
     cancel_routes: StdMutex<HashMap<SessionId, Arc<StdMutex<SessionTurns>>>>,
     shell_search_path: Option<std::ffi::OsString>,
-    /// Present only when hooks are configured. Hook dispatch uses one
-    /// process-wide execution root, so concurrent turns must agree on it.
+    /// Present only when hooks are configured: tracks the active turns'
+    /// workspaces to keep the shared fallback hook root safe.
     hook_roots: Option<Arc<HookRootClaims>>,
-    /// Client-supplied stdio MCP servers launch local processes, so they are
-    /// accepted only from the editor that spawned this server over stdio,
-    /// never from a network peer.
+    /// How client-supplied stdio MCP servers are launched. They start local
+    /// processes, so they are accepted only from the editor that spawned this
+    /// server over stdio (never from a network peer) and run sandboxed unless
+    /// the operator explicitly trusts them.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
-    accepts_client_mcp: bool,
+    client_mcp: ClientMcpPolicy,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -609,6 +638,7 @@ struct TcpTransport {
     host: String,
     port: u16,
     api_key: String,
+    tls: Option<Arc<tls::AcpTlsConfig>>,
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -625,6 +655,23 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let local_addr = listener.local_addr().map_err(|e| {
             agent_client_protocol::util::internal_error(format!("TCP local address: {}", e))
         })?;
+
+        if let Some(tls) = self.tls {
+            tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
+            let (stream, peer_addr) =
+                tls::accept_tls_peer(listener, self.api_key, tls, MAX_PENDING_AUTHENTICATIONS)
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
+                    })?;
+            tracing::info!("Authenticated ACP TLS client connected from {}", peer_addr);
+            let (read_half, write_half) = tokio::io::split(stream);
+            return ConnectTo::<Counterpart>::connect_to(
+                ByteStreams::new(tls::FuturesIo(write_half), tls::FuturesIo(read_half)),
+                client,
+            )
+            .await;
+        }
 
         tracing::info!("ACP TCP listening on {}", local_addr);
         let (stream, peer_addr) =
@@ -722,18 +769,40 @@ struct TcpServerSettings {
     host: String,
     port: u16,
     api_key: String,
+    tls: Option<Arc<tls::AcpTlsConfig>>,
 }
 
-/// Opt-in for a non-loopback ACP TCP bind. The TCP transport authenticates
-/// only the connection handshake: the session afterwards is plaintext and the
-/// client never authenticates the server, so anyone on the network path can
-/// read or inject into a tool-executing session.
+/// Opt-in for a non-loopback plaintext ACP TCP bind. Without TLS the TCP
+/// transport authenticates only the connection handshake: the session
+/// afterwards is plaintext and the client never authenticates the server, so
+/// anyone on the network path can read or inject into a tool-executing
+/// session. A TLS listener (`MINI_AGENT_ACP_TLS_CERT`/`_KEY`) needs no opt-in.
 const ACP_ALLOW_REMOTE_ENV: &str = "MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE";
 
 fn resolve_tcp_settings(cli: &Cli, cfg: &Config) -> anyhow::Result<Option<TcpServerSettings>> {
     let environment_key = std::env::var("MINI_AGENT_ACP_API_KEY").ok();
     let allow_remote = std::env::var(ACP_ALLOW_REMOTE_ENV).is_ok_and(|value| value == "1");
-    resolve_tcp_settings_with_key(cli, cfg, environment_key, allow_remote)
+    let tls_paths = tls::tls_paths_from_env()?;
+    let Some(mut settings) = resolve_tcp_settings_with_key(
+        cli,
+        cfg,
+        environment_key,
+        allow_remote,
+        tls_paths.is_some(),
+    )?
+    else {
+        if tls_paths.is_some() {
+            anyhow::bail!(
+                "{} is set but ACP is not listening on TCP; pass --acp-host/--acp-port",
+                tls::ACP_TLS_CERT_ENV
+            );
+        }
+        return Ok(None);
+    };
+    if let Some((certificate, key)) = tls_paths {
+        settings.tls = Some(Arc::new(tls::AcpTlsConfig::load(&certificate, &key)?));
+    }
+    Ok(Some(settings))
 }
 
 fn resolve_tcp_settings_with_key(
@@ -741,6 +810,7 @@ fn resolve_tcp_settings_with_key(
     cfg: &Config,
     environment_key: Option<String>,
     allow_remote: bool,
+    tls: bool,
 ) -> anyhow::Result<Option<TcpServerSettings>> {
     let configured_host = cli.acp_host.clone().or_else(|| cfg.acp_host.clone());
     let configured_port = cli.acp_port.or(cfg.acp_port);
@@ -759,14 +829,17 @@ fn resolve_tcp_settings_with_key(
             )
         })?;
 
-    if !is_loopback_host(&host) {
+    if !is_loopback_host(&host) && !tls {
         if !allow_remote {
             anyhow::bail!(
                 "refusing ACP TCP bind on non-loopback host '{host}': the TCP transport \
                  authenticates only the handshake, then carries the session in plaintext \
                  without authenticating the server, so an on-path attacker could read or \
-                 inject into a tool-executing session. Bind to 127.0.0.1 and tunnel (for \
-                 example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 to accept that risk"
+                 inject into a tool-executing session. Set {} and {} to serve TLS, bind to \
+                 127.0.0.1 and tunnel (for example over SSH), or set {ACP_ALLOW_REMOTE_ENV}=1 \
+                 to accept that risk",
+                tls::ACP_TLS_CERT_ENV,
+                tls::ACP_TLS_KEY_ENV
             );
         }
         let warning = format!(
@@ -782,6 +855,7 @@ fn resolve_tcp_settings_with_key(
         host,
         port,
         api_key,
+        tls: None,
     }))
 }
 
@@ -908,7 +982,10 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
         hook_roots: acp_hook_root_claims(),
-        accepts_client_mcp: !is_tcp,
+        client_mcp: client_mcp_policy(
+            is_tcp,
+            std::env::var(ACP_TRUST_CLIENT_MCP_ENV).is_ok_and(|value| value == "1"),
+        ),
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -927,6 +1004,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
                 host: settings.host,
                 port: settings.port,
                 api_key: settings.api_key,
+                tls: settings.tls,
             },
         )
         .await
@@ -1141,15 +1219,51 @@ type ClientMcpServers = HashMap<String, crate::extras::mcp::config::McpServerCon
 #[cfg(not(feature = "mcp"))]
 type ClientMcpServers = ();
 
+/// Operator opt-in that launches client-supplied stdio MCP servers without the
+/// workspace-service sandbox, like a configured command server.
+const ACP_TRUST_CLIENT_MCP_ENV: &str = "MINI_AGENT_ACP_TRUST_CLIENT_MCP";
+
+/// Launch policy for MCP servers an ACP client supplies in `session/new`.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+enum ClientMcpPolicy {
+    /// A network peer must not launch local processes (ACP TCP).
+    Refused,
+    /// Default for stdio: run in the dedicated workspace-service sandbox of
+    /// the resolved backend, refusing the servers when it is unavailable.
+    Sandboxed,
+    /// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1`: launch unsandboxed.
+    Trusted,
+}
+
+fn client_mcp_policy(is_tcp: bool, trusted_by_operator: bool) -> ClientMcpPolicy {
+    if is_tcp {
+        ClientMcpPolicy::Refused
+    } else if trusted_by_operator {
+        tracing::warn!(
+            "ACP: {ACP_TRUST_CLIENT_MCP_ENV}=1 — client-supplied MCP servers run unsandboxed \
+             with host filesystem and network access"
+        );
+        ClientMcpPolicy::Trusted
+    } else {
+        ClientMcpPolicy::Sandboxed
+    }
+}
+
 /// Validate the MCP servers a client supplied in `session/new`.
 ///
-/// ACP requires every agent to accept stdio servers. They are launched like a
-/// configured `mcp_servers` command entry (no sandbox, working directory = the
-/// session root) with the client's `env` plus the server process's `PATH` and
-/// `HOME`. Anything this server cannot honour is refused explicitly rather
-/// than silently ignored: HTTP/SSE servers (not advertised), servers from a
-/// TCP peer (a network client must not launch local processes), and servers
-/// when MCP is disabled or not compiled in.
+/// ACP requires every agent to accept stdio servers. The server list comes
+/// from editor configuration that may be repository-controlled (for example a
+/// workspace settings file), which is not the human-trusted `mcp_servers`
+/// path, so by default they are launched in the dedicated workspace-service
+/// sandbox of the resolved sandbox backend (working directory = the session
+/// root, the client's `env` plus the server process's `PATH` and `HOME`).
+/// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` launches them unsandboxed instead.
+/// Anything this server cannot honour is refused explicitly rather than
+/// silently ignored: HTTP/SSE servers (not advertised), servers from a TCP
+/// peer (a network client must not launch local processes), servers when the
+/// sandbox is unavailable and not explicitly bypassed, and servers when MCP
+/// is disabled or not compiled in.
 fn client_mcp_servers(
     state: &AcpState,
     servers: &[McpServer],
@@ -1171,13 +1285,30 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
-        if !state.accepts_client_mcp {
-            return refuse(
-                "client-supplied MCP servers are refused over ACP TCP; configure them in \
-                 `mcp_servers` on the agent host instead"
-                    .into(),
-            );
-        }
+        let sandbox = match state.client_mcp {
+            ClientMcpPolicy::Refused => {
+                return refuse(
+                    "client-supplied MCP servers are refused over ACP TCP; configure them in \
+                     `mcp_servers` on the agent host instead"
+                        .into(),
+                );
+            }
+            ClientMcpPolicy::Trusted => None,
+            ClientMcpPolicy::Sandboxed => {
+                let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+                if !matches!(
+                    crate::sandbox::Sandbox::new(true, &backend).policy(),
+                    crate::sandbox::SandboxPolicy::RequiredAndAvailable
+                ) {
+                    return refuse(format!(
+                        "client-supplied MCP servers run in the '{backend}' workspace-service \
+                         sandbox, which is not available; configure them in `mcp_servers` or set \
+                         {ACP_TRUST_CLIENT_MCP_ENV}=1 to launch them unsandboxed"
+                    ));
+                }
+                Some(backend)
+            }
+        };
         if !state.cli.mcp_is_eligible(&state.cfg) {
             return refuse(
                 "client-supplied MCP servers were sent but MCP is disabled for this agent".into(),
@@ -1213,7 +1344,7 @@ fn client_mcp_servers(
                         .map(|variable| (variable.name.clone(), variable.value.clone()))
                         .collect(),
                     inherit_env: vec!["PATH".to_string(), "HOME".to_string()],
-                    sandbox: None,
+                    sandbox: sandbox.clone(),
                     network: McpStdioNetwork::Inherit,
                 },
             );
@@ -1442,9 +1573,7 @@ async fn handle_prompt(
             hook_lease = state
                 .hook_roots
                 .as_ref()
-                .map(|claims| claims.try_acquire(sess.workspace.root()))
-                .transpose()
-                .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
+                .map(|claims| claims.acquire(sess.workspace.root()));
             let generation = turns.next_generation;
             turns.next_generation = turns.next_generation.wrapping_add(1);
             turns.queue.push_back(RegisteredTurn {
@@ -2116,8 +2245,6 @@ async fn execute_prompt(
     if let Err(error) = workspace.validate() {
         return Ok(PromptOutcome::failed(error.to_string()));
     }
-    #[cfg(feature = "hooks")]
-    crate::extras::hooks::set_active_workspace(workspace.root());
     // The provider this turn's usage is reported by, so a goal's token total
     // is normalised the same way as the TUI's and headless rounds'.
     #[cfg(feature = "goal")]
@@ -2276,6 +2403,10 @@ async fn execute_prompt(
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
     let work_scope = crate::agent::runner::AgentWorkScope::new();
+    // Hooks dispatched by this turn (prompt submit, tools, stop, subagents)
+    // run against this session's workspace, independent of other sessions.
+    #[cfg(feature = "hooks")]
+    work_scope.set_hook_execution_root(workspace.root());
     #[cfg(feature = "mcp")]
     {
         *mcp_manager = if state.cli.mcp_is_eligible(&state.cfg) {
@@ -3321,7 +3452,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3339,7 +3470,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -3360,7 +3491,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3397,7 +3528,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -4107,7 +4238,7 @@ mod protocol_tests {
     }
 
     #[tokio::test]
-    async fn hooked_server_refuses_concurrent_turns_in_different_workspaces() {
+    async fn hooked_server_runs_concurrent_turns_in_different_workspaces() {
         let blocked_started = Arc::new(tokio::sync::Notify::new());
         let fixture: PromptFixture = {
             let blocked_started = blocked_started.clone();
@@ -4126,7 +4257,12 @@ mod protocol_tests {
             })
         };
         let mut state = fixture_state(fixture);
-        Arc::get_mut(&mut state).unwrap().hook_roots = Some(Arc::default());
+        let published = Arc::new(StdMutex::new(Vec::<Option<std::path::PathBuf>>::new()));
+        let recorder = published.clone();
+        Arc::get_mut(&mut state).unwrap().hook_roots =
+            Some(Arc::new(HookRootClaims::with_publisher(move |root| {
+                lock_unpoisoned(&recorder).push(root.map(Path::to_path_buf));
+            })));
         let repo_a = ProtocolTempDir::new();
         let repo_b = ProtocolTempDir::new();
         let (cwd_a, cwd_b) = (repo_a.path().to_path_buf(), repo_b.path().to_path_buf());
@@ -4169,12 +4305,13 @@ mod protocol_tests {
                     .await
                     .expect("the first turn should start");
 
-                let refused = cx
+                // Each turn dispatches hooks against its own workspace, so a
+                // prompt in another repository runs concurrently (mini-agent-su92b).
+                let other_repo = cx
                     .send_request(prompt(b.clone(), "other-repo"))
                     .block_task()
-                    .await
-                    .expect_err("hooks would run against the wrong workspace");
-                assert!(refused.to_string().contains("hooks"), "{refused}");
+                    .await?;
+                assert_eq!(other_repo.stop_reason, StopReason::EndTurn);
                 let same_repo = cx
                     .send_request(prompt(a_again, "same-repo"))
                     .block_task()
@@ -4195,6 +4332,13 @@ mod protocol_tests {
             })
             .await
             .unwrap();
+        // While both workspaces were active the shared fallback root was
+        // disabled rather than pointing at either repository.
+        assert!(
+            lock_unpoisoned(&published).contains(&None),
+            "{:?}",
+            lock_unpoisoned(&published)
+        );
     }
 
     #[cfg(feature = "mcp")]
@@ -4202,7 +4346,8 @@ mod protocol_tests {
     fn client_stdio_mcp_servers_become_session_command_servers() {
         use crate::extras::mcp::config::McpServerConfig;
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
-        let state = fixture_state(fixture);
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().client_mcp = ClientMcpPolicy::Trusted;
         let command = std::env::temp_dir().join("client-mcp-server");
         let servers = vec![McpServer::Stdio(
             McpServerStdio::new("editor-tools", command.clone())
@@ -4256,6 +4401,67 @@ mod protocol_tests {
         ));
     }
 
+    /// Client-supplied servers may come from repository-controlled editor
+    /// settings, so by default they run in the workspace-service sandbox and
+    /// are refused when it is unavailable (mini-agent-e6rne).
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn client_stdio_mcp_servers_are_sandboxed_by_default() {
+        use crate::extras::mcp::config::McpServerConfig;
+        assert!(matches!(
+            client_mcp_policy(false, false),
+            ClientMcpPolicy::Sandboxed
+        ));
+        assert!(matches!(
+            client_mcp_policy(false, true),
+            ClientMcpPolicy::Trusted
+        ));
+        assert!(matches!(
+            client_mcp_policy(true, true),
+            ClientMcpPolicy::Refused
+        ));
+
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let servers = vec![McpServer::Stdio(McpServerStdio::new(
+            "editor-tools",
+            std::env::temp_dir().join("client-mcp-server"),
+        ))];
+        let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+        let available = matches!(
+            crate::sandbox::Sandbox::new(true, &backend).policy(),
+            crate::sandbox::SandboxPolicy::RequiredAndAvailable
+        );
+        match client_mcp_servers(&state, &servers) {
+            Ok(accepted) => {
+                assert!(available, "accepted without an available sandbox");
+                let Some(McpServerConfig::Command { sandbox, .. }) = accepted.get("editor-tools")
+                else {
+                    panic!("expected a command server: {accepted:?}");
+                };
+                assert_eq!(sandbox.as_deref(), Some(backend.as_str()));
+            }
+            Err(error) => {
+                assert!(!available, "refused although the sandbox is available");
+                let message = error.to_string();
+                assert!(message.contains(ACP_TRUST_CLIENT_MCP_ENV), "{message}");
+            }
+        }
+
+        // An unknown backend is never available, so the servers are refused
+        // rather than launched unsandboxed.
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut missing = fixture_state(fixture);
+        Arc::get_mut(&mut missing).unwrap().cfg.sandbox_backend =
+            Some("no-such-backend".to_string());
+        let error = client_mcp_servers(&missing, &servers)
+            .expect_err("an unavailable sandbox must refuse client servers");
+        assert!(
+            error.to_string().contains(ACP_TRUST_CLIENT_MCP_ENV),
+            "{error}"
+        );
+    }
+
     #[test]
     fn unsupported_client_mcp_servers_are_refused_not_ignored() {
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
@@ -4289,7 +4495,7 @@ mod protocol_tests {
 
             let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
             let mut tcp = fixture_state(fixture);
-            Arc::get_mut(&mut tcp).unwrap().accepts_client_mcp = false;
+            Arc::get_mut(&mut tcp).unwrap().client_mcp = ClientMcpPolicy::Refused;
             let error = refused(
                 &tcp,
                 McpServer::Stdio(McpServerStdio::new("local", absolute.clone())),
@@ -6466,34 +6672,34 @@ mod hook_root_tests {
     use super::*;
 
     #[test]
-    fn concurrent_turns_must_share_the_hook_root() {
-        let claims = Arc::new(HookRootClaims::default());
+    fn concurrent_turns_in_different_workspaces_disable_the_shared_root() {
+        let published = Arc::new(StdMutex::new(Vec::<Option<std::path::PathBuf>>::new()));
+        let recorder = published.clone();
+        let claims = Arc::new(HookRootClaims::with_publisher(move |root| {
+            lock_unpoisoned(&recorder).push(root.map(Path::to_path_buf));
+        }));
         let repo_a = Path::new("/workspace/a");
         let repo_b = Path::new("/workspace/b");
+        let take = || std::mem::take(&mut *lock_unpoisoned(&published));
 
-        let first = claims
-            .try_acquire(repo_a)
-            .expect("first turn claims its root");
-        let same = claims
-            .try_acquire(repo_a)
-            .expect("a second session in the same workspace may run concurrently");
-        let refused = claims
-            .try_acquire(repo_b)
-            .err()
-            .expect("a turn in another workspace would run hooks against the wrong repo");
-        assert!(refused.contains("/workspace/a"), "{refused}");
+        let first = claims.acquire(repo_a);
+        assert_eq!(take(), vec![Some(repo_a.to_path_buf())]);
+        let same = claims.acquire(repo_a);
+        assert!(take().is_empty(), "the same root is not republished");
+        let other = claims.acquire(repo_b);
+        assert_eq!(
+            take(),
+            vec![None],
+            "several workspaces leave no correct shared root"
+        );
 
         drop(first);
-        assert!(
-            claims.try_acquire(repo_b).is_err(),
-            "the root stays held while any turn in it is active"
-        );
+        assert!(take().is_empty(), "repo a is still held by another turn");
         drop(same);
-        let other = claims
-            .try_acquire(repo_b)
-            .expect("once every turn settles another workspace may claim the root");
+        assert_eq!(take(), vec![Some(repo_b.to_path_buf())]);
         drop(other);
-        assert!(lock_unpoisoned(&claims.active).is_none());
+        assert!(take().is_empty());
+        assert!(lock_unpoisoned(&claims.active).is_empty());
     }
 }
 
@@ -6520,7 +6726,7 @@ mod tcp_authentication_tests {
     #[test]
     fn stdio_remains_default_without_tcp_endpoint() {
         let settings =
-            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false)
+            resolve_tcp_settings_with_key(&Cli::default(), &Config::default(), None, false, false)
                 .unwrap();
         assert!(settings.is_none());
     }
@@ -6533,7 +6739,7 @@ mod tcp_authentication_tests {
         };
         let cfg = tcp_config(DEFAULT_TCP_HOST, 8123, Some("configured-key"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false)
+        let settings = resolve_tcp_settings_with_key(&cli, &cfg, None, false, false)
             .unwrap()
             .unwrap();
         assert_eq!(settings.host, DEFAULT_TCP_HOST);
@@ -6548,7 +6754,7 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
 
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false)
+        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), None, false, false)
             .err()
             .expect("TCP without authentication must fail");
         assert!(error.to_string().contains("requires authentication"));
@@ -6561,16 +6767,26 @@ mod tcp_authentication_tests {
             ..Default::default()
         };
         let key = Some("secret".to_owned());
-        let error = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
-            .err()
-            .expect("a remote bind must be refused by default");
+        let error =
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, false)
+                .err()
+                .expect("a remote bind must be refused by default");
         assert!(error.to_string().contains(ACP_ALLOW_REMOTE_ENV), "{error}");
         assert!(!error.to_string().contains("secret"));
 
-        let settings = resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true)
-            .unwrap()
-            .unwrap();
+        let settings =
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), true, false)
+                .unwrap()
+                .unwrap();
         assert_eq!(settings.host, "0.0.0.0");
+
+        // A TLS listener authenticates the server and protects the session,
+        // so a remote bind needs no insecure opt-in (mini-agent-bky6w).
+        assert!(
+            resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, true)
+                .unwrap()
+                .is_some()
+        );
 
         for loopback in ["127.0.0.1", "::1", "localhost"] {
             let cli = Cli {
@@ -6578,7 +6794,7 @@ mod tcp_authentication_tests {
                 ..Default::default()
             };
             assert!(
-                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false)
+                resolve_tcp_settings_with_key(&cli, &Config::default(), key.clone(), false, false)
                     .unwrap()
                     .is_some(),
                 "{loopback} needs no opt-in"

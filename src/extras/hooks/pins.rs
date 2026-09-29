@@ -8,14 +8,20 @@
 //! outside the sandbox. [`HookContentPins`] records a SHA-256 digest of every
 //! such file when hooks are loaded; every launch re-resolves the same operands
 //! and denies the hook unless each workspace-resident file still has the
-//! recorded content.
+//! recorded content. Project hooks bind the digests into their confirmation
+//! hash; global and managed hooks persist them per project in the trust store
+//! (see `trust::pin_configured_hook_content`), so a rewrite in one session is
+//! also caught at the next start.
 //!
 //! Operands are the resolved executable, each argument, and every
 //! whitespace/shell-punctuation-separated token of the arguments and the `if`
-//! condition. Only operands that resolve (lexically or after following links)
-//! into the workspace and name an existing regular file are bound. Shell
-//! variable expansion inside a condition and files a script reads on its own
-//! are outside this best-effort binding.
+//! condition, plus `$ZEROSTACK_PROJECT_DIR`-prefixed tokens expanded to the
+//! workspace. Only operands that resolve (lexically or after following links)
+//! into the workspace and name an existing regular file are bound. Other
+//! variable expansion, files a script sources or reads on its own, and the
+//! short window between verification and `exec` are outside this best-effort
+//! binding (see "Workspace hook files are content-bound" in
+//! `docs/agent/CONFIG.md`).
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -41,6 +47,9 @@ pub(crate) enum PinnedLocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HookContentPins {
     files: BTreeMap<PinnedLocation, String>,
+    /// Set when the workspace files changed since a persisted approval and
+    /// the change was not re-approved: every launch is denied (fail-closed).
+    rejected: Option<String>,
 }
 
 /// The shell used for `if` conditions, as an absolute path on Unix so a
@@ -67,19 +76,37 @@ impl HookContentPins {
         {
             pins.insert_operand(&root, program.as_os_str());
         }
-        for token in operand_tokens(handler.args.iter().flatten().map(String::as_str)) {
-            pins.insert_operand(&root, std::ffi::OsStr::new(token));
+        for token in operand_tokens(handler.args.iter().flatten().map(String::as_str), &root) {
+            pins.insert_operand(&root, std::ffi::OsStr::new(&token));
         }
         if let Some(condition) = handler.condition.as_deref() {
             let (shell, _) = condition_shell();
             if let Ok(program) = resolve_hook_program(shell, search_path.as_deref(), &root) {
                 pins.insert_operand(&root, program.as_os_str());
             }
-            for token in operand_tokens(std::iter::once(condition)) {
-                pins.insert_operand(&root, std::ffi::OsStr::new(token));
+            for token in operand_tokens(std::iter::once(condition), &root) {
+                pins.insert_operand(&root, std::ffi::OsStr::new(&token));
             }
         }
         pins
+    }
+
+    /// A binding that denies every launch with `reason`, used when a global
+    /// or managed hook's workspace files no longer match the persisted
+    /// digests and the change was not re-approved.
+    pub(crate) fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            files: BTreeMap::new(),
+            rejected: Some(reason.into()),
+        }
+    }
+
+    /// Stable SHA-256 over [`Self::entries`], persisted for global and
+    /// managed hooks so a later session detects rewritten workspace files.
+    pub(crate) fn content_digest(&self) -> String {
+        let canonical = serde_json::to_vec(&self.entries())
+            .expect("serializing hook content bindings cannot fail");
+        crate::hex::encode_lower(Sha256::digest(canonical))
     }
 
     fn insert_operand(&mut self, root: &Path, operand: &std::ffi::OsStr) {
@@ -129,8 +156,11 @@ impl HookContentPins {
         program: &Path,
         args: &[String],
     ) -> Result<(), String> {
+        if let Some(reason) = &self.rejected {
+            return Err(reason.clone());
+        }
         let operands = std::iter::once(program.as_os_str().to_os_string()).chain(
-            operand_tokens(args.iter().map(String::as_str))
+            operand_tokens(args.iter().map(String::as_str), root)
                 .into_iter()
                 .map(std::ffi::OsString::from),
         );
@@ -217,10 +247,14 @@ pub(crate) fn resolve_hook_program(
 
 /// Every argument plus its whitespace/shell-punctuation separated tokens, so
 /// `sh -c "./check.sh --fast"` and `--config=hook.toml` bind their files.
-fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut tokens = Vec::new();
+/// A token that starts with `$ZEROSTACK_PROJECT_DIR` or
+/// `${ZEROSTACK_PROJECT_DIR}` is also bound with that prefix replaced by
+/// `root`, because the hook child receives exactly that value and a shell
+/// condition or script argument expands it. Other variables are not expanded.
+fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>, root: &Path) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
     for arg in args {
-        tokens.push(arg);
+        tokens.push(arg.to_string());
         tokens.extend(
             arg.split(|c: char| {
                 c.is_whitespace()
@@ -229,12 +263,34 @@ fn operand_tokens<'a>(args: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
                         ';' | '|' | '&' | '(' | ')' | '<' | '>' | '\'' | '"' | '`' | '='
                     )
             })
-            .filter(|token| !token.is_empty() && *token != arg),
+            .filter(|token| !token.is_empty() && *token != arg)
+            .map(str::to_string),
         );
     }
+    let expanded: Vec<String> = tokens
+        .iter()
+        .filter_map(|token| expand_project_dir(token, root))
+        .collect();
+    tokens.extend(expanded);
     tokens.sort_unstable();
     tokens.dedup();
     tokens
+}
+
+/// The hook environment variable naming the selected workspace.
+const PROJECT_DIR_VARIABLE: &str = "ZEROSTACK_PROJECT_DIR";
+
+fn expand_project_dir(token: &str, root: &Path) -> Option<String> {
+    let rest = token.strip_prefix('$')?;
+    let braced = format!("{{{PROJECT_DIR_VARIABLE}}}");
+    let rest = match rest.strip_prefix(braced.as_str()) {
+        Some(rest) => rest,
+        // `$ZEROSTACK_PROJECT_DIRX` names a different variable.
+        None => rest
+            .strip_prefix(PROJECT_DIR_VARIABLE)
+            .filter(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))?,
+    };
+    Some(format!("{}{rest}", root.to_string_lossy()))
 }
 
 /// Returns the pin key and canonical path when `operand` names an existing

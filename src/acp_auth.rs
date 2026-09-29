@@ -112,6 +112,11 @@ fn classify_io_error(error: io::Error) -> AuthError {
 }
 
 fn response_digest(nonce: &str, api_key: &str) -> String {
+    hmac_sha256_hex(api_key, &[AUTH_VERSION.as_bytes(), &[0], nonce.as_bytes()])
+}
+
+/// HMAC-SHA256 of the concatenated `message` parts keyed by `api_key`.
+fn hmac_sha256_hex(api_key: &str, message: &[&[u8]]) -> String {
     let mut key_block = [0_u8; SHA256_BLOCK_LEN];
     if api_key.len() > SHA256_BLOCK_LEN {
         let hashed_key = Sha256::digest(api_key.as_bytes());
@@ -131,9 +136,9 @@ fn response_digest(nonce: &str, api_key: &str) -> String {
 
     let mut inner = Sha256::new();
     inner.update(inner_pad);
-    inner.update(AUTH_VERSION.as_bytes());
-    inner.update([0]);
-    inner.update(nonce.as_bytes());
+    for part in message {
+        inner.update(part);
+    }
 
     let mut outer = Sha256::new();
     outer.update(outer_pad);
@@ -154,6 +159,85 @@ fn fixed_time_digest_eq(candidate: &[u8], expected: &[u8]) -> bool {
     }
 
     std::hint::black_box(difference) == 0
+}
+
+/// Handshake used inside ACP TLS. The response additionally binds the
+/// SHA-256 of the server's leaf certificate (DER) as the client observed it,
+/// so a man in the middle that terminates TLS with any other certificate
+/// cannot relay a valid response even to a client that skipped certificate
+/// verification.
+#[cfg(feature = "acp")]
+pub(crate) const TLS_CHALLENGE_PREFIX: &str = "MINI-AGENT-ACP-AUTH/2 CHALLENGE ";
+#[cfg(feature = "acp")]
+pub(crate) const TLS_RESPONSE_PREFIX: &str = "MINI-AGENT-ACP-AUTH/2 RESPONSE ";
+#[cfg(feature = "acp")]
+const TLS_AUTH_VERSION: &str = "MINI-AGENT-ACP-AUTH/2";
+
+/// `HMAC-SHA256(api_key, "MINI-AGENT-ACP-AUTH/2" 0x00 nonce 0x00
+/// lowercase-hex(SHA-256(server leaf certificate DER)))`, lowercase hex.
+#[cfg(feature = "acp")]
+pub(crate) fn channel_bound_response_digest(
+    nonce: &str,
+    api_key: &str,
+    server_certificate_sha256: &str,
+) -> String {
+    hmac_sha256_hex(
+        api_key,
+        &[
+            TLS_AUTH_VERSION.as_bytes(),
+            &[0],
+            nonce.as_bytes(),
+            &[0],
+            server_certificate_sha256.as_bytes(),
+        ],
+    )
+}
+
+/// Authenticates a peer over an established TLS stream with the
+/// channel-bound handshake. The caller bounds the total time.
+#[cfg(feature = "acp")]
+pub(crate) async fn authenticate_tls_peer<S>(
+    stream: &mut S,
+    api_key: &str,
+    server_certificate_sha256: &str,
+) -> Result<(), AuthError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let nonce = Uuid::new_v4().simple().to_string();
+    let challenge = format!("{TLS_CHALLENGE_PREFIX}{nonce}\n");
+    stream
+        .write_all(challenge.as_bytes())
+        .await
+        .map_err(classify_io_error)?;
+    stream.flush().await.map_err(classify_io_error)?;
+
+    let mut bytes = Vec::with_capacity(MAX_RESPONSE_BYTES);
+    loop {
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte).await {
+            Ok(0) => return Err(AuthError::Disconnected),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                if bytes.len() == MAX_RESPONSE_BYTES {
+                    return Err(AuthError::Oversized);
+                }
+                bytes.push(byte[0]);
+            }
+            Err(error) => return Err(classify_io_error(error)),
+        }
+    }
+    let response = String::from_utf8(bytes).map_err(|_| AuthError::Invalid)?;
+    let candidate = response
+        .strip_prefix(TLS_RESPONSE_PREFIX)
+        .ok_or(AuthError::Invalid)?;
+    let expected = channel_bound_response_digest(&nonce, api_key, server_certificate_sha256);
+    if !fixed_time_digest_eq(candidate.as_bytes(), expected.as_bytes()) {
+        return Err(AuthError::Invalid);
+    }
+    Ok(())
 }
 
 pub(crate) fn read_challenge(stream: &mut TcpStream) -> Result<String, AuthError> {
@@ -301,6 +385,20 @@ mod tests {
         assert_eq!(
             response_digest("00000000000000000000000000000000", "correct-key"),
             "24d1030854a2ee4a50dfd3d9acabddab7cabe8052958b99f77440f3f649a585f"
+        );
+    }
+
+    /// Pinned so TLS client implementations can check their HMAC input.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn channel_bound_digest_matches_hmac_sha256_vector() {
+        assert_eq!(
+            channel_bound_response_digest(
+                "00000000000000000000000000000000",
+                "correct-key",
+                &"ab".repeat(32)
+            ),
+            "053a8193c950cb0e0d398af3f5df2a35c1676e5abee870cf58106385c7c76c46"
         );
     }
 

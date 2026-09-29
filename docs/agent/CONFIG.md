@@ -854,9 +854,34 @@ refuse to modify a bound file in every security mode. For project hooks the
 digests are part of the confirmation hash and are shown in the prompt, so a
 rewritten script requires fresh confirmation on the next start; bindings that
 execute no workspace file keep their existing approval. Global and managed
-hooks are bound for the running session only, so point them at files outside
-the workspace. The binding is best-effort for shell text: variables expanded
-by a condition and files a script reads or sources on its own are not bound.
+hooks need no confirmation, but their workspace-file digests are persisted
+per project (as `hook-content-v1:` entries in the same trust store) the first
+time they are seen. When a later start finds different content, an
+interactive session asks whether to trust the change; a declined change or a
+headless start keeps the hook installed but denies every launch (fail-closed
+for `PreToolUse`) until the change is approved interactively, so a guard
+rewritten in one session never silently takes effect in the next. First use
+is trusted as configured, so prefer pointing global hooks at files outside
+the workspace.
+
+A token that starts with `$ZEROSTACK_PROJECT_DIR/` or
+`${ZEROSTACK_PROJECT_DIR}/` is bound as the same path inside the workspace,
+because the hook child receives exactly that value. The binding is otherwise
+best-effort, and these gaps remain:
+
+- **Sourced and read files.** Only files named by the executable, arguments,
+  and condition are bound. A file a bound script sources (`. ./lib.sh`),
+  imports, or reads on its own is not. Keep such helpers outside the
+  workspace, or inline them into the bound script.
+- **Other variables.** Paths built from any other variable (`$HOME/x`,
+  `$DIR/check.sh`, command substitution) are not expanded and not bound.
+- **Verify-to-exec window.** Digests are re-checked immediately before each
+  child is created. A process that is already running (for example a
+  background job started by the model's `bash` tool) could still swap the file
+  between that check and `exec`. The `write`/`edit`/`write_file` refusal and the
+  next start's re-check narrow this, but do not close it; a hook whose
+  integrity matters against a concurrently running workspace process should
+  live outside the workspace.
 
 Bare command names (`sh`, `python3`) resolve only through absolute `PATH`
 entries; empty, `.`, or other relative entries are ignored so a planted file in
@@ -1389,7 +1414,13 @@ default action applied when no rule for a tool matches. In `standard` mode an
 unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
 default (so `"*": ask` asks before workspace modifications), while unmatched
 workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
-external paths follow `external_directory`. Use
+external paths follow `external_directory`. A matching `external_directory`
+rule is combined with what the same call would get inside the workspace, and
+the stricter one wins: with `"*": ask` an external read under an
+`external_directory` allow is allowed (the `"*"` default does not turn it back
+into a prompt), while an external write there still asks like a workspace
+write. With no matching `external_directory` rule an external path asks (or
+follows a stricter `"*": deny`). Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
@@ -1840,13 +1871,31 @@ ACP server configs (in `acp_servers`) support two transport types:
 When `--acp` is passed without `--acp-host`, zerostack runs in stdio mode
 (the editor spawns it as a subprocess). Supplying `--acp-host`, `--acp-port`,
 `acp_host`, or `acp_port` selects TCP. If only a port is supplied, the bind
-host defaults to `127.0.0.1`. A non-loopback `acp_host` is refused at startup
-unless the environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which
-case a prominent warning is printed. The TCP handshake authenticates the
-client, but the session that follows is plaintext and the server is never
-authenticated to the client, so an on-path attacker could read or inject into
-a tool-executing session. Prefer a loopback bind behind an SSH tunnel or
-another encrypted, mutually authenticated channel.
+host defaults to `127.0.0.1`.
+
+**TLS.** Setting both `MINI_AGENT_ACP_TLS_CERT` (PEM certificate chain, leaf
+first) and `MINI_AGENT_ACP_TLS_KEY` (PEM PKCS#8 private key) in the agent's
+environment serves the TCP listener over TLS 1.2 or newer, using the platform
+TLS stack. Setting only one of them, or setting them without a TCP endpoint,
+is a startup error. Inside TLS the handshake is channel-bound: the server
+sends `MINI-AGENT-ACP-AUTH/2 CHALLENGE <nonce>` and the client answers
+`MINI-AGENT-ACP-AUTH/2 RESPONSE <hex>` where `<hex>` is
+`HMAC-SHA256(api_key, "MINI-AGENT-ACP-AUTH/2" 0x00 nonce 0x00 hex(SHA-256(server leaf certificate DER)))`
+in lowercase hex, computed over the certificate the client actually received.
+A man in the middle that terminates TLS with any other certificate therefore
+cannot relay a valid response, even to a client that does not verify the
+certificate chain; clients should still verify or pin the certificate. The
+session that follows is encrypted and integrity-protected. A TLS listener may
+bind a non-loopback `acp_host` without any opt-in.
+
+Without TLS, a non-loopback `acp_host` is refused at startup unless the
+environment sets `MINI_AGENT_ACP_ALLOW_INSECURE_REMOTE=1`, in which case a
+prominent warning is printed. The plaintext handshake
+(`MINI-AGENT-ACP-AUTH/1`) authenticates the client, but the session that
+follows is plaintext and the server is never authenticated to the client, so
+an on-path attacker could read or inject into a tool-executing session. Prefer
+TLS, or a loopback bind behind an SSH tunnel or another encrypted, mutually
+authenticated channel.
 
 Every `session/new` request must provide an existing directory as `cwd`.
 zerostack canonicalizes that directory before creating the session and binds
@@ -1875,15 +1924,23 @@ startup, so delegated read-only agents work over ACP.
 
 `session/new` accepts the client's `mcpServers` list. Each stdio entry is
 connected for every tool-enabled prompt in that session alongside the
-configured `mcp_servers`, launched like a configured command server (absolute
-`command`, no sandbox, working directory = the session root, the client's
-`env` plus this process's `PATH` and `HOME`). A configured server keeps its
-name if a client server uses the same one. The request is refused with an
-explicit error instead of being silently ignored when it lists an HTTP or SSE
-server (not advertised), a relative command or duplicate name, when MCP is
-disabled or not compiled in, or when it arrives over ACP TCP: a network peer
-must not launch local processes, so TCP deployments configure MCP on the
-agent host.
+configured `mcp_servers` (absolute `command`, working directory = the session
+root, the client's `env` plus this process's `PATH` and `HOME`). Because the
+list can come from repository-controlled editor settings rather than the
+human-trusted `mcp_servers` configuration, client servers run in the
+dedicated workspace-service sandbox of the resolved sandbox backend
+(`--sandbox-backend`/`sandbox-backend`, else the platform default), exactly as
+a configured server with `sandbox` set; network access is inherited. When that
+backend is unavailable the `session/new` request is refused rather than
+launching them unsandboxed. An operator who trusts the editor's servers can
+set `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` in the agent's environment to launch
+them like a configured command server without a sandbox (a warning is
+logged). A configured server keeps its name if a client server uses the same
+one. The request is refused with an explicit error instead of being silently
+ignored when it lists an HTTP or SSE server (not advertised), a relative
+command or duplicate name, when MCP is disabled or not compiled in, or when it
+arrives over ACP TCP: a network peer must not launch local processes, so TCP
+deployments configure MCP on the agent host.
 
 A turn that fails internally (provider or runner error, unusable workspace,
 missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
@@ -1939,11 +1996,16 @@ directory-handle authority.
 Permission containment, LSP services, and delegated read-only agents use the
 same binding. Concurrent ACP sessions may therefore use different roots
 without changing or inheriting the server process working directory.
-Hooks are the exception: hook execution uses one process-wide workspace root,
-so when any hook is configured, a prompt is refused (JSON-RPC error `-32000`)
-while another session's prompt is active in a different workspace. Sessions in
-the same workspace still run concurrently, and the refused prompt can be
-retried once the other turn finishes. Missing
+Hooks follow the same rule: each ACP turn binds hook dispatch (prompt submit,
+tool hooks, `Stop`, and subagent hooks, including nested agent work) to its
+own session workspace, so `$ZEROSTACK_PROJECT_DIR`, the hook's working
+directory, and content-binding checks name that session's root even while
+sessions in other workspaces run concurrently. The process-wide hook root is
+only a fallback for dispatch outside a workspace-bound turn: it names the
+single active workspace, and while turns in several workspaces are active it
+is disabled, so such a dispatch is refused (fail-closed; a blocked
+`PreToolUse`) instead of running against another session's repository.
+Missing
 paths and non-directories are rejected before an agent is built. LSP file
 requests are strictly contained; other absolute, `..`, symlink, and reparse-point
 escapes are rejected.
