@@ -2042,10 +2042,143 @@ async fn worker_broker_records_skill_capability_denials_for_parent_telemetry() {
             code: EffectErrorCode::CapabilityDenied
         })
     ));
+    let snapshot = tracker.snapshot().unwrap();
     assert_eq!(
-        tracker.snapshot().unwrap(),
+        snapshot.capability_faults,
         BTreeSet::from([skill_invocation])
     );
+    assert!(snapshot.scope_misses.is_empty());
+}
+
+/// Dispatch one skill effect through the worker-facing handler and return the tracker snapshot.
+#[cfg(feature = "skills")]
+async fn skill_denial_snapshot(
+    case: &OperationCase,
+    invocation_id: &InvocationId,
+    grant: InvocationGrant,
+    normalized_target: Option<Result<NormalizedTarget, HostEffectError>>,
+) -> crate::extras::js::broker::SkillDenialSnapshot {
+    let effect = request(case, &grant);
+    let (mut broker, record, _audit) = broker_with_normalized_target(
+        invocation_id.clone(),
+        vec![grant],
+        HostCapability::all(),
+        ServiceFailures::default(),
+        normalized_target,
+    );
+    let tracker = broker.capability_denial_tracker();
+    let result = broker.handle_effect(effect, PermCancellation::new()).await;
+    assert!(
+        matches!(
+            result,
+            EffectResult::Error(crate::extras::js::protocol::EffectError {
+                code: EffectErrorCode::CapabilityDenied
+            })
+        ),
+        "{}: both denial classes surface as the same capability denial: {result:?}",
+        case.name
+    );
+    assert_eq!(record.lock().unwrap().executions, 0, "{}", case.name);
+    // The denial itself stays truthful in the audit log whatever its telemetry class.
+    assert_single_denial_record(&broker);
+    tracker.snapshot().unwrap()
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn worker_broker_records_caller_scope_misses_apart_from_policy_faults() {
+    let invocation_id = invocation("inv-skill-scope-miss");
+    let skill_invocation = invocation_id.to_string();
+    let only = |set: &BTreeSet<String>| set == &BTreeSet::from([skill_invocation.clone()]);
+
+    // A declared capability with a caller-derived target outside its scope: a scope miss.
+    for case in operation_cases(&invocation_id).into_iter().filter(|case| {
+        matches!(
+            case.capability,
+            HostCapability::ReadFile
+                | HostCapability::WriteFile
+                | HostCapability::Fetch
+                | HostCapability::Spawn
+        )
+    }) {
+        let grant = scoped_skill_grant(
+            &case,
+            &invocation_id,
+            manifest_for(&case, false),
+            Instant::now() + Duration::from_secs(10),
+        );
+        let snapshot = skill_denial_snapshot(&case, &invocation_id, grant, None).await;
+        assert!(only(&snapshot.scope_misses), "{}: {snapshot:?}", case.name);
+        assert!(
+            snapshot.capability_faults.is_empty(),
+            "{}: a target miss must not be a policy fault",
+            case.name
+        );
+    }
+
+    // An undeclared method on a declared fetch origin is caller input too.
+    let mut fetch_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Fetch)
+        .unwrap();
+    fetch_case.operation = EffectOperation::Fetch {
+        url: "https://example.test/api".into(),
+        method: HttpMethod::Post,
+        headers: vec![],
+        body: Some("body".into()),
+    };
+    let grant = scoped_skill_grant(
+        &fetch_case,
+        &invocation_id,
+        manifest_for(&fetch_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let snapshot = skill_denial_snapshot(&fetch_case, &invocation_id, grant, None).await;
+    assert!(only(&snapshot.scope_misses), "{snapshot:?}");
+    assert!(snapshot.capability_faults.is_empty());
+
+    // A declared program resolving to a different executable than the one pinned at grant time
+    // is not caller input: it stays a policy fault.
+    let spawn_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::Spawn)
+        .unwrap();
+    let grant = scoped_skill_grant(
+        &spawn_case,
+        &invocation_id,
+        manifest_for(&spawn_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let snapshot = skill_denial_snapshot(
+        &spawn_case,
+        &invocation_id,
+        grant,
+        Some(Ok(NormalizedTarget::Spawn {
+            program: "printf".into(),
+            resolved_executable: resolve_program_identity("true").unwrap(),
+        })),
+    )
+    .await;
+    assert!(only(&snapshot.capability_faults), "{snapshot:?}");
+    assert!(snapshot.scope_misses.is_empty());
+
+    // A capability the skill never declared is a policy fault, whatever its target.
+    let read_case = operation_cases(&invocation_id)
+        .into_iter()
+        .find(|case| case.capability == HostCapability::ReadFile)
+        .unwrap();
+    let read_only_grant = scoped_skill_grant(
+        &read_case,
+        &invocation_id,
+        manifest_for(&read_case, true),
+        Instant::now() + Duration::from_secs(10),
+    );
+    let mut undeclared = spawn_case.clone();
+    undeclared.principal = read_case.principal.clone();
+    undeclared.advisory = read_case.advisory.clone();
+    let snapshot = skill_denial_snapshot(&undeclared, &invocation_id, read_only_grant, None).await;
+    assert!(only(&snapshot.capability_faults), "{snapshot:?}");
+    assert!(snapshot.scope_misses.is_empty());
 }
 
 #[tokio::test]

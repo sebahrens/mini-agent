@@ -350,7 +350,10 @@ canonical event with its own retrieval metadata, index generation, production fl
 and evidence status. Worker feedback, selection, observability, and capability-policy kinds are
 rejected. The parent broker separately records capability-policy denials against its authoritative
 learned-skill grant principal and promotes the matching worker-observed terminal call to a
-canonical `CapabilityDenied` event. Positive evidence exists only after a complete canonical batch
+canonical `CapabilityDenied` event. A manifest denial caused only by a caller-derived target
+outside a declared capability scope is recorded separately as a scope miss and becomes a canonical
+`Threw` terminal with outcome `scope_miss` instead (Phase 5 section 12a.1); the denial, wire error,
+and audit record are identical for both classes. Positive evidence exists only after a complete canonical batch
 is accepted by the bounded dispatcher. Invalid, incomplete, saturated, disconnected, or failed dispatch records a
 parent-owned `ObservabilityLost` signal and cannot trigger feedback or quarantine. Stored
 learned-skill realms receive no effect or writer
