@@ -692,7 +692,7 @@ pub struct Cli {
         long = "edit-system",
         help = "Edit system (similarity or hashedit). Default: similarity"
     )]
-    pub edit_system: Option<String>,
+    pub edit_system: Option<EditSystem>,
 
     #[arg(
         long = "no-context-files",
@@ -1147,11 +1147,7 @@ impl Cli {
     }
 
     pub fn resolve_edit_system(&self, cfg: &config::Config) -> EditSystem {
-        self.edit_system
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .or(cfg.edit_system)
-            .unwrap_or_default()
+        self.edit_system.or(cfg.edit_system).unwrap_or_default()
     }
 
     #[cfg(feature = "git-worktree")]
@@ -1255,6 +1251,20 @@ output_token_cost = 0.0
     }
 
     // mini-agent-jm8cf: `--provider X` must not keep another provider's model.
+    // mini-agent-r2y6m: a typo in --edit-system is a usage error, not a
+    // silent fall back to the default.
+    #[test]
+    fn edit_system_flag_rejects_unknown_values() {
+        let error = Cli::try_parse_from(["mini-agent", "--edit-system", "hashedt"])
+            .expect_err("an unknown edit system must be rejected");
+        assert!(error.to_string().contains("unknown edit system"), "{error}");
+        let cli = Cli::try_parse_from(["mini-agent", "--edit-system", "hashedit"]).unwrap();
+        assert_eq!(
+            cli.resolve_edit_system(&config::Config::default()),
+            crate::config::types::EditSystem::Hashedit
+        );
+    }
+
     #[test]
     fn provider_override_uses_that_providers_default_model() {
         assert_eq!(
