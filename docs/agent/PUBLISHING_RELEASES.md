@@ -262,6 +262,21 @@ local set, and only then publishes the draft. A rerun removes its stale draft bu
 an already-published release for the tag. Consumers can verify a downloaded asset with
 `gh attestation verify <asset> --repo sebahrens/mini-agent`.
 
+`SHA256SUMS` is published by the same release as the archives, so a matching checksum only shows
+that a download is intact; the attestation is what ties an asset to this repository's release
+workflow. Both consumers of the release therefore check provenance as well as the manifest:
+
+- `install.sh` compares the archive with `SHA256SUMS` and then, when `gh` is installed and signed in,
+  runs `gh attestation verify <archive> --repo sebahrens/mini-agent` before extracting anything. A
+  failed verification aborts the install. A missing, signed-out, or pre-attestation `gh`, or
+  `MINI_AGENT_INSTALL_NO_GH=1`, only prints a warning with that command;
+  `MINI_AGENT_SKIP_ATTESTATION=1` skips the provenance check.
+- `scripts/update-release-checksums.sh` (run by `just post-release`) downloads the release
+  `SHA256SUMS` first and fails if any downloaded asset's digest disagrees with its manifest entry, or
+  if the entry is missing, duplicated, or malformed. With a signed-in `gh` it also requires
+  `gh attestation verify --repo sebahrens/mini-agent` to accept every asset; without `gh` it warns.
+  `LICENSE` is fetched from the tagged tree and is not a release asset.
+
 ## GPL release checklist
 
 Before treating a release as complete, verify that:
@@ -324,7 +339,9 @@ This gate is expected to fail closed when `sebahrens/mini-agent` has no complete
 the platform archive and `SHA256SUMS`; do not publish or close the coordinate change in that state.
 
 The smoke and checksum updater fail on HTTP errors before changing package metadata. The updater
-downloads all required artifacts for the exact Cargo version before it writes any checksum. It
+downloads all required artifacts for the exact Cargo version, checks each release asset against the
+release `SHA256SUMS` and (with a signed-in `gh`) its build-provenance attestation, and only then
+writes any checksum. Run it with a signed-in `gh` so recipe digests are provenance-checked. It
 then updates SHA256 checksums in:
 
 - `packaging/aur/PKGBUILD`

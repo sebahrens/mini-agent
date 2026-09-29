@@ -1478,13 +1478,38 @@ for ((i = 1; i <= $#; i++)); do
         out="${!next}"
     fi
 done
-printf '%s' "${!#}" > "$out"
+case "${!#}" in
+    */SHA256SUMS) cp "$UPDATE_TEST_MANIFEST" "$out" ;;
+    *) printf '%s' "${!#}" > "$out" ;;
+esac
 """,
                 encoding="utf-8",
             )
             curl.chmod(0o755)
+            # Each stub asset's bytes are its URL; the manifest lists their digests.
+            version = tomllib.loads((root / "Cargo.toml").read_text())["package"][
+                "version"
+            ]
+            base = f"https://github.com/sebahrens/mini-agent/releases/download/v{version}"
+            manifest = root / "SHA256SUMS"
+            manifest.write_text(
+                "".join(
+                    f"{hashlib.sha256(f'{base}/{name}'.encode()).hexdigest()}  {name}\n"
+                    for name in (
+                        "mini-agent-aarch64-apple-darwin.tar.gz",
+                        "mini-agent-aarch64-unknown-linux-musl.tar.gz",
+                        f"mini-agent-v{version}-source.tar.gz",
+                        "mini-agent-x86_64-apple-darwin.tar.gz",
+                        "mini-agent-x86_64-unknown-linux-musl.tar.gz",
+                    )
+                ),
+                encoding="utf-8",
+            )
             env = os.environ.copy()
             env["PATH"] = f"{stub_bin}:{env['PATH']}"
+            env["UPDATE_TEST_MANIFEST"] = str(manifest)
+            # Stub assets carry no attestation; provenance has its own tests.
+            env["MINI_AGENT_SKIP_ATTESTATION"] = "1"
 
             result = subprocess.run(
                 ["bash", str(root / "scripts/update-release-checksums.sh"), "all"],

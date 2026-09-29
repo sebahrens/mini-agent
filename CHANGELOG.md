@@ -13,6 +13,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   quiet, and every kebab-case key (`permission-deny`, `sandbox-backend`, `permission-modes`,
   `js-fetch-origins`, ...) now also accepts its snake_case spelling instead of ignoring it (fail-open).
   TOML parse errors now name the line and column, still without a source excerpt.
+- The shell installer no longer trusts the release origin alone: after the `SHA256SUMS` check it
+  runs `gh attestation verify <archive> --repo sebahrens/mini-agent` when a signed-in GitHub CLI is
+  available and aborts if the build provenance does not verify (without `gh` it warns and prints the
+  command; `MINI_AGENT_SKIP_ATTESTATION=1` opts out). `scripts/update-release-checksums.sh` now
+  refuses to pin a package-recipe digest that disagrees with the release `SHA256SUMS` or fails
+  attestation. The README shows pinned installs (`bash -s -- --release X.Y.Z`) and the verify command.
 - The permission prompt can no longer show a different command than the one that runs: bidi
   override/embedding/isolate controls, LRM/RLM/ALM, line/paragraph separators and zero-width format
   characters in a request are shown as visible `<U+XXXX>` markers ("Trojan Source"), and are removed

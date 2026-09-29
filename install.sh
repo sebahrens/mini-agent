@@ -8,6 +8,9 @@
 #   # Custom install directory:
 #   curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --dir /usr/local/bin
 #
+#   # Exact release:
+#   curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --release X.Y.Z
+#
 set -euo pipefail
 
 REPO="sebahrens/mini-agent"
@@ -29,6 +32,12 @@ Options:
 Private releases: if the anonymous download fails, the installer retries with
 GITHUB_TOKEN (GitHub REST API) and then with an authenticated 'gh' CLI. Set
 MINI_AGENT_INSTALL_NO_TOKEN=1 or MINI_AGENT_INSTALL_NO_GH=1 to disable either.
+
+Verification: the archive must match the release's SHA256SUMS. When an
+authenticated 'gh' is available, the installer also requires
+'gh attestation verify <archive> --repo ${REPO}' to accept the archive's
+build provenance and aborts if it does not; without gh it warns and prints
+that command. MINI_AGENT_SKIP_ATTESTATION=1 skips the provenance check.
 EOF
     exit "$status"
 }
@@ -379,6 +388,61 @@ if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
     echo "  Actual:   ${ACTUAL_HASH}" >&2
     exit 1
 fi
+
+# ---- verify build provenance before extraction ----
+#
+# SHA256SUMS comes from the same origin as the archive, so the checksum above
+# detects a corrupted or truncated download but not a replaced release. The
+# release workflow signs SLSA build provenance for every asset; when an
+# authenticated GitHub CLI is available, require that attestation to verify
+# against this repository. A missing, unauthenticated, or too-old gh is a
+# warning with the manual command, never a silent pass: only a failed
+# verification aborts.
+#
+#   MINI_AGENT_SKIP_ATTESTATION=1  skip provenance verification
+#   MINI_AGENT_INSTALL_NO_GH=1     never invoke gh (also skips verification)
+attestation_manual_hint() {
+    echo "  Verify it yourself with the GitHub CLI (https://cli.github.com):" >&2
+    echo "    gh attestation verify ${ARCHIVE_FILE} --repo ${REPO}" >&2
+}
+
+verify_attestation() {
+    if [[ "${MINI_AGENT_SKIP_ATTESTATION:-}" == "1" ]]; then
+        echo "Warning: skipping build provenance verification (MINI_AGENT_SKIP_ATTESTATION=1)." >&2
+        attestation_manual_hint
+        return 0
+    fi
+    local reason=""
+    if [[ "${MINI_AGENT_INSTALL_NO_GH:-}" == "1" ]]; then
+        reason="MINI_AGENT_INSTALL_NO_GH=1 disables the GitHub CLI"
+    elif ! command -v gh >/dev/null 2>&1; then
+        reason="the GitHub CLI ('gh') is not installed"
+    elif ! gh auth status >/dev/null 2>&1; then
+        reason="the GitHub CLI is not signed in (run 'gh auth login')"
+    elif ! gh attestation verify --help >/dev/null 2>&1; then
+        reason="this GitHub CLI does not support 'gh attestation verify'; upgrade gh"
+    fi
+    if [[ -n "$reason" ]]; then
+        echo "Warning: build provenance was not verified: ${reason}." >&2
+        echo "  The archive matched SHA256SUMS, which is served from the same release;" >&2
+        echo "  that detects a damaged download, not a replaced release." >&2
+        attestation_manual_hint
+        return 0
+    fi
+    local log="${TMPDIR}/.attestation.log"
+    if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" >"$log" 2>&1; then
+        echo "Verified build provenance for ${ARCHIVE_FILE} (gh attestation verify --repo ${REPO})."
+        return 0
+    fi
+    echo "Error: build provenance verification failed for ${ARCHIVE_FILE}." >&2
+    echo "  'gh attestation verify --repo ${REPO}' did not accept the archive:" >&2
+    sed 's/^/    /' "$log" >&2
+    echo "  Nothing was installed. To install without provenance verification anyway," >&2
+    echo "  rerun with MINI_AGENT_SKIP_ATTESTATION=1." >&2
+    exit 1
+}
+
+verify_attestation
 
 # ---- install ----
 mkdir -p "$INSTALL_DIR"

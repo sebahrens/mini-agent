@@ -293,6 +293,98 @@ _assert_file_contains \
     "$REQUEST_LOG" \
     "${CANONICAL_BASE}/SHA256SUMS"
 
+# ---- Cases 8-10: build provenance (gh attestation verify) ----
+# A signed-in gh whose attestation check is controlled by GH_TEST_ATTESTATION.
+GH_STUB_BIN="${FIXTURE}/gh-stub-bin"
+GH_LOG="${FIXTURE}/gh.log"
+mkdir -p "$GH_STUB_BIN"
+cat > "${GH_STUB_BIN}/gh" <<'STUB_GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_TEST_LOG"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "attestation verify")
+    [[ "${3:-}" == "--help" ]] && exit 0
+    [[ "$GH_TEST_ATTESTATION" == pass ]] && exit 0
+    echo "Error: no attestations matched the artifact digest" >&2
+    exit 1
+    ;;
+esac
+exit 2
+STUB_GH
+chmod +x "${GH_STUB_BIN}/gh"
+
+# A PATH with only what the installer and stubs need, so a host gh is absent.
+TOOLS_BIN="${FIXTURE}/tools-bin"
+mkdir -p "$TOOLS_BIN"
+for tool in awk basename bash cat chmod cp dirname grep gzip head mkdir mktemp \
+    mv od rm sed sh sha256sum shasum tar tr; do
+    if resolved="$(command -v "$tool")"; then
+        ln -s "$resolved" "${TOOLS_BIN}/${tool}"
+    fi
+done
+
+run_real_installer() {
+    local install_dir="$1" path="$2" attestation="$3"
+    env -u GITHUB_TOKEN -u GH_TOKEN -u MINI_AGENT_INSTALL_NO_GH -u MINI_AGENT_SKIP_ATTESTATION \
+        PATH="$path" \
+        GH_TEST_LOG="$GH_LOG" \
+        GH_TEST_ATTESTATION="$attestation" \
+        INSTALLER_REQUEST_LOG="$REQUEST_LOG" \
+        INSTALLER_MANIFEST="${FIXTURE}/SHA256SUMS" \
+        INSTALLER_ARCHIVE="${FIXTURE}/${ARCHIVE}" \
+        bash "${ROOT_DIR}/install.sh" --release "$CARGO_VERSION" --dir "$install_dir"
+}
+
+# Case 8: an attestation that does not verify aborts before installing.
+ATTEST_FAIL_DIR="${FIXTURE}/attest-fail-install"
+if output=$(run_real_installer "$ATTEST_FAIL_DIR" "${GH_STUB_BIN}:${STUB_BIN}:$PATH" fail 2>&1); then
+    echo "  FAIL: failed attestation should abort the install"
+    FAIL=$((FAIL + 1))
+elif [[ "$output" == *"build provenance verification failed"* ]]; then
+    echo "  PASS: failed attestation aborts the install"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: failed attestation aborted without naming the cause: $output"
+    FAIL=$((FAIL + 1))
+fi
+_assert_file_absent "no binary installed after failed attestation" "${ATTEST_FAIL_DIR}/${BINARY_NAME}"
+if grep -Eq "^attestation verify /.*/${ARCHIVE} --repo sebahrens/mini-agent\$" "$GH_LOG"; then
+    echo "  PASS: installer verifies the downloaded archive against sebahrens/mini-agent"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: installer did not run gh attestation verify on the archive"
+    FAIL=$((FAIL + 1))
+fi
+
+# Case 9: a verified attestation installs.
+ATTEST_PASS_DIR="${FIXTURE}/attest-pass-install"
+if output=$(run_real_installer "$ATTEST_PASS_DIR" "${GH_STUB_BIN}:${STUB_BIN}:$PATH" pass 2>&1) \
+    && [[ -x "${ATTEST_PASS_DIR}/${BINARY_NAME}" ]] \
+    && [[ "$output" == *"Verified build provenance"* ]]; then
+    echo "  PASS: verified attestation installs"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: verified attestation should install: $output"
+    FAIL=$((FAIL + 1))
+fi
+
+# Case 10: without gh the install proceeds and prints the manual command.
+NO_GH_DIR="${FIXTURE}/no-gh-install"
+if [[ -e "${STUB_BIN}/gh" || -e "${TOOLS_BIN}/gh" ]]; then
+    echo "  FAIL: test PATH unexpectedly contains gh"
+    FAIL=$((FAIL + 1))
+elif output=$(run_real_installer "$NO_GH_DIR" "${STUB_BIN}:${TOOLS_BIN}" fail 2>&1) \
+    && [[ -x "${NO_GH_DIR}/${BINARY_NAME}" ]] \
+    && [[ "$output" == *"Warning: build provenance was not verified"* ]] \
+    && [[ "$output" == *"gh attestation verify ${ARCHIVE} --repo sebahrens/mini-agent"* ]]; then
+    echo "  PASS: missing gh installs with a manual verification warning"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: missing gh should install with a warning: $output"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]

@@ -261,17 +261,36 @@ approve them, or bypass the human lifecycle gates.
 The Cargo package, installed CLI, and every binary release archive use the executable name
 `mini-agent`.
 
-Install the latest checksum-verified release on Linux or macOS:
+Install the latest release on Linux or macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
 
+To install an exact release instead of the latest one, pass `--release`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash -s -- --release X.Y.Z
+```
+
+The installer refuses an archive that does not match the release's `SHA256SUMS`. That manifest is
+served from the same release as the archive, so it catches a damaged or truncated download but not a
+replaced release. Every release asset also carries SLSA build provenance signed by the release
+workflow: when the GitHub CLI is installed and signed in, the installer runs
+`gh attestation verify <archive> --repo sebahrens/mini-agent` and aborts if it fails. Without `gh` it
+installs with a warning that prints the command; to verify a downloaded asset yourself, run:
+
+```bash
+gh attestation verify mini-agent-<arch>-<os>.tar.gz --repo sebahrens/mini-agent
+```
+
+`MINI_AGENT_SKIP_ATTESTATION=1` skips the provenance check (the `SHA256SUMS` check always runs).
+
 If the anonymous download fails or returns a sign-in page (for example, a private fork), the
 installer retries with credentials: first with `GITHUB_TOKEN` through the GitHub REST API (sent
 as a header, never on the command line), then with `gh release download` when the GitHub CLI is
 installed and `gh auth status` succeeds. Assets fetched either way pass the same `SHA256SUMS`
-verification. Set `MINI_AGENT_INSTALL_NO_TOKEN=1` or `MINI_AGENT_INSTALL_NO_GH=1` to disable a
+and provenance checks. Set `MINI_AGENT_INSTALL_NO_TOKEN=1` or `MINI_AGENT_INSTALL_NO_GH=1` to disable a
 fallback.
 
 On x86-64 Windows, the same release publishes

@@ -6,18 +6,24 @@ description: "Get started with mini-agent: install the minimal Rust coding agent
 
 Thanks for picking up mini-agent. This guide covers installation, model setup, and the basic commands.
 
-This tutorial applies to Linux, macOS, and Windows. The checksum-verified shell installer below
+This tutorial applies to Linux, macOS, and Windows. The shell installer below
 targets Linux and macOS; x86-64 Windows also has a release MSI. JavaScript actions expose the same brokered
 feature contract on all three systems, while each platform uses and reports its own containment
 assurance; see the repository README and architecture overview for those guarantees.
 
 ## 1. Installation
 
-You can build from source or use the checksum-verified shell installer. The shell installer requires a
+You can build from source or use the shell installer. The shell installer requires a
 complete release in the canonical repository:
 ```
 curl -fsSL https://raw.githubusercontent.com/sebahrens/mini-agent/main/install.sh | bash
 ```
+
+Append `-s -- --release X.Y.Z` to `bash` to install an exact release. The installer checks the
+archive against the release's `SHA256SUMS` (which detects a damaged download, not a replaced
+release) and, when the GitHub CLI is installed and signed in, requires
+`gh attestation verify <archive> --repo sebahrens/mini-agent` to accept the archive's build
+provenance. Without `gh` it installs with a warning that prints that command.
 
 On x86-64 Windows, download `mini-agent-windows-x64.msi` and
 `MSI_SHA256SUMS` from the same GitHub release, verify the checksum, then open
