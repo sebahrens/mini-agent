@@ -330,10 +330,55 @@ async fn handle_rename(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         return Ok(());
     }
     let new_name = parts[1..].join(" ").trim().to_string();
-    ctx.session.name = CompactString::new(&new_name);
-    crate::session::storage::save_session(ctx.session)?;
-    write_ok(ctx.renderer, format!("session renamed to \"{}\"", new_name));
+    let no_session = ctx.cli.no_session;
+    // Mid-turn the disk snapshot stays at the settled pre-turn state; the
+    // new name is saved with the turn when it settles.
+    let turn_in_flight = *ctx.is_running;
+    match mutate_and_persist_session(
+        ctx.session,
+        |session| rename_session_mutation(session, &new_name),
+        |session| {
+            if turn_in_flight {
+                Ok(())
+            } else {
+                persist_session_unless_ephemeral(no_session, session)
+            }
+        },
+        crate::session::storage::load_session_exact,
+    ) {
+        Ok(PersistedMutation::Unchanged) => {
+            write_ok(
+                ctx.renderer,
+                format!("session already named \"{new_name}\""),
+            );
+        }
+        Ok(PersistedMutation::Persisted(())) => {
+            write_ok(ctx.renderer, format!("session renamed to \"{new_name}\""));
+        }
+        Ok(PersistedMutation::PersistedWithWarning((), warning)) => {
+            write_error(ctx.renderer, warning);
+            write_ok(ctx.renderer, format!("session renamed to \"{new_name}\""));
+        }
+        Err(error) => {
+            write_error(
+                ctx.renderer,
+                format!("failed to save renamed session: {error}"),
+            );
+            if is_persistence_restart_required(&error) {
+                return Err(error);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Set the session name; `None` when it already has that name.
+fn rename_session_mutation(session: &mut crate::session::Session, name: &str) -> Option<()> {
+    if session.name == name {
+        return None;
+    }
+    session.name = CompactString::new(name);
+    Some(())
 }
 
 async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
@@ -946,7 +991,8 @@ mod session_id_tests {
 mod session_persistence_tests {
     use super::{
         PersistedMutation, clear_session_mutation, is_persistence_restart_required,
-        mutate_and_persist_session, redo_session_mutation, undo_session_mutation,
+        mutate_and_persist_session, persist_session_unless_ephemeral, redo_session_mutation,
+        rename_session_mutation, undo_session_mutation,
     };
     use crate::session::{MessageRole, Session};
     use std::cell::{Cell, RefCell};
@@ -1027,6 +1073,52 @@ mod session_persistence_tests {
             !reloaded_clear.redo(),
             "clear must invalidate the redo point"
         );
+    }
+
+    /// mini-agent-yjupx: /rename goes through the guarded persist: it never
+    /// writes under --no-session, and a failed save restores the old name.
+    #[test]
+    fn rename_is_guarded_and_rolls_back_a_failed_save() {
+        let mut session = session_with_turn();
+        session.name = "old".into();
+        assert_eq!(
+            persist_session_unless_ephemeral(true, &session).ok(),
+            Some(()),
+            "--no-session must not touch storage"
+        );
+        let outcome = mutate_and_persist_session(
+            &mut session,
+            |s| rename_session_mutation(s, "old"),
+            |_| panic!("an unchanged name must not save"),
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(outcome, PersistedMutation::Unchanged);
+
+        let persisted_before = session.clone();
+        let error = mutate_and_persist_session(
+            &mut session,
+            |s| rename_session_mutation(s, "new"),
+            |_| anyhow::bail!("disk full"),
+            |_| Ok(Some(persisted_before)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disk full"));
+        assert_eq!(session.name, "old");
+
+        let saved = RefCell::new(None);
+        mutate_and_persist_session(
+            &mut session,
+            |s| rename_session_mutation(s, "new"),
+            |candidate| {
+                *saved.borrow_mut() = Some(candidate.name.to_string());
+                Ok(())
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(session.name, "new");
+        assert_eq!(saved.borrow().as_deref(), Some("new"));
     }
 
     #[test]

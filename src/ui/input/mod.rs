@@ -1,5 +1,6 @@
 pub(crate) mod cursor;
 mod pickers;
+pub(crate) mod wrap;
 
 pub use cursor::cursor_to_line_col;
 pub use cursor::{
@@ -199,6 +200,17 @@ pub(crate) fn is_modifier_chord(key: KeyEvent) -> bool {
     ctrl != alt && !(ctrl && matches!(c, 'h' | 'H'))
 }
 
+/// Backspace, Ctrl+H, Ctrl+W or Alt+Backspace: keys that delete backwards.
+pub(crate) fn is_backward_delete(key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace => true,
+        KeyCode::Char('\x08') => true,
+        KeyCode::Char('h' | 'w') => ctrl,
+        _ => false,
+    }
+}
+
 /// Whether an `@` inserted at byte offset `pos` starts a file mention: at the
 /// buffer start or after whitespace, an opening parenthesis or a quote.
 pub(crate) fn mention_can_start_at(buffer: &str, pos: usize) -> bool {
@@ -229,6 +241,71 @@ fn read_editor_text(reader: impl std::io::Read) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// Spaces a pasted tab expands to. The input box draws a tab as zero width,
+/// so it is expanded rather than kept.
+const PASTE_TAB_WIDTH: usize = 4;
+
+/// Make pasted text safe for the input buffer: line endings become `\n`
+/// (iTerm2 and VTE send pasted newlines as `\r`), tabs expand to spaces, and
+/// escape sequences and other control characters are dropped so they can
+/// neither reach the terminal when the prompt is drawn nor the model.
+pub(crate) fn sanitize_paste(data: &str) -> String {
+    let mut out = String::with_capacity(data.len());
+    let mut chars = data.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.extend(std::iter::repeat_n(' ', PASTE_TAB_WIDTH)),
+            '\x1b' => skip_escape_sequence(&mut chars),
+            // C1 CSI and OSC introducers start sequences as well.
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{9d}' => skip_string_sequence(&mut chars),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    // Parameters and intermediates, then one final byte in 0x40..=0x7E.
+    for c in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&c) {
+            break;
+        }
+    }
+}
+
+/// OSC/DCS/APC/PM/SOS bodies end with BEL or ST (`ESC \` or U+009C).
+fn skip_string_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(c) = chars.next() {
+        match c {
+            '\x07' | '\u{9c}' => break,
+            '\x1b' => {
+                chars.next_if_eq(&'\\');
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => skip_csi(chars),
+        Some(']' | 'P' | '_' | '^' | 'X') => skip_string_sequence(chars),
+        // Intermediate bytes (e.g. `ESC ( B`) take one more final byte.
+        Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+            chars.next();
+        }
+        _ => {}
+    }
+}
+
 const MAX_KILL_RING: usize = 30;
 const MAX_PICKER_PASTE_CHARS: usize = 256;
 
@@ -245,6 +322,9 @@ pub struct InputEditor {
     theme_names: Vec<String>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
+    current_model: Option<String>,
+    /// Text width the input box wraps at, once the renderer has laid it out.
+    wrap_width: Option<usize>,
     provider_names: Vec<String>,
     /// Source of the current security mode for the `/mode` picker.
     permission: Option<crate::permission::checker::PermCheck>,
@@ -269,6 +349,8 @@ impl InputEditor {
             theme_names: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
+            current_model: None,
+            wrap_width: None,
             provider_names: Vec::new(),
             permission: None,
             editor: None,
@@ -282,12 +364,28 @@ impl InputEditor {
     /// within the buffer. Used when a mouse click places the cursor.
     pub fn set_cursor(&mut self, pos: usize) {
         let pos = pos.min(self.buffer.len());
+        let pos = if self.buffer.is_char_boundary(pos) {
+            pos
+        } else {
+            prev_char_boundary(&self.buffer, pos)
+        };
+        if pos != self.cursor {
+            // A query picker assumes the caret sits at the end of its query.
+            self.close_query_picker();
+        }
+        self.cursor = pos;
+        self.yank_pos = None;
+    }
+
+    /// Keep `cursor` a valid byte offset on a char boundary so no edit can
+    /// slice or remove inside a multi-byte character.
+    fn clamp_cursor(&mut self) {
+        let pos = self.cursor.min(self.buffer.len());
         self.cursor = if self.buffer.is_char_boundary(pos) {
             pos
         } else {
             prev_char_boundary(&self.buffer, pos)
         };
-        self.yank_pos = None;
     }
 
     pub fn clear_buffer(&mut self) {
@@ -296,6 +394,15 @@ impl InputEditor {
         self.history_pos = None;
         self.draft = None;
         self.yank_pos = None;
+    }
+
+    /// Ctrl+C on an idle draft: clear the input and close any picker, keeping
+    /// the text on the kill ring so Ctrl+Y brings it back.
+    pub fn discard_draft(&mut self) {
+        let draft = std::mem::take(&mut self.buffer);
+        self.push_kill(draft);
+        self.close_query_picker();
+        self.clear_buffer();
     }
 
     /// Replace the input buffer with `text`, cursor at the end. Used by the
@@ -317,6 +424,16 @@ impl InputEditor {
 
     pub fn set_live_model_names(&mut self, names: Vec<String>) {
         self.live_model_names = names;
+    }
+
+    /// Text width of the input box, so Up/Down move by soft-wrapped rows.
+    pub fn set_wrap_width(&mut self, width: usize) {
+        self.wrap_width = Some(width);
+    }
+
+    /// The session's current model, marked in the `/model` picker.
+    pub fn set_current_model(&mut self, model: Option<String>) {
+        self.current_model = model;
     }
 
     pub fn set_provider_names(&mut self, names: Vec<String>) {
@@ -390,8 +507,10 @@ impl InputEditor {
         self.picker = Some(Picker::Command(picker));
     }
 
-    pub fn start_models_picker(&mut self) {
-        let mut picker = ModelsPicker::new();
+    /// Open the model picker completing the argument of `prefix`
+    /// (`"/model "` or `"/models "`).
+    pub fn start_models_picker(&mut self, prefix: &'static str) {
+        let mut picker = ModelsPicker::for_command(prefix, self.current_model.clone());
         picker.set_monochrome(self.monochrome);
         picker.set_groups(
             self.quick_model_names.clone(),
@@ -545,6 +664,10 @@ impl InputEditor {
     }
 
     pub fn handle_paste(&mut self, data: String) {
+        let data = sanitize_paste(&data);
+        if data.is_empty() {
+            return;
+        }
         // Keep query pickers open only for bounded, single-line text. Larger or
         // control-bearing pastes use the normal atomic buffer path below.
         let picker_accepts_query = self.picker.as_ref().is_some_and(|picker| {
@@ -586,6 +709,34 @@ impl InputEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        let submitted = self.handle_editor_key(key);
+        if is_backward_delete(key) {
+            self.reopen_command_picker_for_slash_word();
+        }
+        submitted
+    }
+
+    /// After deleting back to a bare `/command` word (for example out of an
+    /// argument picker), offer slash completion again, seeded with the word.
+    pub(crate) fn reopen_command_picker_for_slash_word(&mut self) {
+        if self.picker.as_ref().is_some_and(Picker::active)
+            || self.cursor != self.buffer.len()
+            || !self.buffer.starts_with('/')
+            || self.buffer.chars().any(char::is_whitespace)
+        {
+            return;
+        }
+        let query: String = self.buffer[1..].to_string();
+        self.start_command_picker();
+        if let Some(Picker::Command(picker)) = self.picker.as_mut() {
+            for c in query.chars() {
+                picker.char_input(c);
+            }
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        self.clamp_cursor();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -674,15 +825,42 @@ impl InputEditor {
             }
         }
 
-        if alt {
+        // Word motion also on Ctrl+Left/Right, the common non-Emacs binding.
+        if ctrl && !alt {
             match key.code {
-                KeyCode::Char('b') => {
+                KeyCode::Left => {
                     self.cursor = self.prev_word_start();
                     self.yank_pos = None;
                     return None;
                 }
-                KeyCode::Char('f') => {
+                KeyCode::Right => {
                     self.cursor = self.next_word_end();
+                    self.yank_pos = None;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        if alt {
+            match key.code {
+                // Terminals send Option/Alt+arrows either as `ESC b`/`ESC f`
+                // or as CSI `1;3D`/`1;3C`; both move by word.
+                KeyCode::Char('b') | KeyCode::Left => {
+                    self.cursor = self.prev_word_start();
+                    self.yank_pos = None;
+                    return None;
+                }
+                KeyCode::Char('f') | KeyCode::Right => {
+                    self.cursor = self.next_word_end();
+                    self.yank_pos = None;
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    let deleted = self.delete_prev_word();
+                    if !deleted.is_empty() {
+                        self.push_kill(deleted);
+                    }
                     self.yank_pos = None;
                     return None;
                 }
@@ -764,7 +942,8 @@ impl InputEditor {
                 self.buffer.clear();
                 self.cursor = 0;
                 self.yank_pos = None;
-                if text.is_empty() { None } else { Some(text) }
+                // Whitespace-only input (e.g. Tab's two spaces) is not sent.
+                if is_blank { None } else { Some(text) }
             }
             KeyCode::Char(c)
                 if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
@@ -818,16 +997,18 @@ impl InputEditor {
                         }
                     }
                 }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/models ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/models ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_models_picker();
-                            if let Some(Picker::Models(ref mut mp)) = self.picker {
-                                mp.char_input(c);
+                for prefix in ["/model ", "/models "] {
+                    if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
+                        && self.buffer.starts_with(prefix)
+                    {
+                        let after_prefix: String = self.buffer.chars().skip(prefix.len()).collect();
+                        if !after_prefix.is_empty() && c != ' ' {
+                            let query_len = after_prefix.len();
+                            if query_len == 1 {
+                                self.start_models_picker(prefix);
+                                if let Some(Picker::Models(ref mut mp)) = self.picker {
+                                    mp.char_input(c);
+                                }
                             }
                         }
                     }
@@ -964,7 +1145,33 @@ impl InputEditor {
         None
     }
 
+    /// Move one visual row up or down when the input soft-wraps. Returns
+    /// `false` at the first/last row so the caller falls back to history.
+    fn move_visual_row(&mut self, down: bool) -> Option<bool> {
+        let width = self.wrap_width?;
+        let rows = wrap::wrap_rows(&self.buffer, width);
+        let (row, column) = wrap::cursor_position(&self.buffer, &rows, self.cursor);
+        let target = if down {
+            row + 1
+        } else {
+            match row.checked_sub(1) {
+                Some(target) => target,
+                None => return Some(false),
+            }
+        };
+        if target >= rows.len() {
+            return Some(false);
+        }
+        self.cursor = wrap::offset_in_row(&self.buffer, &rows, target, column);
+        Some(true)
+    }
+
     fn cursor_up(&mut self) -> Option<CompactString> {
+        match self.move_visual_row(false) {
+            Some(true) => return None,
+            Some(false) => return self.history_up(),
+            None => {}
+        }
         let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
         if line > 0 {
             let line_len =
@@ -982,6 +1189,11 @@ impl InputEditor {
     }
 
     fn cursor_down(&mut self) -> Option<CompactString> {
+        match self.move_visual_row(true) {
+            Some(true) => return None,
+            Some(false) => return self.history_down(),
+            None => {}
+        }
         let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
         let total = count_lines(&self.buffer);
         if line + 1 < total {
@@ -1025,10 +1237,10 @@ impl InputEditor {
             .position(|&(bi, _)| bi >= self.cursor)
             .unwrap_or(pairs.len());
         let mut pos = char_idx;
-        while pos > 0 && pairs[pos - 1].1 == ' ' {
+        while pos > 0 && pairs[pos - 1].1.is_whitespace() {
             pos -= 1;
         }
-        while pos > 0 && pairs[pos - 1].1 != ' ' {
+        while pos > 0 && !pairs[pos - 1].1.is_whitespace() {
             pos -= 1;
         }
         if pos < pairs.len() {
@@ -1049,10 +1261,10 @@ impl InputEditor {
             .position(|&(bi, _)| bi >= self.cursor)
             .unwrap_or(len);
         let mut pos = char_idx;
-        while pos < len && pairs[pos].1 == ' ' {
+        while pos < len && pairs[pos].1.is_whitespace() {
             pos += 1;
         }
-        while pos < len && pairs[pos].1 != ' ' {
+        while pos < len && !pairs[pos].1.is_whitespace() {
             pos += 1;
         }
         if pos < len {
