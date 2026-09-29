@@ -20,7 +20,8 @@ use super::protocol::{
     BuildIdentity, DiagnosticClass, EffectErrorCode, EffectRequest, EffectResponse, EffectResult,
     FrameError, InvocationId, JsErrorCode, JsExceptionClass, ParentFrame, ParentProtocol,
     ParentWireFrame, RunStep, ScriptRole, StepOutcome, StepResult, VERIFICATION_LOADER_VERSION,
-    VerificationResult, WireFrame, WorkerFrame, WorkerWireFrame, read_frame, write_frame,
+    VerificationResult, WireFrame, WorkerFrame, WorkerWireFrame, frame_exceeds_limit, read_frame,
+    write_frame,
 };
 #[cfg(feature = "skills")]
 use super::protocol::{SkillCallRequest, SkillCallResponse};
@@ -2000,6 +2001,16 @@ async fn run_invocation<H: InvocationEffectHandler>(
                 };
                 cancel_on_drop.armed = false;
                 drop(effect);
+                // The effect already executed and was audited. A result that cannot be framed must
+                // become a bounded effect error, never a worker protocol fault that reads like a
+                // pre-effect failure and invites replay of a mutating effect.
+                let result = fit_effect_result_to_frame(
+                    &connection.build,
+                    &invocation,
+                    connection.sequence,
+                    effect_ordinal,
+                    result,
+                );
                 let outcome_unknown = matches!(
                     &result,
                     EffectResult::Error(super::protocol::EffectError {
@@ -2138,6 +2149,40 @@ async fn write_parent(
     #[cfg(test)]
     connection.process.notify_parent_write_for_test();
     Ok(())
+}
+
+/// Return `result` unchanged when its `EffectResponse` frame fits the wire limit. Otherwise
+/// replace it with `OutcomeUnknown` for a possibly mutating effect (it ran, but the caller cannot
+/// observe its result) or `TooLarge` for a read-only effect.
+fn fit_effect_result_to_frame(
+    build: &BuildIdentity,
+    invocation: &InvocationId,
+    sequence: u64,
+    effect_ordinal: u32,
+    result: EffectResult,
+) -> EffectResult {
+    let frame = WireFrame::invocation(
+        build.clone(),
+        invocation.clone(),
+        sequence,
+        ParentFrame::EffectResponse(EffectResponse {
+            effect_ordinal,
+            result,
+        }),
+    );
+    let exceeds = frame_exceeds_limit(&frame);
+    let ParentFrame::EffectResponse(EffectResponse { result, .. }) = frame.message else {
+        unreachable!("frame was constructed as an effect response");
+    };
+    if !exceeds {
+        return result;
+    }
+    let code = if interrupted_effect_requires_unknown(&result) {
+        EffectErrorCode::OutcomeUnknown
+    } else {
+        EffectErrorCode::TooLarge
+    };
+    EffectResult::Error(super::protocol::EffectError { code })
 }
 
 /// Cancellation can win the parent select after a mutating service has already completed but
