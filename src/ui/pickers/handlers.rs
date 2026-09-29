@@ -21,7 +21,7 @@ const BACKSPACE: KeyEvent = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE
 /// Replace the `@<query>` span that starts at byte offset `at` with
 /// `replacement` and return the byte cursor just after the inserted text.
 ///
-/// Every offset here is a byte offset: `at` comes from `str::rfind`, and
+/// Every offset here is a byte offset: `at` comes from [`mention_start`], and
 /// `query_len` is `picker.query.len()` (bytes). Slicing by chars with these
 /// values corrupted any buffer containing multi-byte text before the `@`.
 fn replace_at_span(
@@ -40,6 +40,20 @@ fn replace_at_span(
     at + replacement.len()
 }
 
+/// Byte offset of the `@` that opened the file picker. The picker mirrors its
+/// query into the buffer right before the caret, so the mention being
+/// completed is `@<query>` ending at `cursor`; searching the whole buffer for
+/// the last `@` would edit a later mention instead.
+fn mention_start(buffer: &str, cursor: usize, query: &str) -> Option<usize> {
+    let cursor = cursor.min(buffer.len());
+    let exact = cursor.checked_sub(query.len() + 1).filter(|&at| {
+        buffer
+            .get(at..cursor)
+            .is_some_and(|span| span.strip_prefix('@') == Some(query))
+    });
+    exact.or_else(|| buffer.get(..cursor)?.rfind('@'))
+}
+
 pub fn handle_file_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
@@ -55,7 +69,7 @@ pub fn handle_file_key(
                 *cursor = prev_char_boundary(buffer, *cursor);
                 buffer.remove(*cursor);
             } else {
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
@@ -93,7 +107,7 @@ pub fn handle_file_key(
                 buffer.remove(*cursor);
                 true
             } else {
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, 0, "");
                 }
                 picker.deactivate();
@@ -116,7 +130,7 @@ pub fn handle_file_key(
         KeyCode::Enter | KeyCode::Tab => {
             if let Some(path) = picker.selected_path() {
                 let path_str = path.to_string_lossy().to_string();
-                if let Some(at) = buffer.rfind('@') {
+                if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                     *cursor = replace_at_span(buffer, at, picker.query.len(), &path_str);
                 }
             }
@@ -124,7 +138,7 @@ pub fn handle_file_key(
             true
         }
         KeyCode::Esc => {
-            if let Some(at) = buffer.rfind('@') {
+            if let Some(at) = mention_start(buffer, *cursor, &picker.query) {
                 *cursor = replace_at_span(buffer, at, picker.query.len(), "");
             }
             picker.deactivate();

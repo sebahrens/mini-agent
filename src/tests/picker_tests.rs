@@ -1535,6 +1535,31 @@ mod caret_keys_close_query_pickers {
         assert_eq!(input.buffer, "/xmo");
     }
 
+    /// mini-agent-mr5xb: completing an earlier `@` mention must edit that
+    /// mention, not the last `@` in the buffer.
+    #[test]
+    fn completing_an_earlier_mention_leaves_later_mentions_alone() {
+        for (query, key, expected, caret) in [
+            ("rea", KeyCode::Enter, "fix README.md and @b", 13),
+            ("rea", KeyCode::Tab, "fix README.md and @b", 13),
+            ("rea", KeyCode::Esc, "fix  and @b", 4),
+            ("", KeyCode::Backspace, "fix  and @b", 4),
+        ] {
+            let mut input = InputEditor::new();
+            input.load_text("fix  and @b");
+            input.set_cursor(4);
+            typed(&mut input, "@");
+            let Some(Picker::File(picker)) = input.picker.as_mut() else {
+                panic!("@ after a space opens the file picker");
+            };
+            picker.test_set_cache(vec![PathBuf::from("README.md")]);
+            typed(&mut input, query);
+            press(&mut input, key);
+            assert_eq!(input.buffer, expected, "{key:?}");
+            assert_eq!(input.cursor, caret, "{key:?}");
+        }
+    }
+
     #[test]
     fn a_stale_caret_inside_a_character_is_clamped_before_editing() {
         let mut input = InputEditor::new();
