@@ -188,6 +188,35 @@ impl TerminalOperations for SystemTerminal {
     }
 }
 
+/// Agent activity reported through the terminal title (config
+/// `terminal_title`), for multiplexers and tab bars that surface titles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentActivity {
+    Idle,
+    Working,
+    WaitingForApproval,
+}
+
+impl AgentActivity {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AgentActivity::Idle => "idle",
+            AgentActivity::Working => "working",
+            AgentActivity::WaitingForApproval => "waiting for approval",
+        }
+    }
+}
+
+/// OSC 0 (icon name and window title) announcing `activity`. The text is a
+/// fixed product name and label, never model or tool output.
+pub(crate) fn title_sequence(activity: AgentActivity) -> String {
+    format!(
+        "\x1b]0;{}: {}\x07",
+        crate::product::PUBLIC_NAME,
+        activity.label()
+    )
+}
+
 /// Best effort: discard bytes the terminal already queued on stdin. Failure
 /// (stdin redirected, not a tty) leaves nothing to discard.
 #[cfg(unix)]
@@ -815,6 +844,22 @@ mod tests {
         let mut buffer = [0u8; 64];
         let read = slave.read(&mut buffer).unwrap();
         assert_eq!(&buffer[..read], b"Z");
+    }
+
+    #[test]
+    fn activity_titles_are_fixed_osc_sequences() {
+        assert_eq!(
+            title_sequence(AgentActivity::Working),
+            "\x1b]0;mini-agent: working\x07"
+        );
+        assert_eq!(
+            title_sequence(AgentActivity::WaitingForApproval),
+            "\x1b]0;mini-agent: waiting for approval\x07"
+        );
+        assert_eq!(
+            title_sequence(AgentActivity::Idle),
+            "\x1b]0;mini-agent: idle\x07"
+        );
     }
 
     #[test]

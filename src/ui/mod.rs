@@ -198,6 +198,11 @@ pub(crate) fn refresh_display(
     // the size the input is about to occupy (avoids a stale separator when the
     // input shrinks, or chat text hidden under it when the input grows).
     renderer.sync_input_height(&input.buffer)?;
+    renderer.set_activity(if run.is_running {
+        crate::ui::terminal::AgentActivity::Working
+    } else {
+        crate::ui::terminal::AgentActivity::Idle
+    })?;
     renderer.render_viewport()?;
     let perm_mode = ui.permission.as_ref().map(|p| {
         p.lock()

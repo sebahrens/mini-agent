@@ -142,6 +142,7 @@ async fn read_prompt_input(
         tool: header,
         options: options.into(),
     });
+    renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
     draw_prompt(renderer)?;
 
     let input = loop {

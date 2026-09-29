@@ -371,6 +371,10 @@ pub struct Renderer {
     /// Transient status-line message (e.g. a copy result) that must not
     /// become a permanent transcript entry.
     notice: Option<Notice>,
+    /// Report agent activity in the terminal title (config `terminal_title`).
+    title_status: bool,
+    /// Activity last written to the title, so unchanged frames write nothing.
+    title_activity: Option<crate::ui::terminal::AgentActivity>,
 }
 
 /// A status-line message that disappears on its own.
@@ -425,6 +429,8 @@ impl Renderer {
             statusline_builds: 0,
             bottom_cursor: None,
             notice: None,
+            title_status: false,
+            title_activity: None,
         })
     }
 
@@ -458,6 +464,27 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn statusline_builds(&self) -> usize {
         self.statusline_builds
+    }
+
+    /// Enable activity reporting through the terminal title.
+    pub fn set_title_status(&mut self, enabled: bool) {
+        self.title_status = enabled;
+    }
+
+    /// Announce `activity` in the terminal title when it changed. A no-op
+    /// unless title reporting is enabled.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: crate::ui::terminal::AgentActivity,
+    ) -> io::Result<()> {
+        if !self.title_status || self.title_activity == Some(activity) {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        stdout.write_all(crate::ui::terminal::title_sequence(activity).as_bytes())?;
+        stdout.flush()?;
+        self.title_activity = Some(activity);
+        Ok(())
     }
 
     /// Show `text` on the status line for [`NOTICE_DURATION`] instead of
@@ -619,6 +646,12 @@ impl Renderer {
     pub fn invalidate(&mut self) {
         self.chat_dirty = true;
         self.bottom_dirty = true;
+    }
+
+    /// Forget the announced title activity: a suspended and resumed terminal
+    /// restored the pre-attach title, so the next frame announces again.
+    pub(crate) fn forget_title(&mut self) {
+        self.title_activity = None;
     }
 
     /// The separator row above the input: the first row, counting down, that a

@@ -569,7 +569,7 @@ impl<'a> App<'a> {
     ) -> anyhow::Result<Self> {
         let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
             mouse_capture: ui.cfg.resolve_mouse_capture(),
-            title_status: false,
+            title_status: ui.cfg.resolve_terminal_title(),
         })?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
@@ -581,6 +581,7 @@ impl<'a> App<'a> {
         let mut renderer = Renderer::new()?;
         renderer.set_statusline_height(crate::ui::statusline::line_count());
         renderer.set_monochrome(ui.cli.no_color);
+        renderer.set_title_status(ui.cfg.resolve_terminal_title());
         renderer.set_chat_margin(ui.cfg.resolve_chat_left_margin());
         if let Some(ref theme_name) = ui.context.current_theme_name {
             if let Some(content) = ui.context.themes.get(theme_name.as_str()) {
@@ -2928,6 +2929,7 @@ impl<'a> App<'a> {
         self.pause_event_thread();
         // Terminal resumption clears the screen even when the draft is unchanged.
         self.renderer.invalidate();
+        self.renderer.forget_title();
         self.running = Arc::new(AtomicBool::new(true));
         // Background producers retain clones of this sender across handoffs.
         self.event_handle = Some(spawn_event_thread(
