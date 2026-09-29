@@ -333,15 +333,14 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             write_result(ctx.renderer, line);
         }
     } else {
-        let new_state = match parts.get(2).copied() {
-            Some("on") => true,
-            Some("off") => false,
-            Some(other) => {
-                write_error(ctx.renderer, format!("invalid: '{}', use on or off", other));
-                return Ok(());
-            }
-            None => !*ctx.todo_tools_enabled,
-        };
+        let new_state =
+            match toggle_target(parts[1], parts.get(2).copied(), *ctx.todo_tools_enabled) {
+                Ok(state) => state,
+                Err(error) => {
+                    write_error(ctx.renderer, error);
+                    return Ok(());
+                }
+            };
         if new_state == *ctx.todo_tools_enabled {
             write_ok(
                 ctx.renderer,
@@ -363,6 +362,24 @@ async fn handle_toggle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+/// The todo-tools state `/toggle <feature> [on|off]` asks for. `todo` is the
+/// only toggleable feature; the runtime lines bare `/toggle` prints are
+/// read-only, so naming one (or anything else) is an error rather than a
+/// silent todo toggle.
+fn toggle_target(feature: &str, state: Option<&str>, current: bool) -> Result<bool, String> {
+    if !feature.eq_ignore_ascii_case("todo") {
+        return Err(format!(
+            "'{feature}' cannot be toggled; toggleable features: todo (run /toggle to list)"
+        ));
+    }
+    match state.map(str::to_ascii_lowercase).as_deref() {
+        None => Ok(!current),
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(other) => Err(format!("invalid: '{other}', use on or off")),
+    }
 }
 
 /// Renders the read-only runtime availability lines shown by bare `/toggle`.
@@ -624,7 +641,20 @@ fn handle_mcp_logout(name: Option<&str>, ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 
 #[cfg(test)]
 mod reasoning_tests {
-    use super::reasoning_target;
+    use super::{reasoning_target, toggle_target};
+
+    /// mini-agent-x1dmg: only `todo` toggles; other names are errors.
+    #[test]
+    fn toggle_only_accepts_todo() {
+        assert_eq!(toggle_target("todo", Some("off"), true), Ok(false));
+        assert_eq!(toggle_target("TODO", Some("on"), false), Ok(true));
+        assert_eq!(toggle_target("todo", None, true), Ok(false));
+        assert!(toggle_target("todo", Some("sideways"), true).is_err());
+        for other in ["skills", "js", "mcp"] {
+            let error = toggle_target(other, Some("off"), true).unwrap_err();
+            assert!(error.contains(other) && error.contains("todo"), "{error}");
+        }
+    }
 
     /// mini-agent-dhq65: `/reasoning off` must never turn reasoning on.
     #[test]
