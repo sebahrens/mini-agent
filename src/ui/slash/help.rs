@@ -317,7 +317,7 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(false, "  Ctrl+R                 toggle reasoning");
     emit(false, "  Ctrl+G                 edit input in $EDITOR");
-    emit(false, "  Ctrl+H                 launch lazygit");
+    emit(false, "  Ctrl+O                 launch lazygit");
     emit(
         false,
         "  Ctrl+W/U/K             delete word/before/after cursor",
@@ -325,7 +325,10 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     emit(false, "  Ctrl+A/E/B/F           move line edge/character");
     emit(false, "  Alt+B/F/D              move word/delete next word");
     emit(false, "  Ctrl+Y / Alt+Y         yank/rotate kill ring");
-    emit(false, "  Ctrl+C / Ctrl+D        interrupt/quit");
+    emit(
+        false,
+        "  Ctrl+C / Ctrl+D        interrupt; idle: clear draft/delete, quit when empty",
+    );
     emit(false, "  mouse scroll           scroll chat");
 }
 

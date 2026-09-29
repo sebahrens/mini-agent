@@ -169,7 +169,7 @@ Here is some keybindings to speed up your coding experience:
 | ---- | ------ |
 | `Ctrl+R` | Toggle reasoning/thinking |
 | `Ctrl+G` | Open input in `$EDITOR` |
-| `Ctrl+H` | Launch `lazygit` |
+| `Ctrl+O` | Launch `lazygit` |
 | `Ctrl+C` | Interrupt the agent |
 | `Ctrl+Shift+C` | Copy selected text (Windows) |
 | `Ctrl+V` | Paste Unicode clipboard text (Windows) |

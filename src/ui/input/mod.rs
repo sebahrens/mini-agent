@@ -379,6 +379,15 @@ impl InputEditor {
         self.yank_pos = None;
     }
 
+    /// Ctrl+C on an idle draft: clear the input and close any picker, keeping
+    /// the text on the kill ring so Ctrl+Y brings it back.
+    pub fn discard_draft(&mut self) {
+        let draft = std::mem::take(&mut self.buffer);
+        self.push_kill(draft);
+        self.close_query_picker();
+        self.clear_buffer();
+    }
+
     /// Replace the input buffer with `text`, cursor at the end. Used by the
     /// rewind flow to drop the chosen user turn back into the box for editing.
     pub fn load_text(&mut self, text: &str) {

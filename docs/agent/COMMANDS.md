@@ -467,8 +467,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | -------- | ------ |
 | `Enter` | Send message. |
 | `Shift+Enter` or `Alt+Enter` | Insert newline. |
-| `Ctrl+C` | Cancel the current agent response, validation, or shell command; quit when idle. |
-| `Ctrl+D` | Same interrupt/quit behavior as `Ctrl+C`. |
+| `Ctrl+C` | Cancel the current agent response, validation, or shell command. When idle it clears a non-empty draft (Ctrl+Y brings it back) and quits on an empty input. |
+| `Ctrl+D` | Same interrupt behavior as `Ctrl+C` while something runs. When idle it deletes the character under the cursor in a non-empty draft and quits on an empty input. |
 | `Ctrl+Shift+C` | Copy selected text through the Unicode clipboard on Windows. |
 | `Ctrl+V` | Paste Unicode clipboard text at the cursor on Windows. |
 | `Ctrl+W` | Delete word backwards. |
@@ -481,7 +481,7 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | Other `Ctrl`/`Alt` letters | Ignored in the input and pickers; they never type the plain letter. With macOS Option-as-Meta enabled, Option-layer characters such as `@` on a German layout arrive as `Alt`+letter, so disable Option-as-Meta (or use the right Option key without it) to type them. |
 | `Ctrl+Y` / `Alt+Y` | Yank the last deletion / rotate the kill ring. |
 | `Ctrl+G` | Open the current input in the system editor (`$EDITOR`). |
-| `Ctrl+H` | Launch `lazygit` (git TUI) in the project directory. |
+| `Ctrl+O` | Launch `lazygit` (git TUI) in the project directory. (It was `Ctrl+H`, which many terminals send for Backspace; `Ctrl+H` is now always backspace.) |
 | `Ctrl+R` | Toggle reasoning visibility. |
 | `/` | Open the command picker at the start of the input. Typing filters it, and commands that start with the typed text rank first. Tab inserts the highlighted command. Enter runs a command typed in full and otherwise inserts the highlighted one. Up/Down or Shift+Tab move the highlight, Backspace on the bare slash removes it, and Escape closes the picker. |
 | `@<query>` | Activate the file picker when `@` starts a word (input start, or after whitespace, a newline, `(` or a quote, including a pasted trailing `@`); Tab or Enter inserts the highlighted path, a space keeps the typed text and closes the picker, Ctrl+W deletes the query, and Escape closes it. |

@@ -240,7 +240,7 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     feed.push_line(BlockStyle::Plain, "");
     feed.push_line(BlockStyle::Tool, "  Keybindings:");
     feed.push_line(BlockStyle::Plain, "    Ctrl+G     Open input in $EDITOR");
-    feed.push_line(BlockStyle::Plain, "    Ctrl+H     Launch lazygit");
+    feed.push_line(BlockStyle::Plain, "    Ctrl+O     Launch lazygit");
     feed.push_line(
         BlockStyle::Plain,
         "    /command   Command picker (Tab inserts, Enter runs)",
