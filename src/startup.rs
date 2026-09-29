@@ -698,29 +698,7 @@ impl Startup {
                 session::storage::SessionSelection::Ambiguous(sessions) => {
                     eprintln!("multiple sessions match '{}':", session_id);
                     for s in &sessions {
-                        let preview = s
-                            .messages
-                            .last()
-                            .map(|m| {
-                                let truncated: String = m.content.chars().take(40).collect();
-                                truncated
-                            })
-                            .unwrap_or_default();
-                        let time = crate::ui::events::format_time(&s.updated_at);
-                        let name_part = if s.name.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  [{}]", s.name)
-                        };
-                        eprintln!(
-                            "  {}  {}  {}msgs  {}  {}{}",
-                            crate::print::short_session_id(&s.id),
-                            time,
-                            s.messages.len(),
-                            s.model,
-                            preview,
-                            name_part
-                        );
+                        eprintln!("{}", crate::print::session_list_line(s));
                     }
                     anyhow::bail!("be more specific with the session ID prefix");
                 }

@@ -11,26 +11,7 @@ pub(crate) fn short_id(id: &str) -> String {
 }
 
 fn format_session_line(s: &crate::session::Session) -> String {
-    let last = s
-        .messages
-        .last()
-        .map(|m| format!("...{}", m.content.chars().take(30).collect::<String>()))
-        .unwrap_or_default();
-    let time = crate::ui::events::format_time(&s.updated_at);
-    let name_part = if s.name.is_empty() {
-        String::new()
-    } else {
-        format!("  [{}]", s.name)
-    };
-    format!(
-        "  {}  {}  {}msgs  {}  {}{}",
-        short_id(&s.id),
-        time,
-        s.messages.len(),
-        s.model,
-        last,
-        name_part
-    )
+    crate::print::session_list_line(s)
 }
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

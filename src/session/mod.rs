@@ -467,6 +467,9 @@ pub struct Compaction {
     pub memory_ref: Option<CompactString>,
 }
 
+/// Longest derived session title shown in `--resume` and `/sessions`.
+pub const SESSION_TITLE_CHARS: usize = 48;
+
 /// A short, stable tag for one compaction summary.
 ///
 /// The daily memory log and the session's recap carry the same summary; the
@@ -1611,6 +1614,37 @@ impl Session {
 
     pub fn update_context_window(&mut self, cw: u64) {
         self.context_window = cw;
+    }
+
+    /// A short label for session lists: the session's name when it has one,
+    /// otherwise its first user message on one line, cut to
+    /// [`SESSION_TITLE_CHARS`] characters. Empty for a session with neither.
+    ///
+    /// Deliberately derived, not generated: a title costs no model call and
+    /// needs no storage, and it names what the session was started for
+    /// (mini-agent-72jb0).
+    pub fn list_title(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return format!("[{}]", self.name.trim());
+        }
+        let Some(first) = self
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User && !m.content.trim().is_empty())
+        else {
+            return String::new();
+        };
+        let line = first
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if line.chars().count() <= SESSION_TITLE_CHARS {
+            return line;
+        }
+        let mut cut: String = line.chars().take(SESSION_TITLE_CHARS - 1).collect();
+        cut.push('…');
+        cut
     }
 
     /// The [`compaction_ref`] of the summary this session currently replays

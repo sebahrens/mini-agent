@@ -820,6 +820,34 @@ fn write_output(mut writer: impl IoWrite, output: &str) -> io::Result<()> {
     }
 }
 
+/// One session in `--resume` and `/sessions`: id, time, size and model, then
+/// its title ([`Session::list_title`]) and the tail of its last message.
+pub(crate) fn session_list_line(s: &Session) -> String {
+    let last = s
+        .messages
+        .last()
+        .map(|m| {
+            let preview = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("...{}", preview.chars().take(30).collect::<String>())
+        })
+        .unwrap_or_default();
+    let title = s.list_title();
+    let title = if title.is_empty() {
+        String::new()
+    } else {
+        format!("{title}  ")
+    };
+    format!(
+        "  {}  {}  {}msgs  {}  {}{}",
+        short_session_id(&s.id),
+        crate::ui::events::format_time(&s.updated_at),
+        s.messages.len(),
+        s.model,
+        title,
+        last,
+    )
+}
+
 pub(crate) fn print_sessions() {
     let sessions = match session::storage::find_recent_sessions(20) {
         Ok(s) => s,
@@ -833,29 +861,7 @@ pub(crate) fn print_sessions() {
     } else {
         println!("recent sessions ({}):", sessions.len());
         for s in &sessions {
-            let last = s
-                .messages
-                .last()
-                .map(|m| {
-                    let truncated: String = m.content.chars().take(30).collect();
-                    format!("...{truncated}")
-                })
-                .unwrap_or_default();
-            let time = crate::ui::events::format_time(&s.updated_at);
-            let name_col = if s.name.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", s.name)
-            };
-            println!(
-                "  {}  {}  {}msgs  {}  {}{}",
-                short_session_id(&s.id),
-                time,
-                s.messages.len(),
-                s.model,
-                last,
-                name_col
-            );
+            println!("{}", session_list_line(s));
         }
         println!();
         println!("Use --session <id-or-name> to load a session by its ID prefix or name.");
@@ -1216,6 +1222,31 @@ mod tests {
     #[test]
     fn flushing_config_output_treats_a_closed_pipe_as_success() {
         assert!(write_output(FlushBrokenPipeWriter, CHAT_HISTORY_FILE_LABEL).is_ok());
+    }
+
+    // mini-agent-72jb0: session lists lead with a title — the name, else the
+    // first user message — before the last-message preview.
+    #[test]
+    fn session_list_line_shows_a_title_before_the_preview() {
+        use crate::session::{MessageRole, SESSION_TITLE_CHARS, Session};
+        let mut session = Session::new("openai", "gpt-test", 128_000, "");
+        assert_eq!(session.list_title(), "");
+        session.add_message(MessageRole::User, "  fix the\nflaky   parser test  ");
+        session.add_message(MessageRole::Assistant, "done, the parser test passes");
+        assert_eq!(session.list_title(), "fix the flaky parser test");
+        let line = super::session_list_line(&session);
+        let title_at = line.find("fix the flaky parser test").expect(&line);
+        let preview_at = line.find("...done, the parser").expect(&line);
+        assert!(title_at < preview_at, "{line}");
+
+        let mut long = Session::new("openai", "gpt-test", 128_000, "");
+        long.add_message(MessageRole::User, &"é".repeat(200));
+        let title = long.list_title();
+        assert_eq!(title.chars().count(), SESSION_TITLE_CHARS);
+        assert!(title.ends_with('…'));
+
+        session.name = "parser".into();
+        assert_eq!(session.list_title(), "[parser]");
     }
 
     // mini-agent-4nqvb: a closed stdout must neither panic nor keep writing.
