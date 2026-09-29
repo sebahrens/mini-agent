@@ -39,5 +39,32 @@ Silent per-machine install for GPO, Intune, or SCCM:
 msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart
 ```
 
+## Code signing status
+
+The MSI and the `mini-agent.exe` it installs are **not Authenticode-signed**: the project has no
+code-signing certificate yet, and the release workflow runs no `signtool` step. Consequences:
+
+- Opening a downloaded MSI shows the SmartScreen "Windows protected your PC" dialog. Choose
+  **More info**, then **Run anyway**, only after verifying the file as described below.
+- AppLocker and WDAC (App Control for Business) publisher rules cannot pin a mini-agent signer
+  identity. Allow the package with file-hash rules for the verified MSI and `mini-agent.exe`
+  instead, and update those rules on every release. A default-deny publisher-only policy blocks the
+  installer and the binary.
+- `Get-AuthenticodeSignature` reports `NotSigned` for both files; that is expected until signing
+  exists.
+
+Verify the download before installing, silently or interactively:
+
+```powershell
+# SHA-256 must match the line in MSI_SHA256SUMS from the same release
+Get-FileHash mini-agent-windows-x64.msi -Algorithm SHA256
+Get-Content MSI_SHA256SUMS
+
+# SLSA build provenance produced by the release workflow
+gh attestation verify mini-agent-windows-x64.msi --repo sebahrens/mini-agent
+```
+
+## Release smoke
+
 The release workflow performs a real quiet per-user install, binary smoke, uninstall, and MSI
 checksum generation on `windows-latest` before the artifact can be published.

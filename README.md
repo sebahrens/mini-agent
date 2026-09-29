@@ -280,6 +280,24 @@ checksum, open the MSI for a per-user, no-admin install; it also attempts to
 side-load the bundled VSIX when VS Code is installed. Enterprise deployment
 can use `msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`.
 
+Release binaries are not code-signed yet. The Windows MSI and `mini-agent.exe` carry no
+Authenticode signature, and the macOS binaries are neither Developer ID signed nor notarized.
+Opening a browser-downloaded MSI therefore shows a SmartScreen "Windows protected your PC"
+prompt; choose **More info**, then **Run anyway**. On macOS, the shell installer's `curl`
+download is not quarantined, but a `.tar.gz` downloaded with a browser is: after extracting it,
+run `xattr -d com.apple.quarantine ./mini-agent` (or Control-click the binary in Finder and choose
+**Open** once). Verify integrity before bypassing either prompt:
+
+- compare the file's SHA-256 with the release's `SHA256SUMS` or `MSI_SHA256SUMS`
+  (`Get-FileHash mini-agent-windows-x64.msi -Algorithm SHA256` on Windows,
+  `shasum -a 256 <file>` on macOS); and
+- check its build provenance with
+  `gh attestation verify <file> --repo sebahrens/mini-agent`.
+
+Because there is no publisher certificate, AppLocker and WDAC publisher rules cannot allow
+mini-agent by signer identity. Managed fleets that enforce application control must use file-hash
+rules for the verified MSI and `mini-agent.exe`, and refresh them on every release.
+
 Or build and install the checked-out source. Do not run `cargo install mini-agent`: crates.io
 currently assigns that name to an unrelated project.
 

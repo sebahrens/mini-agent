@@ -56,6 +56,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `SECURITY.md` documents private vulnerability reporting through GitHub, supported versions,
   response targets and scope; the README and the new-issue page point security reports there, and
   `CONTRIBUTING.md` describes the build, test, documentation and beads workflow.
+- The README, Get Started guide, Windows packaging README and release guide now state that the
+  Windows MSI/exe and macOS binaries are unsigned and not notarized, explain the SmartScreen and
+  Gatekeeper prompts, show how to verify downloads with `SHA256SUMS` and `gh attestation verify`,
+  and point AppLocker/WDAC users to hash rules until code signing exists.
 
 ### Fixed
 

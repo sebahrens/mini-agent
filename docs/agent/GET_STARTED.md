@@ -28,6 +28,15 @@ bundled VSIX when VS Code is present. Managed machines can use:
 msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart
 ```
 
+Release binaries are not code-signed yet: the MSI and `mini-agent.exe` have no Authenticode
+signature, and the macOS binaries are not notarized. Windows SmartScreen therefore asks before
+opening a downloaded MSI (choose **More info**, then **Run anyway**), and macOS Gatekeeper blocks a
+browser-downloaded archive's binary until you run `xattr -d com.apple.quarantine ./mini-agent` or
+Control-click it and choose **Open**. The `curl` installer above is not affected. Before bypassing
+either prompt, check the file against `SHA256SUMS`/`MSI_SHA256SUMS` and run
+`gh attestation verify <file> --repo sebahrens/mini-agent`. Application-control policies
+(AppLocker, WDAC) cannot use publisher rules for mini-agent yet; use file-hash rules instead.
+
 For a source checkout, use:
 ```
 git clone https://github.com/sebahrens/mini-agent.git
