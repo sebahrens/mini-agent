@@ -1168,16 +1168,11 @@ mod settle_tests {
             }
         })
         .await;
-        assert!(
-            !matches!(
-                outcome,
-                RoundOutcome::Stopped {
-                    status: GoalStatus::Met,
-                    ..
-                }
-            ),
-            "{outcome:?}"
-        );
+        let completed = match &outcome {
+            RoundOutcome::Stopped { status, .. } => *status == GoalStatus::Met,
+            _ => false,
+        };
+        assert!(!completed, "{outcome:?}");
         assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
         let goal = store.snapshot().unwrap();
         assert_eq!(goal.status, GoalStatus::Active);
