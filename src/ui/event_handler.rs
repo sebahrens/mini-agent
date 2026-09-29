@@ -642,15 +642,15 @@ async fn start_goal_verification(
     // An operator who interrupts must not wait for a check, and the check must
     // actually stop: cancellation terminates the command's process group and
     // reaps it, which dropping this task's future would not.
-    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        let (checks, interrupted) = crate::extras::goal::checks::run_with_interrupt(
+        let (checks, mut interrupted) = crate::extras::goal::checks::run_with_interrupt(
             &goal,
             &request,
             &sandbox,
             &cfg,
-            async move {
-                let _ = cancelled.await;
+            async {
+                let _ = (&mut cancelled).await;
                 Ok(())
             },
         )
@@ -660,18 +660,30 @@ async fn start_goal_verification(
         // an answer nobody reads.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => Some(
-                crate::extras::goal::judge::ask_with_transcript(
-                    &goal,
-                    &request,
-                    &resolved,
-                    &client,
-                    &transcript,
-                    &cfg,
-                    checks.as_ref(),
+            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
+                // The judge is cancelled like a check: an interrupt or a
+                // `/goal pause` while it waits on its provider abandons the
+                // request rather than letting it run to an ignored verdict
+                // (mini-agent-4teup).
+                let verdict = crate::extras::goal::driver::unless_interrupted(
+                    crate::extras::goal::judge::ask_with_transcript(
+                        &goal,
+                        &request,
+                        &resolved,
+                        &client,
+                        &transcript,
+                        &cfg,
+                        checks.as_ref(),
+                    ),
+                    async {
+                        let _ = (&mut cancelled).await;
+                        Ok(())
+                    },
                 )
-                .await,
-            ),
+                .await;
+                interrupted = verdict.is_none();
+                verdict
+            }
             _ => None,
         };
         let _ = tx
@@ -697,6 +709,37 @@ async fn start_goal_verification(
         request: pending_request,
     });
     Ok(true)
+}
+
+/// Stop a goal round's verification once a goal control command (`/goal
+/// pause`) has left its goal no longer running (mini-agent-4teup).
+///
+/// The result would be set aside when it arrived anyway; cancelling now also
+/// terminates the running check's process group and abandons a judge request,
+/// instead of letting them run on for nothing. The task is left to wind down
+/// rather than aborted, because it is what reaps the check. Returns whether a
+/// verification was stopped.
+#[cfg(feature = "goal")]
+pub(crate) fn retire_goal_verification_after_control(
+    run: &mut AgentRunState,
+    session: &crate::session::Session,
+) -> bool {
+    let Some(pending) = run.pending_goal_gate.as_ref() else {
+        return false;
+    };
+    if session
+        .goal_store
+        .snapshot()
+        .is_some_and(|goal| goal_verification_still_applies(&goal, &pending.goal_id))
+    {
+        return false;
+    }
+    if let Some(pending) = run.pending_goal_gate.take() {
+        let _ = pending.cancel.send(());
+    }
+    run.main_abort = None;
+    run.is_running = false;
+    true
 }
 
 /// Whether a verification result may still settle its round.
