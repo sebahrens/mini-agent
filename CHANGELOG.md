@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Replayed sessions (`--continue`/`--resume`, double-Esc rewind, session or worktree switch, `/memory`,
+  `/init`) no longer paint stored escape sequences: user, assistant and system messages and the
+  welcome line's directory name are sanitised, and the chat feed and painter now strip control
+  sequences from all text so only the renderer's own colours and hyperlinks reach the terminal.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

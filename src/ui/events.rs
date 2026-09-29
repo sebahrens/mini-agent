@@ -60,17 +60,9 @@ pub fn render_session(
     }
     push_session_messages(feed, &session.messages, cfg);
     if session.messages.is_empty() {
-        let cwd = &context.workspace_root;
-        let cwd_str = cwd.file_name().and_then(|n| n.to_str()).unwrap_or(".");
         feed.push_line(
             BlockStyle::Welcome,
-            format!(
-                "[>] {} {} | {} | {}",
-                crate::product::PUBLIC_NAME,
-                env!("CARGO_PKG_VERSION"),
-                cli.resolve_model(cfg),
-                cwd_str,
-            ),
+            welcome_header(&cli.resolve_model(cfg), &context.workspace_root),
         );
         feed.push_line(
             BlockStyle::Welcome,
@@ -88,6 +80,22 @@ pub fn render_session(
     Ok(())
 }
 
+/// The first welcome line. The workspace directory name comes from the
+/// filesystem, so it is sanitised like any other untrusted terminal text.
+fn welcome_header(model: &str, workspace_root: &std::path::Path) -> String {
+    let cwd_str = workspace_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(".");
+    format!(
+        "[>] {} {} | {} | {}",
+        crate::product::PUBLIC_NAME,
+        env!("CARGO_PKG_VERSION"),
+        model,
+        sanitize_output(cwd_str),
+    )
+}
+
 /// Replay stored messages into the feed. A tool result is placed directly
 /// under its own call (matched by tool-call id), as the live view does, so a
 /// response that issued several calls before any result replays as
@@ -100,16 +108,18 @@ pub(crate) fn push_session_messages(
 ) {
     for msg in messages {
         match msg.role {
+            // Stored text is raw (the live view sanitised only what it
+            // painted), so every role is sanitised again on replay.
             MessageRole::User => {
-                for line in msg.content.lines() {
+                for line in sanitize_output(&msg.content).lines() {
                     feed.push_line(BlockStyle::User, format!("> {}", line));
                 }
             }
             MessageRole::Assistant => {
-                feed.push_block(BlockStyle::Agent, msg.content.to_string());
+                feed.push_block(BlockStyle::Agent, sanitize_output(&msg.content).to_string());
             }
             MessageRole::System => {
-                for line in msg.content.lines() {
+                for line in sanitize_output(&msg.content).lines() {
                     feed.push_line(BlockStyle::System, format!("# {}", line));
                 }
             }
@@ -550,6 +560,53 @@ mod replay_tests {
                 .any(|row| row.contains("Ctrl+O") && row.contains("lazygit")),
             "{rows:?}"
         );
+    }
+
+    /// True when `text` carries a byte that could start or end a terminal
+    /// control sequence.
+    fn has_terminal_control(text: &str) -> bool {
+        text.chars()
+            .any(|c| matches!(c, '\x1b' | '\u{9b}' | '\u{9d}' | '\x07'))
+    }
+
+    /// mini-agent-q60fh: stored user, assistant and system text is replayed
+    /// (on --continue, rewind, session switch, ...) without the escape
+    /// sequences the live view stripped, so an OSC 52 clipboard write or a
+    /// screen clear in a stored message never reaches the terminal.
+    #[test]
+    fn replay_strips_terminal_control_sequences_from_every_role() {
+        use crate::session::MessageRole;
+        let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+        session.add_shell_interaction("!cat x", "a\x1b]52;c;SGk=\x07b");
+        session.add_message(MessageRole::User, "u\u{9b}2Jv\u{9d}0;title\x07w");
+        session.add_message(MessageRole::Assistant, "x\x1b[2Jy\x1b[Hz");
+        session.add_message(MessageRole::System, "s\x1b]0;pwned\x07t\x1b[31mred");
+        let mut feed = Feed::new();
+        push_session_messages(&mut feed, &session.messages, &Config::default());
+
+        let rows = texts(&feed);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(!has_terminal_control(row), "control byte in {row:?}");
+        }
+        let joined = rows.join("\n");
+        for visible in ["ab", "uvw", "xyz", "st", "red"] {
+            assert!(joined.contains(visible), "{visible} missing: {rows:?}");
+        }
+        assert!(!joined.contains("SGk="), "OSC payload leaked: {rows:?}");
+        assert!(!joined.contains("pwned"), "OSC payload leaked: {rows:?}");
+    }
+
+    /// mini-agent-q60fh: the welcome line names the workspace directory,
+    /// whose name is attacker-influenced; it must not carry escapes.
+    #[test]
+    fn welcome_header_strips_control_sequences_from_the_directory_name() {
+        let header = super::welcome_header(
+            "model",
+            std::path::Path::new("/tmp/evil\x1b]52;c;SGk=\x07dir"),
+        );
+        assert!(!has_terminal_control(&header), "{header:?}");
+        assert!(header.ends_with("evildir"), "{header:?}");
     }
 
     /// Results without an id (legacy sessions) keep their stored order.
