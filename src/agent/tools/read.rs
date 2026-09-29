@@ -188,17 +188,12 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
-        let workspace_root =
-            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
-        let requested =
-            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), &args.path);
+        crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
+        let requested = target.requested;
         let path = requested.to_string_lossy().into_owned();
-        let relative = Path::new(&args.path);
-        let bound_workspace = if !relative.is_absolute() && !args.path.starts_with('~') {
-            self.workspace.as_ref()
-        } else {
-            None
-        };
+        let relative = target.bound_relative.as_deref().unwrap_or(Path::new(""));
+        let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         let capability_file = bound_workspace
             .map(|workspace| workspace.open_relative(relative))
             .transpose()?;

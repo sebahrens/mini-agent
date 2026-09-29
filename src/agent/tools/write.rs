@@ -179,10 +179,9 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        let workspace_root =
-            crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
-        let requested =
-            crate::agent::tools::resolve_tool_path(workspace_root.as_deref(), &args.path);
+        crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
+        let target = crate::agent::tools::resolve_tool_target(self.workspace.as_ref(), &args.path);
+        let requested = target.requested;
         let expanded = requested.to_string_lossy().into_owned();
         tracing::debug!(
             "tool write start: path={}, content_len={}",
@@ -202,9 +201,7 @@ impl Tool for WriteTool {
                 bytes, self.max_text_file_size
             )));
         }
-        let relative = Path::new(&args.path);
-        if !relative.is_absolute()
-            && !args.path.starts_with('~')
+        if let Some(relative) = target.bound_relative.as_deref()
             && let Some(workspace) = &self.workspace
         {
             let coaching =
