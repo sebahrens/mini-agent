@@ -4,7 +4,7 @@ package:
 
 source:
   url: https://github.com/sebahrens/mini-agent/releases/download/v1.9.4/mini-agent-v1.9.4-source.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: 38a4e39e37c42cf29c8618589f0bb08fd0a350bea75cda1bcdb2eb565bd37f1c
 
 build:
   number: 0
