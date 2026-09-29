@@ -734,12 +734,51 @@ pub(crate) fn rebind_worktree_workspace(
     }
 
     session.working_dir = compact_str::CompactString::new(replacement.root().to_string_lossy());
+    #[cfg(feature = "goal")]
+    move_goal_plan_to_workspace(
+        &session.goal_store,
+        active_workspace.root(),
+        replacement.root(),
+    );
     context.reload_from_binding(no_context_files, &replacement);
     #[cfg(feature = "hooks")]
     crate::extras::hooks::set_active_workspace(replacement.root());
     *sandbox = replacement_sandbox;
     *active_workspace = replacement;
     Ok(())
+}
+
+/// Point a running `/loop`'s plan at the workspace the session just moved to
+/// (mini-agent-mw7ae).
+///
+/// A plan the new workspace does not have yet is carried over, so the loop
+/// keeps its state rather than starting the next round without a plan; one the
+/// new workspace already has is used as it is. A copy that fails is logged and
+/// the loop reads whatever the new workspace holds.
+#[cfg(all(feature = "goal", feature = "git-worktree"))]
+pub(crate) fn move_goal_plan_to_workspace(
+    store: &crate::extras::goal::GoalStore,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) {
+    let Some(Some((previous, rebased))) = store.with_mut(|goal| goal.rebase_context_file(from, to))
+    else {
+        return;
+    };
+    if previous.is_file() && !rebased.exists() {
+        let copied = rebased
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::copy(&previous, &rebased).map(drop));
+        if let Err(error) = copied {
+            tracing::warn!(
+                %error,
+                from = %previous.display(),
+                to = %rebased.display(),
+                "goal: could not carry the loop plan into the new workspace"
+            );
+        }
+    }
 }
 
 pub(crate) fn git_stash_in_workspace(
@@ -1636,5 +1675,47 @@ mod paste_followup_tests {
         assert!(event_counts_as_paste_followup(&event::Event::Key(
             crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
         )));
+    }
+}
+
+#[cfg(all(test, feature = "goal", feature = "git-worktree"))]
+mod goal_plan_workspace_tests {
+    use super::*;
+
+    /// `/loop` then `/worktree`: later rounds read the new workspace's plan,
+    /// which is seeded from the original when it has none, and an existing
+    /// plan there is never overwritten (mini-agent-mw7ae).
+    #[test]
+    fn a_running_loop_reads_the_plan_of_the_workspace_it_moved_to() {
+        let root = std::env::temp_dir().join(format!("mini-agent-mw7ae-{}", uuid::Uuid::new_v4()));
+        let original = root.join("repo");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(original.join("LOOP_PLAN.md"), "- [x] step one\n").unwrap();
+
+        let store = crate::extras::goal::GoalStore::default();
+        let mut goal = crate::extras::goal::Goal::new("iterate", Vec::new()).unwrap();
+        goal.context_file = Some(original.join("LOOP_PLAN.md"));
+        store.set(goal, false).unwrap();
+
+        move_goal_plan_to_workspace(&store, &original, &linked);
+        let plan = linked.join("LOOP_PLAN.md");
+        assert_eq!(store.snapshot().unwrap().context_file, Some(plan.clone()));
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "- [x] step one\n");
+        let prompt = crate::extras::goal::driver::first_round_prompt(&store.snapshot().unwrap());
+        assert!(prompt.contains(&plan.display().to_string()), "{prompt}");
+
+        // The agent edits the new workspace's plan; moving back and forth
+        // again never overwrites a plan the destination already has.
+        std::fs::write(&plan, "- [x] step two\n").unwrap();
+        move_goal_plan_to_workspace(&store, &linked, &original);
+        assert_eq!(
+            std::fs::read_to_string(original.join("LOOP_PLAN.md")).unwrap(),
+            "- [x] step one\n"
+        );
+        move_goal_plan_to_workspace(&store, &original, &linked);
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "- [x] step two\n");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

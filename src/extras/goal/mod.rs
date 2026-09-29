@@ -788,6 +788,28 @@ impl Goal {
         self.set_status(GoalStatus::Active, None)
     }
 
+    /// Re-resolve a plan file that lives in the workspace `from` against the
+    /// workspace `to`, when the session moves (`/worktree` and back).
+    ///
+    /// The plan is stored as an absolute path resolved when the loop started,
+    /// so without this every later round would re-read the original
+    /// checkout's plan while the agent edits the new workspace's
+    /// (mini-agent-mw7ae). A plan outside `from` was named explicitly and is
+    /// left alone. Returns the old and new paths when the plan moved.
+    pub fn rebase_context_file(
+        &mut self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let current = self.context_file.as_ref()?;
+        let rebased = to.join(current.strip_prefix(from).ok()?);
+        if rebased == *current {
+            return None;
+        }
+        let previous = self.context_file.replace(rebased.clone())?;
+        Some((previous, rebased))
+    }
+
     /// Reopen a goal that was declared impossible.
     pub fn reopen(&mut self) -> bool {
         if self.status != GoalStatus::Impossible {
@@ -1127,6 +1149,36 @@ mod tests {
 
     fn goal() -> Goal {
         Goal::new("ship the feature", vec!["tests pass".into()]).expect("valid goal")
+    }
+
+    /// A loop's plan follows the session into a new workspace; a plan named
+    /// outside the old workspace stays where it is (mini-agent-mw7ae).
+    #[test]
+    fn a_workspace_plan_is_rebased_onto_the_new_workspace() {
+        let from = std::path::Path::new("/repo");
+        let to = std::path::Path::new("/repo-linked/feature");
+        let mut g = goal();
+        assert_eq!(g.rebase_context_file(from, to), None, "no plan, no move");
+
+        g.context_file = Some(from.join("plans/LOOP_PLAN.md"));
+        assert_eq!(
+            g.rebase_context_file(from, to),
+            Some((
+                from.join("plans/LOOP_PLAN.md"),
+                to.join("plans/LOOP_PLAN.md")
+            ))
+        );
+        assert_eq!(g.context_file, Some(to.join("plans/LOOP_PLAN.md")));
+        // And back again when the session leaves the linked checkout.
+        assert!(g.rebase_context_file(to, from).is_some());
+        assert_eq!(g.context_file, Some(from.join("plans/LOOP_PLAN.md")));
+
+        g.context_file = Some(std::path::PathBuf::from("/elsewhere/PLAN.md"));
+        assert_eq!(g.rebase_context_file(from, to), None);
+        assert_eq!(
+            g.context_file,
+            Some(std::path::PathBuf::from("/elsewhere/PLAN.md"))
+        );
     }
 
     #[test]

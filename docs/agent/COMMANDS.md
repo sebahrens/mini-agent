@@ -260,8 +260,11 @@ model's update instructions (default: `LOOP_PLAN.md`). When that file exists,
 startup asks whether to resume if stdin is a terminal; unattended runs resume
 automatically without reading stdin. To start fresh unattended, remove the plan
 before launching or select a new path. `/loop` uses `LOOP_PLAN.md` in the
-current workspace (the worktree, after `/worktree`), resolved when the loop
-starts. Each iteration re-reads the plan and shows at most its first 32 KiB, so
+current workspace (the worktree, after `/worktree`). A loop that is already
+running follows the session when `/worktree` switches workspace (in either
+direction): later iterations read the new workspace's `LOOP_PLAN.md`, which is
+seeded with a copy of the current plan when the new workspace has none; an
+existing plan there is used as it is. Each iteration re-reads the plan and shows at most its first 32 KiB, so
 a plan that keeps growing cannot overflow the context.
 
 The optional `--loop-run <command>` validator uses the selected process sandbox
