@@ -1252,6 +1252,7 @@ Available items:
 | `compaction`          | Number of compactions (`cmp:<n>`). |
 | `btw`                 | `/btw` side-question token/cost usage. |
 | `reasoning`           | Shows `reasoning` when reasoning is enabled (hidden when off). |
+| `reasoning_effort`    | Configured `[reasoning] effort` (`effort:<level>`; hidden when unset). The built-in default layout shows it after the model. |
 | `message_count`       | Number of messages in the session. |
 | `session_age`         | Time since the session was created (e.g. `5m`, `2h10m`). |
 | `session_updated`     | Time since the last message (same format). |

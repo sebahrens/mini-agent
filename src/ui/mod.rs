@@ -226,6 +226,12 @@ pub(crate) fn refresh_display(
         #[cfg(not(feature = "goal"))]
         goal_label: None,
         prompt_name: ui.context.current_prompt_name.as_deref(),
+        reasoning_effort: ui
+            .cfg
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort)
+            .map(|effort| effort.as_wire_str()),
         perm_mode: perm_mode.as_deref(),
         chain_label: chain.label_msg.as_deref(),
         background_jobs: ui.sandbox.running_background_job_count(),

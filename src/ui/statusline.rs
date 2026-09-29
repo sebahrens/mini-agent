@@ -38,6 +38,8 @@ pub struct StatusContext<'a> {
     /// not simply running.
     pub goal_label: Option<&'a str>,
     pub prompt_name: Option<&'a str>,
+    /// Configured `[reasoning] effort` (wire spelling), if any.
+    pub reasoning_effort: Option<&'a str>,
     pub perm_mode: Option<&'a str>,
     pub chain_label: Option<&'a str>,
     pub background_jobs: usize,
@@ -120,7 +122,9 @@ pub fn cache_key(session: &Session, ctx: &StatusContext) -> u64 {
     session.reasoning_enabled.hash(&mut state);
     ctx.workspace.hash(&mut state);
     ctx.loop_label.hash(&mut state);
+    ctx.goal_label.hash(&mut state);
     ctx.prompt_name.hash(&mut state);
+    ctx.reasoning_effort.hash(&mut state);
     ctx.perm_mode.hash(&mut state);
     ctx.chain_label.hash(&mut state);
     ctx.background_jobs.hash(&mut state);
@@ -326,6 +330,9 @@ fn resolve_item(
             .ok()
             .filter(|u| !u.is_empty()),
         "reasoning" => session.reasoning_enabled.then(|| "reasoning".to_string()),
+        "reasoning_effort" => ctx
+            .reasoning_effort
+            .map(|effort| format!("effort:{effort}")),
         "tokens_input" => (session.total_input_tokens > 0 || always)
             .then(|| fmt_tokens(session.total_input_tokens)),
         "tokens_output" => (session.total_output_tokens > 0 || always)
@@ -624,6 +631,8 @@ pub fn default_spec() -> StatusLineConfig {
         },
         sep(" | "),
         seg("model", Some("dark_grey")),
+        sep(" "),
+        seg("reasoning_effort", Some("dark_grey")),
         sep("  |  "),
         seg("context_used", Some("dark_grey")),
         sep("/"),
