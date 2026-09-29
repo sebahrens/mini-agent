@@ -999,12 +999,14 @@ impl PermissionChecker {
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         for (allowed_tool, pattern) in &self.session_allowlist {
-            let matches = if tool == "shell" {
-                pattern.original == input
-            } else if is_path_tool_name(tool) {
+            // Only path tools receive generated scope patterns. Every other
+            // AllowAlways key (shell scripts, `git/commit` messages, `js/fetch`
+            // URLs, MCP operations) is a literal the model controls, so a `*`
+            // or `?` inside it must never widen the grant.
+            let matches = if is_path_tool_name(tool) {
                 pattern.matches_path(input)
             } else {
-                pattern.matches(input)
+                pattern.original == input
             };
             if allowed_tool == tool && matches {
                 return true;
@@ -2769,6 +2771,50 @@ mod case_insensitive_deny_tests {
         assert_eq!(
             checker.check_path("read", "README.md"),
             CheckResult::Allowed
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(test)]
+mod exact_session_key_tests {
+    use super::*;
+
+    #[test]
+    fn allow_always_on_non_path_tools_grants_only_the_exact_key() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_exact_session_key_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::default(),
+            SecurityMode::Guarded,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        checker.add_session_allowlist("git/commit".into(), "fix *");
+        checker.add_session_allowlist("js/fetch".into(), "https://example.com/?q=*");
+        checker
+            .load_session_allowlist(&[("mcp_tool".to_string(), "mcp_tool:server:*".to_string())]);
+
+        assert_eq!(checker.check("git/commit", "fix *"), CheckResult::Allowed);
+        assert_eq!(
+            checker.check("git/commit", "fix everything"),
+            CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check("js/fetch", "https://example.com/?q=*"),
+            CheckResult::Allowed
+        );
+        assert_eq!(
+            checker.check("js/fetch", "https://example.com/?q=1&exfil=secret"),
+            CheckResult::Ask
+        );
+        assert_eq!(
+            checker.check("mcp_tool", "mcp_tool:server:delete_all"),
+            CheckResult::Ask
         );
         let _ = std::fs::remove_dir_all(workspace);
     }

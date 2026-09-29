@@ -1465,7 +1465,9 @@ default action (`"*"`), the glob default takes precedence.
 When a rule resolves to `ask`, the TUI shows the request and these keys:
 
 - `y` allows this one call.
-- `a` allows the suggested scope (a path tree, or the exact shell script) for
+- `a` allows the suggested scope (a path tree for file tools; otherwise the
+  exact shell script, commit message, URL, or MCP operation, compared
+  literally so `*` or `?` inside it never widens the grant) for
   the rest of this session. It is recorded with the session for `--resume`
   but never written to the config.
 - `f` (only for `read`, `edit`, and `list_dir` requests) allows `read`,
