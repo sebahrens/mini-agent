@@ -850,7 +850,8 @@ impl InputEditor {
                 self.buffer.clear();
                 self.cursor = 0;
                 self.yank_pos = None;
-                if text.is_empty() { None } else { Some(text) }
+                // Whitespace-only input (e.g. Tab's two spaces) is not sent.
+                if is_blank { None } else { Some(text) }
             }
             KeyCode::Char(c)
                 if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>

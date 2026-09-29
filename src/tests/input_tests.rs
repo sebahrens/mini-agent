@@ -138,6 +138,19 @@ fn clipboard_paste_payload_is_inserted_once_at_the_cursor() {
     assert_eq!(editor.cursor, "a☃\nline".len());
 }
 
+#[test]
+fn enter_on_whitespace_only_input_submits_nothing() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Tab));
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    assert_eq!(editor.buffer.as_str(), "  \n");
+    assert_eq!(editor.handle_key(press(KeyCode::Enter)), None);
+    assert_eq!(editor.buffer.as_str(), "");
+    // Nothing blank lands in history either.
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
 // --- bracketed paste sanitizing (mini-agent-el3xe) ---
 
 #[test]

@@ -541,6 +541,10 @@ pub(crate) fn rewind_targets(session: &Session) -> Vec<(usize, String)> {
 }
 
 pub(crate) fn classify_submission(is_running: bool, text: &str) -> SubmitAction {
+    // Whitespace-only input is never a prompt: providers reject it.
+    if text.trim().is_empty() {
+        return SubmitAction::Ignore;
+    }
     // Idle, or a whitelisted parallel-safe command → let it through to its
     // handler. Everything else, while running, is gated.
     if !is_running || allowed_while_running(text) {
