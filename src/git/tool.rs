@@ -533,12 +533,11 @@ impl GitTool {
                 command.push("--".into());
                 command.extend(paths);
                 let output = self.run("log", command, TEXT_LIMITS, true).await?;
-                let truncated = matches!(output.status, CommandStatus::OutputLimitExceeded(_));
-                let commits = parse_log_records(&output.stdout, truncated)?;
+                let commits = parse_log_records(&output.stdout)?;
                 Ok(serde_json::json!({
                     "operation": "log",
                     "commits": commits,
-                    "truncated": truncated,
+                    "truncated": matches!(output.status, CommandStatus::OutputLimitExceeded(_)),
                     "coaching": coaching,
                 }))
             }
@@ -585,16 +584,12 @@ impl GitTool {
 const LOG_FORMAT: &str = "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e";
 const LOG_FIELD_COUNT: usize = 6;
 
-fn parse_log_records(stdout: &[u8], truncated: bool) -> Result<Vec<serde_json::Value>, ToolError> {
+fn parse_log_records(stdout: &[u8]) -> Result<Vec<serde_json::Value>, ToolError> {
     let mut records = stdout.split(|byte| *byte == 0x1e).collect::<Vec<_>>();
     // What follows the final terminator is only the trailing newline for
-    // complete output, or a partial record when the output limit cut it off.
-    let tail = records.pop().unwrap_or_default();
-    if !truncated && !tail.iter().all(u8::is_ascii_whitespace) {
-        return Err(ToolError::Msg(
-            "git log output had an unterminated record".to_string(),
-        ));
-    }
+    // complete output, or a partial record when the output limit cut it off
+    // (reported separately as `truncated`). Only terminated records count.
+    records.pop();
     records
         .into_iter()
         .map(|record| {
@@ -1040,18 +1035,18 @@ mod tests {
     }
 
     #[test]
-    fn log_parser_drops_a_partial_record_only_when_output_was_truncated() {
+    fn log_parser_returns_only_terminated_records() {
         let complete = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n\0e\0t\0s2\x1e\n";
         let partial = b"a\0\0n\0e\0t\0s1\x1e\nb\0a\0n";
-        let parsed = super::parse_log_records(complete, false).expect("complete output");
+        let parsed = super::parse_log_records(complete).expect("complete output");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1]["id"], "b");
         assert_eq!(parsed[1]["parents"], "a");
-        let parsed = super::parse_log_records(partial, true).expect("truncated output");
+        let parsed = super::parse_log_records(partial).expect("truncated output");
         assert_eq!(parsed.len(), 1);
-        assert!(super::parse_log_records(partial, false).is_err());
+        assert!(super::parse_log_records(b"a\0b\x1e\n").is_err());
         assert!(
-            super::parse_log_records(b"", false)
+            super::parse_log_records(b"")
                 .expect("empty history")
                 .is_empty()
         );
