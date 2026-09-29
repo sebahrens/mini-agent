@@ -131,6 +131,35 @@ impl WorkspaceBinding {
         open_file_no_follow(&parent, &name)
     }
 
+    /// Return the workspace-relative prefix of `path` whose final component is
+    /// a symbolic link (or Windows reparse point), if any.
+    ///
+    /// Bound-workspace opens deliberately refuse to follow links, so callers
+    /// use this after a failed open to explain the refusal instead of
+    /// surfacing a raw `ELOOP`/`ENOTDIR`. Lookup is diagnostic only: it walks
+    /// the retained capability without following links and never grants
+    /// access.
+    pub(crate) fn symlink_component(&self, path: &Path) -> Option<PathBuf> {
+        let path = self.normalize_relative(path).ok()?;
+        let mut directory = open_dir_no_follow(&self.capability, OsStr::new(".")).ok()?;
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            let std::path::Component::Normal(name) = component else {
+                continue;
+            };
+            prefix.push(name);
+            let metadata = directory.symlink_metadata(name).ok()?;
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                return Some(prefix);
+            }
+            if !metadata.is_dir() {
+                return None;
+            }
+            directory = open_dir_no_follow(&directory, name).ok()?;
+        }
+        None
+    }
+
     pub(crate) fn open_dir_relative(&self, path: &Path) -> io::Result<cap_std::fs::Dir> {
         let path = self.normalize_relative(path)?;
         self.open_directory_path(&path, false)
@@ -732,6 +761,18 @@ fn open_dir_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result<
         ));
     }
     Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(windows)]
