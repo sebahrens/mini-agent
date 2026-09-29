@@ -2103,6 +2103,10 @@ async fn execute_prompt(
         refreshed.refresh_memory_if_changed(None).await;
         Arc::new(refreshed)
     };
+    // The provider this turn's usage is reported by, so a goal's token total
+    // is normalised the same way as the TUI's and headless rounds'.
+    #[cfg(feature = "goal")]
+    let usage_provider = acp_provider_and_model(&state.cli, &state.cfg).0;
     #[cfg(test)]
     if let Some(fixture) = &state.runner_fixture {
         let prior_history = history
@@ -2114,7 +2118,15 @@ async fn execute_prompt(
             }
             runner = fixture(prompt_text.to_owned(), prior_history.clone()) => runner,
         };
-        return Ok(relay_paused_runner(session_id, cx, control, paused_runner).await);
+        return Ok(relay_paused_runner(
+            session_id,
+            cx,
+            control,
+            paused_runner,
+            #[cfg(feature = "goal")]
+            (&state.cfg, &usage_provider),
+        )
+        .await);
     }
 
     #[cfg(test)]
@@ -2141,7 +2153,15 @@ async fn execute_prompt(
             })?;
         }
         drop(event_tx);
-        return Ok(relay_prompt_events(session_id, cx, control, event_rx).await);
+        return Ok(relay_prompt_events(
+            session_id,
+            cx,
+            control,
+            event_rx,
+            #[cfg(feature = "goal")]
+            (&state.cfg, &usage_provider),
+        )
+        .await);
     }
 
     let workspace_root = workspace.root();
@@ -2303,7 +2323,15 @@ async fn execute_prompt(
     else {
         return Ok(PromptOutcome::cancelled(None));
     };
-    Ok(relay_paused_runner(session_id, cx, control, paused_runner).await)
+    Ok(relay_paused_runner(
+        session_id,
+        cx,
+        control,
+        paused_runner,
+        #[cfg(feature = "goal")]
+        (&state.cfg, &usage_provider),
+    )
+    .await)
 }
 
 #[cfg(feature = "mcp")]
@@ -2357,13 +2385,41 @@ async fn relay_paused_runner(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     paused_runner: crate::agent::runner::PausedAgentRunner,
+    #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     let attached = control.attach_runner(paused_runner.cancellation_handle());
     let mut runner = paused_runner.start();
     if !attached {
         return cancelled_after_runner(&mut runner.event_rx).await;
     }
-    relay_prompt_events(session_id, cx, control, runner.event_rx).await
+    relay_prompt_events(
+        session_id,
+        cx,
+        control,
+        runner.event_rx,
+        #[cfg(feature = "goal")]
+        usage_provider,
+    )
+    .await
+}
+
+/// Add one usage report to an ACP goal round's token total, normalised for
+/// `provider` exactly once (Gemini reports thinking tokens beside output), so
+/// the goal's `max_tokens` bound counts what the TUI and headless rounds count
+/// (mini-agent-da4my).
+#[cfg(feature = "goal")]
+fn add_goal_usage(
+    total: &mut rig::completion::Usage,
+    cfg: &Config,
+    provider: &str,
+    delta: crate::event::UsageDelta,
+) {
+    let delta = cfg.normalize_usage(provider, delta);
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.total_tokens = total
+        .total_tokens
+        .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
 }
 
 async fn relay_prompt_events(
@@ -2371,6 +2427,7 @@ async fn relay_prompt_events(
     cx: ConnectionTo<Client>,
     control: Arc<TurnControl>,
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    #[cfg(feature = "goal")] usage_provider: (&Config, &str),
 ) -> PromptOutcome {
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
@@ -2514,13 +2571,7 @@ async fn relay_prompt_events(
                 // enforced from this total, so it is accumulated rather than
                 // dropped.
                 #[cfg(feature = "goal")]
-                {
-                    usage.input_tokens = usage.input_tokens.saturating_add(delta.input_tokens);
-                    usage.output_tokens = usage.output_tokens.saturating_add(delta.output_tokens);
-                    usage.total_tokens = usage
-                        .total_tokens
-                        .saturating_add(delta.input_tokens.saturating_add(delta.output_tokens));
-                }
+                add_goal_usage(&mut usage, usage_provider.0, usage_provider.1, delta);
                 #[cfg(not(feature = "goal"))]
                 let _ = delta;
             }
@@ -6760,5 +6811,41 @@ mod goal_acp_tests {
                 .unwrap_or_default()
                 .contains("already done")
         );
+    }
+}
+
+#[cfg(all(test, feature = "goal"))]
+mod goal_usage_tests {
+    use super::*;
+
+    fn report(output_tokens: u64, reasoning_tokens: u64) -> crate::event::UsageDelta {
+        crate::event::UsageDelta {
+            input_tokens: 100,
+            output_tokens,
+            total_tokens: 100 + output_tokens + reasoning_tokens,
+            reasoning_tokens,
+            ..crate::event::UsageDelta::default()
+        }
+    }
+
+    #[test]
+    fn acp_goal_usage_folds_gemini_thinking_tokens_into_output() {
+        let cfg = Config::default();
+        let mut total = rig::completion::Usage::default();
+        add_goal_usage(&mut total, &cfg, "gemini", report(20, 30));
+        add_goal_usage(&mut total, &cfg, "gemini", report(5, 0));
+        assert_eq!(total.input_tokens, 200);
+        assert_eq!(total.output_tokens, 55);
+        assert_eq!(total.total_tokens, 255);
+    }
+
+    #[test]
+    fn acp_goal_usage_does_not_double_count_inclusive_reasoning() {
+        let cfg = Config::default();
+        let mut total = rig::completion::Usage::default();
+        // OpenAI already includes reasoning in output_tokens.
+        add_goal_usage(&mut total, &cfg, "openai", report(50, 30));
+        assert_eq!(total.output_tokens, 50);
+        assert_eq!(total.total_tokens, 150);
     }
 }

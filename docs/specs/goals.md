@@ -216,7 +216,9 @@ terminal around its own prompt, an editor by subtracting what the client spent d
 headless run by the round's wall clock, since nothing there can prompt.
 
 `max_tokens` and the goal's token total count the whole round: the agent's usage, including any
-mid-round reminder it was sent, plus the judge call that adjudicated it. A judge is counted in input
+mid-round reminder it was sent, plus the judge call that adjudicated it. The agent's usage is
+normalised once per provider report on every surface (terminal, headless and editor alike), so a
+provider that reports reasoning tokens beside its output (Gemini) has them counted as output. A judge is counted in input
 plus output tokens as its provider reported them for the call that returned an answer, parseable or
 not, on whichever provider it runs. A call that failed, was interrupted, or was retried away before a
 final response reported nothing and adds nothing. Tokens, not cost, are what the bound measures, so a
