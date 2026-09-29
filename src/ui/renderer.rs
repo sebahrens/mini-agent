@@ -46,6 +46,9 @@ pub struct LineEntry {
 pub struct PermissionPrompt {
     pub tool: CompactString,
     pub options: CompactString,
+    /// Whether `e` expanded the prompt to show as much of the request as
+    /// the screen allows instead of the compact summary.
+    pub expanded: bool,
 }
 
 pub struct ChainPrompt {
@@ -76,6 +79,7 @@ pub(crate) enum PromptSnapshot {
     Permission {
         tool: CompactString,
         options: CompactString,
+        expanded: bool,
     },
     Chain {
         question: CompactString,
@@ -252,6 +256,62 @@ pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) 
 /// disappears.
 pub(crate) fn prompt_max_rows(available_rows: usize) -> usize {
     (available_rows * 2 / 5).clamp(2, 12)
+}
+
+/// Most rows an expanded permission prompt may take: everything above the
+/// status line except one transcript row.
+pub(crate) fn expanded_prompt_max_rows(available_rows: usize) -> usize {
+    available_rows.saturating_sub(1).max(2)
+}
+
+/// Options hint of a permission prompt whose request was shortened.
+pub(crate) const PROMPT_EXPAND_HINT: &str = "(e) show full request";
+/// Options hint of an expanded permission prompt.
+pub(crate) const PROMPT_COLLAPSE_HINT: &str = "(e) collapse";
+
+/// Lay out a permission prompt in a bottom area of `available_rows` rows.
+/// Collapsed, it is the compact [`prompt_block_rows`] layout, and when that
+/// had to shorten the request the options gain an `(e)` hint to expand it.
+/// Expanded, the request gets every row but one of the area, so a long
+/// path wraps in full and a script shows as many lines as fit.
+pub(crate) fn permission_prompt_rows(
+    header: &str,
+    options: &str,
+    width: usize,
+    available_rows: usize,
+    expanded: bool,
+) -> Vec<String> {
+    if expanded {
+        let options = format!("{options}  {PROMPT_COLLAPSE_HINT}");
+        return prompt_block_rows(
+            header,
+            &options,
+            width,
+            expanded_prompt_max_rows(available_rows),
+        );
+    }
+    let max_rows = prompt_max_rows(available_rows);
+    let rows = prompt_block_rows(header, options, width, max_rows);
+    if !prompt_header_shortened(header, options, width, &rows) {
+        return rows;
+    }
+    let options = format!("{options}  {PROMPT_EXPAND_HINT}");
+    prompt_block_rows(header, &options, width, max_rows)
+}
+
+/// Whether the header rows of a [`prompt_block_rows`] layout differ from
+/// the full request wrapped to `width` (lines hidden or a path elided).
+fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[String]) -> bool {
+    use crate::ui::utils::wrap_to_width;
+    let width = width.max(1);
+    let header = crate::ui::events::sanitize_output(header);
+    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
+    let option_rows = wrap_to_width(&options, width).len().min(rows.len());
+    let full: Vec<String> = header
+        .split('\n')
+        .flat_map(|line| wrap_to_width(line, width))
+        .collect();
+    rows[..rows.len() - option_rows] != full[..]
 }
 
 /// Lay out a permission (or chain) prompt as terminal rows: the sanitized
@@ -717,23 +777,28 @@ impl Renderer {
     /// Rows of the active permission or chain prompt laid out for a
     /// `cols` x `rows` terminal, or `None` when the input editor is shown.
     fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<Vec<String>> {
-        let (header, options) = if let Some(pp) = &self.permission_prompt {
-            (pp.tool.as_str(), pp.options.as_str())
-        } else if let Some(cp) = &self.chain_prompt {
-            (cp.question.as_str(), self.chain_options())
-        } else {
-            return None;
-        };
         let available = rows.saturating_sub(self.statusline_reserve()) as usize;
         // One column short of the edge: a full-width row leaves the terminal
         // in its pending-wrap state, where clearing to end of line misbehaves.
         let width = (cols as usize).saturating_sub(1).max(1);
-        Some(prompt_block_rows(
-            header,
-            options,
-            width,
-            prompt_max_rows(available),
-        ))
+        if let Some(pp) = &self.permission_prompt {
+            Some(permission_prompt_rows(
+                &pp.tool,
+                &pp.options,
+                width,
+                available,
+                pp.expanded,
+            ))
+        } else {
+            self.chain_prompt.as_ref().map(|cp| {
+                prompt_block_rows(
+                    &cp.question,
+                    self.chain_options(),
+                    width,
+                    prompt_max_rows(available),
+                )
+            })
+        }
     }
 
     /// Recompute the input height and reconcile `prev_input_height` before the
@@ -1346,6 +1411,7 @@ impl Renderer {
             PromptSnapshot::Permission {
                 tool: pp.tool.clone(),
                 options: pp.options.clone(),
+                expanded: pp.expanded,
             }
         } else if let Some(ref cp) = self.chain_prompt {
             PromptSnapshot::Chain {

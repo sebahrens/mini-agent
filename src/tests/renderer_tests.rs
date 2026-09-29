@@ -953,7 +953,10 @@ fn history_above_the_view_is_always_signalled() {
 }
 
 mod permission_prompt_layout_tests {
-    use crate::ui::renderer::{prompt_block_rows, prompt_max_rows};
+    use crate::ui::renderer::{
+        PROMPT_COLLAPSE_HINT, PROMPT_EXPAND_HINT, expanded_prompt_max_rows, permission_prompt_rows,
+        prompt_block_rows, prompt_max_rows,
+    };
     use crate::ui::utils::display_width;
 
     const OPTIONS: &str = "  (y) allow once  (n) deny";
@@ -1009,6 +1012,56 @@ mod permission_prompt_layout_tests {
     fn a_short_request_keeps_the_classic_two_rows() {
         let rows = prompt_block_rows("[permission] read: /a.rs", OPTIONS, 80, 6);
         assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
+    }
+
+    fn script_header(lines: usize) -> String {
+        let script = (1..=lines)
+            .map(|n| format!("echo line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("[permission] bash: sh -c '\n{script}\n'")
+    }
+
+    /// mini-agent-wb29a: a shortened request offers `(e)`, and expanding it
+    /// shows the whole script when the screen has room.
+    #[test]
+    fn a_shortened_request_offers_expansion_and_expands_in_full() {
+        let header = script_header(12);
+        let collapsed = permission_prompt_rows(&header, OPTIONS, 80, 20, false);
+        assert_eq!(collapsed.len(), prompt_max_rows(20), "{collapsed:?}");
+        assert!(
+            collapsed.last().unwrap().ends_with(PROMPT_EXPAND_HINT),
+            "{collapsed:?}"
+        );
+        assert!(collapsed.iter().any(|row| row.contains("more line(s)")));
+
+        let expanded = permission_prompt_rows(&header, OPTIONS, 80, 20, true);
+        assert!(expanded.len() <= expanded_prompt_max_rows(20));
+        assert!(
+            expanded.last().unwrap().ends_with(PROMPT_COLLAPSE_HINT),
+            "{expanded:?}"
+        );
+        assert!(!expanded.iter().any(|row| row.contains("more line(s)")));
+        assert_eq!(expanded[..expanded.len() - 1].join("\n"), header);
+    }
+
+    #[test]
+    fn an_elided_path_offers_expansion_and_wraps_in_full_when_expanded() {
+        let header = format!("[permission] edit: /{}/Input.tsx", "deep/".repeat(60));
+        let collapsed = permission_prompt_rows(&header, OPTIONS, 60, 10, false);
+        assert!(collapsed[..collapsed.len() - 1].concat().contains('…'));
+        assert!(collapsed.last().unwrap().ends_with(PROMPT_EXPAND_HINT));
+
+        let expanded = permission_prompt_rows(&header, OPTIONS, 60, 40, true);
+        assert_eq!(expanded[..expanded.len() - 1].concat(), header);
+    }
+
+    #[test]
+    fn a_request_that_fits_has_no_expansion_hint() {
+        let rows = permission_prompt_rows("[permission] read: /a.rs", OPTIONS, 80, 20, false);
+        assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
+        assert_eq!(expanded_prompt_max_rows(1), 2);
+        assert_eq!(expanded_prompt_max_rows(30), 29);
     }
 
     #[test]

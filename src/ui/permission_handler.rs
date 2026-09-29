@@ -23,6 +23,9 @@ enum PromptInput {
     Deny,
     /// Esc / Ctrl+C / Ctrl+D: refuse without further questions.
     Abort,
+    /// `e`: expand or collapse the prompt's view of the request. Never an
+    /// answer.
+    ToggleFull,
     Ignore,
 }
 
@@ -62,6 +65,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('a' | 'A') if plain => PromptInput::AllowSession,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
+        KeyCode::Char('e' | 'E') if plain => PromptInput::ToggleFull,
         KeyCode::Esc => PromptInput::Abort,
         _ => PromptInput::Ignore,
     }
@@ -143,6 +147,7 @@ async fn read_prompt_input(
     renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
         tool: header,
         options: options.into(),
+        expanded: false,
     });
     renderer.set_activity(crate::ui::terminal::AgentActivity::WaitingForApproval)?;
     draw_prompt(renderer)?;
@@ -159,6 +164,13 @@ async fn read_prompt_input(
         match event {
             UserEvent::Key(key) => {
                 let input = classify_prompt_key(key);
+                if input == PromptInput::ToggleFull {
+                    if let Some(prompt) = renderer.permission_prompt.as_mut() {
+                        prompt.expanded = !prompt.expanded;
+                    }
+                    draw_prompt(renderer)?;
+                    continue;
+                }
                 if input != PromptInput::Ignore && accept(input) {
                     break input;
                 }
@@ -315,7 +327,7 @@ pub async fn handle_permission_request(
             }
             _ => (UserDecision::Deny, Vec::new()),
         },
-        PromptInput::Deny | PromptInput::Abort | PromptInput::Ignore => {
+        PromptInput::Deny | PromptInput::Abort | PromptInput::ToggleFull | PromptInput::Ignore => {
             (UserDecision::Deny, Vec::new())
         }
     };
@@ -436,6 +448,13 @@ mod tests {
         assert_eq!(key('a'), PromptInput::AllowSession);
         assert_eq!(key('f'), PromptInput::AllowFolder);
         assert_eq!(key('n'), PromptInput::Deny);
+        // mini-agent-wb29a: `e` expands the request, it never answers.
+        assert_eq!(key('e'), PromptInput::ToggleFull);
+        assert_eq!(key('E'), PromptInput::ToggleFull);
+        assert_eq!(
+            classify_prompt_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            PromptInput::Ignore
+        );
         assert_eq!(
             classify_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             PromptInput::Abort
