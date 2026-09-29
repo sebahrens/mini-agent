@@ -354,10 +354,10 @@ pub(crate) fn suggest_pattern(tool: &str, input: &str) -> String {
             let parent = path.parent().unwrap_or(path);
             descendant_pattern(parent)
         }
-        "grep" | "find_files" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
-            format!("{}*", first)
-        }
+        // The tool side supplies the matching exact-root scope as an
+        // additional pattern (see `search_root_allow_scope`); this fallback
+        // is the literal tree, never a `first_token*` prefix glob.
+        "grep" | "find_files" => crate::permission::pattern::search_root_allow_scope(input).0,
         // Permission inputs for non-path tools are already canonical keys
         // (for example `mcp_tool:{server}:{tool}` or `git:commit`).  Grant
         // exactly that operation; a generated wildcard here would silently
@@ -477,6 +477,26 @@ mod tests {
             crate::permission::pattern::Pattern::new_generated_path_scope(&pattern).is_some(),
             "{pattern}"
         );
+    }
+
+    #[test]
+    fn search_suggestion_is_the_literal_root_tree_not_a_token_prefix() {
+        let root = if cfg!(windows) {
+            r"C:\Users\seb\my other"
+        } else {
+            "/Users/seb/my other"
+        };
+        for tool in ["grep", "find_files"] {
+            let pattern = suggest_pattern(tool, root);
+            let matcher =
+                crate::permission::pattern::Pattern::new_generated_path_scope(&pattern).unwrap();
+            let child = std::path::Path::new(root).join("sub").join("f.rs");
+            assert!(matcher.matches_path(child.to_str().unwrap()), "{tool}");
+            let prefix_sibling = format!("{root}-secrets");
+            assert!(!matcher.matches_path(&prefix_sibling), "{tool}");
+            let cut_at_space = root.split_whitespace().next().unwrap();
+            assert!(!matcher.matches_path(&format!("{cut_at_space}x")), "{tool}");
+        }
     }
 
     #[test]

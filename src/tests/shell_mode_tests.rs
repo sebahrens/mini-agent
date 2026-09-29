@@ -77,6 +77,66 @@ async fn implicit_unavailable_default_clears_ambient_credentials() {
     );
 }
 
+/// `TC-MODEL-ACTION` and `TC-EXPLICIT-USER-SHELL` in the subprocess trust
+/// spec promise one environment policy for every `Disabled` reason. Pin both
+/// the running behaviour of `!` shells and the spec text to it.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shell_under_no_sandbox_env_policy_matches_spec() {
+    const POLICY: &str =
+        "clears the ambient environment, then restores only the non-credential allow-list";
+    let spec = include_str!("../../docs/specs/subprocess-trust.md");
+    for class in [
+        "`TC-MODEL-ACTION` — `BashTool::call`",
+        "`TC-EXPLICIT-USER-SHELL`",
+    ] {
+        let row = spec
+            .lines()
+            .find(|line| line.starts_with(&format!("| {class}")))
+            .unwrap_or_else(|| panic!("spec row {class} is missing"));
+        assert!(row.contains(POLICY), "{class} row must state: {POLICY}");
+        assert!(
+            !row.contains("inherits ambient environment")
+                && !row.contains("inherits the ambient environment"),
+            "{class} row must not claim an unsandboxed launch inherits the environment"
+        );
+    }
+
+    let _environment = crate::tests::ScopedProcessEnv::set(&[(
+        "MINI_AGENT_EXPLICIT_SHELL_SECRET",
+        Some("must-not-cross".into()),
+    )]);
+    let explicit_bypass = Sandbox::new(false, "bwrap");
+    let unavailable_default =
+        Sandbox::new(false, "missing-default").with_unavailable_default_fallback();
+    for (sandbox, boundary) in [
+        (explicit_bypass, ExplicitShellBoundary::UserTrustedBypass),
+        (
+            unavailable_default,
+            ExplicitShellBoundary::UnavailableDefaultFallback {
+                backend: "missing-default".to_string(),
+            },
+        ),
+    ] {
+        let run = sandbox
+            .run_explicit_shell(
+                "!test -z \"${MINI_AGENT_EXPLICIT_SHELL_SECRET+x}\" && printf '%s' \"$PATH\"",
+                SHORT_LIMITS,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.audit.boundary, boundary);
+        assert!(run.succeeded(), "{boundary:?}: {}", run.rendered_output());
+        // The non-credential allow-list is restored after clearing.
+        assert_eq!(run.rendered_output(), std::env::var("PATH").unwrap());
+        assert_eq!(
+            sandbox.capability_matrix().environment,
+            "cleared, then populated from a non-credential allow-list"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_shell_success_and_nonzero_share_one_status_policy() {

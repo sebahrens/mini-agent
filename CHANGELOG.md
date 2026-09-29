@@ -84,6 +84,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- "Always allow" for `grep` and `find_files` now grants the approved search root and its literal
+  subtree instead of a `first-word*` prefix glob, so approving `/a/other` no longer covers
+  `/a/other-secrets` and a root containing a space is no longer cut at the space.
+- The subprocess trust spec now states that unsandboxed Bash and explicit `!` shells clear the
+  ambient environment and restore only the non-credential allow-list for every disabled-sandbox
+  reason, matching the implementation.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

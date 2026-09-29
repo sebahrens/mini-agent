@@ -421,6 +421,19 @@ async fn handle_ask_inner(
     suggested_pattern: Option<String>,
     additional_allow_patterns: Vec<String>,
 ) -> Result<(), ToolError> {
+    // Directory-walking searches approve one literal root: default their
+    // AllowAlways scope to that tree plus the root itself (as read, edit and
+    // list_dir folder grants do) so the grant never widens to a sibling that
+    // shares the root's prefix and the root re-checks without a new prompt.
+    let (suggested_pattern, additional_allow_patterns) = match suggested_pattern {
+        None if matches!(tool, "grep" | "find_files") => {
+            let (descendants, exact) = crate::permission::pattern::search_root_allow_scope(input);
+            let mut additional = additional_allow_patterns;
+            additional.push(exact);
+            (Some(descendants), additional)
+        }
+        suggested => (suggested, additional_allow_patterns),
+    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     ask_tx
         .send(AskRequest {
