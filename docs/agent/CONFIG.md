@@ -1355,7 +1355,14 @@ omitted, zerostack installs built-in exact-script allows (for commands such as
 `pwd`, `git status`, and `cargo test`) plus pattern-based deny rules.
 An `external_directory` deny is a security baseline: it takes precedence over
 matching tool-specific allows and prior session AllowAlways scopes, including
-inherited `read` access used by `lsp_diagnostics`.
+inherited `read` access used by `lsp_diagnostics`. When several
+`external_directory` rules match one path they follow the same
+order-independent precedence as tool rules (see Rule precedence): any `deny`
+wins, otherwise the most specific pattern, with `ask` beating `allow` on a tie.
+So `/tmp/**` allow plus `/**` ask allows `/tmp/x` and asks elsewhere, and a
+nested `~/.ssh/**` deny always beats a broader `~/**` allow. On Windows, where
+a path is also matched in its verbatim spelling, matching rules combine
+fail-closed instead (deny, then ask, then allow).
 
 `todo_write` replaces the structured task list stored with the current session;
 `todo_read` reads that same session-local list and performs no filesystem access.

@@ -1249,14 +1249,19 @@ impl PermissionChecker {
             }
             return decision;
         }
+        // Evaluate every rule so the outcome follows the documented
+        // order-independent precedence (any deny, then the most specific
+        // pattern, then ask over allow) rather than map iteration order.
         #[cfg(not(windows))]
-        for (pattern, action) in &self.ext_dir_rules {
-            if pattern.matches_path(path_str) {
-                return Some(*action);
-            }
+        {
+            let matched: SmallVec<[(usize, Action); 4]> = self
+                .ext_dir_rules
+                .iter()
+                .filter(|(pattern, _)| pattern.matches_path(path_str))
+                .map(|(pattern, action)| (pattern.specificity(), *action))
+                .collect();
+            Self::resolve_matched(&matched)
         }
-        #[cfg(not(windows))]
-        None
     }
 
     /// Feeds a hook-denied call into doom-loop detection. A hook deny never
@@ -2425,5 +2430,78 @@ mod pinned_hook_file_tests {
             );
         }
         let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_directory_precedence_tests {
+    use super::*;
+
+    fn checker(workspace: &Path, rules: &[(String, Action)]) -> PermissionChecker {
+        let config = PermissionConfig {
+            external_directory: Some(rules.iter().cloned().collect()),
+            ..PermissionConfig::default()
+        };
+        PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.to_path_buf()),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn external_directory_rules_resolve_independently_of_map_order() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_ext_precedence_{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let home = base.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("tmp")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::write(home.join("tmp/scratch"), "x").unwrap();
+        std::fs::write(home.join("notes"), "x").unwrap();
+        let home_text = home.to_string_lossy();
+
+        // Each constructed HashMap gets a fresh random hasher seed, so many
+        // constructions cover both iteration orders.
+        for _ in 0..64 {
+            let mut deny_nested = checker(
+                &workspace,
+                &[
+                    (format!("{home_text}/**"), Action::Allow),
+                    (format!("{home_text}/.ssh/**"), Action::Deny),
+                ],
+            );
+            assert!(matches!(
+                deny_nested.check_path("read", &home.join(".ssh/id_ed25519").to_string_lossy()),
+                CheckResult::Denied(_)
+            ));
+            assert_eq!(
+                deny_nested.check_path("read", &home.join("notes").to_string_lossy()),
+                CheckResult::Allowed
+            );
+
+            let mut specific_allow = checker(
+                &workspace,
+                &[
+                    (format!("{home_text}/tmp/**"), Action::Allow),
+                    ("/**".to_string(), Action::Ask),
+                ],
+            );
+            assert_eq!(
+                specific_allow.check_path("read", &home.join("tmp/scratch").to_string_lossy()),
+                CheckResult::Allowed
+            );
+            assert_eq!(
+                specific_allow.check_path("read", &home.join("notes").to_string_lossy()),
+                CheckResult::Ask
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 }
