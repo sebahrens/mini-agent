@@ -347,13 +347,23 @@ pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
         else {
             continue;
         };
-        let outcome = match rest
+        // The token must be exactly one of the three words. A prefix match
+        // would read an echoed `met | not_yet | impossible` template line, or
+        // `met? not yet…`, as a completion, and complete the goal on text that
+        // decided nothing.
+        let token = rest
             .trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '*'))
-            .to_ascii_lowercase()
-        {
-            v if v.starts_with("met") => Outcome::Met,
-            v if v.starts_with("not_yet") || v.starts_with("not yet") => Outcome::NotYet,
-            v if v.starts_with("impossible") => Outcome::Impossible,
+            .trim_end_matches('.')
+            .trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '*'))
+            .to_ascii_lowercase();
+        if token.contains('|') {
+            // An echoed format line decides nothing; a real verdict may follow.
+            continue;
+        }
+        let outcome = match token.as_str() {
+            "met" => Outcome::Met,
+            "not_yet" | "not yet" | "notyet" => Outcome::NotYet,
+            "impossible" => Outcome::Impossible,
             other => return Err(format!("unrecognized verdict {other:?}")),
         };
         let reason = text
@@ -644,6 +654,39 @@ mod tests {
         ] {
             assert!(parse_verdict(raw).is_err(), "{raw:?} must not parse");
         }
+    }
+
+    /// A judge that echoes the format line, or hedges with a word that merely
+    /// begins with `met`, has not said `met`. Prefix matching completed goals
+    /// on exactly that text (mini-agent-euj6q).
+    #[test]
+    fn an_echoed_template_or_hedged_prefix_is_not_a_verdict() {
+        for raw in [
+            "VERDICT: met | not_yet | impossible\nREASON: <one short paragraph>",
+            "VERDICT: met|not_yet|impossible",
+            "VERDICT: met? not yet, the tests still fail",
+            "VERDICT: metadata looks fine",
+            "VERDICT: impossible-ish",
+            "VERDICT: not_yet or met",
+        ] {
+            assert!(parse_verdict(raw).is_err(), "{raw:?} must not parse");
+        }
+        assert_eq!(
+            parse_verdict("VERDICT: met.\nREASON: done").unwrap().0,
+            Outcome::Met,
+            "a trailing full stop is still the word"
+        );
+        assert_eq!(
+            parse_verdict("VERDICT: not yet\nREASON: more").unwrap().0,
+            Outcome::NotYet
+        );
+        assert_eq!(
+            parse_verdict("VERDICT: met | not_yet | impossible\nVERDICT: not_yet\nREASON: more")
+                .unwrap()
+                .0,
+            Outcome::NotYet,
+            "an echoed template followed by a real answer reads the answer"
+        );
     }
 
     #[test]
