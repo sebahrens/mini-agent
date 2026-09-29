@@ -8,7 +8,7 @@ use tokio::process::Child;
 use crate::process_creation::TokioCommandCreationExt;
 use crate::sandbox::{
     HOOK_SANDBOX_READY_MARKER, ProcessGroupGuard, Sandbox, SandboxPolicy,
-    hook_containment_supported, kill_process_group,
+    hook_containment_supported, terminate_process_group,
 };
 #[cfg(unix)]
 use crate::sandbox::{PROCESS_GROUP_DRAIN_BUDGET, await_drained_process_group};
@@ -543,7 +543,7 @@ async fn run_hook_with_policy_and_limits(
             // the hook, and wait for them to go: a hook that reports completion
             // while one of its children is still runnable has not finished.
             if let Some(pid) = pid {
-                kill_process_group(pid);
+                terminate_process_group(pid).await;
                 #[cfg(unix)]
                 await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
             }
@@ -622,7 +622,7 @@ where
 
 async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
-        kill_process_group(pid);
+        terminate_process_group(pid).await;
     }
     let _ = child.start_kill();
     if let Err(error) = child.wait().await {

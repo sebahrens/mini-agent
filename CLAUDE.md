@@ -43,7 +43,7 @@ integration tests that launch the contained worker. See `src/extras/js/tests/`.
 
 - On Windows, JS remains disabled unless the LPAC supported-install-location gate passes. Parent-brokered JS `spawn` is wired through the separate general AppContainer command sandbox and must remain unavailable when that backend or the requested executable grant cannot be established.
 - Hook handler commands are resolved and launched as direct executable-plus-argv calls. Only an explicit hook `if` condition is opaque shell text (`sh -c` on Unix or PowerShell `-Command` on Windows); preserve that distinction when changing hook launch code.
-- `sandbox.rs`: `kill_process_group` is `#[cfg(unix)]` with empty Windows arm — keep it that way
+- `sandbox.rs`: `kill_process_group` signals the Unix process group; its Windows arm calls `windows::terminate_helper`, which cooperatively cancels an AppContainer helper (whose Job drains the tree) and otherwise terminates only that one process, waiting up to ~5 s. Never call it directly on the async executor: async callers use `terminate_process_group` (blocking pool on Windows), and the sync form uses `block_in_place` on the multi-threaded runtime. Windows descendants of non-helper children (trusted hooks) are not killed.
 
 ## Dependency changes
 

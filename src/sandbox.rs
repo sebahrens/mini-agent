@@ -3020,7 +3020,6 @@ impl Sandbox {
     }
 }
 
-#[cfg(feature = "hooks")]
 /// Whether `trust: sandboxed` hooks can be launched under `backend` on this
 /// platform. Hook containment needs a Unix wrapper plus a trusted `sh`
 /// readiness launcher; the Windows AppContainer backend has no direct-exec
@@ -3030,6 +3029,7 @@ pub(crate) fn hook_containment_supported(backend: &str) -> bool {
     cfg!(unix) && matches!(backend, "bwrap" | "seatbelt" | "zerobox")
 }
 
+#[cfg(feature = "hooks")]
 fn hook_readiness_shell() -> Result<PathBuf, String> {
     find_trusted_system_executable("sh").ok_or_else(|| {
         "sandbox: no trusted system `sh` is available for the hook readiness launcher".to_string()
@@ -3491,7 +3491,7 @@ pub(crate) const PROCESS_GROUP_DRAIN_BUDGET: std::time::Duration =
 
 async fn terminate_and_reap(child: &mut Child, pid: Option<u32>) {
     if let Some(pid) = pid {
-        kill_process_group(pid);
+        terminate_process_group(pid).await;
     }
     let _ = child.start_kill();
     if let Err(error) = child.wait().await {
@@ -3598,8 +3598,46 @@ pub(crate) fn kill_process_group(pid: u32) {
             }
         }
     }
+    // Windows has no process group: `terminate_helper` cooperatively cancels
+    // an AppContainer helper (which owns and drains its Job) and otherwise
+    // terminates only the single process. It waits up to ~5 s, so keep it off
+    // the async executor. Async callers should use
+    // [`terminate_process_group`]; this synchronous form (Drop, cancel-all)
+    // must keep its ordering guarantee, so it runs in place but lets the
+    // multi-threaded runtime move other tasks off this worker first.
     #[cfg(windows)]
-    windows::terminate_helper(pid);
+    {
+        #[cfg(feature = "multithread")]
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(|| windows::terminate_helper(pid));
+            return;
+        }
+        windows::terminate_helper(pid);
+    }
+}
+
+/// Async form of [`kill_process_group`] for callers on the executor.
+///
+/// On Unix this only signals the group (callers drain it separately). On
+/// Windows the bounded cooperative helper cancellation and forced
+/// termination run on the blocking pool, so a timed-out or cancelled command
+/// never stalls other tasks while its helper tears down. The call still
+/// completes before returning, preserving the "cooperative cancel before
+/// `start_kill`" ordering the AppContainer helper relies on for cleanup.
+pub(crate) async fn terminate_process_group(pid: u32) {
+    #[cfg(windows)]
+    {
+        if tokio::task::spawn_blocking(move || windows::terminate_helper(pid))
+            .await
+            .is_err()
+        {
+            tracing::warn!("sandbox: helper termination task for process {pid} failed");
+        }
+    }
+    #[cfg(not(windows))]
+    kill_process_group(pid);
 }
 
 /// Best-effort post-reap cleanup. Unlike the primary kill path, this first
@@ -5841,5 +5879,73 @@ printf {pass_token}
                 "zerobox command restored non-allow-listed variable {key:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_group_async_kills_the_whole_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; /bin/sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        terminate_process_group(pid).await;
+        for _ in 0..200 {
+            if child.try_wait().unwrap().is_some() {
+                await_drained_process_group(pid, PROCESS_GROUP_DRAIN_BUDGET).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("async process-group termination did not terminate group {pid}");
+    }
+
+    /// Regression for mini-agent-2tdv3: Windows termination waits up to ~5 s
+    /// for a cooperative helper exit and must not stall the executor meanwhile.
+    #[cfg(windows)]
+    #[test]
+    fn terminate_process_group_does_not_block_current_thread_executor() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = runtime.block_on({
+            let ticks = ticks.clone();
+            async move {
+                let ticker = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                // A non-helper process never opens the cancellation event, so
+                // termination spends its full cooperative window (~4 s) here.
+                terminate_process_group(pid).await;
+                let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+                ticker.abort();
+                observed
+            }
+        });
+        let status = child.wait().unwrap();
+        assert!(
+            observed > 0,
+            "the executor made no progress while Windows termination was in flight"
+        );
+        assert!(
+            !status.success(),
+            "terminated process must not exit cleanly"
+        );
     }
 }
