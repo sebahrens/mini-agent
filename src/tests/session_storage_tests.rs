@@ -126,6 +126,112 @@ fn recent_session_lookup_is_scoped_to_the_captured_workspace() {
     assert_eq!(found[0].id, first_session.id);
 }
 
+// mini-agent-5s9me: `--continue` decodes only the sessions of its own
+// workspace. A session elsewhere whose body no longer decodes as a Session
+// does not get in the way, and the newest match is returned.
+#[test]
+fn recent_workspace_lookup_only_decodes_matching_sessions() {
+    let env = setup_test_env();
+    let here = std::fs::canonicalize(&env.dir).unwrap();
+    let elsewhere = env.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = std::fs::canonicalize(elsewhere).unwrap();
+
+    let mut older = Session::new("openai", "gpt-4", 128_000, "older");
+    older.working_dir = here.to_string_lossy().into_owned().into();
+    save_session(&older).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut newer = Session::new("openai", "gpt-4", 128_000, "newer");
+    newer.working_dir = here.to_string_lossy().into_owned().into();
+    save_session(&newer).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Newest of all, for another workspace, and not a decodable Session.
+    let foreign = serde_json::json!({
+        "working_dir": elsewhere.to_string_lossy(),
+        "messages": "not a message list",
+    });
+    atomic_write(
+        &env.dir.join("sessions").join("foreign.json"),
+        &foreign.to_string(),
+    )
+    .unwrap();
+
+    let found = find_recent_sessions_for_workspace(1, &here).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, newer.id);
+    let both = find_recent_sessions_for_workspace(5, &here).unwrap();
+    assert_eq!(
+        both.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        [newer.id.as_str(), older.id.as_str()]
+    );
+    assert!(
+        find_recent_sessions_for_workspace(0, &here)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// mini-agent-6wvoz: `--session work` selects the session named exactly `work`
+// even though `homework` also contains it.
+#[test]
+fn session_selection_prefers_exact_id_then_exact_name() {
+    use crate::session::storage::{SessionSelection, select_session};
+    let named = |name: &str| Session::new("openai", "gpt-4", 128_000, name);
+    let work = named("Work");
+    let homework = named("homework");
+
+    let SessionSelection::One(selected) =
+        select_session("work", vec![homework.clone(), work.clone()])
+    else {
+        panic!("an exact name must select its session");
+    };
+    assert_eq!(selected.id, work.id);
+
+    let SessionSelection::One(selected) =
+        select_session(&homework.id, vec![work.clone(), homework.clone()])
+    else {
+        panic!("an exact id must select its session");
+    };
+    assert_eq!(selected.id, homework.id);
+
+    assert!(matches!(
+        select_session("ork", vec![work.clone(), homework.clone()]),
+        SessionSelection::Ambiguous(sessions) if sessions.len() == 2
+    ));
+    assert!(matches!(
+        select_session("home", vec![homework.clone()]),
+        SessionSelection::One(_)
+    ));
+    assert!(matches!(
+        select_session("nothing", Vec::new()),
+        SessionSelection::NoMatch
+    ));
+    let twin = named("work");
+    assert!(matches!(
+        select_session("work", vec![work, twin, homework]),
+        SessionSelection::Ambiguous(sessions) if sessions.len() == 2
+    ));
+}
+
+#[test]
+fn session_flag_selects_an_exact_name_over_a_containing_one() {
+    let env = setup_test_env();
+    let work = Session::new("openai", "gpt-4", 128_000, "work");
+    save_session(&work).unwrap();
+    let homework = Session::new("openai", "gpt-4", 128_000, "homework");
+    save_session(&homework).unwrap();
+
+    let candidates = find_sessions_by_prefix("work").unwrap();
+    assert_eq!(candidates.len(), 2, "both names contain the query");
+    let crate::session::storage::SessionSelection::One(selected) =
+        crate::session::storage::select_session("work", candidates)
+    else {
+        panic!("exact name must win");
+    };
+    assert_eq!(selected.id, work.id);
+    drop(env);
+}
+
 #[test]
 fn load_session_exact_reconciles_the_private_saved_snapshot() {
     let env = setup_test_env();

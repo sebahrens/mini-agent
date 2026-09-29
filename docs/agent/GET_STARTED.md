@@ -199,7 +199,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `-c`, `--continue` | Continue the most recent session. |
 | `-r`, `--resume` | List recent sessions for selection. |
 | `--name <name>` | Set a name for the new session |
-| `--session <id-or-name>` | Load session by ID prefix or name |
+| `--session <id-or-name>` | Load a session: an exact ID or exact (case-insensitive) name wins, otherwise a unique ID prefix or name substring |
 | `--resume-provider <name>` / `--resume-model <id>` | Explicitly change provider/model while resuming saved context; the provider change displays and audits a privacy warning. |
 | `--no-session` | Run ephemerally without saving a session. |
 | `--restrictive` | Ask for every operation. |

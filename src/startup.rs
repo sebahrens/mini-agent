@@ -686,46 +686,44 @@ impl Startup {
         }
 
         if let Some(session_id) = &cli.session {
-            let sessions = session::storage::find_sessions_by_prefix(session_id)?;
-            if sessions.is_empty() {
-                // try exact name match as fallback
-                if let Some(s) = session::storage::find_session_by_name(session_id)? {
-                    session = s;
+            let candidates = session::storage::find_sessions_by_prefix(session_id)?;
+            match session::storage::select_session(session_id, candidates) {
+                session::storage::SessionSelection::One(selected) => {
+                    session = *selected;
                     session_resumed = true;
-                } else {
+                }
+                session::storage::SessionSelection::NoMatch => {
                     anyhow::bail!("no session matching '{}'", session_id);
                 }
-            } else if sessions.len() == 1 {
-                session = sessions.into_iter().next().unwrap();
-                session_resumed = true;
-            } else {
-                eprintln!("multiple sessions match '{}':", session_id);
-                for s in &sessions {
-                    let preview = s
-                        .messages
-                        .last()
-                        .map(|m| {
-                            let truncated: String = m.content.chars().take(40).collect();
-                            truncated
-                        })
-                        .unwrap_or_default();
-                    let time = crate::ui::events::format_time(&s.updated_at);
-                    let name_part = if s.name.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", s.name)
-                    };
-                    eprintln!(
-                        "  {}  {}  {}msgs  {}  {}{}",
-                        crate::print::short_session_id(&s.id),
-                        time,
-                        s.messages.len(),
-                        s.model,
-                        preview,
-                        name_part
-                    );
+                session::storage::SessionSelection::Ambiguous(sessions) => {
+                    eprintln!("multiple sessions match '{}':", session_id);
+                    for s in &sessions {
+                        let preview = s
+                            .messages
+                            .last()
+                            .map(|m| {
+                                let truncated: String = m.content.chars().take(40).collect();
+                                truncated
+                            })
+                            .unwrap_or_default();
+                        let time = crate::ui::events::format_time(&s.updated_at);
+                        let name_part = if s.name.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", s.name)
+                        };
+                        eprintln!(
+                            "  {}  {}  {}msgs  {}  {}{}",
+                            crate::print::short_session_id(&s.id),
+                            time,
+                            s.messages.len(),
+                            s.model,
+                            preview,
+                            name_part
+                        );
+                    }
+                    anyhow::bail!("be more specific with the session ID prefix");
                 }
-                anyhow::bail!("be more specific with the session ID prefix");
             }
         }
 
