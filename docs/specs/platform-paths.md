@@ -113,6 +113,13 @@ configuration. Before trust, startup may merge only this exhaustive benign top-l
 `reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `show_tool_details`, `statusline`,
 the four `subagent_max_*` result/read limits, and `temperature`.
 
+`retry` is admitted only as a tightening of the user's policy: after the benign merge, each project
+`[retry]` field is capped at the effective global (or default) value, so repository content can make
+retrying stop sooner or wait less but never retry more or wait longer. Independently, every retry
+policy is clamped at load to `max_attempts` in 1..=10, backoffs at most 60000 ms, and
+`initial_backoff_ms <= max_backoff_ms`, with a startup warning naming the field and its source
+(global or project config); the retry loops re-apply the same envelope defensively.
+
 Every other key is sensitive, including unknown future keys and all provider/API-key, permission,
 sandbox, shell/editor, MCP, LSP, ACP, worktree, auto-update, and executable integration settings.
 Sensitive keys remain inert until the user approves a prompt that displays their names, the
