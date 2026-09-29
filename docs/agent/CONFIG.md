@@ -1770,6 +1770,10 @@ Concurrent prompts for one session are rejected while its turn is active, so an
 untagged duplicate cancellation cannot be redirected to queued work. Other
 sessions remain independent and continue normally.
 
+Context files (global and workspace `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md`)
+share a 512 KiB budget. A file that does not fit in what remains is truncated with a
+visible notice rather than loaded whole, and files after the budget is spent are skipped.
+
 ACP context includes managed global files and context files in the captured
 workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or
 `ARCHITECTURE.md` from ambient parent directories, because those parents are
