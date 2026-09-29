@@ -845,8 +845,26 @@ headless start keeps the hook installed but denies every launch (fail-closed
 for `PreToolUse`) until the change is approved interactively, so a guard
 rewritten in one session never silently takes effect in the next. First use
 is trusted as configured, so prefer pointing global hooks at files outside
-the workspace. The binding is best-effort for shell text: variables expanded
-by a condition and files a script reads or sources on its own are not bound.
+the workspace.
+
+A token that starts with `$ZEROSTACK_PROJECT_DIR/` or
+`${ZEROSTACK_PROJECT_DIR}/` is bound as the same path inside the workspace,
+because the hook child receives exactly that value. The binding is otherwise
+best-effort, and these gaps remain:
+
+- **Sourced and read files.** Only files named by the executable, arguments,
+  and condition are bound. A file a bound script sources (`. ./lib.sh`),
+  imports, or reads on its own is not. Keep such helpers outside the
+  workspace, or inline them into the bound script.
+- **Other variables.** Paths built from any other variable (`$HOME/x`,
+  `$DIR/check.sh`, command substitution) are not expanded and not bound.
+- **Verify-to-exec window.** Digests are re-checked immediately before each
+  child is created. A process that is already running (for example a
+  background job started by the model's `bash` tool) could still swap the file
+  between that check and `exec`. The `write`/`edit`/`write_file` refusal and the
+  next start's re-check narrow this, but do not close it; a hook whose
+  integrity matters against a concurrently running workspace process should
+  live outside the workspace.
 
 Bare command names (`sh`, `python3`) resolve only through absolute `PATH`
 entries; empty, `.`, or other relative entries are ignored so a planted file in

@@ -423,6 +423,57 @@ async fn rewritten_workspace_file_of_a_global_hook_is_denied_in_a_later_session(
     }
 }
 
+/// `$ZEROSTACK_PROJECT_DIR`-relative paths name the workspace the hook child
+/// receives, so they are bound like `./` paths (mini-agent-ryobw).
+#[test]
+fn project_dir_variable_paths_are_content_bound() {
+    let project = Project::new("project-dir-var");
+    project.write_script("hooks/check.sh", "#!/bin/sh\nexit 0\n");
+    project.write_script("hooks/guard.sh", DENY_SCRIPT);
+    let mut configured = handler("sh", &["${ZEROSTACK_PROJECT_DIR}/hooks/guard.sh"]);
+    configured.condition = Some("sh \"$ZEROSTACK_PROJECT_DIR/hooks/check.sh\"".into());
+    let pins = HookContentPins::capture(&project.root, &configured);
+    let locations: Vec<String> = pins.entries().into_iter().map(|(path, _)| path).collect();
+    assert_eq!(
+        locations,
+        vec!["workspace:hooks/check.sh", "workspace:hooks/guard.sh"]
+    );
+
+    // A different variable that merely shares the prefix is not expanded.
+    let other = handler("sh", &["$ZEROSTACK_PROJECT_DIRX/hooks/guard.sh"]);
+    assert!(HookContentPins::capture(&project.root, &other).is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rewritten_project_dir_variable_condition_script_is_denied() {
+    let project = Project::new("project-dir-var-rewrite");
+    let marker = project.base.join("var-escaped");
+    project.write_script("allow.sh", ALLOW_SCRIPT);
+    project.write_script("check.sh", "#!/bin/sh\nexit 0\n");
+    let mut configured = handler("./allow.sh", &[]);
+    configured.condition = Some("sh \"$ZEROSTACK_PROJECT_DIR/check.sh\"".into());
+    let dispatcher = HookDispatcher::from_config_with_backend_and_root(
+        &pre_tool_config(configured),
+        "unused",
+        &project.root,
+    )
+    .unwrap();
+    assert_eq!(
+        pre_tool(&dispatcher, &project).await.verdict,
+        Verdict::Allow
+    );
+    project.write_script(
+        "check.sh",
+        &format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    );
+    let _ = pre_tool(&dispatcher, &project).await;
+    assert!(
+        !marker.exists(),
+        "a rewritten $ZEROSTACK_PROJECT_DIR condition script must not run"
+    );
+}
+
 #[test]
 fn global_hooks_without_workspace_files_record_nothing() {
     let project = Project::new("persist-none");
