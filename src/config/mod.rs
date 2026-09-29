@@ -404,7 +404,6 @@ impl Config {
     /// what the turn actually cost. OpenAI (Responses and Chat Completions),
     /// Anthropic and the OpenAI-compatible gateways all fold reasoning into
     /// `output_tokens` — adding it there charges the same tokens twice.
-    #[cfg(any(test, feature = "subagents"))]
     pub fn reasoning_tokens_are_exclusive_of_output(&self, provider: &str) -> bool {
         let kind_name = self
             .custom_providers
@@ -416,6 +415,25 @@ impl Config {
             crate::auth::ProviderKind::from_name(kind_name),
             Some(crate::auth::ProviderKind::Gemini)
         )
+    }
+
+    /// `usage` in the shape every other provider reports: reasoning tokens
+    /// that `provider` counts separately are folded into `output_tokens`.
+    ///
+    /// Gemini's thinking tokens are billed as output but reported beside it,
+    /// so without this the session and `--output json` never charged them, and
+    /// `total_tokens - output_tokens` counted them as prompt, inflating the
+    /// context estimate (mini-agent-izx3e). Apply it exactly once per usage
+    /// report, before charging or pricing it.
+    pub fn normalize_usage(
+        &self,
+        provider: &str,
+        mut usage: crate::event::UsageDelta,
+    ) -> crate::event::UsageDelta {
+        if self.reasoning_tokens_are_exclusive_of_output(provider) {
+            usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
+        }
+        usage
     }
 
     pub fn resolve_context_window(

@@ -291,7 +291,7 @@ pub async fn handle_agent_event(
             let anthropic_native = ui.cfg.is_anthropic_native(&ui.session.provider);
             apply_usage_delta(
                 ui.session,
-                usage,
+                ui.cfg.normalize_usage(&ui.session.provider, usage),
                 anthropic_native,
                 context_complete,
                 run.request_tool_results_cleared,

@@ -1617,6 +1617,11 @@ impl Startup {
                 prompt: recorded_prompt,
                 persisted: already_persisted,
             } = response_result;
+            // Priced and charged in one shape whatever the provider.
+            let usage: rig::completion::Usage = self
+                .cfg
+                .normalize_usage(&self.session.provider, usage.into())
+                .into();
             let json_context = if json_output {
                 let files_changed = crate::print::files_changed_since(
                     self.workspace.root(),

@@ -1086,3 +1086,49 @@ fn reasoning_tokens_exclusivity_resolves_custom_provider_type() {
     assert!(cfg.reasoning_tokens_are_exclusive_of_output("gw"));
     assert!(!cfg.reasoning_tokens_are_exclusive_of_output("compat"));
 }
+
+// mini-agent-izx3e: Gemini's separately reported thinking tokens are billed as
+// output, and are not prompt tokens for the context estimate.
+#[test]
+fn normalized_usage_charges_gemini_thinking_as_output() {
+    let cfg = Config::default();
+    let gemini_report = crate::event::UsageDelta {
+        input_tokens: 1_000,
+        output_tokens: 100,
+        total_tokens: 1_400,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        tool_use_prompt_tokens: 0,
+        reasoning_tokens: 300,
+    };
+    let normalized = cfg.normalize_usage("gemini", gemini_report);
+    assert_eq!(normalized.output_tokens, 400);
+    assert_eq!(normalized.reasoning_tokens, 300);
+    assert_eq!(
+        crate::session::Session::real_input_tokens(
+            false,
+            normalized.input_tokens,
+            normalized.total_tokens,
+            normalized.output_tokens,
+            0,
+            0,
+        ),
+        1_000,
+        "thoughts are not prompt tokens"
+    );
+
+    let mut session = crate::session::Session::new("gemini", "gemini-test", 1_000_000, "");
+    session.input_token_cost = 0.0;
+    session.output_token_cost = 10.0;
+    session.charge_usage_delta(normalized, false);
+    assert_eq!(session.total_output_tokens, 400);
+    assert!((session.total_cost - 400.0 * 10.0 / 1_000_000.0).abs() < 1e-12);
+
+    // Providers that already include reasoning in output are left alone.
+    let openai_report = crate::event::UsageDelta {
+        output_tokens: 400,
+        total_tokens: 1_400,
+        ..gemini_report
+    };
+    assert_eq!(cfg.normalize_usage("openai", openai_report), openai_report);
+}

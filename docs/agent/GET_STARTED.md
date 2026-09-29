@@ -253,7 +253,10 @@ is interrupted through the same cleanup path.
 with `write` and `edit` targets visible in the provider transcript. It is empty when no
 change can be observed (for example, a non-Git workspace changed only by an opaque shell command).
 `cost` is the estimated cost of this invocation in US dollars using the resolved model prices; it
-is zero when prices are unavailable. Status and diagnostic messages remain on stderr so scripts can
+is zero when prices are unavailable. `usage.output_tokens` includes reasoning tokens for every
+provider: Gemini reports its thinking tokens separately, so they are added to it (and still shown
+in `usage.reasoning_tokens`), and the session totals and cost charge them the same way. Status and
+diagnostic messages remain on stderr so scripts can
 parse stdout directly. Headless runs use a non-interactive prompt: the agent states reasonable
 assumptions and proceeds within its granted authority instead of waiting for clarification.
 
