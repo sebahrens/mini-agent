@@ -112,6 +112,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   extension's `package-lock.json` (whose runtime dependencies are bundled into the VSIX's
   `dist/extension.js`), verified against the lockfile integrity hashes, with offline rebuild steps
   in `SOURCE.md`; the archive is now written reproducibly (sorted entries, fixed timestamps).
+- `cargo test` no longer fails intermittently on macOS in the ACP Bash cancellation test under the
+  parallel runner: its readiness wait is split into bounded stages (tool announced, shell pid, child
+  pid) that each report which one stalled, and CI now runs the unserialised default suite on macOS
+  as well as Linux.
 
 ## [1.9.4] - 2026-09-29
 
