@@ -34,6 +34,15 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
         "provider": session.provider.as_str(),
         "model": session.model.as_str(),
         "created_at": session.created_at.as_str(),
+        // Totals travel with the transcript so an imported session reports
+        // what the original spent rather than starting from zero.
+        "context_window": session.context_window,
+        "total_input_tokens": session.total_input_tokens,
+        "total_output_tokens": session.total_output_tokens,
+        "total_cached_input_tokens": session.total_cached_input_tokens,
+        "total_cache_creation_input_tokens": session.total_cache_creation_input_tokens,
+        "total_real_input_tokens": session.total_real_input_tokens,
+        "total_cost": session.total_cost,
     });
     let header = header.to_string();
     if header.len() > MAX_SESSION_IMPORT_LINE_BYTES {
@@ -50,7 +59,10 @@ pub fn session_to_jsonl(session: &Session) -> Result<String> {
             "objective": goal.objective,
             "criteria": goal.criteria,
             "status": goal.status.label(),
+            "paused_reason": goal.paused_reason,
             "rounds": goal.progress.rounds,
+            "tokens_used": goal.progress.tokens_used,
+            "active_secs": goal.progress.active_secs,
             "last_reason": goal.last_verdict.as_ref().map(|v| v.reason.clone()),
         })
         .to_string();
@@ -115,6 +127,125 @@ struct JsonlSessionHeader {
     provider: CompactString,
     model: CompactString,
     created_at: CompactString,
+    #[serde(flatten)]
+    totals: ImportedTotals,
+}
+
+/// Session totals carried in the JSONL header. Every field is optional: an
+/// export written before they were added, or by another tool, has none.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct ImportedTotals {
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub total_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_real_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_cost: Option<f64>,
+}
+
+impl ImportedTotals {
+    /// Restore the carried totals onto a freshly built session.
+    pub fn apply(&self, session: &mut Session) {
+        let set = |slot: &mut u64, value: Option<u64>| {
+            if let Some(value) = value {
+                *slot = value;
+            }
+        };
+        set(&mut session.total_input_tokens, self.total_input_tokens);
+        set(&mut session.total_output_tokens, self.total_output_tokens);
+        set(
+            &mut session.total_cached_input_tokens,
+            self.total_cached_input_tokens,
+        );
+        set(
+            &mut session.total_cache_creation_input_tokens,
+            self.total_cache_creation_input_tokens,
+        );
+        set(
+            &mut session.total_real_input_tokens,
+            self.total_real_input_tokens,
+        );
+        if let Some(cost) = self
+            .total_cost
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            session.total_cost = cost;
+        }
+    }
+}
+
+/// The goal record of a JSONL export.
+///
+/// Only the objective and its progress travel. Checks, the judge and bounds
+/// are not in the export and are not taken from it: an imported goal is
+/// rebuilt through the installation's own goal factory, so a file cannot
+/// bring commands or a judge endpoint with it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ImportedGoal {
+    pub objective: String,
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub paused_reason: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rounds: u32,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub active_secs: u64,
+}
+
+#[cfg(feature = "goal")]
+impl ImportedGoal {
+    /// Rebuild the goal for this installation.
+    ///
+    /// A status this build does not recognize parks the goal, as it does for
+    /// a stored session.
+    pub fn restore(
+        &self,
+        defaults: crate::extras::goal::GoalDefaults<'_>,
+    ) -> Result<crate::extras::goal::Goal> {
+        use crate::extras::goal::{Goal, GoalStatus, PauseReason};
+
+        let mut goal = Goal::configured(self.objective.clone(), self.criteria.clone(), defaults)
+            .map_err(|error| anyhow::anyhow!("imported goal: {error}"))?;
+        let known = [
+            GoalStatus::Active,
+            GoalStatus::AwaitingUser,
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Met,
+            GoalStatus::Impossible,
+        ];
+        let (status, reason) = match known.into_iter().find(|s| s.label() == self.status) {
+            Some(GoalStatus::Paused) => (
+                GoalStatus::Paused,
+                self.paused_reason
+                    .clone()
+                    .and_then(|value| serde_json::from_value::<PauseReason>(value).ok())
+                    .or(Some(PauseReason::UnknownStatusOnLoad)),
+            ),
+            Some(status) => (status, None),
+            None => (GoalStatus::Paused, Some(PauseReason::UnknownStatusOnLoad)),
+        };
+        goal.status = status;
+        goal.paused_reason = reason;
+        goal.progress.rounds = self.rounds;
+        goal.progress.tokens_used = self.tokens_used;
+        goal.progress.active_secs = self.active_secs;
+        Ok(goal)
+    }
 }
 
 pub struct JsonlSessionImport {
@@ -124,6 +255,8 @@ pub struct JsonlSessionImport {
     pub model: CompactString,
     pub created_at: CompactString,
     pub messages: Vec<SessionMessage>,
+    pub totals: ImportedTotals,
+    pub goal: Option<ImportedGoal>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -191,6 +324,7 @@ pub fn parse_session_file(content: &str) -> Result<ParsedSessionFile> {
 fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut header = None;
+    let mut goal = None;
     let mut messages = Vec::new();
     for (index, raw_line) in content.lines().enumerate() {
         if raw_line.len() > MAX_SESSION_IMPORT_LINE_BYTES {
@@ -232,6 +366,13 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         // as one failed the whole import — an export that carried a goal could
         // not be imported at all.
         if value.get("type").and_then(|item| item.as_str()) == Some("goal") {
+            if goal.is_some() {
+                anyhow::bail!("duplicate goal record on line {}", index + 1);
+            }
+            goal = Some(
+                serde_json::from_value::<ImportedGoal>(value)
+                    .with_context(|| format!("line {} is not a goal record", index + 1))?,
+            );
             continue;
         }
         let message: ImportMessage = serde_json::from_value(value)
@@ -258,6 +399,8 @@ fn parse_jsonl_export(content: &str) -> Result<JsonlSessionImport> {
         model: header.model,
         created_at: header.created_at,
         messages,
+        totals: header.totals,
+        goal,
     })
 }
 

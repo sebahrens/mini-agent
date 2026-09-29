@@ -40,7 +40,11 @@ while executable/active schemes, non-HTTPS images, and tags are removed. The pag
 restrictive Content Security Policy as defense in depth. JSONL exports preserve the original text
 and, for newly recorded tool interactions, the correlated tool-call name, arguments, identifier,
 and bounded tool result used to resume the model conversation. Older exports without those optional
-fields remain importable and replay their tool records as labeled transcript text.
+fields remain importable and replay their tool records as labeled transcript text. The JSONL header
+also carries the session's token and cost totals and its context window, and a goal travels as its
+objective, criteria, status and progress; `/import` restores both. An imported goal takes its
+checks, judge and bounds from the importing installation, never from the file, and a status this
+build does not know parks it.
 
 ## Provider & Model
 

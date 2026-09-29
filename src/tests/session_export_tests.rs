@@ -74,6 +74,49 @@ fn an_export_carrying_a_goal_still_imports() {
     }
 }
 
+/// The JSONL schema itself carries the goal and the session totals through
+/// a parse (mini-agent-5955n).
+#[test]
+fn a_jsonl_export_parses_back_with_its_goal_and_totals() {
+    let mut session = sample_session();
+    session.total_input_tokens = 500;
+    session.total_output_tokens = 60;
+    session.total_cost = 0.25;
+    #[cfg(feature = "goal")]
+    session
+        .goal_store
+        .set(
+            crate::extras::goal::Goal::new("ship it", Vec::new()).unwrap(),
+            false,
+        )
+        .unwrap();
+    let jsonl = session_to_jsonl(&session).unwrap();
+    let ParsedSessionFile::Jsonl(imported) = parse_session_file(&jsonl).unwrap() else {
+        panic!("expected a JSONL session");
+    };
+    assert_eq!(imported.totals.context_window, Some(128_000));
+    assert_eq!(imported.totals.total_input_tokens, Some(500));
+    assert_eq!(imported.totals.total_output_tokens, Some(60));
+    assert_eq!(imported.totals.total_cost, Some(0.25));
+    #[cfg(feature = "goal")]
+    {
+        let goal = imported.goal.expect("the goal record is kept");
+        assert_eq!(goal.objective, "ship it");
+        assert_eq!(goal.status, "active");
+    }
+
+    // An export from before the totals existed still imports, with none.
+    let legacy = "{\"type\":\"session\",\"format\":\"zerostack-session-jsonl\",\"version\":1,\"id\":\"x\",\"provider\":\"p\",\"model\":\"m\",\"created_at\":\"now\"}\n{\"role\":\"user\",\"content\":\"hi\"}\n";
+    let ParsedSessionFile::Jsonl(imported) = parse_session_file(legacy).unwrap() else {
+        panic!("expected a JSONL session");
+    };
+    assert_eq!(
+        imported.totals,
+        crate::extras::export::ImportedTotals::default()
+    );
+    assert!(imported.goal.is_none());
+}
+
 #[test]
 fn jsonl_first_line_is_session_metadata() {
     let session = sample_session();

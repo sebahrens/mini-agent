@@ -270,11 +270,26 @@ fn parse_imported_session(
             session.messages = import.messages;
             session.mark_history_changed();
             let quick_models = crate::config::quick_models_map(cfg);
-            session.update_context_window(cfg.resolve_context_window(
-                &session.provider,
-                &session.model,
-                &quick_models,
-            ));
+            // What this installation knows about the model wins; the window
+            // the export recorded replaces only the generic fallback, which
+            // is a guess where the export is a fact.
+            let known_here = cfg.context_window.is_some()
+                || quick_models
+                    .values()
+                    .any(|q| q.model == session.model && q.context_window.is_some())
+                || crate::config::Config::catalog_context_window(&session.provider, &session.model)
+                    .is_some();
+            let resolved =
+                cfg.resolve_context_window(&session.provider, &session.model, &quick_models);
+            session.update_context_window(if known_here {
+                resolved
+            } else {
+                import
+                    .totals
+                    .context_window
+                    .filter(|window| *window > 0)
+                    .unwrap_or(resolved)
+            });
             if let Some(model) = quick_models
                 .values()
                 .find(|model| model.provider == session.provider && model.model == session.model)
@@ -286,6 +301,19 @@ fn parse_imported_session(
             {
                 session.input_token_cost = input;
                 session.output_token_cost = output;
+            }
+            import.totals.apply(&mut session);
+            #[cfg(feature = "goal")]
+            if let Some(goal) = &import.goal {
+                let goal = goal.restore(crate::extras::goal::GoalDefaults {
+                    cfg,
+                    provider: &session.provider,
+                    model: &session.model,
+                })?;
+                session
+                    .goal_store
+                    .set(goal, true)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
             }
             Ok(session)
         }
@@ -785,14 +813,9 @@ mod import_tests {
         assert_eq!(imported.provider, exported.provider);
         assert_eq!(imported.model, exported.model);
         assert_eq!(imported.created_at, exported.created_at);
-        assert_eq!(
-            imported.context_window,
-            cfg.resolve_context_window(
-                &exported.provider,
-                &exported.model,
-                &crate::config::quick_models_map(&cfg)
-            )
-        );
+        // Nothing here knows `source-model`, so the window the export
+        // recorded beats the generic fallback.
+        assert_eq!(imported.context_window, 64_000);
         assert_eq!(Path::new(imported.working_dir.as_str()), workspace);
         assert_eq!(imported.messages.len(), exported.messages.len());
         for (imported, original) in imported.messages.iter().zip(&exported.messages) {
@@ -805,6 +828,76 @@ mod import_tests {
         let reloaded: Session = serde_json::from_str(&persisted).unwrap();
         assert_eq!(reloaded.id, exported.id);
         assert_eq!(reloaded.messages.len(), exported.messages.len());
+    }
+
+    /// A JSONL export round-trips its goal and its totals rather than
+    /// importing as a fresh, goal-less session that never spent anything
+    /// (mini-agent-5955n).
+    #[test]
+    fn session_jsonl_import_restores_the_goal_and_totals() {
+        let mut exported = Session::new("openrouter", "source-model", 64_000, "with goal");
+        exported.add_message(MessageRole::User, "first");
+        exported.total_input_tokens = 1_200;
+        exported.total_output_tokens = 340;
+        exported.total_cached_input_tokens = 50;
+        exported.total_real_input_tokens = 1_150;
+        exported.total_cost = 0.42;
+        #[cfg(feature = "goal")]
+        {
+            let mut goal = crate::extras::goal::Goal::new(
+                "retire the legacy exporter",
+                vec!["tests pass".into()],
+            )
+            .unwrap();
+            goal.checks
+                .push(crate::extras::goal::GoalCheck::new("never-exported"));
+            goal.status = crate::extras::goal::GoalStatus::Paused;
+            goal.paused_reason = Some(crate::extras::goal::PauseReason::NoProgress);
+            goal.progress.rounds = 7;
+            goal.progress.tokens_used = 9_000;
+            goal.progress.active_secs = 120;
+            exported.goal_store.set(goal, false).unwrap();
+        }
+        let jsonl = session_to_jsonl(&exported).unwrap();
+
+        let current = Session::new("current-provider", "current-model", 128_000, "current");
+        let cfg = Config::default();
+        let imported =
+            parse_imported_session(&jsonl, &current, &cfg, Path::new("active-workspace")).unwrap();
+        assert_eq!(imported.total_input_tokens, 1_200);
+        assert_eq!(imported.total_output_tokens, 340);
+        assert_eq!(imported.total_cached_input_tokens, 50);
+        assert_eq!(imported.total_real_input_tokens, 1_150);
+        assert!((imported.total_cost - 0.42).abs() < 1e-9);
+
+        #[cfg(feature = "goal")]
+        {
+            let goal = imported.goal_store.snapshot().expect("the goal imports");
+            assert_eq!(goal.objective, "retire the legacy exporter");
+            assert_eq!(goal.criteria, vec!["tests pass".to_string()]);
+            assert_eq!(goal.status, crate::extras::goal::GoalStatus::Paused);
+            assert_eq!(
+                goal.paused_reason,
+                Some(crate::extras::goal::PauseReason::NoProgress)
+            );
+            assert_eq!(goal.progress.rounds, 7);
+            assert_eq!(goal.progress.tokens_used, 9_000);
+            assert_eq!(goal.progress.active_secs, 120);
+            // Checks come from this installation, never from the file.
+            assert!(goal.checks.is_empty(), "{:?}", goal.checks);
+
+            // A status this build does not know parks the goal.
+            let tampered = jsonl.replace("\"status\":\"paused\"", "\"status\":\"exploded\"");
+            let imported =
+                parse_imported_session(&tampered, &current, &cfg, Path::new("active-workspace"))
+                    .unwrap();
+            let goal = imported.goal_store.snapshot().unwrap();
+            assert_eq!(goal.status, crate::extras::goal::GoalStatus::Paused);
+            assert_eq!(
+                goal.paused_reason,
+                Some(crate::extras::goal::PauseReason::UnknownStatusOnLoad)
+            );
+        }
     }
 
     #[test]

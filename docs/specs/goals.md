@@ -270,6 +270,10 @@ flags applies them afterwards, so a flag always beats the file it overrides.
 - **Hooks**: the `Stop` envelope carries the goal id, status, and round, published from the moment a
   goal is set rather than from its first gate decision; null without a goal, and after one is
   cleared or the session is switched.
+- **Export**: a JSONL export carries the goal's objective, criteria, status, pause reason and
+  progress counters, and `/import` restores them. The imported goal is rebuilt through the same
+  factory as every other surface, so its checks, judge and bounds are the importing installation's;
+  a file cannot bring commands or a judge endpoint with it.
 - **Transcripts**: one bounded JSON record per gate evaluation under the goals directory, naming
   which model judged and whether it was the agent's own. A stored goal id that is not a plain
   identifier is reissued rather than used as a path. `--no-session` writes none: the records are
