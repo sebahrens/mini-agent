@@ -8,6 +8,7 @@ mod decorator_tests;
 mod dispatcher_tests;
 mod envelope_tests;
 mod normalize_tests;
+mod pins_tests;
 mod prompt_gate_tests;
 mod session_lifecycle_tests;
 mod settings_tests;
