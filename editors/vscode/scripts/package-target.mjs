@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createVSIX } from '@vscode/vsce';
 import { TARGETS, verifyBinary } from './platform.mjs';
@@ -20,6 +20,15 @@ if (manifest.version !== cargoVersion) {
 }
 
 const binaryPath = resolve(cwd, 'bin', target, targetInfo.binary);
+// The native executable's Rust dependency notices travel with it: the release
+// workflow extracts THIRD_PARTY_LICENSES from the same archive as the binary.
+const inventoryPath = resolve(cwd, 'bin', target, 'THIRD_PARTY_LICENSES');
+if (!existsSync(inventoryPath)) {
+  throw new Error(`Missing ${inventoryPath}: generate it with scripts/third_party_licenses.py or extract it from the release archive.`);
+}
+if (!readFileSync(inventoryPath, 'utf8').startsWith('mini-agent third-party license inventory\n')) {
+  throw new Error(`${inventoryPath} is not a generated third-party license inventory.`);
+}
 const binary = readFileSync(binaryPath);
 verifyBinary(binary, target);
 if (targetInfo.format !== 'pe') { chmodSync(binaryPath, 0o755); }
@@ -57,6 +66,7 @@ writeFileSync(ignoreFile, [
   '!bin/',
   `!bin/${target}/`,
   `!bin/${target}/${targetInfo.binary}`,
+  `!bin/${target}/THIRD_PARTY_LICENSES`,
   '',
 ].join('\n'), 'utf8');
 try {

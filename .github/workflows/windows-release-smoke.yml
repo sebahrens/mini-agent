@@ -30,10 +30,15 @@ jobs:
       - name: Build and package the exact default-feature release archive
         run: |
           cargo build --locked --release --target "$RELEASE_TARGET"
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py generate \
+            --target "$RELEASE_TARGET" \
+            --output target/third-party/full/THIRD_PARTY_LICENSES
           python3 scripts/package-release-binary.py \
             --binary "target/$RELEASE_TARGET/release/${CANONICAL_BINARY}.exe" \
             --archive "${CANONICAL_BINARY}-${RELEASE_TARGET}.tar.gz" \
-            --executable-name "${CANONICAL_BINARY}.exe"
+            --executable-name "${CANONICAL_BINARY}.exe" \
+            --third-party-licenses target/third-party/full/THIRD_PARTY_LICENSES
 
       - name: Upload the private archive candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -59,6 +64,14 @@ jobs:
           name: windows-release-archive-candidate
           path: smoke-input
 
+      - name: Install Rust for the license inventory check
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.96.0"
+
+      - name: Fetch locked crate metadata
+        run: cargo fetch --locked
+
       - name: Extract, install-smoke, and checksum the exact archive
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -68,7 +81,9 @@ jobs:
             --archive "smoke-input/$archive" \
             --executable-name "${CANONICAL_BINARY}.exe" \
             --expected-version "$version" \
-            --expect-js yes
+            --expect-js yes \
+            --inventory-target "$RELEASE_TARGET" \
+            --inventory-features default
           printf '%s\n' "$archive" > expected-windows-archive.txt
           python3 scripts/release_artifacts.py manifest \
             --root smoke-input \

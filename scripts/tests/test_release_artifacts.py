@@ -16,6 +16,69 @@ assert SPEC is not None and SPEC.loader is not None
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
 ROOT = Path(__file__).parents[2]
+TARGET = "x86_64-unknown-linux-gnu"
+
+
+def inventory(
+    packages: list[tuple[str, str]],
+    *,
+    target: str = TARGET,
+    features: str = "default",
+) -> bytes:
+    lines = [
+        "mini-agent third-party license inventory",
+        "========================================",
+        "Format: mini-agent-third-party-licenses/1",
+        "Binary: mini-agent 1.8.0",
+        f"Target: {target}",
+        f"Features: {features}",
+        f"Packages: {len(set(packages))}",
+        "",
+        "Packages",
+        "--------",
+        "",
+    ]
+    for name, version in packages:
+        lines += [f"Package: {name} {version}", "License: MIT", ""]
+    return "\n".join(lines).encode("utf-8")
+
+
+def metadata(packages: list[tuple[str, str]]) -> dict:
+    root = "path+file:///repo#mini-agent@1.8.0"
+    entries = [
+        {"id": root, "name": "mini-agent", "version": "1.8.0", "manifest_path": "/repo/Cargo.toml"}
+    ]
+    for name, version in packages:
+        entries.append(
+            {
+                "id": f"registry+https://github.com/rust-lang/crates.io-index#{name}@{version}",
+                "name": name,
+                "version": version,
+                "license": "MIT",
+                "manifest_path": f"/registry/{name}-{version}/Cargo.toml",
+            }
+        )
+    return {
+        "packages": entries,
+        "workspace_members": [root],
+        "resolve": {"root": root, "nodes": [{"id": entry["id"]} for entry in entries]},
+    }
+
+
+RESOLVED = [("ahash", "0.8.12"), ("rquickjs-sys", "0.12.2")]
+INVENTORY = inventory(RESOLVED)
+
+
+def resolved_metadata(target: str, no_default_features: bool) -> dict:
+    del target, no_default_features
+    return metadata(RESOLVED)
+
+
+SMOKE_INVENTORY = {
+    "inventory_target": TARGET,
+    "inventory_features": "default",
+    "metadata_loader": resolved_metadata,
+}
 
 
 class ReleaseArtifactManifestTests(unittest.TestCase):
@@ -32,6 +95,13 @@ class ReleaseArtifactManifestTests(unittest.TestCase):
         self.assertIn("python3 scripts/release_artifacts.py smoke", workflow)
         self.assertIn('--expected-version "$version"', workflow)
         self.assertIn("--expect-js yes", workflow)
+        self.assertIn("python3 scripts/third_party_licenses.py generate", workflow)
+        self.assertIn(
+            "--third-party-licenses target/third-party/full/THIRD_PARTY_LICENSES",
+            workflow,
+        )
+        self.assertIn('--inventory-target "$RELEASE_TARGET"', workflow)
+        self.assertIn("--inventory-features default", workflow)
         self.assertIn("python3 scripts/release_artifacts.py manifest", workflow)
         self.assertIn("python3 scripts/release_artifacts.py verify", workflow)
         self.assertIn("contents: read", workflow)
@@ -40,6 +110,46 @@ class ReleaseArtifactManifestTests(unittest.TestCase):
         smoke_job = workflow.split("  smoke-windows-release-artifact:", 1)[1]
         self.assertNotIn("cargo build", smoke_job)
         self.assertNotIn("cargo install", smoke_job)
+
+    def test_release_workflow_ships_and_checks_a_per_build_inventory(self) -> None:
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        # Each of the three build jobs generates a full and a lite inventory
+        # for its matrix target, and every archive packages the matching one.
+        self.assertEqual(3, workflow.count("- name: Generate third-party license inventories"))
+        self.assertEqual(
+            3,
+            workflow.count(
+                "--no-default-features \\\n"
+                "            --output target/third-party/lite/THIRD_PARTY_LICENSES"
+            ),
+        )
+        self.assertEqual(
+            6,
+            workflow.count("python3 scripts/package-release-binary.py"),
+        )
+        self.assertEqual(
+            3,
+            workflow.count(
+                '--third-party-licenses "target/third-party/full/THIRD_PARTY_LICENSES"'
+            ),
+        )
+        self.assertEqual(
+            3,
+            workflow.count(
+                '--third-party-licenses "target/third-party/lite/THIRD_PARTY_LICENSES"'
+            ),
+        )
+        smoke_job = workflow.split("  archive-smoke:", 1)[1].split("\n  checksums:", 1)[0]
+        self.assertIn("cargo fetch --locked", smoke_job)
+        self.assertEqual(2, smoke_job.count('--inventory-target "$RELEASE_TARGET"'))
+        self.assertIn("--expect-js \"$JS_EXPECTATION\" \\\n            --inventory-target", smoke_job)
+        self.assertIn("--inventory-features default", smoke_job)
+        self.assertIn(
+            "--expect-js no \\\n"
+            '            --inventory-target "$RELEASE_TARGET" \\\n'
+            "            --inventory-features no-default",
+            smoke_job,
+        )
 
     def test_windows_smoke_uses_existing_local_per_user_install_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +255,7 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("LICENSE", b"license", 0o644),
                     ("NOTICE", b"notice", 0o644),
                     ("SOURCE.md", b"source", 0o644),
+                    ("THIRD_PARTY_LICENSES", INVENTORY, 0o644),
                 ],
             )
             RELEASE._validate_archive_members(archive, "mini-agent")
@@ -155,6 +266,7 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
             ("LICENSE", b"license", 0o644),
             ("NOTICE", b"notice", 0o644),
             ("SOURCE.md", b"source", 0o644),
+            ("THIRD_PARTY_LICENSES", INVENTORY, 0o644),
         ]
         variants = (
             valid[:-1],
@@ -186,9 +298,12 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("LICENSE", b"license", 0o644),
                     ("NOTICE", b"notice", 0o644),
                     ("SOURCE.md", b"source", 0o644),
+                    ("THIRD_PARTY_LICENSES", INVENTORY, 0o644),
                 ],
             )
-            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", "yes")
+            RELEASE.smoke_archive(
+                archive, "mini-agent", "1.8.0", "yes", **SMOKE_INVENTORY
+            )
 
     @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
     def test_full_archive_can_require_a_closed_unavailable_js_runtime(self) -> None:
@@ -208,10 +323,11 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("LICENSE", b"license", 0o644),
                     ("NOTICE", b"notice", 0o644),
                     ("SOURCE.md", b"source", 0o644),
+                    ("THIRD_PARTY_LICENSES", INVENTORY, 0o644),
                 ],
             )
             RELEASE.smoke_archive(
-                archive, "mini-agent", "1.8.0", "unavailable"
+                archive, "mini-agent", "1.8.0", "unavailable", **SMOKE_INVENTORY
             )
 
     @unittest.skipIf(RELEASE.os.name == "nt", "fixture is a POSIX shell executable")
@@ -232,6 +348,7 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("LICENSE", b"license", 0o644),
                     ("NOTICE", b"notice", 0o644),
                     ("SOURCE.md", b"source", 0o644),
+                    ("THIRD_PARTY_LICENSES", INVENTORY, 0o644),
                 ],
             )
 
@@ -239,8 +356,101 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                 RELEASE.ReleaseArtifactError, "did not fail closed as unavailable"
             ):
                 RELEASE.smoke_archive(
-                    archive, "mini-agent", "1.8.0", "unavailable"
+                    archive, "mini-agent", "1.8.0", "unavailable", **SMOKE_INVENTORY
                 )
+
+    def base_members(self, contents: bytes) -> list[tuple[str, bytes, int]]:
+        return [
+            ("mini-agent", b"binary", 0o755),
+            ("LICENSE", b"license", 0o644),
+            ("NOTICE", b"notice", 0o644),
+            ("SOURCE.md", b"source", 0o644),
+            ("THIRD_PARTY_LICENSES", contents, 0o644),
+        ]
+
+    def test_archive_without_third_party_inventory_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = self.archive(directory, self.base_members(INVENTORY)[:-1])
+            with self.assertRaisesRegex(RELEASE.ReleaseArtifactError, "payload mismatch"):
+                RELEASE._validate_archive_members(archive, "mini-agent")
+
+    def test_inventory_names_every_resolved_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = self.archive(directory, self.base_members(INVENTORY))
+            count = RELEASE.verify_third_party_inventory(
+                archive,
+                target=TARGET,
+                features="default",
+                metadata_loader=resolved_metadata,
+            )
+        self.assertEqual(2, count)
+
+    def test_inventory_missing_a_resolved_package_fails(self) -> None:
+        def loader(target: str, no_default_features: bool) -> dict:
+            self.assertEqual(TARGET, target)
+            self.assertFalse(no_default_features)
+            return metadata([*RESOLVED, ("ring", "0.17.14")])
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = self.archive(directory, self.base_members(INVENTORY))
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseArtifactError, "omits 1 resolved package.*ring 0.17.14"
+            ):
+                RELEASE.verify_third_party_inventory(
+                    archive, target=TARGET, features="default", metadata_loader=loader
+                )
+
+    def test_inventory_for_another_target_or_feature_set_fails(self) -> None:
+        cases = (
+            (inventory(RESOLVED, target="aarch64-apple-darwin"), "default", "target"),
+            (inventory(RESOLVED), "no-default", "features"),
+            (b"MIT License\n", "default", "unrecognised header"),
+        )
+        for contents, features, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                archive = self.archive(directory, self.base_members(contents))
+                with self.assertRaisesRegex(RELEASE.ReleaseArtifactError, message):
+                    RELEASE.verify_third_party_inventory(
+                        archive,
+                        target=TARGET,
+                        features=features,
+                        metadata_loader=resolved_metadata,
+                    )
+
+    def test_lite_inventory_is_checked_against_the_no_default_resolution(self) -> None:
+        requests: list[tuple[str, bool]] = []
+
+        def loader(target: str, no_default_features: bool) -> dict:
+            requests.append((target, no_default_features))
+            return metadata(RESOLVED)
+
+        lite = inventory(RESOLVED, features="--no-default-features")
+        with tempfile.TemporaryDirectory() as directory:
+            archive = self.archive(directory, self.base_members(lite))
+            RELEASE.verify_third_party_inventory(
+                archive, target=TARGET, features="no-default", metadata_loader=loader
+            )
+        self.assertEqual([(TARGET, True)], requests)
+
+    def test_smoke_cli_requires_the_inventory_target_and_feature_set(self) -> None:
+        arguments = [
+            "smoke",
+            "--archive",
+            "a.tar.gz",
+            "--executable-name",
+            "mini-agent",
+            "--expected-version",
+            "1.8.0",
+            "--expect-js",
+            "yes",
+        ]
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                RELEASE.parser().parse_args(arguments)
+        parsed = RELEASE.parser().parse_args(
+            [*arguments, "--inventory-target", TARGET, "--inventory-features", "default"]
+        )
+        self.assertEqual(TARGET, parsed.inventory_target)
 
     def test_windows_failure_diagnostic_reports_only_closed_helper_status(self) -> None:
         completed = subprocess.CompletedProcess([], 68, "", "ignored")
@@ -364,9 +574,18 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
                     ("LICENSE", b"license", 0o644),
                     ("NOTICE", b"notice", 0o644),
                     ("SOURCE.md", b"source", 0o644),
+                    ("THIRD_PARTY_LICENSES", inventory(RESOLVED, features="--no-default-features"), 0o644),
                 ],
             )
-            RELEASE.smoke_archive(archive, "mini-agent", "1.8.0", "no")
+            RELEASE.smoke_archive(
+                archive,
+                "mini-agent",
+                "1.8.0",
+                "no",
+                inventory_target=TARGET,
+                inventory_features="no-default",
+                metadata_loader=resolved_metadata,
+            )
 
 
 if __name__ == "__main__":

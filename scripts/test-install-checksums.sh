@@ -62,12 +62,27 @@ echo '#!/usr/bin/env bash' > "${FIXTURE}/${BINARY_NAME}"
 echo "echo \"mini-agent ${CARGO_VERSION}\"" >> "${FIXTURE}/${BINARY_NAME}"
 chmod +x "${FIXTURE}/${BINARY_NAME}"
 
-# Create the same exact four-file payload as the release workflow.
+# A minimal generated-format inventory stands in for the per-build
+# THIRD_PARTY_LICENSES that release builds produce with third_party_licenses.py.
+printf '%s\n' \
+    'mini-agent third-party license inventory' \
+    '========================================' \
+    'Format: mini-agent-third-party-licenses/1' \
+    "Binary: mini-agent ${CARGO_VERSION}" \
+    'Target: x86_64-unknown-linux-musl' \
+    'Features: default' \
+    'Packages: 1' \
+    '' \
+    'Package: rquickjs-sys 0.12.2' \
+    'License: MIT' > "${FIXTURE}/THIRD_PARTY_LICENSES"
+
+# Create the same exact five-file payload as the release workflow.
 python3 "${ROOT_DIR}/scripts/package-release-binary.py" \
     --root "$ROOT_DIR" \
     --binary "${FIXTURE}/${BINARY_NAME}" \
     --archive "${FIXTURE}/${ARCHIVE}" \
-    --executable-name "$BINARY_NAME"
+    --executable-name "$BINARY_NAME" \
+    --third-party-licenses "${FIXTURE}/THIRD_PARTY_LICENSES"
 if command -v sha256sum >/dev/null 2>&1; then
     GOOD_HASH=$(sha256sum "${FIXTURE}/${ARCHIVE}" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then

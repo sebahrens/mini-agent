@@ -112,6 +112,17 @@ jobs:
           toolchain: "1.96.0"
           target: ${{ matrix.target }}
 
+      - name: Generate third-party license inventories
+        run: |
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --output target/third-party/full/THIRD_PARTY_LICENSES
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --output target/third-party/lite/THIRD_PARTY_LICENSES
+
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
@@ -121,7 +132,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
             --archive "$archive" \
-            --executable-name "$CANONICAL_BINARY"
+            --executable-name "$CANONICAL_BINARY" \
+            --third-party-licenses "target/third-party/full/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -136,7 +148,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
             --archive "$archive" \
-            --executable-name "$CANONICAL_BINARY"
+            --executable-name "$CANONICAL_BINARY" \
+            --third-party-licenses "target/third-party/lite/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/$CANONICAL_BINARY" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -177,6 +190,17 @@ jobs:
         with:
           tool: cross@0.2.5
 
+      - name: Generate third-party license inventories
+        run: |
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --output target/third-party/full/THIRD_PARTY_LICENSES
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --output target/third-party/lite/THIRD_PARTY_LICENSES
+
       - name: Build static binary (${{ matrix.target }})
         run: cross build --locked --release --target ${{ matrix.target }}
 
@@ -186,7 +210,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
             --archive "$archive" \
-            --executable-name "$CANONICAL_BINARY"
+            --executable-name "$CANONICAL_BINARY" \
+            --third-party-licenses "target/third-party/full/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -210,7 +235,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/$CANONICAL_BINARY" \
             --archive "$archive" \
-            --executable-name "$CANONICAL_BINARY"
+            --executable-name "$CANONICAL_BINARY" \
+            --third-party-licenses "target/third-party/lite/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -257,6 +283,17 @@ jobs:
           toolchain: "1.96.0"
           target: ${{ matrix.target }}
 
+      - name: Generate third-party license inventories
+        run: |
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --output target/third-party/full/THIRD_PARTY_LICENSES
+          python3 scripts/third_party_licenses.py generate \
+            --target ${{ matrix.target }} \
+            --no-default-features \
+            --output target/third-party/lite/THIRD_PARTY_LICENSES
+
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
@@ -266,7 +303,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/${CANONICAL_BINARY}.exe" \
             --archive "$archive" \
-            --executable-name "${CANONICAL_BINARY}.exe"
+            --executable-name "${CANONICAL_BINARY}.exe" \
+            --third-party-licenses "target/third-party/full/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -281,7 +319,8 @@ jobs:
           python3 scripts/package-release-binary.py \
             --binary "target/${{ matrix.target }}/release/${CANONICAL_BINARY}.exe" \
             --archive "$archive" \
-            --executable-name "${CANONICAL_BINARY}.exe"
+            --executable-name "${CANONICAL_BINARY}.exe" \
+            --third-party-licenses "target/third-party/lite/THIRD_PARTY_LICENSES"
           smoke_dir="$(mktemp -d)"
           tar xzf "$archive" -C "$smoke_dir"
           "$smoke_dir/${CANONICAL_BINARY}.exe" --version | grep -Fq -- "$CANONICAL_BINARY "
@@ -387,6 +426,17 @@ jobs:
           name: archives-${{ matrix.target }}
           path: smoke-input
 
+      # The smoke checks each archive's THIRD_PARTY_LICENSES against
+      # `cargo metadata --locked --offline` for the archive's target and
+      # feature set, so the locked crate sources must be present.
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.96.0"
+
+      - name: Fetch locked crate metadata
+        run: cargo fetch --locked
+
       - name: Smoke exact full and lite archives
         env:
           RELEASE_VERSION: ${{ needs.package-metadata.outputs.version }}
@@ -398,12 +448,16 @@ jobs:
             --archive "smoke-input/mini-agent-$RELEASE_TARGET.tar.gz" \
             --executable-name "$RELEASE_EXECUTABLE" \
             --expected-version "$RELEASE_VERSION" \
-            --expect-js "$JS_EXPECTATION"
+            --expect-js "$JS_EXPECTATION" \
+            --inventory-target "$RELEASE_TARGET" \
+            --inventory-features default
           python3 scripts/release_artifacts.py smoke \
             --archive "smoke-input/mini-agent-lite-$RELEASE_TARGET.tar.gz" \
             --executable-name "$RELEASE_EXECUTABLE" \
             --expected-version "$RELEASE_VERSION" \
-            --expect-js no
+            --expect-js no \
+            --inventory-target "$RELEASE_TARGET" \
+            --inventory-features no-default
 
   checksums:
     name: SHA256SUMS
@@ -524,7 +578,7 @@ jobs:
             BINARY_NAME="${CANONICAL_BINARY}.exe"
           fi
           tar -xzf "release-input/mini-agent-$RUST_TARGET.tar.gz" \
-            -C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME"
+            -C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME" THIRD_PARTY_LICENSES
 
       - name: Install locked extension dependencies
         working-directory: editors/vscode
@@ -628,12 +682,14 @@ jobs:
             throw "Expected exactly one win32-x64 VSIX, found $($vsixCandidates.Count)"
           }
           $vsix = $vsixCandidates[0].FullName
+          $thirdPartyLicenses = (Resolve-Path msi-input/THIRD_PARTY_LICENSES).Path
           dotnet build packaging/windows/installer.wixproj `
             --configuration Release `
             --output msi-output `
             -p:ProductVersion=$productVersion `
             -p:BinaryPath=$binary `
-            -p:VsixPath=$vsix
+            -p:VsixPath=$vsix `
+            -p:ThirdPartyLicensesPath=$thirdPartyLicenses
           if ($LASTEXITCODE -ne 0) { throw "WiX build failed with exit code $LASTEXITCODE" }
 
       - name: Quiet install, smoke, and uninstall
@@ -650,6 +706,10 @@ jobs:
           }
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\mini-agent\mini-agent.exe'
           if (-not (Test-Path $installed)) { throw "MSI did not install $installed" }
+          foreach ($document in @('LICENSE.txt', 'NOTICE.txt', 'SOURCE.md', 'THIRD_PARTY_LICENSES.txt')) {
+            $installedDocument = Join-Path (Split-Path $installed) $document
+            if (-not (Test-Path $installedDocument)) { throw "MSI did not install $installedDocument" }
+          }
           $version = & $installed --version
           if ($LASTEXITCODE -ne 0 -or $version -notmatch '^mini-agent ') {
             throw "installed MSI binary failed its version smoke"

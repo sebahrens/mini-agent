@@ -37,6 +37,9 @@
         <Component Id="SourceDirectionsComponent" Guid="*" Bitness="always64">
           <File Id="SourceDirections" Source="$(var.RepositoryRoot)\SOURCE.md" />
         </Component>
+        <Component Id="ThirdPartyLicensesComponent" Guid="*" Bitness="always64">
+          <File Id="ThirdPartyLicenses" Source="$(var.ThirdPartyLicensesPath)" Name="THIRD_PARTY_LICENSES.txt" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
@@ -47,6 +50,7 @@
       <ComponentRef Id="LicenseTextComponent" />
       <ComponentRef Id="NoticeTextComponent" />
       <ComponentRef Id="SourceDirectionsComponent" />
+      <ComponentRef Id="ThirdPartyLicensesComponent" />
     </Feature>
 
     <SetProperty

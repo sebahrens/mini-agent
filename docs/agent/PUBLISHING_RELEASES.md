@@ -11,9 +11,9 @@ GitHub assets, and updating downstream package managers.
 
 Cargo and every package channel install the public executable as `mini-agent`. Full archives are
 named `mini-agent-<target>.tar.gz`; lite archives are named
-`mini-agent-lite-<target>.tar.gz`. Every binary archive contains exactly four top-level files:
-`mini-agent` (or `mini-agent.exe`), `LICENSE`, `NOTICE`, and `SOURCE.md`. The release workflow checks
-that exact payload, extracts it into a clean directory, and runs the executable with `--version`
+`mini-agent-lite-<target>.tar.gz`. Every binary archive contains exactly five top-level files:
+`mini-agent` (or `mini-agent.exe`), `LICENSE`, `NOTICE`, `SOURCE.md`, and `THIRD_PARTY_LICENSES`.
+The release workflow checks that exact payload, extracts it into a clean directory, and runs the executable with `--version`
 before upload. A second clean-runner gate downloads each exact private archive on its native
 platform. Full archives must pass the offline `--js-runtime-check` (`1 + 1` evaluates to `2`) on a
 validated containment host. The Intel archive runs on GitHub's macOS 15 runner, where the normative
@@ -26,6 +26,58 @@ cross-platform archives and keep their platform-specific installation requiremen
 archive-smoke runners install Bubblewrap and enable the hosted runner's
 unprivileged-user-namespace boundary before executing the production runtime check; omitting either
 prerequisite must fail the release metadata policy check.
+
+### Third-party license inventory
+
+`THIRD_PARTY_LICENSES` is generated per archive by `scripts/third_party_licenses.py` (standard-library
+Python, no external tool) from `cargo metadata --locked --offline --format-version 1
+--filter-platform <target>`, with `--no-default-features` for lite archives. It names every package
+of that locked resolution other than mini-agent itself, including build-time tools and test-only
+packages, with its version, declared license expression, and the verbatim license, copyright, and
+NOTICE files it ships; identical texts are printed once and referenced. `*-sys` and `*-src` crates
+also contribute the license files of the native trees they vendor (for example QuickJS in
+`rquickjs-sys` and OpenSSL in `openssl-src`). A package that ships no license file receives the
+canonical text of its declared license from `packaging/license-texts/`; generation fails when no
+such text exists, so a new dependency cannot ship without its notice. A pinned third-party tool was
+not used because `cargo-bundle-licenses` (already used by the Conda source recipe for
+`THIRDPARTY.yml`) cannot select a target or disable default features, omits build-script crates that
+compile vendored C into the binary, and reports "NOT FOUND" for crates without a license file.
+
+Each build job generates the full and lite inventories for its target before packaging, and
+`scripts/package-release-binary.py` requires the generated format. The archive smoke then re-runs
+`cargo metadata --locked --offline` for the archive's target and feature set on the clean runner and
+fails unless the packaged inventory names every resolved package:
+
+```bash
+python3 scripts/third_party_licenses.py generate --target x86_64-unknown-linux-gnu \
+  --output THIRD_PARTY_LICENSES
+python3 scripts/third_party_licenses.py verify --target x86_64-unknown-linux-gnu \
+  --inventory THIRD_PARTY_LICENSES
+python3 scripts/release_artifacts.py smoke --archive mini-agent-x86_64-unknown-linux-gnu.tar.gz \
+  --executable-name mini-agent --expected-version <version> --expect-js yes \
+  --inventory-target x86_64-unknown-linux-gnu --inventory-features default
+```
+
+`NOTICE` additionally names QuickJS and the rquickjs bindings explicitly with their MIT texts. The
+shell installer installs the inventory to `share/doc/mini-agent/`, Homebrew to `pkgshare`, AUR and
+the Conda binary recipe to `share/licenses/<package>/` (Conda also lists it as a `license_file`),
+the Conda source recipe generates it for its host target, the MSI installs it as
+`THIRD_PARTY_LICENSES.txt`, and each VSIX carries it next to its native binary as
+`bin/<target>/THIRD_PARTY_LICENSES`.
+
+The first release that ships the inventory is 1.9.5 (`FIRST_INVENTORY_RELEASE` in `install.sh`).
+Until then the latest published release and the checked-in Homebrew, AUR, and Conda recipes still
+point at archives without it, so the rollout is guarded: `install.sh` requires the inventory only
+for archives of 1.9.5 or later (the requested `--release`, or for `latest` the version the verified
+executable reports; an unreadable version keeps it required) and otherwise installs with the
+warning "this release predates the bundled third-party licence inventory";
+`scripts/smoke-canonical-installer.sh` applies the same rule; and the recipes install the file only
+when the archive contains it (the Conda source recipe generates it only when the source archive
+contains `scripts/third_party_licenses.py`), so neither Conda recipe lists it as a `license_file` or
+tests for it yet. `scripts/smoke-package-compliance.py` stages every recipe with and without the
+inventory. Once 1.9.5 has shipped and every recipe pins it or later, drop these guards: make the
+recipe installs unconditional, restore the Conda `license_file` and `test -f` entries, and remove
+the version tolerance from the installer and the canonical installer smoke.
 
 The manually dispatched `Windows release archive smoke` workflow is the non-publishing audit path
 for the Windows default-feature archive. It builds the documented target, transfers the exact
@@ -122,9 +174,11 @@ python3 scripts/smoke-package-compliance.py \
 The package-compliance smoke is offline. It first verifies the exact canonical GPL-3.0-only
 `LICENSE` digest, then executes the checked-in AUR and Conda install scripts
 with controlled command shims, executes the Homebrew formula's `install` method through a minimal
-Ruby DSL harness, and compares the staged `LICENSE`, `NOTICE`, and `SOURCE.md` bytes with the
-repository originals. The Conda source smoke also executes the recipe's declared binary checks and
-proves the generated third-party license inventory reaches `${PREFIX}/THIRDPARTY.yml`. CI runs
+Ruby DSL harness, and compares the staged `LICENSE`, `NOTICE`, `SOURCE.md`, and
+`THIRD_PARTY_LICENSES` bytes with the payload originals (the inventory is a generated-format
+fixture, since the real one is produced per release build). The Conda source smoke also executes the recipe's declared binary checks and
+proves the generated third-party license inventories reach `${PREFIX}/THIRDPARTY.yml` and
+`${PREFIX}/share/doc/zerostack/THIRD_PARTY_LICENSES`. CI runs
 Linux-only recipes on Ubuntu and the Homebrew formula on macOS.
 
 ## Quick start
@@ -281,7 +335,9 @@ workflow. Both consumers of the release therefore check provenance as well as th
 
 Before treating a release as complete, verify that:
 
-- every binary archive has only the executable, `LICENSE`, `NOTICE`, and `SOURCE.md`;
+- every binary archive has only the executable, `LICENSE`, `NOTICE`, `SOURCE.md`, and a
+  `THIRD_PARTY_LICENSES` that names every package of its target's locked resolution;
+- `NOTICE` names QuickJS and rquickjs with their MIT texts;
 - `NOTICE` identifies the imported ZeroStack commit and the date mini-agent modifications began;
 - the same release contains the source asset named by `SOURCE.md`;
 - the source asset contains the tagged tree, locked vendored dependencies, and offline Cargo config;
@@ -289,8 +345,11 @@ Before treating a release as complete, verify that:
 - `VSIX_SHA256SUMS` and `MSI_SHA256SUMS` cover the editor and Windows installer artifacts;
 - every published asset has repository-linked SLSA build provenance that `gh attestation verify`
   accepts;
-- the MSI installs `LICENSE.txt`, `NOTICE.txt`, and `SOURCE.md` beside its binary and VSIX; and
-- the shell installer and downstream recipes install `NOTICE` and `SOURCE.md` alongside the GPL text.
+- the MSI installs `LICENSE.txt`, `NOTICE.txt`, `SOURCE.md`, and `THIRD_PARTY_LICENSES.txt` beside
+  its binary and VSIX;
+- each VSIX carries `bin/<target>/THIRD_PARTY_LICENSES` next to its native binary; and
+- the shell installer and downstream recipes install `NOTICE`, `SOURCE.md`, and
+  `THIRD_PARTY_LICENSES` alongside the GPL text.
 
 For an older noncompliant release, attach its exact vendored source bundle, standalone compliance
 documents, and a prominent release-note correction before leaving its binary assets available.

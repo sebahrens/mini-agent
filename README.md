@@ -464,7 +464,8 @@ target. Do not use `cargo build`, `cargo check`, or development `--release` buil
 ## License and upstream
 
 mini-agent is licensed under [GPL-3.0-only](LICENSE). Binary releases include the dated
-[upstream and modification notice](NOTICE) plus [exact Corresponding Source directions](SOURCE.md).
+[upstream and modification notice](NOTICE) plus [exact Corresponding Source directions](SOURCE.md),
+and a generated `THIRD_PARTY_LICENSES` inventory of the bundled Rust crates and their license texts.
 It is built from the excellent
 [ZeroStack](https://github.com/gi-dellav/zerostack) project and preserves its preference for a small,
 fast, understandable native agent.

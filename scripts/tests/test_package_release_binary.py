@@ -15,6 +15,21 @@ assert SPEC is not None and SPEC.loader is not None
 PACKAGE_RELEASE_BINARY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGE_RELEASE_BINARY)
 
+INVENTORY = """mini-agent third-party license inventory
+========================================
+Format: mini-agent-third-party-licenses/1
+Binary: mini-agent 0.0.0
+Target: x86_64-unknown-linux-gnu
+Features: default
+Packages: 1
+
+Packages
+--------
+
+Package: example 1.0.0
+License: MIT
+"""
+
 
 class PackageReleaseBinaryTests(unittest.TestCase):
     def test_required_legal_documents_are_checked_out_with_lf_on_windows(self) -> None:
@@ -28,6 +43,7 @@ class PackageReleaseBinaryTests(unittest.TestCase):
         shutil.copyfile(repository / "LICENSE", root / "LICENSE")
         for name in ("NOTICE", "SOURCE.md"):
             (root / name).write_text(f"{name}\n", encoding="utf-8")
+        (root / "inventory").write_text(INVENTORY, encoding="utf-8")
         return root
 
     def test_archive_has_only_executable_and_required_gpl_documents(self) -> None:
@@ -43,12 +59,16 @@ class PackageReleaseBinaryTests(unittest.TestCase):
                 binary=binary,
                 archive=archive,
                 executable_name="mini-agent",
+                third_party_licenses=root / "inventory",
             )
 
             with tarfile.open(archive, "r:gz") as packaged:
                 members = packaged.getmembers()
+                inventory = packaged.extractfile("THIRD_PARTY_LICENSES")
+                assert inventory is not None
+                self.assertEqual(INVENTORY.encode("utf-8"), inventory.read())
             self.assertEqual(
-                ["mini-agent", "LICENSE", "NOTICE", "SOURCE.md"],
+                ["mini-agent", "LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"],
                 [member.name for member in members],
             )
             self.assertTrue(all(member.isfile() for member in members))
@@ -67,6 +87,7 @@ class PackageReleaseBinaryTests(unittest.TestCase):
                 binary=binary,
                 archive=archive,
                 executable_name="mini-agent.exe",
+                third_party_licenses=root / "inventory",
             )
 
             with tarfile.open(archive, "r:gz") as packaged:
@@ -85,7 +106,42 @@ class PackageReleaseBinaryTests(unittest.TestCase):
                     binary=binary,
                     archive=root / "release.tar.gz",
                     executable_name="mini-agent",
+                    third_party_licenses=root / "inventory",
                 )
+
+    def test_missing_third_party_inventory_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            (root / "inventory").unlink()
+            binary = root / "mini-agent"
+            binary.write_bytes(b"binary")
+
+            with self.assertRaisesRegex(ValueError, "THIRD_PARTY_LICENSES"):
+                PACKAGE_RELEASE_BINARY.package_binary(
+                    root=root,
+                    binary=binary,
+                    archive=root / "release.tar.gz",
+                    executable_name="mini-agent",
+                    third_party_licenses=root / "inventory",
+                )
+            self.assertFalse((root / "release.tar.gz").exists())
+
+    def test_arbitrary_file_is_not_accepted_as_the_inventory(self) -> None:
+        for text in ("", "MIT License\n", INVENTORY.replace("Packages: 1", "Packages: 2")):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                root = self.make_root(directory)
+                (root / "inventory").write_text(text, encoding="utf-8")
+                binary = root / "mini-agent"
+                binary.write_bytes(b"binary")
+
+                with self.assertRaisesRegex(ValueError, "generated inventory"):
+                    PACKAGE_RELEASE_BINARY.package_binary(
+                        root=root,
+                        binary=binary,
+                        archive=root / "release.tar.gz",
+                        executable_name="mini-agent",
+                        third_party_licenses=root / "inventory",
+                    )
 
     def test_modified_license_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +156,7 @@ class PackageReleaseBinaryTests(unittest.TestCase):
                     binary=binary,
                     archive=root / "release.tar.gz",
                     executable_name="mini-agent",
+                    third_party_licenses=root / "inventory",
                 )
 
     def test_unsafe_executable_name_is_rejected(self) -> None:
@@ -114,6 +171,7 @@ class PackageReleaseBinaryTests(unittest.TestCase):
                     binary=binary,
                     archive=root / "release.tar.gz",
                     executable_name="../mini-agent",
+                    third_party_licenses=root / "inventory",
                 )
 
 

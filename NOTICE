@@ -20,6 +20,70 @@ SOURCE.md for access to the exact Corresponding Source of release binaries.
 
 Third-party software embedded in the mini-agent executable
 
+Every release archive, package, installer, and VS Code extension also ships
+THIRD_PARTY_LICENSES: the generated inventory of every Rust crate in the
+locked dependency resolution of that binary's target and feature set, with
+each crate's version, license expression, and verbatim license, copyright,
+and NOTICE files. The components below are called out here as well because
+they are not ordinary Rust crates.
+
+QuickJS (https://github.com/quickjs-ng/quickjs), the JavaScript engine, is
+compiled into builds with the `js` feature (the default build) from the C
+sources vendored by the rquickjs-sys 0.12.2 crate (QuickJS-ng 0.15.1). It is
+distributed under the MIT License:
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2026 Fabrice Bellard
+Copyright (c) 2017-2024 Charlie Gordon
+Copyright (c) 2023-2026 Ben Noordhuis
+Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+rquickjs 0.12.2 (https://github.com/DelSkayn/rquickjs), including the
+rquickjs-core and rquickjs-sys crates, provides the Rust bindings to QuickJS.
+It is distributed under the MIT License:
+
+MIT License
+
+Copyright (c) 2020 Mees Delzenne
+Copyright (c) 2025 Rquickjs Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 AJV 8.12.0 (https://github.com/ajv-validator/ajv), Copyright (c) 2015-2021
 Evgeny Poberezkin, is embedded in the binary from
 src/extras/js/vendor/ and provides JSON Schema validation inside private

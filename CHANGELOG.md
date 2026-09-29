@@ -152,6 +152,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   protocol": effects after an accepted result are denied inside the worker without reaching the
   parent or its audit log, and the accepted value is returned. A `result(...)` step also keeps the
   warm JS worker instead of forcing a cold relaunch on the next call.
+- Binary distributions now carry the license notices of their bundled Rust crates: every release
+  archive ships a generated `THIRD_PARTY_LICENSES` naming each package of its target's locked
+  dependency resolution with its license and verbatim license texts, the installer, Homebrew, AUR,
+  Conda, MSI and VSIX install it, and `NOTICE` now credits QuickJS and rquickjs with their MIT texts.
+  Releases before 1.9.5 predate the inventory: `install.sh` and the package recipes still install
+  them, and the installer warns that the inventory is absent.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

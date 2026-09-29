@@ -18,6 +18,7 @@ requirements:
     - "{{ compiler('c') }}"
     - "{{ compiler('rust') }}"
     - cargo-bundle-licenses
+    - python
     - cargo-auditable
 
 test:
