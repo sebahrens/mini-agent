@@ -491,6 +491,8 @@ one JSON object, which carries the extra `note` and `next_command` fields.
 | `Home / End` | Move to the start/end of the current input line. With an empty input (or while a picker is open) they jump to the top/bottom of chat history instead. |
 | `Ctrl+Home / Ctrl+End` | Jump to the top/bottom of chat history. |
 | `Escape` | Close active picker / cancel. |
+| `Left / Right / Delete` in a picker | Close the picker (the typed text stays) and move or delete as in plain text. Clicking elsewhere in the input does the same. |
+| Paste | Bracketed paste and `Ctrl+V` insert at the cursor. Pasted `\r` and `\r\n` line endings become newlines, tabs become four spaces, and escape sequences and other control characters are dropped. |
 | Mouse drag | Select transcript lines and copy them on release. A plain click (no drag) never copies. Set `mouse_capture = false` to leave the mouse to the terminal's native selection. |
 | Mouse scroll | Scroll chat history. |
 

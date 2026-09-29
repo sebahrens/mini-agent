@@ -229,6 +229,71 @@ fn read_editor_text(reader: impl std::io::Read) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// Spaces a pasted tab expands to. The input box draws a tab as zero width,
+/// so it is expanded rather than kept.
+const PASTE_TAB_WIDTH: usize = 4;
+
+/// Make pasted text safe for the input buffer: line endings become `\n`
+/// (iTerm2 and VTE send pasted newlines as `\r`), tabs expand to spaces, and
+/// escape sequences and other control characters are dropped so they can
+/// neither reach the terminal when the prompt is drawn nor the model.
+pub(crate) fn sanitize_paste(data: &str) -> String {
+    let mut out = String::with_capacity(data.len());
+    let mut chars = data.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.extend(std::iter::repeat_n(' ', PASTE_TAB_WIDTH)),
+            '\x1b' => skip_escape_sequence(&mut chars),
+            // C1 CSI and OSC introducers start sequences as well.
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{9d}' => skip_string_sequence(&mut chars),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    // Parameters and intermediates, then one final byte in 0x40..=0x7E.
+    for c in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&c) {
+            break;
+        }
+    }
+}
+
+/// OSC/DCS/APC/PM/SOS bodies end with BEL or ST (`ESC \` or U+009C).
+fn skip_string_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(c) = chars.next() {
+        match c {
+            '\x07' | '\u{9c}' => break,
+            '\x1b' => {
+                chars.next_if_eq(&'\\');
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => skip_csi(chars),
+        Some(']' | 'P' | '_' | '^' | 'X') => skip_string_sequence(chars),
+        // Intermediate bytes (e.g. `ESC ( B`) take one more final byte.
+        Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+            chars.next();
+        }
+        _ => {}
+    }
+}
+
 const MAX_KILL_RING: usize = 30;
 const MAX_PICKER_PASTE_CHARS: usize = 256;
 
@@ -561,6 +626,10 @@ impl InputEditor {
     }
 
     pub fn handle_paste(&mut self, data: String) {
+        let data = sanitize_paste(&data);
+        if data.is_empty() {
+            return;
+        }
         // Keep query pickers open only for bounded, single-line text. Larger or
         // control-bearing pastes use the normal atomic buffer path below.
         let picker_accepts_query = self.picker.as_ref().is_some_and(|picker| {

@@ -134,8 +134,36 @@ fn clipboard_paste_payload_is_inserted_once_at_the_cursor() {
 
     editor.handle_paste("☃\r\nline".to_string());
 
-    assert_eq!(editor.buffer.as_str(), "a☃\r\nlineb");
-    assert_eq!(editor.cursor, "a☃\r\nline".len());
+    assert_eq!(editor.buffer.as_str(), "a☃\nlineb");
+    assert_eq!(editor.cursor, "a☃\nline".len());
+}
+
+// --- bracketed paste sanitizing (mini-agent-el3xe) ---
+
+#[test]
+fn paste_normalizes_line_endings_expands_tabs_and_drops_controls() {
+    use crate::ui::input::sanitize_paste;
+    assert_eq!(sanitize_paste("a\rb\r\nc\nd"), "a\nb\nc\nd");
+    assert_eq!(sanitize_paste("\r\r\n"), "\n\n");
+    assert_eq!(sanitize_paste("x\ty"), "x    y");
+    assert_eq!(sanitize_paste("red \x1b[31mtext\x1b[0m!"), "red text!");
+    assert_eq!(sanitize_paste("\x1b]0;title\x07ok"), "ok");
+    assert_eq!(sanitize_paste("\x1b]8;;https://x\x1b\\link"), "link");
+    assert_eq!(sanitize_paste("\x1b(Bplain\x1bc"), "plain");
+    assert_eq!(sanitize_paste("\u{9b}2Jgone\u{7}\u{0}"), "gone");
+    assert_eq!(sanitize_paste("bell\x07 back\x08"), "bell back");
+    assert_eq!(sanitize_paste("日本 é ☃"), "日本 é ☃");
+}
+
+#[test]
+fn a_carriage_return_paste_becomes_lines_and_is_not_sent_raw() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("one\rtwo\t3\x1b[2J".to_string());
+    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    // A paste made only of controls changes nothing.
+    editor.handle_paste("\x1b[A".to_string());
+    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
 }
 
 // --- byte-offset regressions: Ctrl+U / Ctrl+K / Alt+Y with multi-byte text ---
