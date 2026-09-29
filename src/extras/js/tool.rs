@@ -2728,6 +2728,104 @@ mod js_permission_bridge {
             .unwrap();
         assert_eq!(rejected, "too_large");
     }
+
+    fn private_effect_audit_for_test(tag: &str) -> SharedEffectAudit {
+        let root = std::env::temp_dir().join(format!(
+            "mini-agent-js-tool-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let paths = crate::paths::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            local_data_dir: root.join("local"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            credentials_dir: root.join("credentials"),
+            project_dir: None,
+        };
+        Arc::new(std::sync::Mutex::new(
+            EffectAudit::open(paths.effect_audit()).expect("private test effect audit"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn effects_after_an_accepted_result_are_denied_locally_and_keep_the_result() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let audit = private_effect_audit_for_test("post-result");
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor,
+            audit.clone(),
+        );
+        // More post-result effects than the per-step quota: without local denial the 257th
+        // overwrote the accepted outcome with an effect-limit error and the parent reported a
+        // protocol violation.
+        let rendered = tool
+            .call(JsArgs {
+                code: "result({a:1}); \
+                       for (let i = 0; i < 300; i++) { try { scratch_get('k') } catch (e) {} } \
+                       'done'"
+                    .into(),
+            })
+            .await
+            .expect("post-result effects must not become a worker protocol violation");
+        assert_eq!(rendered, r#"{"a":1}"#);
+
+        let audit = audit.lock().unwrap();
+        let records = audit.records();
+        let result_completion = records
+            .iter()
+            .rposition(|record| {
+                record.capability == "session_state"
+                    && record.state == crate::extras::js::audit::AuditState::Completed
+                    && record.decision == "authorized"
+            })
+            .expect("the accepted result must be audited");
+        let after_result = records.len() - result_completion - 1;
+        assert!(
+            after_result <= 2,
+            "post-result effects must not reach the parent audit: {after_result} records after the result"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_result_keeps_the_warm_worker() {
+        use rig::tool::Tool;
+
+        let supervisor = Arc::new(JsWorkerSupervisor::with_launcher_for_test(
+            crate::sandbox::worker::TestWorkerLauncher::internal_worker_process(),
+        ));
+        let tool = JsTool::new_with_runtime_for_test(
+            Sandbox::new(false, "bwrap"),
+            None,
+            None,
+            AllowConfig::unrestricted(&std::env::current_dir().unwrap()),
+            supervisor.clone(),
+            shared_effect_audit().expect("test effect audit"),
+        );
+        assert_eq!(
+            tool.call(JsArgs {
+                code: "result(1)".into()
+            })
+            .await
+            .unwrap(),
+            "1"
+        );
+        let generation = supervisor
+            .generation_for_test()
+            .await
+            .expect("an accepted structured result must keep the worker");
+        assert_eq!(tool.call(JsArgs { code: "1".into() }).await.unwrap(), "1");
+        assert_eq!(supervisor.generation_for_test().await, Some(generation));
+    }
 }
 
 #[cfg(test)]

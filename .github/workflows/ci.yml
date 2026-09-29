@@ -908,6 +908,22 @@ jobs:
             fi
           done
 
+      # The one-time worker image exists because a single Seatbelt profile
+      # cannot both admit sandbox-exec's initial image and deny a compromised
+      # worker from re-executing it, and macOS rejects a second, tighter
+      # profile. This ignored probe pins those platform facts on each runner so
+      # a macOS change that invalidates the launcher design fails the gate
+      # (mini-agent-ym5ht). `--exact` plus the pass count rejects a silent
+      # zero-test filter match.
+      - name: Confirm the Seatbelt facts behind the one-time worker image
+        shell: bash
+        run: |
+          output=$(cargo test --locked --no-default-features --features js \
+            extras::js::tests::worker_containment::macos_js_worker_containment \
+            -- --exact --ignored --nocapture --test-threads=1 2>&1)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed'
+
       - name: Measure macOS JS worker resources without gating noisy timing percentiles
         if: matrix.os == 'macos-26'
         shell: bash

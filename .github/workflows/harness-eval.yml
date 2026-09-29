@@ -95,3 +95,29 @@ jobs:
             ${{ runner.temp }}/harness-eval.log
             ${{ runner.temp }}/library-axis-eval.log
           if-no-files-found: warn
+
+  # Phase 6 invariant 6 (worker stdout carries protocol frames only) has one
+  # regression that is slow by construction: it holds a reused libtest worker
+  # past libtest's 60-second slow-test notice, so it is `#[ignore]`d and never
+  # runs in the per-push matrix (mini-agent-ym5ht). `--test-threads=1` is the
+  # contract under test: the single-threaded harness prints no notice onto the
+  # reused worker's binary protocol stream. `--exact` plus the pass-count check
+  # stops a renamed test from turning into a silent zero-test success.
+  js-worker-stdout-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Keep a reused test worker's stdout protocol-only past the slow-test notice
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --no-default-features --features skills \
+            extras::js::tests::worker_runtime::worker_supervisor_reused_test_worker_stdout_stays_protocol_only \
+            -- --exact --ignored --nocapture --test-threads=1 2>&1 |
+            tee "$RUNNER_TEMP/js-worker-stdout.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/js-worker-stdout.log"

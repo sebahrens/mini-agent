@@ -2297,6 +2297,16 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
             if protocol_failed.load(Ordering::Acquire) {
                 return backend_failure();
             }
+            if terminal_requested.load(Ordering::Acquire) {
+                // The parent accepted a terminal `result()` and moved the invocation to its
+                // terminal state; it would deny every later effect after appending a fsynced
+                // denial record. Deny locally instead: no wire frame, no audit churn, and no
+                // effect ordinal consumed, so a post-result loop can never exhaust the quota and
+                // turn the accepted structured result into an effect-limit error.
+                return EffectResult::Error(super::protocol::EffectError {
+                    code: EffectErrorCode::Denied,
+                });
+            }
             if effect_limit_reached.load(Ordering::Acquire) {
                 return backend_failure();
             }
@@ -2404,12 +2414,17 @@ fn execute_brokered_run_step<R: std::io::Read + Send + 'static, W: Write + Send 
     if protocol_failed.load(Ordering::Acquire) {
         Err(())
     } else {
-        if let Some(json) = terminal_result.lock().map_err(|_| ())?.take() {
+        let accepted_structured_result = terminal_result.lock().map_err(|_| ())?.take();
+        let structured_result_accepted = accepted_structured_result.is_some();
+        if let Some(json) = accepted_structured_result {
             terminal.outcome =
                 StepOutcome::Structured(serde_json::from_str(&json).map_err(|_| ())?);
             terminal.diagnostic = None;
         }
-        if effect_limit_reached.load(Ordering::Acquire) {
+        // An accepted `result()` holds a parent receipt; the step outcome must match it exactly.
+        // Effect-quota exhaustion never overrides it (the parent would reject the mismatch as a
+        // protocol violation and discard the accepted value).
+        if effect_limit_reached.load(Ordering::Acquire) && !structured_result_accepted {
             #[cfg(feature = "skills")]
             {
                 terminal.evidence_complete = false;
