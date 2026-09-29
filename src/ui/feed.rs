@@ -6,6 +6,7 @@ use std::sync::Arc;
 use compact_str::CompactString;
 use crossterm::style::Color;
 
+use super::events::sanitize_output;
 use super::markdown::{markdown_to_styled, word_wrap};
 use super::renderer::LineEntry;
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
@@ -166,7 +167,7 @@ struct OpenFence {
 
 impl Block {
     pub fn new(style: BlockStyle, text: impl Into<String>) -> Self {
-        let mut text = text.into();
+        let mut text = terminal_safe(text.into());
         compact_oversized_block(&mut text);
         Self {
             style,
@@ -475,7 +476,12 @@ impl Feed {
         if let Some(block) = self.blocks.get_mut(idx) {
             self.generation += 1;
             let old_len = block.text.len();
-            block.text.push_str(text.as_ref());
+            let text = text.as_ref();
+            if has_terminal_control(text) {
+                block.text.push_str(&sanitize_output(text));
+            } else {
+                block.text.push_str(text);
+            }
             let compacted = compact_oversized_block(&mut block.text);
             self.total_bytes = self
                 .total_bytes
@@ -501,7 +507,7 @@ impl Feed {
         if let Some(last) = self.blocks.back_mut() {
             self.total_bytes = self.total_bytes.saturating_sub(last.text.len());
             last.style = style;
-            last.text = text.into();
+            last.text = terminal_safe(text.into());
             compact_oversized_block(&mut last.text);
             self.total_bytes = self.total_bytes.saturating_add(last.text.len());
             last.running = false;
@@ -743,6 +749,27 @@ impl Feed {
     pub(crate) fn total_bytes_for_test(&self) -> usize {
         self.total_bytes
     }
+}
+
+/// Strip terminal control sequences from text entering the feed.
+///
+/// Every feed row is eventually written to the terminal, so this is the one
+/// boundary no producer can bypass: callers still sanitise untrusted text
+/// themselves (defence in depth), and text without any control character
+/// other than `\n` passes through without a copy. The renderer adds its own
+/// SGR and OSC 8 sequences only at paint time.
+fn terminal_safe(text: String) -> String {
+    if has_terminal_control(&text) {
+        sanitize_output(&text).into_string()
+    } else {
+        text
+    }
+}
+
+/// Whether `text` holds a control character (ESC, a C1 introducer, BEL,
+/// `\r`, a tab, ...) that [`sanitize_output`] would remove or rewrite.
+fn has_terminal_control(text: &str) -> bool {
+    text.chars().any(|c| c != '\n' && c.is_control())
 }
 
 fn compact_oversized_block(text: &mut String) -> bool {

@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Replayed sessions (`--continue`/`--resume`, double-Esc rewind, session or worktree switch, `/memory`,
+  `/init`) no longer paint stored escape sequences: user, assistant and system messages and the
+  welcome line's directory name are sanitised, and the chat feed and painter now strip control
+  sequences from all text so only the renderer's own colours and hyperlinks reach the terminal.
+
 ### Fixed
 
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted

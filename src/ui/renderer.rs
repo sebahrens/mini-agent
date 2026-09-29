@@ -13,6 +13,7 @@ use crossterm::terminal::{Clear, ClearType};
 use regex::Regex;
 use smallvec::SmallVec;
 
+use super::events::sanitize_output;
 use super::feed::{BlockStyle, Feed, FeedLines, style_from_color};
 use super::markdown::word_wrap;
 use super::statusline::StatusSpan;
@@ -35,6 +36,36 @@ fn wrap_urls_osc8(text: &str) -> String {
     }
     result.push_str(&text[last..]);
     result
+}
+
+/// Paint one laid-out chat row's text: the only escape sequences written
+/// are the renderer's own reverse-video SGR (for a selection) and OSC 8
+/// hyperlinks. Row text is sanitised again here, after the feed boundary,
+/// so a row that somehow still carries a control sequence is painted inert
+/// instead of reaching the terminal.
+pub(crate) fn paint_row_text(
+    out: &mut impl Write,
+    chunk: &str,
+    selected: Option<(usize, usize)>,
+) -> io::Result<()> {
+    match selected {
+        Some((start, end)) => {
+            write!(out, "{}", paint_text(&chunk[..start]))?;
+            write!(out, "{}", SetAttribute(Attribute::Reverse))?;
+            write!(out, "{}", paint_text(&chunk[start..end]))?;
+            write!(out, "{}", SetAttribute(Attribute::NoReverse))?;
+            write!(out, "{}", paint_text(&chunk[end..]))
+        }
+        None => write!(out, "{}", paint_text(chunk)),
+    }
+}
+
+fn paint_text(text: &str) -> String {
+    if text.chars().any(char::is_control) {
+        wrap_urls_osc8(&sanitize_output(text))
+    } else {
+        wrap_urls_osc8(text)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1213,16 +1244,7 @@ impl Renderer {
             }
             self.write_chat_margin(&mut stdout)?;
             write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-            match selected {
-                Some((start, end)) => {
-                    write!(stdout, "{}", wrap_urls_osc8(&chunk[..start]))?;
-                    write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
-                    write!(stdout, "{}", wrap_urls_osc8(&chunk[start..end]))?;
-                    write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
-                    write!(stdout, "{}", wrap_urls_osc8(&chunk[end..]))?;
-                }
-                None => write!(stdout, "{}", wrap_urls_osc8(chunk))?,
-            }
+            paint_row_text(&mut stdout, chunk, selected)?;
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", ResetColor)?;
 

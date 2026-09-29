@@ -1155,3 +1155,120 @@ mod word_selection_tests {
         assert!(!is_double_click(None, t0, 5, 10));
     }
 }
+
+/// mini-agent-q60fh: painting chat rows emits only the renderer's own
+/// escape sequences, whatever text reached the feed or a row.
+mod paint_sanitisation_tests {
+    use crate::ui::feed::{BlockStyle, Feed};
+    use crate::ui::renderer::paint_row_text;
+
+    const HOSTILE: &str = "a\x1b]52;c;SGk=\x07b \x1b[2J\x1b[Hc \u{9b}2Jd \u{9d}0;t\x07e \
+                           \x1b]8;;https://evil.example\x1b\\f\x1b]8;;\x1b\\ https://ok.example/x";
+
+    fn paint(chunk: &str, selected: Option<(usize, usize)>) -> String {
+        let mut out = Vec::new();
+        paint_row_text(&mut out, chunk, selected).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Assert every escape in `painted` is either an SGR (`CSI digits;... m`)
+    /// or an OSC 8 hyperlink terminated by ST, and that no BEL or 8-bit C1
+    /// introducer survives. Returns the OSC 8 targets seen.
+    fn assert_only_renderer_sequences(painted: &str) -> Vec<String> {
+        assert!(
+            !painted.contains(['\x07', '\u{9b}', '\u{9d}']),
+            "BEL/C1 in {painted:?}"
+        );
+        let mut links = Vec::new();
+        let mut rest = painted;
+        while let Some(pos) = rest.find('\x1b') {
+            let after = &rest[pos + 1..];
+            if let Some(csi) = after.strip_prefix('[') {
+                let params = csi
+                    .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+                    .unwrap_or_else(|| panic!("unterminated CSI in {painted:?}"));
+                assert_eq!(csi.as_bytes()[params], b'm', "non-SGR CSI in {painted:?}");
+                rest = &csi[params + 1..];
+            } else if let Some(osc) = after.strip_prefix("]8;;") {
+                let end = osc
+                    .find("\x1b\\")
+                    .unwrap_or_else(|| panic!("unterminated OSC 8 in {painted:?}"));
+                assert!(
+                    !osc[..end].contains('\x1b'),
+                    "nested escape in OSC 8 in {painted:?}"
+                );
+                links.push(osc[..end].to_string());
+                rest = &osc[end + 2..];
+            } else {
+                panic!("foreign escape sequence in {painted:?}");
+            }
+        }
+        links
+    }
+
+    #[test]
+    fn painting_a_hostile_row_emits_only_sgr_and_osc8() {
+        for selected in [None, Some((0, 0)), Some((3, 12)), Some((1, HOSTILE.len()))] {
+            // A selection boundary inside a sequence may leave its tail as
+            // visible text, but never as a live escape.
+            let painted = paint(HOSTILE, selected);
+            let links = assert_only_renderer_sequences(&painted);
+            assert!(
+                selected.is_some() || !painted.contains("SGk="),
+                "OSC 52 payload leaked: {painted:?}"
+            );
+            assert!(
+                !links.iter().any(|link| link.contains("evil")),
+                "stored OSC 8 survived: {links:?}"
+            );
+        }
+        let links = assert_only_renderer_sequences(&paint(HOSTILE, None));
+        assert!(
+            links.iter().any(|link| link == "https://ok.example/x"),
+            "the renderer's own hyperlink must still be emitted: {links:?}"
+        );
+    }
+
+    #[test]
+    fn plain_row_keeps_selection_sgr_and_hyperlinks() {
+        let painted = paint("see https://example.com/a now", Some((0, 3)));
+        let links = assert_only_renderer_sequences(&painted);
+        assert_eq!(links, ["https://example.com/a", ""]);
+        assert!(painted.contains("\x1b[7m"), "{painted:?}");
+        assert!(painted.contains("\x1b[27m"), "{painted:?}");
+    }
+
+    #[test]
+    fn painting_a_feed_with_raw_escapes_emits_only_renderer_sequences() {
+        let mut feed = Feed::new();
+        feed.push_line(BlockStyle::User, format!("> {HOSTILE}"));
+        feed.push_block(
+            BlockStyle::Agent,
+            format!("# title\n\n{HOSTILE}\n\n- {HOSTILE}"),
+        );
+        feed.push_line(BlockStyle::System, HOSTILE);
+        feed.push_anchored_block("call", BlockStyle::Tool, HOSTILE);
+        feed.place_after_anchor("call", BlockStyle::ToolResult, HOSTILE);
+        feed.push_streaming_block(BlockStyle::Agent);
+        let idx = feed.block_count() - 1;
+        feed.append_to(idx, "tail \x1b]52;c;SGk=");
+        feed.append_to(idx, "\x07 more \x1b[2J");
+        for idx in 0..feed.block_count() {
+            let text = feed.block_text(idx).unwrap();
+            assert!(!text.contains('\x1b'), "raw ESC stored in feed: {text:?}");
+        }
+
+        let lines = feed.lines(60);
+        assert!(lines.len() > 0);
+        let mut saw_link = false;
+        for row in 0..lines.len() {
+            let painted = paint(&lines[row].text, None);
+            let links = assert_only_renderer_sequences(&painted);
+            assert!(!painted.contains("SGk="), "{painted:?}");
+            saw_link |= links
+                .iter()
+                .any(|link| link.starts_with("https://ok.example"));
+        }
+        assert!(saw_link, "hyperlinks must still render");
+    }
+}
