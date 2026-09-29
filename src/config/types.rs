@@ -205,6 +205,14 @@ pub struct CustomProviderConfig {
     pub provider_type: CompactString,
     pub base_url: String,
     pub api_key_env: Option<CompactString>,
+    /// Explicit opt-in to reuse the `provider_type` vendor credentials
+    /// (`OPENAI_API_KEY`, `api_keys.openai`, ...) for this entry's
+    /// `base_url`. Without it, an entry is credential-isolated: only its own
+    /// `api_key_env` and `api_keys[<name>]` apply, even when its name shadows
+    /// a built-in alias such as `openai`, `google` or `custom`, unless it
+    /// points at that vendor's own endpoint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit_builtin_key: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub danger_accept_invalid_certs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

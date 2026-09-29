@@ -2921,6 +2921,7 @@ mod tests {
     fn local_pricing_provider(url: &str) -> crate::config::CustomProviderConfig {
         crate::config::CustomProviderConfig {
             provider_type: "openrouter".into(),
+            inherit_builtin_key: false,
             base_url: url.strip_suffix("/models").unwrap().into(),
             api_key_env: None,
             danger_accept_invalid_certs: None,

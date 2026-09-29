@@ -22,6 +22,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `filter.<name>.clean`/`.process` command, and run with every configured driver emptied.
   Previously an auto-allowed `status` could execute a clean filter the model had written into
   `.git/config` and `.gitattributes`.
+- A `custom_providers` entry named after a built-in alias (`custom`, `openai`, `google`, ...) with
+  a third-party `base_url` no longer inherits the vendor key (`OPENAI_API_KEY`, `api_keys.openai`,
+  ...); it uses only its own `api_key_env` or `api_keys` entry, unless it points at the vendor's
+  own endpoint or sets the new opt-in `inherit_builtin_key = true`.
 
 ### Added
 

@@ -520,7 +520,7 @@ Accepted top-level keys:
 | `auto-update-prompts`     | boolean | When `true`, always regenerate prompts on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `auto-update-themes`      | boolean | When `true`, always regenerate themes on version change without asking. When `false`, never regenerate. When unset, asks interactively.                                         |
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
-| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
+| `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "model", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` and the provider-switch default `model` are optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. `inherit_builtin_key` (default `false`) is the explicit opt-in to reuse the `provider_type` vendor key; see Custom provider credentials below. See the OpenAI API styles section below. |
 | `embedding`               | object  | Skill-retrieval embedding backend and model settings. See Skill embeddings above. |
 | `enable_skill_proposals`  | boolean | Expose bounded `propose_skill` authority to model-authored JS and start the session proposal/admission workers. Default: `false`; project-local values require content-bound trust. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
@@ -558,7 +558,7 @@ Accepted top-level keys:
 | `wt-base-dir`             | path    | Base directory for CLI-created worktrees (default: parent of the repository toplevel; targets inside a checkout are rejected); requires `git-worktree`. |
 | `shell`                   | string  | Shell executable for the model-visible `shell` compatibility tool and explicit shell commands. Unix accepts Bash/sh; Windows also accepts PowerShell/pwsh. |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` environment variable, then `editor`; there is no implicit `nano` fallback).                                                  |
-| `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. |
+| `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set. Custom providers are isolated: an entry named `local-vllm` only consults `api_key_env` and `api_keys["local-vllm"]`, never `OPENAI_API_KEY` or `api_keys["openai"]`, so a vendor key is never sent to a third-party `base_url`. This also holds for an entry that shadows a built-in name (`custom`, `openai`, `google`, ...); see Custom provider credentials below. |
 | `quick_models`            | object  | Map of quick-model names to `{ "provider", "model", "reserve_tokens"?, "context_window"?, "input_token_cost"?, "output_token_cost"?, "temperature"?, "extra_body"? }`. Per-entry `context_window` overrides the catalog unless the global `context_window` is set. Can be switched with `/models <name>` or `--quick-model=<name>`. See Provider-specific request body parameters below for `extra_body`. |
 | `prompt_to_model`         | object  | Map of prompt names to quick-model names (e.g. `plan = "glm-52"`). When switching to a prompt, zerostack automatically switches to the corresponding quick model. Empty-string values are treated as "no change". See Prompt-to-model switching below. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, recommended MCPs are auto-configured (see below).                                                   |
@@ -990,6 +990,56 @@ context_window = 24576
 mid_turn_compact_threshold = 0.80 # compact mid-turn at 80% real prompt pressure
 ```
 
+## Custom provider credentials
+
+Every `custom_providers` entry is credential-isolated: its API key comes only
+from `--api-key`, the variable named by its own `api_key_env`, or
+`api_keys["<entry name>"]`. The vendor key of its `provider_type`
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`, `api_keys.openai`, ...) is never used, so a
+real vendor key is not sent to a third-party `base_url` that merely speaks the
+same protocol.
+
+This applies even when the entry's name is a built-in alias (`custom`,
+`openai`, `anthropic`, `gemini`, `google`, `ollama`, `openrouter`). Two rules
+cover that case:
+
+- An entry named after a built-in (with a matching `provider_type`, or named
+  `custom`) whose `base_url` has the vendor's own origin
+  (same scheme, host and port as `https://api.openai.com`,
+  `https://api.anthropic.com`, `https://generativelanguage.googleapis.com`,
+  `https://openrouter.ai` or `http://localhost:11434`) keeps that vendor's
+  normal key resolution, because the key still goes to the vendor. This is how
+  a custom entry can add headers or timeouts to a built-in.
+- For any other `base_url`, the entry is isolated, and an entry named after a
+  vendor (anything but `custom`) also cannot read `api_keys["<name>"]`, because
+  that slot holds the vendor key. Configure it with `api_key_env`. An entry
+  named `custom` may use `api_keys.custom` as well.
+
+When no key is found, the error names the custom provider and says which
+variable or `api_keys` entry to set:
+
+```toml
+[custom_providers.custom]
+provider_type = "openai"
+base_url = "https://gw.example/v1"
+api_key_env = "GATEWAY_API_KEY"   # or: api_keys.custom = "..."
+```
+
+If you deliberately run a proxy that should receive your vendor key (for
+example a local logging proxy in front of OpenAI), opt in on that entry:
+
+```toml
+[custom_providers.openai]
+provider_type = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+inherit_builtin_key = true   # sends OPENAI_API_KEY / api_keys.openai to base_url
+```
+
+`inherit_builtin_key` defaults to `false`. When it is `true`, the entry
+resolves keys like its `provider_type` built-in, whatever its name: its
+`api_key_env` if set, otherwise the vendor variable, then `api_keys` under the
+vendor slot (`openai`, `gemini`, ...) or under the entry's own name.
+
 ## OpenAI API styles and custom headers
 
 The `openai` provider (and any custom provider with `"provider_type": "openai"`)
@@ -1013,7 +1063,9 @@ will be addressed as Chat Completions.
 
 The way to force a transport is therefore to define the endpoint as a custom
 provider and select it by that name. A custom provider may reuse the name
-`openai`, which shadows the built-in for the whole resolution path:
+`openai`, which shadows the built-in for the whole resolution path (with a
+non-OpenAI `base_url` it then needs its own `api_key_env`; see Custom provider
+credentials above):
 
 ```toml
 [custom_providers.azure-responses]

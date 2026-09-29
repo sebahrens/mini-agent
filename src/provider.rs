@@ -73,6 +73,33 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<CompactString>,
     pub danger_accept_invalid_certs: bool,
+    /// Credential-isolation decision passed to [`AuthResolver`]; `None`
+    /// keeps its name-based default (non-alias names are isolated).
+    pub credential_isolation: Option<bool>,
+}
+
+/// Decides whether a `custom_providers` entry named `name` may use the
+/// vendor credentials of its `provider_type` kind. An explicit
+/// `inherit_builtin_key = true` always may. Otherwise an entry whose name is
+/// not a built-in alias is isolated (the resolver default), and an entry that
+/// shadows a built-in alias (`openai`, `google`, `custom`, ...) is isolated
+/// unless its `base_url` is that vendor's own endpoint, so a vendor key is
+/// never sent to a third-party gateway merely because of the entry's name.
+fn custom_credential_isolation(
+    name: &str,
+    kind: ProviderKind,
+    custom: &CustomProviderConfig,
+) -> Option<bool> {
+    if custom.inherit_builtin_key {
+        return Some(false);
+    }
+    // A non-alias name keeps the resolver's default, which isolates it.
+    let alias = ProviderKind::from_name(name)?;
+    // The vendor-endpoint exemption only applies when the entry's name and
+    // `provider_type` agree (or the name is the generic `custom`), so e.g. a
+    // `google` entry of type `openai` cannot hand `api_keys.google` to OpenAI.
+    let same_vendor = alias == kind || name.eq_ignore_ascii_case("custom");
+    Some(!(same_vendor && kind.is_builtin_endpoint(&custom.base_url)))
 }
 
 pub fn resolve_provider_config(
@@ -91,6 +118,7 @@ pub fn resolve_provider_config(
             base_url: Some(custom.base_url.clone()),
             api_key_env: custom.api_key_env.clone(),
             danger_accept_invalid_certs: custom.danger_accept_invalid_certs.unwrap_or(false),
+            credential_isolation: custom_credential_isolation(name, kind, custom),
         });
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
@@ -105,6 +133,7 @@ pub fn resolve_provider_config(
         base_url: None,
         api_key_env: None,
         danger_accept_invalid_certs: false,
+        credential_isolation: None,
     })
 }
 
@@ -871,6 +900,7 @@ pub async fn list_models_manual(
         .with_env_override(config.api_key_env.as_deref())
         .with_config_keys(config_api_keys)
         .with_custom_provider_name(Some(provider_name))
+        .with_credential_isolation(config.credential_isolation)
         .resolve()
         .ok();
     let custom = custom_providers.get(provider_name);
@@ -926,6 +956,7 @@ pub(crate) fn openrouter_pricing_request(
         .with_env_override(config.api_key_env.as_deref())
         .with_config_keys(config_api_keys)
         .with_custom_provider_name(Some("openrouter"))
+        .with_credential_isolation(config.credential_isolation)
         .resolve()
         .ok();
     let custom = custom_providers.get("openrouter");
@@ -1948,7 +1979,8 @@ pub fn create_client(
         .with_cli_key(api_key)
         .with_env_override(config.api_key_env.as_deref())
         .with_config_keys(config_api_keys)
-        .with_custom_provider_name(Some(provider_name));
+        .with_custom_provider_name(Some(provider_name))
+        .with_credential_isolation(config.credential_isolation);
     let key = resolver.resolve()?;
 
     // Every provider kind gets a client carrying the connect and

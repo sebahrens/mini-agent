@@ -33,6 +33,13 @@ pub struct AuthResolver {
     pub config_api_keys: Option<HashMap<String, String>>,
     /// Custom provider name (e.g., "local-vllm") for fallback key lookup
     pub custom_provider_name: Option<String>,
+    /// Explicit credential-isolation decision for `custom_provider_name`.
+    /// `None` isolates exactly the names that are not built-in aliases;
+    /// `Some(true)` isolates even a built-in alias (a `custom_providers`
+    /// entry that shadows `openai`, `google`, `custom`, ... with a
+    /// third-party `base_url`); `Some(false)` lets the name fall back to
+    /// the built-in kind's env var and `api_keys` slot.
+    pub credential_isolation: Option<bool>,
 }
 
 impl AuthResolver {
@@ -43,6 +50,7 @@ impl AuthResolver {
             cli_key: None,
             config_api_keys: None,
             custom_provider_name: None,
+            credential_isolation: None,
         }
     }
 
@@ -66,19 +74,30 @@ impl AuthResolver {
         self
     }
 
+    /// Overrides the name-based credential-isolation default; see
+    /// [`AuthResolver::credential_isolation`].
+    pub fn with_credential_isolation(mut self, isolated: Option<bool>) -> Self {
+        self.credential_isolation = isolated;
+        self
+    }
+
     pub fn resolve(&self) -> anyhow::Result<String> {
         self.resolve_with_env(|name| std::env::var(name))
     }
 
-    /// A custom provider is any name that is not a built-in provider alias.
-    /// Its credentials are isolated: only its own `api_key_env` and its own
-    /// `api_keys[<name>]` entry are consulted, never the built-in kind's
-    /// environment variable or config slot, so a real vendor key is never
-    /// sent to a third-party `base_url` that merely speaks the same protocol.
+    /// A custom provider is any name that is not a built-in provider alias,
+    /// plus any built-in alias the caller explicitly isolates (a
+    /// `custom_providers` entry that shadows a built-in name with a
+    /// third-party `base_url`). Its credentials are isolated: only its own
+    /// `api_key_env` and its own `api_keys[<name>]` entry are consulted, never
+    /// the built-in kind's environment variable or config slot, so a real
+    /// vendor key is never sent to a third-party `base_url` that merely speaks
+    /// the same protocol.
     fn custom_provider(&self) -> Option<&str> {
-        self.custom_provider_name
-            .as_deref()
-            .filter(|name| ProviderKind::from_name(name).is_none())
+        self.custom_provider_name.as_deref().filter(|name| {
+            self.credential_isolation
+                .unwrap_or_else(|| ProviderKind::from_name(name).is_none())
+        })
     }
 
     pub fn resolve_with_env<F: Fn(&str) -> Result<String, VarError>>(
@@ -115,12 +134,17 @@ impl AuthResolver {
 
         // Priority 3: Config file. Built-ins use their slug (and, for
         // compatibility, the name they were referenced by); custom providers
-        // use exactly their own name.
+        // use exactly their own name, unless that name is itself a vendor's
+        // `api_keys` slot (an isolated `openai`, `google`, ... entry), which
+        // holds the vendor key rather than one for the third-party gateway.
+        let own_config_slot = custom.filter(|name| !is_vendor_key_slot(name));
         if let Some(ref keys) = self.config_api_keys {
             let lookup = |name: &str| keys.get(name).filter(|k| !k.is_empty()).cloned();
             match custom {
-                Some(name) => {
-                    if let Some(key) = lookup(name) {
+                Some(_) => {
+                    if let Some(name) = own_config_slot
+                        && let Some(key) = lookup(name)
+                    {
                         return Ok(key);
                     }
                 }
@@ -144,11 +168,16 @@ impl AuthResolver {
 
         match custom {
             Some(name) => anyhow::bail!(
-                "No API key found for custom provider '{name}'. {}Add it to config.api_keys under '{name}', pass --api-key, or run `mini-agent --setup` to configure interactively.",
+                "No API key found for custom provider '{name}'. {}{}pass --api-key, or run `mini-agent --setup` to configure interactively. Built-in vendor credentials are never sent to a custom provider's base_url unless its custom_providers entry sets `inherit_builtin_key = true`.",
                 match env_var {
                     Some(env_var) => format!("Set the {env_var} environment variable, "),
-                    None =>
-                        "Set `api_key_env` for the provider and export that variable, ".to_string(),
+                    None => format!(
+                        "Set `api_key_env` in custom_providers.{name} and export that variable, "
+                    ),
+                },
+                match own_config_slot {
+                    Some(name) => format!("add it to config.api_keys under '{name}', "),
+                    None => String::new(),
                 }
             ),
             None => anyhow::bail!(
@@ -160,7 +189,24 @@ impl AuthResolver {
     }
 
     fn env_var_name(&self) -> &'static str {
-        match self.provider_kind {
+        self.provider_kind.env_var_name()
+    }
+
+    fn provider_slug(&self) -> &'static str {
+        self.provider_kind.slug()
+    }
+}
+
+/// Whether `name` is an `api_keys` slot a built-in provider reads its vendor
+/// key from (every built-in alias except the generic `custom`).
+fn is_vendor_key_slot(name: &str) -> bool {
+    ProviderKind::from_name(name).is_some() && !name.eq_ignore_ascii_case("custom")
+}
+
+impl ProviderKind {
+    /// The vendor environment variable holding this kind's API key.
+    pub fn env_var_name(self) -> &'static str {
+        match self {
             ProviderKind::OpenAI => "OPENAI_API_KEY",
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::Gemini => "GEMINI_API_KEY",
@@ -169,8 +215,34 @@ impl AuthResolver {
         }
     }
 
-    fn provider_slug(&self) -> &'static str {
-        match self.provider_kind {
+    /// The vendor's own API endpoint for this kind. A `custom_providers`
+    /// entry that shadows a built-in name keeps that kind's vendor
+    /// credentials only when its `base_url` has this origin.
+    pub fn builtin_endpoint(self) -> &'static str {
+        match self {
+            ProviderKind::OpenAI => "https://api.openai.com/v1",
+            ProviderKind::Anthropic => "https://api.anthropic.com",
+            ProviderKind::Gemini => "https://generativelanguage.googleapis.com",
+            ProviderKind::Ollama => "http://localhost:11434",
+            ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
+        }
+    }
+
+    /// Whether `base_url` addresses this kind's own vendor endpoint (same
+    /// scheme, host and port as [`ProviderKind::builtin_endpoint`]).
+    pub fn is_builtin_endpoint(self, base_url: &str) -> bool {
+        let (Ok(candidate), Ok(builtin)) = (
+            reqwest::Url::parse(base_url.trim()),
+            reqwest::Url::parse(self.builtin_endpoint()),
+        ) else {
+            return false;
+        };
+        candidate.origin() == builtin.origin()
+    }
+
+    /// The canonical `api_keys` slot for this kind.
+    pub fn slug(self) -> &'static str {
+        match self {
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::OpenAI => "openai",
             ProviderKind::Anthropic => "anthropic",

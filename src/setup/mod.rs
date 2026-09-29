@@ -1271,6 +1271,7 @@ fn handle_provider_detail_key(ctx: &Ctx, key: KeyEvent) -> anyhow::Result<KeyRes
                     final_name.clone(),
                     CustomProviderConfig {
                         provider_type: CompactString::new(&new_provider_type),
+                        inherit_builtin_key: false,
                         base_url: new_base_url,
                         api_key_env: if new_api_key_env.is_empty() {
                             None
@@ -1863,6 +1864,7 @@ mod tests {
             "local-vllm".to_string(),
             CustomProviderConfig {
                 provider_type: CompactString::new("openai"),
+                inherit_builtin_key: false,
                 base_url: "http://localhost:8000/v1".to_string(),
                 api_key_env: None,
                 danger_accept_invalid_certs: None,

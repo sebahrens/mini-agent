@@ -1180,6 +1180,7 @@ mod provider_param_tests {
             "openai-capture".to_string(),
             CustomProviderConfig {
                 provider_type: "openai".into(),
+                inherit_builtin_key: false,
                 base_url: format!("http://{address}/v1"),
                 api_key_env: None,
                 danger_accept_invalid_certs: None,
