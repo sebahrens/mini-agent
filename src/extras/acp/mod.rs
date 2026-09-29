@@ -282,6 +282,7 @@ struct PromptSessionSnapshot {
     skill_services: Arc<crate::extras::js::skills::session::SkillServiceOwner>,
     control: Arc<TurnControl>,
     registration: TurnRegistration,
+    hook_lease: Option<HookRootLease>,
 }
 
 const TURN_ACTIVE: u8 = 0;
@@ -463,6 +464,67 @@ impl Drop for TurnRegistration {
     }
 }
 
+/// The workspace root that every active ACP turn shares while hooks are
+/// configured.
+///
+/// Hook dispatch (the `HookedTool` context and the dispatcher's execution
+/// root) is process-wide: each prompt rebinds it to that session's workspace.
+/// Two concurrent turns in different workspaces would therefore run each
+/// other's hooks against the wrong repository. Until hook execution carries a
+/// per-turn root, a turn whose workspace differs from the one active turns
+/// already hold is refused instead.
+#[derive(Default)]
+struct HookRootClaims {
+    active: StdMutex<Option<(std::path::PathBuf, usize)>>,
+}
+
+/// One active turn's hold on the shared hook root; released on drop.
+struct HookRootLease {
+    claims: Arc<HookRootClaims>,
+}
+
+impl HookRootClaims {
+    fn try_acquire(self: &Arc<Self>, root: &Path) -> Result<HookRootLease, String> {
+        let mut active = lock_unpoisoned(&self.active);
+        match active.as_mut() {
+            Some((held, count)) if held.as_path() == root => *count += 1,
+            Some((held, _)) => {
+                return Err(format!(
+                    "hooks are configured and another ACP session is running a prompt in '{}'; \
+                     hooks run against one workspace at a time, so this prompt in '{}' was refused \
+                     (retry when that prompt finishes)",
+                    held.display(),
+                    root.display()
+                ));
+            }
+            None => *active = Some((root.to_path_buf(), 1)),
+        }
+        Ok(HookRootLease {
+            claims: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for HookRootLease {
+    fn drop(&mut self) {
+        let mut active = lock_unpoisoned(&self.claims.active);
+        if let Some((_, count)) = active.as_mut() {
+            *count -= 1;
+            if *count == 0 {
+                *active = None;
+            }
+        }
+    }
+}
+
+fn acp_hook_root_claims() -> Option<Arc<HookRootClaims>> {
+    #[cfg(feature = "hooks")]
+    if crate::extras::hooks::get_dispatcher().is_some_and(|dispatcher| !dispatcher.is_empty()) {
+        return Some(Arc::default());
+    }
+    None
+}
+
 struct AcpState {
     cli: Cli,
     cfg: Config,
@@ -470,6 +532,9 @@ struct AcpState {
     sessions: Mutex<HashMap<SessionId, SessionState>>,
     cancel_routes: StdMutex<HashMap<SessionId, Arc<StdMutex<SessionTurns>>>>,
     shell_search_path: Option<std::ffi::OsString>,
+    /// Present only when hooks are configured. Hook dispatch uses one
+    /// process-wide execution root, so concurrent turns must agree on it.
+    hook_roots: Option<Arc<HookRootClaims>>,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -790,6 +855,7 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         sessions: Mutex::new(HashMap::new()),
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
+        hook_roots: acp_hook_root_claims(),
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -1193,6 +1259,7 @@ async fn handle_prompt(
             .get(&session_id)
             .ok_or_else(|| agent_client_protocol::Error::new(-32602, "unknown ACP session"))?;
         let control = Arc::new(TurnControl::new());
+        let hook_lease;
         let generation = {
             let mut turns = lock_unpoisoned(&sess.turns);
             if !turns.queue.is_empty() {
@@ -1201,6 +1268,12 @@ async fn handle_prompt(
                     "ACP session already has an active prompt",
                 ));
             }
+            hook_lease = state
+                .hook_roots
+                .as_ref()
+                .map(|claims| claims.try_acquire(sess.workspace.root()))
+                .transpose()
+                .map_err(|error| agent_client_protocol::Error::new(-32000, error))?;
             let generation = turns.next_generation;
             turns.next_generation = turns.next_generation.wrapping_add(1);
             turns.queue.push_back(RegisteredTurn {
@@ -1228,6 +1301,7 @@ async fn handle_prompt(
                 turns: sess.turns.clone(),
                 control: control.clone(),
             },
+            hook_lease,
         }
     };
     let PromptSessionSnapshot {
@@ -1245,6 +1319,7 @@ async fn handle_prompt(
         skill_services,
         control,
         registration,
+        hook_lease,
     } = snapshot;
 
     // A client sets or clears the session's goal through the request's `_meta`
@@ -1280,6 +1355,8 @@ async fn handle_prompt(
             // kill/reap hooks and finish tracked blocking work.
             let _cancel_on_connection_drop = CancelTurnOnDrop(teardown_control);
             tokio::spawn(async move {
+                // Held until the turn, its hooks and its tracked work settle.
+                let _hook_lease = hook_lease;
                 let registration = registration;
                 let _request_cancellation_bridge = request_cancellation_bridge;
                 if control.is_cancelled() {
@@ -2924,6 +3001,7 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -2940,6 +3018,7 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -2959,6 +3038,7 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
+            hook_roots: None,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -2994,6 +3074,7 @@ mod protocol_tests {
             sessions: Mutex::new(HashMap::new()),
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
+            hook_roots: None,
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3674,6 +3755,98 @@ mod protocol_tests {
                     .expect("cancellation must release the active turn")
                     .unwrap()?;
                 assert_eq!(blocked.stop_reason, StopReason::Cancelled);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooked_server_refuses_concurrent_turns_in_different_workspaces() {
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let blocked_started = blocked_started.clone();
+            Arc::new(move |prompt, _history| {
+                let blocked_started = blocked_started.clone();
+                Box::pin(async move {
+                    if prompt == "blocked" {
+                        blocked_started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().hook_roots = Some(Arc::default());
+        let repo_a = ProtocolTempDir::new();
+        let repo_b = ProtocolTempDir::new();
+        let (cwd_a, cwd_b) = (repo_a.path().to_path_buf(), repo_b.path().to_path_buf());
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let a = cx
+                    .send_request(NewSessionRequest::new(cwd_a.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let a_again = cx
+                    .send_request(NewSessionRequest::new(cwd_a))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let b = cx
+                    .send_request(NewSessionRequest::new(cwd_b))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                let blocked_cx = cx.clone();
+                let blocked_id = a.clone();
+                let blocked = tokio::spawn(async move {
+                    blocked_cx
+                        .send_request(prompt(blocked_id, "blocked"))
+                        .block_task()
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+                    .await
+                    .expect("the first turn should start");
+
+                let refused = cx
+                    .send_request(prompt(b.clone(), "other-repo"))
+                    .block_task()
+                    .await
+                    .err()
+                    .expect("hooks would run against the wrong workspace");
+                assert!(refused.to_string().contains("hooks"), "{refused}");
+                let same_repo = cx
+                    .send_request(prompt(a_again, "same-repo"))
+                    .block_task()
+                    .await?;
+                assert_eq!(same_repo.stop_reason, StopReason::EndTurn);
+
+                cx.send_notification(CancelNotification::new(a))?;
+                tokio::time::timeout(Duration::from_secs(5), blocked)
+                    .await
+                    .expect("cancellation must release the active turn")
+                    .unwrap()?;
+                let after = cx
+                    .send_request(prompt(b, "other-repo"))
+                    .block_task()
+                    .await?;
+                assert_eq!(after.stop_reason, StopReason::EndTurn);
                 Ok(())
             })
             .await
@@ -5826,6 +5999,42 @@ model = "acme-fast"
 
         let disabled = config(&format!("task_enabled = false\n{CUSTOM}"));
         assert!(acp_subagent_config(&cli, &disabled).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hook_root_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_turns_must_share_the_hook_root() {
+        let claims = Arc::new(HookRootClaims::default());
+        let repo_a = Path::new("/workspace/a");
+        let repo_b = Path::new("/workspace/b");
+
+        let first = claims
+            .try_acquire(repo_a)
+            .expect("first turn claims its root");
+        let same = claims
+            .try_acquire(repo_a)
+            .expect("a second session in the same workspace may run concurrently");
+        let refused = claims
+            .try_acquire(repo_b)
+            .err()
+            .expect("a turn in another workspace would run hooks against the wrong repo");
+        assert!(refused.contains("/workspace/a"), "{refused}");
+
+        drop(first);
+        assert!(
+            claims.try_acquire(repo_b).is_err(),
+            "the root stays held while any turn in it is active"
+        );
+        drop(same);
+        let other = claims
+            .try_acquire(repo_b)
+            .expect("once every turn settles another workspace may claim the root");
+        drop(other);
+        assert!(lock_unpoisoned(&claims.active).is_none());
     }
 }
 

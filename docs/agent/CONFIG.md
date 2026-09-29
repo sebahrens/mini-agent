@@ -1792,7 +1792,12 @@ directory-handle authority.
 
 Permission containment, LSP services, and delegated read-only agents use the
 same binding. Concurrent ACP sessions may therefore use different roots
-without changing or inheriting the server process working directory. Missing
+without changing or inheriting the server process working directory.
+Hooks are the exception: hook execution uses one process-wide workspace root,
+so when any hook is configured, a prompt is refused (JSON-RPC error `-32000`)
+while another session's prompt is active in a different workspace. Sessions in
+the same workspace still run concurrently, and the refused prompt can be
+retried once the other turn finishes. Missing
 paths and non-directories are rejected before an agent is built. LSP file
 requests are strictly contained; other absolute, `..`, symlink, and reparse-point
 escapes are rejected.
