@@ -186,11 +186,26 @@ jobs:
       - name: Verify Cargo feature graph
         run: python3 scripts/check_feature_graph.py
 
+      # The Corresponding Source archive vendors the VS Code extension's
+      # locked npm tarballs and rebuilds dist/extension.js offline from them.
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: editors/vscode/.nvmrc
+
+      - name: Install and verify pinned npm
+        working-directory: editors/vscode
+        run: |
+          npm install --global "$(node --print "require('./package.json').packageManager")"
+          test "npm@$(npm --version)" = "$(node --print "require('./package.json').packageManager")"
+
       - name: Assemble GPL Corresponding Source offline
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           bash scripts/package-corresponding-source.sh \
             "v${version}-ci" "$RUNNER_TEMP" HEAD --allow-untagged-label
+          MINI_AGENT_SOURCE_ARCHIVE="$RUNNER_TEMP/mini-agent-v${version}-ci-source.tar.gz" \
+            python3 -m unittest scripts.tests.test_package_corresponding_source
 
       - name: Verify production and research workspace boundaries
         run: |
