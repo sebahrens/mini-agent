@@ -1368,7 +1368,13 @@ impl Startup {
             if let Some(task) = self.session_start_task.take() {
                 let _ = task.await;
             }
-            heap_future(|| self.dispatch_print()).await
+            let result = heap_future(|| self.dispatch_print()).await;
+            // Every headless exit ends the session: a failed turn, a
+            // persistence failure and a goal's own exit code alike
+            // (mini-agent-rnpjm).
+            #[cfg(feature = "hooks")]
+            crate::extras::hooks::dispatch_session_end("exit").await;
+            result
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
@@ -1422,7 +1428,7 @@ impl Startup {
                     None
                 };
                 if !json_output {
-                    println!("{result}");
+                    crate::print::headless_stdout(format_args!("{result}\n"));
                 }
                 let mut persistence_failure = None;
                 if !self.cli.no_session {
@@ -1445,8 +1451,8 @@ impl Startup {
                     } else {
                         crate::print::HeadlessStopReason::Failed
                     };
-                    println!(
-                        "{}",
+                    crate::print::headless_stdout(format_args!(
+                        "{}\n",
                         crate::print::render_headless_json(
                             self.workspace.root(),
                             &result,
@@ -1458,7 +1464,7 @@ impl Startup {
                             #[cfg(feature = "goal")]
                             None,
                         )?
-                    );
+                    ));
                 }
                 if !run.succeeded() {
                     let failure = anyhow::anyhow!("explicit shell command failed");
@@ -1682,8 +1688,8 @@ impl Startup {
                         crate::print::HeadlessStopReason::Completed
                     }
                 };
-                println!(
-                    "{}",
+                crate::print::headless_stdout(format_args!(
+                    "{}\n",
                     crate::print::render_headless_json(
                         self.workspace.root(),
                         &response,
@@ -1695,7 +1701,7 @@ impl Startup {
                         #[cfg(feature = "goal")]
                         finished_goal.as_ref(),
                     )?
-                );
+                ));
             }
             // A goal that stopped for a reason of its own exits with that
             // reason's code, whatever the output format. The distinction
@@ -1727,9 +1733,6 @@ impl Startup {
                 return Err(error);
             }
         }
-
-        #[cfg(feature = "hooks")]
-        crate::extras::hooks::dispatch_session_end("exit").await;
 
         Ok(())
     }

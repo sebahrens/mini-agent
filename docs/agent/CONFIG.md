@@ -744,6 +744,8 @@ Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting
 the first user or automatic turn. Print and loop modes still join the hook
 before constructing their first request.
+`SessionEnd` (`"exit"`) runs whenever a print-mode run ends, including a
+failed turn, a persistence failure, and a goal that exits with its own code.
 
 Only `PreToolUse` is permission-blockable by default. A handler's stdout JSON
 may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it

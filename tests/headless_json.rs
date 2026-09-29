@@ -663,6 +663,14 @@ fn provider_print_json_retains_progress_and_reports_terminal_failures() {
             outcome == "completed",
             "{outcome}: {stderr}"
         );
+        // mini-agent-itc4b: stdout is exactly one JSON line, so `head -1 | jq`
+        // works; nothing may precede it.
+        assert_eq!(
+            output.stdout.first(),
+            Some(&b'{'),
+            "{outcome}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         let value: serde_json::Value = serde_json::from_slice(&output.stdout)
             .expect("one JSON result, even after turn failure");
         assert_eq!(
@@ -681,8 +689,10 @@ fn provider_print_json_retains_progress_and_reports_terminal_failures() {
         assert_eq!(
             value["result"],
             match outcome {
-                "initial_failure" => "",
-                "partial_failure" => "partial reply",
+                // The result is the final completion's text. The text written
+                // before the tool call is a transcript segment of its own
+                // (mini-agent-knwk1), and the failed turn has no final text.
+                "initial_failure" | "partial_failure" => "",
                 _ => "finished",
             }
         );
@@ -893,19 +903,22 @@ fn headless_interrupt_preserves_progress_and_settles_owned_work() {
             let saved = root.saved_session();
             assert_eq!(saved["total_input_tokens"], completions * 100, "{mode}");
             assert_eq!(saved["total_output_tokens"], completions * 20, "{mode}");
-            let response = match mode {
-                "initial_wait" => "",
-                "validation" | "loop_next" => "finished",
-                "verification" => "partial replyfinished",
-                _ => "partial reply",
+            // Text before a tool call is its own assistant record; the
+            // result is only the final completion's text, never the two
+            // glued together (mini-agent-knwk1).
+            let (segments, response): (&[&str], &str) = match mode {
+                "initial_wait" => (&[], ""),
+                "validation" | "loop_next" => (&["finished"], "finished"),
+                "verification" => (&["partial reply", "finished"], "finished"),
+                _ => (&["partial reply"], ""),
             };
             let messages = saved["messages"].as_array().unwrap();
-            if !response.is_empty() {
+            for segment in segments {
                 assert!(
                     messages
                         .iter()
                         .any(|message| message["role"] == "assistant"
-                            && message["content"] == response),
+                            && message["content"] == *segment),
                     "{mode}: {messages:?}"
                 );
             }
@@ -1130,4 +1143,86 @@ fn a_headless_goal_reports_its_outcome_and_exits_with_it() {
             prompts[1]
         );
     }
+}
+
+// mini-agent-4nqvb: `mini-agent -p ... | head` closes stdout early. The run
+// must neither panic nor lose the turn: it finishes and saves the session.
+#[cfg(unix)]
+#[test]
+fn text_output_to_a_closed_pipe_still_saves_the_turn() {
+    use std::process::Stdio;
+    let root = TempRoot::new();
+    let server = root.local_provider("completed");
+    let mut command = root.provider_command("read");
+    command.args(["-p", "say something"]);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the reading end before the child writes anything.
+    drop(child.stdout.take());
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+        text
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("headless run stalled");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stderr = stderr.join().unwrap();
+    server.join().unwrap().unwrap();
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let saved = root.saved_session();
+    let messages = saved["messages"].as_array().unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["role"] == "assistant" && message["content"] == "finished"),
+        "{messages:?}"
+    );
+}
+
+// mini-agent-rnpjm: SessionEnd runs however the headless run ends, including
+// a failed turn.
+#[cfg(all(unix, feature = "hooks"))]
+#[test]
+fn headless_session_end_hook_runs_after_a_failed_turn() {
+    let root = TempRoot::new();
+    let marker = root.0.join("session-end.marker");
+    std::fs::write(
+        root.0.join("settings.json"),
+        serde_json::json!({
+            "hooks": {
+                "SessionEnd": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/bin/sh",
+                        "args": ["-c", format!("touch '{}'", marker.display())],
+                        "trust": "trusted"
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server = root.local_provider("initial_failure");
+    let mut command = root.provider_command("read");
+    command.args(["-p", "fail please"]);
+    let output = bounded_output(command);
+    server.join().unwrap().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(marker.exists(), "SessionEnd did not run: {stderr}");
 }
