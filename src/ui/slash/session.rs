@@ -30,7 +30,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         #[cfg(feature = "export")]
         "/import" => handle_import(parts, ctx).await,
         #[cfg(feature = "export")]
-        "/share" => handle_share(ctx).await,
+        "/share" => handle_share(parts, ctx).await,
         _ => Ok(()),
     }
 }
@@ -301,13 +301,44 @@ fn parse_imported_session(
     }
 }
 
+/// What `/share` is about to publish, stated before anything leaves the
+/// machine (mini-agent-p73n1): the upload is the full transcript, tool output
+/// included, and a secret gist is readable by anyone who has its link.
 #[cfg(feature = "export")]
-async fn handle_share(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+pub(crate) fn share_confirmation(session: &crate::session::Session, html_bytes: usize) -> String {
+    let tool_outputs = session
+        .messages
+        .iter()
+        .filter(|message| message.role == crate::session::MessageRole::ToolResult)
+        .count();
+    format!(
+        "/share uploads this session's full transcript ({}, {} tool output{}, which may include \
+         file contents and secrets) as a secret GitHub gist, readable by anyone with the link.\n\
+         Run /share confirm to upload it.",
+        crate::agent::tools::list_dir::format_size(html_bytes as u64),
+        tool_outputs,
+        if tool_outputs == 1 { "" } else { "s" },
+    )
+}
+
+#[cfg(feature = "export")]
+async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let filename = format!(
         "zerostack-session-{}.html",
         &ctx.session.id[..8.min(ctx.session.id.len())]
     );
     let html = crate::extras::export::session_to_html(ctx.session);
+    match parts.get(1).map(|arg| arg.trim()) {
+        Some("confirm") if parts.len() == 2 => {}
+        None | Some("") => {
+            write_result(ctx.renderer, share_confirmation(ctx.session, html.len()));
+            return Ok(());
+        }
+        Some(_) => {
+            write_error(ctx.renderer, "usage: /share, then /share confirm to upload");
+            return Ok(());
+        }
+    }
     let description = if ctx.session.name.is_empty() {
         "zerostack session".to_string()
     } else {

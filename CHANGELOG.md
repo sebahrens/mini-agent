@@ -12,6 +12,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   walkers: with `read = { "config/secrets/**" = "deny" }` they no longer list or search those files.
   JS file effects also treat `$HOME/...` like `~/...` (the home directory, checked by the ambient
   path policy) instead of a literal `$HOME` directory inside the workspace.
+- `/share` no longer uploads on its own: it first states the export's size, how many tool outputs it
+  contains and that a secret gist is readable by anyone with the link, and uploads only on
+  `/share confirm`. The upload now gives up after 10 s connecting or 30 s in total instead of
+  freezing the UI.
 
 - Misspelled or unknown top-level config keys are no longer silently dropped: startup (and
   `--print-config`) warns with the nearest known key, keys of builds with other Cargo features stay
@@ -119,6 +123,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Hook, command and support-command cleanup no longer signals a process group after its leader has
   been reaped unless the group still has a live member, so a recycled pgid belonging to an unrelated
   process can no longer be sent SIGTERM/SIGKILL; lingering descendants are still terminated.
+- A headless (`-p`, `--loop`, `--goal`) run no longer swallows a second Ctrl-C/SIGTERM while its
+  cleanup stalls: the second signal, or 10 s after the first, saves what the turn returned and exits
+  with status 130 without waiting for the stalled work.
+- Sessions, config and other saved state are now `fsync`ed (file before the rename, directory after
+  it), so a crash or power loss can no longer leave the session `--continue` would pick undecodable.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

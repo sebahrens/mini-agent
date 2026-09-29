@@ -308,6 +308,14 @@ New Windows private objects explicitly name the current user as owner, including
 directories and lock files, so a token whose default owner is Administrators still satisfies
 the current-user ownership check.
 
+The shared secure-write contract is atomic **and durable** for the application's own state
+(sessions, config, trust records, memory, credentials, lock and marker files): the exclusively
+created temporary file is flushed and `fsync`ed before the no-follow rename, and on Linux and
+macOS the parent directory is `fsync`ed after it, so a write that reported success survives a
+crash or power loss and `--continue` never finds a truncated session it has to skip. On Windows
+the temporary file is flushed with `FlushFileBuffers` before the rename, which NTFS journals.
+Workspace edits made by tools keep the atomicity-only contract (flushed, not `fsync`ed).
+
 For MCP OAuth, `canonical-server-identity` is the versioned, length-prefixed tuple of the exact
 UTF-8 config map key, normalized absolute HTTP(S) URL, and explicit OAuth client ID (or empty).
 URL normalization lowercases scheme/IDNA host, removes a default port, strips a fragment, and

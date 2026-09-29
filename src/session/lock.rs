@@ -105,6 +105,17 @@ pub fn release_session(session_id: &str) {
     }
 }
 
+/// Give up every session this process owns. A force-stopped headless run
+/// calls this before `exit` (mini-agent-p73n1): a stalled child may still
+/// share a lock's open file description, which would otherwise keep the
+/// session locked after this process is gone.
+pub fn release_all() {
+    let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (_, file) in held.drain() {
+        let _ = file.unlock();
+    }
+}
+
 /// The error a save reports when another process owns the session.
 pub(crate) fn held_elsewhere_error(session_id: &str) -> anyhow::Error {
     anyhow::anyhow!(

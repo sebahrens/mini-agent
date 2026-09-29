@@ -2112,6 +2112,11 @@ async fn run_headless_goal_rounds(
             if goal.status.is_terminal() {
                 break;
             }
+            // A force-stopped turn (second interrupt or grace deadline) ends
+            // the run: no verification, no relaunch; the caller persists it.
+            if crate::print::headless_force_stopped() {
+                break;
+            }
 
             let open_todos = session
                 .todos

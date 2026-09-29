@@ -51,73 +51,304 @@ fn emit_headless(
 }
 
 /// Wait for a headless interruption without affecting the interactive UI.
+#[cfg(feature = "goal")]
 pub(crate) async fn headless_interrupt() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        let mut terminate = signal(SignalKind::terminate())?;
-        tokio::select! {
-            _ = interrupt.recv() => Ok(()),
-            _ = terminate.recv() => Ok(()),
+    HeadlessInterrupts::os().recv().await
+}
+
+/// How long a headless run keeps waiting, after the first SIGINT/SIGTERM, for
+/// the cancelled turn to hand back its partial transcript and for its owned
+/// tools and hooks to settle. A second signal ends the wait at once.
+pub(crate) const HEADLESS_FORCED_STOP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Exit status of a force-stopped headless run (128 + SIGINT).
+pub(crate) const HEADLESS_FORCED_STOP_EXIT_CODE: i32 = 130;
+
+/// Set once a headless run stopped waiting for its own cleanup, after a second
+/// interrupt or the grace deadline (mini-agent-p73n1). Owned work may still be
+/// running, so the process must not wait for the runtime to drain it: `main`
+/// exits with [`HEADLESS_FORCED_STOP_EXIT_CODE`] after the caller has
+/// persisted what it has.
+static HEADLESS_FORCED_STOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn headless_force_stopped() -> bool {
+    HEADLESS_FORCED_STOP.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// End a force-stopped headless run. Session locks are released explicitly
+/// first (a stalled child may still share the lock's open file description),
+/// then the process exits without dropping the runtime, whose drop would wait
+/// for the stalled blocking work forever.
+pub(crate) fn exit_force_stopped() -> ! {
+    crate::session::lock::release_all();
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(HEADLESS_FORCED_STOP_EXIT_CODE)
+}
+
+/// Why a headless run stopped waiting for its cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedStop {
+    SecondSignal,
+    Deadline,
+}
+
+impl ForcedStop {
+    fn error(self, grace: std::time::Duration) -> anyhow::Error {
+        match self {
+            Self::SecondSignal => {
+                anyhow::anyhow!("interrupted again; stopped without waiting for the turn's cleanup")
+            }
+            Self::Deadline => anyhow::anyhow!(
+                "the interrupted turn did not settle within {}s; stopped without waiting for its cleanup",
+                grace.as_secs_f32()
+            ),
         }
     }
+}
+
+/// The SIGINT/SIGTERM listeners of one headless run. Both waits (the first
+/// interrupt and the second one that forces the exit) share these listeners,
+/// so a signal landing between them is never lost.
+pub(crate) enum HeadlessInterrupts {
+    #[cfg(unix)]
+    Os {
+        interrupt: tokio::signal::unix::Signal,
+        terminate: tokio::signal::unix::Signal,
+    },
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
+    Os,
+    /// Installing the handlers failed: the error is reported as the first
+    /// "signal" (as it always was), after which no further signal arrives.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Failed(Option<io::Error>),
+    #[cfg(test)]
+    Channel(tokio::sync::mpsc::UnboundedReceiver<()>),
+}
+
+impl HeadlessInterrupts {
+    pub(crate) fn os() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            match (
+                signal(SignalKind::interrupt()),
+                signal(SignalKind::terminate()),
+            ) {
+                (Ok(interrupt), Ok(terminate)) => Self::Os {
+                    interrupt,
+                    terminate,
+                },
+                (Err(error), _) | (_, Err(error)) => Self::Failed(Some(error)),
+            }
+        }
+        #[cfg(not(unix))]
+        Self::Os
+    }
+
+    pub(crate) async fn recv(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Os {
+                interrupt,
+                terminate,
+            } => {
+                tokio::select! {
+                    _ = interrupt.recv() => Ok(()),
+                    _ = terminate.recv() => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            Self::Os => tokio::signal::ctrl_c().await,
+            Self::Failed(error) => match error.take() {
+                Some(error) => Err(error),
+                None => std::future::pending().await,
+            },
+            #[cfg(test)]
+            Self::Channel(receiver) => match receiver.recv().await {
+                Some(()) => Ok(()),
+                None => std::future::pending().await,
+            },
+        }
+    }
+
+    /// Resolve on the next signal or at `deadline`, whichever comes first.
+    async fn second_signal_or(&mut self, deadline: tokio::time::Instant) -> ForcedStop {
+        tokio::select! {
+            _ = self.recv() => ForcedStop::SecondSignal,
+            () = tokio::time::sleep_until(deadline) => ForcedStop::Deadline,
+        }
+    }
+}
+
+/// Wait for the scope's owned work to settle. Before any interrupt the wait is
+/// unbounded, as before; once one has arrived (or arrives now) it is bounded by
+/// the grace deadline and a second signal.
+async fn settle_headless_scope(
+    scope: &crate::agent::runner::AgentWorkScope,
+    interrupts: &mut HeadlessInterrupts,
+    grace: std::time::Duration,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<ForcedStop> {
+    let deadline = match deadline {
+        Some(deadline) => deadline,
+        None => tokio::select! {
+            biased;
+            () = scope.wait_idle() => return None,
+            _ = interrupts.recv() => tokio::time::Instant::now() + grace,
+        },
+    };
+    tokio::select! {
+        biased;
+        () = scope.wait_idle() => None,
+        forced = interrupts.second_signal_or(deadline) => Some(forced),
+    }
+}
+
+fn record_forced_stop() {
+    HEADLESS_FORCED_STOP.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn forced_stop_io_error(forced: ForcedStop, grace: std::time::Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("headless command interrupted: {:#}", forced.error(grace)),
+    )
 }
 
 pub(crate) async fn run_headless_command<F, T>(command: F) -> io::Result<T>
 where
     F: std::future::Future<Output = io::Result<T>>,
 {
+    let grace = HEADLESS_FORCED_STOP_GRACE;
+    if headless_force_stopped() {
+        return Err(forced_stop_io_error(ForcedStop::SecondSignal, grace));
+    }
+    let (result, forced) =
+        run_headless_command_with(command, HeadlessInterrupts::os(), grace).await;
+    if forced.is_some() {
+        record_forced_stop();
+    }
+    result
+}
+
+/// [`run_headless_command`] without the process-wide forced-stop record, so
+/// tests can drive it with injected signals.
+async fn run_headless_command_with<F, T>(
+    command: F,
+    mut interrupts: HeadlessInterrupts,
+    grace: std::time::Duration,
+) -> (io::Result<T>, Option<ForcedStop>)
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
     let scope = crate::agent::runner::AgentWorkScope::new();
-    let result = scope
+    let (result, deadline) = scope
         .run(async {
             tokio::select! {
-                // Poll first to install signal handlers before launching work.
+                // Poll first so the listeners are live before work launches.
                 biased;
-                signal = headless_interrupt() => {
-                    signal?;
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "headless command interrupted"))
+                signal = interrupts.recv() => {
+                    let result = signal.and_then(|()| {
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "headless command interrupted"))
+                    });
+                    (result, Some(tokio::time::Instant::now() + grace))
                 }
-                result = command => result,
+                result = command => (result, None),
             }
         })
         .await;
     // Dropping the command future closes its response receiver. The scoped
     // worker then cancels, kills/reaps the group, and completes its audit.
     scope.cancellation_handle().cancel();
-    scope.wait_idle().await;
-    result
+    match settle_headless_scope(&scope, &mut interrupts, grace, deadline).await {
+        Some(forced) => (Err(forced_stop_io_error(forced, grace)), Some(forced)),
+        None => (result, None),
+    }
 }
 
 /// Let the runner observe cancellation and return its partial transcript before
 /// waiting for tool and hook cleanup. Dropping the whole turn would lose it.
+///
+/// After the first SIGINT/SIGTERM both waits are bounded by
+/// [`HEADLESS_FORCED_STOP_GRACE`] and a second signal (mini-agent-p73n1): the
+/// run then returns what it has, marked failed, and records the forced stop so
+/// the caller persists it and `main` exits 130 without draining stalled work.
 pub(crate) async fn run_headless_turn<F>(turn: F) -> crate::agent::runner::HeadlessTurn
 where
     F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
 {
+    let grace = HEADLESS_FORCED_STOP_GRACE;
+    if headless_force_stopped() {
+        return crate::agent::runner::HeadlessTurn::failed_before_start(
+            ForcedStop::SecondSignal.error(grace),
+        );
+    }
+    let (result, forced) = run_headless_turn_with(turn, HeadlessInterrupts::os(), grace).await;
+    if forced.is_some() {
+        record_forced_stop();
+    }
+    result
+}
+
+/// [`run_headless_turn`] without the process-wide forced-stop record, so tests
+/// can drive it with injected signals.
+async fn run_headless_turn_with<F>(
+    turn: F,
+    mut interrupts: HeadlessInterrupts,
+    grace: std::time::Duration,
+) -> (crate::agent::runner::HeadlessTurn, Option<ForcedStop>)
+where
+    F: std::future::Future<Output = crate::agent::runner::HeadlessTurn>,
+{
     let scope = crate::agent::runner::AgentWorkScope::new();
-    let result = scope
+    let (mut result, deadline, forced) = scope
         .run(async {
             tokio::pin!(turn);
             tokio::select! {
                 biased;
-                signal = headless_interrupt() => {
+                signal = interrupts.recv() => {
                     scope.cancellation_handle().cancel();
-                    let mut result = turn.await;
+                    let deadline = tokio::time::Instant::now() + grace;
+                    let mut result = tokio::select! {
+                        biased;
+                        result = &mut turn => result,
+                        forced = interrupts.second_signal_or(deadline) => {
+                            // The turn never returned: nothing of it survives
+                            // but the fact that it was stopped.
+                            return (
+                                crate::agent::runner::HeadlessTurn::failed_before_start(
+                                    anyhow::anyhow!("headless turn interrupted"),
+                                ),
+                                Some(deadline),
+                                Some(forced),
+                            );
+                        }
+                    };
                     if let Err(error) = signal {
                         result.failure = Some(anyhow::anyhow!(error).context("headless signal handler failed"));
                     }
-                    result
+                    (result, Some(deadline), None)
                 }
-                result = &mut turn => result,
+                result = &mut turn => (result, None, None),
             }
         })
         .await;
     scope.cancellation_handle().cancel();
-    scope.wait_idle().await;
-    result
+    let forced = match forced {
+        Some(forced) => Some(forced),
+        None => settle_headless_scope(&scope, &mut interrupts, grace, deadline).await,
+    };
+    if let Some(forced) = forced {
+        let error = forced.error(grace);
+        result.failure = Some(match result.failure.take() {
+            Some(failure) => failure.context(format!("{error:#}")),
+            None => error,
+        });
+    }
+    (result, forced)
 }
 
 /// Char-safe short preview of a session id for listings. Ids are normally
@@ -1219,6 +1450,168 @@ mod tests {
             .unwrap();
         assert_eq!(result.response, "done");
         assert!(result.failure.is_none());
+    }
+
+    /// Scoped blocking work that ignores cancellation until the test releases
+    /// it: a child whose cleanup never finishes on its own.
+    fn stalled_work(
+        started: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        std::mem::drop(crate::agent::runner::spawn_blocking_scoped(move || {
+            let _ = started.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(120));
+        }));
+    }
+
+    fn injected_interrupts() -> (
+        tokio::sync::mpsc::UnboundedSender<()>,
+        super::HeadlessInterrupts,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (sender, super::HeadlessInterrupts::Channel(receiver))
+    }
+
+    // mini-agent-p73n1: a second interrupt ends the wait for a turn that never
+    // returns, instead of being swallowed until SIGKILL.
+    #[tokio::test]
+    async fn a_second_interrupt_force_stops_a_turn_that_never_returns() {
+        use std::time::Duration;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (signals, interrupts) = injected_interrupts();
+        let mut run = tokio::spawn(super::run_headless_turn_with(
+            async move {
+                stalled_work(started_tx, release_rx);
+                std::future::pending::<crate::agent::runner::HeadlessTurn>().await
+            },
+            interrupts,
+            Duration::from_secs(600),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        signals.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut run)
+                .await
+                .is_err(),
+            "the first interrupt must still wait for the partial turn"
+        );
+        signals.send(()).unwrap();
+        let (turn, forced) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the second interrupt must end the wait")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(forced, Some(super::ForcedStop::SecondSignal));
+        let failure = format!("{:#}", turn.failure.expect("a forced stop is a failure"));
+        assert!(failure.contains("interrupted again"), "{failure}");
+    }
+
+    // mini-agent-p73n1: with no second signal the wait is bounded by the grace
+    // deadline, and the partial turn the runner handed back survives it.
+    #[tokio::test]
+    async fn stalled_cleanup_after_an_interrupt_is_bounded_and_keeps_the_partial_turn() {
+        use std::time::Duration;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (signals, interrupts) = injected_interrupts();
+        let run = tokio::spawn(super::run_headless_turn_with(
+            async move {
+                stalled_work(started_tx, release_rx);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                crate::agent::runner::HeadlessTurn {
+                    response: "partial".to_owned(),
+                    usage: Usage::default(),
+                    interactions: Vec::new(),
+                    failure: None,
+                }
+            },
+            interrupts,
+            Duration::from_millis(300),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        signals.send(()).unwrap();
+        let (turn, forced) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the grace deadline must end the wait")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(forced, Some(super::ForcedStop::Deadline));
+        assert_eq!(turn.response, "partial");
+        let failure = format!("{:#}", turn.failure.expect("a forced stop is a failure"));
+        assert!(failure.contains("did not settle"), "{failure}");
+    }
+
+    // Without an interrupt, settling stays unbounded: slow cleanup of a
+    // finished turn is not cut short.
+    #[tokio::test]
+    async fn uninterrupted_turns_still_wait_for_their_cleanup() {
+        use std::time::Duration;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (_signals, interrupts) = injected_interrupts();
+        let mut run = tokio::spawn(super::run_headless_turn_with(
+            async move {
+                stalled_work(started_tx, release_rx);
+                crate::agent::runner::HeadlessTurn {
+                    response: "done".to_owned(),
+                    usage: Usage::default(),
+                    interactions: Vec::new(),
+                    failure: None,
+                }
+            },
+            interrupts,
+            Duration::from_millis(10),
+        ));
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut run)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        let (turn, forced) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced, None);
+        assert!(turn.failure.is_none());
+    }
+
+    // mini-agent-p73n1: the `!command` path is bounded the same way.
+    #[tokio::test]
+    async fn a_second_interrupt_force_stops_a_stalled_headless_command() {
+        use std::time::Duration;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (signals, interrupts) = injected_interrupts();
+        let run = tokio::spawn(super::run_headless_command_with(
+            async move {
+                stalled_work(started_tx, release_rx);
+                std::future::pending::<io::Result<()>>().await
+            },
+            interrupts,
+            Duration::from_secs(600),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        signals.send(()).unwrap();
+        signals.send(()).unwrap();
+        let (result, forced) = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the second interrupt must end the wait")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(forced, Some(super::ForcedStop::SecondSignal));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
     }
 
     struct BrokenPipeWriter;

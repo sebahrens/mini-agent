@@ -673,19 +673,56 @@ fn escape_html(text: &str) -> String {
     out
 }
 
+/// How long the gist upload may spend connecting, and in total. `/share` runs
+/// inline in the slash handler, so a stalled GitHub connection must end in an
+/// error rather than freeze the UI (mini-agent-p73n1).
+pub(crate) const GIST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const GIST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const GIST_API_URL: &str = "https://api.github.com/gists";
+
+/// The HTTP client every gist upload uses: bounded connect and total time.
+pub(crate) fn gist_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(GIST_CONNECT_TIMEOUT)
+        .timeout(GIST_REQUEST_TIMEOUT)
+        .build()
+        .context("failed to build the GitHub API client")
+}
+
 /// Upload `content` as a secret gist and return its URL. Requires
-/// `GITHUB_TOKEN` or `GH_TOKEN` in the environment.
+/// `GITHUB_TOKEN` or `GH_TOKEN` in the environment. A secret gist is unlisted,
+/// not private: anyone with the link can read it.
 pub async fn share_gist(filename: &str, content: &str, description: &str) -> Result<String> {
     let token = std::env::var("GITHUB_TOKEN")
         .or_else(|_| std::env::var("GH_TOKEN"))
         .context("set GITHUB_TOKEN or GH_TOKEN to share sessions as gists")?;
+    upload_gist(
+        &gist_client()?,
+        GIST_API_URL,
+        &token,
+        filename,
+        content,
+        description,
+    )
+    .await
+}
+
+pub(crate) async fn upload_gist(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    filename: &str,
+    content: &str,
+    description: &str,
+) -> Result<String> {
     let body = serde_json::json!({
         "description": description,
         "public": false,
         "files": { filename: { "content": content } },
     });
-    let response = reqwest::Client::new()
-        .post("https://api.github.com/gists")
+    let response = client
+        .post(url)
         .header(reqwest::header::USER_AGENT, crate::product::PUBLIC_NAME)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")

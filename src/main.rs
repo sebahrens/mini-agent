@@ -70,7 +70,17 @@ fn main() -> anyhow::Result<ExitCode> {
     let runtime = normal_runtime().context("failed to initialize the async runtime")?;
     // Runtime adapters otherwise copy the entire startup future into their
     // own stack frames before polling it.
-    match runtime.block_on(Box::pin(run(cli))) {
+    let result = runtime.block_on(Box::pin(run(cli)));
+    // A headless run that stopped waiting for stalled cleanup (a second
+    // interrupt, or the grace deadline) has already persisted what it had.
+    // Exit now: dropping the runtime would wait for that work forever.
+    if print::headless_force_stopped() {
+        if let Err(error) = &result {
+            eprintln!("Error: {error:?}");
+        }
+        print::exit_force_stopped();
+    }
+    match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         // A goal that stopped short is an outcome, not a crash: it exits with
         // its own code so a script can branch on it, and without an error
