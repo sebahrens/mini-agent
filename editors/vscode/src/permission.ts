@@ -2,7 +2,7 @@ import type * as acp from '@agentclientprotocol/sdk';
 
 /** Upper bound for the input text rendered in the permission modal. */
 export const PERMISSION_DETAIL_LIMIT = 800;
-/** Upper bound for the pattern echoed in the "Allow always" button label. */
+/** Upper bound for the pattern echoed in the allow-always button label. */
 export const PERMISSION_LABEL_LIMIT = 60;
 
 const META_PATTERN_KEYS = ['suggestedPattern', 'suggested_pattern', 'pattern'] as const;
@@ -24,7 +24,7 @@ function metaString(meta: unknown): string | undefined {
 }
 
 /**
- * The rule the server will persist when the user picks an `allow_always`
+ * The session rule the server will install when the user picks an `allow_always`
  * option, if the server advertised it (option `_meta` wins over the tool call
  * and request `_meta`). Returns undefined when nothing was provided.
  */
@@ -77,7 +77,7 @@ export function toolCallInputLines(toolCall: acp.ToolCallUpdate): string[] {
 
 /**
  * Compose the modal `detail` text: the command/input the tool wants to run,
- * bounded to a sane length, what "Allow always" would persist, and the id.
+ * bounded to a sane length, what the allow-always option grants for this session, and the id.
  */
 export function buildPermissionDetail(
   request: acp.RequestPermissionRequest,
@@ -90,16 +90,17 @@ export function buildPermissionDetail(
   const always = request.options.find(option => option.kind === 'allow_always');
   if (always) {
     const pattern = suggestedPattern(request, always);
+    // mini-agent installs allow-always grants for the current session only.
     sections.push(pattern
-      ? `"${always.name}" will persist this rule: ${truncate(pattern, limit)}`
-      : `"${always.name}" will persist a rule for this exact input.`);
+      ? `"${always.name}" will allow this for this session: ${truncate(pattern, limit)}`
+      : `"${always.name}" will allow this exact input for this session.`);
   }
 
   sections.push(`Tool call ${request.toolCall.toolCallId}`);
   return sections.join('\n\n');
 }
 
-/** Button label for an option; the allow-always option shows what it persists. */
+/** Button label for an option; the allow-always option shows the session rule it installs. */
 export function permissionOptionTitle(
   request: acp.RequestPermissionRequest,
   option: acp.PermissionOption,

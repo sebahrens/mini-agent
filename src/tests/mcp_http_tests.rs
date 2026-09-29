@@ -92,6 +92,7 @@ async fn mcp_http_initialization_honors_deadlines_and_scope_cancellation() {
                     &url,
                     &headers,
                     oauth.as_ref(),
+                    None,
                     if cancel {
                         Duration::from_secs(10)
                     } else {

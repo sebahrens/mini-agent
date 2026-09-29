@@ -226,7 +226,7 @@ export async function requestPermission(
     optionIndex: index,
   }));
   // The detail shows the actual command/input (content text blocks and rawInput),
-  // not just the tool name, so "Allow always" never persists an unseen rule.
+  // not just the tool name, so the allow-always option never grants an unseen rule.
   const cancellation = new vscode.CancellationTokenSource();
   let resolveAbort!: (value: undefined) => void;
   const aborted = new Promise<undefined>(resolve => { resolveAbort = resolve; });

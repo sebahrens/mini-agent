@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use super::bounded_http::BoundedHttpClient;
 use super::config::{McpServerConfig, McpStdioNetwork, OAuthConfig, TrustedMcpServer};
+use super::egress::ValidatedEndpoint;
 use crate::process_creation::CommandWrapCreationExt;
 use crate::sandbox::{Sandbox, owned_workspace_service_tree};
 
@@ -406,16 +407,17 @@ impl McpClientHandle {
                 headers,
                 oauth,
             } => {
-                tokio::select! {
+                let endpoint = tokio::select! {
                     biased;
                     _ = crate::agent::runner::current_work_scope_cancelled() => anyhow::bail!("MCP connection cancelled"),
                     result = validate_mcp_server_url(url) => result?,
-                }
+                };
                 let mut handle = Self::connect_http_with_timeout(
                     server_name,
                     url,
                     headers,
                     oauth.as_ref(),
+                    Some(&endpoint),
                     initialize_timeout,
                 )
                 .await?;
@@ -427,6 +429,7 @@ impl McpClientHandle {
                     server_name,
                     identity.endpoint(),
                     headers,
+                    None,
                     None,
                     initialize_timeout,
                 )
@@ -443,12 +446,17 @@ impl McpClientHandle {
     /// initialization handshake.
     ///
     /// The caller is responsible for URL validation; this is the transport
-    /// layer only, so tests can drive it against a loopback listener.
+    /// layer only, so tests can drive it against a loopback listener. A
+    /// validated `endpoint` pins the server host to the addresses that passed
+    /// validation for the transport and the OAuth client alike, and holds
+    /// every other name they resolve to the same public-address policy (see
+    /// [`super::egress`]); `None` is for built-in endpoints and tests.
     pub(crate) async fn connect_http_with_timeout(
         server_name: CompactString,
         url: &str,
         headers: &HashMap<String, String>,
         oauth: Option<&OAuthConfig>,
+        endpoint: Option<&ValidatedEndpoint>,
         initialize_timeout: Duration,
     ) -> anyhow::Result<Self> {
         tracing::debug!(
@@ -466,15 +474,20 @@ impl McpClientHandle {
         let oauth_settings = oauth.and_then(|o| o.settings());
         // Every response body and SSE event is capped (see `bounded_http`).
         let http_client = BoundedHttpClient::new(
-            http_client(initialize_timeout)?,
+            http_client_for(initialize_timeout, endpoint)?,
             super::bounded_http::MCP_HTTP_MAX_BODY_BYTES,
         );
 
         let connect = async {
             if let Some(settings) = oauth_settings {
-                let auth_client =
-                    super::oauth::build_auth_client(&server_name, url, &settings, http_client)
-                        .await?;
+                let auth_client = super::oauth::build_auth_client(
+                    &server_name,
+                    url,
+                    &settings,
+                    http_client,
+                    endpoint,
+                )
+                .await?;
                 type AuthHttpClient = rmcp::transport::StreamableHttpClientTransport<
                     rmcp::transport::auth::AuthClient<BoundedHttpClient>,
                 >;
@@ -526,12 +539,26 @@ impl McpClientHandle {
 /// Only the connect phase is time-bounded here. A whole-request timeout would sever
 /// the long-lived SSE stream and legitimate long tool calls; those are bounded
 /// per RPC through [`PeerRequestOptions`] instead.
+#[cfg(test)]
 pub(crate) fn http_client(connect_timeout: Duration) -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    http_client_for(connect_timeout, None)
+}
+
+/// [`http_client`] pinned to a validated endpoint when there is one, so
+/// neither the first connect nor an SSE reconnect resolves the host again.
+fn http_client_for(
+    connect_timeout: Duration,
+    endpoint: Option<&ValidatedEndpoint>,
+) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(connect_timeout)
-        .build()
-        .map_err(|error| anyhow::anyhow!("MCP HTTP client construction failed: {error}"))
+        .connect_timeout(connect_timeout);
+    match endpoint {
+        Some(endpoint) => endpoint.pin(builder),
+        None => builder,
+    }
+    .build()
+    .map_err(|error| anyhow::anyhow!("MCP HTTP client construction failed: {error}"))
 }
 
 /// `tools/list` with a total time budget across every paginated page and a cap
@@ -792,26 +819,34 @@ fn parse_headers(
     Ok(result)
 }
 
-async fn validate_mcp_server_url(value: &str) -> anyhow::Result<()> {
-    let (host, port, literal_ip) = parse_mcp_server_url(value)?;
+/// Validates a URL MCP server and returns its host with the addresses that
+/// passed, for the HTTP clients to pin (see [`super::egress`]).
+pub(crate) async fn validate_mcp_server_url(value: &str) -> anyhow::Result<ValidatedEndpoint> {
+    validate_mcp_server_url_with(value, &super::egress::system_lookup()).await
+}
+
+pub(super) async fn validate_mcp_server_url_with(
+    value: &str,
+    lookup: &super::egress::Lookup,
+) -> anyhow::Result<ValidatedEndpoint> {
+    let (host, _port, literal_ip) = parse_mcp_server_url(value)?;
     let addresses = if let Some(address) = literal_ip {
         vec![address]
     } else {
-        let resolver_host = host.clone();
-        crate::agent::runner::spawn_blocking_scoped(move || {
-            (resolver_host.as_str(), port)
-                .to_socket_addrs()
-                .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("could not resolve MCP server host '{host}': {error}"))?
-        .map_err(|error| anyhow::anyhow!("could not resolve MCP server host '{host}': {error}"))?
+        lookup(host.clone()).await.map_err(|error| {
+            anyhow::anyhow!("could not resolve MCP server host '{host}': {error}")
+        })?
     };
 
-    validate_resolved_addresses(&addresses)
+    validate_resolved_addresses(&addresses)?;
+    Ok(ValidatedEndpoint::new(
+        host,
+        &addresses,
+        literal_ip.is_some(),
+    ))
 }
 
-fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAddr>)> {
+pub(super) fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAddr>)> {
     let url = reqwest::Url::parse(value)
         .map_err(|error| anyhow::anyhow!("invalid MCP server URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -845,7 +880,7 @@ fn parse_mcp_server_url(value: &str) -> anyhow::Result<(String, u16, Option<IpAd
     Ok((host, port, literal_ip))
 }
 
-fn validate_resolved_addresses(addresses: &[IpAddr]) -> anyhow::Result<()> {
+pub(super) fn validate_resolved_addresses(addresses: &[IpAddr]) -> anyhow::Result<()> {
     if addresses.is_empty() {
         anyhow::bail!("MCP server host did not resolve to an IP address");
     }

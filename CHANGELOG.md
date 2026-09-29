@@ -8,6 +8,20 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- URL MCP servers are pinned to the addresses that passed the public-address check: the HTTP
+  transport, its SSE reconnects and the OAuth client no longer resolve the host again, and every
+  other OAuth host, lookup and redirect must also be public, so DNS rebinding to `127.0.0.1` or
+  `169.254.169.254` is refused. `/mcp login` now validates the server URL too.
+- ACP "Allow always" (now labelled "Allow for this session") on a file tool without a narrower
+  scope approves exactly the prompted path; a `*` or `?` in it no longer widens the grant to a
+  glob. The option's `_meta.suggestedPattern` names the exact session rule, and the VS Code
+  extension no longer says the rule is persisted.
+- The VS Code extension resolves a bare `mini-agent.executablePath` to an absolute path using only
+  the absolute `PATH` directories, so on Windows a `mini-agent.exe` planted in the workspace is
+  never launched, and the version probe and the launch run the same file.
+- An aborted, reset or interrupted connection, or a brief descriptor shortage, no longer shuts
+  down the ACP TCP (plaintext or TLS) listener before a client authenticates; the plaintext
+  listener no longer blocks an async worker while it waits.
 - The `js` tool's `list_dir`, `glob` and `grep` now honour per-file path deny rules like the built-in
   walkers: with `read = { "config/secrets/**" = "deny" }` they no longer list or search those files.
   JS file effects also treat `$HOME/...` like `~/...` (the home directory, checked by the ambient

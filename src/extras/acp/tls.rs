@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use super::accept::AcceptSource;
 use crate::acp_auth::{AuthError, authenticate_tls_peer};
 
 pub(super) const ACP_TLS_CERT_ENV: &str = "MINI_AGENT_ACP_TLS_CERT";
@@ -122,13 +123,42 @@ pub(super) async fn accept_tls_peer(
     tls: Arc<AcpTlsConfig>,
     max_pending: usize,
 ) -> std::io::Result<(TlsStream, SocketAddr)> {
-    listener.set_nonblocking(true)?;
-    let listener = tokio::net::TcpListener::from_std(listener)?;
+    accept_tls_peer_from(
+        super::accept::tokio_listener(listener)?,
+        api_key,
+        tls,
+        max_pending,
+    )
+    .await
+}
+
+/// [`accept_tls_peer`] over any [`AcceptSource`]. A failed accept of one
+/// connection is logged and skipped (see [`super::accept`]); only a failure
+/// of the listener itself ends the loop.
+pub(super) async fn accept_tls_peer_from<S: AcceptSource>(
+    mut source: S,
+    api_key: String,
+    tls: Arc<AcpTlsConfig>,
+    max_pending: usize,
+) -> std::io::Result<(TlsStream, SocketAddr)> {
     let api_key: Arc<str> = api_key.into();
     let mut pending: tokio::task::JoinSet<PeerOutcome> = tokio::task::JoinSet::new();
+    let mut backoff_until: Option<tokio::time::Instant> = None;
     loop {
         let event = tokio::select! {
-            accepted = listener.accept() => PeerEvent::Accepted(accepted?),
+            accepted = source.accept(), if backoff_until.is_none() => match accepted {
+                Ok(connection) => PeerEvent::Accepted(connection),
+                Err(error) => {
+                    backoff_until = super::accept::after_accept_error("ACP TLS", error)?;
+                    continue;
+                }
+            },
+            () = tokio::time::sleep_until(backoff_until.unwrap_or_else(tokio::time::Instant::now)),
+                if backoff_until.is_some() =>
+            {
+                backoff_until = None;
+                continue;
+            }
             Some(joined) = pending.join_next(), if !pending.is_empty() => PeerEvent::Settled(joined),
         };
         match event {
@@ -307,6 +337,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(line, "{\"jsonrpc\":\"2.0\"}\n");
+    }
+
+    #[tokio::test]
+    async fn aborted_accepts_do_not_stop_a_valid_tls_peer_from_authenticating() {
+        use crate::extras::acp::accept::test_support::{FlakyListener, per_connection_failures};
+        let tls = config();
+        let (source, address) = FlakyListener::bind(per_connection_failures());
+        let server = tokio::spawn(accept_tls_peer_from(source, "key".into(), tls.clone(), 4));
+
+        let (mut client, observed) = connect(address).await;
+        respond(&mut client, "key", &observed).await;
+        let (_, peer) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the listener survives per-connection accept failures")
+            .unwrap()
+            .unwrap();
+        assert!(peer.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn a_listener_failure_still_ends_the_tls_accept_loop() {
+        use crate::extras::acp::accept::test_support::FlakyListener;
+        let (source, _) =
+            FlakyListener::bind(vec![std::io::Error::from(std::io::ErrorKind::InvalidInput)]);
+        let error = accept_tls_peer_from(source, "key".into(), config(), 4)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

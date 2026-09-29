@@ -213,6 +213,28 @@ pub(crate) fn search_root_allow_scope(root: &str) -> (String, String) {
     (descendant_path_pattern(root), exact_path_pattern(root))
 }
 
+/// The human-readable form of an AllowAlways pattern, for showing the user
+/// exactly what a grant covers. Generated literal scopes are decoded (they
+/// are opaque hex on the wire); any other pattern is returned verbatim.
+#[cfg_attr(not(feature = "acp"), allow(dead_code))]
+pub(crate) fn describe_allow_pattern(pattern: &str) -> String {
+    let (kind, encoded) = if let Some(encoded) = pattern.strip_prefix(EXACT_SCOPE_PREFIX) {
+        (GeneratedScopeKind::Exact, encoded)
+    } else if let Some(encoded) = pattern.strip_prefix(DESCENDANT_SCOPE_PREFIX) {
+        (GeneratedScopeKind::Descendants, encoded)
+    } else {
+        return pattern.to_string();
+    };
+    let Some(path) = decode_hex_path(encoded) else {
+        return pattern.to_string();
+    };
+    match kind {
+        GeneratedScopeKind::Exact => format!("exactly {path}"),
+        GeneratedScopeKind::Descendants if path.ends_with('/') => format!("anything under {path}"),
+        GeneratedScopeKind::Descendants => format!("anything under {path}/"),
+    }
+}
+
 fn encode_generated_scope(prefix: &str, path: &str) -> String {
     let mut encoded = String::with_capacity(prefix.len() + path.len() * 2);
     encoded.push_str(prefix);

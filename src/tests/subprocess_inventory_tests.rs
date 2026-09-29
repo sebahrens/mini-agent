@@ -869,12 +869,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ("src/docs.rs", ".status()", 1, "TC-SUPPORT-UTILITY"),
     (
         "src/extras/acp/mod.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/extras/acp/mod.rs",
         ".status(ToolCallStatus::Completed)",
         1,
         "NON-PROCESS",
@@ -1192,6 +1186,24 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/extras/mcp/client.rs",
         "assert_eq!(response.status(), reqwest::StatusCode::FOUND);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        ".status(response.status())",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        "assert!(response.status().is_success());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        "assert_eq!(response.status(), http::StatusCode::FOUND);",
         1,
         "NON-PROCESS",
     ),
@@ -3202,6 +3214,20 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
             1,
         )],
     ),
+    // HTTP response status assertions in the MCP egress (DNS pinning) tests.
+    (
+        "src/extras/mcp/egress.rs",
+        &[
+            (
+                "56f9f8b16d35fc1be3c432a7d764aadd96ea501839ca14a09963e45bf406bc4f",
+                1,
+            ),
+            (
+                "df267c0700d3a41de9a0eb6a981b1b50b28f85cb3af770b7d4b261d3f6715198",
+                1,
+            ),
+        ],
+    ),
     (
         "src/sandbox.rs",
         &[
@@ -3499,6 +3525,24 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "NON-PROCESS",
     ),
     (
+        "src/extras/mcp/egress.rs",
+        ".status(response.status())",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        "assert!(response.status().is_success());",
+        1,
+        "NON-PROCESS",
+    ),
+    (
+        "src/extras/mcp/egress.rs",
+        "assert_eq!(response.status(), http::StatusCode::FOUND);",
+        1,
+        "NON-PROCESS",
+    ),
+    (
         "src/sandbox.rs",
         "let mut command = std::process::Command::new(bwrap);",
         2,
@@ -3682,12 +3726,6 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(\"kill\")",
         1,
         "TEST-ONLY",
-    ),
-    (
-        "src/extras/acp/mod.rs",
-        ".spawn(move || {",
-        1,
-        "NON-PROCESS",
     ),
     (
         "src/extras/acp/mod.rs",
