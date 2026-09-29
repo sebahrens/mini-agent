@@ -1069,6 +1069,42 @@ class RepositoryCoordinateValidationTests(unittest.TestCase):
             ),
         )
 
+    def test_every_package_recipe_must_install_the_third_party_inventory(self) -> None:
+        for relative, fragments in (
+            CHECK_PACKAGE_METADATA.DISTRIBUTION_NOTICE_FRAGMENTS.items()
+        ):
+            with self.subTest(relative=relative):
+                self.assertTrue(
+                    any("THIRD_PARTY_LICENSES" in fragment for fragment in fragments)
+                )
+
+    def test_notice_without_quickjs_attribution_is_rejected(self) -> None:
+        repository = SCRIPT.parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(
+                repository,
+                root / "repository",
+                ignore=shutil.ignore_patterns(
+                    ".git", "target", "node_modules", "spike", ".beads", ".claude"
+                ),
+            )
+            copy = root / "repository"
+            notice = copy / "NOTICE"
+            notice.write_text(
+                notice.read_text(encoding="utf-8").replace(
+                    "Copyright (c) 2017-2026 Fabrice Bellard", "", 1
+                ),
+                encoding="utf-8",
+            )
+
+            errors = CHECK_PACKAGE_METADATA.validate_file_fragments(copy, "mini-agent")
+
+        self.assertEqual(
+            ["NOTICE is missing required text 'Copyright (c) 2017-2026 Fabrice Bellard'"],
+            errors,
+        )
+
     def test_each_package_recipe_compliance_install_is_fail_closed(self) -> None:
         repository = SCRIPT.parents[1]
         for relative, fragments in (

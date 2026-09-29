@@ -29,6 +29,7 @@ sha256sums_aarch64=('2cd1fbcbc593456ae4eaac08a37005985d54c8261572ac31ef6a44e1f45
 package() {
     install -Dm755 mini-agent "${pkgdir}/usr/bin/mini-agent"
     install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 THIRD_PARTY_LICENSES "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES"
     install -Dm644 NOTICE "${pkgdir}/usr/share/doc/${pkgname}/NOTICE"
     install -Dm644 SOURCE.md "${pkgdir}/usr/share/doc/${pkgname}/SOURCE.md"
 }

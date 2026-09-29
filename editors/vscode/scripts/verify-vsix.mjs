@@ -15,6 +15,7 @@ export function verifyVsix(vsixPath, target) {
     'extension/THIRD_PARTY_LICENSES.md',
     'extension/THIRD_PARTY_APACHE_LICENSE.txt',
     `extension/bin/${target}/${targetInfo.binary}`,
+    `extension/bin/${target}/THIRD_PARTY_LICENSES`,
     'extension/dist/extension.js',
     'extension/package.json',
   ].sort();

@@ -13,7 +13,7 @@ set -euo pipefail
 REPO="sebahrens/mini-agent"
 BINARY_NAME="mini-agent"
 DEFAULT_DIR="${HOME}/.local/bin"
-REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")
+REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md" "THIRD_PARTY_LICENSES")
 
 usage() {
     local status="${1:-0}"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import subprocess
@@ -13,6 +14,17 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 INSTALLER = ROOT / "install.sh"
 PACKAGER = ROOT / "scripts/package-release-binary.py"
+INVENTORY = """mini-agent third-party license inventory
+========================================
+Format: mini-agent-third-party-licenses/1
+Binary: mini-agent 1.7.2
+Target: aarch64-apple-darwin
+Features: default
+Packages: 1
+
+Package: rquickjs-sys 0.12.2
+License: MIT
+"""
 
 
 class InstallScriptTests(unittest.TestCase):
@@ -52,6 +64,8 @@ class InstallScriptTests(unittest.TestCase):
         target = {"Darwin": "apple-darwin", "Linux": "unknown-linux-musl"}[os_name]
         archive = release / f"mini-agent-aarch64-{target}.tar.gz"
 
+        inventory = root / "THIRD_PARTY_LICENSES"
+        inventory.write_text(INVENTORY, encoding="utf-8")
         if include_notice:
             subprocess.run(
                 [
@@ -65,6 +79,8 @@ class InstallScriptTests(unittest.TestCase):
                     str(archive),
                     "--executable-name",
                     "mini-agent",
+                    "--third-party-licenses",
+                    str(inventory),
                 ],
                 check=True,
             )
@@ -73,6 +89,7 @@ class InstallScriptTests(unittest.TestCase):
                 packaged.add(binary, arcname="mini-agent")
                 packaged.add(ROOT / "LICENSE", arcname="LICENSE")
                 packaged.add(ROOT / "SOURCE.md", arcname="SOURCE.md")
+                packaged.add(inventory, arcname="THIRD_PARTY_LICENSES")
 
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         (release / "SHA256SUMS").write_text(
@@ -234,6 +251,37 @@ fi
                     (ROOT / document).read_bytes(),
                     (root / "prefix/share/doc/mini-agent" / document).read_bytes(),
                 )
+            self.assertEqual(
+                INVENTORY,
+                (root / "prefix/share/doc/mini-agent/THIRD_PARTY_LICENSES").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_missing_third_party_inventory_fails_before_installing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            archive = next(release.glob("*.tar.gz"))
+            with tarfile.open(archive, "r:gz") as packaged:
+                members = [
+                    (member, packaged.extractfile(member).read())
+                    for member in packaged.getmembers()
+                    if member.name != "THIRD_PARTY_LICENSES"
+                ]
+            with tarfile.open(archive, "w:gz") as repacked:
+                for member, contents in members:
+                    repacked.addfile(member, io.BytesIO(contents))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            (release / "SHA256SUMS").write_text(
+                f"{digest}  {archive.name}\n", encoding="utf-8"
+            )
+
+            result = self.run_installer(root, release, stub_bin)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("THIRD_PARTY_LICENSES", result.stderr)
+            self.assertFalse((root / "prefix/bin/mini-agent").exists())
 
     def test_missing_notice_fails_before_installing_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

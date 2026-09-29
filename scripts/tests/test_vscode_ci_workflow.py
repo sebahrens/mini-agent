@@ -64,6 +64,28 @@ class VsCodeCiWorkflowTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, self.body)
 
+    def test_vsix_bundles_the_native_binary_license_inventory(self) -> None:
+        self.assertIn(
+            "python3 scripts/third_party_licenses.py generate \\\n"
+            "            --target x86_64-unknown-linux-gnu \\\n"
+            "            --output editors/vscode/bin/linux-x64/THIRD_PARTY_LICENSES",
+            self.body,
+        )
+        release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn(
+            '-C "editors/vscode/bin/$VSCODE_TARGET" "$BINARY_NAME" THIRD_PARTY_LICENSES',
+            release,
+        )
+        scripts = REPOSITORY_ROOT / "editors/vscode/scripts"
+        self.assertIn(
+            "`!bin/${target}/THIRD_PARTY_LICENSES`",
+            (scripts / "package-target.mjs").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "`extension/bin/${target}/THIRD_PARTY_LICENSES`",
+            (scripts / "verify-vsix.mjs").read_text(encoding="utf-8"),
+        )
+
     def test_job_uses_the_standard_non_scheduled_guard(self) -> None:
         condition = self.body.splitlines()[0].strip()
         self.assertIn("github.event_name != 'schedule'", condition)

@@ -104,6 +104,45 @@ class WindowsMsiPolicyTests(unittest.TestCase):
 
             self.assertTrue(any("--print-config" in error for error in errors))
 
+    def test_msi_must_install_the_third_party_license_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(REPOSITORY / "packaging/windows", root / "packaging/windows")
+            workflow = root / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            text = (REPOSITORY / ".github/workflows/release.yml").read_text(encoding="utf-8")
+            workflow.write_text(
+                text.replace(" `\n            -p:ThirdPartyLicensesPath=$thirdPartyLicenses", "", 1),
+                encoding="utf-8",
+            )
+            shutil.copy(REPOSITORY / ".github/workflows/ci.yml", workflow.parent / "ci.yml")
+            source = root / "packaging/windows/mini-agent.wxs"
+            source.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    '      <ComponentRef Id="ThirdPartyLicensesComponent" />\n', ""
+                ),
+                encoding="utf-8",
+            )
+            project = root / "packaging/windows/installer.wixproj"
+            project.write_text(
+                project.read_text(encoding="utf-8").replace(
+                    "'$(ThirdPartyLicensesPath)' == ''", "'$(ThirdPartyLicensesPath)' == 'x'"
+                ),
+                encoding="utf-8",
+            )
+
+            errors = check_windows_msi.validate(root)
+
+            self.assertTrue(
+                any("ThirdPartyLicensesComponent" in error for error in errors), errors
+            )
+            self.assertTrue(
+                any("missing ThirdPartyLicensesPath" in error for error in errors), errors
+            )
+            self.assertTrue(
+                any("-p:ThirdPartyLicensesPath" in error for error in errors), errors
+            )
+
     def test_per_machine_extension_install_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

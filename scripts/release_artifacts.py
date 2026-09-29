@@ -11,13 +11,18 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import third_party_licenses as inventory_format  # noqa: E402
 
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 SHA256_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)$")
-REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")
+REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES")
+INVENTORY_FEATURES = {"default": False, "no-default": True}
 WINDOWS_PRIVATE_DIRECTORY_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -297,17 +302,72 @@ def _smoke_environment(
     return smoke_environment
 
 
+def _cargo_metadata(target: str, no_default_features: bool) -> dict[str, Any]:
+    return inventory_format.cargo_metadata(
+        root=inventory_format.ROOT,
+        target=target,
+        no_default_features=no_default_features,
+    )
+
+
+def verify_third_party_inventory(
+    archive: Path,
+    *,
+    target: str,
+    features: str,
+    metadata_loader: Callable[[str, bool], Mapping[str, Any]] = _cargo_metadata,
+) -> int:
+    """Require the archive's inventory to name every package of its build.
+
+    The expected set is every non-workspace package of
+    `cargo metadata --locked --offline --format-version 1` filtered to the
+    archive's target and feature set.
+    """
+
+    if features not in INVENTORY_FEATURES:
+        raise ReleaseArtifactError(f"unknown inventory feature set: {features!r}")
+    no_default_features = INVENTORY_FEATURES[features]
+    with tarfile.open(archive, "r:gz") as bundle:
+        member = bundle.extractfile("THIRD_PARTY_LICENSES")
+        if member is None:
+            raise ReleaseArtifactError("release archive has no THIRD_PARTY_LICENSES")
+        try:
+            text = member.read().decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ReleaseArtifactError("THIRD_PARTY_LICENSES is not UTF-8") from error
+    try:
+        metadata = metadata_loader(target, no_default_features)
+        return inventory_format.verify_inventory(
+            text,
+            metadata,
+            target=target,
+            no_default_features=no_default_features,
+        )
+    except inventory_format.InventoryError as error:
+        raise ReleaseArtifactError(str(error)) from error
+
+
 def smoke_archive(
     archive: Path,
     executable_name: str,
     expected_version: str,
     js_expectation: str,
+    *,
+    inventory_target: str,
+    inventory_features: str,
+    metadata_loader: Callable[[str, bool], Mapping[str, Any]] = _cargo_metadata,
 ) -> None:
     if not archive.is_file() or archive.is_symlink():
         raise ReleaseArtifactError(f"release archive is not a regular file: {archive}")
     if not SAFE_NAME.fullmatch(executable_name):
         raise ReleaseArtifactError("unsafe executable name")
     _validate_archive_members(archive, executable_name)
+    verify_third_party_inventory(
+        archive,
+        target=inventory_target,
+        features=inventory_features,
+        metadata_loader=metadata_loader,
+    )
     install_parent = _smoke_install_parent()
     with tempfile.TemporaryDirectory(
         prefix="mini-agent-release-smoke-", dir=install_parent
@@ -380,6 +440,17 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument(
         "--expect-js", choices=("yes", "no", "unavailable"), required=True
     )
+    smoke.add_argument(
+        "--inventory-target",
+        required=True,
+        help="Rust target triple whose locked resolution THIRD_PARTY_LICENSES must cover",
+    )
+    smoke.add_argument(
+        "--inventory-features",
+        choices=tuple(INVENTORY_FEATURES),
+        required=True,
+        help="feature set the archive was built with (default or no-default)",
+    )
     return root
 
 
@@ -398,6 +469,8 @@ def main() -> int:
                 args.executable_name,
                 args.expected_version,
                 args.expect_js,
+                inventory_target=args.inventory_target,
+                inventory_features=args.inventory_features,
             )
     except ReleaseArtifactError as error:
         print(f"release artifact validation failed: {error}", file=sys.stderr)

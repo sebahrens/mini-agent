@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Faithfully stage package recipes and verify their GPL compliance payloads."""
+"""Faithfully stage package recipes and verify their license compliance payloads."""
 
 from __future__ import annotations
 
@@ -17,6 +17,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CHANNELS = ("aur", "conda-bin", "conda-source", "homebrew")
 DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")
+# Generated per build by scripts/third_party_licenses.py; release archives
+# carry it next to the repository documents above.
+INVENTORY = "THIRD_PARTY_LICENSES"
+INVENTORY_FIXTURE = """mini-agent third-party license inventory
+========================================
+Format: mini-agent-third-party-licenses/1
+Binary: mini-agent 0.0.0
+Target: {target}
+Features: default
+Packages: 1
+
+Packages
+--------
+
+Package: rquickjs-sys 0.12.2
+License: MIT
+"""
+SOURCE_BUILD_TARGET = "x86_64-unknown-linux-gnu"
 CANONICAL_GPL3_LICENSE_SHA256 = (
     "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 )
@@ -85,7 +103,33 @@ if args[:2] != ["--format", "yaml"] or "--output" not in args:
 Path(args[args.index("--output") + 1]).write_text("third-party: []\\n", encoding="utf-8")
 """,
     )
+    write_executable(
+        tools / "rustc",
+        f"""#!/usr/bin/env python3
+import sys
+
+if sys.argv[1:] != ["-vV"]:
+    raise SystemExit(f"unsupported controlled rustc invocation: {{sys.argv[1:]!r}}")
+print("rustc 1.96.0\\nhost: {SOURCE_BUILD_TARGET}")
+""",
+    )
     return tools
+
+
+INVENTORY_GENERATOR_STUB = """#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:1] != ["generate"] or "--target" not in args or "--output" not in args:
+    raise SystemExit(f"unsupported controlled inventory invocation: {args!r}")
+if "--no-default-features" in args:
+    raise SystemExit("the Conda source recipe builds the default feature set")
+target = args[args.index("--target") + 1]
+Path(args[args.index("--output") + 1]).write_text(
+    INVENTORY_FIXTURE.format(target=target), encoding="utf-8"
+)
+"""
 
 
 def make_payload(root: Path) -> tuple[Path, Path]:
@@ -106,6 +150,9 @@ def make_payload(root: Path) -> tuple[Path, Path]:
         raise RuntimeError("LICENSE is not the canonical GPL-3.0-only text")
     for document in DOCUMENTS:
         shutil.copyfile(ROOT / document, payload / document)
+    (payload / INVENTORY).write_text(
+        INVENTORY_FIXTURE.format(target="x86_64-unknown-linux-musl"), encoding="utf-8"
+    )
     return payload, binary
 
 
@@ -142,6 +189,7 @@ def stage_aur(root: Path, payload: Path, binary: Path, tools: Path) -> None:
         {
             "usr/bin/mini-agent": binary,
             "usr/share/licenses/zerostack-bin/LICENSE": payload / "LICENSE",
+            "usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY,
             "usr/share/doc/zerostack-bin/NOTICE": payload / "NOTICE",
             "usr/share/doc/zerostack-bin/SOURCE.md": payload / "SOURCE.md",
         },
@@ -161,11 +209,16 @@ def stage_conda_binary(root: Path, payload: Path, binary: Path, tools: Path) -> 
         cwd=payload,
         env=env,
     )
+    meta = (ROOT / "packaging/conda/zerostack-bin/meta.yaml").read_text(encoding="utf-8")
+    for license_file in ("LICENSE", INVENTORY):
+        if f"    - {license_file}" not in meta:
+            raise RuntimeError(f"Conda binary recipe omits license_file {license_file}")
     assert_files(
         stage,
         {
             "bin/mini-agent": binary,
             "share/licenses/zerostack-bin/LICENSE": payload / "LICENSE",
+            "share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY,
             "share/doc/zerostack-bin/NOTICE": payload / "NOTICE",
             "share/doc/zerostack-bin/SOURCE.md": payload / "SOURCE.md",
         },
@@ -176,12 +229,22 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
     stage = root / "conda-source"
     source = root / "conda-source-input"
     shutil.copytree(payload, source)
+    # A source tarball has no prebuilt inventory; the recipe generates it with
+    # the repository's generator, stubbed here like cargo.
+    (source / INVENTORY).unlink()
+    (source / "scripts").mkdir()
+    (source / "scripts/third_party_licenses.py").write_text(
+        f"INVENTORY_FIXTURE = {INVENTORY_FIXTURE!r}\n"
+        + INVENTORY_GENERATOR_STUB.split("\n", 1)[1],
+        encoding="utf-8",
+    )
     env = recipe_env(
         tools,
         PREFIX=str(stage),
         PKG_NAME="zerostack",
         STUB_BINARY=str(binary),
     )
+    env.pop("CARGO_BUILD_TARGET", None)
     run(
         ["bash", str(ROOT / "packaging/conda/zerostack/build.sh")],
         cwd=source,
@@ -193,7 +256,7 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
         raise RuntimeError("Conda source recipe test cannot find PREFIX/THIRDPARTY.yml")
 
     meta = (ROOT / "packaging/conda/zerostack/meta.yaml").read_text(encoding="utf-8")
-    for license_file in ("LICENSE", "THIRDPARTY.yml"):
+    for license_file in ("LICENSE", "THIRDPARTY.yml", INVENTORY):
         if f"    - {license_file}" not in meta:
             raise RuntimeError(f"Conda source recipe omits license_file {license_file}")
         license_dir = stage / "info/licenses"
@@ -208,8 +271,12 @@ def stage_conda_source(root: Path, payload: Path, binary: Path, tools: Path) -> 
             "info/licenses/LICENSE": payload / "LICENSE",
             "share/doc/zerostack/NOTICE": payload / "NOTICE",
             "share/doc/zerostack/SOURCE.md": payload / "SOURCE.md",
+            f"share/doc/zerostack/{INVENTORY}": source / INVENTORY,
         },
     )
+    inventory = (stage / f"share/doc/zerostack/{INVENTORY}").read_text(encoding="utf-8")
+    if f"Target: {SOURCE_BUILD_TARGET}\n" not in inventory:
+        raise RuntimeError("Conda source recipe did not generate the host-target inventory")
 
 
 HOMEBREW_HARNESS = r"""
@@ -263,6 +330,7 @@ def stage_homebrew(root: Path, payload: Path, binary: Path, tools: Path) -> None
             "share/zerostack/LICENSE": payload / "LICENSE",
             "share/zerostack/NOTICE": payload / "NOTICE",
             "share/zerostack/SOURCE.md": payload / "SOURCE.md",
+            f"share/zerostack/{INVENTORY}": payload / INVENTORY,
         },
     )
 

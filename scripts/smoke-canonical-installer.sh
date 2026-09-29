@@ -24,5 +24,8 @@ fi
 for document in LICENSE NOTICE SOURCE.md; do
     cmp "${ROOT_DIR}/${document}" "${INSTALL_ROOT}/share/doc/mini-agent/${document}"
 done
+# THIRD_PARTY_LICENSES is generated per build, so it is checked by format.
+head -n 1 "${INSTALL_ROOT}/share/doc/mini-agent/THIRD_PARTY_LICENSES" |
+    grep -Fxq "mini-agent third-party license inventory"
 
 echo "canonical installer smoke: PASS (${VERSION_OUTPUT})"

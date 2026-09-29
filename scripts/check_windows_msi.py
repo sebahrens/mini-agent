@@ -53,7 +53,7 @@ def validate(root: Path) -> list[str]:
         f"installer.wixproj must pin WixToolset.Util.wixext {WIX_VERSION}",
     )
     project_text = project_path.read_text(encoding="utf-8")
-    for required_input in ("BinaryPath", "VsixPath", "ProductVersion"):
+    for required_input in ("BinaryPath", "VsixPath", "ThirdPartyLicensesPath", "ProductVersion"):
         _require(
             errors,
             f"'$({required_input})' == ''" in project_text,
@@ -91,6 +91,10 @@ def validate(root: Path) -> list[str]:
         "LicenseText": ("$(var.RepositoryRoot)\\LICENSE", "LICENSE.txt"),
         "NoticeText": ("$(var.RepositoryRoot)\\NOTICE", "NOTICE.txt"),
         "SourceDirections": ("$(var.RepositoryRoot)\\SOURCE.md", None),
+        "ThirdPartyLicenses": (
+            "$(var.ThirdPartyLicensesPath)",
+            "THIRD_PARTY_LICENSES.txt",
+        ),
     }
     expected_components = {
         "MiniAgentExe": "MiniAgentExeComponent",
@@ -99,6 +103,7 @@ def validate(root: Path) -> list[str]:
         "LicenseText": "LicenseTextComponent",
         "NoticeText": "NoticeTextComponent",
         "SourceDirections": "SourceDirectionsComponent",
+        "ThirdPartyLicenses": "ThirdPartyLicensesComponent",
     }
     for file_id, (source_name, installed_name) in expected_files.items():
         attributes = files.get(file_id)
@@ -206,6 +211,9 @@ def validate(root: Path) -> list[str]:
         "Get-ChildItem msi-input/mini-agent-*-win32-x64.vsix",
         "/quiet",
         "/norestart",
+        "(Resolve-Path msi-input/THIRD_PARTY_LICENSES).Path",
+        "-p:ThirdPartyLicensesPath=$thirdPartyLicenses",
+        "'THIRD_PARTY_LICENSES.txt'",
         "MSI_SHA256SUMS",
         "mini-agent-windows-x64.msi",
         "& $installed --print-config",
@@ -228,6 +236,7 @@ def validate(root: Path) -> list[str]:
         "windows-msi:",
         "python scripts/check_windows_msi.py",
         "dotnet build packaging/windows/installer.wixproj",
+        "-p:ThirdPartyLicensesPath=$thirdPartyLicenses",
         "Start-Process msiexec.exe",
         "-Wait -PassThru",
     ):

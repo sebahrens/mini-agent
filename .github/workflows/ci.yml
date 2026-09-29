@@ -176,6 +176,7 @@ jobs:
         run: |
           python3 -m unittest \
             scripts.tests.test_package_release_binary \
+            scripts.tests.test_third_party_licenses \
             scripts.tests.test_package_corresponding_source \
             scripts.tests.test_install_script
           bash scripts/test-install-checksums.sh
@@ -315,6 +316,10 @@ jobs:
           cargo install --path . --debug --locked --root "$RUNNER_TEMP/vscode-native"
           mkdir -p editors/vscode/bin/linux-x64
           cp "$RUNNER_TEMP/vscode-native/bin/mini-agent" editors/vscode/bin/linux-x64/mini-agent
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py generate \
+            --target x86_64-unknown-linux-gnu \
+            --output editors/vscode/bin/linux-x64/THIRD_PARTY_LICENSES
 
       - name: Check, package, and smoke extension candidate
         run: |
@@ -2218,6 +2223,7 @@ jobs:
           New-Item -ItemType Directory -Force msi-fixtures | Out-Null
           Copy-Item $env:ComSpec msi-fixtures/mini-agent.exe
           'CI fixture for WiX authoring validation' | Set-Content -Encoding ascii msi-fixtures/mini-agent-win32-x64.vsix
+          'CI fixture third-party license inventory' | Set-Content -Encoding ascii msi-fixtures/THIRD_PARTY_LICENSES
 
       - name: Compile MSI with pinned WiX
         shell: pwsh
@@ -2227,12 +2233,14 @@ jobs:
           if (-not $version) { throw 'could not read MSI-compatible package version' }
           $binary = (Resolve-Path msi-fixtures/mini-agent.exe).Path
           $vsix = (Resolve-Path msi-fixtures/mini-agent-win32-x64.vsix).Path
+          $thirdPartyLicenses = (Resolve-Path msi-fixtures/THIRD_PARTY_LICENSES).Path
           dotnet build packaging/windows/installer.wixproj `
             --configuration Release `
             --output msi-output `
             -p:ProductVersion=$version `
             -p:BinaryPath=$binary `
-            -p:VsixPath=$vsix
+            -p:VsixPath=$vsix `
+            -p:ThirdPartyLicensesPath=$thirdPartyLicenses
           if ($LASTEXITCODE -ne 0) { throw "WiX build failed with exit code $LASTEXITCODE" }
 
       - name: Quiet install and uninstall
@@ -2249,6 +2257,8 @@ jobs:
           }
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\mini-agent\mini-agent.exe'
           if (-not (Test-Path $installed)) { throw "MSI did not install $installed" }
+          $inventory = Join-Path (Split-Path $installed) 'THIRD_PARTY_LICENSES.txt'
+          if (-not (Test-Path $inventory)) { throw "MSI did not install $inventory" }
           $uninstallResult = Start-Process msiexec.exe `
             -ArgumentList "/x `"$msi`" /quiet /norestart" `
             -Wait -PassThru

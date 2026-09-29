@@ -59,19 +59,23 @@ APPROVED_RELEASE_ACTIONS = {
 }
 DISTRIBUTION_NOTICE_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "packaging/homebrew/zerostack.rb": (
-        'pkgshare.install "LICENSE", "NOTICE", "SOURCE.md"',
+        'pkgshare.install "LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"',
     ),
     "packaging/aur/PKGBUILD": (
         'install -Dm644 NOTICE "${pkgdir}/usr/share/doc/${pkgname}/NOTICE"',
         'install -Dm644 SOURCE.md "${pkgdir}/usr/share/doc/${pkgname}/SOURCE.md"',
+        'install -Dm644 THIRD_PARTY_LICENSES "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES"',
     ),
     "packaging/conda/zerostack-bin/build.sh": (
         'install -Dm644 "${SRC_DIR}/NOTICE" "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
         'install -Dm644 "${SRC_DIR}/SOURCE.md" "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+        'install -Dm644 "${SRC_DIR}/THIRD_PARTY_LICENSES" "${PREFIX}/share/licenses/${PKG_NAME}/THIRD_PARTY_LICENSES"',
     ),
     "packaging/conda/zerostack/build.sh": (
         'install -Dm644 NOTICE "${PREFIX}/share/doc/${PKG_NAME}/NOTICE"',
         'install -Dm644 SOURCE.md "${PREFIX}/share/doc/${PKG_NAME}/SOURCE.md"',
+        "python3 scripts/third_party_licenses.py generate",
+        'install -Dm644 THIRD_PARTY_LICENSES "${PREFIX}/share/doc/${PKG_NAME}/THIRD_PARTY_LICENSES"',
     ),
 }
 USES_ENTRY = re.compile(
@@ -988,7 +992,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'TARGET="${INSTALL_DIR}/${BINARY_NAME}"',
             'cp "${TMPDIR}/${BINARY_NAME}" "$STAGED"',
             'mv -f "$STAGED" "$TARGET"',
-            'REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")',
+            'REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md" "THIRD_PARTY_LICENSES")',
             'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
         ),
         "NOTICE": (
@@ -997,10 +1001,42 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "modified version of ZeroStack",
             "AJV 8.12.0",
             "The MIT License (MIT)",
+            "THIRD_PARTY_LICENSES",
+            "QuickJS (https://github.com/quickjs-ng/quickjs)",
+            "Copyright (c) 2017-2026 Fabrice Bellard",
+            "Copyright (c) 2017-2024 Charlie Gordon",
+            "rquickjs 0.12.2 (https://github.com/DelSkayn/rquickjs)",
+            "Copyright (c) 2020 Mees Delzenne",
         ),
         "editors/vscode/THIRD_PARTY_LICENSES.md": (
             "ajv` 8.12.0, MIT",
             "## MIT License (AJV)",
+            "It is not the complete notice for that\nexecutable",
+            "`bin/<target>/THIRD_PARTY_LICENSES`",
+            "QuickJS (the quickjs-ng engine vendored by the `rquickjs-sys` 0.12.2 crate)",
+        ),
+        "editors/vscode/scripts/verify-vsix.mjs": (
+            "`extension/bin/${target}/THIRD_PARTY_LICENSES`",
+        ),
+        "scripts/third_party_licenses.py": (
+            '"cargo", "metadata", "--locked", "--offline", "--format-version", "1"',
+            'command += ["--filter-platform", target]',
+            "has no canonical text for",
+            "omits {len(missing)} resolved package(s)",
+        ),
+        "scripts/release_artifacts.py": (
+            'REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES")',
+            "verify_third_party_inventory(",
+        ),
+        ".github/workflows/release.yml": (
+            "python3 scripts/third_party_licenses.py generate",
+            "--output target/third-party/lite/THIRD_PARTY_LICENSES",
+            '--third-party-licenses "target/third-party/full/THIRD_PARTY_LICENSES"',
+            '--third-party-licenses "target/third-party/lite/THIRD_PARTY_LICENSES"',
+            "--inventory-features default",
+            "--inventory-features no-default",
+            '"$BINARY_NAME" THIRD_PARTY_LICENSES',
+            "-p:ThirdPartyLicensesPath=$thirdPartyLicenses",
         ),
         "SOURCE.md": (
             "mini-agent-v<VERSION>-source.tar.gz",
@@ -1008,7 +1044,9 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             "for as long as it distributes",
         ),
         "scripts/package-release-binary.py": (
-            'REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md")',
+            'REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES")',
+            "--third-party-licenses",
+            "THIRD_PARTY_LICENSES is not a generated inventory",
             "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
             "LICENSE is not the canonical GPL-3.0-only text",
             "release archive payload mismatch",
@@ -1039,6 +1077,9 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'run(["ruby", "--disable-gems", "-e", HOMEBREW_HARNESS]',
             'source "$RECIPE"; package',
             '"info/licenses/LICENSE": payload / "LICENSE"',
+            'INVENTORY = "THIRD_PARTY_LICENSES"',
+            '"usr/share/licenses/zerostack-bin/THIRD_PARTY_LICENSES": payload / INVENTORY',
+            'f"share/zerostack/{INVENTORY}": payload / INVENTORY',
         ),
         "packaging/homebrew/zerostack.rb": (
             f'homepage "{CANONICAL_REPOSITORY_URL}"',
@@ -1072,12 +1113,15 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
             f"- {binary} --help",
             f"- {binary} --version",
+            "    - THIRD_PARTY_LICENSES",
         ),
         "packaging/conda/zerostack/meta.yaml": (
             f"repository: {CANONICAL_REPOSITORY_URL}",
             f"- {binary} --help",
             f"- {binary} --version",
             "- test -f ${PREFIX}/THIRDPARTY.yml",
+            "- test -f ${PREFIX}/share/doc/zerostack/THIRD_PARTY_LICENSES",
+            "    - THIRD_PARTY_LICENSES",
         ),
         "packaging/conda/zerostack/build.sh": (
             'install -Dm644 THIRDPARTY.yml "${PREFIX}/THIRDPARTY.yml"',
@@ -1152,6 +1196,7 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'EXPECTED_OUTPUT="mini-agent ${VERSION}"',
             'for document in LICENSE NOTICE SOURCE.md; do',
             '"${INSTALL_ROOT}/share/doc/mini-agent/${document}"',
+            '"${INSTALL_ROOT}/share/doc/mini-agent/THIRD_PARTY_LICENSES"',
         ),
         ".github/workflows/pages.yml": ("https://sebahrens.github.io/mini-agent",),
         ".github/workflows/ci.yml": (

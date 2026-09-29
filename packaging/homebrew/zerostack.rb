@@ -26,7 +26,7 @@ class Zerostack < Formula
 
   def install
     bin.install "mini-agent"
-    pkgshare.install "LICENSE", "NOTICE", "SOURCE.md"
+    pkgshare.install "LICENSE", "NOTICE", "SOURCE.md", "THIRD_PARTY_LICENSES"
   end
 
   test do
