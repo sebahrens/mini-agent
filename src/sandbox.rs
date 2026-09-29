@@ -3131,7 +3131,6 @@ impl Sandbox {
             Ok(foreground) => foreground,
             Err(error) => {
                 terminate_and_reap(&mut child, pid).await;
-                guard.disarm();
                 let output = CommandOutput {
                     exit_status: None,
                     stdout: Vec::new(),
@@ -3139,7 +3138,9 @@ impl Sandbox {
                     status: CommandStatus::Failed,
                     descendants_escaped: false,
                 };
+                // Cleanup, then audit, then accounting: see the normal path.
                 audit.emit(&output);
+                guard.disarm();
                 let _ = response_tx.send(output);
                 return;
             }
@@ -3179,8 +3180,6 @@ impl Sandbox {
             }
             CommandTermination::ReaderError(_) => unreachable!("support commands have no readers"),
         };
-        guard.disarm();
-        self.take_cancelled(pid);
         #[cfg(unix)]
         drop(foreground);
         let output = CommandOutput {
@@ -3190,7 +3189,16 @@ impl Sandbox {
             status,
             descendants_escaped: false,
         };
+        // Same cleanup-before-audit-before-accounting order as
+        // `OutputCommandLifecycleGuard::finish`: the group stays accounted as
+        // active until its terminal audit has been emitted, so an observer
+        // that sees zero active groups also sees the record, whichever thread
+        // the worker runs on. A caller drop is otherwise unobservable.
         audit.emit(&output);
+        guard.disarm();
+        // Clear a cancellation that `kill_active` recorded before the group
+        // left the active set, so a reused pid is not reported as cancelled.
+        self.take_cancelled(pid);
         let _ = response_tx.send(output);
     }
 
