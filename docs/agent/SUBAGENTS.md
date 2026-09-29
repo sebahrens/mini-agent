@@ -148,6 +148,10 @@ data_dir/agents/<name>.md        # user global
 data/agents/<name>.md            # compiled-in default
 ```
 
+In the `task` tool schema every specialist is labelled a read-only
+investigation subagent: a persona changes the child's focus, never its write
+access or tools beyond the read-only set.
+
 A trusted project may also provide `.zerostack/agents/.notes.md`. Unlike a
 same-named definition, this file replaces nothing: the host appends it under a
 `## Project notes` boundary to every resolved persona after overrides have

@@ -552,7 +552,7 @@ impl Tool for TaskTool {
     type Output = String;
 
     fn description(&self) -> String {
-        "Search and investigate the codebase via a fresh-context subagent. \
+        "Search and investigate the codebase via a fresh-context, read-only investigation subagent. \
 Use for any cross-file question: where is X used, how does Y work, \
 find/list/count all X across the codebase, what calls Z, audit Q. \
 The subagent uses its configured subset of read, grep, file discovery, \
@@ -622,7 +622,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 "agent_type": {
                     "type": "string",
                     "enum": specialist_names,
-                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Available specialists:\n{specialist_descriptions}")
+                    "description": format!("Optional specialist agent type resolved from the installed global and active-workspace agent definitions. Omit for general codebase exploration. Every specialist runs as a read-only investigation subagent: its persona changes focus, never write access or tools beyond the read-only set. Available specialists:\n{specialist_descriptions}")
                 }
             },
             // Exclusivity is stated in the descriptions and enforced by
@@ -1762,6 +1762,11 @@ mod tests {
         assert!(names.iter().any(|name| name == "rust-security-review"));
         let description = agent_type["description"].as_str().unwrap();
         assert!(description.contains("rust-security-review:"));
+        assert!(description.contains("read-only investigation subagent"));
+        assert!(
+            tool.description()
+                .contains("read-only investigation subagent")
+        );
         assert_eq!(description.lines().count(), names.len() + 1);
         assert!(crate::agent::prompt::TASK_TOOL_PROMPT.contains("agent_type"));
         assert_eq!(

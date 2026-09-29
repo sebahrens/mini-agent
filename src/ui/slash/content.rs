@@ -85,6 +85,7 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             );
         }
     }
+    let mode_from_agent = matches!(outcome.prompt_mode, PromptModeOutcome::Applied(_));
     match outcome.prompt_mode {
         PromptModeOutcome::RestoredUserMode => {
             if let Some(perm) = ctx.permission {
@@ -106,8 +107,54 @@ async fn handle_agent(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
     if !rebuilt {
         ctx.rebuild_agent().await;
     }
-    write_ok(ctx.renderer, format!("active agent: {name} ({source})"));
+    let mode = ctx.permission.as_ref().map(|perm| {
+        perm.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mode()
+            .to_string()
+    });
+    write_ok(
+        ctx.renderer,
+        active_agent_message(name, &source, mode.as_deref(), mode_from_agent),
+    );
     Ok(())
+}
+
+/// Confirmation for `/agent <name>` that states what a persona changes: its
+/// prompt (and, when its prompt mode says so, the security mode) — never the
+/// tool set, so a name like `rust-maintainer` is not mistaken for new powers.
+fn active_agent_message(
+    name: &str,
+    source: &str,
+    mode: Option<&str>,
+    mode_from_agent: bool,
+) -> String {
+    let mode = mode.unwrap_or("unchanged");
+    if mode_from_agent {
+        format!(
+            "active agent: {name} ({source}); persona prompt, security mode from its prompt (mode: {mode}); tools unchanged"
+        )
+    } else {
+        format!(
+            "active agent: {name} ({source}); persona prompt only; tools and security mode unchanged (mode: {mode})"
+        )
+    }
+}
+
+#[cfg(test)]
+mod active_agent_message_tests {
+    use super::active_agent_message;
+
+    #[test]
+    fn persona_confirmation_states_capabilities_are_unchanged() {
+        assert_eq!(
+            active_agent_message("rust-maintainer", "global", Some("standard"), false),
+            "active agent: rust-maintainer (global); persona prompt only; tools and security mode unchanged (mode: standard)"
+        );
+        let applied = active_agent_message("reviewer", "project", Some("plan"), true);
+        assert!(applied.contains("security mode from its prompt (mode: plan)"));
+        assert!(applied.ends_with("tools unchanged"));
+    }
 }
 
 async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

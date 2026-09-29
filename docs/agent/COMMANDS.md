@@ -116,7 +116,7 @@ starting a session or making a model call. See
 | `/prompt <name>` | Activate a named prompt. Also applies `%%mode=` and `%%agent=` header directives when present (see below). |
 | `/prompt default` | Clear the active prompt. |
 | `/agent` | List main-agent personas resolved for the active workspace. |
-| `/agent <name>` | Apply a persona to the main loop and activate its optional `mode:` prompt. |
+| `/agent <name>` | Apply a persona to the main loop and activate its optional `mode:` prompt. The confirmation states that only the persona prompt changes (and the security mode, when its prompt mode sets one); the tool set is unchanged. |
 | `/agent default` | Clear the active main-agent persona. |
 
 Prompts may start with contiguous `%%mode=<mode>` and `%%agent=<name>`
