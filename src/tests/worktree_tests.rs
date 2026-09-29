@@ -67,6 +67,7 @@ mod tests {
     }
 
     struct TempRepo {
+        _repository_execution: Option<crate::git::runner::RepositoryExecutionForTest>,
         _directory: OwnedDirectory,
         path: PathBuf,
     }
@@ -84,9 +85,21 @@ mod tests {
             let path = directory.path().join("repository");
             std::fs::create_dir(&path).expect("create repository directory");
             Self {
+                _repository_execution: None,
                 _directory: directory,
                 path,
             }
+        }
+
+        /// Production host Git never runs repository hooks or
+        /// repository-configured commands (mini-agent-93gx4). Fault-injection
+        /// fixtures that stop or fail Git through a real hook or
+        /// `remote.*.uploadpack` opt back in for this owned directory only.
+        fn allowing_repository_hooks(mut self) -> Self {
+            self._repository_execution = Some(
+                crate::git::runner::allow_repository_execution_for_test(self._directory.path()),
+            );
+            self
         }
 
         fn initialize(self) -> Self {
@@ -504,8 +517,9 @@ mod tests {
             worktree.canonicalize().unwrap().display().to_string()
         );
         std::fs::write(worktree.join("tracked.txt"), "undo stash workspace\n").unwrap();
-        let undo_stash = crate::ui::git_stash_in_workspace(&worktree).unwrap();
-        assert!(undo_stash.status.success());
+        crate::ui::git_stash_in_workspace(&worktree)
+            .await
+            .expect("undo stash in the bound worktree");
         assert_eq!(
             std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
             "initial\n"
@@ -1005,6 +1019,68 @@ mod tests {
 
         assert_eq!(git_stdout(repo.path(), ["show", "HEAD:new.txt"]), "new");
         assert_eq!(worktree_has_uncommitted(repo.path()).await, Ok(false));
+    }
+
+    /// mini-agent-93gx4: the model can write `.git/hooks` and `.git/config`
+    /// from inside the sandbox, so the host-side auto-commit must not run
+    /// repository hooks or repository-configured filters.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_git_commit_ignores_workspace_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new("auto commit hooks");
+        let markers = repo.path().with_extension("hook markers");
+        std::fs::create_dir(&markers).unwrap();
+        let mut expected = Vec::new();
+        for hook in [
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+            "post-index-change",
+            "reference-transaction",
+        ] {
+            let marker = markers.join(hook);
+            let path = repo.path().join(".git/hooks").join(hook);
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            expected.push(marker);
+        }
+        let clean = markers.join("clean-filter");
+        let clean_script = markers.join("clean.sh");
+        std::fs::write(
+            &clean_script,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", clean.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&clean_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            repo.path(),
+            [
+                OsStr::new("config"),
+                OsStr::new("filter.probe.clean"),
+                clean_script.as_os_str(),
+            ],
+        );
+        std::fs::write(repo.path().join(".gitattributes"), "* filter=probe\n").unwrap();
+        expected.push(clean);
+        std::fs::write(repo.path().join("new.txt"), "new\n").unwrap();
+
+        worktree_auto_commit_all(repo.path()).await.unwrap();
+
+        assert_eq!(git_stdout(repo.path(), ["show", "HEAD:new.txt"]), "new");
+        for marker in &expected {
+            assert!(
+                !marker.exists(),
+                "host auto-commit ran repository code: {}",
+                marker.display()
+            );
+        }
+
+        // The fixture is live: an ordinary commit runs the hooks.
+        git(repo.path(), ["commit", "--allow-empty", "-m", "unhardened"]);
+        assert!(markers.join("pre-commit").exists(), "fixture hook inert");
     }
 
     #[tokio::test]
@@ -1628,9 +1704,9 @@ mod tests {
         }
 
         fn run_case(case: Case, failure: Failure) {
-            let repo = TempRepo::new("held first 'repo'");
-            let second =
-                matches!(case, Case::Independent).then(|| TempRepo::new("held second repo"));
+            let repo = TempRepo::new("held first 'repo'").allowing_repository_hooks();
+            let second = matches!(case, Case::Independent)
+                .then(|| TempRepo::new("held second repo").allowing_repository_hooks());
             let linked = repo.path().join("linked checkout");
             if matches!(case, Case::LinkedWorktree) {
                 git(
@@ -1833,7 +1909,7 @@ mod tests {
     async fn failed_worktree_create_rolls_back_the_new_ref_and_registration() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("failed create rollback");
+        let repo = TempRepo::new("failed create rollback").allowing_repository_hooks();
         let base = repo.path().with_extension("create base");
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("create-fail");
@@ -1870,7 +1946,7 @@ mod tests {
     async fn failed_create_retains_dirty_hook_output_and_its_exact_branch() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("dirty failed create");
+        let repo = TempRepo::new("dirty failed create").allowing_repository_hooks();
         let base = repo.path().with_extension("dirty failed create base");
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("dirty-create");
@@ -1916,7 +1992,7 @@ mod tests {
     async fn definite_reservation_failure_never_deletes_a_concurrent_same_oid_branch() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("definite reservation failure");
+        let repo = TempRepo::new("definite reservation failure").allowing_repository_hooks();
         let base = repo
             .path()
             .with_extension("definite reservation failure base");
@@ -1991,7 +2067,7 @@ mod tests {
     ) {
         use futures::FutureExt;
 
-        let repo = TempRepo::new("held create 'rollback'");
+        let repo = TempRepo::new("held create 'rollback'").allowing_repository_hooks();
         // Own the sibling directory before setup can fail, through the final
         // rollback rendezvous. TempRepo owns the hook and FIFO separately.
         let _base = OwnedDirectory::create(base.to_path_buf());
@@ -2493,7 +2569,8 @@ wait
         // starting the caller, and keeps them until rollback has settled.
         let directory = OwnedDirectory::create(path.to_path_buf());
         let repo = TempRepo::uninitialized(OwnedDirectory::create(directory.path().join("repo")))
-            .initialize();
+            .initialize()
+            .allowing_repository_hooks();
         let remote = directory.path().join("bare remote");
         std::fs::create_dir(&remote).unwrap();
         git(&remote, ["init", "--bare"]);
@@ -3030,7 +3107,7 @@ wait
     async fn successful_post_commit_hook_cannot_replace_the_verified_squash_commit() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("post commit reset");
+        let repo = TempRepo::new("post commit reset").allowing_repository_hooks();
         let remote = repo.path().with_extension("post commit reset remote");
         let worktree = repo.path().with_extension("post commit reset worktree");
         std::fs::create_dir_all(&remote).unwrap();
@@ -3092,7 +3169,7 @@ wait
     async fn post_commit_branch_switch_rolls_back_only_target_and_preserves_unrelated_ref() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("post commit branch switch");
+        let repo = TempRepo::new("post commit branch switch").allowing_repository_hooks();
         let remote = repo
             .path()
             .with_extension("post commit branch switch remote");
@@ -4308,7 +4385,7 @@ wait
     async fn post_pull_head_read_failure_rolls_target_back_to_its_exact_pre_pull_oid() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("post pull head failure");
+        let repo = TempRepo::new("post pull head failure").allowing_repository_hooks();
         let remote = repo.path().with_extension("post pull head failure remote");
         let peer = repo.path().with_extension("post pull head failure peer");
         std::fs::create_dir_all(&remote).unwrap();
@@ -4372,7 +4449,7 @@ wait
     async fn post_pull_hook_branch_switch_is_detected_and_only_target_is_rolled_back() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("post pull branch switch");
+        let repo = TempRepo::new("post pull branch switch").allowing_repository_hooks();
         let remote = repo.path().with_extension("post pull branch switch remote");
         let peer = repo.path().with_extension("post pull branch switch peer");
         std::fs::create_dir_all(&remote).unwrap();
@@ -4442,7 +4519,7 @@ wait
     async fn failed_post_checkout_hook_restores_and_verifies_branch_before_stash_pop() {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new("failed checkout hook");
+        let repo = TempRepo::new("failed checkout hook").allowing_repository_hooks();
         let remote = repo.path().with_extension("failed checkout bare remote");
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, ["init", "--bare"]);
@@ -4492,7 +4569,8 @@ wait
     async fn timed_out_post_checkout_attempt(attempt: usize, deadline: Duration) -> bool {
         use std::os::unix::fs::PermissionsExt;
 
-        let repo = TempRepo::new(&format!("timed checkout hook {attempt}"));
+        let repo =
+            TempRepo::new(&format!("timed checkout hook {attempt}")).allowing_repository_hooks();
         let remote = repo.path().with_extension("timed checkout bare remote");
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, ["init", "--bare"]);

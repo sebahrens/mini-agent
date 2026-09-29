@@ -120,6 +120,12 @@ policy is clamped at load to `max_attempts` in 1..=10, backoffs at most 60000 ms
 `initial_backoff_ms <= max_backoff_ms`, with a startup warning naming the field and its source
 (global or project config); the retry loops re-apply the same envelope defensively.
 
+`statusline` is benign only while none of its segments is `git_status` or `git_changes`. Those
+segments drive a background host-side `git status` refresh, which runs Git outside the model
+sandbox against repository content the model can author, so a project `statusline` that names one
+is treated as a sensitive key as a whole: until trusted, the user-global statusline (or the
+default) applies and the refresh stays off unless the user's own configuration asked for it.
+
 Every other key is sensitive, including unknown future keys and all provider/API-key, permission,
 sandbox, shell/editor, MCP, LSP, ACP, worktree, auto-update, and executable integration settings.
 Sensitive keys remain inert until the user approves a prompt that displays their names, the

@@ -57,6 +57,15 @@ Notable changes to mini-agent are documented in this file. The format follows
   `PATH` entries, as hooks already did: an empty or relative entry (`::`, `.`) can no longer make a
   workspace-planted `rust-analyzer`, `gopls` or MCP server binary run unsandboxed. A relative
   command with a directory component is rejected for LSP and needs an explicit `cwd` for MCP.
+- Git commands mini-agent runs itself on the host (the statusline `git_status`/`git_changes`
+  refresh, the headless JSON change list, worktree create/merge/auto-commit/cleanup, and
+  `/undo stash`) no longer run anything the sandboxed agent can write into the repository: hooks,
+  `core.fsmonitor`, repository-configured filter/diff/merge drivers, credential helpers, and
+  `core.sshCommand` are neutralised, and Git gets an allow-listed environment without API keys
+  (SSH agent and proxy variables only for fetch/pull). A fetch/pull is refused while the
+  repository's own config sets a remote `uploadpack`/`receivepack` or `core.gitProxy`.
+- A project `.zerostack/config.toml` statusline showing `git_status` or `git_changes` now needs
+  project-config trust before it can turn on the background host `git status` refresh.
 
 ### Added
 

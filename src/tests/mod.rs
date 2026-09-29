@@ -102,6 +102,8 @@ mod headless_ask_tests;
 mod hooks;
 #[cfg(test)]
 mod input_tests;
+#[cfg(all(test, unix))]
+mod internal_git_hardening_tests;
 #[cfg(test)]
 mod list_dir_tests;
 #[cfg(test)]

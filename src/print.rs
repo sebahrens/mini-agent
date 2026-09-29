@@ -334,6 +334,8 @@ pub(crate) async fn capture_workspace_change_baseline(
                 "-z",
                 "--untracked-files=all",
                 "--no-renames",
+                // Never spawn Git inside a (model-writable) nested repository.
+                "--ignore-submodules=dirty",
             ],
             crate::git::runner::QUERY_LIMITS,
         )

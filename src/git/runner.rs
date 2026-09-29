@@ -29,7 +29,6 @@ pub(crate) const QUERY_LIMITS: CommandLimits = CommandLimits {
     stderr_bytes: 256 * 1024,
     combined_bytes: 384 * 1024,
 };
-#[cfg(any(test, feature = "git-worktree"))]
 pub(crate) const LOCAL_MUTATION_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(60),
     stdout_bytes: 512 * 1024,
@@ -43,21 +42,6 @@ pub(crate) const NETWORK_LIMITS: CommandLimits = CommandLimits {
     stderr_bytes: 512 * 1024,
     combined_bytes: 768 * 1024,
 };
-
-const REDIRECTING_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_PREFIX",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_ATTR_NOSYSTEM",
-];
 
 #[cfg(any(test, feature = "git-worktree"))]
 static PROCESS_GIT_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
@@ -191,20 +175,118 @@ impl GitRunner {
         argv
     }
 
-    fn internal_command<I, S>(&self, repo_path: &Path, args: I) -> Result<Command, String>
+    /// Builds a host-side (uncontained) Git command.
+    ///
+    /// The model can author everything under the workspace, including
+    /// `.git/config`, `.git/hooks`, `.git/info/attributes`, and
+    /// `.gitattributes`, so every internal command is hardened before launch:
+    ///
+    /// * the environment is cleared to the [`internal_git_environment`]
+    ///   allow-list (no provider keys; SSH agent, askpass, and proxy variables
+    ///   only for [`InternalProfile::Network`]);
+    /// * a fixed configuration baseline disables fsmonitor, the untracked
+    ///   cache, hooks, signing, external diff, submodule recursion, and the
+    ///   `ext::` transport (and, outside network operations, credential
+    ///   helpers, `core.sshCommand`, and `core.askPass`);
+    /// * every command-executing key that repository-scoped configuration
+    ///   (`local`/`worktree`, including anything it includes) sets is
+    ///   overridden with the user's global value or a non-executing default,
+    ///   so repository filter, diff, and merge drivers, credential helpers,
+    ///   and `core.sshCommand` never run. Keys Git resolves first-value-wins
+    ///   (`remote.*.uploadpack`/`receivepack`, `core.gitProxy`) cannot be
+    ///   overridden, so a repository value refuses network operations.
+    ///
+    /// Overrides travel through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
+    /// `GIT_CONFIG_VALUE_n`, which have command-line precedence and keep keys
+    /// and values separate (a subsection containing `=` cannot split a key).
+    async fn internal_command<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+        args: I,
+        profile: InternalProfile,
+    ) -> Result<Command, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         self.validate()?;
+        #[cfg(test)]
+        let repository_execution = repository_execution_allowed_for_test(repo_path);
+        #[cfg(not(test))]
+        let repository_execution = false;
+        let mut config = hardened_config(profile, repository_execution);
+        if !repository_execution {
+            config.extend(
+                self.repository_config_overrides(repo_path, operation, profile)
+                    .await?,
+            );
+        }
+        Ok(self.build_internal_command(repo_path, args, profile, &config))
+    }
+
+    fn build_internal_command<I, S>(
+        &self,
+        repo_path: &Path,
+        args: I,
+        profile: InternalProfile,
+        config: &[(String, String)],
+    ) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = Command::new(self.program.as_path());
         command.args(self.argv(repo_path, args));
-        for name in REDIRECTING_ENV {
-            command.env_remove(name);
+        command.env_clear();
+        command.envs(internal_git_environment(profile, |name| {
+            std::env::var_os(name)
+        }));
+        command.env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (index, (key, value)) in config.iter().enumerate() {
+            command
+                .env(format!("GIT_CONFIG_KEY_{index}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{index}"), value);
         }
-        apply_git_environment(&mut command);
         configure_child_lifetime(&mut command);
-        Ok(command)
+        command
+    }
+
+    /// Lists every command-executing key the configuration sets, with its
+    /// scope, and returns the overrides that neutralise the repository-scoped
+    /// ones. `git config` only reads configuration: it runs no hooks,
+    /// fsmonitor, or drivers.
+    async fn repository_config_overrides(
+        &self,
+        repo_path: &Path,
+        operation: &str,
+        profile: InternalProfile,
+    ) -> Result<Vec<(String, String)>, String> {
+        let command = self.build_internal_command(
+            repo_path,
+            [
+                "config",
+                "--show-scope",
+                "--null",
+                "--get-regexp",
+                EXECUTABLE_CONFIG_PATTERN,
+            ],
+            InternalProfile::Local,
+            &[],
+        );
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, QUERY_LIMITS)
+            .await
+            .map_err(|_| format!("git {operation} runner failed"))?;
+        if output.status != CommandStatus::Completed {
+            return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
+        }
+        match output.exit_status.and_then(|status| status.code()) {
+            Some(0) => untrusted_config_overrides(&parse_scoped_config(&output.stdout), profile),
+            // `git config --get-regexp` exits 1 when no key matches.
+            Some(1) => Ok(Vec::new()),
+            _ => Err(command_failure(operation, &output)),
+        }
     }
 
     #[cfg(any(test, feature = "git-worktree"))]
@@ -320,7 +402,14 @@ impl GitRunner {
         key: &str,
         config_env: &[(String, OsString)],
     ) -> Result<Option<String>, String> {
-        let mut command = self.internal_command(repo_path, ["config", "--get", key])?;
+        let mut command = self
+            .internal_command(
+                repo_path,
+                "config",
+                ["config", "--get", key],
+                InternalProfile::Local,
+            )
+            .await?;
         for (name, value) in config_env {
             command.env(name, value);
         }
@@ -352,7 +441,45 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.internal_command(repo_path, args)?;
+        self.run_profiled(repo_path, operation, args, limits, InternalProfile::Local)
+            .await
+    }
+
+    /// Runs a host-side fetch/pull that may need the user's credentials: the
+    /// SSH agent, askpass, and proxy environment are passed through and the
+    /// user's *global* credential helpers and `core.sshCommand` stay active,
+    /// while repository-scoped command-executing keys remain neutralised.
+    #[cfg(any(test, feature = "git-worktree"))]
+    pub(crate) async fn run_network<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &'static str,
+        args: I,
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_profiled(repo_path, operation, args, limits, InternalProfile::Network)
+            .await
+    }
+
+    async fn run_profiled<I, S>(
+        &self,
+        repo_path: &Path,
+        operation: &'static str,
+        args: I,
+        limits: CommandLimits,
+        profile: InternalProfile,
+    ) -> Result<CommandOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let command = self
+            .internal_command(repo_path, operation, args, profile)
+            .await?;
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
@@ -410,7 +537,9 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.internal_command(repo_path, args)?;
+        let command = self
+            .internal_command(repo_path, operation, args, InternalProfile::Local)
+            .await?;
         let output = Sandbox::new(false, "git")
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
@@ -430,7 +559,9 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.internal_command(repo_path, args)?;
+        let command = self
+            .internal_command(repo_path, operation, args, InternalProfile::Local)
+            .await?;
         let output = Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
@@ -458,7 +589,9 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.internal_command(repo_path, args)?;
+        let command = self
+            .internal_command(repo_path, operation, args, InternalProfile::Local)
+            .await?;
         Sandbox::new(false, "git")
             .output_built_command_with_limits(command, limits)
             .await
@@ -478,7 +611,9 @@ impl GitRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let command = self.internal_command(repo_path, args)?;
+        let command = self
+            .internal_command(repo_path, operation, args, InternalProfile::Local)
+            .await?;
         Sandbox::new(false, "git")
             .output_built_command_with_input_and_limits(command, input, limits)
             .await
@@ -645,14 +780,319 @@ fn output_path(bytes: &[u8]) -> PathBuf {
     }
 }
 
-fn apply_git_environment(command: &mut Command) {
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_EXTERNAL_DIFF", "")
-        .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+/// What a host-side Git command may reach beyond the local repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InternalProfile {
+    /// Queries and local mutations: no credentials of any kind.
+    Local,
+    /// Explicit fetch/pull: the user's SSH agent, askpass, proxy settings,
+    /// and *global* credential helpers remain available.
+    #[cfg_attr(not(any(test, feature = "git-worktree")), allow(dead_code))]
+    Network,
+}
+
+/// Process environment passed to every internal Git command. Everything else
+/// (provider API keys, `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_*` redirection,
+/// `GIT_CONFIG_PARAMETERS`, ...) is cleared.
+const INTERNAL_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    // Commit identity overrides honoured by the auto-commit and merge flows.
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "EMAIL",
+    // Windows process essentials and home/config discovery.
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMDRIVE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+];
+
+/// Additional variables for [`InternalProfile::Network`] only.
+const INTERNAL_NETWORK_ENV: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "DISPLAY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// Fixed policy variables. `GIT_EDITOR=:` is Git's documented no-op editor.
+const INTERNAL_POLICY_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_EXTERNAL_DIFF", ""),
+    ("GIT_LITERAL_PATHSPECS", "1"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_ATTR_NOSYSTEM", "1"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_EDITOR", ":"),
+    ("GIT_SEQUENCE_EDITOR", ":"),
+    ("GIT_MERGE_AUTOEDIT", "no"),
+];
+
+/// The complete environment of an internal Git command.
+pub(crate) fn internal_git_environment(
+    profile: InternalProfile,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(OsString, OsString)> {
+    let network: &[&str] = match profile {
+        InternalProfile::Local => &[],
+        InternalProfile::Network => INTERNAL_NETWORK_ENV,
+    };
+    let mut env = Vec::new();
+    for name in INTERNAL_BASE_ENV.iter().chain(network) {
+        if let Some(value) = lookup(name) {
+            env.push((OsString::from(name), value));
+        }
+    }
+    env.extend(
+        INTERNAL_POLICY_ENV
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+    );
+    env
+}
+
+/// Configuration every internal command runs with, regardless of what the
+/// repository or the user configured.
+fn hardened_config(profile: InternalProfile, repository_execution: bool) -> Vec<(String, String)> {
+    let mut config: Vec<(String, String)> = [
+        ("core.fsmonitor", "false"),
+        ("core.untrackedCache", "false"),
+        ("commit.gpgSign", "false"),
+        ("tag.gpgSign", "false"),
+        ("merge.verifySignatures", "false"),
+        ("log.showSignature", "false"),
+        ("diff.external", ""),
+        ("submodule.recurse", "false"),
+        ("fetch.recurseSubmodules", "false"),
+        ("status.submoduleSummary", "false"),
+        ("protocol.ext.allow", "never"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    if !repository_execution {
+        config.push(("core.hooksPath".into(), "/dev/null".into()));
+    }
+    if profile == InternalProfile::Local {
+        for key in ["credential.helper", "core.sshCommand", "core.askPass"] {
+            config.push((key.into(), String::new()));
+        }
+    }
+    config
+}
+
+/// Canonical (lower-case section and variable) names of configuration keys
+/// whose value Git executes. Hooks, fsmonitor, external diff, the editor,
+/// and the pager are covered by [`hardened_config`] and the policy
+/// environment instead.
+const EXECUTABLE_CONFIG_PATTERN: &str = "^(core\\.(sshcommand|askpass|gitproxy|alternaterefscommand)\
+|credential\\.(.*\\.)?helper\
+|remote\\..*\\.(uploadpack|receivepack)\
+|filter\\..*\\.(clean|smudge|process|required)\
+|diff\\..*\\.(command|textconv)\
+|merge\\..*\\.driver\
+|gpg\\.(.*\\.)?program)$";
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScopedConfigEntry {
+    scope: String,
+    key: String,
+    value: Option<String>,
+}
+
+/// Parses `git config --show-scope --null` output: `scope NUL key LF value
+/// NUL` per entry, with no `LF value` for a value-less boolean key.
+fn parse_scoped_config(bytes: &[u8]) -> Vec<ScopedConfigEntry> {
+    let mut fields = bytes.split(|byte| *byte == 0);
+    let mut entries = Vec::new();
+    while let (Some(scope), Some(pair)) = (fields.next(), fields.next()) {
+        if scope.is_empty() && pair.is_empty() {
+            break;
+        }
+        let pair = String::from_utf8_lossy(pair);
+        let (key, value) = match pair.split_once('\n') {
+            Some((key, value)) => (key.to_string(), Some(value.to_string())),
+            None => (pair.into_owned(), None),
+        };
+        entries.push(ScopedConfigEntry {
+            scope: String::from_utf8_lossy(scope).into_owned(),
+            key,
+            value,
+        });
+    }
+    entries
+}
+
+/// Overrides for every executable key that repository-scoped configuration
+/// sets. Only the user's `global` (and, if ever enabled, `system`) scope is
+/// trusted; `local`, `worktree`, `command`, and unknown scopes are
+/// model-writable or unexplained.
+fn untrusted_config_overrides(
+    entries: &[ScopedConfigEntry],
+    profile: InternalProfile,
+) -> Result<Vec<(String, String)>, String> {
+    let trusted = |entry: &ScopedConfigEntry| matches!(entry.scope.as_str(), "global" | "system");
+    let mut keys: Vec<&str> = Vec::new();
+    for entry in entries.iter().filter(|entry| !trusted(entry)) {
+        if !keys.contains(&entry.key.as_str()) {
+            keys.push(entry.key.as_str());
+        }
+    }
+    let mut overrides = Vec::new();
+    for key in keys {
+        let trusted_values = entries
+            .iter()
+            .filter(|entry| entry.key == key && trusted(entry))
+            .map(|entry| entry.value.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        if first_value_wins(key) {
+            // Git uses the first value it reads for these keys, so a later
+            // override cannot displace a repository value. A user (global)
+            // value is read before the repository's and already wins; only
+            // transports use these keys, so local operations are unaffected.
+            let first_is_trusted = entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .is_some_and(trusted);
+            if profile == InternalProfile::Network && !first_is_trusted {
+                return Err(format!(
+                    "refusing network Git operation: repository configuration sets {key}; \
+                     remove it from the repository's .git/config to continue"
+                ));
+            }
+            continue;
+        }
+        if key.starts_with("credential.") {
+            // An empty helper resets the list; re-add only the user's own.
+            overrides.push((key.to_string(), String::new()));
+            if profile == InternalProfile::Network {
+                overrides.extend(
+                    trusted_values
+                        .into_iter()
+                        .map(|value| (key.to_string(), value)),
+                );
+            }
+            continue;
+        }
+        let fallback = if key.ends_with(".required") {
+            "false"
+        } else {
+            // Git never executes an empty filter command, and an empty
+            // driver/ssh/askpass/gpg command fails to launch instead of
+            // running repository-chosen text.
+            ""
+        };
+        let value = trusted_values
+            .last()
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string());
+        overrides.push((key.to_string(), value));
+    }
+    Ok(overrides)
+}
+
+/// Keys for which Git keeps the first value read (with an error for later
+/// ones) instead of the last: `core.gitProxy` and a remote's upload/receive
+/// pack, which a local-path remote executes on this host.
+fn first_value_wins(key: &str) -> bool {
+    key == "core.gitproxy"
+        || (key.starts_with("remote.")
+            && (key.ends_with(".uploadpack") || key.ends_with(".receivepack")))
+}
+
+/// Test-only escape hatch: fixture repositories that inject faults through
+/// real hooks or `remote.*.uploadpack` register their owned directory here.
+/// Registration never exists outside `cfg(test)`.
+#[cfg(test)]
+static REPOSITORY_EXECUTION_FOR_TEST: OnceLock<StdMutex<Vec<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct RepositoryExecutionForTest(Vec<PathBuf>);
+
+#[cfg(test)]
+impl Drop for RepositoryExecutionForTest {
+    fn drop(&mut self) {
+        let registry = REPOSITORY_EXECUTION_FOR_TEST.get_or_init(Default::default);
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &self.0 {
+            if let Some(index) = registry.iter().position(|entry| entry == path) {
+                registry.remove(index);
+            }
+        }
+    }
+}
+
+/// Lets repository hooks and repository-configured commands run for Git
+/// commands under `root` until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn allow_repository_execution_for_test(root: &Path) -> RepositoryExecutionForTest {
+    let mut paths = vec![root.to_path_buf()];
+    if let Ok(canonical) = root.canonicalize()
+        && canonical != root
+    {
+        paths.push(canonical);
+    }
+    REPOSITORY_EXECUTION_FOR_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(paths.iter().cloned());
+    RepositoryExecutionForTest(paths)
+}
+
+#[cfg(test)]
+fn repository_execution_allowed_for_test(repo_path: &Path) -> bool {
+    REPOSITORY_EXECUTION_FOR_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|root| repo_path.starts_with(root))
 }
 
 #[cfg(any(test, feature = "git-worktree"))]
@@ -895,6 +1335,151 @@ mod tests {
             assert_eq!(
                 result.err().as_deref(),
                 Some("Git executable is unavailable or unsupported")
+            );
+        }
+    }
+
+    #[test]
+    fn internal_environment_is_an_allow_list() {
+        let everything = |name: &str| Some(OsString::from(format!("value-of-{name}")));
+        let hostile = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_EXEC_PATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+        ];
+        for profile in [InternalProfile::Local, InternalProfile::Network] {
+            let env = internal_git_environment(profile, |name| {
+                // The lookup is only ever asked for allow-listed names.
+                assert!(!hostile.contains(&name), "{name} must never be looked up");
+                everything(name)
+            });
+            let names = env
+                .iter()
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(names.iter().any(|name| name == "PATH"));
+            assert!(names.iter().any(|name| name == "HOME"));
+            assert_eq!(
+                names.iter().any(|name| name == "SSH_AUTH_SOCK"),
+                profile == InternalProfile::Network,
+                "only network operations see the SSH agent"
+            );
+            for (name, value) in INTERNAL_POLICY_ENV {
+                assert!(
+                    env.iter()
+                        .any(|(key, actual)| key == name && actual == value),
+                    "missing policy {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_config_output_parses_values_and_valueless_keys() {
+        let entries = parse_scoped_config(
+            b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0local\0filter.x.required\0local\0core.sshcommand\nevil\nline\0",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ScopedConfigEntry {
+                    scope: "global".into(),
+                    key: "filter.lfs.clean".into(),
+                    value: Some("git-lfs clean -- %f".into()),
+                },
+                ScopedConfigEntry {
+                    scope: "local".into(),
+                    key: "filter.x.required".into(),
+                    value: None,
+                },
+                ScopedConfigEntry {
+                    scope: "local".into(),
+                    key: "core.sshcommand".into(),
+                    value: Some("evil\nline".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repository_scoped_executables_are_overridden_and_global_ones_kept() {
+        let entry = |scope: &str, key: &str, value: &str| ScopedConfigEntry {
+            scope: scope.into(),
+            key: key.into(),
+            value: Some(value.into()),
+        };
+        let entries = vec![
+            entry("global", "filter.lfs.clean", "git-lfs clean -- %f"),
+            entry("global", "credential.helper", "osxkeychain"),
+            entry("local", "credential.helper", "!evil"),
+            entry("worktree", "credential.https://example.com.helper", "!evil"),
+            entry("global", "core.sshcommand", "ssh -i key"),
+            entry("local", "core.sshcommand", "evil"),
+            entry("local", "filter.a=b.clean", "evil"),
+            entry("local", "filter.x.clean", "evil"),
+            entry("local", "filter.x.required", "true"),
+            entry("local", "merge.m.driver", "evil"),
+            entry("command", "diff.d.textconv", "evil"),
+        ];
+        let local = untrusted_config_overrides(&entries, InternalProfile::Local).unwrap();
+        let network = untrusted_config_overrides(&entries, InternalProfile::Network).unwrap();
+        let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+        for overrides in [&local, &network] {
+            assert!(
+                !overrides.iter().any(|(key, _)| key == "filter.lfs.clean"),
+                "global-only drivers are the user's own and stay active"
+            );
+            for expected in [
+                pair("credential.https://example.com.helper", ""),
+                pair("core.sshcommand", "ssh -i key"),
+                pair("filter.a=b.clean", ""),
+                pair("filter.x.clean", ""),
+                pair("filter.x.required", "false"),
+                pair("merge.m.driver", ""),
+                pair("diff.d.textconv", ""),
+            ] {
+                assert!(overrides.contains(&expected), "missing {expected:?}");
+            }
+        }
+        let helpers = |overrides: &[(String, String)]| {
+            overrides
+                .iter()
+                .filter(|(key, _)| key == "credential.helper")
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(helpers(&local), vec![String::new()]);
+        assert_eq!(
+            helpers(&network),
+            vec![String::new(), "osxkeychain".to_string()],
+            "network operations reset the list and re-add only global helpers"
+        );
+
+        // First-value-wins keys cannot be overridden: a repository value
+        // refuses network operations unless a user value is read first.
+        for key in [
+            "core.gitproxy",
+            "remote.origin.uploadpack",
+            "remote.a=b.receivepack",
+        ] {
+            let repository_only = [entry("local", key, "evil")];
+            assert_eq!(
+                untrusted_config_overrides(&repository_only, InternalProfile::Local),
+                Ok(Vec::new())
+            );
+            let error = untrusted_config_overrides(&repository_only, InternalProfile::Network)
+                .expect_err("repository first-wins key must refuse the network operation");
+            assert!(error.contains(key), "{error}");
+            let user_first = [entry("global", key, "mine"), entry("local", key, "evil")];
+            assert_eq!(
+                untrusted_config_overrides(&user_first, InternalProfile::Network),
+                Ok(Vec::new())
             );
         }
     }

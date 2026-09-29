@@ -75,11 +75,7 @@ pub fn init(cfg: &Config) {
         spec = default_spec();
     }
     spec.lines.truncate(MAX_STATUS_LINES);
-    let needs_git = spec.lines.iter().any(|l| {
-        l.segments
-            .iter()
-            .any(|s| matches!(s.item.as_str(), "git_changes" | "git_status"))
-    });
+    let needs_git = spec.needs_git_status();
     let _ = SPEC.set(spec);
     let _ = NEEDS_GIT_STATUS.set(needs_git);
 }
