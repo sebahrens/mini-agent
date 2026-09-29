@@ -16,6 +16,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   the summarizer's `</message>`, `</transcript>`, `</previous_summary>` or `</user_instructions>`
   fences to forge user turns or contract updates, the summarizer is told fenced history is data, and
   a summary flushed to the daily memory log can no longer forge a separate log entry.
+- The model-facing Git tool no longer runs workspace-defined filter drivers: `status`, `diff`,
+  `stage`, `unstage` and `commit` (including their before/after snapshots) refuse with an error
+  naming the `filter` attribute when a tracked path is bound to a repository-configured
+  `filter.<name>.clean`/`.process` command, and run with every configured driver emptied.
+  Previously an auto-allowed `status` could execute a clean filter the model had written into
+  `.git/config` and `.gitattributes`.
 
 ### Added
 

@@ -5,7 +5,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{ToolError, check_perm, check_perm_bound_path};
-use crate::git::runner::{GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS};
+use crate::git::runner::{GitRunner, LOCAL_MUTATION_LIMITS, QUERY_LIMITS, command_result};
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::{CommandOutput, CommandStatus, Sandbox};
@@ -15,6 +15,15 @@ const TEXT_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits
     stdout_bytes: 192 * 1024,
     stderr_bytes: 64 * 1024,
     combined_bytes: 224 * 1024,
+};
+
+/// Bounds for the filter-attribute probe, which lists and classifies every
+/// index path. Exceeding them fails the operation closed.
+const FILTER_PROBE_LIMITS: crate::sandbox::CommandLimits = crate::sandbox::CommandLimits {
+    timeout: std::time::Duration::from_secs(30),
+    stdout_bytes: 16 * 1024 * 1024,
+    stderr_bytes: 64 * 1024,
+    combined_bytes: 16 * 1024 * 1024 + 64 * 1024,
 };
 
 #[derive(Debug, Deserialize)]
@@ -253,18 +262,23 @@ impl GitTool {
         Ok(validated)
     }
 
-    async fn status_snapshot(&self) -> Result<serde_json::Value, ToolError> {
+    /// `git status` refreshes the index, so callers pass the argument prefix
+    /// returned by [`Self::filter_guard`] for the current operation.
+    async fn status_snapshot(&self, guard: &[String]) -> Result<serde_json::Value, ToolError> {
         let output = self
             .run(
                 "status",
-                vec![
-                    "status".into(),
-                    "--porcelain=v2".into(),
-                    "-z".into(),
-                    "--branch".into(),
-                    "--untracked-files=all".into(),
-                    "--ignore-submodules=all".into(),
-                ],
+                guarded(
+                    guard,
+                    vec![
+                        "status".into(),
+                        "--porcelain=v2".into(),
+                        "-z".into(),
+                        "--branch".into(),
+                        "--untracked-files=all".into(),
+                        "--ignore-submodules=all".into(),
+                    ],
+                ),
                 QUERY_LIMITS,
                 false,
             )
@@ -296,6 +310,109 @@ impl GitTool {
         let id = String::from_utf8(output.stdout).ok()?;
         let id = id.trim();
         (!id.is_empty()).then(|| id.to_string())
+    }
+
+    /// Names of the filter drivers the contained Git would see configured.
+    async fn configured_filter_drivers(&self) -> Result<Vec<String>, ToolError> {
+        let output = self
+            .run(
+                "list-filter-drivers",
+                vec![
+                    "config".into(),
+                    "-z".into(),
+                    "--get-regexp".into(),
+                    r"^filter\.".into(),
+                ],
+                QUERY_LIMITS,
+                true,
+            )
+            .await?;
+        if output.status != CommandStatus::Completed {
+            return Err(ToolError::Msg(
+                "could not enumerate Git filter drivers".to_string(),
+            ));
+        }
+        match output.exit_status.and_then(|status| status.code()) {
+            Some(0) => parse_filter_driver_names(&output.stdout),
+            // `git config --get-regexp` exits 1 when no key matches.
+            Some(1) => Ok(Vec::new()),
+            _ => Err(ToolError::Msg(
+                "could not enumerate Git filter drivers".to_string(),
+            )),
+        }
+    }
+
+    /// Keeps workspace-defined clean filters from running during commands
+    /// that read working-tree content through Git's conversion layer
+    /// (`status`, worktree `diff`, and the `stage`/`unstage`/`commit`
+    /// commands and their before/after snapshots, which refresh the index).
+    ///
+    /// A `filter.<driver>.clean` or `.process` command in repository config
+    /// runs for every stat-dirty index path whose `filter` attribute names
+    /// that driver, and the model can write both the config and the
+    /// attributes. When any driver is configured, the operation is refused
+    /// with a closed error if an index path is currently bound to one; the
+    /// returned `-c` prefix, which callers prepend to every Git command of
+    /// the operation, additionally empties each configured driver so an
+    /// attribute written after this probe still executes nothing.
+    async fn filter_guard(&self, operation: &'static str) -> Result<Vec<String>, ToolError> {
+        let drivers = self.configured_filter_drivers().await?;
+        if drivers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let guard = neutralizing_args(&drivers);
+        let listed = self
+            .run(
+                "list-index-paths",
+                guarded(
+                    &guard,
+                    vec!["ls-files".into(), "-z".into(), "--cached".into()],
+                ),
+                FILTER_PROBE_LIMITS,
+                false,
+            )
+            .await?;
+        if listed.stdout.is_empty() {
+            return Ok(guard);
+        }
+        let output = self
+            .run_with_input(
+                "check-filter-attributes",
+                guarded(
+                    &guard,
+                    vec![
+                        "check-attr".into(),
+                        "--stdin".into(),
+                        "-z".into(),
+                        "filter".into(),
+                    ],
+                ),
+                listed.stdout,
+                FILTER_PROBE_LIMITS,
+            )
+            .await?;
+        let output = command_result("check-filter-attributes", FILTER_PROBE_LIMITS, output)
+            .map_err(ToolError::Msg)?;
+        let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        // Every record is `path NUL attribute NUL value NUL`, so the split
+        // leaves one empty trailing field.
+        if fields.len() % 3 != 1 || fields.last().is_some_and(|field| !field.is_empty()) {
+            return Err(ToolError::Msg(
+                "git check-attr output had unexpected field count".to_string(),
+            ));
+        }
+        for record in fields.chunks_exact(3) {
+            let value = String::from_utf8_lossy(record[2]);
+            if let Some(driver) = drivers.iter().find(|driver| driver.as_str() == value) {
+                return Err(ToolError::Msg(format!(
+                    "Git {operation} refused: a tracked path has a `filter` attribute bound to \
+                     the repository-configured filter driver `{driver}`, and refreshing the index \
+                     would execute that driver's command. Remove the `filter.{driver}` \
+                     configuration or the attribute to use this operation."
+                )));
+            }
+        }
+        Ok(guard)
     }
 
     async fn ensure_no_external_filters(&self, paths: &[String]) -> Result<(), ToolError> {
@@ -364,13 +481,14 @@ impl GitTool {
             .acquire_mutation(self.workspace.root())
             .await
             .map_err(ToolError::Msg)?;
-        let before = self.status_snapshot().await?;
+        let guard = self.filter_guard("stage").await?;
+        let before = self.status_snapshot(&guard).await?;
         let expanded_paths = self.expand_stage_paths(&paths).await?;
         self.ensure_no_external_filters(&expanded_paths).await?;
         let mut command = vec!["add".into(), "--".into()];
         command.extend(paths);
-        let output = self.run_mutation("stage", command).await?;
-        let after = self.status_snapshot().await?;
+        let output = self.run_mutation("stage", guarded(&guard, command)).await?;
+        let after = self.status_snapshot(&guard).await?;
         Ok(render_mutation_result("stage", None, before, after, output))
     }
 
@@ -385,7 +503,8 @@ impl GitTool {
             .acquire_mutation(self.workspace.root())
             .await
             .map_err(ToolError::Msg)?;
-        let before = self.status_snapshot().await?;
+        let guard = self.filter_guard("unstage").await?;
+        let before = self.status_snapshot(&guard).await?;
         let head = self
             .run(
                 "resolve-head",
@@ -411,8 +530,10 @@ impl GitTool {
             ]
         };
         command.extend(paths);
-        let output = self.run_mutation("unstage", command).await?;
-        let after = self.status_snapshot().await?;
+        let output = self
+            .run_mutation("unstage", guarded(&guard, command))
+            .await?;
+        let after = self.status_snapshot(&guard).await?;
         Ok(render_mutation_result(
             "unstage", None, before, after, output,
         ))
@@ -441,15 +562,20 @@ impl GitTool {
             .acquire_mutation(self.workspace.root())
             .await
             .map_err(ToolError::Msg)?;
-        let before = self.status_snapshot().await?;
+        // `git commit` itself refreshes the index before writing the tree.
+        let guard = self.filter_guard("commit").await?;
+        let before = self.status_snapshot(&guard).await?;
         let output = self
             .run_with_input(
                 "commit",
-                vec![
-                    "commit".into(),
-                    "--file=-".into(),
-                    "--cleanup=verbatim".into(),
-                ],
+                guarded(
+                    &guard,
+                    vec![
+                        "commit".into(),
+                        "--file=-".into(),
+                        "--cleanup=verbatim".into(),
+                    ],
+                ),
                 message.as_bytes().to_vec(),
                 LOCAL_MUTATION_LIMITS,
             )
@@ -461,7 +587,7 @@ impl GitTool {
         } else {
             None
         };
-        let after = self.status_snapshot().await?;
+        let after = self.status_snapshot(&guard).await?;
         let mut result = render_mutation_result("commit", coaching, before, after, output);
         result["commit_id"] = serde_json::json!(commit_id);
         Ok(result)
@@ -477,7 +603,8 @@ impl GitTool {
                     ));
                 }
                 let coaching = self.permission("git/status", "workspace").await?;
-                let mut value = self.status_snapshot().await?;
+                let guard = self.filter_guard("status").await?;
+                let mut value = self.status_snapshot(&guard).await?;
                 value["operation"] = serde_json::json!("status");
                 value["coaching"] = serde_json::json!(coaching);
                 Ok(value)
@@ -502,10 +629,13 @@ impl GitTool {
                 }
                 command.push("--".into());
                 command.extend(paths);
+                // Without `--cached` every diff reads the working tree.
+                let guard = self.filter_guard("diff").await?;
                 render_text_result(
                     "diff",
                     coaching,
-                    self.run("diff", command, TEXT_LIMITS, true).await?,
+                    self.run("diff", guarded(&guard, command), TEXT_LIMITS, true)
+                        .await?,
                 )
             }
             GitOperation::Log => {
@@ -659,6 +789,11 @@ fn hardened_args(mut args: Vec<String>) -> Vec<String> {
         "core.untrackedCache=false".into(),
         "-c".into(),
         "core.hooksPath=/dev/null".into(),
+        // A repository-local `core.attributesFile` could point at any
+        // workspace file; only in-tree and `info/attributes` remain, and the
+        // filter guard inspects those.
+        "-c".into(),
+        "core.attributesFile=/dev/null".into(),
         "-c".into(),
         "commit.gpgSign=false".into(),
         "-c".into(),
@@ -682,6 +817,62 @@ fn hardened_args(mut args: Vec<String>) -> Vec<String> {
     ];
     hardened.append(&mut args);
     hardened
+}
+
+/// Prepends an operation's filter-neutralising `-c` prefix (see
+/// [`GitTool::filter_guard`]) to a Git subcommand and its operands.
+fn guarded(guard: &[String], args: Vec<String>) -> Vec<String> {
+    let mut command = guard.to_vec();
+    command.extend(args);
+    command
+}
+
+/// Parses `git config -z --get-regexp '^filter\.'` output (`key LF value NUL`
+/// or `key NUL`) into the sorted, distinct driver names. A name that cannot
+/// be expressed as a `-c filter.<name>.<var>=` override fails closed.
+fn parse_filter_driver_names(stdout: &[u8]) -> Result<Vec<String>, ToolError> {
+    let mut names = std::collections::BTreeSet::new();
+    for record in stdout.split(|byte| *byte == 0) {
+        let key = record.split(|byte| *byte == b'\n').next().unwrap_or(record);
+        let Some(rest) = key.strip_prefix(b"filter.") else {
+            continue;
+        };
+        // Section and variable names contain no dots; the subsection may.
+        let Some(dot) = rest.iter().rposition(|byte| *byte == b'.') else {
+            continue;
+        };
+        let name = std::str::from_utf8(&rest[..dot])
+            .ok()
+            .filter(|name| !name.is_empty() && !name.contains(['=', '\0', '\n']))
+            .ok_or_else(|| {
+                ToolError::Msg(
+                    "Git operation refused: repository config defines a filter driver whose \
+                     name cannot be safely neutralised"
+                        .to_string(),
+                )
+            })?;
+        names.insert(name.to_string());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// `-c` overrides that empty each driver's `clean` and `process` commands
+/// (Git runs neither when empty) and clear `required`, so a matching path is
+/// read unfiltered instead of executing a command.
+fn neutralizing_args(drivers: &[String]) -> Vec<String> {
+    drivers
+        .iter()
+        .flat_map(|driver| {
+            [
+                "-c".to_string(),
+                format!("filter.{driver}.clean="),
+                "-c".to_string(),
+                format!("filter.{driver}.process="),
+                "-c".to_string(),
+                format!("filter.{driver}.required=false"),
+            ]
+        })
+        .collect()
 }
 
 fn render_text_result(
@@ -1166,6 +1357,210 @@ mod tests {
         assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
     }
 
+    /// Recreates `tracked.txt` with identical content so its cached stat data
+    /// no longer matches and any index refresh must hash (and so clean-filter)
+    /// the working-tree file.
+    #[cfg(unix)]
+    fn make_stat_dirty(repo: &TestRepo) {
+        std::fs::remove_file(repo.path().join("tracked.txt")).expect("remove tracked file");
+        repo.write("tracked.txt", "content\n");
+    }
+
+    /// Sets `filter.probe.clean` in the repository-local config to a command
+    /// that leaves a marker file whenever Git executes it.
+    #[cfg(unix)]
+    fn configure_marker_filter(repo: &TestRepo) -> std::path::PathBuf {
+        let marker = repo.path().join(".git").join("filter-ran");
+        let command = format!("touch '{}'; cat", marker.display());
+        repo.git(["config", "filter.probe.clean", command.as_str()]);
+        marker
+    }
+
+    /// A committed `tracked.txt` bound by `.gitattributes` to a
+    /// repository-configured clean filter, left stat-dirty. The fixture first
+    /// proves that plain `git status` really executes the filter here.
+    #[cfg(unix)]
+    fn clean_filter_fixture() -> (TestRepo, std::path::PathBuf) {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "content\n");
+        repo.write(".gitattributes", "tracked.txt filter=probe\n");
+        repo.git(["add", "tracked.txt", ".gitattributes"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        let marker = configure_marker_filter(&repo);
+        make_stat_dirty(&repo);
+        repo.git(["status", "--porcelain"]);
+        assert!(
+            marker.exists(),
+            "fixture must demonstrate that an index refresh runs the clean filter"
+        );
+        std::fs::remove_file(&marker).expect("reset filter marker");
+        make_stat_dirty(&repo);
+        (repo, marker)
+    }
+
+    #[cfg(unix)]
+    fn assert_filter_refusal(error: &super::ToolError, marker: &Path) {
+        let error = error.to_string();
+        assert!(
+            error.contains("`filter`") && error.contains("probe"),
+            "refusal must name the attribute and driver: {error}"
+        );
+        assert!(!marker.exists(), "the workspace clean filter must not run");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_status_refuses_or_ignores_workspace_clean_filter() {
+        let (repo, marker) = clean_filter_fixture();
+
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .expect_err("status must refuse a configured clean filter");
+
+        assert_filter_refusal(&error, &marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_diff_refuses_or_ignores_workspace_clean_filter() {
+        let (repo, marker) = clean_filter_fixture();
+        let tool = repo.tool();
+
+        let error = tool
+            .call(args(GitOperation::Diff, &[], None))
+            .await
+            .expect_err("worktree diff must refuse a configured clean filter");
+        assert_filter_refusal(&error, &marker);
+
+        let mut against_head = args(GitOperation::Diff, &["tracked.txt"], None);
+        against_head.revision = Some("HEAD".into());
+        let error = tool
+            .call(against_head)
+            .await
+            .expect_err("revision-to-worktree diff must refuse a configured clean filter");
+        assert_filter_refusal(&error, &marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_stage_snapshot_does_not_run_filters() {
+        let (repo, marker) = clean_filter_fixture();
+        repo.write("unfiltered.txt", "plain\n");
+
+        let error = repo
+            .tool()
+            .call(args(GitOperation::Stage, &["unfiltered.txt"], None))
+            .await
+            .expect_err("stage snapshots must not refresh a filtered index entry");
+
+        assert_filter_refusal(&error, &marker);
+        assert!(repo.git(["diff", "--cached", "--name-only"]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_unstage_and_commit_do_not_run_filters() {
+        let (repo, marker) = clean_filter_fixture();
+        let tool = repo.tool();
+
+        let error = tool
+            .call(args(GitOperation::Unstage, &["tracked.txt"], None))
+            .await
+            .expect_err("unstage must refuse a configured clean filter");
+        assert_filter_refusal(&error, &marker);
+
+        let head = repo.git(["rev-parse", "HEAD"]);
+        let error = tool
+            .call(args(
+                GitOperation::Commit,
+                &[],
+                Some("refresh would filter"),
+            ))
+            .await
+            .expect_err("commit must refuse a configured clean filter");
+        assert_filter_refusal(&error, &marker);
+        assert_eq!(repo.git(["rev-parse", "HEAD"]), head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filter_neutralization_covers_attributes_added_after_the_probe() {
+        let repo = TestRepo::new();
+        repo.write("tracked.txt", "content\n");
+        repo.git(["add", "tracked.txt"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        let marker = configure_marker_filter(&repo);
+        let tool = repo.tool();
+
+        let guard = tool
+            .filter_guard("status")
+            .await
+            .expect("no attribute binds the driver yet");
+        assert!(guard.iter().any(|arg| arg == "filter.probe.clean="));
+
+        // A concurrent writer binds the driver after the probe has passed.
+        repo.write(".gitattributes", "tracked.txt filter=probe\n");
+        make_stat_dirty(&repo);
+        tool.status_snapshot(&guard)
+            .await
+            .expect("status runs with every configured driver neutralised");
+
+        assert!(!marker.exists(), "a neutralised driver must not run");
+    }
+
+    #[tokio::test]
+    async fn filter_attributes_without_a_configured_driver_do_not_block_reads() {
+        let repo = TestRepo::new();
+        repo.write(
+            ".gitattributes",
+            "tracked.txt filter=mini-agent-unconfigured\n",
+        );
+        repo.write("tracked.txt", "content\n");
+        repo.git(["add", "tracked.txt", ".gitattributes"]);
+        repo.git(["commit", "--quiet", "-m", "base"]);
+        repo.write("tracked.txt", "changed\n");
+        let tool = repo.tool();
+
+        let snapshot = tool
+            .call(args(GitOperation::Status, &[], None))
+            .await
+            .expect("an attribute naming no configured driver executes nothing");
+        assert!(snapshot["records"].to_string().contains("tracked.txt"));
+        let diff = tool
+            .call(args(GitOperation::Diff, &[], None))
+            .await
+            .expect("diff an unconfigured filter attribute");
+        assert!(diff["text"].as_str().unwrap().contains("+changed"));
+    }
+
+    #[test]
+    fn filter_driver_names_are_parsed_from_nul_terminated_config() {
+        let names = super::parse_filter_driver_names(
+            b"filter.lfs.required\ntrue\0filter.lfs.clean\ngit-lfs clean -- %f\0\
+              filter.dotted.name.process\ncmd\0filter.flag\0filter.bare.smudge\0",
+        )
+        .expect("parse driver names");
+        assert_eq!(names, vec!["bare", "dotted.name", "lfs"]);
+        assert_eq!(
+            super::neutralizing_args(&names[2..]),
+            vec![
+                "-c",
+                "filter.lfs.clean=",
+                "-c",
+                "filter.lfs.process=",
+                "-c",
+                "filter.lfs.required=false",
+            ]
+        );
+
+        let error = super::parse_filter_driver_names(b"filter.a=b.clean\ncmd\0")
+            .expect_err("a driver name that -c cannot express must fail closed");
+        assert!(error.to_string().contains("filter driver"));
+        assert!(super::parse_filter_driver_names(b"filter.\xff.clean\ncmd\0").is_err());
+    }
+
     #[tokio::test]
     async fn read_operations_reject_fields_they_do_not_use() {
         let repo = TestRepo::new();
@@ -1209,6 +1604,7 @@ mod tests {
             ("core.fsmonitor", "false"),
             ("core.untrackedCache", "false"),
             ("core.hooksPath", "/dev/null"),
+            ("core.attributesFile", "/dev/null"),
             ("commit.gpgSign", "false"),
             ("tag.gpgSign", "false"),
             ("diff.external", ""),
