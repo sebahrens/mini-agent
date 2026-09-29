@@ -48,10 +48,11 @@ fields remain importable and replay their tool records as labeled transcript tex
 | ------- | ----------- |
 | `/provider` | Show the current provider. |
 | `/provider <name>` | Switch to a different provider. |
-| `/model` | Show the current model. |
-| `/model <name>` | Switch to a different model. |
-| `/models` | List all quick models defined in config. |
-| `/models <name>` | Switch to a named quick model. |
+| `/model` | Show the current model. From the command picker, Enter on `/model` opens the model picker: Tab switches between quick aliases and the provider's models, and the current model is marked `(current)`. |
+| `/model <alias\|id>` | Switch model: a `[quick_models]` alias first (which may also switch provider and pricing), otherwise a raw model id on the current provider. |
+| `/models` | List quick models and the provider's available models. |
+| `/models refresh` | Re-fetch the provider's model list (also retries a listing that failed recently). |
+| `/models <name>` | Same as `/model <name>`, kept for compatibility. |
 | `/models-add <name> <provider> <model>` | Save a new quick model to the config file. |
 
 ## Context Files

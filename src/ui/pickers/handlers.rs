@@ -155,6 +155,8 @@ pub struct CommandPickerCtx<'a> {
     pub quick_model_names: &'a [String],
     pub live_model_names: &'a [String],
     pub provider_names: &'a [String],
+    /// The session's current model, marked in the `/model` picker.
+    pub current_model: Option<String>,
     /// The active security mode, or `None` when no permission system is
     /// running (then `/mode` has no picker and submits as text).
     pub security_mode: Option<crate::permission::SecurityMode>,
@@ -192,7 +194,9 @@ fn opens_sub_picker(command: &str, ctx: &CommandPickerCtx) -> bool {
     match command {
         "/prompt" => !ctx.prompt_names.is_empty(),
         "/agent" => !ctx.agent_names.is_empty(),
-        "/models" => !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty()),
+        "/model" | "/models" => {
+            !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty())
+        }
         "/theme" => !ctx.theme_names.is_empty(),
         "/provider" => !ctx.provider_names.is_empty(),
         "/queue" => true,
@@ -228,8 +232,13 @@ fn accept_command(
         if opens_sub_picker(&selected, ctx) {
             picker.deactivate();
             let sub = match selected.as_str() {
-                "/models" => {
-                    let mut mp = ModelsPicker::new();
+                "/model" | "/models" => {
+                    let prefix = if selected == "/model" {
+                        "/model "
+                    } else {
+                        "/models "
+                    };
+                    let mut mp = ModelsPicker::for_command(prefix, ctx.current_model.clone());
                     mp.set_groups(
                         ctx.quick_model_names.to_vec(),
                         ctx.live_model_names.to_vec(),
@@ -501,7 +510,7 @@ pub fn handle_models_key(
     picker: &mut ModelsPicker,
     key: KeyEvent,
 ) -> bool {
-    let prefix = "/models ";
+    let prefix = picker.prefix;
     let prefix_len = prefix.len();
     match key.code {
         KeyCode::Char(c)

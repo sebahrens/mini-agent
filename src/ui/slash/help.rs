@@ -68,13 +68,19 @@ pub(crate) fn help_lines(emit: &mut dyn FnMut(bool, &str)) {
     );
     emit(false, "  /clear [/new]          clear the current session");
     emit(false, "  /provider [name]       show or switch provider");
-    emit(false, "  /model [name]          show or switch model");
+    emit(
+        false,
+        "  /model [alias|id]      show or switch model (quick alias, else raw id)",
+    );
     emit(
         false,
         "  /agent [name]          show or switch the main-agent persona",
     );
-    emit(false, "  /models                list quick models");
-    emit(false, "  /models <name>         switch to a quick model");
+    emit(
+        false,
+        "  /models [refresh]      list quick and provider models (or refresh)",
+    );
+    emit(false, "  /models <name>         same as /model <name>");
     emit(false, "  /models-add <n> <p> <m> save a quick model");
     emit(false, "  /sessions              list recent sessions");
     emit(

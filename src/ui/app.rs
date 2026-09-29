@@ -1170,6 +1170,8 @@ impl<'a> App<'a> {
     /// background listing has landed since the last sync (or when `force`).
     fn sync_live_model_names(&mut self, force: bool) {
         let generation = crate::ui::slash::model_cache_generation();
+        self.input
+            .set_current_model(Some(self.ui.session.model.to_string()));
         if force || generation != self.model_cache_generation {
             self.model_cache_generation = generation;
             self.input

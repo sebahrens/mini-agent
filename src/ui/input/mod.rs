@@ -321,6 +321,7 @@ pub struct InputEditor {
     theme_names: Vec<String>,
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
+    current_model: Option<String>,
     provider_names: Vec<String>,
     /// Source of the current security mode for the `/mode` picker.
     permission: Option<crate::permission::checker::PermCheck>,
@@ -345,6 +346,7 @@ impl InputEditor {
             theme_names: Vec::new(),
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
+            current_model: None,
             provider_names: Vec::new(),
             permission: None,
             editor: None,
@@ -420,6 +422,11 @@ impl InputEditor {
         self.live_model_names = names;
     }
 
+    /// The session's current model, marked in the `/model` picker.
+    pub fn set_current_model(&mut self, model: Option<String>) {
+        self.current_model = model;
+    }
+
     pub fn set_provider_names(&mut self, names: Vec<String>) {
         self.provider_names = names;
     }
@@ -491,8 +498,10 @@ impl InputEditor {
         self.picker = Some(Picker::Command(picker));
     }
 
-    pub fn start_models_picker(&mut self) {
-        let mut picker = ModelsPicker::new();
+    /// Open the model picker completing the argument of `prefix`
+    /// (`"/model "` or `"/models "`).
+    pub fn start_models_picker(&mut self, prefix: &'static str) {
+        let mut picker = ModelsPicker::for_command(prefix, self.current_model.clone());
         picker.set_monochrome(self.monochrome);
         picker.set_groups(
             self.quick_model_names.clone(),
@@ -979,16 +988,18 @@ impl InputEditor {
                         }
                     }
                 }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/models ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/models ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_models_picker();
-                            if let Some(Picker::Models(ref mut mp)) = self.picker {
-                                mp.char_input(c);
+                for prefix in ["/model ", "/models "] {
+                    if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
+                        && self.buffer.starts_with(prefix)
+                    {
+                        let after_prefix: String = self.buffer.chars().skip(prefix.len()).collect();
+                        if !after_prefix.is_empty() && c != ' ' {
+                            let query_len = after_prefix.len();
+                            if query_len == 1 {
+                                self.start_models_picker(prefix);
+                                if let Some(Picker::Models(ref mut mp)) = self.picker {
+                                    mp.char_input(c);
+                                }
                             }
                         }
                     }

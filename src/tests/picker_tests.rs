@@ -895,6 +895,48 @@ mod slash_picker_contract {
         assert!(!command_picker_open(&input));
     }
 
+    /// mini-agent-9rbwc: `/model` is the selector: its picker groups quick
+    /// aliases and provider models, marks the current model, and inserts
+    /// the choice as `/model <name>`.
+    #[test]
+    fn model_opens_the_grouped_model_picker_with_the_current_model() {
+        let mut input = InputEditor::new();
+        input.set_quick_model_names(vec!["fast".to_string(), "smart".to_string()]);
+        input.set_live_model_names(vec!["org/a".to_string(), "org/b".to_string()]);
+        input.set_current_model(Some("smart".to_string()));
+        typed(&mut input, "/model");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/model ");
+        let Some(Picker::Models(picker)) = input.picker.as_ref() else {
+            panic!("/model opens the model picker");
+        };
+        assert_eq!(picker.prefix, "/model ");
+        assert_eq!(picker.selected_name(), Some("smart"));
+        assert!(
+            picker
+                .display_rows()
+                .contains(&"smart  (current)".to_string())
+        );
+
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        typed(&mut input, "b");
+        assert_eq!(input.buffer, "/model b");
+        assert_eq!(press(&mut input, KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(input.buffer, "/model org/b");
+        assert_eq!(
+            press(&mut input, KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+            Some("/model org/b")
+        );
+
+        // Typing the argument after a closed picker opens the same picker.
+        input.load_text("/model ");
+        typed(&mut input, "f");
+        assert!(matches!(
+            input.picker.as_ref(),
+            Some(Picker::Models(p)) if p.active && p.prefix == "/model " && p.query == "f"
+        ));
+    }
+
     /// mini-agent-lqq0c: aliases are not suggested but still run in one Enter.
     #[test]
     fn hidden_aliases_are_not_suggested_but_run_when_typed_in_full() {

@@ -398,49 +398,69 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     Ok(())
 }
 
+/// `/model` is the single model selector: `/model` shows the current model,
+/// `/model <name>` switches to a quick-model alias, else to a raw model id on
+/// the current provider. `/models <name>` does the same for compatibility.
 async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
         write_ok(
             ctx.renderer,
-            format!("current model: {}", ctx.session.model),
+            format!(
+                "current model: {} ({})",
+                ctx.session.model, ctx.session.provider
+            ),
+        );
+        write_result(
+            ctx.renderer,
+            "  /model <alias|id> switches (Tab in the picker toggles quick aliases and provider models); /models lists them",
         );
         return Ok(());
     }
-    let new_model = compact_str::CompactString::new(parts[1].trim());
-    let new_agent = ctx
-        .agent_build_ctx()
-        .rebuild_agent(&new_model, *ctx.reasoning_enabled)
-        .await;
-    *ctx.agent = Some(new_agent);
-    ctx.session.model = new_model.clone();
-    ctx.session
-        .update_context_window(ctx.cfg.resolve_context_window(
-            &ctx.session.provider,
-            &new_model,
-            &crate::config::quick_models_map(ctx.cfg),
-        ));
-    if let Some((input, output)) = lookup_pricing_from_cache(&ctx.session.provider, &new_model) {
-        ctx.session.input_token_cost = input;
-        ctx.session.output_token_cost = output;
-    } else if ctx.session.provider == "openrouter"
-        && let Ok(prices) = crate::provider::fetch_openrouter_pricing(
-            ctx.cli.api_key.as_deref(),
-            &ctx.cfg.custom_providers_map(),
-            ctx.cfg.api_keys.as_ref(),
-        )
-        .await
-        && let Some(info) = prices.get(&*new_model)
-    {
-        ctx.session.input_token_cost = info.input_cost;
-        ctx.session.output_token_cost = info.output_cost;
-        if ctx.cfg.context_window.is_none()
-            && crate::config::Config::catalog_context_window("openrouter", &new_model).is_none()
-            && let Some(cw) = info.context_length
-        {
-            ctx.session.update_context_window(cw);
-        }
+    switch_model(ctx, parts[1].trim()).await
+}
+
+/// How `/model <arg>` resolves its argument.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ModelTarget<'a> {
+    /// A `[quick_models]` alias (it may also switch provider).
+    Quick(&'a str),
+    /// A raw model id on the current provider.
+    Raw(&'a str),
+}
+
+/// Aliases win over raw ids, so a quick model named like a model id selects
+/// the alias's provider and pricing.
+pub(crate) fn resolve_model_target<'a>(
+    arg: &'a str,
+    quick: &HashMap<String, config::QuickModelConfig>,
+) -> ModelTarget<'a> {
+    if quick.contains_key(arg) {
+        ModelTarget::Quick(arg)
+    } else {
+        ModelTarget::Raw(arg)
     }
-    write_ok(ctx.renderer, format!("switched to model: {}", new_model));
+}
+
+async fn switch_model(ctx: &mut SlashCtx<'_>, arg: &str) -> anyhow::Result<()> {
+    let qm = config::quick_models_map(ctx.cfg);
+    match resolve_model_target(arg, &qm) {
+        ModelTarget::Quick(name) => {
+            let q = &qm[name];
+            ctx.switch_client(&q.provider)?;
+            apply_model(ctx, &q.model).await;
+            // preserve v1.4.x pricing/cost tracking
+            ctx.session.input_token_cost = q.input_token_cost;
+            ctx.session.output_token_cost = q.output_token_cost;
+            write_result(
+                ctx.renderer,
+                format!(
+                    "  quick model {} — ${:.4}/M in  ${:.4}/M out",
+                    name, q.input_token_cost, q.output_token_cost
+                ),
+            );
+        }
+        ModelTarget::Raw(id) => apply_model(ctx, id).await,
+    }
     Ok(())
 }
 
@@ -451,26 +471,9 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
 
     let refresh = parts.get(1).map(|s| s.trim()) == Some("refresh");
 
-    // /models <name-or-id> — quick-model name first, else raw model id for current provider
+    // /models <name-or-id> — same as /model <name-or-id>.
     if parts.len() >= 2 && !refresh {
-        let arg = parts[1].trim();
-        if let Some(q) = qm.get(arg) {
-            ctx.switch_client(&q.provider)?;
-            apply_model(ctx, &q.model).await;
-            // preserve v1.4.x pricing/cost tracking
-            ctx.session.input_token_cost = q.input_token_cost;
-            ctx.session.output_token_cost = q.output_token_cost;
-            write_result(
-                ctx.renderer,
-                format!(
-                    "  quick model {} — ${:.4}/M in  ${:.4}/M out",
-                    arg, q.input_token_cost, q.output_token_cost
-                ),
-            );
-            return Ok(());
-        }
-        apply_model(ctx, arg).await;
-        return Ok(());
+        return switch_model(ctx, parts[1].trim()).await;
     }
 
     // ---- list mode (+ optional refresh) ----
@@ -852,6 +855,34 @@ mod model_cache_tests {
             assert!(model_cache_generation() >= before);
         }
         assert!(!WARMING.lock().unwrap().contains("anthropic"));
+    }
+}
+
+#[cfg(test)]
+mod model_target_tests {
+    use super::{ModelTarget, resolve_model_target};
+    use crate::config::QuickModelConfig;
+    use std::collections::HashMap;
+
+    /// mini-agent-9rbwc: `/model` resolves a quick alias before a raw id.
+    #[test]
+    fn aliases_resolve_before_raw_ids() {
+        let quick: HashMap<String, QuickModelConfig> = serde_json::from_value(serde_json::json!({
+            "fast": {"provider": "openrouter", "model": "org/fast-model"}
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_model_target("fast", &quick),
+            ModelTarget::Quick("fast")
+        );
+        assert_eq!(
+            resolve_model_target("org/fast-model", &quick),
+            ModelTarget::Raw("org/fast-model")
+        );
+        assert_eq!(
+            resolve_model_target("fast", &HashMap::new()),
+            ModelTarget::Raw("fast")
+        );
     }
 }
 

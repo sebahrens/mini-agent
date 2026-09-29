@@ -18,6 +18,12 @@ pub struct ModelsPicker {
     provider: Vec<String>,
     pub group: usize,
     monochrome: bool,
+    /// The command whose argument this picker completes: `/model ` (the
+    /// selector) or `/models ` (kept for compatibility).
+    pub prefix: &'static str,
+    /// The session's current model, marked `(current)` and highlighted
+    /// while the query is empty.
+    current: Option<String>,
 }
 
 impl ModelsPicker {
@@ -32,7 +38,32 @@ impl ModelsPicker {
             provider: Vec::new(),
             group: 0,
             monochrome: false,
+            prefix: "/models ",
+            current: None,
         }
+    }
+
+    /// A picker completing `/model <name>` with the current model marked.
+    pub fn for_command(prefix: &'static str, current: Option<String>) -> Self {
+        ModelsPicker {
+            prefix,
+            current,
+            ..ModelsPicker::new()
+        }
+    }
+
+    /// The rows drawn for `matches`, with `(current)` after the current model.
+    pub(crate) fn display_rows(&self) -> Vec<String> {
+        self.matches
+            .iter()
+            .map(|name| {
+                if self.current.as_deref() == Some(name.as_str()) {
+                    format!("{name}  (current)")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect()
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -114,7 +145,14 @@ impl ModelsPicker {
             .take(50)
             .map(|(_, n)| n.clone())
             .collect();
-        self.selected = 0;
+        self.selected = if self.query.is_empty() {
+            self.current
+                .as_ref()
+                .and_then(|current| self.matches.iter().position(|m| m == current))
+                .unwrap_or(0)
+        } else {
+            0
+        };
     }
 
     pub fn select_next(&mut self) {
@@ -167,7 +205,7 @@ impl ModelsPicker {
             )?;
             write!(
                 stdout,
-                "{}  {}   (Tab to switch · /models refresh for the latest)",
+                "{}  {}   (Tab to switch groups · /models refresh for the latest)",
                 tab("Quick", self.quick.len(), self.group == 0),
                 tab("Provider", self.provider.len(), self.group == 1)
             )?;
@@ -175,7 +213,7 @@ impl ModelsPicker {
         }
 
         draw_picker_list(
-            &self.matches,
+            &self.display_rows(),
             self.selected,
             self.monochrome,
             None,

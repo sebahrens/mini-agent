@@ -132,6 +132,7 @@ impl InputEditor {
                     quick_model_names: &self.quick_model_names,
                     live_model_names: &self.live_model_names,
                     provider_names: &self.provider_names,
+                    current_model: self.current_model.clone(),
                     security_mode: self
                         .permission
                         .as_ref()
