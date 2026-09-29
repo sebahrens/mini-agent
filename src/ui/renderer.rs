@@ -1047,6 +1047,39 @@ impl Renderer {
         Ok(())
     }
 
+    /// Like [`Renderer::write_line`], and later lines can be placed under
+    /// this one with [`Renderer::write_line_after`] using the same `anchor`.
+    pub fn write_line_anchored(
+        &mut self,
+        anchor: &str,
+        text: &str,
+        color: Color,
+    ) -> io::Result<()> {
+        self.commit_partial();
+        self.feed
+            .push_anchored_block(anchor, style_from_color(color), text);
+        self.chat_dirty = true;
+        if self.scroll_offset == 0 {
+            self.render_viewport()?;
+        }
+        Ok(())
+    }
+
+    /// Place a line directly under the line written with `anchor` (a tool
+    /// result under its own call), or at the end when that line is gone.
+    pub fn write_line_after(&mut self, anchor: &str, text: &str, color: Color) -> io::Result<()> {
+        self.commit_partial();
+        let style = style_from_color(color);
+        if !self.feed.insert_after_anchor(anchor, style, text) {
+            self.feed.push_block(style, text);
+        }
+        self.chat_dirty = true;
+        if self.scroll_offset == 0 {
+            self.render_viewport()?;
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, text: &str, color: Color) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());

@@ -178,7 +178,9 @@ pub async fn handle_agent_event(
                 "◈ {}",
                 crate::ui::utils::format_tool_call_display(&name, &args)
             );
-            renderer.write_line(&sanitize_output(&line), C_TOOL)?;
+            // Anchored so the result renders directly under this call even
+            // when the model issued several calls before any result arrived.
+            renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
         }
         #[cfg(feature = "subagents")]
         AgentEvent::SubagentToolCall { name, args } => {
@@ -213,7 +215,7 @@ pub async fn handle_agent_event(
                 // The following ToolLoop event renders the diagnostic with a
                 // dedicated style; keep this event for canonical persistence.
             } else if name == "todo_write" {
-                renderer.write_line(&sanitize_output(&output), C_TOOL)?;
+                renderer.write_line_after(&id, &sanitize_output(&output), C_TOOL)?;
             } else {
                 let show_details = ui
                     .cfg
@@ -236,18 +238,18 @@ pub async fn handle_agent_event(
                                 max_lines,
                                 shown
                             );
-                            renderer.write_line(&summary, Color::DarkGrey)?;
+                            renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
                         } else {
                             let summary =
                                 format!("◈ result ({} chars):\n{}", char_count, sanitized);
-                            renderer.write_line(&summary, Color::DarkGrey)?;
+                            renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
                         }
                     }
                     ResolvedShowToolDetails::Unlimited => {
                         let sanitized = sanitize_output(&output);
                         let char_count = sanitized.chars().count();
                         let summary = format!("◈ result ({} chars):\n{}", char_count, sanitized);
-                        renderer.write_line(&summary, Color::DarkGrey)?;
+                        renderer.write_line_after(&id, &summary, Color::DarkGrey)?;
                     }
                 }
             }
