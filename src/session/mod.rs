@@ -1,4 +1,5 @@
 pub mod chat_history;
+pub mod lock;
 pub mod storage;
 pub mod title;
 

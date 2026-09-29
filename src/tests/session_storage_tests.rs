@@ -1325,3 +1325,181 @@ fn recent_session_limit_counts_decoded_sessions_only() {
     );
     drop(env);
 }
+
+// ── Cross-process session ownership (mini-agent-e42za) ──
+
+/// Retry `attempt` briefly. A lock released by dropping its descriptor can
+/// stay held for a moment while a concurrently forked test child still shares
+/// that descriptor between `fork` and `exec` (it is close-on-exec).
+fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(value) = attempt() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lock never became free"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Hold `session_id`'s lock through a separate open file description, the way
+/// another mini-agent process would. Advisory locks contend per open file
+/// (flock / LockFileEx), so this handle blocks the current process too.
+fn hold_lock_as_another_process(session_id: &str) -> std::fs::File {
+    let path = crate::session::lock::lock_path(session_id).unwrap();
+    let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+    eventually(|| file.try_lock().ok());
+    file
+}
+
+/// Save `session` as its owner, then give up the ownership so a simulated
+/// foreign process can take it over.
+fn save_then_hand_over(session: &Session) -> std::fs::File {
+    save_session(session).unwrap();
+    crate::session::lock::release_session(&session.id);
+    hold_lock_as_another_process(&session.id)
+}
+
+#[test]
+fn second_owner_cannot_overwrite_a_session_another_process_holds() {
+    use crate::session::lock::{SessionClaim, claim_or_fork, claim_session};
+
+    let env = setup_test_env();
+    let mut first = Session::new("openai", "gpt-4", 128_000, "shared");
+    first.add_message(MessageRole::User, "turn A");
+    let foreign = save_then_hand_over(&first);
+
+    // The second opener of the same session is refused ownership, and a save
+    // of its diverged copy is refused rather than clobbering turn A.
+    assert_eq!(
+        claim_session(&first.id).unwrap(),
+        SessionClaim::HeldElsewhere
+    );
+    let mut second = load_session_exact(&first.id).unwrap().unwrap();
+    second.add_message(MessageRole::User, "turn B");
+    let error = save_session(&second).unwrap_err().to_string();
+    assert!(error.contains("another mini-agent process"), "{error}");
+    let on_disk = load_session_exact(&first.id).unwrap().unwrap();
+    assert_eq!(on_disk.messages.len(), 1);
+    assert_eq!(on_disk.messages[0].content, "turn A");
+
+    // Resuming it instead forks: both histories survive.
+    let resumed = claim_or_fork(load_session_exact(&first.id).unwrap().unwrap()).unwrap();
+    let notice = resumed.notice.expect("a fork must be announced");
+    assert!(notice.contains(first.id.as_str()), "{notice}");
+    let mut fork = resumed.session;
+    assert_ne!(fork.id, first.id);
+    assert!(notice.contains(fork.id.as_str()), "{notice}");
+    assert_eq!(fork.name, "shared (fork)");
+    fork.add_message(MessageRole::User, "turn B");
+    save_session(&fork).unwrap();
+    let saved_fork = load_session_exact(&fork.id).unwrap().unwrap();
+    assert_eq!(
+        saved_fork
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        ["turn A", "turn B"]
+    );
+    assert_eq!(
+        load_session_exact(&first.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+
+    // The owner exiting (or crashing) releases the lock; the lock file left
+    // behind is inert and the session can be owned again.
+    drop(foreign);
+    assert!(
+        crate::session::lock::lock_path(&first.id)
+            .unwrap()
+            .is_file()
+    );
+    eventually(|| (claim_session(&first.id).unwrap() == SessionClaim::Owned).then_some(()));
+    save_session(&second).unwrap();
+    drop(env);
+}
+
+#[test]
+fn continue_forks_instead_of_clobbering_a_session_in_use() {
+    let env = setup_test_env();
+    let workspace = std::fs::canonicalize(&env.dir).unwrap();
+    let mut running = Session::new("openai", "gpt-4", 128_000, "");
+    running.working_dir = workspace.to_string_lossy().into_owned().into();
+    running.add_message(MessageRole::User, "first process turn");
+    let foreign = save_then_hand_over(&running);
+
+    // `--continue` selects the in-use session, then forks it.
+    let selected = find_recent_sessions_for_workspace(1, &workspace)
+        .unwrap()
+        .remove(0);
+    assert_eq!(selected.id, running.id);
+    let resumed = crate::session::lock::claim_or_fork(selected).unwrap();
+    assert!(resumed.notice.is_some());
+    let mut continued = resumed.session;
+    assert_ne!(continued.id, running.id);
+    assert!(continued.name.is_empty());
+    continued.add_message(MessageRole::User, "second process turn");
+    save_session(&continued).unwrap();
+
+    // The first process keeps writing its own file unhindered by the fork.
+    assert_eq!(
+        load_session_exact(&running.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert_eq!(
+        load_session_exact(&continued.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    // The fork is itself owned: a third process continuing it would fork too.
+    let path = crate::session::lock::lock_path(&continued.id).unwrap();
+    let third = std::fs::File::open(path).unwrap();
+    assert!(matches!(
+        third.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(foreign);
+    drop(env);
+}
+
+#[test]
+fn resuming_an_unowned_session_keeps_its_id() {
+    let env = setup_test_env();
+    let session = Session::new("openai", "gpt-4", 128_000, "solo");
+    save_session(&session).unwrap();
+    crate::session::lock::release_session(&session.id);
+
+    let resumed =
+        crate::session::lock::claim_or_fork(load_session_exact(&session.id).unwrap().unwrap())
+            .unwrap();
+    assert!(resumed.notice.is_none());
+    assert_eq!(resumed.session.id, session.id);
+    // Claiming is idempotent for the owner, and lock files never surface as
+    // sessions in discovery.
+    assert_eq!(
+        crate::session::lock::claim_session(&session.id).unwrap(),
+        crate::session::lock::SessionClaim::Owned
+    );
+    assert_eq!(find_sessions_by_prefix("").unwrap().len(), 1);
+    #[cfg(unix)]
+    assert_eq!(
+        mode(&crate::session::lock::lock_path(&session.id).unwrap()),
+        0o600
+    );
+    drop(env);
+}

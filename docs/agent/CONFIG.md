@@ -324,8 +324,31 @@ private-persistence policy to the state root's `sessions/` and
 
 Session replacement publishes only a fully written private temporary file.
 Failure cleanup removes a temporary file only after confirming that it is the
-same file created by the failed write. Session saves are currently lock-free;
-any lock artifact added later must continue to use the private storage helper.
+same file created by the failed write.
+
+### Session ownership across processes
+
+Each save replaces the whole session file, so only one process may own a
+session at a time. The owning process holds an advisory lock (`flock` on Unix,
+`LockFileEx` on Windows) on `sessions/<session-id>.lock` from the moment it
+resumes the session (`--continue`, `--session`, `/sessions <id>`) or first
+saves a new one until it exits or loads another session with `/sessions`. The lock file is
+created through the same private storage helper (`0600` / protected DACL).
+
+- Resuming a session another live process owns does not share its file: the
+  run continues in a forked copy under a new session ID (a named session's copy
+  is named `<name> (fork)`) and prints a notice naming both IDs. Both
+  histories are kept.
+- A save of a session whose lock another process holds is refused with an
+  error instead of overwriting that process's turns, tool records, cost, and
+  goal progress.
+- `--no-session` runs never save and take no lock. ACP sessions are
+  process-local and are not persisted, so they need no lock.
+- The operating system releases the lock when the owner exits or crashes. A
+  leftover `.lock` file is inert and is never deleted, because unlinking a lock
+  file another process has open would let two owners lock different files.
+- On a filesystem without advisory locks the lock is reported in the log and
+  sessions are saved unguarded rather than failing.
 
 One-step `/redo` persistence stores only the tail removed by `/undo` or the
 rewind picker; readers still accept the older full-snapshot shape. In memory,

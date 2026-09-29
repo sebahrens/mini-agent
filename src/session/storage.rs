@@ -87,6 +87,19 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     let dir = session_dir();
     crate::paths::ensure_private_directory(&dir)?;
     let path = session_path(&session.id)?;
+    // The snapshot replaces the whole file, so only the process that owns the
+    // session may write it; another owner's turns would otherwise be lost
+    // (mini-agent-e42za). A lock that cannot be established at all does not
+    // block the save: losing this process's own turns would be worse.
+    match crate::session::lock::claim_session(&session.id) {
+        Ok(crate::session::lock::SessionClaim::Owned) => {}
+        Ok(crate::session::lock::SessionClaim::HeldElsewhere) => {
+            return Err(crate::session::lock::held_elsewhere_error(&session.id));
+        }
+        Err(error) => {
+            tracing::warn!("session lock for {} unavailable: {}", session.id, error);
+        }
+    }
     let json = serde_json::to_string(session)?;
     let json_len = json.len();
     atomic_write(&path, &json)?;
