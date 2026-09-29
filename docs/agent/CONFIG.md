@@ -1497,7 +1497,10 @@ characters) is more specific than `**` (none), while `README.md` falls through
 to the `**` ask rule. Path rules are matched against the absolute path, the
 path as the tool received it, and the workspace-relative spelling, so a
 relative rule such as `secrets/**` also applies when a tool passes the
-canonical absolute path. Bash scripts are checked as a whole and line by line
+canonical absolute path. On macOS and Windows, whose default volumes are
+case-insensitive, path `deny` rules (tool and `external_directory`) also match
+every case variant, so `read .ENV` or `read Secrets/key` cannot bypass a
+`.env` or `secrets/**` deny. Bash scripts are checked as a whole and line by line
 against deny rules: a deny that matches any line denies the entire script.
 
 Outside the working directory, a tool `allow` rule only counts when it names

@@ -984,7 +984,7 @@ impl PermissionChecker {
             for (pattern, action) in rules {
                 let matches = |input: &&str| {
                     if is_path_tool_name(tool) {
-                        pattern.matches_path(input)
+                        pattern.matches_path_for_deny(input)
                     } else {
                         pattern.matches(input)
                     }
@@ -1252,11 +1252,16 @@ impl PermissionChecker {
             let verbatim = windows_verbatim_policy_path(&ordinary);
             let mut decision = None;
             for (pattern, action) in &self.ext_dir_rules {
-                if pattern.matches_path(path_str)
-                    || pattern.matches_path(&ordinary)
-                    || verbatim
-                        .as_deref()
-                        .is_some_and(|path| pattern.matches_path(path))
+                let matches = |path: &str| {
+                    if *action == Action::Deny {
+                        pattern.matches_path_for_deny(path)
+                    } else {
+                        pattern.matches_path(path)
+                    }
+                };
+                if matches(path_str)
+                    || matches(&ordinary)
+                    || verbatim.as_deref().is_some_and(matches)
                 {
                     decision = Some(match (decision, *action) {
                         (_, Action::Deny) | (Some(Action::Deny), _) => Action::Deny,
@@ -1275,7 +1280,13 @@ impl PermissionChecker {
             let matched: SmallVec<[(usize, Action); 4]> = self
                 .ext_dir_rules
                 .iter()
-                .filter(|(pattern, _)| pattern.matches_path(path_str))
+                .filter(|(pattern, action)| {
+                    if *action == Action::Deny {
+                        pattern.matches_path_for_deny(path_str)
+                    } else {
+                        pattern.matches_path(path_str)
+                    }
+                })
                 .map(|(pattern, action)| (pattern.specificity(), *action))
                 .collect();
             Self::resolve_matched(&matched)
@@ -2707,6 +2718,58 @@ mod standard_default_tests {
                 "{tool}"
             );
         }
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod case_insensitive_deny_tests {
+    use super::*;
+
+    #[test]
+    fn relative_deny_rules_cover_case_variants_on_case_insensitive_volumes() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_case_deny_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("secrets")).unwrap();
+        std::fs::write(workspace.join(".env"), "TOKEN=x").unwrap();
+        std::fs::write(workspace.join("secrets/key"), "k").unwrap();
+        let config = PermissionConfig {
+            read: Some(ToolPerm::Granular(
+                [
+                    (".env".to_string(), Action::Deny),
+                    ("secrets/**".to_string(), Action::Deny),
+                ]
+                .into(),
+            )),
+            ..PermissionConfig::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &PermissionConfigs::from(config),
+            SecurityMode::Standard,
+            Some(workspace.clone()),
+            None,
+        )
+        .unwrap();
+        for spelling in [".ENV", ".Env", "Secrets/key", "SECRETS/KEY", "secrets/KEY"] {
+            assert!(
+                matches!(checker.check_path("read", spelling), CheckResult::Denied(_)),
+                "check_path {spelling}"
+            );
+            let bound = workspace.join(spelling);
+            assert!(
+                matches!(
+                    checker.check_bound_path("read", &bound.to_string_lossy()),
+                    CheckResult::Denied(_)
+                ),
+                "check_bound_path {spelling}"
+            );
+        }
+        assert_eq!(
+            checker.check_path("read", "README.md"),
+            CheckResult::Allowed
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 }
