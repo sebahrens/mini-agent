@@ -266,7 +266,8 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 {"result":"done","files_changed":["src/main.rs"],"tool_calls":{"total":2,"by_name":{"edit":1,"read":1}},"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"cached_input_tokens":0,"cache_creation_input_tokens":0,"tool_use_prompt_tokens":0,"reasoning_tokens":0},"cost":0.00042,"stop_reason":"completed"}
 ```
 
-The object is the first and only line on stdout. `result` is the text of the turn's final
+The object is the first and only line on stdout. `usage` and `cost` cover the turn's requests and
+an automatic compaction that ran before the turn. `result` is the text of the turn's final
 completion: text the agent wrote before a tool call is saved as its own message in the session but
 is not prepended to `result`, matching the interactive transcript. A goal round that ends with an
 accepted `goal_report` and no closing text completes with an empty `result` rather than being

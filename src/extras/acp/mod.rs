@@ -136,21 +136,24 @@ impl SessionHistory {
 
     /// Reduce history to its retention bounds, carrying successful summaries
     /// between passes. Cancellation drops the pending summary and returns None;
-    /// only completed passes may have changed history at that point.
+    /// only completed passes may have changed history at that point. Otherwise
+    /// returns the summed summarizer usage of every successful pass, which the
+    /// turn's goal round counts as its own spend (mini-agent-i6q98).
     async fn compact_with<F, Fut>(
         &mut self,
         control: &TurnControl,
         #[cfg(feature = "goal")] goal_store: Option<&crate::extras::goal::GoalStore>,
         mut summarize: F,
-    ) -> Option<()>
+    ) -> Option<crate::event::UsageDelta>
     where
         F: FnMut(Vec<crate::session::SessionMessage>, Option<String>) -> Fut,
-        Fut: Future<Output = anyhow::Result<(String, usize)>>,
+        Fut: Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
     {
         const SUMMARY_ALLOWANCE: usize = 16 * 1024;
         if control.is_cancelled() {
             return None;
         }
+        let mut usage = crate::event::UsageDelta::default();
 
         // A provider may summarize only a leading prefix within its request
         // budget. Each successful pass removes at least one complete turn;
@@ -198,14 +201,19 @@ impl SessionHistory {
                 _ = control.cancelled() => return None,
                 result = summarize(serialized, self.summary.clone()) => result,
             };
-            let (summary, messages_included) = match summarized {
+            let crate::provider::CompactionOutput {
+                summary,
+                messages_included,
+                usage: pass_usage,
+            } = match summarized {
                 Ok(result) => result,
                 Err(error) => {
                     tracing::warn!(%error, "ACP history summarization failed; evicting oldest complete turns");
                     self.emergency_compact();
-                    return Some(());
+                    return Some(usage);
                 }
             };
+            usage = usage.saturating_add(pass_usage);
             let turns_included = cumulative_messages
                 .iter()
                 .take_while(|count| **count <= messages_included)
@@ -215,7 +223,7 @@ impl SessionHistory {
                     "ACP history summary did not cover a complete turn; evicting oldest complete turns"
                 );
                 self.emergency_compact();
-                return Some(());
+                return Some(usage);
             }
             for _ in 0..turns_included {
                 if let Some(turn) = self.turns.pop_front() {
@@ -237,7 +245,7 @@ impl SessionHistory {
                 };
             self.summary = Some(crate::provider::bound_summary(&summary, SUMMARY_ALLOWANCE));
         }
-        Some(())
+        Some(usage)
     }
 
     /// The reference of the recap this history replays, which the turn's
@@ -2195,6 +2203,19 @@ struct PromptOutcome {
     usage: rig::completion::Usage,
 }
 
+/// A summarizer result for `SessionHistory::compact_with` tests.
+#[cfg(test)]
+fn compaction_output(
+    summary: impl Into<String>,
+    messages_included: usize,
+) -> crate::provider::CompactionOutput {
+    crate::provider::CompactionOutput {
+        summary: summary.into(),
+        messages_included,
+        usage: crate::event::UsageDelta::default(),
+    }
+}
+
 impl PromptOutcome {
     fn cancelled(progress: Option<Vec<Message>>) -> Self {
         Self {
@@ -2347,6 +2368,10 @@ async fn execute_prompt(
         }
     };
 
+    // What this turn's compaction spent, for the goal round's token count.
+    // ACP keeps no session cost ledger, so there is nothing else to charge.
+    #[cfg(feature = "goal")]
+    let mut compaction_usage = crate::event::UsageDelta::default();
     if history.needs_compaction() {
         let quick_models = crate::config::quick_models_map(&state.cfg);
         let context_window =
@@ -2381,9 +2406,15 @@ async fn execute_prompt(
                 },
             )
             .await;
-        if compacted.is_none() {
+        let Some(usage) = compacted else {
             return Ok(PromptOutcome::cancelled(None));
+        };
+        #[cfg(feature = "goal")]
+        {
+            compaction_usage = usage;
         }
+        #[cfg(not(feature = "goal"))]
+        let _ = usage;
     }
     // Refreshed after compaction, so the recap this turn replays is the one
     // whose daily-memory copy is left out of the block.
@@ -2479,7 +2510,8 @@ async fn execute_prompt(
     else {
         return Ok(PromptOutcome::cancelled(None));
     };
-    Ok(relay_paused_runner(
+    #[cfg_attr(not(feature = "goal"), allow(unused_mut))]
+    let mut outcome = relay_paused_runner(
         session_id,
         cx,
         control,
@@ -2487,7 +2519,18 @@ async fn execute_prompt(
         #[cfg(feature = "goal")]
         (&state.cfg, &usage_provider),
     )
-    .await)
+    .await;
+    // The compaction ran on this round's behalf, so its tokens count toward
+    // the goal's total and `max_tokens` bound like the agent's own
+    // (mini-agent-i6q98).
+    #[cfg(feature = "goal")]
+    add_goal_usage(
+        &mut outcome.usage,
+        &state.cfg,
+        &usage_provider,
+        compaction_usage,
+    );
+    Ok(outcome)
 }
 
 #[cfg(feature = "mcp")]
@@ -3056,7 +3099,7 @@ mod history_tests {
                 None,
                 |messages, _| async move {
                     let count = messages.len();
-                    Ok(("origin user-0 assistant-0".to_string(), count))
+                    Ok(compaction_output("origin user-0 assistant-0", count))
                 },
             )
             .await
@@ -3082,7 +3125,7 @@ mod history_tests {
                 None,
                 |messages, _| async move {
                     let count = messages.len();
-                    Ok(("oversized origin retained".to_string(), count))
+                    Ok(compaction_output("oversized origin retained", count))
                 },
             )
             .await
@@ -3125,7 +3168,12 @@ mod history_tests {
                         let index = prior_summaries.len();
                         assert!(messages[0].content.contains(&format!("user-{index}")));
                         prior_summaries.push(previous);
-                        async move { Ok((format!("covered through turn {index}"), 2)) }
+                        async move {
+                            Ok(compaction_output(
+                                format!("covered through turn {index}"),
+                                2,
+                            ))
+                        }
                     },
                 )
                 .await
@@ -3146,6 +3194,45 @@ mod history_tests {
             );
             assert_eq!(snapshot[1..], retained);
         }
+    }
+
+    /// mini-agent-i6q98: every compaction pass is real spend, so the history
+    /// reports the sum of all passes for the turn's goal round to count.
+    #[tokio::test]
+    async fn compaction_reports_the_summed_usage_of_every_pass() {
+        let mut history = SessionHistory::default();
+        for index in 0..(MAX_ACP_HISTORY_TURNS + 3) {
+            history.commit_completed_turn(
+                &format!("user-{index}"),
+                vec![Message::assistant(format!("assistant-{index}"))],
+            );
+        }
+        let mut passes = 0u64;
+        let usage = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |_, _| {
+                    passes += 1;
+                    let pass = passes;
+                    async move {
+                        Ok(crate::provider::CompactionOutput {
+                            usage: crate::event::UsageDelta {
+                                input_tokens: 1_000 * pass,
+                                output_tokens: 100 * pass,
+                                ..crate::event::UsageDelta::default()
+                            },
+                            ..compaction_output(format!("pass {pass}"), 2)
+                        })
+                    }
+                },
+            )
+            .await
+            .expect("compaction is not cancelled");
+        assert_eq!(passes, 3);
+        assert_eq!(usage.input_tokens, 6_000);
+        assert_eq!(usage.output_tokens, 600);
     }
 
     #[tokio::test]
@@ -3193,11 +3280,14 @@ mod history_tests {
                             let entered = &entered;
                             async move {
                                 if complete_this_pass {
-                                    return Ok(("first pass recap".into(), 2));
+                                    return Ok(compaction_output("first pass recap", 2));
                                 }
                                 let _pending = PendingSummary(dropped);
                                 entered.notify_one();
-                                std::future::pending::<anyhow::Result<(String, usize)>>().await
+                                std::future::pending::<
+                                    anyhow::Result<crate::provider::CompactionOutput>,
+                                >()
+                                .await
                             }
                         },
                     )
@@ -3227,7 +3317,11 @@ mod history_tests {
                         &control,
                         #[cfg(feature = "goal")]
                         None,
-                        |_, _| -> std::future::Ready<anyhow::Result<(String, usize)>> {
+                        |_,
+                         _|
+                         -> std::future::Ready<
+                            anyhow::Result<crate::provider::CompactionOutput>,
+                        > {
                             panic!("an already-cancelled turn must not start a summary")
                         }
                     )
@@ -3239,7 +3333,9 @@ mod history_tests {
                     &TurnControl::new(),
                     #[cfg(feature = "goal")]
                     None,
-                    |messages, _| async move { Ok(("recovered recap".into(), messages.len())) },
+                    |messages, _| async move {
+                        Ok(compaction_output("recovered recap", messages.len()))
+                    },
                 )
                 .await
                 .expect("a later turn can compact the unchanged history");
@@ -3263,7 +3359,7 @@ mod history_tests {
                     None,
                     |_, _| async move {
                         if incomplete {
-                            Ok(("did not cover a turn".to_string(), 0))
+                            Ok(compaction_output("did not cover a turn", 0))
                         } else {
                             anyhow::bail!("summarizer unavailable")
                         }
@@ -3299,7 +3395,7 @@ mod history_tests {
                 &TurnControl::new(),
                 #[cfg(feature = "goal")]
                 None,
-                |messages, _| async move { Ok((summary.to_string(), messages.len())) },
+                |messages, _| async move { Ok(compaction_output(summary, messages.len())) },
             )
             .await
             .unwrap();
@@ -7077,7 +7173,7 @@ mod goal_acp_tests {
         let control = TurnControl::new();
         history
             .compact_with(&control, Some(&store), |_, _| async {
-                Ok(("a summary that forgot everything".to_string(), 2))
+                Ok(compaction_output("a summary that forgot everything", 2))
             })
             .await;
 
@@ -7102,7 +7198,7 @@ mod goal_acp_tests {
         let control = TurnControl::new();
         history
             .compact_with(&control, Some(&store), |_, _| async {
-                Ok(("summary".to_string(), 2))
+                Ok(compaction_output("summary", 2))
             })
             .await;
         assert!(

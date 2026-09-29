@@ -438,7 +438,7 @@ pub async fn handle_compress(
 
     let client = &ui.client;
     let retry_config = &ui.cfg.retry;
-    let (first_kept_index, tokens_before) = compact_session_with(
+    let (first_kept_index, tokens_before, usage) = compact_session_with(
         ui.session,
         cut_idx,
         summarizer_input_budget,
@@ -473,6 +473,19 @@ pub async fn handle_compress(
         },
     )
     .await?;
+
+    // Every rolling summarizer request ran on the session's model: charge it
+    // at the session's prices, and count it toward the goal round in progress
+    // (auto-compaction runs before a finished round is settled). A manual
+    // `/compress` between rounds has no round to join and is only charged
+    // (mini-agent-i6q98).
+    let usage = ui.cfg.normalize_usage(&ui.session.provider, usage);
+    ui.session
+        .charge_usage_delta(usage, ui.cfg.is_anthropic_native(&ui.session.provider));
+    #[cfg(feature = "goal")]
+    if let Some(collector) = run.goal_round.as_mut() {
+        collector.add_usage(usage);
+    }
 
     run.agent = Some(
         ui.agent_build_ctx()
@@ -541,10 +554,10 @@ pub(crate) async fn compact_session_with<S, F>(
     keep_recent_tool_results: usize,
     summarize: S,
     stage_summary: impl FnOnce(&str, usize),
-) -> anyhow::Result<(usize, u64)>
+) -> anyhow::Result<(usize, u64, crate::event::UsageDelta)>
 where
     S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
-    F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
+    F: std::future::Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
 {
     let model = session.model.to_string();
     let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
@@ -552,7 +565,11 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
-    let (summary, messages_included) = summarize(
+    let crate::provider::CompactionOutput {
+        summary,
+        messages_included,
+        usage,
+    } = summarize(
         model,
         messages,
         previous_summary,
@@ -568,7 +585,7 @@ where
         .sum();
     stage_summary(&summary, first_kept_index);
     session.compress(summary, first_kept_index, tokens_before);
-    Ok((first_kept_index, tokens_before))
+    Ok((first_kept_index, tokens_before, usage))
 }
 
 /// Split a slash command into at most three fields: the command, its first
@@ -843,6 +860,14 @@ mod compaction_budget_tests {
     };
     use crate::session::{MessageRole, Session};
 
+    fn output(summary: &str, messages_included: usize) -> crate::provider::CompactionOutput {
+        crate::provider::CompactionOutput {
+            summary: summary.to_string(),
+            messages_included,
+            usage: crate::event::UsageDelta::default(),
+        }
+    }
+
     #[test]
     fn known_exhausted_window_does_not_use_unknown_window_fallback() {
         assert_eq!(summarizer_input_budget(8_000, 8_000), 0);
@@ -882,7 +907,7 @@ mod compaction_budget_tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let staged = std::cell::RefCell::new(None);
-        let (first_kept_index, tokens_before) = compact_session_with(
+        let (first_kept_index, tokens_before, _) = compact_session_with(
             &mut session,
             2,
             80,
@@ -895,7 +920,7 @@ mod compaction_budget_tests {
                 assert!(previous_summary.is_none());
                 assert_eq!(input_budget, 80);
                 assert_eq!(response_budget, 20);
-                Ok(("TUI_SUMMARY".to_string(), 2usize))
+                Ok(output("TUI_SUMMARY", 2))
             },
             |summary, first_kept_index| {
                 *staged.borrow_mut() = Some((summary.to_string(), first_kept_index));
@@ -937,7 +962,7 @@ mod compaction_budget_tests {
     #[tokio::test]
     async fn tui_compaction_with_partial_coverage_keeps_unsummarized_messages() {
         let mut session = over_budget_session();
-        let (first_kept_index, tokens_before) = compact_session_with(
+        let (first_kept_index, tokens_before, _) = compact_session_with(
             &mut session,
             2,
             80,
@@ -945,7 +970,7 @@ mod compaction_budget_tests {
             KEEP_RECENT_TOOL_RESULTS,
             |_, messages, _, _, _| async move {
                 assert_eq!(messages.len(), 2);
-                Ok(("PARTIAL".to_string(), 1usize))
+                Ok(output("PARTIAL", 1))
             },
             |_, _| {},
         )
@@ -973,7 +998,7 @@ mod compaction_budget_tests {
             80,
             20,
             KEEP_RECENT_TOOL_RESULTS,
-            |_, _, _, _, _| async move { Ok(("EMPTY".to_string(), 0usize)) },
+            |_, _, _, _, _| async move { Ok(output("EMPTY", 0)) },
             |_, _| panic!("nothing must be staged when nothing is drained"),
         )
         .await
@@ -1008,7 +1033,7 @@ mod compaction_budget_tests {
                 assert_eq!(messages[2].role, MessageRole::ToolCall);
                 assert!(messages[1].content.contains("[result cleared:"));
                 assert!(messages[3].content.contains("full-output-1"));
-                Ok(("PRUNED_SUMMARY".to_string(), 4))
+                Ok(output("PRUNED_SUMMARY", 4))
             },
             |_, _| {},
         )

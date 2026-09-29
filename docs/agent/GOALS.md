@@ -107,6 +107,10 @@ when it judges with the session model). If no price is known for the judge model
 added without cost, the first such call says so, and `/goal status` shows how many judge tokens the
 session cost leaves out.
 
+Context compaction that runs during a round is the round's spend too: its summarizer tokens count
+toward the goal's total and `max_tokens` bound in the terminal, headless runs and ACP, and are
+charged to the session at the session model's prices.
+
 ## Statuses
 
 | Status | Meaning |

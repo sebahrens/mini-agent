@@ -2,13 +2,14 @@ use crate::auth::ProviderKind;
 use crate::config::{
     ApiStyle, CustomProviderConfig, ReasoningConfig, ReasoningEffort, ReasoningSummary,
 };
+use crate::event::UsageDelta;
 use crate::provider::ModelEntry;
 use crate::provider::{
-    AnyClient, AnyModel, bound_summary, compaction_request_limits, compress_messages_with,
-    create_client, expand_env, is_agent_model, is_localhost, merge_extra_body,
-    openai_completions_extra_body, openai_responses_extra_body, openrouter_anthropic_routing,
-    resolve_api_style, resolve_provider_config, serialize_conversation,
-    summarize_conversation_bounded,
+    AnyClient, AnyModel, CompactionOutput, bound_summary, compaction_request_limits,
+    compress_messages_with, create_client, expand_env, is_agent_model, is_localhost,
+    merge_extra_body, openai_completions_extra_body, openai_responses_extra_body,
+    openrouter_anthropic_routing, resolve_api_style, resolve_provider_config,
+    serialize_conversation, summarize_conversation_bounded,
 };
 use crate::session::{MessageRole, SessionMessage};
 use compact_str::CompactString;
@@ -111,7 +112,7 @@ async fn bounded_compaction_chunks_history_larger_than_the_prompt_budget() {
     let conversation = "history line with code and json {}\n".repeat(400);
     let budget = 1_024;
 
-    let summary = summarize_conversation_bounded(
+    let (summary, _) = summarize_conversation_bounded(
         &conversation,
         None,
         Some("preserve decisions"),
@@ -121,7 +122,10 @@ async fn bounded_compaction_chunks_history_larger_than_the_prompt_budget() {
             async move {
                 let mut prompts = observed.lock().unwrap();
                 prompts.push(prompt);
-                Ok(format!("partial summary {}", prompts.len()))
+                Ok((
+                    format!("partial summary {}", prompts.len()),
+                    UsageDelta::default(),
+                ))
             }
         },
     )
@@ -167,7 +171,11 @@ async fn compress_messages_summarizes_whole_cut_slice_across_multiple_requests()
     let observed = prompts.clone();
     let messages = compaction_messages(60, &"history line with code and json {}".repeat(4));
 
-    let (summary, messages_included) = compress_messages_with(
+    let CompactionOutput {
+        summary,
+        messages_included,
+        ..
+    } = compress_messages_with(
         &messages,
         Some("earlier summary"),
         Some("preserve decisions"),
@@ -177,7 +185,10 @@ async fn compress_messages_summarizes_whole_cut_slice_across_multiple_requests()
             async move {
                 let mut prompts = observed.lock().unwrap();
                 prompts.push(prompt);
-                Ok(format!("partial summary {}", prompts.len()))
+                Ok((
+                    format!("partial summary {}", prompts.len()),
+                    UsageDelta::default(),
+                ))
             }
         },
     )
@@ -212,6 +223,57 @@ async fn compress_messages_summarizes_whole_cut_slice_across_multiple_requests()
     );
 }
 
+/// mini-agent-i6q98: every rolling summarizer request is real spend, so the
+/// compaction reports the sum of all of them rather than dropping it.
+#[tokio::test]
+async fn compress_messages_sums_usage_across_rolling_requests() {
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed = requests.clone();
+    let messages = compaction_messages(16, &"history line with code and json {}".repeat(4));
+
+    let output = compress_messages_with(&messages, None, None, 2_500, move |_prompt| {
+        let observed = observed.clone();
+        async move {
+            let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok((
+                format!("partial summary {n}"),
+                UsageDelta {
+                    input_tokens: 1_000 * n,
+                    output_tokens: 100 * n,
+                    total_tokens: 1_100 * n,
+                    cached_input_tokens: 10 * n,
+                    cache_creation_input_tokens: 5 * n,
+                    tool_use_prompt_tokens: 0,
+                    reasoning_tokens: 7 * n,
+                },
+            ))
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the fixture must span exactly three rolling requests"
+    );
+    assert_eq!(output.messages_included, messages.len());
+    assert_eq!(output.summary, "partial summary 3");
+    // 1 + 2 + 3 = 6 of each per-request unit.
+    assert_eq!(
+        output.usage,
+        UsageDelta {
+            input_tokens: 6_000,
+            output_tokens: 600,
+            total_tokens: 6_600,
+            cached_input_tokens: 60,
+            cache_creation_input_tokens: 30,
+            tool_use_prompt_tokens: 0,
+            reasoning_tokens: 42,
+        }
+    );
+}
+
 #[tokio::test]
 async fn compress_messages_keeps_transcript_isolated_from_summarizer_instructions() {
     let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -224,16 +286,17 @@ async fn compress_messages_keeps_transcript_isolated_from_summarizer_instruction
         tool: None,
     }];
 
-    let (_, messages_included) =
-        compress_messages_with(&messages, None, None, 7_000, move |prompt| {
-            let observed = observed.clone();
-            async move {
-                observed.lock().unwrap().push(prompt);
-                Ok("summary".to_string())
-            }
-        })
-        .await
-        .unwrap();
+    let CompactionOutput {
+        messages_included, ..
+    } = compress_messages_with(&messages, None, None, 7_000, move |prompt| {
+        let observed = observed.clone();
+        async move {
+            observed.lock().unwrap().push(prompt);
+            Ok(("summary".to_string(), UsageDelta::default()))
+        }
+    })
+    .await
+    .unwrap();
 
     assert_eq!(messages_included, 1);
     let prompts = prompts.lock().unwrap();
@@ -259,16 +322,17 @@ async fn compress_messages_returns_summarized_prefix_len_when_slice_exceeds_requ
     let observed = prompts.clone();
     let messages = compaction_messages(400, &"dense:{}[](),;!".repeat(8));
 
-    let (_, messages_included) =
-        compress_messages_with(&messages, None, None, 1_000, move |prompt| {
-            let observed = observed.clone();
-            async move {
-                observed.lock().unwrap().push(prompt);
-                Ok("summary".to_string())
-            }
-        })
-        .await
-        .unwrap();
+    let CompactionOutput {
+        messages_included, ..
+    } = compress_messages_with(&messages, None, None, 1_000, move |prompt| {
+        let observed = observed.clone();
+        async move {
+            observed.lock().unwrap().push(prompt);
+            Ok(("summary".to_string(), UsageDelta::default()))
+        }
+    })
+    .await
+    .unwrap();
 
     let prompts = prompts.lock().unwrap();
     assert!(prompts.len() <= 16);
@@ -294,7 +358,7 @@ async fn bounded_compaction_rejects_metadata_over_budget_without_calling_summari
             let observed = observed.clone();
             async move {
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok("must not be called".to_string())
+                Ok(("must not be called".to_string(), UsageDelta::default()))
             }
         },
     )
@@ -318,12 +382,12 @@ async fn bounded_compaction_splits_only_at_utf8_boundaries() {
     // request without allowing a split inside either code point.
     let budget = fixed_prompt.len() + 11;
 
-    let summary =
+    let (summary, _) =
         summarize_conversation_bounded("記憶", Some("s"), Some("i"), budget, move |prompt| {
             let observed = observed.clone();
             async move {
                 observed.lock().unwrap().push(prompt);
-                Ok("s".to_string())
+                Ok(("s".to_string(), UsageDelta::default()))
             }
         })
         .await
@@ -352,7 +416,7 @@ async fn bounded_compaction_limits_verbose_rolling_summaries() {
     let observed = prompts.clone();
     let budget = 1_024;
 
-    let summary = summarize_conversation_bounded(
+    let (summary, _) = summarize_conversation_bounded(
         &"dense:{}[](),;!\n".repeat(1_000),
         None,
         None,
@@ -361,7 +425,7 @@ async fn bounded_compaction_limits_verbose_rolling_summaries() {
             let observed = observed.clone();
             async move {
                 observed.lock().unwrap().push(prompt);
-                Ok("verbose summary ".repeat(10_000))
+                Ok(("verbose summary ".repeat(10_000), UsageDelta::default()))
             }
         },
     )
@@ -386,7 +450,7 @@ async fn bounded_compaction_caps_requests_and_keeps_recent_history() {
         let observed = observed.clone();
         async move {
             observed.lock().unwrap().push(prompt);
-            Ok("summary".to_string())
+            Ok(("summary".to_string(), UsageDelta::default()))
         }
     })
     .await
@@ -402,7 +466,7 @@ async fn bounded_compaction_caps_requests_and_keeps_recent_history() {
 #[tokio::test]
 async fn bounded_compaction_rejects_empty_summarizer_output() {
     let error = summarize_conversation_bounded("conversation", None, None, usize::MAX, |_| async {
-        Ok(String::new())
+        Ok((String::new(), UsageDelta::default()))
     })
     .await
     .unwrap_err();
@@ -1415,7 +1479,7 @@ async fn compaction_prompt_defangs_previous_summary_and_instructions() {
     let observed = prompts.clone();
     // The rolling summary returned by the model is untrusted as well: it is
     // re-fed as the previous summary of the next request.
-    let summary = summarize_conversation_bounded(
+    let (summary, _) = summarize_conversation_bounded(
         &serialize_conversation(&breakout_messages(12)),
         Some(FENCE_BREAKOUT),
         Some(FENCE_BREAKOUT),
@@ -1424,7 +1488,7 @@ async fn compaction_prompt_defangs_previous_summary_and_instructions() {
             let observed = observed.clone();
             async move {
                 observed.lock().unwrap().push(prompt);
-                Ok(format!("partial\n{FENCE_BREAKOUT}"))
+                Ok((format!("partial\n{FENCE_BREAKOUT}"), UsageDelta::default()))
             }
         },
     )
@@ -1456,7 +1520,9 @@ async fn compress_messages_request_has_exactly_one_transcript_close_as_last_tag(
     let observed = prompts.clone();
     let messages = breakout_messages(5);
 
-    let (_, messages_included) = compress_messages_with(
+    let CompactionOutput {
+        messages_included, ..
+    } = compress_messages_with(
         &messages,
         Some(FENCE_BREAKOUT),
         Some("keep decisions"),
@@ -1465,7 +1531,7 @@ async fn compress_messages_request_has_exactly_one_transcript_close_as_last_tag(
             let observed = observed.clone();
             async move {
                 observed.lock().unwrap().push(prompt);
-                Ok("summary".to_string())
+                Ok(("summary".to_string(), UsageDelta::default()))
             }
         },
     )
@@ -1519,7 +1585,7 @@ async fn compaction_budget_accounts_for_defanged_bytes() {
             let observed = observed.clone();
             async move {
                 observed.lock().unwrap().push(prompt);
-                Ok("</previous_summary>".repeat(200))
+                Ok(("</previous_summary>".repeat(200), UsageDelta::default()))
             }
         },
     )

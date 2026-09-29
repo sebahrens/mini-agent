@@ -84,6 +84,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   owning process holds an advisory lock on `sessions/<id>.lock`, `--continue`/`--session`/`/sessions`
   on a session another running process owns continue in a forked copy with a notice, and a save of a
   session owned elsewhere is refused instead of overwriting it.
+- Context compaction is now charged: the usage of every rolling summarizer request (up to 16
+  full-context requests) is added to the session's token and cost totals, the headless JSON `usage`
+  and `cost`, and a running goal's token count and `max_tokens` bound (mini-agent-i6q98).
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

@@ -966,6 +966,20 @@ user or assistant message so a retained tool result is never separated from
 its call. If a provider still rejects an ordinary request for exceeding its
 context limit, the error points to `/compress` and `compact_enabled` recovery.
 
+Compaction is paid for like any other completion. The summarizer runs on the
+session's model, so the usage of every rolling request is summed and charged to
+the session's token and cost counters at the session model's prices, whether
+the compaction was automatic (between turns, mid-turn, or before a headless
+`-p` request) or a manual `/compress`. A headless `--output json` object
+includes the compaction that ran before its turn in `usage` and `cost`. When a
+goal is running, compaction during a round counts toward that round's tokens
+and the goal's `max_tokens` bound (TUI, headless, and ACP); a manual
+`/compress` between rounds is charged to the session only. ACP keeps no session
+cost ledger, so there it counts toward a goal only. A compaction that fails is
+not charged for the requests it completed before failing. The opt-in
+`session_title_model` call is the one model call left out of the session cost
+(see its row above).
+
 `mid_turn_compact_threshold` opts in to a second, *within-turn* check. On every
 provider call zerostack compares the real provider-reported prompt size against
 `context_window`. When a tool-bearing call crosses the threshold, the runner

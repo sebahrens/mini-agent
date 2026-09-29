@@ -469,7 +469,7 @@ impl AnyClient {
         input_token_budget: u64,
         response_token_budget: u64,
         retry_config: &RetryConfig,
-    ) -> anyhow::Result<(String, usize)> {
+    ) -> anyhow::Result<CompactionOutput> {
         let preamble = summarizer_preamble();
         // Without a provider tokenizer, one UTF-8 byte per configured token is
         // the provider-neutral conservative fallback. `input_token_budget`
@@ -499,7 +499,7 @@ impl AnyClient {
                             retry_config,
                         )
                         .await
-                        .map(|(summary, _usage)| summary)
+                        .map(|(summary, usage)| (summary, usage.into()))
                     }
                 },
             ),
@@ -509,9 +509,25 @@ impl AnyClient {
     }
 }
 
+/// What one compaction produced: the summary, how many leading messages of the
+/// cut slice it covers, and the provider usage of every rolling summarizer
+/// request it took (mini-agent-i6q98).
+///
+/// `usage` is the raw sum of the provider reports, one per request. Callers
+/// normalize it once for the session's provider (`Config::normalize_usage`)
+/// and charge it at the session model's prices: compaction always runs on the
+/// session model, and up to `MAX_COMPACTION_REQUESTS` full-context requests
+/// are real spend.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionOutput {
+    pub summary: String,
+    pub messages_included: usize,
+    pub usage: crate::event::UsageDelta,
+}
+
 /// Summarizes the cut slice `messages` through `summarize` and returns the
 /// summary together with the number of leading messages whose content was
-/// summarized.
+/// summarized and the summed usage `summarize` reported for its requests.
 ///
 /// Contract: the whole slice is serialized in the injection-isolated message
 /// format and fed to the rolling reduction in `summarize_conversation_bounded`,
@@ -527,14 +543,14 @@ pub(crate) async fn compress_messages_with<F, Fut>(
     instructions: Option<&str>,
     prompt_budget_bytes: usize,
     summarize: F,
-) -> anyhow::Result<(String, usize)>
+) -> anyhow::Result<CompactionOutput>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = anyhow::Result<String>>,
+    Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
 {
     let (conversation, messages_included) =
         serialize_conversation_bounded(messages, instructions, prompt_budget_bytes)?;
-    let summary = summarize_conversation_bounded(
+    let (summary, usage) = summarize_conversation_bounded(
         &conversation,
         previous_summary,
         instructions,
@@ -542,7 +558,11 @@ where
         summarize,
     )
     .await?;
-    Ok((summary, messages_included))
+    Ok(CompactionOutput {
+        summary,
+        messages_included,
+        usage,
+    })
 }
 
 fn compaction_prompt(
@@ -727,17 +747,18 @@ fn bounded_recent_conversation<'a>(
 
 /// Summarizes bounded recent slices of a conversation through a rolling
 /// reduction. Every request has a fixed history and summary partition, and the
-/// total number of provider calls is capped.
+/// total number of provider calls is capped. Returns the final summary and the
+/// sum of the usage `summarize` reported for every request it made.
 pub(crate) async fn summarize_conversation_bounded<F, Fut>(
     conversation: &str,
     previous_summary: Option<&str>,
     instructions: Option<&str>,
     prompt_budget_bytes: usize,
     mut summarize: F,
-) -> anyhow::Result<String>
+) -> anyhow::Result<(String, crate::event::UsageDelta)>
 where
     F: FnMut(String) -> Fut,
-    Fut: Future<Output = anyhow::Result<String>>,
+    Fut: Future<Output = anyhow::Result<(String, crate::event::UsageDelta)>>,
 {
     let (summary_budget, conversation_budget) =
         compaction_payload_budgets(instructions, prompt_budget_bytes)?;
@@ -761,12 +782,14 @@ where
     let mut rolling_summary = previous_summary.map(bound_untrusted_summary);
     let mut made_request = false;
     let mut requests = 0usize;
+    let mut usage = crate::event::UsageDelta::default();
 
     loop {
         let remaining = &conversation[offset..];
         if remaining.is_empty() && made_request {
             return rolling_summary
                 .filter(|summary| !summary.is_empty())
+                .map(|summary| (summary, usage))
                 .ok_or_else(|| anyhow::anyhow!("Compression returned empty response"));
         }
 
@@ -783,7 +806,8 @@ where
             anyhow::bail!("Compression exceeded its bounded provider request count");
         }
 
-        let next_summary = summarize(request).await?;
+        let (next_summary, request_usage) = summarize(request).await?;
+        usage = usage.saturating_add(request_usage);
         if next_summary.is_empty() {
             anyhow::bail!("Compression returned empty response");
         }
