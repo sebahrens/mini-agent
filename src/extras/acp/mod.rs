@@ -539,11 +539,12 @@ struct AcpState {
     /// Present only when hooks are configured. Hook dispatch uses one
     /// process-wide execution root, so concurrent turns must agree on it.
     hook_roots: Option<Arc<HookRootClaims>>,
-    /// Client-supplied stdio MCP servers launch local processes, so they are
-    /// accepted only from the editor that spawned this server over stdio,
-    /// never from a network peer.
+    /// How client-supplied stdio MCP servers are launched. They start local
+    /// processes, so they are accepted only from the editor that spawned this
+    /// server over stdio (never from a network peer) and run sandboxed unless
+    /// the operator explicitly trusts them.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
-    accepts_client_mcp: bool,
+    client_mcp: ClientMcpPolicy,
     #[cfg(test)]
     prompt_fixture: Option<PromptFixture>,
     #[cfg(test)]
@@ -886,7 +887,10 @@ pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Resu
         cancel_routes: StdMutex::new(HashMap::new()),
         shell_search_path: std::env::var_os("PATH"),
         hook_roots: acp_hook_root_claims(),
-        accepts_client_mcp: !is_tcp,
+        client_mcp: client_mcp_policy(
+            is_tcp,
+            std::env::var(ACP_TRUST_CLIENT_MCP_ENV).is_ok_and(|value| value == "1"),
+        ),
         #[cfg(test)]
         prompt_fixture: None,
         #[cfg(test)]
@@ -1119,15 +1123,51 @@ type ClientMcpServers = HashMap<String, crate::extras::mcp::config::McpServerCon
 #[cfg(not(feature = "mcp"))]
 type ClientMcpServers = ();
 
+/// Operator opt-in that launches client-supplied stdio MCP servers without the
+/// workspace-service sandbox, like a configured command server.
+const ACP_TRUST_CLIENT_MCP_ENV: &str = "MINI_AGENT_ACP_TRUST_CLIENT_MCP";
+
+/// Launch policy for MCP servers an ACP client supplies in `session/new`.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+enum ClientMcpPolicy {
+    /// A network peer must not launch local processes (ACP TCP).
+    Refused,
+    /// Default for stdio: run in the dedicated workspace-service sandbox of
+    /// the resolved backend, refusing the servers when it is unavailable.
+    Sandboxed,
+    /// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1`: launch unsandboxed.
+    Trusted,
+}
+
+fn client_mcp_policy(is_tcp: bool, trusted_by_operator: bool) -> ClientMcpPolicy {
+    if is_tcp {
+        ClientMcpPolicy::Refused
+    } else if trusted_by_operator {
+        tracing::warn!(
+            "ACP: {ACP_TRUST_CLIENT_MCP_ENV}=1 — client-supplied MCP servers run unsandboxed \
+             with host filesystem and network access"
+        );
+        ClientMcpPolicy::Trusted
+    } else {
+        ClientMcpPolicy::Sandboxed
+    }
+}
+
 /// Validate the MCP servers a client supplied in `session/new`.
 ///
-/// ACP requires every agent to accept stdio servers. They are launched like a
-/// configured `mcp_servers` command entry (no sandbox, working directory = the
-/// session root) with the client's `env` plus the server process's `PATH` and
-/// `HOME`. Anything this server cannot honour is refused explicitly rather
-/// than silently ignored: HTTP/SSE servers (not advertised), servers from a
-/// TCP peer (a network client must not launch local processes), and servers
-/// when MCP is disabled or not compiled in.
+/// ACP requires every agent to accept stdio servers. The server list comes
+/// from editor configuration that may be repository-controlled (for example a
+/// workspace settings file), which is not the human-trusted `mcp_servers`
+/// path, so by default they are launched in the dedicated workspace-service
+/// sandbox of the resolved sandbox backend (working directory = the session
+/// root, the client's `env` plus the server process's `PATH` and `HOME`).
+/// `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` launches them unsandboxed instead.
+/// Anything this server cannot honour is refused explicitly rather than
+/// silently ignored: HTTP/SSE servers (not advertised), servers from a TCP
+/// peer (a network client must not launch local processes), servers when the
+/// sandbox is unavailable and not explicitly bypassed, and servers when MCP
+/// is disabled or not compiled in.
 fn client_mcp_servers(
     state: &AcpState,
     servers: &[McpServer],
@@ -1149,13 +1189,30 @@ fn client_mcp_servers(
     #[cfg(feature = "mcp")]
     {
         use crate::extras::mcp::config::{McpServerConfig, McpStdioNetwork};
-        if !state.accepts_client_mcp {
-            return refuse(
-                "client-supplied MCP servers are refused over ACP TCP; configure them in \
-                 `mcp_servers` on the agent host instead"
-                    .into(),
-            );
-        }
+        let sandbox = match state.client_mcp {
+            ClientMcpPolicy::Refused => {
+                return refuse(
+                    "client-supplied MCP servers are refused over ACP TCP; configure them in \
+                     `mcp_servers` on the agent host instead"
+                        .into(),
+                );
+            }
+            ClientMcpPolicy::Trusted => None,
+            ClientMcpPolicy::Sandboxed => {
+                let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+                if !matches!(
+                    crate::sandbox::Sandbox::new(true, &backend).policy(),
+                    crate::sandbox::SandboxPolicy::RequiredAndAvailable
+                ) {
+                    return refuse(format!(
+                        "client-supplied MCP servers run in the '{backend}' workspace-service \
+                         sandbox, which is not available; configure them in `mcp_servers` or set \
+                         {ACP_TRUST_CLIENT_MCP_ENV}=1 to launch them unsandboxed"
+                    ));
+                }
+                Some(backend)
+            }
+        };
         if !state.cli.mcp_is_eligible(&state.cfg) {
             return refuse(
                 "client-supplied MCP servers were sent but MCP is disabled for this agent".into(),
@@ -1191,7 +1248,7 @@ fn client_mcp_servers(
                         .map(|variable| (variable.name.clone(), variable.value.clone()))
                         .collect(),
                     inherit_env: vec!["PATH".to_string(), "HOME".to_string()],
-                    sandbox: None,
+                    sandbox: sandbox.clone(),
                     network: McpStdioNetwork::Inherit,
                 },
             );
@@ -3185,7 +3242,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3203,7 +3260,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: None,
             runner_fixture: Some(runner_fixture),
             #[cfg(feature = "mcp")]
@@ -3224,7 +3281,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: std::env::var_os("PATH"),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: Some(prompt_fixture),
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -3261,7 +3318,7 @@ mod protocol_tests {
             cancel_routes: StdMutex::new(HashMap::new()),
             shell_search_path: Some(std::ffi::OsString::from("bin")),
             hook_roots: None,
-            accepts_client_mcp: true,
+            client_mcp: ClientMcpPolicy::Sandboxed,
             prompt_fixture: None,
             runner_fixture: None,
             #[cfg(feature = "mcp")]
@@ -4066,7 +4123,8 @@ mod protocol_tests {
     fn client_stdio_mcp_servers_become_session_command_servers() {
         use crate::extras::mcp::config::McpServerConfig;
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
-        let state = fixture_state(fixture);
+        let mut state = fixture_state(fixture);
+        Arc::get_mut(&mut state).unwrap().client_mcp = ClientMcpPolicy::Trusted;
         let command = std::env::temp_dir().join("client-mcp-server");
         let servers = vec![McpServer::Stdio(
             McpServerStdio::new("editor-tools", command.clone())
@@ -4120,6 +4178,67 @@ mod protocol_tests {
         ));
     }
 
+    /// Client-supplied servers may come from repository-controlled editor
+    /// settings, so by default they run in the workspace-service sandbox and
+    /// are refused when it is unavailable (mini-agent-e6rne).
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn client_stdio_mcp_servers_are_sandboxed_by_default() {
+        use crate::extras::mcp::config::McpServerConfig;
+        assert!(matches!(
+            client_mcp_policy(false, false),
+            ClientMcpPolicy::Sandboxed
+        ));
+        assert!(matches!(
+            client_mcp_policy(false, true),
+            ClientMcpPolicy::Trusted
+        ));
+        assert!(matches!(
+            client_mcp_policy(true, true),
+            ClientMcpPolicy::Refused
+        ));
+
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let state = fixture_state(fixture);
+        let servers = vec![McpServer::Stdio(McpServerStdio::new(
+            "editor-tools",
+            std::env::temp_dir().join("client-mcp-server"),
+        ))];
+        let backend = state.cli.resolve_sandbox_backend(&state.cfg);
+        let available = matches!(
+            crate::sandbox::Sandbox::new(true, &backend).policy(),
+            crate::sandbox::SandboxPolicy::RequiredAndAvailable
+        );
+        match client_mcp_servers(&state, &servers) {
+            Ok(accepted) => {
+                assert!(available, "accepted without an available sandbox");
+                let Some(McpServerConfig::Command { sandbox, .. }) = accepted.get("editor-tools")
+                else {
+                    panic!("expected a command server: {accepted:?}");
+                };
+                assert_eq!(sandbox.as_deref(), Some(backend.as_str()));
+            }
+            Err(error) => {
+                assert!(!available, "refused although the sandbox is available");
+                let message = error.to_string();
+                assert!(message.contains(ACP_TRUST_CLIENT_MCP_ENV), "{message}");
+            }
+        }
+
+        // An unknown backend is never available, so the servers are refused
+        // rather than launched unsandboxed.
+        let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let mut missing = fixture_state(fixture);
+        Arc::get_mut(&mut missing).unwrap().cfg.sandbox_backend =
+            Some("no-such-backend".to_string());
+        let error = client_mcp_servers(&missing, &servers)
+            .expect_err("an unavailable sandbox must refuse client servers");
+        assert!(
+            error.to_string().contains(ACP_TRUST_CLIENT_MCP_ENV),
+            "{error}"
+        );
+    }
+
     #[test]
     fn unsupported_client_mcp_servers_are_refused_not_ignored() {
         let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
@@ -4153,7 +4272,7 @@ mod protocol_tests {
 
             let fixture: PromptFixture = Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
             let mut tcp = fixture_state(fixture);
-            Arc::get_mut(&mut tcp).unwrap().accepts_client_mcp = false;
+            Arc::get_mut(&mut tcp).unwrap().client_mcp = ClientMcpPolicy::Refused;
             let error = refused(
                 &tcp,
                 McpServer::Stdio(McpServerStdio::new("local", absolute.clone())),

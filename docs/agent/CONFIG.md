@@ -1887,15 +1887,23 @@ startup, so delegated read-only agents work over ACP.
 
 `session/new` accepts the client's `mcpServers` list. Each stdio entry is
 connected for every tool-enabled prompt in that session alongside the
-configured `mcp_servers`, launched like a configured command server (absolute
-`command`, no sandbox, working directory = the session root, the client's
-`env` plus this process's `PATH` and `HOME`). A configured server keeps its
-name if a client server uses the same one. The request is refused with an
-explicit error instead of being silently ignored when it lists an HTTP or SSE
-server (not advertised), a relative command or duplicate name, when MCP is
-disabled or not compiled in, or when it arrives over ACP TCP: a network peer
-must not launch local processes, so TCP deployments configure MCP on the
-agent host.
+configured `mcp_servers` (absolute `command`, working directory = the session
+root, the client's `env` plus this process's `PATH` and `HOME`). Because the
+list can come from repository-controlled editor settings rather than the
+human-trusted `mcp_servers` configuration, client servers run in the
+dedicated workspace-service sandbox of the resolved sandbox backend
+(`--sandbox-backend`/`sandbox-backend`, else the platform default), exactly as
+a configured server with `sandbox` set; network access is inherited. When that
+backend is unavailable the `session/new` request is refused rather than
+launching them unsandboxed. An operator who trusts the editor's servers can
+set `MINI_AGENT_ACP_TRUST_CLIENT_MCP=1` in the agent's environment to launch
+them like a configured command server without a sandbox (a warning is
+logged). A configured server keeps its name if a client server uses the same
+one. The request is refused with an explicit error instead of being silently
+ignored when it lists an HTTP or SSE server (not advertised), a relative
+command or duplicate name, when MCP is disabled or not compiled in, or when it
+arrives over ACP TCP: a network peer must not launch local processes, so TCP
+deployments configure MCP on the agent host.
 
 A turn that fails internally (provider or runner error, unusable workspace,
 missing credentials) answers `session/prompt` with a JSON-RPC error (`-32603`)
