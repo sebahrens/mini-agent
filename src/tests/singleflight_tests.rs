@@ -10,6 +10,14 @@ fn idle_runs_immediately() {
 }
 
 #[test]
+fn whitespace_only_input_is_ignored_idle_or_running() {
+    for text in ["", "   ", "\t\n  ", "\n"] {
+        assert_eq!(classify_submission(false, text), SubmitAction::Ignore);
+        assert_eq!(classify_submission(true, text), SubmitAction::Ignore);
+    }
+}
+
+#[test]
 fn running_plain_text_is_queued() {
     // The whole point: typing while busy must NOT spawn a second run.
     assert_eq!(classify_submission(true, "ok"), SubmitAction::Queue);

@@ -21,7 +21,7 @@ pub(crate) mod goal;
 #[cfg(test)]
 mod session_restore_tests;
 
-pub(crate) use providers::warm_model_cache;
+pub(crate) use providers::{cached_model_ids, model_cache_generation, warm_model_cache};
 
 use smallvec::SmallVec;
 
@@ -171,26 +171,22 @@ impl SlashCtx<'_> {
         Ok(())
     }
 
-    pub async fn rebuild_agent_with_client(
-        &mut self,
-        provider: &str,
-        new_reasoning: bool,
-    ) -> Result<(), anyhow::Error> {
-        *self.client = crate::provider::create_client(
+    /// Switch the provider client and `session.provider` together. The client
+    /// is created first, so on failure nothing changes; on success the caller
+    /// sets the model and rebuilds the agent (no await point can fail between).
+    pub fn switch_client(&mut self, provider: &str) -> anyhow::Result<()> {
+        let client = crate::provider::create_client(
             provider,
             self.cli.api_key.as_deref(),
             &self.cfg.custom_providers_map(),
             self.cfg.api_keys.as_ref(),
         )?;
+        *self.client = client;
+        self.session.provider = compact_str::CompactString::new(provider);
         #[cfg(feature = "advisor")]
         {
             crate::extras::advisor::update_client(provider, self.client.clone());
         }
-        let new_agent = self
-            .agent_build_ctx()
-            .rebuild_agent(&self.session.model, new_reasoning)
-            .await;
-        *self.agent = Some(new_agent);
         Ok(())
     }
 
@@ -212,39 +208,31 @@ impl SlashCtx<'_> {
         let new_model = compact_str::CompactString::from(&*qmc.model);
         let provider_changed = qmc.provider != self.session.provider;
 
-        // Update model before rebuild so the agent is built with it.
-        self.session.model = new_model.clone();
-
+        // Create the new provider's client before touching the session: a
+        // failure must leave provider, model and agent consistent.
         if provider_changed {
-            match self
-                .rebuild_agent_with_client(&qmc.provider, *self.reasoning_enabled)
-                .await
-            {
-                Ok(()) => {
-                    self.session.provider = compact_str::CompactString::from(&*qmc.provider);
-                }
-                Err(e) => {
-                    let _ = self.renderer.write_line(
-                        &format!(
-                            "failed to switch provider for prompt '{}': {}",
-                            prompt_name, e
-                        ),
-                        C_ERROR,
-                    );
-                    return false;
-                }
+            if let Err(e) = self.switch_client(&qmc.provider) {
+                let _ = self.renderer.write_line(
+                    &format!(
+                        "failed to switch provider for prompt '{}': {}",
+                        prompt_name, e
+                    ),
+                    C_ERROR,
+                );
+                return false;
             }
         } else {
             #[cfg(feature = "advisor")]
             {
                 crate::extras::advisor::update_client(&self.session.provider, self.client.clone());
             }
-            let new_agent = self
-                .agent_build_ctx()
-                .rebuild_agent(&new_model, *self.reasoning_enabled)
-                .await;
-            *self.agent = Some(new_agent);
         }
+        self.session.model = new_model.clone();
+        let new_agent = self
+            .agent_build_ctx()
+            .rebuild_agent(&new_model, *self.reasoning_enabled)
+            .await;
+        *self.agent = Some(new_agent);
 
         self.session.input_token_cost = qmc.input_token_cost;
         self.session.output_token_cost = qmc.output_token_cost;
@@ -289,8 +277,8 @@ pub(crate) async fn apply_prompt_model(
     let new_model = compact_str::CompactString::from(&*qmc.model);
     let provider_changed = qmc.provider != ui.session.provider;
 
-    ui.session.model = new_model.clone();
-
+    // The model is assigned only after the provider client exists, so a
+    // failed switch leaves the session's provider and model matching.
     if provider_changed {
         match crate::provider::create_client(
             &qmc.provider,
@@ -316,6 +304,7 @@ pub(crate) async fn apply_prompt_model(
         }
     }
 
+    ui.session.model = new_model.clone();
     #[cfg(feature = "advisor")]
     {
         crate::extras::advisor::update_client(&ui.session.provider, ui.client.clone());
@@ -583,6 +572,88 @@ where
     Ok((first_kept_index, tokens_before))
 }
 
+/// Split a slash command into at most three fields: the command, its first
+/// argument and the rest of the line. Runs of whitespace separate fields, so
+/// `/cmd  arg` never yields an empty argument; the rest keeps its inner
+/// spacing for commands that take free text.
+pub(crate) fn split_command(text: &str) -> SmallVec<[&str; 3]> {
+    let mut parts = SmallVec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        if parts.len() == 2 {
+            parts.push(rest);
+            break;
+        }
+        match rest.split_once(char::is_whitespace) {
+            Some((field, tail)) => {
+                parts.push(field);
+                rest = tail.trim_start();
+            }
+            None => {
+                parts.push(rest);
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push("");
+    }
+    parts
+}
+
+/// Split command arguments like a shell: whitespace separates them, and
+/// single or double quotes keep spaces inside one argument. Outside Windows a
+/// backslash escapes a following space, quote or backslash; on Windows it is
+/// literal so paths keep their separators.
+pub(crate) fn split_args(text: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_arg = true;
+            }
+            (Some('"') | None, '\\')
+                if !cfg!(windows)
+                    && chars.peek().is_some_and(|next| {
+                        next.is_whitespace() || matches!(next, '"' | '\'' | '\\')
+                    }) =>
+            {
+                current.extend(chars.next());
+                in_arg = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            (_, c) => {
+                current.push(c);
+                in_arg = true;
+            }
+        }
+    }
+    if let Some(q) = quote {
+        return Err(format!("unclosed {q} quote"));
+    }
+    if in_arg {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+/// Commands whose arguments are paths, split with [`split_args`] so several
+/// paths and quoted paths with spaces work.
+fn takes_path_args(command: &str) -> bool {
+    matches!(command, "/add" | "/drop" | "/export" | "/import")
+}
+
 /// Commands `providers::handle` owns (apart from `/models-add`, which needs
 /// its own split). Subagent model commands are routed in every build so a
 /// build without the feature can say so instead of doing nothing.
@@ -602,7 +673,20 @@ pub async fn handle_slash(
     _chain: &mut ChainState,
     terminal_guard: &mut TerminalGuard,
 ) -> anyhow::Result<()> {
-    let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
+    let parts = split_command(text);
+    let path_args: Vec<String> = if takes_path_args(parts[0]) {
+        let rest = text.trim().strip_prefix(parts[0]).unwrap_or("");
+        match split_args(rest) {
+            Ok(args) => std::iter::once(parts[0].to_string()).chain(args).collect(),
+            Err(error) => {
+                write_error(renderer, format!("{}: {error}", parts[0]));
+                return Ok(());
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let path_parts: Vec<&str> = path_args.iter().map(String::as_str).collect();
     let mut ctx = SlashCtx {
         prebuild_invalidated: &ui.prebuild_invalidated,
         agent: &mut run.agent,
@@ -643,7 +727,20 @@ pub async fn handle_slash(
         "/sessions" | "/rename" | "/clear" | "/new" | "/undo" | "/redo" | "/rewind" | "/retry"
         | "/quit" | "/exit" | "/history" => session::handle(&parts, &mut ctx).await,
         #[cfg(feature = "export")]
-        "/export" | "/import" | "/share" => session::handle(&parts, &mut ctx).await,
+        "/export" | "/import" if path_parts.len() > 2 => {
+            write_error(
+                ctx.renderer,
+                format!(
+                    "{} takes one path; quote a path that contains spaces",
+                    parts[0]
+                ),
+            );
+            Ok(())
+        }
+        #[cfg(feature = "export")]
+        "/export" | "/import" => session::handle(&path_parts, &mut ctx).await,
+        #[cfg(feature = "export")]
+        "/share" => session::handle(&parts, &mut ctx).await,
         "/help" => {
             help::handle(&parts, &mut ctx);
             Ok(())
@@ -653,7 +750,8 @@ pub async fn handle_slash(
             Ok(())
         }
         "/tutor" => help::handle_tutor(ctx.renderer, ctx.terminal_guard),
-        "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
+        "/add" | "/drop" => add::handle(&path_parts, &mut ctx).await,
+        "/drop-all" => add::handle(&parts, &mut ctx).await,
         "/init" => init::handle(&parts, &mut ctx).await,
         "/review" => review::handle(&parts, &mut ctx).await,
         // `/memory write <target> <content>` and `/memory read daily <date>`
@@ -687,6 +785,49 @@ pub async fn handle_slash(
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod argument_split_tests {
+    use super::{split_args, split_command, takes_path_args};
+
+    #[test]
+    fn command_split_collapses_whitespace_and_keeps_the_rest() {
+        assert_eq!(split_command("/help").as_slice(), ["/help"]);
+        assert_eq!(
+            split_command("  /model   gpt  ").as_slice(),
+            ["/model", "gpt"]
+        );
+        assert_eq!(
+            split_command("/rename  my   new name").as_slice(),
+            ["/rename", "my", "new name"]
+        );
+        assert_eq!(
+            split_command("/toggle\ttodo off").as_slice(),
+            ["/toggle", "todo", "off"]
+        );
+        assert_eq!(split_command("").as_slice(), [""]);
+    }
+
+    #[test]
+    fn path_arguments_split_like_a_shell() {
+        assert_eq!(split_args(" a.rs  b.rs ").unwrap(), ["a.rs", "b.rs"]);
+        assert_eq!(
+            split_args(r#""my file.rs" 'other one.md' c"#).unwrap(),
+            ["my file.rs", "other one.md", "c"]
+        );
+        assert_eq!(split_args("''").unwrap(), [""]);
+        assert!(split_args("").unwrap().is_empty());
+        assert!(split_args("\"open").is_err());
+        #[cfg(not(windows))]
+        assert_eq!(split_args(r"my\ file.rs").unwrap(), ["my file.rs"]);
+        #[cfg(windows)]
+        assert_eq!(split_args(r"C:\dir\f.rs").unwrap(), [r"C:\dir\f.rs"]);
+        for command in ["/add", "/drop", "/export", "/import"] {
+            assert!(takes_path_args(command));
+        }
+        assert!(!takes_path_args("/rename"));
     }
 }
 

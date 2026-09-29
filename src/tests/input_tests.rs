@@ -134,8 +134,49 @@ fn clipboard_paste_payload_is_inserted_once_at_the_cursor() {
 
     editor.handle_paste("☃\r\nline".to_string());
 
-    assert_eq!(editor.buffer.as_str(), "a☃\r\nlineb");
-    assert_eq!(editor.cursor, "a☃\r\nline".len());
+    assert_eq!(editor.buffer.as_str(), "a☃\nlineb");
+    assert_eq!(editor.cursor, "a☃\nline".len());
+}
+
+#[test]
+fn enter_on_whitespace_only_input_submits_nothing() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Tab));
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    assert_eq!(editor.buffer.as_str(), "  \n");
+    assert_eq!(editor.handle_key(press(KeyCode::Enter)), None);
+    assert_eq!(editor.buffer.as_str(), "");
+    // Nothing blank lands in history either.
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+// --- bracketed paste sanitizing (mini-agent-el3xe) ---
+
+#[test]
+fn paste_normalizes_line_endings_expands_tabs_and_drops_controls() {
+    use crate::ui::input::sanitize_paste;
+    assert_eq!(sanitize_paste("a\rb\r\nc\nd"), "a\nb\nc\nd");
+    assert_eq!(sanitize_paste("\r\r\n"), "\n\n");
+    assert_eq!(sanitize_paste("x\ty"), "x    y");
+    assert_eq!(sanitize_paste("red \x1b[31mtext\x1b[0m!"), "red text!");
+    assert_eq!(sanitize_paste("\x1b]0;title\x07ok"), "ok");
+    assert_eq!(sanitize_paste("\x1b]8;;https://x\x1b\\link"), "link");
+    assert_eq!(sanitize_paste("\x1b(Bplain\x1bc"), "plain");
+    assert_eq!(sanitize_paste("\u{9b}2Jgone\u{7}\u{0}"), "gone");
+    assert_eq!(sanitize_paste("bell\x07 back\x08"), "bell back");
+    assert_eq!(sanitize_paste("日本 é ☃"), "日本 é ☃");
+}
+
+#[test]
+fn a_carriage_return_paste_becomes_lines_and_is_not_sent_raw() {
+    let mut editor = InputEditor::new();
+    editor.handle_paste("one\rtwo\t3\x1b[2J".to_string());
+    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    // A paste made only of controls changes nothing.
+    editor.handle_paste("\x1b[A".to_string());
+    assert_eq!(editor.buffer.as_str(), "one\ntwo    3");
 }
 
 // --- byte-offset regressions: Ctrl+U / Ctrl+K / Alt+Y with multi-byte text ---
@@ -245,6 +286,81 @@ fn alt_y_after_yanking_multibyte_text_mid_buffer() {
     editor.handle_key(alt('y'));
     assert_eq!(editor.buffer.as_str(), "[🦀🦀]");
     assert_eq!(editor.cursor, "[🦀🦀".len());
+}
+
+// --- soft-wrapped input rows (mini-agent-h7vgt) ---
+
+#[test]
+fn up_and_down_move_by_wrapped_rows_then_reach_history() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "earlier");
+    editor.handle_key(press(KeyCode::Enter));
+    editor.set_wrap_width(8);
+    // Rows: "hello " | "world " | "again".
+    type_str(&mut editor, "hello world again");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(
+        editor.cursor,
+        "hello world ".len() - 1,
+        "row end, not next row"
+    );
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.cursor, "hello".len());
+    editor.handle_key(press(KeyCode::Down));
+    assert_eq!(editor.cursor, "hello world".len());
+    editor.handle_key(press(KeyCode::Down));
+    assert_eq!(editor.cursor, "hello world again".len());
+    // From the first row Up recalls history, as with unwrapped input.
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "earlier");
+}
+
+// --- word motion on Alt/Ctrl+arrows and Alt+Backspace (mini-agent-rmcpm) ---
+
+fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}
+
+#[test]
+fn alt_and_ctrl_arrows_move_by_word() {
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+        let mut editor = InputEditor::new();
+        type_str(&mut editor, "héllo wörld  end");
+        editor.handle_key(with(KeyCode::Left, modifiers));
+        assert_eq!(editor.cursor, "héllo wörld  ".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Left, modifiers));
+        assert_eq!(editor.cursor, "héllo ".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Right, modifiers));
+        assert_eq!(editor.cursor, "héllo wörld".len(), "{modifiers:?}");
+        editor.handle_key(with(KeyCode::Right, modifiers));
+        assert_eq!(editor.cursor, editor.buffer.len(), "{modifiers:?}");
+    }
+}
+
+#[test]
+fn alt_backspace_deletes_the_previous_word_onto_the_kill_ring() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "keep this");
+    editor.handle_key(with(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(editor.buffer.as_str(), "keep ");
+    editor.handle_key(ctrl('y'));
+    assert_eq!(editor.buffer.as_str(), "keep this");
+}
+
+#[test]
+fn word_commands_treat_newlines_and_tabs_as_separators() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "foo bar");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "baz");
+    editor.handle_key(ctrl('w'));
+    assert_eq!(editor.buffer.as_str(), "foo bar\n");
+    editor.handle_key(alt('b'));
+    assert_eq!(editor.cursor, "foo ".len());
+    editor.handle_key(alt('f'));
+    assert_eq!(editor.cursor, "foo bar".len());
 }
 
 // --- line-edge keys, history recall, unbound chords, @ triggers ---

@@ -81,8 +81,45 @@ impl Picker {
 
 use super::InputEditor;
 
+/// Keys that move the editor caret or delete at it without going through a
+/// query picker. The query pickers mirror their query into the buffer at a
+/// position derived from the query itself, so a caret moved behind their back
+/// desynchronises the two (and a later Delete could land inside a multi-byte
+/// character). These keys therefore close the picker before the editor acts.
+pub(crate) fn is_caret_editing_key(key: KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+    matches!(
+        key.code,
+        KeyCode::Left | KeyCode::Right | KeyCode::Delete | KeyCode::Home | KeyCode::End
+    )
+}
+
 impl InputEditor {
+    /// Close an open query picker (everything but the rewind picker, which
+    /// does not mirror a query into the buffer). The typed text stays.
+    pub(crate) fn close_query_picker(&mut self) {
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.active() && !matches!(p, Picker::Rewind(_)))
+        {
+            self.picker = None;
+        }
+    }
+
     pub fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
+        if is_caret_editing_key(key) && !matches!(self.picker, Some(Picker::Rewind(_))) {
+            // Leave the key unconsumed so the editor moves the caret or
+            // deletes in plain-text mode.
+            self.close_query_picker();
+            return false;
+        }
+        // Argument pickers of slash commands (`/theme `, `/models `, ...).
+        let argument_picker = match &self.picker {
+            Some(Picker::Prefixed(_, prefix)) => prefix.starts_with('/'),
+            Some(Picker::Models(_)) => true,
+            _ => false,
+        };
         let handled = match self.picker.as_mut() {
             Some(Picker::File(p)) => {
                 handlers::handle_file_key(&mut self.buffer, &mut self.cursor, p, key)
@@ -95,6 +132,7 @@ impl InputEditor {
                     quick_model_names: &self.quick_model_names,
                     live_model_names: &self.live_model_names,
                     provider_names: &self.provider_names,
+                    current_model: self.current_model.clone(),
                     security_mode: self
                         .permission
                         .as_ref()
@@ -122,6 +160,31 @@ impl InputEditor {
         if handled {
             self.yank_pos = None;
         }
+        if handled
+            && argument_picker
+            && super::is_backward_delete(key)
+            && !self.picker.as_ref().is_some_and(Picker::active)
+        {
+            self.back_out_of_argument_picker();
+        }
         handled
+    }
+
+    /// Backspace on an empty argument query closed the argument picker and
+    /// left `/command `: delete that space too and reopen slash completion
+    /// on the command, so backing out walks back the way the user came.
+    fn back_out_of_argument_picker(&mut self) {
+        if self.cursor == self.buffer.len()
+            && self.buffer.ends_with(' ')
+            && !self
+                .buffer
+                .trim_end_matches(' ')
+                .contains(char::is_whitespace)
+            && self.buffer.starts_with('/')
+        {
+            self.buffer.pop();
+            self.cursor = self.buffer.len();
+        }
+        self.reopen_command_picker_for_slash_word();
     }
 }

@@ -10,12 +10,10 @@ const BASE_COMMANDS: &[&str] = &[
     "/agent",
     "/btw",
     "/clear",
-    "/compact",
     "/compress",
     "/drop",
     "/drop-all",
     "/editsys",
-    "/exit",
     "/help",
     "/history",
     "/init",
@@ -39,13 +37,28 @@ const BASE_COMMANDS: &[&str] = &[
     "/rewind",
     "/sessions",
     "/theme",
-    "/thinking",
     "/toggle",
     "/tutor",
-    "/tutorial",
     "/undo",
     "/welcome",
 ];
+
+/// Compatibility aliases, `(alias, canonical)`. They still dispatch, and `/help`
+/// mentions them next to their command, but completion offers only the
+/// canonical name so each command appears once.
+pub(crate) const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("/compact", "/compress"),
+    ("/exit", "/quit"),
+    ("/model-subagent", "/subagent-model"),
+    ("/models-subagent", "/subagent-models"),
+    ("/thinking", "/reasoning"),
+    ("/tutorial", "/welcome"),
+];
+
+/// Whether `name` is a hidden compatibility alias.
+pub(crate) fn is_command_alias(name: &str) -> bool {
+    COMMAND_ALIASES.iter().any(|(alias, _)| *alias == name)
+}
 
 /// Build the autocomplete command list, including only the commands whose
 /// backing feature was actually compiled in.
@@ -91,7 +104,6 @@ pub(crate) fn available_commands() -> Vec<&'static str> {
 
     #[cfg(feature = "subagents")]
     {
-        // `/model-subagent` and `/models-subagent` remain hidden aliases.
         cmds.push("/subagent-model");
         cmds.push("/subagent-models");
     }

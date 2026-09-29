@@ -68,15 +68,28 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
         return Ok(());
     }
 
-    let path = resolve_path(ctx.workspace.root(), parts[1]);
+    let mut rebuild = false;
+    for arg in &parts[1..] {
+        rebuild |= add_one(arg, ctx).await;
+    }
+    if rebuild {
+        ctx.rebuild_agent().await;
+    }
+    Ok(())
+}
+
+/// Add one path; returns whether a text file joined the context (the agent
+/// then needs a rebuild).
+async fn add_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
+    let path = resolve_path(ctx.workspace.root(), arg);
 
     if !path.exists() {
         write_error(ctx.renderer, format!("file not found: {}", path.display()));
-        return Ok(());
+        return false;
     }
     if !path.is_file() {
         write_error(ctx.renderer, format!("not a file: {}", path.display()));
-        return Ok(());
+        return false;
     }
 
     #[cfg(feature = "multimodal")]
@@ -102,7 +115,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                 write_error(ctx.renderer, format!("failed to load media: {e}"));
             }
         }
-        return Ok(());
+        return false;
     }
 
     let canonical = path.canonicalize().unwrap_or(path);
@@ -111,7 +124,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             ctx.renderer,
             format!("already added: {}", canonical.display()),
         );
-        return Ok(());
+        return false;
     }
 
     // Count limit: reject before any I/O.
@@ -123,7 +136,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                  (use /drop to remove one first)"
             ),
         );
-        return Ok(());
+        return false;
     }
 
     // Aggregate byte budget: sum already-added file sizes plus this file's metadata size.
@@ -143,7 +156,7 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
                  use /drop to remove files before adding more"
             ),
         );
-        return Ok(());
+        return false;
     }
 
     // Preload content via spawn_blocking so agent-rebuild paths never block Tokio workers
@@ -161,37 +174,50 @@ async fn handle_add(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             ctx.renderer,
             format!("failed to read file: {}", canonical.display()),
         );
-        return Ok(());
+        return false;
     };
 
     ctx.context.extra_files.push(canonical.clone());
     ctx.context
         .extra_file_contents
         .insert(canonical.clone(), Arc::new(content));
-    ctx.rebuild_agent().await;
     write_ok(
         ctx.renderer,
         format!("added: {} ({file_size}B)", canonical.display()),
     );
-    Ok(())
+    true
 }
 
 async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_error(ctx.renderer, "usage: /drop <path-or-index>");
+        write_error(ctx.renderer, "usage: /drop <path-or-index>...");
         return Ok(());
     }
 
-    let path = resolve_path(ctx.workspace.root(), parts[1]);
+    let mut rebuild = false;
+    // Highest media index first so earlier removals do not shift later ones.
+    let mut args: Vec<&str> = parts[1..].to_vec();
+    args.sort_by_key(|arg| std::cmp::Reverse(arg.parse::<usize>().ok()));
+    for arg in args {
+        rebuild |= drop_one(arg, ctx);
+    }
+    if rebuild {
+        ctx.rebuild_agent().await;
+    }
+    Ok(())
+}
+
+/// Drop one path or media index; returns whether a text file left the context.
+fn drop_one(arg: &str, ctx: &mut SlashCtx<'_>) -> bool {
+    let path = resolve_path(ctx.workspace.root(), arg);
     let canonical = path.canonicalize().unwrap_or(path);
 
     // Try extra_files first.
     if let Some(i) = ctx.context.extra_files.iter().position(|f| f == &canonical) {
         ctx.context.extra_files.remove(i);
         ctx.context.extra_file_contents.remove(&canonical);
-        ctx.rebuild_agent().await;
         write_ok(ctx.renderer, format!("dropped: {}", canonical.display()));
-        return Ok(());
+        return true;
     }
 
     // Try pending_media by path match.
@@ -209,10 +235,10 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 ctx.renderer,
                 format!("dropped media: {}", canonical.display()),
             );
-            return Ok(());
+            return false;
         }
         // Also try parsing as an index into the pending_media list.
-        if let Ok(idx) = parts[1].parse::<usize>()
+        if let Ok(idx) = arg.parse::<usize>()
             && idx < ctx.session.pending_media.len()
         {
             let removed = ctx.session.pending_media.remove(idx);
@@ -220,7 +246,7 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
                 ctx.renderer,
                 format!("dropped media: {}", removed.path().display()),
             );
-            return Ok(());
+            return false;
         }
     }
 
@@ -228,7 +254,7 @@ async fn handle_drop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         ctx.renderer,
         format!("not in context: {} (use /add to see)", canonical.display()),
     );
-    Ok(())
+    false
 }
 
 async fn handle_drop_all(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {

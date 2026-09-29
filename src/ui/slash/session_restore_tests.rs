@@ -398,3 +398,109 @@ async fn exercise_replacement(provider_changed: bool) {
     );
     assert_eq!(std::env::current_dir().unwrap(), cwd_before);
 }
+
+/// mini-agent-k3ay5: a `[prompt_to_model]` switch whose provider client cannot
+/// be created leaves the session's provider, model and costs untouched, and a
+/// failed `/provider` switch does too.
+#[tokio::test]
+async fn failed_prompt_model_and_provider_switches_leave_the_session_consistent() {
+    let root = FixtureRoot(
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mini-agent-prompt-model-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&root.0).unwrap();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&root.0).unwrap());
+    let cli = Cli::parse_from([
+        "mini-agent",
+        "--no-session",
+        "--api-key",
+        "unused-test-key",
+        "--no-sandbox",
+    ]);
+    let cfg: Config = serde_json::from_value(json!({
+        "quick_models": {"broken": {"provider": "nonexistent-provider", "model": "other-model",
+            "input_token_cost": 9.0, "output_token_cost": 9.0}},
+        "prompt_to_model": {"plan": "broken"}
+    }))
+    .unwrap();
+    let mut context = ContextFiles {
+        workspace_root: workspace.root().to_path_buf(),
+        agents: None,
+        prompts: Default::default(),
+        current_prompt: None,
+        current_prompt_name: None,
+        agent_definitions: Default::default(),
+        current_agent_name: None,
+        current_agent_explicit: false,
+        themes: Default::default(),
+        current_theme_name: None,
+        extra_files: Vec::new(),
+        extra_file_contents: Default::default(),
+        one_shot_restore: None,
+        chain_declined: Vec::new(),
+        #[cfg(feature = "memory")]
+        memory: None,
+        #[cfg(feature = "archmd")]
+        architecture: None,
+    };
+    let mut client = AnyClient::OpenRouter(
+        rig::providers::openrouter::Client::builder()
+            .api_key("unused-test-key")
+            .build()
+            .unwrap(),
+    );
+    let mut session = Session::new("openrouter", "current-model", 128_000, "prompt-model");
+    session.input_token_cost = 1.0;
+    session.output_token_cost = 2.0;
+    let sandbox = Sandbox::new(false, "none").with_workspace_binding(workspace.clone());
+    let mut agent = None;
+    let mut renderer = Renderer::new().unwrap();
+    let mut input = InputEditor::new();
+    let mut terminal_guard = TerminalGuard::detached_for_test();
+    let invalidated = std::sync::atomic::AtomicBool::new(false);
+    let mut show_reasoning = false;
+    let mut reasoning_enabled = false;
+    let mut is_running = false;
+    let mut todo_tools_enabled = true;
+    #[cfg(feature = "skills")]
+    let skill_services = Arc::new(crate::extras::js::skills::session::SkillServiceOwner::new());
+    let mut ctx = SlashCtx {
+        prebuild_invalidated: &invalidated,
+        agent: &mut agent,
+        client: &mut client,
+        renderer: &mut renderer,
+        session: &mut session,
+        cli: &cli,
+        cfg: &cfg,
+        context: &mut context,
+        workspace: &workspace,
+        show_reasoning: &mut show_reasoning,
+        reasoning_enabled: &mut reasoning_enabled,
+        is_running: &mut is_running,
+        input: &mut input,
+        permission: &None,
+        ask_tx: &None,
+        todo_tools_enabled: &mut todo_tools_enabled,
+        sandbox: &sandbox,
+        terminal_guard: &mut terminal_guard,
+        #[cfg(feature = "skills")]
+        skill_services: &skill_services,
+        #[cfg(feature = "mcp")]
+        mcp_manager: None,
+    };
+
+    assert!(!ctx.switch_to_prompt_model("plan").await);
+    assert_eq!(ctx.session.provider, "openrouter");
+    assert_eq!(ctx.session.model, "current-model");
+    assert_eq!(
+        (ctx.session.input_token_cost, ctx.session.output_token_cost),
+        (1.0, 2.0)
+    );
+    assert!(matches!(ctx.client, AnyClient::OpenRouter(_)));
+
+    assert!(ctx.switch_client("nonexistent-provider").is_err());
+    assert_eq!(ctx.session.provider, "openrouter");
+    assert!(matches!(ctx.client, AnyClient::OpenRouter(_)));
+}
