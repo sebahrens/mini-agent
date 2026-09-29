@@ -241,7 +241,7 @@ fn push_context_file(prompt: &mut String, goal: &Goal) {
     let Some(path) = goal.context_file.as_ref() else {
         return;
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Some(contents) = read_context_file(path) else {
         return;
     };
     prompt.push_str(&format!("\n\nCurrent plan ({}):\n", path.display()));
@@ -250,6 +250,41 @@ fn push_context_file(prompt: &mut String, goal: &Goal) {
         "\n\nKeep {} current: mark finished items, add what you discover.",
         path.display()
     ));
+}
+
+/// Most of a plan file carried into one round's instruction.
+///
+/// The plan rides every round's prompt. One that grows without bound — the
+/// agent appending to it round after round, or a large file named as the plan
+/// — would eventually overflow the context and park the goal on
+/// `context_overflow`, which rerunning cannot fix.
+pub(crate) const CONTEXT_FILE_BYTES: usize = 32 * 1024;
+
+/// Read at most [`CONTEXT_FILE_BYTES`] of the plan, clipped on a character
+/// boundary. A file that is not text is absent, like a missing one.
+fn read_context_file(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    // A few bytes past the cap tell a clipped file from one that fits, and
+    // keep a character split by the cap decodable up to the boundary.
+    file.take(CONTEXT_FILE_BYTES as u64 + 4)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        // Only a sequence cut short by the read limit is tolerated.
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
+    Some(crate::extras::truncate::truncate_cjk(
+        text,
+        CONTEXT_FILE_BYTES,
+        "\n…[plan clipped: only its first 32 KiB is shown each round; keep it concise]",
+    ))
 }
 
 fn round_header(goal: &Goal, round: u32) -> String {
@@ -676,6 +711,42 @@ mod tests {
         let third = next_round(&g, &decision).expect("relaunch");
         assert!(!third.prompt.contains("second task"));
         assert!(third.prompt.contains("carry on"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan that grows without bound cannot grow the round instruction with
+    /// it (mini-agent-3o7sl).
+    #[test]
+    fn a_large_context_file_is_clipped_in_the_round_instruction() {
+        let dir = std::env::temp_dir().join(format!("goal-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("PLAN.md");
+        // Multi-byte characters straddle the cap, so clipping has to find a
+        // boundary rather than split one.
+        let body = "- [ ] 計画 item\n".repeat(20_000);
+        std::fs::write(&plan, format!("FIRST LINE\n{body}LAST LINE\n")).unwrap();
+
+        let mut g = goal();
+        g.context_file = Some(plan.clone());
+        let decision = GateDecision::Continue {
+            instruction: "carry on".into(),
+            wrap_up: false,
+            source: crate::extras::goal::VerdictSource::Structural,
+        };
+        let round = next_round(&g, &decision).expect("relaunch");
+        assert!(round.prompt.contains("FIRST LINE"));
+        assert!(!round.prompt.contains("LAST LINE"));
+        assert!(round.prompt.contains("plan clipped"));
+        assert!(
+            round.prompt.len() < CONTEXT_FILE_BYTES + 4 * 1024,
+            "{} bytes",
+            round.prompt.len()
+        );
+
+        // A file that is not text is absent, as before.
+        std::fs::write(&plan, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let round = next_round(&g, &decision).expect("relaunch");
+        assert!(!round.prompt.contains("Current plan"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

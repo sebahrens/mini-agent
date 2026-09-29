@@ -75,7 +75,14 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         write_error(ctx.renderer, "usage: /loop <prompt>");
         return Ok(());
     }
-    let plan_file = std::path::PathBuf::from(crate::extras::r#loop::DEFAULT_PLAN_FILENAME);
+    // The plan lives in the workspace the agent edits, not wherever the
+    // process happened to start: after `/worktree` the two differ, and a
+    // relative path would have every round re-read the original checkout's
+    // plan while the agent kept the worktree's current.
+    let plan_file = ctx
+        .workspace
+        .root()
+        .join(crate::extras::r#loop::DEFAULT_PLAN_FILENAME);
     let preset = match crate::extras::goal::preset::loop_goal(
         &prompt,
         &plan_file,
