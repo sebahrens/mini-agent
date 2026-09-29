@@ -1395,7 +1395,13 @@ default action applied when no rule for a tool matches. In `standard` mode an
 unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
 default (so `"*": ask` asks before workspace modifications), while unmatched
 workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
-external paths follow `external_directory`. Use
+external paths follow `external_directory`. A matching `external_directory`
+rule is combined with what the same call would get inside the workspace, and
+the stricter one wins: with `"*": ask` an external read under an
+`external_directory` allow is allowed (the `"*"` default does not turn it back
+into a prompt), while an external write there still asks like a workspace
+write. With no matching `external_directory` rule an external path asks (or
+follows a stricter `"*": deny`). Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as
