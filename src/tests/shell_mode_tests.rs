@@ -1,6 +1,8 @@
+#[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
@@ -477,24 +479,24 @@ async fn support_utility_runner_bounds_and_reaps_an_interactive_process_tree() {
 #[cfg(unix)]
 #[test]
 fn lazygit_style_caller_drop_audits_cleanup_and_allows_the_next_launch() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = BufferWriter(logs.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(move || writer.clone())
-        .finish();
+    let sandbox = Sandbox::new(false, "bwrap");
+    let capture = AuditCapture::new(&sandbox);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let expected_cwd = std::env::current_dir().unwrap();
 
-    tracing::subscriber::with_default(subscriber, || {
+    // Everything runs inside the runtime and inside the subscriber's scope.
+    // Asserting after this closure returns would uninstall the subscriber,
+    // and a record emitted a moment later would then be lost rather than
+    // late — a failure that cannot show its own cause.
+    tracing::subscriber::with_default(capture.subscriber(), || {
         runtime.block_on(async {
+            prime_support_audit_capture(&sandbox, &capture).await;
+
             let marker = unique_marker("support-drop-descendant");
             let started = unique_marker("support-drop-started");
-            let sandbox = Sandbox::new(false, "bwrap");
             let script = format!(
                 "trap '' TERM; sh -c 'printf started > {}; sleep 1; printf leaked > {}' & wait",
                 started.display(),
@@ -509,72 +511,127 @@ fn lazygit_style_caller_drop_audits_cleanup_and_allows_the_next_launch() {
                         .status_support_command(
                             command,
                             SupportCommandLimits {
-                                timeout: Duration::from_secs(5),
+                                timeout: SUPPORT_STAGE_BUDGET,
                             },
-                            SupportCommandAudit::new(
-                                "lazygit-caller-drop-test",
-                                "user-trusted-bypass",
-                            ),
+                            SupportCommandAudit::new(CALLER_DROP_UTILITY, "user-trusted-bypass"),
                         )
                         .await
                 }
             });
 
-            wait_until(|| sandbox.active_group_count() == 1 && started.exists()).await;
+            // Spawn and publication are separate stages: the worker
+            // registers the group as soon as the leader exists, and the
+            // leader's child publishes its start marker once it runs.
+            let diagnostics = || {
+                format!(
+                    "active groups: {}, start marker present: {}, captured audit: {}",
+                    sandbox.active_group_count(),
+                    started.exists(),
+                    capture.summary(),
+                )
+            };
+            support_stage(
+                "the utility registered its process group",
+                || sandbox.active_group_count() == 1,
+                diagnostics,
+            )
+            .await;
+            support_stage(
+                "the utility's child published its start marker",
+                || started.exists(),
+                diagnostics,
+            )
+            .await;
+
             handle.abort();
             let _ = handle.await;
-            wait_until(|| sandbox.active_group_count() == 0).await;
+            support_stage(
+                "the cancelled utility's process group was released",
+                || sandbox.active_group_count() == 0,
+                diagnostics,
+            )
+            .await;
+            // The worker emits the audit record before it releases the
+            // group's accounting, so a zero count means the record exists.
+            let (record, groups_at_write) =
+                capture.record(CALLER_DROP_UTILITY).unwrap_or_else(|| {
+                    panic!(
+                        "support utility caller-drop stalled: the cancelled utility's audit \
+                         record was not written before its group was released ({})",
+                        diagnostics()
+                    )
+                });
+            assert_eq!(
+                groups_at_write, 1,
+                "the cancelled utility's audit record must be written before its group is \
+                 released: {record}"
+            );
+            assert!(record.contains("outcome=\"cancelled\""), "{record}");
+            assert!(
+                record.contains(&format!("cwd={}", expected_cwd.display())),
+                "{record}"
+            );
+            assert!(
+                record.contains("support utility ended after process cleanup"),
+                "{record}"
+            );
+
             sleep(Duration::from_millis(1200)).await;
             assert!(!marker.exists());
+            let _ = std::fs::remove_file(&started);
 
             let mut next = tokio::process::Command::new("bash");
             next.args(["-c", "exit 0"]);
-            let next = sandbox
-                .status_support_command(
+            let next = timeout(
+                SUPPORT_STAGE_BUDGET,
+                sandbox.status_support_command(
                     next,
                     SupportCommandLimits {
-                        timeout: Duration::from_secs(1),
+                        timeout: SUPPORT_STAGE_BUDGET,
                     },
                     SupportCommandAudit::new("lazygit-next-launch-test", "user-trusted-bypass"),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "support utility caller-drop stalled: the next launch did not finish within \
+                     {SUPPORT_STAGE_BUDGET:?} ({})",
+                    diagnostics()
                 )
-                .await
-                .unwrap();
+            })
+            .unwrap();
             assert_eq!(next.status, CommandStatus::Completed);
             assert!(next.exit_status.is_some_and(|status| status.success()));
-            let _ = std::fs::remove_file(started);
-
-            // Wait for the cancelled utility's audit line here, inside the
-            // runtime and inside the subscriber's scope.
-            //
-            // The worker that emits it is a separate task: it disarms its
-            // process-group guard, which is what `active_group_count` watches,
-            // and only then emits. So observing zero groups does not mean the
-            // record has been written. Asserting after this closure returns
-            // also uninstalls the subscriber, and a line emitted a moment later
-            // would then be lost rather than late — which is a test that fails
-            // for a reason the failure cannot show.
-            wait_until_named("the cancelled utility's audit record", || {
-                let captured = logs.lock().unwrap();
-                let captured = String::from_utf8_lossy(&captured);
-                captured.contains("lazygit-caller-drop-test")
-                    && captured.contains("support utility ended after process cleanup")
-            })
-            .await;
+            assert_eq!(sandbox.active_group_count(), 0);
         });
     });
+}
 
-    let logs = logs.lock().unwrap();
-    let logs = String::from_utf8_lossy(&logs);
-    assert!(logs.contains("lazygit-caller-drop-test"), "{logs}");
-    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
-    assert!(
-        logs.contains(&format!("cwd={}", expected_cwd.display())),
-        "{logs}"
-    );
-    assert!(
-        logs.contains("support utility ended after process cleanup"),
-        "{logs}"
-    );
+#[cfg(unix)]
+#[test]
+fn support_utility_audit_is_written_before_its_process_group_is_released() {
+    let sandbox = Sandbox::new(false, "bwrap");
+    let capture = AuditCapture::new(&sandbox);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    tracing::subscriber::with_default(capture.subscriber(), || {
+        runtime.block_on(async {
+            prime_support_audit_capture(&sandbox, &capture).await;
+            let (record, groups_at_write) = capture
+                .record(PROBE_UTILITY)
+                .expect("priming proved the probe record was captured");
+            // Zero active groups is the observable end of a support
+            // utility's lifecycle, so its terminal audit must already exist
+            // while the group is still accounted as active.
+            assert_eq!(groups_at_write, 1, "{record}");
+            assert!(record.contains("outcome=\"nonzero\""), "{record}");
+            assert_eq!(sandbox.active_group_count(), 0);
+        });
+    });
 }
 
 #[test]
@@ -640,12 +697,154 @@ async fn wait_until_for_named(timeout: Duration, label: &str, mut predicate: imp
     }
 }
 
-#[derive(Clone)]
-struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+/// Budget for each stage of the support-utility caller-drop fixtures. Each
+/// stage is timed from the end of the previous one, so load that delays one
+/// stage is never charged against the next.
+#[cfg(unix)]
+const SUPPORT_STAGE_BUDGET: Duration = Duration::from_secs(30);
 
-impl Write for BufferWriter {
+/// Support utility whose non-success audit proves that this thread's scoped
+/// subscriber receives the support-utility audit callsite.
+#[cfg(unix)]
+const PROBE_UTILITY: &str = "support-audit-capture-probe-test";
+
+#[cfg(unix)]
+const CALLER_DROP_UTILITY: &str = "lazygit-caller-drop-test";
+
+/// Waits for `ready` within [`SUPPORT_STAGE_BUDGET`] and names the stage,
+/// with `diagnostics`, when it stalls.
+#[cfg(unix)]
+async fn support_stage(
+    name: &str,
+    mut ready: impl FnMut() -> bool,
+    diagnostics: impl Fn() -> String,
+) {
+    let deadline = std::time::Instant::now() + SUPPORT_STAGE_BUDGET;
+    while !ready() {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "support utility caller-drop stalled: {name} did not happen within \
+                 {SUPPORT_STAGE_BUDGET:?} ({})",
+                diagnostics()
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Makes this test's scoped subscriber observe the support-utility audit
+/// callsite before the scenario relies on it.
+///
+/// tracing caches each callsite's interest process-wide. While a scoped
+/// subscriber is the only live dispatcher, tracing-core resolves a
+/// callsite's first registration against the registering thread's default
+/// alone. A concurrent test that first reaches the same audit `warn!` on a
+/// thread without a subscriber therefore caches `Interest::never`, and every
+/// later record from that callsite, including this test's, is discarded
+/// before any subscriber sees it. That is how the cancelled utility's
+/// record went missing under a loaded parallel runner (mini-agent-jwvsr).
+///
+/// Rebuilding the cache from inside this scope and proving capture with a
+/// probe that ends non-successfully (the same callsite) makes a record that
+/// is missing later a production fault rather than a lost line: after a
+/// captured probe the callsite is registered, and later rebuilds include
+/// this still-live subscriber.
+#[cfg(unix)]
+async fn prime_support_audit_capture(sandbox: &Sandbox, capture: &AuditCapture) {
+    let deadline = std::time::Instant::now() + SUPPORT_STAGE_BUDGET;
+    let mut probes = 0;
+    loop {
+        tracing::callsite::rebuild_interest_cache();
+        probes += 1;
+        let mut probe = tokio::process::Command::new("bash");
+        probe.args(["-c", "exit 3"]);
+        let output = sandbox
+            .status_support_command(
+                probe,
+                SupportCommandLimits {
+                    timeout: SUPPORT_STAGE_BUDGET,
+                },
+                SupportCommandAudit::new(PROBE_UTILITY, "user-trusted-bypass"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status, CommandStatus::Completed);
+        if capture.record(PROBE_UTILITY).is_some() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "support utility caller-drop stalled: the audit capture was not primed after \
+             {probes} probes within {SUPPORT_STAGE_BUDGET:?} (captured audit: {})",
+            capture.summary()
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Test subscriber sink that keeps each formatted event together with the
+/// sandbox's active process-group count at the moment it was written, so a
+/// test can prove an audit record precedes the release of its group.
+#[cfg(unix)]
+#[derive(Clone)]
+struct AuditCapture {
+    records: Arc<Mutex<Vec<(String, usize)>>>,
+    sandbox: Sandbox,
+}
+
+#[cfg(unix)]
+impl AuditCapture {
+    fn new(sandbox: &Sandbox) -> Self {
+        Self {
+            records: Arc::new(Mutex::new(Vec::new())),
+            sandbox: sandbox.clone(),
+        }
+    }
+
+    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        let writer = self.clone();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish()
+    }
+
+    /// The terminal audit record of `utility`, with the active group count
+    /// observed when it was written.
+    fn record(&self, utility: &str) -> Option<(String, usize)> {
+        let field = format!("utility=\"{utility}\"");
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(line, _)| line.contains(&field) && line.contains("after process cleanup"))
+            .cloned()
+    }
+
+    fn summary(&self) -> String {
+        let records = self.records.lock().unwrap();
+        let lines: Vec<&str> = records
+            .iter()
+            .map(|(line, _)| line.trim_end())
+            .filter(|line| line.contains("support utility"))
+            .collect();
+        if lines.is_empty() {
+            "none".to_string()
+        } else {
+            lines.join(" | ")
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Write for AuditCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        let groups = self.sandbox.active_group_count();
+        self.records
+            .lock()
+            .unwrap()
+            .push((String::from_utf8_lossy(bytes).into_owned(), groups));
         Ok(bytes.len())
     }
 

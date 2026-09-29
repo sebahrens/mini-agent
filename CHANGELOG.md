@@ -107,6 +107,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `todo_write` rejects lists over 50 items or items over 500 characters, and the todo block
   re-injected into every compaction summary is bounded to 32 KiB, so large todo content can no
   longer pin the context and force repeated compaction.
+- A support utility such as lazygit now writes its terminal audit record before its process group
+  leaves the active set, the same cleanup-then-audit-then-accounting order as the explicit shell,
+  so a finished lifecycle always has its record. The caller-drop test no longer loses that record
+  under a loaded parallel test runner.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.
