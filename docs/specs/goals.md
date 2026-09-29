@@ -243,7 +243,9 @@ flags applies them afterwards, so a flag always beats the file it overrides.
   unfinished goal is refused. A status-line item shows round and status. Each gate decision prints
   one line, because an agent that keeps going without saying why is the most common complaint about
   autonomous loops. `status` and `pause` are reachable while rounds are chaining, which is the whole
-  time a goal exists.
+  time a goal exists. A pause while a completion claim is being verified wins: the result that
+  arrives afterwards is set aside, the round is not counted, and `resume` picks the goal up again.
+  The same holds for a result whose goal was cleared or replaced meanwhile.
 - **CLI**: `--goal`, `--goal-done`, `--goal-check`, `--goal-max-rounds`, `--goal-continuation`,
   `--goal-replace`. The dependent flags require `--goal` rather than being accepted and dropped. A
   goal under `--no-tools` is refused at startup, whether it came from the flag or from a resumed

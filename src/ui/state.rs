@@ -434,6 +434,9 @@ pub(crate) struct PendingGoalGate {
     /// dropping the future alone does not, and would leave a test suite
     /// running after the operator asked for it to stop.
     pub cancel: tokio::sync::oneshot::Sender<()>,
+    /// The goal the round belongs to. A result for a goal that was since
+    /// cleared or replaced is set aside rather than applied to its successor.
+    pub goal_id: compact_str::CompactString,
     pub summary: crate::extras::goal::gate::RoundSummary,
     pub request: crate::extras::goal::gate::VerifyRequest,
 }
