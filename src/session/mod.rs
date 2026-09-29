@@ -1671,6 +1671,29 @@ impl Session {
     /// the unsummarized remainder for a later pass. Zero is an error because
     /// inserting a summary without removing anything grows the session and
     /// re-triggers auto-compaction on every turn.
+    /// The messages a compaction of the first `cut_idx` messages hands the
+    /// summarizer, and how many leading messages were left out of them.
+    ///
+    /// The previous compaction's summary record sits at index 0 and is passed
+    /// to the summarizer separately as the rolling `previous_summary`, so it is
+    /// left out here rather than sent twice (mini-agent-g8m5v). It is still
+    /// part of the drained prefix: the new summary replaces it. Callers drain
+    /// `skipped + compaction_drain_len(cut_idx - skipped, included)`.
+    pub fn compaction_input(
+        &self,
+        cut_idx: usize,
+        keep_recent_tool_results: usize,
+    ) -> (usize, Vec<SessionMessage>) {
+        let skipped = match self.compacted_context() {
+            (Some(_), 1) if cut_idx > 1 => 1,
+            _ => 0,
+        };
+        let messages = self.context_messages_with_pruned_tool_results(keep_recent_tool_results)
+            [skipped..cut_idx]
+            .to_vec();
+        (skipped, messages)
+    }
+
     pub fn compaction_drain_len(cut_idx: usize, messages_included: usize) -> anyhow::Result<usize> {
         let drain = messages_included.min(cut_idx);
         if drain == 0 {

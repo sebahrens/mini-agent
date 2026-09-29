@@ -470,10 +470,8 @@ where
 
     eprintln!("auto-compacting headless session...");
     let model = session.model.to_string();
-    let messages = session
-        .context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results())
-        [..plan.cut_idx]
-        .to_vec();
+    let (skipped, messages) =
+        session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());
     let previous_summary = session
         .compactions
         .last()
@@ -489,7 +487,8 @@ where
     // `messages_included` is the length of the oldest prefix of the cut slice
     // whose content the summarizer saw (`cut_idx` with full coverage). Drain
     // exactly that prefix so unsummarized history is never discarded.
-    let first_kept_index = Session::compaction_drain_len(plan.cut_idx, messages_included)?;
+    let first_kept_index =
+        skipped + Session::compaction_drain_len(plan.cut_idx - skipped, messages_included)?;
     let tokens_before = if first_kept_index == plan.cut_idx {
         plan.tokens_before
     } else {
@@ -2558,6 +2557,52 @@ mod tests {
         assert_eq!(session.compactions.len(), 1);
         assert_eq!(session.messages[0].content, "HEADLESS_SUMMARY");
         assert_eq!(session.messages.len(), 2);
+    }
+
+    // mini-agent-g8m5v: a second compaction passes the previous summary once,
+    // as `previous_summary`, not also as the first message of the cut.
+    #[tokio::test]
+    async fn recompaction_sends_the_previous_summary_once() {
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 60;
+        session.add_message(crate::session::MessageRole::User, &"z".repeat(40));
+        session.compress("OLD_SUMMARY".to_string(), 1, 10);
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        session.add_message(crate::session::MessageRole::User, &"c".repeat(40));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+
+        let result = compact_headless_session_with(
+            &mut session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            |_, messages, previous_summary, _, _| async move {
+                assert_eq!(previous_summary.as_deref(), Some("OLD_SUMMARY"));
+                assert!(
+                    messages
+                        .iter()
+                        .all(|message| message.content != "OLD_SUMMARY"),
+                    "the previous summary must not also be a summarized message"
+                );
+                assert_eq!(messages.len(), 2, "{messages:?}");
+                Ok(("NEW_SUMMARY".to_string(), messages.len()))
+            },
+        )
+        .await
+        .unwrap();
+
+        // The old summary record plus both summarized messages are drained.
+        assert_eq!(result, Some(("NEW_SUMMARY".to_string(), 3)));
+        assert_eq!(session.messages[0].content, "NEW_SUMMARY");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content, "c".repeat(40));
     }
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};

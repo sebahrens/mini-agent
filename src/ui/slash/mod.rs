@@ -558,9 +558,7 @@ where
     F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
 {
     let model = session.model.to_string();
-    let messages = session.context_messages_with_pruned_tool_results(keep_recent_tool_results)
-        [..cut_idx]
-        .to_vec();
+    let (skipped, messages) = session.compaction_input(cut_idx, keep_recent_tool_results);
     let previous_summary = session
         .compactions
         .last()
@@ -573,7 +571,8 @@ where
         response_token_budget,
     )
     .await?;
-    let first_kept_index = Session::compaction_drain_len(cut_idx, messages_included)?;
+    let first_kept_index =
+        skipped + Session::compaction_drain_len(cut_idx - skipped, messages_included)?;
     let tokens_before: u64 = session.messages[..first_kept_index]
         .iter()
         .map(|message| message.estimated_tokens)
