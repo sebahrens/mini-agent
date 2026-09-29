@@ -51,6 +51,9 @@ Notable changes to mini-agent are documented in this file. The format follows
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded
   read timeout and reassembles a split request line.
+- The goal round-clock test that proves time waiting on a permission prompt does not count against a
+  goal's time budget no longer flakes on loaded macOS CI runners: it now injects the instants instead
+  of bounding real sleeps from above.
 
 ## [1.9.4] - 2026-09-29
 
