@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::cli::Cli;
 use crate::config::{self, Config};
@@ -68,11 +70,83 @@ async fn handle_subagent_model_command(
 static MODEL_CACHE: LazyLock<Mutex<HashMap<String, Arc<[ModelEntry]>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Bumped whenever [`MODEL_CACHE`] gains or replaces an entry, so the UI can
+/// pick up a background warm without re-reading the list on every event.
+static MODEL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Providers whose last listing failed, and when. A failed listing is not
+/// retried implicitly until [`LISTING_FAILURE_TTL`] passes (an explicit
+/// `/models refresh` always retries), so an unreachable gateway cannot stall
+/// every slash command.
+static LISTING_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Providers with a background warm in flight.
+static WARMING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const LISTING_FAILURE_TTL: Duration = Duration::from_secs(300);
+
+/// Credentials a model listing needs, owned so a background task can use them.
+#[derive(Clone)]
+pub(crate) struct ListingCredentials {
+    api_key: Option<String>,
+    custom_providers: HashMap<String, crate::config::CustomProviderConfig>,
+    api_keys: Option<HashMap<String, String>>,
+}
+
+impl ListingCredentials {
+    pub(crate) fn new(cli: &Cli, cfg: &Config) -> Self {
+        Self {
+            api_key: cli.api_key.clone(),
+            custom_providers: cfg.custom_providers_map(),
+            api_keys: cfg.api_keys.clone(),
+        }
+    }
+}
+
+fn cache_insert(provider: &str, models: Arc<[ModelEntry]>) {
+    MODEL_CACHE
+        .lock()
+        .unwrap()
+        .insert(provider.to_string(), models);
+    LISTING_FAILURES.lock().unwrap().remove(provider);
+    MODEL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether a listing for `provider` failed within the TTL (as of `now`).
+fn recently_failed(provider: &str, now: Instant) -> bool {
+    LISTING_FAILURES
+        .lock()
+        .unwrap()
+        .get(provider)
+        .is_some_and(|failed| now.saturating_duration_since(*failed) < LISTING_FAILURE_TTL)
+}
+
+/// The cached listing or the baked catalog, without any network access.
+fn cached_or_baked(provider: &str, is_custom: bool) -> Option<Arc<[ModelEntry]>> {
+    if let Some(hit) = MODEL_CACHE.lock().unwrap().get(provider) {
+        return Some(Arc::clone(hit)); // guard dropped here, NOT across any await
+    }
+    // No cache yet: serve the baked catalog for built-in providers — no network.
+    let entries = (!is_custom)
+        .then(|| crate::models_catalog::catalog_entries(provider))
+        .flatten()?;
+    let models: Vec<ModelEntry> = entries
+        .iter()
+        .filter(|m| crate::provider::is_agent_model(m))
+        .cloned()
+        .collect();
+    let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
+    cache_insert(provider, Arc::clone(&arc));
+    Some(arc)
+}
+
 /// Returns the provider's models.
 ///
 /// Network is only touched on `refresh`, for custom gateways, or for built-in
 /// providers that aren't baked (e.g. ollama). Baked built-ins are served from
 /// the embedded catalog with no network call — this is what keeps startup instant.
+/// A recent failure is returned without a new request unless `refresh` is set.
 pub(crate) async fn fetch_models_cached(
     provider: &str,
     is_custom: bool,
@@ -82,30 +156,55 @@ pub(crate) async fn fetch_models_cached(
     refresh: bool,
 ) -> anyhow::Result<Arc<[ModelEntry]>> {
     if !refresh {
-        if let Some(hit) = MODEL_CACHE.lock().unwrap().get(provider) {
-            return Ok(Arc::clone(hit)); // guard dropped here, NOT across any await
+        if let Some(hit) = cached_or_baked(provider, is_custom) {
+            return Ok(hit);
         }
-        // No cache yet: serve the baked catalog for built-in providers — no network.
-        if !is_custom && let Some(entries) = crate::models_catalog::catalog_entries(provider) {
-            let models: Vec<ModelEntry> = entries
-                .iter()
-                .filter(|m| crate::provider::is_agent_model(m))
-                .cloned()
-                .collect();
-            let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
-            MODEL_CACHE
-                .lock()
-                .unwrap()
-                .insert(provider.to_string(), Arc::clone(&arc));
-            return Ok(arc);
+        if recently_failed(provider, Instant::now()) {
+            anyhow::bail!(
+                "model listing for {provider} failed recently; run /models refresh to retry"
+            );
         }
     }
+    fetch_and_cache(
+        provider,
+        is_custom,
+        client,
+        &ListingCredentials::new(cli, cfg),
+    )
+    .await
+}
+
+async fn fetch_and_cache(
+    provider: &str,
+    is_custom: bool,
+    client: &AnyClient,
+    creds: &ListingCredentials,
+) -> anyhow::Result<Arc<[ModelEntry]>> {
+    let result = fetch_uncached(provider, is_custom, client, creds).await;
+    match &result {
+        Ok(models) => cache_insert(provider, Arc::clone(models)),
+        Err(_) => {
+            LISTING_FAILURES
+                .lock()
+                .unwrap()
+                .insert(provider.to_string(), Instant::now());
+        }
+    }
+    result
+}
+
+async fn fetch_uncached(
+    provider: &str,
+    is_custom: bool,
+    client: &AnyClient,
+    creds: &ListingCredentials,
+) -> anyhow::Result<Arc<[ModelEntry]>> {
     let mut models = if is_custom {
         list_models_manual(
             provider,
-            cli.api_key.as_deref(),
-            &cfg.custom_providers_map(),
-            cfg.api_keys.as_ref(),
+            creds.api_key.as_deref(),
+            &creds.custom_providers,
+            creds.api_keys.as_ref(),
         )
         .await?
     } else {
@@ -115,9 +214,9 @@ pub(crate) async fn fetch_models_cached(
 
     if provider == "openrouter" {
         match crate::provider::fetch_openrouter_pricing(
-            cli.api_key.as_deref(),
-            &cfg.custom_providers_map(),
-            cfg.api_keys.as_ref(),
+            creds.api_key.as_deref(),
+            &creds.custom_providers,
+            creds.api_keys.as_ref(),
         )
         .await
         {
@@ -135,12 +234,7 @@ pub(crate) async fn fetch_models_cached(
         }
     }
 
-    let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
-    MODEL_CACHE
-        .lock()
-        .unwrap()
-        .insert(provider.to_string(), Arc::clone(&arc));
-    Ok(arc)
+    Ok(Arc::from(models.into_boxed_slice()))
 }
 
 /// sync read for the picker (no await)
@@ -153,16 +247,42 @@ pub(crate) fn cached_model_ids(provider: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// best-effort warm; returns id list (empty on failure, never errors)
-pub(crate) async fn warm_model_cache(
+/// The cache generation; changes whenever a listing lands in the cache.
+pub(crate) fn model_cache_generation() -> u64 {
+    MODEL_CACHE_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Make sure `provider`'s models get cached without blocking the caller: a
+/// cached or baked list is used as is, a recent failure is not retried, and
+/// otherwise one background task per provider fetches the list. Read the
+/// result with [`cached_model_ids`] once [`model_cache_generation`] changes.
+pub(crate) fn warm_model_cache(
     provider: &str,
     is_custom: bool,
     client: &AnyClient,
     cli: &Cli,
     cfg: &Config,
-) -> Vec<String> {
-    let _ = fetch_models_cached(provider, is_custom, client, cli, cfg, false).await;
-    cached_model_ids(provider)
+) {
+    if cached_or_baked(provider, is_custom).is_some()
+        || recently_failed(provider, Instant::now())
+        || !WARMING.lock().unwrap().insert(provider.to_string())
+    {
+        return;
+    }
+    // Outside a runtime (never in the app) there is nothing to spawn on.
+    if tokio::runtime::Handle::try_current().is_err() {
+        WARMING.lock().unwrap().remove(provider);
+        return;
+    }
+    let provider = provider.to_string();
+    let client = client.clone();
+    let creds = ListingCredentials::new(cli, cfg);
+    tokio::spawn(async move {
+        if let Err(error) = fetch_and_cache(&provider, is_custom, &client, &creds).await {
+            tracing::debug!("background model listing for {provider} failed: {error}");
+        }
+        WARMING.lock().unwrap().remove(&provider);
+    });
 }
 
 fn lookup_pricing_from_cache(provider: &str, model_id: &str) -> Option<(f64, f64)> {
@@ -662,6 +782,76 @@ mod subagent_command_tests {
     #[test]
     fn disabled_message_names_the_feature() {
         assert!(SUBAGENTS_DISABLED.contains("'subagents' feature"));
+    }
+}
+
+/// mini-agent-bgg91: failed listings are cached so slash commands never wait
+/// on an unreachable gateway again within the TTL, and warming never blocks.
+#[cfg(test)]
+mod model_cache_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn fixtures() -> (AnyClient, Cli, Config) {
+        let client = AnyClient::OpenRouter(
+            rig::providers::openrouter::Client::builder()
+                .api_key("unused-test-key")
+                .build()
+                .unwrap(),
+        );
+        (
+            client,
+            Cli::parse_from(["mini-agent", "--api-key", "unused-test-key"]),
+            Config::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_is_not_retried_until_refresh_or_ttl() {
+        let (client, cli, cfg) = fixtures();
+        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
+        let first = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(!first.to_string().contains("failed recently"), "{first}");
+        assert!(recently_failed(&provider, Instant::now()));
+
+        let cached = fetch_models_cached(&provider, true, &client, &cli, &cfg, false)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(cached.to_string().contains("failed recently"), "{cached}");
+
+        let refreshed = fetch_models_cached(&provider, true, &client, &cli, &cfg, true)
+            .await
+            .err()
+            .expect("listing must fail");
+        assert!(!refreshed.to_string().contains("failed recently"));
+
+        let later = Instant::now() + LISTING_FAILURE_TTL + Duration::from_secs(1);
+        assert!(!recently_failed(&provider, later), "the TTL expires");
+    }
+
+    #[tokio::test]
+    async fn warming_returns_immediately_and_skips_known_failures() {
+        let (client, cli, cfg) = fixtures();
+        let provider = format!("missing-gateway-{}", uuid::Uuid::new_v4());
+        LISTING_FAILURES
+            .lock()
+            .unwrap()
+            .insert(provider.clone(), Instant::now());
+        warm_model_cache(&provider, true, &client, &cli, &cfg);
+        assert!(!WARMING.lock().unwrap().contains(&provider));
+
+        // A baked built-in catalog warms synchronously, with no task.
+        let before = model_cache_generation();
+        warm_model_cache("anthropic", false, &client, &cli, &cfg);
+        if crate::models_catalog::catalog_entries("anthropic").is_some() {
+            assert!(!cached_model_ids("anthropic").is_empty());
+            assert!(model_cache_generation() >= before);
+        }
+        assert!(!WARMING.lock().unwrap().contains("anthropic"));
     }
 }
 

@@ -303,6 +303,12 @@ mod lazygit_key_tests {
         input.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(input.buffer, "raft", "Ctrl+D deletes forward");
 
+        // Nothing is warmed after /quit or /exit (mini-agent-bgg91).
+        assert!(is_quit_command("/quit"));
+        assert!(is_quit_command(" /exit now"));
+        assert!(!is_quit_command("/quiet"));
+        assert!(!is_quit_command("/model x"));
+
         // Ctrl+H reaches the editor as backspace.
         let mut input = InputEditor::new();
         input.load_text("ab");
@@ -544,6 +550,11 @@ pub(crate) fn idle_interrupt(is_ctrl_d: bool, draft_empty: bool) -> IdleInterrup
     }
 }
 
+/// `/quit` and `/exit` leave the app; nothing needs warming after them.
+fn is_quit_command(text: &str) -> bool {
+    matches!(text.split_whitespace().next(), Some("/quit" | "/exit"))
+}
+
 pub(crate) fn interrupt_target(
     btw_inflight: usize,
     validation_active: bool,
@@ -597,6 +608,8 @@ pub(crate) struct App<'a> {
     event_handle: Option<std::thread::JoinHandle<()>>,
     prebuild: Option<super::prebuild::AgentPrebuild>,
     terminal_guard: TerminalGuard,
+    /// Last model-cache generation handed to the model picker.
+    model_cache_generation: u64,
 }
 
 impl<'a> App<'a> {
@@ -710,11 +723,9 @@ impl<'a> App<'a> {
         {
             let provider = ui.session.provider.to_string();
             let is_custom = ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
-                &provider, is_custom, &ui.client, ui.cli, ui.cfg,
-            )
-            .await;
-            input.set_live_model_names(ids);
+            // Non-blocking: an unreachable gateway must not stall startup.
+            crate::ui::slash::warm_model_cache(&provider, is_custom, &ui.client, ui.cli, ui.cfg);
+            input.set_live_model_names(crate::ui::slash::cached_model_ids(&provider));
         }
 
         #[cfg(feature = "git-worktree")]
@@ -972,6 +983,7 @@ impl<'a> App<'a> {
             event_handle,
             prebuild,
             terminal_guard,
+            model_cache_generation: crate::ui::slash::model_cache_generation(),
         };
         app.request_git_status_refresh();
         Ok(app)
@@ -1154,7 +1166,21 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Hand the model picker the current provider's cached ids when a
+    /// background listing has landed since the last sync (or when `force`).
+    fn sync_live_model_names(&mut self, force: bool) {
+        let generation = crate::ui::slash::model_cache_generation();
+        if force || generation != self.model_cache_generation {
+            self.model_cache_generation = generation;
+            self.input
+                .set_live_model_names(crate::ui::slash::cached_model_ids(
+                    &self.ui.session.provider,
+                ));
+        }
+    }
+
     fn refresh(&mut self) -> io::Result<()> {
+        self.sync_live_model_names(false);
         refresh_display(
             &mut self.renderer,
             &mut self.input,
@@ -2354,18 +2380,19 @@ impl<'a> App<'a> {
             return result;
         }
 
-        {
+        // The provider may have changed: warm its model list in the
+        // background (never blocking the command) and show what is cached.
+        if !is_quit_command(text) {
             let provider = self.ui.session.provider.to_string();
             let is_custom = self.ui.cfg.custom_providers_map().contains_key(&provider);
-            let ids = crate::ui::slash::warm_model_cache(
+            crate::ui::slash::warm_model_cache(
                 &provider,
                 is_custom,
                 &self.ui.client,
                 self.ui.cli,
                 self.ui.cfg,
-            )
-            .await;
-            self.input.set_live_model_names(ids);
+            );
+            self.sync_live_model_names(true);
         }
 
         self.handle_slash_result(result).await?;
