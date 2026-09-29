@@ -177,7 +177,8 @@ jobs:
           python3 -m unittest \
             scripts.tests.test_package_release_binary \
             scripts.tests.test_package_corresponding_source \
-            scripts.tests.test_install_script
+            scripts.tests.test_install_script \
+            scripts.tests.test_update_release_checksums
           bash scripts/test-install-checksums.sh
 
       - name: Verify release workflow policy

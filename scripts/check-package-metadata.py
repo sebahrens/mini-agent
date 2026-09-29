@@ -990,6 +990,8 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             'mv -f "$STAGED" "$TARGET"',
             'REQUIRED_DOCUMENTS=("LICENSE" "NOTICE" "SOURCE.md")',
             'cp "${TMPDIR}/${document}" "${DOC_DIR}/${document}"',
+            'if gh attestation verify "$ARCHIVE_PATH" --repo "$REPO" >"$log" 2>&1; then',
+            'MINI_AGENT_SKIP_ATTESTATION',
         ),
         "NOTICE": (
             "997b825a69d67022b169f36825632bdbcee296a0",
@@ -1102,10 +1104,15 @@ def validate_file_fragments(root: Path, binary: str) -> list[str]:
             f"{binary}-aarch64-apple-darwin.tar.gz",
             f"{binary}-x86_64-unknown-linux-musl.tar.gz",
             f"{binary}-aarch64-unknown-linux-musl.tar.gz",
+            'download SHA256SUMS "${RELEASE_BASE}/SHA256SUMS"',
+            'expected="$(manifest_digest "$name")" || exit 1',
+            '&& ! gh attestation verify "$path" --repo "$REPO" >&2; then',
         ),
         "README.md": (
             f"The Cargo package, installed CLI, and every binary release archive use the executable name\n`{binary}`.",
             "The default build enables `loop`, `git-worktree`, `mcp`, `acp`, `subagents`, `archmd`,\n`status-signals`, `multithread`, `export`, `js`, `sandbox`, and `memory`.",
+            f"https://raw.githubusercontent.com/{CANONICAL_REPOSITORY}/main/install.sh | bash -s -- --release X.Y.Z",
+            f"gh attestation verify mini-agent-<arch>-<os>.tar.gz --repo {CANONICAL_REPOSITORY}",
         ),
         "docs/agent/PUBLISHING_RELEASES.md": (
             f"Cargo and every package channel install the public executable as `{binary}`.",

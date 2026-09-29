@@ -133,6 +133,16 @@ printf '%s\\n' "$*" >> "${INSTALL_TEST_GH_LOG:-/dev/null}"
 if [[ "$1 $2" == "auth status" ]]; then
     exit "${INSTALL_TEST_GH_AUTH_STATUS:-0}"
 fi
+if [[ "$1 $2" == "attestation verify" ]]; then
+    if [[ "$3" == "--help" ]]; then
+        exit "${INSTALL_TEST_GH_ATTESTATION_HELP_STATUS:-0}"
+    fi
+    status="${INSTALL_TEST_GH_ATTESTATION_STATUS:-0}"
+    if [[ "$status" != 0 ]]; then
+        echo "Error: no attestations matched the artifact digest" >&2
+    fi
+    exit "$status"
+fi
 if [[ "$1 $2" == "release download" ]]; then
     dir=""
     for ((index = 1; index <= $#; index++)); do
@@ -441,8 +451,8 @@ fi
     # any host bwrap (CI Linux runners have one in /usr/bin).
     INSTALLER_TOOLS = (
         "awk", "basename", "bash", "cat", "chmod", "cp", "dirname", "grep",
-        "gzip", "head", "mkdir", "mktemp", "mv", "od", "rm", "sh", "sha256sum",
-        "shasum", "tar", "tr",
+        "gzip", "head", "mkdir", "mktemp", "mv", "od", "rm", "sed", "sh",
+        "sha256sum", "shasum", "tar", "tr",
     )
 
     def tools_without_bwrap(self, root: Path) -> str:
@@ -691,7 +701,168 @@ fi
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertNotIn("api.github.com", (root / "curl.log").read_text())
             self.assertNotIn(" -H ", (root / "curl.log").read_text())
+            # gh is consulted only to verify provenance, never to download.
+            gh_log = (root / "gh.log").read_text().splitlines()
+            self.assertFalse(
+                any(line.startswith("release download") for line in gh_log), gh_log
+            )
+
+    # ---- build provenance (gh attestation verify) ----
+
+    ARCHIVE = "mini-agent-aarch64-apple-darwin.tar.gz"
+    PROVENANCE_WARNING = "Warning: build provenance was not verified"
+    MANUAL_COMMAND = (
+        "gh attestation verify mini-agent-aarch64-apple-darwin.tar.gz"
+        " --repo sebahrens/mini-agent"
+    )
+
+    def gh_env(self, root: Path, **overrides: str) -> dict[str, str]:
+        env = {
+            "MINI_AGENT_INSTALL_NO_GH": "",
+            "INSTALL_TEST_GH_LOG": str(root / "gh.log"),
+        }
+        env.update(overrides)
+        return env
+
+    def attestation_calls(self, root: Path) -> list[str]:
+        log = root / "gh.log"
+        if not log.exists():
+            return []
+        return [
+            line
+            for line in log.read_text().splitlines()
+            if line.startswith("attestation verify ") and "--help" not in line
+        ]
+
+    def test_verified_attestation_installs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+
+            result = self.run_installer(
+                root, release, stub_bin, extra_env=self.gh_env(root)
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            self.assertIn("Verified build provenance", result.stdout)
+            calls = self.attestation_calls(root)
+            self.assertEqual(1, len(calls), calls)
+            self.assertTrue(calls[0].endswith(f"/{self.ARCHIVE} --repo sebahrens/mini-agent"))
+
+    def test_failed_attestation_aborts_before_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            env = self.gh_env(root, INSTALL_TEST_GH_ATTESTATION_STATUS="1")
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("build provenance verification failed", result.stderr)
+            self.assertIn("no attestations matched", result.stderr)
+            self.assertIn("MINI_AGENT_SKIP_ATTESTATION=1", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    def test_failed_attestation_after_gh_download_aborts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin, env = self.make_private_fixture(directory)
+            env.update(self.gh_env(root, INSTALL_TEST_GH_ATTESTATION_STATUS="1"))
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("Downloaded release assets with gh", result.stdout)
+            self.assertIn("build provenance verification failed", result.stderr)
+            self.assertFalse((root / "prefix").exists())
+
+    def test_missing_gh_installs_with_manual_verification_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (stub_bin / "gh").unlink()
+            system_path = self.tools_without_bwrap(root)
+            self.assertIsNone(shutil.which("gh", path=f"{stub_bin}:{system_path}"))
+
+            result = self.run_installer(
+                root,
+                release,
+                stub_bin,
+                extra_env=self.gh_env(root),
+                system_path=system_path,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertTrue((root / "prefix/bin/mini-agent").is_file())
+            self.assertIn(self.PROVENANCE_WARNING, result.stderr)
+            self.assertIn("is not installed", result.stderr)
+            self.assertIn(self.MANUAL_COMMAND, result.stderr)
+
+    def test_unauthenticated_gh_installs_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            env = self.gh_env(
+                root,
+                INSTALL_TEST_GH_AUTH_STATUS="1",
+                INSTALL_TEST_GH_ATTESTATION_STATUS="1",
+            )
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(self.PROVENANCE_WARNING, result.stderr)
+            self.assertIn("gh auth login", result.stderr)
+            self.assertIn(self.MANUAL_COMMAND, result.stderr)
+            self.assertEqual([], self.attestation_calls(root))
+
+    def test_gh_without_attestation_support_installs_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            env = self.gh_env(
+                root,
+                INSTALL_TEST_GH_ATTESTATION_HELP_STATUS="1",
+                INSTALL_TEST_GH_ATTESTATION_STATUS="1",
+            )
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("upgrade gh", result.stderr)
+            self.assertEqual([], self.attestation_calls(root))
+
+    def test_skip_attestation_switch_never_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            env = self.gh_env(
+                root,
+                MINI_AGENT_SKIP_ATTESTATION="1",
+                INSTALL_TEST_GH_ATTESTATION_STATUS="1",
+            )
+
+            result = self.run_installer(root, release, stub_bin, extra_env=env)
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("skipping build provenance verification", result.stderr)
+            self.assertIn(self.MANUAL_COMMAND, result.stderr)
             self.assertFalse((root / "gh.log").exists())
+
+    def test_checksum_mismatch_aborts_before_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, stub_bin = self.make_fixture(directory)
+            (release / "SHA256SUMS").write_text(f"{'0' * 64}  {self.ARCHIVE}\n")
+
+            result = self.run_installer(
+                root, release, stub_bin, extra_env=self.gh_env(root)
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("checksum mismatch", result.stderr)
+            self.assertEqual([], self.attestation_calls(root))
 
 
 if __name__ == "__main__":
