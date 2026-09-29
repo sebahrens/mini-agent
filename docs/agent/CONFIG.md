@@ -1348,7 +1348,12 @@ permission tool keys are `shell` (`bash` is a compatibility alias), `js/fetch`, 
 `find_files`, `list_dir`, `todo_write`, `git/status`, `git/diff`, `git/log`,
 `git/show`, `git/stage`, `git/unstage`, `git/commit`, and `mcp_tool`.
 MCP-backed calls use `mcp_tool` as the tool key and
-`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the default action,
+`mcp_tool:{server_name}:{tool_name}` as the matched input. Use `"*"` for the
+default action applied when no rule for a tool matches. In `standard` mode an
+unmatched `write`, `edit`, or JS `write_file` inside the workspace follows that
+default (so `"*": ask` asks before workspace modifications), while unmatched
+workspace reads (`read`, `grep`, `find_files`, `list_dir`) stay allowed and
+external paths follow `external_directory`. Use
 `external_directory` for absolute-path rules outside the working directory, and
 `doom_loop` for repeated identical tool calls (default: `ask`). If `bash` is
 omitted, zerostack installs built-in exact-script allows (for commands such as

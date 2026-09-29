@@ -584,7 +584,14 @@ impl PermissionChecker {
                 let a = base.unwrap_or(self.default_action);
                 let is_external = external && !capability_contained;
                 if matched.is_empty() && self.is_path_tool(tool) && !is_external {
-                    Action::Allow
+                    // Workspace reads stay auto-allowed; an unmatched
+                    // workspace modification follows a configured `"*"`
+                    // default (which is `allow` when none is configured).
+                    if self.is_read_tool(tool) {
+                        Action::Allow
+                    } else {
+                        self.default_action
+                    }
                 } else if matched.is_empty() && a == Action::Allow && is_external {
                     external_action.unwrap_or(Action::Ask)
                 } else {
@@ -2644,5 +2651,62 @@ mod external_tool_allow_tests {
                 .unwrap()
                 .is_absolute_anchored()
         );
+    }
+}
+
+#[cfg(test)]
+mod standard_default_tests {
+    use super::*;
+
+    #[test]
+    fn configured_default_governs_unmatched_workspace_modifications_in_standard() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("zs_standard_default_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let checker_with = |default: Option<Action>| {
+            PermissionChecker::new(
+                &PermissionConfigs::from(PermissionConfig {
+                    default,
+                    ..PermissionConfig::default()
+                }),
+                SecurityMode::Standard,
+                Some(workspace.clone()),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mut ask = checker_with(Some(Action::Ask));
+        for tool in ["write", "edit", "js/write_file"] {
+            assert_eq!(
+                ask.check_path(tool, "src/lib.rs"),
+                CheckResult::Ask,
+                "{tool}"
+            );
+        }
+        for tool in ["read", "grep", "find_files", "list_dir"] {
+            assert_eq!(
+                ask.check_path(tool, "src/lib.rs"),
+                CheckResult::Allowed,
+                "{tool}"
+            );
+        }
+        let mut deny = checker_with(Some(Action::Deny));
+        assert!(matches!(
+            deny.check_path("edit", "src/lib.rs"),
+            CheckResult::Denied(_)
+        ));
+
+        let mut unconfigured = checker_with(None);
+        for tool in ["write", "edit", "read", "grep"] {
+            assert_eq!(
+                unconfigured.check_path(tool, "src/lib.rs"),
+                CheckResult::Allowed,
+                "{tool}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
