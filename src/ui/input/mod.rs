@@ -1,5 +1,6 @@
 pub(crate) mod cursor;
 mod pickers;
+pub(crate) mod wrap;
 
 pub use cursor::cursor_to_line_col;
 pub use cursor::{
@@ -322,6 +323,8 @@ pub struct InputEditor {
     quick_model_names: Vec<String>,
     live_model_names: Vec<String>,
     current_model: Option<String>,
+    /// Text width the input box wraps at, once the renderer has laid it out.
+    wrap_width: Option<usize>,
     provider_names: Vec<String>,
     /// Source of the current security mode for the `/mode` picker.
     permission: Option<crate::permission::checker::PermCheck>,
@@ -347,6 +350,7 @@ impl InputEditor {
             quick_model_names: Vec::new(),
             live_model_names: Vec::new(),
             current_model: None,
+            wrap_width: None,
             provider_names: Vec::new(),
             permission: None,
             editor: None,
@@ -420,6 +424,11 @@ impl InputEditor {
 
     pub fn set_live_model_names(&mut self, names: Vec<String>) {
         self.live_model_names = names;
+    }
+
+    /// Text width of the input box, so Up/Down move by soft-wrapped rows.
+    pub fn set_wrap_width(&mut self, width: usize) {
+        self.wrap_width = Some(width);
     }
 
     /// The session's current model, marked in the `/model` picker.
@@ -1136,7 +1145,33 @@ impl InputEditor {
         None
     }
 
+    /// Move one visual row up or down when the input soft-wraps. Returns
+    /// `false` at the first/last row so the caller falls back to history.
+    fn move_visual_row(&mut self, down: bool) -> Option<bool> {
+        let width = self.wrap_width?;
+        let rows = wrap::wrap_rows(&self.buffer, width);
+        let (row, column) = wrap::cursor_position(&self.buffer, &rows, self.cursor);
+        let target = if down {
+            row + 1
+        } else {
+            match row.checked_sub(1) {
+                Some(target) => target,
+                None => return Some(false),
+            }
+        };
+        if target >= rows.len() {
+            return Some(false);
+        }
+        self.cursor = wrap::offset_in_row(&self.buffer, &rows, target, column);
+        Some(true)
+    }
+
     fn cursor_up(&mut self) -> Option<CompactString> {
+        match self.move_visual_row(false) {
+            Some(true) => return None,
+            Some(false) => return self.history_up(),
+            None => {}
+        }
         let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
         if line > 0 {
             let line_len =
@@ -1154,6 +1189,11 @@ impl InputEditor {
     }
 
     fn cursor_down(&mut self) -> Option<CompactString> {
+        match self.move_visual_row(true) {
+            Some(true) => return None,
+            Some(false) => return self.history_down(),
+            None => {}
+        }
         let (line, col) = cursor_to_line_col(&self.buffer, self.cursor);
         let total = count_lines(&self.buffer);
         if line + 1 < total {

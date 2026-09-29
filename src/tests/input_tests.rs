@@ -288,6 +288,35 @@ fn alt_y_after_yanking_multibyte_text_mid_buffer() {
     assert_eq!(editor.cursor, "[🦀🦀".len());
 }
 
+// --- soft-wrapped input rows (mini-agent-h7vgt) ---
+
+#[test]
+fn up_and_down_move_by_wrapped_rows_then_reach_history() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "earlier");
+    editor.handle_key(press(KeyCode::Enter));
+    editor.set_wrap_width(8);
+    // Rows: "hello " | "world " | "again".
+    type_str(&mut editor, "hello world again");
+    assert_eq!(editor.cursor, editor.buffer.len());
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(
+        editor.cursor,
+        "hello world ".len() - 1,
+        "row end, not next row"
+    );
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.cursor, "hello".len());
+    editor.handle_key(press(KeyCode::Down));
+    assert_eq!(editor.cursor, "hello world".len());
+    editor.handle_key(press(KeyCode::Down));
+    assert_eq!(editor.cursor, "hello world again".len());
+    // From the first row Up recalls history, as with unwrapped input.
+    editor.set_cursor(0);
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "earlier");
+}
+
 // --- word motion on Alt/Ctrl+arrows and Alt+Backspace (mini-agent-rmcpm) ---
 
 fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

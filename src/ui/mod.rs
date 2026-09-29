@@ -198,6 +198,7 @@ pub(crate) fn refresh_display(
     // the size the input is about to occupy (avoids a stale separator when the
     // input shrinks, or chat text hidden under it when the input grows).
     renderer.sync_input_height(&input.buffer)?;
+    input.set_wrap_width(renderer.input_wrap_width());
     renderer.render_viewport()?;
     let perm_mode = ui.permission.as_ref().map(|p| {
         p.lock()
