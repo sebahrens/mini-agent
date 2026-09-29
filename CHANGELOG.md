@@ -80,6 +80,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   diagnostic that names the cause and the fix, both in sandbox startup and launch errors and in
   the JS runtime's "unavailable" reason. Previously the sandbox or `js` tool was reported
   unavailable with no explanation.
+- Two processes can no longer silently lose each other's turns by resuming the same session: the
+  owning process holds an advisory lock on `sessions/<id>.lock`, `--continue`/`--session`/`/sessions`
+  on a session another running process owns continue in a forked copy with a notice, and a save of a
+  session owned elsewhere is refused instead of overwriting it.
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

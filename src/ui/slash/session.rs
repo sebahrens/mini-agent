@@ -443,8 +443,29 @@ async fn handle_sessions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
         } else if sessions.len() == 1 {
             if let Some(s) = sessions.into_iter().next() {
                 let msg_count = s.messages.len();
-                ctx.replace_session(s).await?;
+                // Loading a session another live process owns continues in a
+                // fork rather than overwriting its turns (mini-agent-e42za).
+                let (s, notice) = if ctx.cli.no_session || s.id == ctx.session.id {
+                    (s, None)
+                } else {
+                    let resumed = crate::session::lock::claim_or_fork(s)?;
+                    (resumed.session, resumed.notice)
+                };
+                let previous_id = ctx.session.id.clone();
+                let incoming_id = s.id.clone();
+                if let Err(error) = ctx.replace_session(s).await {
+                    if incoming_id != previous_id {
+                        crate::session::lock::release_session(&incoming_id);
+                    }
+                    return Err(error);
+                }
+                if previous_id != ctx.session.id {
+                    crate::session::lock::release_session(&previous_id);
+                }
                 render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
+                if let Some(notice) = notice {
+                    write_error(ctx.renderer, notice);
+                }
                 write_ok(ctx.renderer, format!("loaded session ({} msgs)", msg_count));
             }
         } else {

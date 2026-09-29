@@ -699,6 +699,17 @@ impl Startup {
             }
         }
 
+        // Another live process that already owns this session keeps writing
+        // it; continuing in a fork keeps both histories (mini-agent-e42za).
+        // An ephemeral run never saves, so it needs no ownership.
+        if session_resumed && !cli.no_session {
+            let resumed = session::lock::claim_or_fork(session)?;
+            session = resumed.session;
+            if let Some(notice) = resumed.notice {
+                eprintln!("notice: {notice}");
+            }
+        }
+
         let resume_decision = if session_resumed {
             Some(resolve_resume_provider_decision(&cli, &cfg, &session)?)
         } else {
