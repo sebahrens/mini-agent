@@ -421,6 +421,45 @@ async fn hook_subprocess_limits_forked_descendant_is_terminated() {
     );
 }
 
+/// A hook whose leader exits normally while a descendant that closed its
+/// inherited pipes lingers: the completion path runs after the leader is
+/// reaped, must still end the descendant through its live group, and reports
+/// the hook as completed (mini-agent-7xrej.1).
+#[cfg(unix)]
+#[tokio::test]
+async fn hook_subprocess_normal_completion_terminates_lingering_descendant() {
+    let pid_file = unique_temp_path("lingering-descendant-pid");
+    let command = format!(
+        "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > \"{}\"",
+        pid_file.display()
+    );
+    let args = shell_args(command);
+
+    let output = run_hook_with_limits(
+        "sh",
+        Some(&args),
+        b"",
+        Duration::from_secs(30),
+        super::TEST_WORKING_DIR,
+        limits(64, 64, 128),
+    )
+    .await;
+    assert_eq!(output.status, HookStatus::Completed);
+    assert_eq!(output.exit_code, Some(0));
+
+    let text = std::fs::read_to_string(&pid_file).unwrap();
+    let _ = std::fs::remove_file(&pid_file);
+    let descendant_pid: u32 = text.trim().parse().unwrap();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_alive(descendant_pid) && Instant::now() < cleanup_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !process_is_alive(descendant_pid),
+        "lingering hook descendant {descendant_pid} survived post-reap cleanup"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn hook_subprocess_async_cancellation_terminates_descendants() {

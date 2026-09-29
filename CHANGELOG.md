@@ -84,6 +84,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Hook, command and support-command cleanup no longer signals a process group after its leader has
+  been reaped unless the group still has a live member, so a recycled pgid belonging to an unrelated
+  process can no longer be sent SIGTERM/SIGKILL; lingering descendants are still terminated.
+
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.
