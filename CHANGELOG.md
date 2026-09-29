@@ -6,6 +6,18 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Git commands mini-agent runs itself on the host (the statusline `git_status`/`git_changes`
+  refresh, the headless JSON change list, worktree create/merge/auto-commit/cleanup, and
+  `/undo stash`) no longer run anything the sandboxed agent can write into the repository: hooks,
+  `core.fsmonitor`, repository-configured filter/diff/merge drivers, credential helpers, and
+  `core.sshCommand` are neutralised, and Git gets an allow-listed environment without API keys
+  (SSH agent and proxy variables only for fetch/pull). A fetch/pull is refused while the
+  repository's own config sets a remote `uploadpack`/`receivepack` or `core.gitProxy`.
+- A project `.zerostack/config.toml` statusline showing `git_status` or `git_changes` now needs
+  project-config trust before it can turn on the background host `git status` refresh.
+
 ## [1.9.4] - 2026-09-29
 
 Versions 1.9.0 to 1.9.2 were not published from this repository. The `v1.9.3` tag was created but

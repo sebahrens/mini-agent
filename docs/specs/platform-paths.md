@@ -113,6 +113,12 @@ configuration. Before trust, startup may merge only this exhaustive benign top-l
 `reserve_tokens`, `retry`, `show_cost_always`, `show_reasoning`, `show_tool_details`, `statusline`,
 the four `subagent_max_*` result/read limits, and `temperature`.
 
+`statusline` is benign only while none of its segments is `git_status` or `git_changes`. Those
+segments drive a background host-side `git status` refresh, which runs Git outside the model
+sandbox against repository content the model can author, so a project `statusline` that names one
+is treated as a sensitive key as a whole: until trusted, the user-global statusline (or the
+default) applies and the refresh stays off unless the user's own configuration asked for it.
+
 Every other key is sensitive, including unknown future keys and all provider/API-key, permission,
 sandbox, shell/editor, MCP, LSP, ACP, worktree, auto-update, and executable integration settings.
 Sensitive keys remain inert until the user approves a prompt that displays their names, the

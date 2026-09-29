@@ -146,11 +146,27 @@ pub struct GoalConfig {
     pub check_every_round: Option<bool>,
 }
 
+/// Statusline items that make the UI refresh `git status` on the host in the
+/// background. A project-local statusline that names one of them is a
+/// sensitive (trust-gated) project setting.
+pub const STATUSLINE_GIT_STATUS_ITEMS: &[&str] = &["git_changes", "git_status"];
+
 /// Status-bar statusline layout. Up to 3 lines, each an ordered list of segments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusLineConfig {
     #[serde(default)]
     pub lines: Vec<StatusLineLine>,
+}
+
+impl StatusLineConfig {
+    /// Whether any line shows a segment backed by a host `git status` refresh.
+    pub fn needs_git_status(&self) -> bool {
+        self.lines.iter().any(|line| {
+            line.segments
+                .iter()
+                .any(|segment| STATUSLINE_GIT_STATUS_ITEMS.contains(&segment.item.as_str()))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

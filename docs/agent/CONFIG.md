@@ -53,7 +53,10 @@ and permission-mode changes—remains inert until the user approves the exact
 canonical project path, config path, and SHA-256 of the file. Approval is
 stored in the private state root and is invalidated by a content change or a
 copied checkout. Headless and ACP startup never prompt; they apply only the
-benign subset and print a notice for ignored sensitive settings.
+benign subset and print a notice for ignored sensitive settings. A project
+`statusline` is benign unless it shows a `git_status` or `git_changes`
+segment: those run `git status` on the host in the background, so such a
+statusline needs the same approval.
 
 Trusted project specialist definitions and the append-only
 `.zerostack/agents/.notes.md` layer use this same content-and-path-bound trust

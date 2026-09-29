@@ -73,6 +73,9 @@ pub(crate) trait StdCommandCreationExt {
     #[cfg(windows)]
     fn spawn_guarded_until(&mut self, deadline: Instant) -> io::Result<Child>;
     fn status_guarded(&mut self) -> io::Result<ExitStatus>;
+    // Production callers are Windows-only since `/undo stash` moved to the
+    // hardened Git runner (mini-agent-93gx4).
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
     fn output_guarded(&mut self) -> io::Result<Output>;
 }
 

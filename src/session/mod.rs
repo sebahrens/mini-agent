@@ -851,7 +851,14 @@ impl Session {
             .run(
                 dir,
                 "status",
-                ["status", "--porcelain=v2", "--branch"],
+                // `dirty` still reports moved submodule commits but never
+                // spawns Git inside a (model-writable) nested repository.
+                [
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                    "--ignore-submodules=dirty",
+                ],
                 crate::git::runner::QUERY_LIMITS,
             )
             .await

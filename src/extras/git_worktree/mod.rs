@@ -328,7 +328,7 @@ where
     S: AsRef<OsStr>,
 {
     GitRunner::default()
-        .run(repo_path, operation, args, NETWORK_LIMITS)
+        .run_network(repo_path, operation, args, NETWORK_LIMITS)
         .await
 }
 

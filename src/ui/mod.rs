@@ -40,7 +40,6 @@ use crate::extras::mcp::McpClientManager;
 use crate::permission::SecurityMode;
 use crate::permission::ask::AskReceiver;
 use crate::permission::checker::PermCheck;
-use crate::process_creation::StdCommandCreationExt;
 use crate::provider::AnyAgent;
 use crate::session::{MessageRole, Session};
 use crate::ui::event_handler::ensure_agent;
@@ -781,13 +780,25 @@ pub(crate) fn move_goal_plan_to_workspace(
     }
 }
 
-pub(crate) fn git_stash_in_workspace(
+/// `/undo stash`: stash the workspace's changes through the hardened Git
+/// runner (identity-pinned executable, allow-listed environment, repository
+/// hooks, fsmonitor, and drivers neutralised), never a PATH-resolved `git`
+/// with the full process environment.
+pub(crate) async fn git_stash_in_workspace(
     workspace: &std::path::Path,
-) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .arg("stash")
-        .current_dir(workspace)
-        .output_guarded()
+) -> Result<crate::sandbox::CommandOutput, String> {
+    let runner = tokio::task::spawn_blocking(crate::git::runner::GitRunner::discover)
+        .await
+        .map_err(|_| "git stash failed: Git executable discovery failed".to_string())?
+        .map_err(|error| format!("git stash failed: {error}"))?;
+    runner
+        .run(
+            workspace,
+            "stash",
+            ["stash"],
+            crate::git::runner::LOCAL_MUTATION_LIMITS,
+        )
+        .await
 }
 
 /// Result of a background agent prebuild.

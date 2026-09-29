@@ -830,6 +830,22 @@ fn save_project_config_trust(path: &Path, store: &ProjectConfigTrustStore) -> st
 /// same reason `goal_judge_model` and `goal_checks` are sensitive keys.
 const SENSITIVE_FIELDS_IN_BENIGN_TABLES: &[(&str, &str)] = &[("goal", "judge")];
 
+/// Whether a raw project `statusline` table shows a segment that drives the
+/// background host `git status` refresh. Such a statusline is sensitive: the
+/// refresh runs Git on the host against repository content the model can
+/// author, so an untrusted clone must not be able to switch it on.
+fn statusline_value_needs_git_status(value: &toml::Value) -> bool {
+    value
+        .get("lines")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|line| line.get("segments").and_then(toml::Value::as_array))
+        .flatten()
+        .filter_map(|segment| segment.get("item").and_then(toml::Value::as_str))
+        .any(|item| crate::config::STATUSLINE_GIT_STATUS_ITEMS.contains(&item))
+}
+
 fn split_project_override(
     local_toml: &str,
 ) -> Result<(toml::Value, toml::Value, BTreeSet<String>), String> {
@@ -842,7 +858,9 @@ fn split_project_override(
     let mut sensitive = toml::map::Map::new();
     let mut sensitive_keys = BTreeSet::new();
     for (key, value) in table {
-        if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str()) {
+        if !BENIGN_PROJECT_CONFIG_KEYS.contains(&key.as_str())
+            || (key == "statusline" && statusline_value_needs_git_status(value))
+        {
             sensitive_keys.insert(key.clone());
             sensitive.insert(key.clone(), value.clone());
             continue;
@@ -1754,6 +1772,83 @@ mod project_config_trust_tests {
         assert_eq!(outcome, ProjectConfigTrustOutcome::AlreadyTrusted);
         assert_eq!(fresh.yolo, Some(true));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// mini-agent-93gx4: a cloned repository's statusline must not switch on
+    /// the background host `git status` refresh without trust.
+    #[test]
+    fn untrusted_project_statusline_with_git_status_does_not_set_needs_git_status() {
+        let (root, config_path, trust_path) = fixture("statusline-git");
+        std::fs::write(
+            &config_path,
+            "chat_left_margin = 5\n\
+             [[statusline.lines]]\n\
+             segments = [{ item = \"model\" }, { item = \"git_status\" }]\n",
+        )
+        .unwrap();
+
+        for (interactive, expected) in [
+            (false, ProjectConfigTrustOutcome::SkippedHeadless),
+            (true, ProjectConfigTrustOutcome::Declined),
+        ] {
+            let mut cfg = Config::default();
+            let outcome = apply_local_override_with_confirmation(
+                &mut cfg,
+                &config_path,
+                &trust_path,
+                interactive,
+                &|description| {
+                    assert!(description.contains("statusline"), "{description}");
+                    false
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(cfg.chat_left_margin, Some(5), "benign keys still apply");
+            assert!(
+                !cfg.statusline
+                    .as_ref()
+                    .is_some_and(crate::config::StatusLineConfig::needs_git_status),
+                "untrusted statusline must not enable the host git refresh"
+            );
+        }
+
+        let mut approved = Config::default();
+        assert_eq!(
+            apply_local_override_with_confirmation(
+                &mut approved,
+                &config_path,
+                &trust_path,
+                true,
+                &|_| true,
+            )
+            .unwrap(),
+            ProjectConfigTrustOutcome::Approved
+        );
+        assert!(
+            approved
+                .statusline
+                .as_ref()
+                .is_some_and(crate::config::StatusLineConfig::needs_git_status),
+            "a trusted project statusline keeps its git segments"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_statusline_without_git_status_segments_stays_benign() {
+        let (_root, _, sensitive) = split_project_override(
+            "[[statusline.lines]]\n\
+             segments = [{ item = \"model\" }, { item = \"git_branch\" }]\n",
+        )
+        .unwrap();
+        assert!(sensitive.is_empty(), "{sensitive:?}");
+        let (_, _, sensitive) = split_project_override(
+            "[[statusline.lines]]\n\
+             segments = [{ item = \"git_changes\" }]\n",
+        )
+        .unwrap();
+        assert!(sensitive.contains("statusline"), "{sensitive:?}");
     }
 
     #[test]

@@ -540,16 +540,13 @@ async fn handle_undo(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
             "working tree left untouched (use `/undo stash` to also git stash changes)",
         );
     } else {
-        match crate::ui::git_stash_in_workspace(ctx.workspace.root()) {
-            Ok(out) if out.status.success() => {
+        match crate::ui::git_stash_in_workspace(ctx.workspace.root()).await {
+            Ok(_) => {
                 write_ok(ctx.renderer, "git stash done");
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                write_error(ctx.renderer, format!("git stash failed: {}", stderr.trim()));
-            }
-            Err(e) => {
-                write_error(ctx.renderer, format!("git stash failed: {}", e));
+            // The runner already reports `git stash failed: <stderr>`.
+            Err(error) => {
+                write_error(ctx.renderer, error);
             }
         }
     }
