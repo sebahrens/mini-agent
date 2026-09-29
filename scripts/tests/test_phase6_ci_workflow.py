@@ -475,6 +475,60 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         ].split("- name:", 1)[0]
         self.assertIn("cargo test --locked --no-run", step)
 
+    @staticmethod
+    def matrix_features(body: str) -> list[str]:
+        block = body.split("        features:\n", 1)[1]
+        rows = []
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if not stripped.startswith("- "):
+                break
+            rows.append(stripped[2:].strip().strip('"'))
+        return rows
+
+    def test_windows_compiles_and_runs_every_hooks_row(self) -> None:
+        # mini-agent-2dp1m: a Windows-only hooks compile break was invisible
+        # to CI because no Windows job enabled `hooks`.
+        body = job_body(self.workflow, "windows-hooks-compile")
+        header = body.split("    steps:\n", 1)[0]
+        self.assertIn("runs-on: windows-latest", header)
+        self.assertIn("timeout-minutes:", header)
+        self.assertNotIn("continue-on-error", header)
+        rows = self.matrix_features(body)
+        test_rows = self.matrix_features(job_body(self.workflow, "test"))
+        hook_rows = [row for row in test_rows if "hooks" in row.split("--features", 1)[-1]]
+        self.assertTrue(hook_rows)
+        self.assertEqual(sorted(rows), sorted(hook_rows))
+        compile_step = body.split("name: Compile the Windows hooks feature suite", 1)[
+            1
+        ].split("- name:", 1)[0]
+        self.assertIn("shell: bash", compile_step)
+        self.assertIn("cargo test --locked ${{ matrix.features }} --no-run", compile_step)
+        run_step = body.split("name: Test Windows trusted hook tree termination", 1)[
+            1
+        ].split("- name:", 1)[0]
+        self.assertIn("shell: bash", run_step)
+        self.assertIn("hook_subprocess_windows_", run_step)
+        self.assertIn("-- --list", run_step)
+        self.assertIn('-lt 1', run_step)
+
+    def test_every_test_row_has_a_strict_linux_clippy_row(self) -> None:
+        # A test row compiles with warnings allowed, so a cfg-gated item that is
+        # dead on Linux under that exact feature set only fails under Clippy.
+        clippy = job_body(self.workflow, "clippy")
+        self.assertIn("runs-on: ubuntu-latest", clippy)
+        self.assertIn(
+            "cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings",
+            clippy,
+        )
+        clippy_rows = set(self.matrix_features(clippy))
+        test_rows = self.matrix_features(job_body(self.workflow, "test"))
+        self.assertGreater(len(test_rows), 5)
+        missing = [row for row in test_rows if row not in clippy_rows]
+        self.assertEqual([], missing, "test rows without a strict Clippy row")
+
     def test_hosted_platform_prerequisites_preserve_real_security_gates(self) -> None:
         linux = job_body(self.workflow, "linux-sandbox-policy")
         self.assertIn("bash scripts/install-ci-bubblewrap.sh", linux)
