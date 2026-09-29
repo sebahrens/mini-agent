@@ -1015,6 +1015,31 @@ mod slash_picker_contract {
         assert!(matches!(input.picker.as_ref(), Some(Picker::Prefixed(p, "/queue ")) if p.active));
     }
 
+    /// mini-agent-cuux6: argument pickers opened from the command picker
+    /// inherit monochrome mode.
+    #[test]
+    fn sub_pickers_inherit_monochrome_mode() {
+        let mut input = InputEditor::new();
+        input.set_monochrome(true);
+        input.set_theme_names(vec!["dark".to_string()]);
+        typed(&mut input, "/theme");
+        press(&mut input, KeyCode::Enter, KeyModifiers::NONE);
+        let Some(Picker::Prefixed(picker, "/theme ")) = input.picker.as_ref() else {
+            panic!("/theme opens its argument picker");
+        };
+        assert!(picker.is_monochrome());
+
+        let mut input = InputEditor::new();
+        input.set_monochrome(true);
+        input.set_quick_model_names(vec!["fast".to_string()]);
+        typed(&mut input, "/model");
+        press(&mut input, KeyCode::Tab, KeyModifiers::NONE);
+        let Some(Picker::Models(picker)) = input.picker.as_ref() else {
+            panic!("/model opens the model picker");
+        };
+        assert!(picker.is_monochrome());
+    }
+
     fn input_with_mode(mode: crate::permission::SecurityMode) -> InputEditor {
         use crate::permission::PermissionConfigs;
         use crate::permission::checker::PermissionChecker;

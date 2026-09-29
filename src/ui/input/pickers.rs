@@ -140,7 +140,10 @@ impl InputEditor {
                 };
                 let (handled, replacement) =
                     handlers::handle_command_key(&mut self.buffer, &mut self.cursor, &ctx, p, key);
-                if let Some(new) = replacement {
+                if let Some(mut new) = replacement {
+                    // A sub-picker opened from the command picker draws in
+                    // the same colour mode as every other picker.
+                    new.set_monochrome(self.monochrome);
                     self.picker = Some(new);
                 }
                 handled

@@ -177,6 +177,11 @@ impl ListPicker {
         self.monochrome = monochrome;
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_monochrome(&self) -> bool {
+        self.monochrome
+    }
+
     pub fn set_items(&mut self, items: Vec<String>) {
         self.items = items;
         self.descriptions.clear();

@@ -70,6 +70,11 @@ impl ModelsPicker {
         self.monochrome = monochrome;
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_monochrome(&self) -> bool {
+        self.monochrome
+    }
+
     pub fn set_groups(&mut self, quick: Vec<String>, provider: Vec<String>) {
         self.quick = quick;
         self.provider = provider;
