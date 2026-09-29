@@ -18,6 +18,8 @@ pub(crate) mod settings;
 
 #[cfg(feature = "goal")]
 pub(crate) mod goal;
+#[cfg(all(test, feature = "loop"))]
+mod loop_command_tests;
 #[cfg(test)]
 mod session_restore_tests;
 

@@ -2113,9 +2113,11 @@ mod one_time_image {
         CFDictionary, CFDictionaryGetValueIfPresent, CFDictionaryRef,
     };
     #[cfg(test)]
+    use core_foundation::number::CFNumber;
+    #[cfg(test)]
     use core_foundation::string::{CFString, CFStringRef};
     #[cfg(test)]
-    use core_foundation::url::CFURL;
+    use core_foundation::url::{CFURL, CFURLRef};
     #[cfg(test)]
     use security_framework::os::macos::code_signing::{Flags, SecRequirement, SecStaticCode};
     #[cfg(test)]
@@ -2168,6 +2170,14 @@ mod one_time_image {
     // Eight exact 20-byte CDHash clauses require at most 428 ASCII bytes, including separators.
     #[cfg(test)]
     const MAX_CODE_IDENTITY_REQUIREMENT_BYTES: usize = 512;
+    // Mach-O universal ("fat") headers are big-endian on disk; thin 64-bit images start with the
+    // little-endian MH_MAGIC_64 bytes.
+    #[cfg(test)]
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    #[cfg(test)]
+    const FAT_MAGIC_64: u32 = 0xcafe_babf;
+    #[cfg(test)]
+    const MAX_CODE_IDENTITY_ARCHITECTURES: usize = 4;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct FileIdentity {
@@ -2228,7 +2238,15 @@ mod one_time_image {
             flags: SecCSFlags,
             information: *mut CFDictionaryRef,
         ) -> OSStatus;
+        fn SecStaticCodeCreateWithPathAndAttributes(
+            path: CFURLRef,
+            flags: SecCSFlags,
+            attributes: CFDictionaryRef,
+            static_code: *mut SecStaticCodeRef,
+        ) -> OSStatus;
         static kSecCodeInfoCdHashes: CFStringRef;
+        static kSecCodeAttributeArchitecture: CFStringRef;
+        static kSecCodeAttributeSubarchitecture: CFStringRef;
     }
 
     #[cfg(test)]
@@ -2246,55 +2264,29 @@ mod one_time_image {
             })?;
             let code = SecStaticCode::from_path(&url, Flags::NONE)
                 .map_err(|_| permission_denied("worker static code object could not be created"))?;
-            let mut signing_information = std::ptr::null();
-            let information_status = unsafe {
-                // SAFETY: `code` is a live static-code object and `signing_information` points to
-                // writable storage for the create-rule dictionary returned by Security.framework.
-                SecCodeCopySigningInformation(
-                    code.as_concrete_TypeRef(),
-                    Flags::NONE.bits(),
-                    &mut signing_information,
-                )
-            };
-            require_security_success(
-                information_status,
-                "worker signing identity was unavailable",
-            )?;
-            if signing_information.is_null() {
-                return Err(permission_denied("worker signing identity was unavailable"));
+
+            // Signing information describes one architecture only: a universal image carries an
+            // independently signed slice per architecture, each with its own CDHashes. The exact
+            // requirement below is checked against every slice, so it must name the CDHashes of
+            // every slice or a genuine universal binary (such as /bin/ls) never validates.
+            let architectures = universal_architectures(file)?;
+            let mut cdhashes = Vec::new();
+            if architectures.is_empty() {
+                cdhashes = signing_cdhashes(&code)?;
+            } else {
+                for (cpu_type, cpu_subtype) in architectures {
+                    let slice = static_code_for_architecture(&url, cpu_type, cpu_subtype)?;
+                    for cdhash in signing_cdhashes(&slice)? {
+                        if cdhashes.contains(&cdhash) {
+                            return Err(permission_denied(
+                                "worker signing identity contained duplicate hashes",
+                            ));
+                        }
+                        cdhashes.push(cdhash);
+                    }
+                }
+                cdhashes.sort();
             }
-            let information: CFDictionary = unsafe {
-                // SAFETY: successful `SecCodeCopySigningInformation` returns a retained
-                // dictionary. It remains untyped until the one documented value read below.
-                CFDictionary::wrap_under_create_rule(signing_information)
-            };
-            let cdhashes_key_ref = unsafe {
-                // SAFETY: Security.framework exports `kSecCodeInfoCdHashes` as an immortal
-                // CFString constant on every supported macOS version.
-                kSecCodeInfoCdHashes
-            };
-            if cdhashes_key_ref.is_null() {
-                return Err(permission_denied("worker signing identity was unavailable"));
-            }
-            let mut cdhashes_value = std::ptr::null();
-            let cdhashes_present = unsafe {
-                // SAFETY: `information` is a live CFDictionary and the checked framework key is
-                // a valid CFString. The out-pointer receives a borrowed dictionary value.
-                CFDictionaryGetValueIfPresent(
-                    information.as_concrete_TypeRef(),
-                    cdhashes_key_ref.cast(),
-                    &mut cdhashes_value,
-                )
-            };
-            if cdhashes_present == 0 || cdhashes_value.is_null() {
-                return Err(permission_denied("worker signing identity was unavailable"));
-            }
-            let cdhashes = unsafe {
-                // SAFETY: Security.framework documents this dictionary value as a CoreFoundation
-                // object. The parser validates its concrete type and every element type before
-                // using any type-specific accessors.
-                parse_cdhash_array(cdhashes_value.cast())
-            }?;
 
             // Signing information is only an untrusted candidate until the same static-code
             // object validates against an exact requirement derived from every returned CDHash.
@@ -2319,6 +2311,154 @@ mod one_time_image {
 
             verify_code_identity_path(path, file, expected)?;
             Ok(Self { cdhashes })
+        }
+    }
+
+    /// The `(cputype, cpusubtype)` of every slice of a universal Mach-O image, or no entries for
+    /// a thin image. The header is read from the pinned descriptor, not the path.
+    #[cfg(test)]
+    fn universal_architectures(file: &mut std::fs::File) -> io::Result<Vec<(i32, i32)>> {
+        fn be_u32(bytes: &[u8]) -> u32 {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+        let entry_len = match be_u32(&header[..4]) {
+            FAT_MAGIC => 20,
+            FAT_MAGIC_64 => 32,
+            _ => return Ok(Vec::new()),
+        };
+        let count = usize::try_from(be_u32(&header[4..]))
+            .ok()
+            .filter(|count| (1..=MAX_CODE_IDENTITY_ARCHITECTURES).contains(count))
+            .ok_or_else(|| {
+                permission_denied("worker universal image architecture count was invalid")
+            })?;
+        let mut entries = vec![0u8; count * entry_len];
+        file.read_exact(&mut entries)?;
+        let mut architectures = Vec::with_capacity(count);
+        for entry in entries.chunks_exact(entry_len) {
+            let architecture = (be_u32(&entry[..4]) as i32, be_u32(&entry[4..8]) as i32);
+            if architectures.contains(&architecture) {
+                return Err(permission_denied(
+                    "worker universal image repeated an architecture",
+                ));
+            }
+            architectures.push(architecture);
+        }
+        Ok(architectures)
+    }
+
+    #[cfg(test)]
+    #[allow(unsafe_code)]
+    fn static_code_for_architecture(
+        url: &CFURL,
+        cpu_type: i32,
+        cpu_subtype: i32,
+    ) -> io::Result<SecStaticCode> {
+        let (architecture_key, subarchitecture_key) = unsafe {
+            // SAFETY: Security.framework exports both attribute keys as immortal CFString
+            // constants; they are checked for NULL before being wrapped under the get rule.
+            (
+                kSecCodeAttributeArchitecture,
+                kSecCodeAttributeSubarchitecture,
+            )
+        };
+        if architecture_key.is_null() || subarchitecture_key.is_null() {
+            return Err(permission_denied(
+                "worker static code architecture attributes were unavailable",
+            ));
+        }
+        let attributes = CFDictionary::from_CFType_pairs(&[
+            (
+                unsafe { CFString::wrap_under_get_rule(architecture_key) },
+                CFNumber::from(cpu_type),
+            ),
+            (
+                unsafe { CFString::wrap_under_get_rule(subarchitecture_key) },
+                CFNumber::from(cpu_subtype),
+            ),
+        ]);
+        let mut slice = std::ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: `url` and `attributes` are live CoreFoundation objects and `slice` points to
+            // writable storage for the create-rule static-code reference.
+            SecStaticCodeCreateWithPathAndAttributes(
+                url.as_concrete_TypeRef(),
+                Flags::NONE.bits(),
+                attributes.as_concrete_TypeRef(),
+                &mut slice,
+            )
+        };
+        require_security_success(
+            status,
+            "worker static code architecture could not be selected",
+        )?;
+        if slice.is_null() {
+            return Err(permission_denied(
+                "worker static code architecture could not be selected",
+            ));
+        }
+        Ok(unsafe {
+            // SAFETY: a successful create call returns one retained static-code reference.
+            SecStaticCode::wrap_under_create_rule(slice)
+        })
+    }
+
+    /// The CDHashes Security.framework reports for one static-code object (one architecture).
+    #[cfg(test)]
+    #[allow(unsafe_code)]
+    fn signing_cdhashes(code: &SecStaticCode) -> io::Result<Vec<Vec<u8>>> {
+        let mut signing_information = std::ptr::null();
+        let information_status = unsafe {
+            // SAFETY: `code` is a live static-code object and `signing_information` points to
+            // writable storage for the create-rule dictionary returned by Security.framework.
+            SecCodeCopySigningInformation(
+                code.as_concrete_TypeRef(),
+                Flags::NONE.bits(),
+                &mut signing_information,
+            )
+        };
+        require_security_success(
+            information_status,
+            "worker signing identity was unavailable",
+        )?;
+        if signing_information.is_null() {
+            return Err(permission_denied("worker signing identity was unavailable"));
+        }
+        let information: CFDictionary = unsafe {
+            // SAFETY: successful `SecCodeCopySigningInformation` returns a retained
+            // dictionary. It remains untyped until the one documented value read below.
+            CFDictionary::wrap_under_create_rule(signing_information)
+        };
+        let cdhashes_key_ref = unsafe {
+            // SAFETY: Security.framework exports `kSecCodeInfoCdHashes` as an immortal
+            // CFString constant on every supported macOS version.
+            kSecCodeInfoCdHashes
+        };
+        if cdhashes_key_ref.is_null() {
+            return Err(permission_denied("worker signing identity was unavailable"));
+        }
+        let mut cdhashes_value = std::ptr::null();
+        let cdhashes_present = unsafe {
+            // SAFETY: `information` is a live CFDictionary and the checked framework key is
+            // a valid CFString. The out-pointer receives a borrowed dictionary value.
+            CFDictionaryGetValueIfPresent(
+                information.as_concrete_TypeRef(),
+                cdhashes_key_ref.cast(),
+                &mut cdhashes_value,
+            )
+        };
+        if cdhashes_present == 0 || cdhashes_value.is_null() {
+            return Err(permission_denied("worker signing identity was unavailable"));
+        }
+        unsafe {
+            // SAFETY: Security.framework documents this dictionary value as a CoreFoundation
+            // object. The parser validates its concrete type and every element type before
+            // using any type-specific accessors.
+            parse_cdhash_array(cdhashes_value.cast())
         }
     }
 
@@ -3903,8 +4043,24 @@ mod one_time_image {
             assert!(requirement.len() <= MAX_CODE_IDENTITY_REQUIREMENT_BYTES);
         }
 
+        /// The last byte of the first code page of the image's first architecture. Every byte of
+        /// that page is covered by the slice's page hash, unlike the padding between a universal
+        /// header and its first slice, which no signature covers.
+        fn first_signed_page_byte(bytes: &[u8]) -> usize {
+            let word = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+            let slice_offset = match word(0) {
+                FAT_MAGIC => word(16) as usize,
+                FAT_MAGIC_64 => u64::from_be_bytes(bytes[16..24].try_into().unwrap()) as usize,
+                _ => 0,
+            };
+            slice_offset + 4_095
+        }
+
+        // mini-agent-6ap52: /bin/ls is a universal (x86_64 + arm64e) binary. Signing information
+        // reports one slice's CDHash while the strict check covers every slice, so before the
+        // identity named every slice's CDHash these real-signature tests failed on every host and
+        // were ignored, leaving the tamper test below passing vacuously.
         #[test]
-        #[ignore = "requires a host whose Security.framework trusts sealed system binaries"]
         fn code_identity_matches_a_signed_system_source_and_exact_one_time_copy() {
             let root = TestRoot::new();
             let source = Path::new("/bin/ls");
@@ -3914,6 +4070,10 @@ mod one_time_image {
             let image_identity = code_identity_for_path(image.image_path()).unwrap();
 
             assert_eq!(source_identity, image_identity);
+            assert!(
+                source_identity.cdhashes.len() >= 2,
+                "a universal system binary names one CDHash per slice: {source_identity:?}"
+            );
         }
 
         #[test]
@@ -3922,8 +4082,11 @@ mod one_time_image {
             let source = Path::new("/bin/ls");
             let image = OneTimeWorkerImage::prepare_from(source, &root.path).unwrap();
             let image_path = image.image_path();
+            // The rejection below is meaningful only because the untampered copy validates.
+            code_identity_for_path(image_path).unwrap();
             let mut bytes = std::fs::read(image_path).unwrap();
-            let changed = bytes.len().min(4_096).saturating_sub(1);
+            let changed = first_signed_page_byte(&bytes);
+            assert!(changed < bytes.len());
             bytes[changed] ^= 1;
             std::fs::set_permissions(image_path, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::write(image_path, bytes).unwrap();
@@ -3943,12 +4106,23 @@ mod one_time_image {
         }
 
         #[test]
-        #[ignore = "requires a host whose Security.framework trusts sealed system binaries"]
         fn code_identity_distinguishes_different_signed_system_executables() {
             let first = code_identity_for_path(Path::new("/bin/ls")).unwrap();
             let second = code_identity_for_path(Path::new("/bin/sleep")).unwrap();
 
             assert_ne!(first, second);
+        }
+
+        #[test]
+        fn code_identity_rejects_an_implausible_universal_header() {
+            let root = TestRoot::new();
+            let mut header = FAT_MAGIC.to_be_bytes().to_vec();
+            header.extend_from_slice(&((MAX_CODE_IDENTITY_ARCHITECTURES as u32) + 1).to_be_bytes());
+            header.resize(4_096, 0);
+            let image = root.source("oversized-universal", &header);
+
+            let error = code_identity_for_path(&image).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         }
 
         #[test]

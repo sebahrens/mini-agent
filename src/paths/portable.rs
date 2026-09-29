@@ -1,13 +1,22 @@
+// Whole-path validation and containment serve only the JS audit and skill
+// stores (`skills` implies `js`), and collision keys only MCP credentials and
+// skill imports; builds without those consumers compile them out rather than
+// carrying dead policy code.
+#[cfg(any(feature = "js", test))]
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+#[cfg(any(feature = "mcp", feature = "skills", test))]
 use unicode_normalization::UnicodeNormalization;
 
 /// The strictest common component limits used by supported filesystems.
 pub const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
 pub const MAX_PORTABLE_COMPONENT_UTF16_UNITS: usize = 255;
 /// Linux's common `PATH_MAX` is stricter than the Windows extended-path limit.
+/// Only whole relative paths (skill imports) are length-checked.
+#[cfg(any(feature = "skills", test))]
 pub const MAX_PORTABLE_PATH_BYTES: usize = 4096;
+#[cfg(any(feature = "skills", test))]
 pub const MAX_PORTABLE_PATH_UTF16_UNITS: usize = 32_767;
 
 const OPAQUE_IDENTITY_VERSION: &[u8] = b"zerostack-opaque-name-v1";
@@ -18,6 +27,7 @@ pub enum PortablePathError {
     EmptyComponent,
     #[error("dot path components are not portable")]
     DotComponent,
+    #[cfg(any(feature = "js", test))]
     #[error("parent traversal is not allowed")]
     ParentTraversal,
     #[error("absolute, drive-prefixed, and UNC paths are not portable components")]
@@ -43,6 +53,7 @@ pub enum PortablePathError {
         utf8_bytes: usize,
         utf16_units: usize,
     },
+    #[cfg(any(feature = "skills", test))]
     #[error(
         "path is too long ({utf8_bytes} UTF-8 bytes, {utf16_units} UTF-16 units; maxima are 4096 and 32767)"
     )]
@@ -50,14 +61,18 @@ pub enum PortablePathError {
         utf8_bytes: usize,
         utf16_units: usize,
     },
+    #[cfg(any(feature = "skills", test))]
     #[error("path contains a non-UTF-8 component")]
     NonUtf8Component,
     #[error("digest filename extension must be a short ASCII alphanumeric identifier")]
     InvalidExtension,
+    #[cfg(any(feature = "js", test))]
     #[error("candidate path is outside the requested root")]
     OutsideRoot,
+    #[cfg(any(feature = "js", test))]
     #[error("path traverses a symbolic link, junction, or reparse point at {path:?}")]
     LinkTraversal { path: PathBuf },
+    #[cfg(any(feature = "js", test))]
     #[error("could not inspect {path:?}: {message}")]
     Filesystem { path: PathBuf, message: String },
 }
@@ -116,6 +131,7 @@ pub fn validate_portable_component(component: &str) -> Result<(), PortablePathEr
 ///
 /// NFKC is applied before and after full Unicode case folding so canonically
 /// equivalent names and case variants collide even on a case-sensitive host.
+#[cfg(any(feature = "mcp", feature = "skills", test))]
 pub fn collision_key(component: &str) -> Result<String, PortablePathError> {
     validate_portable_component(component)?;
     let normalized: String = component.nfkc().collect();
@@ -160,6 +176,7 @@ pub fn digest_filename(
 }
 
 /// Validate a relative path component-by-component, independent of host syntax.
+#[cfg(any(feature = "skills", test))]
 pub fn validate_portable_relative_path(path: &Path) -> Result<(), PortablePathError> {
     let raw = path.to_str().ok_or(PortablePathError::NonUtf8Component)?;
     if raw.is_empty() {
@@ -193,6 +210,7 @@ pub fn validate_portable_relative_path(path: &Path) -> Result<(), PortablePathEr
 }
 
 /// Join a validated portable relative path and prove lexical containment.
+#[cfg(any(feature = "skills", test))]
 pub fn contained_join(root: &Path, relative: &Path) -> Result<PathBuf, PortablePathError> {
     validate_portable_relative_path(relative)?;
     let relative = relative
@@ -207,6 +225,7 @@ pub fn contained_join(root: &Path, relative: &Path) -> Result<PathBuf, PortableP
 }
 
 /// Prove containment using path components, not string prefixes.
+#[cfg(any(feature = "js", test))]
 pub fn ensure_contained(root: &Path, candidate: &Path) -> Result<(), PortablePathError> {
     let remainder = candidate
         .strip_prefix(root)
@@ -228,6 +247,7 @@ pub fn ensure_contained(root: &Path, candidate: &Path) -> Result<(), PortablePat
 ///
 /// Mutation code must combine this policy with the race-resistant secure
 /// filesystem contract; this preflight helper alone is not a write primitive.
+#[cfg(any(feature = "js", test))]
 pub fn ensure_no_link_traversal(root: &Path, candidate: &Path) -> Result<(), PortablePathError> {
     ensure_contained(root, candidate)?;
     let mut current = root.to_path_buf();
@@ -257,6 +277,7 @@ pub fn ensure_no_link_traversal(root: &Path, candidate: &Path) -> Result<(), Por
     Ok(())
 }
 
+#[cfg(any(feature = "js", test))]
 fn inspect_link(path: &Path) -> Result<(), PortablePathError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if is_link_or_reparse(&metadata) => Err(PortablePathError::LinkTraversal {

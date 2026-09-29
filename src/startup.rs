@@ -315,7 +315,6 @@ pub(crate) struct Startup {
     pub cli: Cli,
     pub cfg: Config,
     // Startup-owned source of truth shared by persistent artifact owners.
-    #[allow(dead_code)]
     pub paths: AppPaths,
     pub workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     pub is_first_startup: bool,
@@ -1278,13 +1277,11 @@ impl Startup {
             // config is trusted (context::prompts), and the checker refuses
             // any directive that would raise the mode above the user's
             // CLI/config selection, so this can only narrow authority.
-            if let Some(name) = &self.context.current_prompt_name
-                && let Ok(paths) = crate::paths::process_paths()
-            {
+            if let Some(name) = &self.context.current_prompt_name {
                 guard.set_prompt_grant_offer(crate::context::prompts::prompt_grant_offer(
                     &self.context.prompts,
                     name,
-                    &paths,
+                    &self.paths,
                 ));
             }
             if let Some(name) = &self.context.current_prompt_name

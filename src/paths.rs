@@ -1134,18 +1134,19 @@ mod windows_workspace_binding_tests {
     }
 }
 
-// These shared path-policy primitives are exercised by the acceptance suite
-// before all of their production consumers land.
-#[allow(dead_code)]
 pub mod portable;
 
-#[allow(unused_imports)]
-pub use portable::{
-    MAX_PORTABLE_COMPONENT_BYTES, MAX_PORTABLE_COMPONENT_UTF16_UNITS, MAX_PORTABLE_PATH_BYTES,
-    MAX_PORTABLE_PATH_UTF16_UNITS, PortablePathError, collision_key, contained_join,
-    ensure_contained, ensure_no_link_traversal, validate_portable_relative_path,
-};
+#[cfg(any(feature = "mcp", test))]
+pub use portable::collision_key;
+#[cfg(any(feature = "js", test))]
+pub use portable::ensure_no_link_traversal;
 pub use portable::{digest_filename, opaque_name, validate_portable_component};
+// Re-exported for the portable-filename acceptance suite only; production
+// callers reach these through `paths::portable`.
+#[cfg(test)]
+pub use portable::{
+    PortablePathError, contained_join, ensure_contained, validate_portable_relative_path,
+};
 
 const APP_COMPONENT: &str = crate::product::LEGACY_APP_COMPONENT;
 const MIGRATION_VERSION: u32 = 1;
@@ -1536,7 +1537,7 @@ impl AppPaths {
         Ok(paths)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
@@ -1690,7 +1691,7 @@ impl AppPaths {
             .join("trusted-project-configs.json")
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(feature = "mcp", test))]
     pub fn mcp_oauth_dir(&self) -> PathBuf {
         self.credentials_dir.join("mcp-oauth")
     }
