@@ -557,10 +557,16 @@ pub(crate) fn spawn_event_thread(
                         });
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        let _ = user_tx.blocking_send(UserEvent::MouseDrag { row: m.row });
+                        let _ = user_tx.blocking_send(UserEvent::MouseDrag {
+                            row: m.row,
+                            col: m.column,
+                        });
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        let _ = user_tx.blocking_send(UserEvent::MouseUp { row: m.row });
+                        let _ = user_tx.blocking_send(UserEvent::MouseUp {
+                            row: m.row,
+                            col: m.column,
+                        });
                     }
                     _ => {}
                 },

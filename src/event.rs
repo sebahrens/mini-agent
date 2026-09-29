@@ -183,9 +183,11 @@ pub enum UserEvent {
     },
     MouseDrag {
         row: u16,
+        col: u16,
     },
     MouseUp {
         row: u16,
+        col: u16,
     },
     /// Leave the TUI in an orderly way (termination signal, lost terminal):
     /// stop any run, save the session and restore the terminal.

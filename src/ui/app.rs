@@ -26,8 +26,8 @@ use crate::ui::input::{InputEditor, Picker};
 use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::pickers::rewind::RewindOutcome;
 use crate::ui::renderer::{
-    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, copy_to_clipboard,
-    read_from_clipboard,
+    self as renderer_mod, ChainPrompt, ClipboardCopyOutcome, Renderer, SelectionPoint,
+    copy_to_clipboard, read_from_clipboard,
 };
 use crate::ui::slash::{apply_prompt_model, handle_compress, handle_slash};
 use crate::ui::state::{
@@ -176,7 +176,7 @@ pub(crate) fn clipboard_shortcut(
 
 /// Whether releasing the left button should copy the transcript selection.
 /// Only a real drag copies; a plain click (no movement, one line) does not.
-fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> bool {
+fn mouse_up_copies<P: PartialEq>(dragged: bool, start: Option<P>, end: Option<P>) -> bool {
     match (start, end) {
         (Some(start), Some(end)) => dragged || start != end,
         _ => false,
@@ -185,15 +185,17 @@ fn mouse_up_copies(dragged: bool, start: Option<usize>, end: Option<usize>) -> b
 
 #[cfg(test)]
 mod mouse_selection_tests {
-    use super::mouse_up_copies;
+    use super::{SelectionPoint, mouse_up_copies};
 
     #[test]
     fn plain_click_does_not_copy_but_a_drag_does() {
-        assert!(!mouse_up_copies(false, Some(4), Some(4)));
-        assert!(mouse_up_copies(true, Some(4), Some(4)));
-        assert!(mouse_up_copies(false, Some(4), Some(6)));
-        assert!(mouse_up_copies(true, Some(6), Some(4)));
-        assert!(!mouse_up_copies(true, None, None));
+        let at = |line, col| Some(SelectionPoint::new(line, col));
+        assert!(!mouse_up_copies(false, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(true, at(4, 3), at(4, 3)));
+        assert!(mouse_up_copies(false, at(4, 3), at(6, 0)));
+        assert!(mouse_up_copies(false, at(4, 3), at(4, 9)));
+        assert!(mouse_up_copies(true, at(6, 0), at(4, 3)));
+        assert!(!mouse_up_copies::<SelectionPoint>(true, None, None));
     }
 }
 
@@ -1041,6 +1043,12 @@ impl<'a> App<'a> {
                     self.handle_btw_event(bev)?;
                     self.refresh()?;
                 }
+                _ = tokio::time::sleep_until(
+                    self.renderer.notice_deadline().map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+                ), if self.renderer.notice_deadline().is_some() => {
+                    // A transient notice expired; the redraw clears it.
+                    self.refresh()?;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)), if self.run.is_running => {
                     if self.renderer.paint_pending_chat()?
                         && self.input.picker.as_ref().is_some_and(|picker| picker.active())
@@ -1169,25 +1177,28 @@ impl<'a> App<'a> {
                             }
                         });
                     } else {
+                        let point = SelectionPoint::new(idx, self.renderer.chat_text_col(col));
                         self.renderer.selection_active = true;
-                        self.renderer.selection_start = Some(idx);
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_start = Some(point);
+                        self.renderer.selection_end = Some(point);
                         self.renderer.selection_dragged = false;
                     }
                 }
             }
-            UserEvent::MouseDrag { row } => {
+            UserEvent::MouseDrag { row, col } => {
                 if self.renderer.selection_active {
                     self.renderer.selection_dragged = true;
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                 }
             }
-            UserEvent::MouseUp { row } => {
+            UserEvent::MouseUp { row, col } => {
                 if self.renderer.selection_active {
                     if let Some(idx) = self.renderer.buffer_line_at_row(row) {
-                        self.renderer.selection_end = Some(idx);
+                        self.renderer.selection_end =
+                            Some(SelectionPoint::new(idx, self.renderer.chat_text_col(col)));
                     }
                     if mouse_up_copies(
                         self.renderer.selection_dragged,
@@ -1301,18 +1312,20 @@ impl<'a> App<'a> {
             return Ok(());
         };
         match copy_to_clipboard(&text).await {
+            // The outcome is a transient status-line notice: copying must not
+            // grow the transcript it is copying from.
             Ok(ClipboardCopyOutcome::Confirmed) => {
-                self.renderer.write_line("copied selection", Color::Green)?;
+                self.renderer.show_notice("copied selection", Color::Green);
                 self.renderer.clear_selection();
             }
             Ok(ClipboardCopyOutcome::FallbackRequested) => {
                 self.renderer
-                    .write_line("copy requested through terminal", Color::Green)?;
+                    .show_notice("copy requested through terminal", Color::Green);
                 self.renderer.clear_selection();
             }
             Err(error) => {
                 self.renderer
-                    .write_line(&format!("copy to clipboard failed: {error}"), C_ERROR)?;
+                    .show_notice(&format!("copy to clipboard failed: {error}"), C_ERROR);
                 self.renderer.clear_selection();
             }
         }
