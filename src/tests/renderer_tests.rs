@@ -871,3 +871,70 @@ fn picker_floor_row_rises_with_the_statusline() {
     r.set_statusline_height(3);
     assert_eq!(r.picker_floor_row() + 2, one_line);
 }
+
+mod permission_prompt_layout_tests {
+    use crate::ui::renderer::{prompt_block_rows, prompt_max_rows};
+    use crate::ui::utils::display_width;
+
+    const OPTIONS: &str = "  (y) allow once  (n) deny";
+
+    #[test]
+    fn a_long_path_wraps_instead_of_being_clipped() {
+        let header = "[permission] edit: /home/user/projects/app/src/components/forms/Input.tsx";
+        let rows = prompt_block_rows(header, OPTIONS, 30, 6);
+        assert!(rows.iter().all(|row| display_width(row) <= 30), "{rows:?}");
+        assert_eq!(rows.last().unwrap(), OPTIONS);
+        assert_eq!(rows[..rows.len() - 1].concat(), header);
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_budget_keeps_its_file_name() {
+        let header = format!("[permission] edit: /{}/Input.tsx", "deep/".repeat(60));
+        let rows = prompt_block_rows(&header, OPTIONS, 40, 3);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[..2].concat().ends_with("/Input.tsx"), "{rows:?}");
+        assert!(rows[..2].concat().contains('…'));
+    }
+
+    #[test]
+    fn a_multi_line_script_is_summarised_never_written_raw() {
+        let script = (1..=40)
+            .map(|n| format!("echo line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let header = format!("[permission] bash: cat <<'END'\n{script}\nEND");
+        let rows = prompt_block_rows(&header, OPTIONS, 60, 6);
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(rows.iter().all(|row| !row.contains('\n')));
+        assert!(rows.iter().all(|row| display_width(row) <= 60));
+        assert_eq!(rows[0], "[permission] bash: cat <<'END'");
+        let note = &rows[4];
+        assert!(note.contains("more line(s)"), "{note}");
+        assert!(note.contains("scroll up"), "{note}");
+        assert_eq!(rows[5], OPTIONS);
+    }
+
+    #[test]
+    fn control_sequences_in_a_request_are_stripped() {
+        let rows = prompt_block_rows(
+            "[permission] bash: ls\x1b[2J\x1b]0;x\x07 -la",
+            OPTIONS,
+            80,
+            4,
+        );
+        assert_eq!(rows[0], "[permission] bash: ls -la");
+    }
+
+    #[test]
+    fn a_short_request_keeps_the_classic_two_rows() {
+        let rows = prompt_block_rows("[permission] read: /a.rs", OPTIONS, 80, 6);
+        assert_eq!(rows, ["[permission] read: /a.rs", OPTIONS]);
+    }
+
+    #[test]
+    fn the_prompt_never_takes_most_of_the_screen() {
+        assert_eq!(prompt_max_rows(3), 2);
+        assert_eq!(prompt_max_rows(20), 8);
+        assert_eq!(prompt_max_rows(200), 12);
+    }
+}

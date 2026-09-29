@@ -176,7 +176,7 @@ pub async fn handle_agent_event(
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let line = format!(
                 "◈ {}",
-                crate::ui::utils::format_tool_call_summary(&name, &args)
+                crate::ui::utils::format_tool_call_display(&name, &args)
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
@@ -190,7 +190,7 @@ pub async fn handle_agent_event(
             save_session_if_settled(ui.session, ui.cli, run, renderer)?;
             let line = format!(
                 "⌥ {}",
-                crate::ui::utils::format_tool_call_summary(&name, &args)
+                crate::ui::utils::format_tool_call_display(&name, &args)
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }

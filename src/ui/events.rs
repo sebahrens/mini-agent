@@ -74,17 +74,19 @@ pub fn render_session(
                 }
             }
             MessageRole::ToolCall => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::Tool, format!("◈ {}", line));
-                }
+                feed.push_line(
+                    BlockStyle::Tool,
+                    format!("◈ {}", replayed_tool_call(&msg.content)),
+                );
             }
             MessageRole::ToolResult => {
                 render_tool_result_to_feed(feed, &msg.content, cfg)?;
             }
             MessageRole::SubagentToolCall => {
-                for line in msg.content.lines() {
-                    feed.push_line(BlockStyle::Tool, format!("⌥ {}", line));
-                }
+                feed.push_line(
+                    BlockStyle::Tool,
+                    format!("⌥ {}", replayed_tool_call(&msg.content)),
+                );
             }
         }
         feed.push_line(BlockStyle::Plain, "");
@@ -260,6 +262,12 @@ pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
     );
     feed.push_line(BlockStyle::Plain, "");
     Ok(())
+}
+
+/// A stored tool-call summary replayed as one transcript row: a multi-line
+/// script shows its first line and a line/char count, like the live view.
+fn replayed_tool_call(content: &str) -> String {
+    crate::ui::utils::compact_multiline(&sanitize_output(content), 240)
 }
 
 /// Spaces a tab expands to. A raw tab moves the cursor to the terminal's next

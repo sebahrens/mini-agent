@@ -153,6 +153,84 @@ pub(crate) fn input_top_row(rows: u16, reserve: u16, visible_line_count: usize) 
         .saturating_add(1)
 }
 
+/// Most rows a permission/chain prompt may take from a bottom area with
+/// `available_rows` rows above the status line: enough to read a wrapped
+/// path or the start of a script, never so many that the transcript
+/// disappears.
+pub(crate) fn prompt_max_rows(available_rows: usize) -> usize {
+    (available_rows * 2 / 5).clamp(2, 12)
+}
+
+/// Lay out a permission (or chain) prompt as terminal rows: the sanitized
+/// `header` hard-wrapped to `width`, then the `options`, in at most
+/// `max_rows` rows. Nothing is ever written raw: a multi-line header (a
+/// heredoc, a `node -e` script) shows its first lines and a note counting
+/// the rest, and a single over-long line (a deep path) is elided in the
+/// middle so its file name stays visible. The full request is also in the
+/// transcript, which can be scrolled while the prompt waits.
+pub(crate) fn prompt_block_rows(
+    header: &str,
+    options: &str,
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    use crate::ui::utils::{compact_multiline, middle_elide, wrap_to_width};
+
+    let width = width.max(1);
+    let max_rows = max_rows.max(2);
+    let header = crate::ui::events::sanitize_output(header);
+    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
+    let mut option_rows = wrap_to_width(&options, width);
+    option_rows.truncate(max_rows - 1);
+    let budget = max_rows - option_rows.len();
+    let lines: Vec<&str> = header.split('\n').collect();
+
+    let fit = |line: &str, rows: usize| {
+        let mut wrapped = wrap_to_width(line, width);
+        if wrapped.len() > rows {
+            wrapped = wrap_to_width(&middle_elide(line, rows * width), width);
+            wrapped.truncate(rows);
+        }
+        wrapped
+    };
+
+    let mut rows = Vec::with_capacity(max_rows);
+    if lines.len() == 1 {
+        rows = fit(&header, budget);
+    } else if budget == 1 {
+        rows.push(middle_elide(
+            &compact_multiline(&header, header.len()),
+            width,
+        ));
+    } else {
+        let content_budget = budget - 1;
+        let mut shown = 0usize;
+        for line in &lines {
+            let room = content_budget - rows.len();
+            if room == 0 {
+                break;
+            }
+            let wrapped = wrap_to_width(line, width);
+            let complete = wrapped.len() <= room;
+            rows.extend(if complete { wrapped } else { fit(line, room) });
+            if !complete {
+                break;
+            }
+            shown += 1;
+        }
+        let hidden = lines.len() - shown;
+        if hidden > 0 {
+            let note = format!(
+                "… {hidden} more line(s), {} chars in total: scroll up (PgUp / wheel) to review the full request",
+                header.chars().count()
+            );
+            rows.push(crate::ui::utils::display_prefix(&note, width).to_string());
+        }
+    }
+    rows.extend(option_rows);
+    rows
+}
+
 pub struct Renderer {
     spinner_frame: u8,
     feed: Feed,
@@ -437,12 +515,43 @@ impl Renderer {
     /// Number of rows the input area will occupy for the given content. Kept in
     /// sync with the height logic used while drawing the input in `draw_bottom`.
     fn input_visible_height(&self, input_line: &str, rows: u16) -> usize {
-        if self.permission_prompt.is_some() || self.chain_prompt.is_some() {
-            return 2;
+        if let Some(prompt_rows) = self.overlay_prompt_rows(self.terminal_size().0, rows) {
+            return prompt_rows.len();
         }
         let available_rows = rows.saturating_sub(self.statusline_reserve()) as usize;
         let max_input_rows = available_rows.min((available_rows * 3 / 10).max(5));
         input_line.split('\n').count().min(max_input_rows).max(1)
+    }
+
+    /// Options row of the chain prompt for its current mode.
+    fn chain_options(&self) -> &'static str {
+        if self.chain_but_mode {
+            "[Enter] send  [Esc] cancel"
+        } else {
+            "[Y] Yes  [N] No  [B] yes, But (add instruction)"
+        }
+    }
+
+    /// Rows of the active permission or chain prompt laid out for a
+    /// `cols` x `rows` terminal, or `None` when the input editor is shown.
+    fn overlay_prompt_rows(&self, cols: u16, rows: u16) -> Option<Vec<String>> {
+        let (header, options) = if let Some(pp) = &self.permission_prompt {
+            (pp.tool.as_str(), pp.options.as_str())
+        } else if let Some(cp) = &self.chain_prompt {
+            (cp.question.as_str(), self.chain_options())
+        } else {
+            return None;
+        };
+        let available = rows.saturating_sub(self.statusline_reserve()) as usize;
+        // One column short of the edge: a full-width row leaves the terminal
+        // in its pending-wrap state, where clearing to end of line misbehaves.
+        let width = (cols as usize).saturating_sub(1).max(1);
+        Some(prompt_block_rows(
+            header,
+            options,
+            width,
+            prompt_max_rows(available),
+        ))
     }
 
     /// Recompute the input height and reconcile `prev_input_height` before the
@@ -1154,13 +1263,9 @@ impl Renderer {
         let reserve = self.statusline_reserve();
         let mut stdout = io::stdout();
 
-        if let Some(ref pp) = self.permission_prompt {
-            let perm_lines = [pp.tool.as_str(), pp.options.as_str()];
-            let line_count = 2usize;
-            let input_top = rows
-                .saturating_sub(reserve)
-                .saturating_sub(line_count as u16)
-                .saturating_add(1);
+        if let Some(prompt_rows) = self.overlay_prompt_rows(cols, rows) {
+            let line_count = prompt_rows.len();
+            let input_top = input_top_row(rows, reserve, line_count);
             let sep_above = input_top.saturating_sub(1);
 
             self.clear_shrunk_rows(self.prev_input_height, line_count)?;
@@ -1170,62 +1275,14 @@ impl Renderer {
                 self.draw_separator(sep_above, cols)?;
             }
 
-            let perm_color = self.color(Color::DarkYellow);
-            for (i, line) in perm_lines.iter().enumerate() {
-                let render_row = input_top + i as u16;
+            let prompt_color = self.color(Color::DarkYellow);
+            for (i, line) in prompt_rows.iter().enumerate() {
+                let render_row = input_top.saturating_add(i as u16);
                 stdout.execute(MoveTo(0, render_row))?;
                 if let Some(bg) = self.input_bg {
                     write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
                 }
-                write!(stdout, "{}", SetForegroundColor(perm_color))?;
-                write!(stdout, "{}", line)?;
-                write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
-                write!(stdout, "{}", ResetColor)?;
-            }
-
-            let sep_below = rows.saturating_sub(reserve.saturating_sub(1));
-            if sep_below < rows.saturating_sub(1) {
-                self.draw_separator(sep_below, cols)?;
-            }
-
-            self.draw_statusline(statusline, cols, false)?;
-            write!(stdout, "{}", Hide)?;
-            stdout.flush()?;
-            self.bottom_cursor = None;
-            self.record_bottom_drawn(snapshot);
-            return Ok(());
-        }
-
-        if let Some(ref cp) = self.chain_prompt {
-            let question = cp.question.as_str();
-            let options = if self.chain_but_mode {
-                "[Enter] send  [Esc] cancel"
-            } else {
-                "[Y] Yes  [N] No  [B] yes, But (add instruction)"
-            };
-            let line_count = 2usize;
-            let input_top = rows
-                .saturating_sub(reserve)
-                .saturating_sub(line_count as u16)
-                .saturating_add(1);
-            let sep_above = input_top.saturating_sub(1);
-
-            self.clear_shrunk_rows(self.prev_input_height, line_count)?;
-            self.prev_input_height = line_count;
-
-            if sep_above < input_top {
-                self.draw_separator(sep_above, cols)?;
-            }
-
-            let chain_color = self.color(Color::DarkYellow);
-            let render_lines = [question, options];
-            for (i, line) in render_lines.iter().enumerate() {
-                let render_row = input_top + i as u16;
-                stdout.execute(MoveTo(0, render_row))?;
-                if let Some(bg) = self.input_bg {
-                    write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
-                }
-                write!(stdout, "{}", SetForegroundColor(chain_color))?;
+                write!(stdout, "{}", SetForegroundColor(prompt_color))?;
                 write!(stdout, "{}", line)?;
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
                 write!(stdout, "{}", ResetColor)?;
