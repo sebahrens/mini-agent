@@ -268,7 +268,12 @@ Every successful child response is required to use this host-owned structure:
 ```
 
 The host checks the section order, confidence label, and both coverage entries.
-If a model returns unstructured text, mini-agent retains it under `Raw child
+If a model returns unstructured text, the host first gives the same child one
+bounded repair turn (a single model reply, no tools, charged to the task
+budget) asking it to restate its own previous response in the required
+sections; a negative result such as "no such capability exists" is a finding.
+The restatement is used only if it passes validation. Otherwise mini-agent
+retains the original text under `Raw child
 response` but wraps it in a machine-checkable partial report with low
 confidence. This keeps malformed output useful without letting it masquerade as
 a complete specialist report.
