@@ -1106,10 +1106,24 @@ fn session_storage_permissions_windows_reject_reparse_paths_without_mutation() {
     assert!(atomic_write(&lock_path, "private lock").is_err());
     std::fs::remove_dir(&lock_path).unwrap();
 
+    // The refused save still claimed the session's ownership lock
+    // (`<id>.lock`, mini-agent-e42za) inside the real sessions directory.
+    // Release it and remove the file so the directory can be replaced by a
+    // junction below; an open handle would also block the removal on Windows.
+    crate::session::lock::release_session(SESSION_ID);
+    let ownership_lock = sessions.join(format!("{SESSION_ID}.lock"));
+    if ownership_lock.exists() {
+        std::fs::remove_file(&ownership_lock).unwrap();
+    }
+
     std::fs::remove_dir(&sessions).unwrap();
     junction(&sessions, &outside);
     assert!(save_session(&session).is_err());
     assert!(!outside.join(format!("{SESSION_ID}.json")).exists());
+    assert!(
+        !outside.join(format!("{SESSION_ID}.lock")).exists(),
+        "a junctioned sessions directory must not receive the ownership lock"
+    );
     std::fs::remove_dir(&sessions).unwrap();
 }
 
