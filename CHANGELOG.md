@@ -31,6 +31,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Context compaction is now charged: the usage of every rolling summarizer request (up to 16
+  full-context requests) is added to the session's token and cost totals, the headless JSON `usage`
+  and `cost`, and a running goal's token count and `max_tokens` bound (mini-agent-i6q98).
+
 - The MCP OAuth callback listener no longer drops a legitimate browser redirect on macOS. The accepted
   socket inherited the listener's non-blocking flag, so a redirect whose bytes had not yet arrived was
   answered with 400 and the login waited out its full timeout. The listener now blocks with a bounded

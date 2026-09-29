@@ -20,6 +20,26 @@ impl UsageDelta {
     pub fn has_values(self) -> bool {
         self != Self::default()
     }
+
+    /// Field-wise saturating sum, for totalling several reports of separate
+    /// requests (never a stream's increments against its own aggregate).
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_add(other.cached_input_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            tool_use_prompt_tokens: self
+                .tool_use_prompt_tokens
+                .saturating_add(other.tool_use_prompt_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

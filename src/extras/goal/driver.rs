@@ -75,6 +75,14 @@ impl RoundCollector {
         }
     }
 
+    /// Count usage the round spent outside the agent's event stream, such as
+    /// the context compaction that ran on its behalf (mini-agent-i6q98).
+    /// `usage` must already be normalized for its provider.
+    pub fn add_usage(&mut self, usage: crate::event::UsageDelta) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+    }
+
     /// The agent is blocked on a permission prompt; stop the clock.
     pub fn pause_clock(&mut self) {
         if self.blocked_since.is_none() {
@@ -434,6 +442,26 @@ mod tests {
             summary.mutating_tool_calls, 1,
             "only the edit can have changed the workspace"
         );
+    }
+
+    /// Compaction run on the round's behalf is the round's spend
+    /// (mini-agent-i6q98).
+    #[test]
+    fn compaction_usage_counts_toward_the_round_tokens() {
+        let mut collector = RoundCollector::new();
+        collector.add_usage(crate::event::UsageDelta {
+            input_tokens: 4_000,
+            output_tokens: 500,
+            cached_input_tokens: 1_000,
+            ..crate::event::UsageDelta::default()
+        });
+        collector.add_usage(crate::event::UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..crate::event::UsageDelta::default()
+        });
+        let summary = collector.finish(&goal(), RoundEnd::Done, 0);
+        assert_eq!(summary.tokens_used, 5_600);
     }
 
     #[test]

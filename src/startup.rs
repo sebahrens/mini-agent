@@ -410,7 +410,7 @@ async fn compact_headless_session_if_needed(
     cfg: &Config,
     context: &ContextFiles,
     pending_tokens: u64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<crate::event::UsageDelta> {
     #[cfg(not(feature = "memory"))]
     let _ = context;
     let compacted = compact_headless_session_with(
@@ -437,14 +437,29 @@ async fn compact_headless_session_if_needed(
     .map_err(|error| anyhow::anyhow!("headless auto-compaction failed: {error}"))?;
 
     #[cfg(feature = "memory")]
-    if let Some((summary, cut_idx)) = &compacted {
+    if let Some(compacted) = &compacted {
         crate::extras::memory::flush_compaction_summary(
             &crate::extras::memory::Mem::open(),
-            summary,
-            Some(*cut_idx),
+            &compacted.summary,
+            Some(compacted.first_kept_index),
         );
     }
-    Ok(compacted.is_some())
+    Ok(compacted
+        .map(|compacted| compacted.usage)
+        .unwrap_or_default())
+}
+
+/// A completed headless compaction: the summary, where the kept history now
+/// starts, and the summarizer usage already charged to the session
+/// (normalized for the session's provider).
+#[derive(Debug)]
+struct HeadlessCompaction {
+    // Read by the memory flush and by tests.
+    #[cfg_attr(not(feature = "memory"), allow(dead_code))]
+    summary: String,
+    #[cfg_attr(not(feature = "memory"), allow(dead_code))]
+    first_kept_index: usize,
+    usage: crate::event::UsageDelta,
 }
 
 async fn compact_headless_session_with<S, F>(
@@ -453,10 +468,10 @@ async fn compact_headless_session_with<S, F>(
     pending_tokens: u64,
     #[cfg(feature = "memory")] memory: Option<&str>,
     summarize: S,
-) -> anyhow::Result<Option<(String, usize)>>
+) -> anyhow::Result<Option<HeadlessCompaction>>
 where
     S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
-    F: std::future::Future<Output = anyhow::Result<(String, usize)>>,
+    F: std::future::Future<Output = anyhow::Result<provider::CompactionOutput>>,
 {
     let Some(plan) = headless_compaction_plan(
         session,
@@ -476,7 +491,11 @@ where
         .compactions
         .last()
         .map(|compaction| compaction.summary.to_string());
-    let (summary, messages_included) = summarize(
+    let provider::CompactionOutput {
+        summary,
+        messages_included,
+        usage,
+    } = summarize(
         model,
         messages,
         previous_summary,
@@ -484,6 +503,11 @@ where
         plan.response_token_budget,
     )
     .await?;
+    // Every rolling summarizer request ran on the session's model, so it is
+    // charged at the session's prices like any other completion
+    // (mini-agent-i6q98).
+    let usage = cfg.normalize_usage(&session.provider, usage);
+    session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
     // `messages_included` is the length of the oldest prefix of the cut slice
     // whose content the summarizer saw (`cut_idx` with full coverage). Drain
     // exactly that prefix so unsummarized history is never discarded.
@@ -498,7 +522,11 @@ where
             .sum()
     };
     session.compress(summary.clone(), first_kept_index, tokens_before);
-    Ok(Some((summary, first_kept_index)))
+    Ok(Some(HeadlessCompaction {
+        summary,
+        first_kept_index,
+        usage,
+    }))
 }
 
 fn reap_aborted_openrouter_pricing_refresh(
@@ -1438,7 +1466,9 @@ impl Startup {
                     cw = self.session.context_window,
                 );
             }
-            compact_headless_session_if_needed(
+            // Already charged to the session; kept to report in the JSON
+            // usage and cost and to count toward a goal's first round.
+            let compaction_usage = compact_headless_session_if_needed(
                 &mut self.session,
                 &self.client,
                 &self.cfg,
@@ -1527,6 +1557,7 @@ impl Startup {
                 &msg,
                 history,
                 json_output,
+                compaction_usage,
                 #[cfg(feature = "hooks")]
                 false,
             ))
@@ -1554,6 +1585,13 @@ impl Startup {
             let usage: rig::completion::Usage = self
                 .cfg
                 .normalize_usage(&self.session.provider, usage.into())
+                .into();
+            // The JSON reports the turn's usage together with the
+            // auto-compaction that ran before it (mini-agent-i6q98). The
+            // session was charged for that already, so it is added to the
+            // reported figure only, never to `usage`, which is charged below.
+            let json_usage: rig::completion::Usage = crate::event::UsageDelta::from(usage)
+                .saturating_add(compaction_usage)
                 .into();
             let json_context = if json_output {
                 let files_changed = crate::print::files_changed_since(
@@ -1632,7 +1670,7 @@ impl Startup {
                         self.workspace.root(),
                         &response,
                         &interactions,
-                        usage,
+                        json_usage,
                         files_changed,
                         pricing,
                         stop_reason,
@@ -1950,6 +1988,7 @@ pub(crate) async fn run_goal_rounds_for_loop(
         &first_prompt,
         history,
         false,
+        crate::event::UsageDelta::default(),
         #[cfg(feature = "hooks")]
         true,
     ))
@@ -1997,6 +2036,11 @@ async fn run_headless_goal_rounds(
     message: &str,
     history: std::sync::Arc<[rig::completion::Message]>,
     json_output: bool,
+    // Normalized usage of the auto-compaction that ran before the first
+    // round. The session has already been charged for it; its tokens count
+    // toward the goal's first round (mini-agent-i6q98).
+    #[cfg_attr(not(feature = "goal"), allow(unused_variables))]
+    compaction_usage: crate::event::UsageDelta,
     // Whether these rounds are a `--loop`. A loop's iterations have always been
     // reported to `Stop` hooks as `loop_iteration`/`loop_active`, and folding
     // the loop onto the goal driver must not silently empty those fields for
@@ -2042,6 +2086,9 @@ async fn run_headless_goal_rounds(
             .verify_command
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty());
+        let mut pending_compaction_tokens = compaction_usage
+            .input_tokens
+            .saturating_add(compaction_usage.output_tokens);
 
         loop {
             let Some(goal) = session.goal_store.snapshot() else {
@@ -2057,7 +2104,7 @@ async fn run_headless_goal_rounds(
                 .iter()
                 .filter(|item| !matches!(item.status.as_str(), "completed" | "cancelled"))
                 .count();
-            let summary = driver::summary_from_headless_turn(
+            let mut summary = driver::summary_from_headless_turn(
                 &goal,
                 &turn.interactions,
                 &driver::RoundCost {
@@ -2068,6 +2115,11 @@ async fn run_headless_goal_rounds(
                 open_todos,
                 verify_configured,
             );
+            // The compaction before the first round was spent on this goal's
+            // work, so its tokens join that round's count, exactly once.
+            summary.tokens_used = summary
+                .tokens_used
+                .saturating_add(std::mem::take(&mut pending_compaction_tokens));
 
             let sandbox_for_checks = sandbox.clone();
             let cfg_for_checks = cfg.clone();
@@ -2534,16 +2586,79 @@ mod tests {
                 assert!(previous_summary.is_none());
                 assert_eq!(input_budget, 80);
                 assert_eq!(response_budget, 20);
-                Ok(("HEADLESS_SUMMARY".to_string(), 1usize))
+                Ok(crate::provider::CompactionOutput {
+                    summary: "HEADLESS_SUMMARY".to_string(),
+                    messages_included: 1,
+                    usage: crate::event::UsageDelta::default(),
+                })
             },
         )
         .await
+        .unwrap()
         .unwrap();
 
-        assert_eq!(result, Some(("HEADLESS_SUMMARY".to_string(), 1)));
+        assert_eq!(result.summary, "HEADLESS_SUMMARY");
+        assert_eq!(result.first_kept_index, 1);
         assert_eq!(session.compactions.len(), 1);
         assert_eq!(session.messages[0].content, "HEADLESS_SUMMARY");
         assert_eq!(session.messages.len(), 2);
+    }
+
+    // mini-agent-i6q98: the summarizer's requests are charged to the session
+    // at the session model's prices, normalized for its provider.
+    #[tokio::test]
+    async fn headless_auto_compaction_charges_summarizer_usage_to_the_session() {
+        let mut session = crate::session::Session::new("gemini", "model", 100, "");
+        session.overhead_tokens = 90;
+        session.input_token_cost = 2.0;
+        session.output_token_cost = 10.0;
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+        let cost_before = session.total_cost;
+        let usage = crate::event::UsageDelta {
+            input_tokens: 300_000,
+            output_tokens: 20_000,
+            total_tokens: 330_000,
+            reasoning_tokens: 10_000,
+            ..crate::event::UsageDelta::default()
+        };
+
+        let result = compact_headless_session_with(
+            &mut session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            |_, messages, _, _, _| async move {
+                Ok(crate::provider::CompactionOutput {
+                    summary: "SUMMARY".to_string(),
+                    messages_included: messages.len(),
+                    usage,
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the session is over budget and compacts");
+
+        // Gemini reports thinking beside output; it is billed as output.
+        assert_eq!(result.usage.output_tokens, 30_000);
+        assert_eq!(session.total_input_tokens, 300_000);
+        assert_eq!(session.total_output_tokens, 30_000);
+        let expected = crate::pricing::estimate_cost(300_000, 30_000, 2.0, 10.0);
+        assert!(expected > 0.0);
+        assert!(
+            (session.total_cost - cost_before - expected).abs() < 1e-9,
+            "compaction must add its cost: {} -> {}",
+            cost_before,
+            session.total_cost
+        );
     }
 
     // mini-agent-g8m5v: a second compaction passes the previous summary once,
@@ -2579,14 +2694,20 @@ mod tests {
                     "the previous summary must not also be a summarized message"
                 );
                 assert_eq!(messages.len(), 2, "{messages:?}");
-                Ok(("NEW_SUMMARY".to_string(), messages.len()))
+                Ok(crate::provider::CompactionOutput {
+                    summary: "NEW_SUMMARY".to_string(),
+                    messages_included: messages.len(),
+                    usage: crate::event::UsageDelta::default(),
+                })
             },
         )
         .await
+        .unwrap()
         .unwrap();
 
         // The old summary record plus both summarized messages are drained.
-        assert_eq!(result, Some(("NEW_SUMMARY".to_string(), 3)));
+        assert_eq!(result.summary, "NEW_SUMMARY");
+        assert_eq!(result.first_kept_index, 3);
         assert_eq!(session.messages[0].content, "NEW_SUMMARY");
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[1].content, "c".repeat(40));
