@@ -212,6 +212,14 @@ markers (`MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE`), while their Rust recovery-child
 use the test harness. Newly created and recovered control roots retain directory-list access
 without delete sharing so their names cannot be replaced between validation and journal I/O.
 
+On both macOS worker-gate runners (`macos-worker-containment-gate`), CI runs the real Seatbelt
+general-sandbox tests (`macos_seatbelt_policy_enforces_real_backend`,
+`macos_seatbelt_denies_symlinked_credential_reads`) and the JS spawn write-boundary test
+(`spawn_uses_real_macos_seatbelt_write_boundary`) with `MINI_AGENT_REQUIRE_REAL_SANDBOX=1`. Locally
+these tests skip when Seatbelt preflight is denied; with the variable set to `1` that skip panics,
+and the step also fails on any `skipping` output or a missing pass, so a runner where Seatbelt is
+unusable cannot report the general sandbox as verified.
+
 The Windows general-process AppContainer backend is not the Phase 6 LPAC worker profile.
 Its cached production preflight and hosted reference-runner gate establish the recorded
 AppContainer identity, scoped filesystem grants and writes, zero-capability network

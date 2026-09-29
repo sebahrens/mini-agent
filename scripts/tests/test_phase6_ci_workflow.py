@@ -141,6 +141,50 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     body.count("continue-on-error: true"),
                 )
 
+    # mini-agent-dw9ru: real Seatbelt tests for the general command sandbox and
+    # JS spawn, keyed by their libtest path, with the source file defining them.
+    SEATBELT_GENERAL_SANDBOX_TESTS = {
+        "sandbox::sandbox_tests::macos_seatbelt_policy_enforces_real_backend": (
+            "src/sandbox.rs"
+        ),
+        "tests::sandbox_platform_tests::macos_seatbelt_denies_symlinked_credential_reads": (
+            "src/tests/sandbox_platform_tests.rs"
+        ),
+        "extras::js::host::tests::spawn_uses_real_macos_seatbelt_write_boundary": (
+            "src/extras/js/host.rs"
+        ),
+    }
+
+    def test_macos_gate_fails_when_general_seatbelt_tests_skip(self) -> None:
+        body = job_body(self.workflow, "macos-worker-containment-gate")
+        marker = "name: Require the real Seatbelt general command sandbox on this runner"
+        self.assertIn(marker, body)
+        step = body.split(marker, 1)[1].split("- name:", 1)[0]
+        # Runs on every macOS matrix leg and can never be tolerated as a failure.
+        self.assertNotIn("if:", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertRegex(step, r"MINI_AGENT_REQUIRE_REAL_SANDBOX: '1'")
+        self.assertIn("--no-default-features --features js,sandbox", step)
+        self.assertIn("--exact --nocapture", step)
+        self.assertIn("grep -qi 'skipping'", step)
+        self.assertIn("test result: ok. 1 passed", step)
+        for test_name, source in self.SEATBELT_GENERAL_SANDBOX_TESTS.items():
+            with self.subTest(test=test_name):
+                self.assertEqual(1, step.count(f"'{test_name}'"))
+                function = test_name.rsplit("::", 1)[1]
+                text = (REPOSITORY_ROOT / source).read_text(encoding="utf-8")
+                header = re.search(
+                    rf"(?m)^(?P<indent> *)(?:async )?fn {re.escape(function)}\(", text
+                )
+                self.assertIsNotNone(header)
+                # The early return must go through the env-var-aware helper,
+                # not a bare eprintln that CI cannot turn into a failure.
+                definition = text[header.end():].split(
+                    f"\n{header.group('indent')}}}\n", 1
+                )[0]
+                self.assertIn("skip_unusable_real_sandbox_test(", definition)
+                self.assertNotIn('eprintln!("skipping', definition)
+
     def test_every_platform_rejects_zero_adversarial_suite_discovery(self) -> None:
         required_categories = (
             "worker_protocol",

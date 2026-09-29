@@ -740,6 +740,28 @@ pub(crate) fn seatbelt_exists() -> bool {
     false
 }
 
+/// Environment variable that turns a real-backend test's "backend unusable,
+/// skipping" early return into a failure. CI sets it to `1` on the macOS
+/// runners so a Seatbelt test that silently skipped cannot pass the job
+/// (mini-agent-dw9ru).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) const REQUIRE_REAL_SANDBOX_ENV: &str = "MINI_AGENT_REQUIRE_REAL_SANDBOX";
+
+#[cfg(all(test, target_os = "macos"))]
+fn real_sandbox_required_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+/// Skip a real-backend sandbox test whose backend is unusable on this host,
+/// or panic when [`REQUIRE_REAL_SANDBOX_ENV`] demands the real backend.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn skip_unusable_real_sandbox_test(reason: &str) {
+    if real_sandbox_required_by(std::env::var_os(REQUIRE_REAL_SANDBOX_ENV).as_deref()) {
+        panic!("{REQUIRE_REAL_SANDBOX_ENV}=1 requires the real sandbox backend, but {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
 #[cfg(target_os = "macos")]
 fn seatbelt_path() -> Option<&'static Path> {
     SEATBELT_PATH
@@ -5381,13 +5403,28 @@ printf LINUX_SANDBOX_POLICY_PASS
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn require_real_sandbox_env_accepts_only_one() {
+        use std::ffi::OsStr;
+        assert!(real_sandbox_required_by(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(
+                !real_sandbox_required_by(value.map(OsStr::new)),
+                "{value:?} must not require the real sandbox"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_seatbelt_policy_enforces_real_backend() {
         if seatbelt_path().is_none() {
             panic!("the supported macOS Seatbelt backend is unavailable");
         }
         if !seatbelt_exists() {
-            eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
+            skip_unusable_real_sandbox_test(
+                "real macOS sandbox probe cannot run because Seatbelt preflight is denied",
+            );
             return;
         }
 

@@ -38,7 +38,9 @@ impl Drop for ScratchDir {
 #[test]
 fn macos_seatbelt_denies_symlinked_credential_reads() {
     if !seatbelt_exists() {
-        eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
+        skip_unusable_real_sandbox_test(
+            "real macOS sandbox probe cannot run because Seatbelt preflight is denied",
+        );
         return;
     }
     let root = ScratchDir::new();
@@ -146,4 +148,48 @@ fn terminate_process_group_does_not_block_current_thread_executor() {
         !status.success(),
         "terminated process must not exit cleanly"
     );
+}
+
+/// Regression for mini-agent-dw9ru: with `MINI_AGENT_REQUIRE_REAL_SANDBOX=1`
+/// an unusable real backend fails the test instead of returning early, so
+/// the macOS CI guard step cannot pass on a silent skip. The probe re-runs
+/// this test in a child process so the parallel runner's process-global
+/// environment is never mutated.
+#[cfg(target_os = "macos")]
+#[test]
+fn skipped_real_sandbox_test_panics_when_the_real_backend_is_required() {
+    const CHILD_MARKER: &str = "MINI_AGENT_TEST_REAL_SANDBOX_SKIP_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        skip_unusable_real_sandbox_test("the backend is unusable in this probe");
+        return;
+    }
+    let test_name = "tests::sandbox_platform_tests::skipped_real_sandbox_test_panics_when_the_real_backend_is_required";
+    let run = |required: &str| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .env(REQUIRE_REAL_SANDBOX_ENV, required)
+            .output()
+            .unwrap()
+    };
+
+    let required = run("1");
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    let stdout = String::from_utf8_lossy(&required.stdout);
+    assert!(!required.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("MINI_AGENT_REQUIRE_REAL_SANDBOX=1 requires the real sandbox backend"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("1 failed"), "{stdout}");
+
+    let optional = run("0");
+    let stderr = String::from_utf8_lossy(&optional.stderr);
+    let stdout = String::from_utf8_lossy(&optional.stdout);
+    assert!(optional.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("skipping: the backend is unusable in this probe"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("1 passed"), "{stdout}");
 }
