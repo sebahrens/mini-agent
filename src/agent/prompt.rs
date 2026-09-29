@@ -80,7 +80,7 @@ pub const FIND_FILES_TOOL_PROMPT: &str =
     "\n- **find_files** finds paths by glob; do not repeat an unchanged search.";
 pub const LIST_DIR_TOOL_PROMPT: &str =
     "\n- **list_dir** lists a directory; do not re-list unchanged directories.";
-pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's persistent task list; use it for work with at least three dependent steps or progress that must survive compaction. Keep at most one item in progress and update milestones. **todo_read** recalls the list after compaction or an agent rebuild.";
+pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's persistent task list; use it for work with at least three dependent steps or progress that must survive compaction. Keep at most one item in progress and update milestones. The list holds at most 50 short items (500 characters each). **todo_read** recalls the list after compaction or an agent rebuild.";
 pub const TASK_TOOL_PROMPT: &str = "\n- **task** delegates read-only investigation to fresh-context subagents. Keep single-file or known-location work local; delegate when research crosses several files or has two or more independent, bounded questions. Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema.";
 
 /// Appended to the preamble when LSP integration is active (`[lsp]

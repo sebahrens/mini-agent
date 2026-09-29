@@ -162,3 +162,158 @@ fn todo_store_round_trips_with_session_and_survives_compaction() {
     assert!(summary.contains("Open work"));
     assert!(!summary.contains("Finished work"));
 }
+
+fn item(content: String, status: &str) -> TodoItem {
+    TodoItem {
+        content,
+        status: CompactString::new(status),
+        priority: CompactString::new("medium"),
+    }
+}
+
+#[tokio::test]
+async fn todo_write_rejects_too_many_items_and_keeps_the_existing_list() {
+    use crate::agent::tools::todo::MAX_TODO_ITEMS;
+
+    let store = TodoStore::default();
+    let writer = WriteTodoList::new_with_store(None, None, store.clone());
+    writer
+        .call(TodoWriteArgs {
+            todos: vec![item("Keep me".to_string(), "pending")],
+        })
+        .await
+        .unwrap();
+
+    let todos = (0..1000)
+        .map(|i| item(format!("step {i}"), "pending"))
+        .collect();
+    let error = writer
+        .call(TodoWriteArgs { todos })
+        .await
+        .expect_err("1000 items must be rejected")
+        .to_string();
+    assert!(error.contains("1000 items"), "{error}");
+    assert!(
+        error.contains(&format!("{MAX_TODO_ITEMS}-item limit")),
+        "{error}"
+    );
+    assert_eq!(
+        store.snapshot(),
+        vec![item("Keep me".to_string(), "pending")]
+    );
+
+    let at_limit = (0..MAX_TODO_ITEMS)
+        .map(|i| item(format!("step {i}"), "pending"))
+        .collect();
+    writer
+        .call(TodoWriteArgs { todos: at_limit })
+        .await
+        .expect("exactly the item limit is accepted");
+    assert_eq!(store.snapshot().len(), MAX_TODO_ITEMS);
+}
+
+#[tokio::test]
+async fn todo_write_rejects_oversized_content_and_labels() {
+    use crate::agent::tools::todo::MAX_TODO_CONTENT_CHARS;
+
+    let store = TodoStore::default();
+    let writer = WriteTodoList::new_with_store(None, None, store.clone());
+    let error = writer
+        .call(TodoWriteArgs {
+            todos: vec![
+                item("fine".to_string(), "pending"),
+                item("x".repeat(100 * 1024), "pending"),
+            ],
+        })
+        .await
+        .expect_err("a 100 KB content string must be rejected")
+        .to_string();
+    assert!(error.contains("item 2"), "{error}");
+    assert!(
+        error.contains(&format!("{MAX_TODO_CONTENT_CHARS}-character limit")),
+        "{error}"
+    );
+    assert!(error.len() < 1024, "rejection must not echo the content");
+    assert!(store.is_empty());
+
+    let error = writer
+        .call(TodoWriteArgs {
+            todos: vec![item("fine".to_string(), &"s".repeat(10_000))],
+        })
+        .await
+        .expect_err("an oversized status must be rejected")
+        .to_string();
+    assert!(error.contains("status"), "{error}");
+    assert!(store.is_empty());
+
+    // Multi-byte content at exactly the character limit is accepted.
+    writer
+        .call(TodoWriteArgs {
+            todos: vec![item("é".repeat(MAX_TODO_CONTENT_CHARS), "pending")],
+        })
+        .await
+        .expect("content at the character limit is accepted");
+}
+
+#[test]
+fn critical_context_is_bounded_even_for_restored_oversized_lists() {
+    use crate::agent::tools::todo::{
+        MAX_CRITICAL_CONTEXT_BYTES, MAX_TODO_CONTENT_CHARS, MAX_TODO_ITEMS,
+    };
+
+    // A session restored from disk bypasses todo_write validation.
+    let store = TodoStore::default();
+    store.replace(
+        (0..1000)
+            .map(|i| item(format!("{i}:{}", "é".repeat(100 * 1024)), "pending"))
+            .collect(),
+    );
+    let context = store.critical_context().expect("open items");
+    assert!(
+        context.len() <= MAX_CRITICAL_CONTEXT_BYTES,
+        "critical context is {} bytes",
+        context.len()
+    );
+    assert!(context.starts_with("Critical Context"));
+    assert!(
+        context.contains("more open todo items omitted"),
+        "{context}"
+    );
+    assert!(context.contains("\"0:"));
+    let longest_content = context
+        .split("\"content\":\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap().chars().count())
+        .max()
+        .unwrap();
+    assert!(longest_content <= MAX_TODO_CONTENT_CHARS);
+
+    // A small list is emitted whole, with no omission note.
+    let small = TodoStore::default();
+    small.replace(vec![item("Open work".to_string(), "in_progress")]);
+    let context = small.critical_context().unwrap();
+    assert!(context.contains("Open work"));
+    assert!(!context.contains("omitted"));
+
+    // A full ASCII list at the todo_write caps survives compaction whole.
+    let full = TodoStore::default();
+    full.replace(
+        (0..MAX_TODO_ITEMS)
+            .map(|_| item("a".repeat(MAX_TODO_CONTENT_CHARS), "pending"))
+            .collect(),
+    );
+    let context = full.critical_context().unwrap();
+    assert!(context.len() <= MAX_CRITICAL_CONTEXT_BYTES);
+    assert!(!context.contains("omitted"), "{}", context.len());
+    let parsed: Vec<TodoItem> = serde_json::from_str(
+        context
+            .split_once('\n')
+            .unwrap()
+            .1
+            .split_once('\n')
+            .unwrap()
+            .1,
+    )
+    .expect("the item block stays valid JSON");
+    assert_eq!(parsed.len(), MAX_TODO_ITEMS);
+}

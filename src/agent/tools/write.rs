@@ -238,8 +238,15 @@ impl Tool for WriteTool {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => workspace
                     .create_relative_atomic(relative, args.content.as_bytes())
-                    .map_err(|error| create_error(&expanded, error))?,
-                Err(error) => return Err(error.into()),
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::AlreadyExists => create_error(&expanded, error),
+                        _ => crate::agent::tools::bound_open_error(workspace, relative, error),
+                    })?,
+                Err(error) => {
+                    return Err(crate::agent::tools::bound_open_error(
+                        workspace, relative, error,
+                    ));
+                }
             }
             self.read_tracker.untrack_read_path(&expanded);
             let mut result = format!("Written {} bytes to {}", bytes, expanded);

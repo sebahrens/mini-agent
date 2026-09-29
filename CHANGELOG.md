@@ -101,6 +101,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - The subprocess trust spec now states that unsandboxed Bash and explicit `!` shells clear the
   ambient environment and restore only the non-credential allow-list for every disabled-sandbox
   reason, matching the implementation.
+- A workspace-relative `read`, `edit` or `write` through a symbolic link (for example
+  `CLAUDE.md -> ../AGENTS.md` or `packages/x -> ../shared/x`) now names the link and suggests the
+  absolute target path instead of reporting a raw "Too many levels of symbolic links".
+- `todo_write` rejects lists over 50 items or items over 500 characters, and the todo block
+  re-injected into every compaction summary is bounded to 32 KiB, so large todo content can no
+  longer pin the context and force repeated compaction.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.

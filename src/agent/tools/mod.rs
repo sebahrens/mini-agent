@@ -12,6 +12,8 @@ pub(crate) mod lsp;
 pub(crate) mod memoize;
 pub(crate) mod normalize;
 pub(crate) mod read;
+#[cfg(all(test, unix))]
+mod symlink_hint_tests;
 pub(crate) mod todo;
 pub(crate) mod write;
 
@@ -102,6 +104,55 @@ pub(crate) fn resolve_tool_target(
             bound_relative: None,
         },
     }
+}
+
+/// Explain a failed bound-workspace open that was refused because the path is,
+/// or passes through, a symbolic link.
+///
+/// Workspace-relative access deliberately opens each component with
+/// `O_NOFOLLOW` inside the captured capability (reparse points rejected on
+/// Windows), which surfaces as a raw `ELOOP`/`ENOTDIR`/escape error. The model
+/// cannot act on that, so name the link and point at the absolute-path route
+/// through the permission policy. An error where no link component is found
+/// passes through unchanged.
+pub(crate) fn bound_open_error(
+    workspace: &crate::paths::WorkspaceBinding,
+    relative: &Path,
+    error: io::Error,
+) -> ToolError {
+    // The refusal's errno is platform-dependent: `ELOOP` from `O_NOFOLLOW`,
+    // `ENOTDIR` from `O_DIRECTORY|O_NOFOLLOW` on some kernels, cap-std's
+    // `PermissionDenied` escape error when a link leaves its directory, or the
+    // Windows reparse-point rejection. Confirm by walking the path for a link
+    // component instead of trusting the error kind alone.
+    if let Some(link) = workspace.symlink_component(relative) {
+        // Diagnostic only: resolving the link grants nothing. A retry with this
+        // absolute path goes through the ambient permission check. The target
+        // is named only when it stays inside the workspace, so a refused open
+        // never discloses an outside location before any permission check.
+        let target = std::fs::canonicalize(workspace.root().join(relative))
+            .ok()
+            .filter(|target| target.starts_with(workspace.root()));
+        return ToolError::Msg(symlink_refusal_message(
+            &workspace.root().join(link),
+            target.as_deref(),
+        ));
+    }
+    error.into()
+}
+
+fn symlink_refusal_message(link: &Path, target: Option<&Path>) -> String {
+    let mut message = format!(
+        "'{}' is (or passes through) a symbolic link; workspace-relative access does not follow links. Use the absolute path of the target to request access through the permission policy.",
+        link.display()
+    );
+    if let Some(target) = target {
+        message.push_str(&format!(
+            " The link currently resolves to '{}'.",
+            target.display()
+        ));
+    }
+    message
 }
 
 // Test fixtures accept paths; production captures one binding before building tools.

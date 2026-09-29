@@ -185,6 +185,21 @@ capability and reported as its logical location inside the workspace. A `$`-pref
 that does not expand (for example `$FOO/x`, or `$HOME/x` without a home directory) is a literal
 workspace-relative name and is reported as such.
 
+Workspace-relative opens do not follow symbolic links out of the component that holds them (each
+component is opened without following links; Windows rejects reparse points). When `read`,
+`edit`, or `write` is refused for that reason, the error names the link (for example
+`'…/packages/x' is (or passes through) a symbolic link`), states where it currently resolves when that target is inside the workspace (an outside target
+is not disclosed), and
+tells the model to retry with the absolute path of the target, which is then checked by the
+ambient permission policy. Other open errors are reported unchanged.
+
+`todo_write` accepts at most 50 items, each with `content` of at most 500 characters and
+`status`/`priority` of at most 32 characters. A list over any cap is rejected with a message
+naming the limit, and the stored list is left unchanged. Open items are re-injected into every
+compaction summary as a "Critical Context" block that is bounded to 32 KiB: fields are clipped
+to the same caps (covering sessions restored from before the caps existed), and items that do not
+fit are counted in an omission note instead of emitted.
+
 `find_files` preserves filename-regex matching for valid regular expressions.
 If the supplied pattern is not valid regex, it is parsed as a workspace-relative
 path glob, so common forms such as `**/*.rs` search recursively. Capped output

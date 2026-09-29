@@ -942,7 +942,11 @@ impl Tool for EditTool {
             .unwrap_or(std::path::Path::new(""));
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         let capability_file = bound_workspace
-            .map(|workspace| workspace.open_relative(relative))
+            .map(|workspace| {
+                workspace.open_relative(relative).map_err(|error| {
+                    crate::agent::tools::bound_open_error(workspace, relative, error)
+                })
+            })
             .transpose()?;
         let capability_metadata = capability_file
             .as_ref()

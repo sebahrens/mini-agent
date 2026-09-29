@@ -195,7 +195,11 @@ impl Tool for ReadTool {
         let relative = target.bound_relative.as_deref().unwrap_or(Path::new(""));
         let bound_workspace = target.bound_relative.as_ref().and(self.workspace.as_ref());
         let capability_file = bound_workspace
-            .map(|workspace| workspace.open_relative(relative))
+            .map(|workspace| {
+                workspace.open_relative(relative).map_err(|error| {
+                    crate::agent::tools::bound_open_error(workspace, relative, error)
+                })
+            })
             .transpose()?;
         let offset = args.offset.unwrap_or(1).saturating_sub(1);
         let limit = args.limit.unwrap_or(self.max_lines as usize);
