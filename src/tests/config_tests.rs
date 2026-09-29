@@ -1086,3 +1086,95 @@ fn reasoning_tokens_exclusivity_resolves_custom_provider_type() {
     assert!(cfg.reasoning_tokens_are_exclusive_of_output("gw"));
     assert!(!cfg.reasoning_tokens_are_exclusive_of_output("compat"));
 }
+
+// mini-agent-izx3e: Gemini's separately reported thinking tokens are billed as
+// output, and are not prompt tokens for the context estimate.
+#[test]
+fn normalized_usage_charges_gemini_thinking_as_output() {
+    let cfg = Config::default();
+    let gemini_report = crate::event::UsageDelta {
+        input_tokens: 1_000,
+        output_tokens: 100,
+        total_tokens: 1_400,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        tool_use_prompt_tokens: 0,
+        reasoning_tokens: 300,
+    };
+    let normalized = cfg.normalize_usage("gemini", gemini_report);
+    assert_eq!(normalized.output_tokens, 400);
+    assert_eq!(normalized.reasoning_tokens, 300);
+    assert_eq!(
+        crate::session::Session::real_input_tokens(
+            false,
+            normalized.input_tokens,
+            normalized.total_tokens,
+            normalized.output_tokens,
+            0,
+            0,
+        ),
+        1_000,
+        "thoughts are not prompt tokens"
+    );
+
+    let mut session = crate::session::Session::new("gemini", "gemini-test", 1_000_000, "");
+    session.input_token_cost = 0.0;
+    session.output_token_cost = 10.0;
+    session.charge_usage_delta(normalized, false);
+    assert_eq!(session.total_output_tokens, 400);
+    assert!((session.total_cost - 400.0 * 10.0 / 1_000_000.0).abs() < 1e-12);
+
+    // Providers that already include reasoning in output are left alone.
+    let openai_report = crate::event::UsageDelta {
+        output_tokens: 400,
+        total_tokens: 1_400,
+        ..gemini_report
+    };
+    assert_eq!(cfg.normalize_usage("openai", openai_report), openai_report);
+}
+
+// mini-agent-ycu8b: a resumed session re-derives its window in the same order
+// a new session does, and keeps its saved value only when nothing knows it.
+#[test]
+fn known_context_window_orders_pin_quick_model_then_catalog() {
+    let mut qm = std::collections::HashMap::new();
+    qm.insert(
+        "pro".to_string(),
+        crate::config::types::QuickModelConfig {
+            provider: compact_str::CompactString::new("openrouter"),
+            model: compact_str::CompactString::new("deepseek/deepseek-v4-pro"),
+            input_token_cost: 0.0,
+            output_token_cost: 0.0,
+            reserve_tokens: None,
+            temperature: None,
+            extra_body: None,
+            context_window: Some(64_000),
+        },
+    );
+    let none = std::collections::HashMap::new();
+    let unpinned = Config::default();
+    assert_eq!(
+        unpinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &qm),
+        Some(64_000),
+        "a quick model's window beats the catalog"
+    );
+    assert_eq!(
+        unpinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &none),
+        Config::catalog_context_window("openrouter", "deepseek/deepseek-v4-pro")
+    );
+    assert_eq!(
+        unpinned.known_context_window("ollama", "llama3.1", &none),
+        None,
+        "unknown models keep the saved window"
+    );
+    let pinned: Config = serde_json::from_str(r#"{ "context_window": 32000 }"#).unwrap();
+    assert_eq!(
+        pinned.known_context_window("openrouter", "deepseek/deepseek-v4-pro", &qm),
+        Some(32_000),
+        "a pinned window is applied to resumed sessions too"
+    );
+    assert_eq!(
+        pinned.known_context_window("ollama", "llama3.1", &none),
+        Some(32_000)
+    );
+}

@@ -124,6 +124,17 @@ fn build_report(args: GoalReportArgs, round: u32) -> Result<Report, ToolError> {
     })
 }
 
+/// Every accepted report's output carries this; a rejection never does.
+const ACCEPTED_MARKER: &str = " recorded for round ";
+
+/// Whether `output` is what [`GoalReport`] returns for an accepted report.
+///
+/// The runner sees only a tool's text, and an accepted report completes the
+/// round even when the model writes nothing after it.
+pub(crate) fn is_accepted_report_output(output: &str) -> bool {
+    output.contains(ACCEPTED_MARKER)
+}
+
 /// The `goal_report` tool.
 pub struct GoalReport {
     store: GoalStore,
@@ -215,13 +226,13 @@ impl Tool for GoalReport {
 
         Ok(match status {
             ReportStatus::Met => format!(
-                "Completion claim recorded for round {round}. It will be verified before the goal is closed."
+                "Completion claim{ACCEPTED_MARKER}{round}. It will be verified before the goal is closed."
             ),
-            ReportStatus::NeedsUser => format!(
-                "Question recorded for round {round}. The goal pauses for the user's answer."
-            ),
+            ReportStatus::NeedsUser => {
+                format!("Question{ACCEPTED_MARKER}{round}. The goal pauses for the user's answer.")
+            }
             _ => format!(
-                "Report recorded for round {round} of {}.",
+                "Report{ACCEPTED_MARKER}{round} of {}.",
                 goal.bounds.max_rounds
             ),
         })
@@ -336,9 +347,26 @@ mod tests {
             ),
         ];
         for (name, a) in cases {
-            tool.call(a).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let out = tool.call(a).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            // The runner recognises an accepted report by its output alone.
+            assert!(is_accepted_report_output(&out), "{name}: {out}");
         }
         assert_eq!(store.snapshot().unwrap().reports.len(), 4);
+        assert!(is_accepted_report_output(
+            &tool.call(args("progress")).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_report_is_not_recognised_as_accepted() {
+        let tool = GoalReport::new(GoalStore::default());
+        let err = tool.call(args("progress")).await.unwrap_err();
+        assert!(!is_accepted_report_output(&err.to_string()));
+        let err = GoalReport::new(store_with_goal())
+            .call(args("met"))
+            .await
+            .unwrap_err();
+        assert!(!is_accepted_report_output(&err.to_string()));
     }
 
     #[tokio::test]

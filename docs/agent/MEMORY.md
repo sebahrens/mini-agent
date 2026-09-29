@@ -248,6 +248,11 @@ Returns `"compaction summary (N msgs)"` (or `"compaction summary"` if no count).
 ### `flush_compaction_summary(mem, summary, count)`
 
 Persists the compaction summary to today's daily log via `append_daily`. Called from the `/compress` slash command before `Session::compress`.
+The heading is tagged `[compaction <ref>]`, where `<ref>` is `session::compaction_ref(summary)`; `Session::compress` stores the same tag as `Compaction::memory_ref`.
+
+### `Mem::context_block_excluding(ref)`
+
+The injected memory block without the daily-log entry tagged `ref`. The session already replays its active compaction summary as a recap, so the interactive turn refresh and a resumed startup pass `Session::active_compaction_ref()` and the model sees that summary once. The entry itself stays in the log and in `memory_search`. Compactions saved before the tag existed exclude nothing.
 
 ### `effective_reserve(base, memory_block)`
 

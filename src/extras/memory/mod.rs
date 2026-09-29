@@ -626,6 +626,16 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
     /// section that already fit. A final whole-string `truncate_cjk` pass is
     /// kept as a hard backstop against unexpected overrun.
     pub fn context_block(&self) -> Option<String> {
+        self.context_block_excluding(None)
+    }
+
+    /// [`Self::context_block`] without the daily-log compaction entry tagged
+    /// `exclude_compaction` (a [`crate::session::compaction_ref`]).
+    ///
+    /// A session replays its active compaction summary as a recap already;
+    /// injecting the daily log's copy of the same summary as well sent it to
+    /// the model twice (mini-agent-vx0yg). The entry stays in the log.
+    pub fn context_block_excluding(&self, exclude_compaction: Option<&str>) -> Option<String> {
         let mut m = String::new();
         if let Ok(meta) = std::fs::metadata(self.memory_md())
             && meta.len() <= 128 * 1024
@@ -646,7 +656,13 @@ it is only allowed for target=note, not long_term/scratchpad/daily",
                 .join("\n");
         }
 
-        let logs = self.recent_daily_logs();
+        let mut logs = self.recent_daily_logs();
+        if let Some(reference) = exclude_compaction {
+            for log in &mut logs {
+                log.content = without_compaction_entry(&log.content, reference);
+            }
+            logs.retain(|log| !log.content.trim().is_empty());
+        }
 
         let mut sections: Vec<Section> = Vec::new();
         if !scratch.trim().is_empty() {
@@ -1007,12 +1023,57 @@ pub fn compaction_heading(count: Option<usize>) -> String {
     }
 }
 
+/// The tag a compaction entry's heading carries, naming its summary.
+fn compaction_tag(reference: &str) -> String {
+    format!("[compaction {reference}]")
+}
+
+/// Whether `line` is an `append_daily` entry heading (`### HH:MM — ...`).
+fn is_daily_entry_heading(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    line.starts_with("### ")
+        && bytes.len() > 9
+        && bytes[4].is_ascii_digit()
+        && bytes[5].is_ascii_digit()
+        && bytes[6] == b':'
+        && bytes[7].is_ascii_digit()
+        && bytes[8].is_ascii_digit()
+        && line[9..].starts_with(" — ")
+}
+
+/// `log` without the entry whose heading carries `reference`'s tag. An entry
+/// runs from its heading to the next entry heading, so markdown headings
+/// inside the summary body stay with it.
+fn without_compaction_entry(log: &str, reference: &str) -> String {
+    let tag = compaction_tag(reference);
+    let mut out = String::with_capacity(log.len());
+    let mut skipping = false;
+    for line in log.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if is_daily_entry_heading(trimmed) {
+            skipping = trimmed.ends_with(&tag);
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 /// Persist a compaction summary to today's daily log. Call before
 /// `Session::compress` so the summary survives compaction deterministically,
 /// rather than depending on the model to write it. `count` is the number of
-/// messages this compaction summarized (Session's `first_kept_index`).
+/// messages this compaction summarized (Session's `first_kept_index`). The
+/// heading is tagged with the summary's [`crate::session::compaction_ref`] so
+/// the session that replays this summary can leave the copy out of its memory
+/// block.
 pub fn flush_compaction_summary(mem: &Mem, summary: &str, count: Option<usize>) {
-    if let Err(e) = mem.append_daily(&compaction_heading(count), summary) {
+    let heading = format!(
+        "{} {}",
+        compaction_heading(count),
+        compaction_tag(&crate::session::compaction_ref(summary))
+    );
+    if let Err(e) = mem.append_daily(&heading, summary) {
         tracing::warn!("memory: failed to persist compaction summary: {e}");
     }
 }

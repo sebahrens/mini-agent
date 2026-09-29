@@ -410,7 +410,6 @@ impl Config {
     /// what the turn actually cost. OpenAI (Responses and Chat Completions),
     /// Anthropic and the OpenAI-compatible gateways all fold reasoning into
     /// `output_tokens` — adding it there charges the same tokens twice.
-    #[cfg(any(test, feature = "subagents"))]
     pub fn reasoning_tokens_are_exclusive_of_output(&self, provider: &str) -> bool {
         let kind_name = self
             .custom_providers
@@ -424,23 +423,55 @@ impl Config {
         )
     }
 
+    /// `usage` in the shape every other provider reports: reasoning tokens
+    /// that `provider` counts separately are folded into `output_tokens`.
+    ///
+    /// Gemini's thinking tokens are billed as output but reported beside it,
+    /// so without this the session and `--output json` never charged them, and
+    /// `total_tokens - output_tokens` counted them as prompt, inflating the
+    /// context estimate (mini-agent-izx3e). Apply it exactly once per usage
+    /// report, before charging or pricing it.
+    pub fn normalize_usage(
+        &self,
+        provider: &str,
+        mut usage: crate::event::UsageDelta,
+    ) -> crate::event::UsageDelta {
+        if self.reasoning_tokens_are_exclusive_of_output(provider) {
+            usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
+        }
+        usage
+    }
+
     pub fn resolve_context_window(
         &self,
         provider: &str,
         model_id: &str,
         qm: &HashMap<String, types::QuickModelConfig>,
     ) -> u64 {
+        self.known_context_window(provider, model_id, qm)
+            .unwrap_or(128_000)
+    }
+
+    /// [`Self::resolve_context_window`] without the 128k fallback: the pinned
+    /// `context_window`, then a quick model's, then the catalog's, or `None`
+    /// when none of them knows the model.
+    pub fn known_context_window(
+        &self,
+        provider: &str,
+        model_id: &str,
+        qm: &HashMap<String, types::QuickModelConfig>,
+    ) -> Option<u64> {
         if let Some(cw) = self.context_window {
-            return cw;
+            return Some(cw);
         }
         for qmc in qm.values() {
             if qmc.model.as_str() == model_id
                 && let Some(cw) = qmc.context_window
             {
-                return cw;
+                return Some(cw);
             }
         }
-        Self::catalog_context_window(provider, model_id).unwrap_or(128_000)
+        Self::catalog_context_window(provider, model_id)
     }
 
     /// The model's context window straight from the static catalog, or `None`

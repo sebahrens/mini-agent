@@ -460,6 +460,26 @@ pub struct Compaction {
     pub summarized_count: usize,
     pub token_savings: u64,
     pub created_at: CompactString,
+    /// [`compaction_ref`] of the summarizer's text, which also tags the copy
+    /// written to the daily memory log. `None` for compactions saved before
+    /// the tag existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_ref: Option<CompactString>,
+}
+
+/// Longest derived session title shown in `--resume` and `/sessions`.
+pub const SESSION_TITLE_CHARS: usize = 48;
+
+/// A short, stable tag for one compaction summary.
+///
+/// The daily memory log and the session's recap carry the same summary; the
+/// tag lets the memory block leave out the copy the session already replays
+/// (mini-agent-vx0yg). It is computed from the summarizer's own text, before
+/// todo or goal context is appended to the session's copy.
+pub fn compaction_ref(summary: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(summary.trim().as_bytes());
+    crate::hex::encode_lower(&digest[..8])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1596,6 +1616,45 @@ impl Session {
         self.context_window = cw;
     }
 
+    /// A short label for session lists: the session's name when it has one,
+    /// otherwise its first user message on one line, cut to
+    /// [`SESSION_TITLE_CHARS`] characters. Empty for a session with neither.
+    ///
+    /// Deliberately derived, not generated: a title costs no model call and
+    /// needs no storage, and it names what the session was started for
+    /// (mini-agent-72jb0).
+    pub fn list_title(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return format!("[{}]", self.name.trim());
+        }
+        let Some(first) = self
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User && !m.content.trim().is_empty())
+        else {
+            return String::new();
+        };
+        let line = first
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if line.chars().count() <= SESSION_TITLE_CHARS {
+            return line;
+        }
+        let mut cut: String = line.chars().take(SESSION_TITLE_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    }
+
+    /// The [`compaction_ref`] of the summary this session currently replays
+    /// as its recap, if it has one.
+    #[cfg(feature = "memory")]
+    pub fn active_compaction_ref(&self) -> Option<&str> {
+        self.compacted_context().0?;
+        self.compactions.last()?.memory_ref.as_deref()
+    }
+
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
         let c = match self.compactions.last() {
             Some(c) => c,
@@ -1612,6 +1671,7 @@ impl Session {
     }
 
     pub fn compress(&mut self, mut summary: String, first_kept_index: usize, token_savings: u64) {
+        let memory_ref = CompactString::new(compaction_ref(&summary));
         if let Some(todo_context) = self.todos.critical_context() {
             summary.push_str("\n\n");
             summary.push_str(&todo_context);
@@ -1651,6 +1711,7 @@ impl Session {
             summarized_count,
             token_savings,
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
+            memory_ref: Some(memory_ref),
         });
 
         // Compaction reindexes messages, so the calibration anchor no longer
@@ -1671,6 +1732,29 @@ impl Session {
     /// the unsummarized remainder for a later pass. Zero is an error because
     /// inserting a summary without removing anything grows the session and
     /// re-triggers auto-compaction on every turn.
+    /// The messages a compaction of the first `cut_idx` messages hands the
+    /// summarizer, and how many leading messages were left out of them.
+    ///
+    /// The previous compaction's summary record sits at index 0 and is passed
+    /// to the summarizer separately as the rolling `previous_summary`, so it is
+    /// left out here rather than sent twice (mini-agent-g8m5v). It is still
+    /// part of the drained prefix: the new summary replaces it. Callers drain
+    /// `skipped + compaction_drain_len(cut_idx - skipped, included)`.
+    pub fn compaction_input(
+        &self,
+        cut_idx: usize,
+        keep_recent_tool_results: usize,
+    ) -> (usize, Vec<SessionMessage>) {
+        let skipped = match self.compacted_context() {
+            (Some(_), 1) if cut_idx > 1 => 1,
+            _ => 0,
+        };
+        let messages = self.context_messages_with_pruned_tool_results(keep_recent_tool_results)
+            [skipped..cut_idx]
+            .to_vec();
+        (skipped, messages)
+    }
+
     pub fn compaction_drain_len(cut_idx: usize, messages_included: usize) -> anyhow::Result<usize> {
         let drain = messages_included.min(cut_idx);
         if drain == 0 {

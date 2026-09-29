@@ -750,6 +750,8 @@ Interactive startup begins `SessionStart` as soon as resume state is known,
 starts the independent agent/MCP prebuild, and joins the hook before accepting
 the first user or automatic turn. Print and loop modes still join the hook
 before constructing their first request.
+`SessionEnd` (`"exit"`) runs whenever a print-mode run ends, including a
+failed turn, a persistence failure, and a goal that exits with its own code.
 
 Only `PreToolUse` is permission-blockable by default. A handler's stdout JSON
 may set `"permissionDecision"` to `"deny"`, `"ask"`, `"allow"`, or omit it
@@ -1761,6 +1763,11 @@ listed API key environment variable when that variable is set):
 Set `enable-exa-mcp = false` to disable the Exa default without touching
 `mcp_servers`. Set `"mcp_servers": {}` to disable all MCP auto-configuration.
 
+A server you define yourself under a built-in's name (`Exa Web Search`,
+`Context7`, `Grep.app`) is kept whatever the toggle says: the toggles only add
+or omit the built-in registration, and saving the config (including `--setup`)
+never removes a user-defined entry.
+
 In `readonly` and `planwrite` modes, approval-free MCP access is limited to
 immutable built-in registrations and these exact read-only tool names:
 Exa `websearch` and `webfetch`; Context7 `get_context` and `search_docs`; and
@@ -1845,6 +1852,10 @@ assistant history. Dropping the original prompt request has the same effect.
 Concurrent prompts for one session are rejected while its turn is active, so an
 untagged duplicate cancellation cannot be redirected to queued work. Other
 sessions remain independent and continue normally.
+
+Context files (global and workspace `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md`)
+share a 512 KiB budget. A file that does not fit in what remains is truncated with a
+visible notice rather than loaded whole, and files after the budget is spent are skipped.
 
 ACP context includes managed global files and context files in the captured
 workspace root. It intentionally does not load `AGENTS.md`, `CLAUDE.md`, or

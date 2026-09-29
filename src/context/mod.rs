@@ -241,10 +241,21 @@ impl ContextFiles {
 
     /// Refresh persistent-memory prompt context without destabilizing the
     /// provider cache when its rendered content is byte-identical.
+    ///
+    /// `exclude_compaction` is the session's
+    /// [`crate::session::Session::active_compaction_ref`]: that summary is
+    /// already replayed as the session's recap, so its daily-log copy is left
+    /// out of the block.
     #[cfg(feature = "memory")]
-    pub(crate) async fn refresh_memory_if_changed(&mut self) -> bool {
-        match tokio::task::spawn_blocking(|| crate::extras::memory::Mem::open().context_block())
-            .await
+    pub(crate) async fn refresh_memory_if_changed(
+        &mut self,
+        exclude_compaction: Option<String>,
+    ) -> bool {
+        match tokio::task::spawn_blocking(move || {
+            crate::extras::memory::Mem::open()
+                .context_block_excluding(exclude_compaction.as_deref())
+        })
+        .await
         {
             Ok(memory) => self.replace_memory_if_changed(memory),
             Err(error) => {
@@ -311,14 +322,15 @@ fn walk_bound_context_files(
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
+    let mut budget = ContextBudget::default();
     if let Some(content) = load_file(&storage::agents_path())
-        && !content.trim().is_empty()
+        .and_then(|(content, truncated)| budget.admit("global AGENTS.md", content, truncated))
     {
         agent_parts.push(format!("# Global AGENTS.md\n{content}"));
     }
     #[cfg(feature = "archmd")]
     if let Some(content) = load_file(&storage::architecture_path())
-        && !content.trim().is_empty()
+        .and_then(|(content, truncated)| budget.admit("global ARCHITECTURE.md", content, truncated))
     {
         arch_parts.push(format!("# Global ARCHITECTURE.md\n{content}"));
     }
@@ -327,12 +339,12 @@ fn walk_bound_context_files(
     } else {
         &["AGENTS.md", "CLAUDE.md"][..]
     };
-    let mut total = 0usize;
-    for (dir, name, content) in workspace.read_ancestor_files(names) {
-        if content.trim().is_empty() || total >= MAX_ANCESTOR_CONTEXT_BYTES {
+    for (dir, name, content, truncated) in
+        workspace.read_ancestor_files(names, MAX_ANCESTOR_CONTEXT_BYTES)
+    {
+        let Some(content) = budget.admit(&name, content, truncated) else {
             continue;
-        }
-        total = total.saturating_add(content.len());
+        };
         if name == "ARCHITECTURE.md" {
             #[cfg(feature = "archmd")]
             arch_parts.push(format!(
@@ -409,18 +421,64 @@ pub fn load_for_workspace(no_context_files: bool, workspace_root: Option<&Path>)
     }
 }
 
-fn load_file(path: &PathBuf) -> Option<String> {
-    if path.exists() {
-        std::fs::read_to_string(path).ok()
-    } else {
-        None
-    }
+/// A context file read up to [`MAX_ANCESTOR_CONTEXT_BYTES`]:
+/// `(content, truncated)`. Never reads an oversized file whole.
+fn load_file(path: &PathBuf) -> Option<(String, bool)> {
+    let file = std::fs::File::open(path).ok()?;
+    crate::paths::read_utf8_prefix(file, MAX_ANCESTOR_CONTEXT_BYTES)
+        .ok()
+        .flatten()
 }
 
-/// Maximum total bytes of repository context files (AGENTS.md, CLAUDE.md,
-/// ARCHITECTURE.md) to load into the system prompt. Prevents a planted or
-/// oversized file from blowing up the context window.
+/// Maximum total bytes of context files (global and repository AGENTS.md,
+/// CLAUDE.md, ARCHITECTURE.md) to load into the system prompt. Prevents a
+/// planted or oversized file from blowing up the context window: a single
+/// file larger than what remains is truncated, not loaded whole.
 const MAX_ANCESTOR_CONTEXT_BYTES: usize = 524_288;
+
+/// Appended where a context file was cut to fit the budget.
+const CONTEXT_TRUNCATION_NOTICE: &str =
+    "\n\n[context file truncated: the combined context-file limit was reached]";
+
+/// The running total of context-file bytes admitted into the prompt
+/// (mini-agent-ag4ze).
+#[derive(Default)]
+struct ContextBudget {
+    used: usize,
+}
+
+impl ContextBudget {
+    /// The part of `content` that fits in what remains, with a notice when it
+    /// was cut, or `None` when it is empty or nothing remains.
+    fn admit(&mut self, label: &str, content: String, truncated: bool) -> Option<String> {
+        if content.trim().is_empty() {
+            return None;
+        }
+        let remaining = MAX_ANCESTOR_CONTEXT_BYTES.saturating_sub(self.used);
+        if remaining == 0 {
+            tracing::warn!(
+                "context file {label} skipped: context files exceed {MAX_ANCESTOR_CONTEXT_BYTES} bytes"
+            );
+            return None;
+        }
+        if content.len() <= remaining && !truncated {
+            self.used += content.len();
+            return Some(content);
+        }
+        let mut end = remaining.min(content.len());
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        tracing::warn!(
+            "context file {label} truncated to {end} bytes: context files exceed {MAX_ANCESTOR_CONTEXT_BYTES} bytes"
+        );
+        self.used = MAX_ANCESTOR_CONTEXT_BYTES;
+        let mut kept = content;
+        kept.truncate(end);
+        kept.push_str(CONTEXT_TRUNCATION_NOTICE);
+        Some(kept)
+    }
+}
 
 /// Reads context only from the explicitly selected workspace root. Global
 /// application context is loaded separately; parent directories outside the
@@ -429,23 +487,21 @@ fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<
     let mut agent_parts: SmallVec<[String; 4]> = SmallVec::new();
     #[cfg_attr(not(feature = "archmd"), allow(unused_mut))]
     let mut arch_parts: SmallVec<[String; 4]> = SmallVec::new();
-    let mut total_bytes: usize = 0;
+    let mut budget = ContextBudget::default();
 
     let global_agents = storage::agents_path();
     if let Some(content) = load_file(&global_agents)
-        && !content.trim().is_empty()
+        .and_then(|(content, truncated)| budget.admit("global AGENTS.md", content, truncated))
     {
-        total_bytes += content.len();
         agent_parts.push(format!("# Global AGENTS.md\n{}", content));
     }
 
     #[cfg(feature = "archmd")]
     {
         let global_arch = storage::architecture_path();
-        if let Some(content) = load_file(&global_arch)
-            && !content.trim().is_empty()
-        {
-            total_bytes += content.len();
+        if let Some(content) = load_file(&global_arch).and_then(|(content, truncated)| {
+            budget.admit("global ARCHITECTURE.md", content, truncated)
+        }) {
             arch_parts.push(format!("# Global ARCHITECTURE.md\n{}", content));
         }
     }
@@ -453,29 +509,20 @@ fn walk_context_files(workspace_root: Option<&Path>) -> (Option<String>, Option<
     if let Some(cwd) = workspace_root {
         let mut current = Some(cwd);
         while let Some(dir) = current {
-            if total_bytes >= MAX_ANCESTOR_CONTEXT_BYTES {
-                tracing::warn!(
-                    "ancestor context files exceed {} bytes, stopping traversal",
-                    MAX_ANCESTOR_CONTEXT_BYTES
-                );
-                break;
-            }
             for name in &["AGENTS.md", "CLAUDE.md"] {
                 let path = dir.join(name);
                 if let Some(content) = load_file(&path)
-                    && !content.trim().is_empty()
+                    .and_then(|(content, truncated)| budget.admit(name, content, truncated))
                 {
-                    total_bytes += content.len();
                     agent_parts.push(format!("# {} ({})\n{}", name, dir.display(), content));
                 }
             }
             #[cfg(feature = "archmd")]
             {
                 let path = dir.join("ARCHITECTURE.md");
-                if let Some(content) = load_file(&path)
-                    && !content.trim().is_empty()
-                {
-                    total_bytes += content.len();
+                if let Some(content) = load_file(&path).and_then(|(content, truncated)| {
+                    budget.admit("ARCHITECTURE.md", content, truncated)
+                }) {
                     arch_parts.push(format!(
                         "# ARCHITECTURE.md ({})\n{}",
                         dir.display(),
@@ -521,6 +568,65 @@ mod repository_context_tests {
         assert!(agents.contains("WORKSPACE_CONTEXT_MARKER"));
         assert!(!agents.contains("PARENT_CONTEXT_MARKER"));
         std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    // mini-agent-ag4ze: one oversized file is cut to the byte cap, and nothing
+    // after the cap is admitted.
+    #[test]
+    fn a_single_oversized_context_file_is_truncated_to_the_cap() {
+        let mut budget = ContextBudget::default();
+        let huge = "x".repeat(MAX_ANCESTOR_CONTEXT_BYTES + 10);
+        let admitted = budget.admit("AGENTS.md", huge, false).unwrap();
+        assert!(admitted.ends_with(CONTEXT_TRUNCATION_NOTICE));
+        assert_eq!(
+            admitted.len(),
+            MAX_ANCESTOR_CONTEXT_BYTES + CONTEXT_TRUNCATION_NOTICE.len()
+        );
+        assert!(budget.admit("CLAUDE.md", "more".into(), false).is_none());
+
+        // A read that was already cut is marked even when it fits exactly.
+        let mut budget = ContextBudget::default();
+        let admitted = budget.admit("AGENTS.md", "short".into(), true).unwrap();
+        assert_eq!(admitted, format!("short{CONTEXT_TRUNCATION_NOTICE}"));
+
+        // Multi-byte text is cut on a character boundary.
+        let mut budget = ContextBudget {
+            used: MAX_ANCESTOR_CONTEXT_BYTES - 3,
+        };
+        let admitted = budget.admit("CLAUDE.md", "éé".into(), false).unwrap();
+        assert_eq!(admitted, format!("é{CONTEXT_TRUNCATION_NOTICE}"));
+    }
+
+    #[test]
+    fn an_oversized_workspace_file_is_never_loaded_whole() {
+        let workspace =
+            std::env::temp_dir().join(format!("mini-agent-context-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "y".repeat(2 * MAX_ANCESTOR_CONTEXT_BYTES),
+        )
+        .unwrap();
+
+        let (agents, _) = walk_context_files(Some(&workspace));
+        let agents = agents.expect("the file is loaded, truncated");
+        assert!(
+            agents.len() <= MAX_ANCESTOR_CONTEXT_BYTES + 256,
+            "{}",
+            agents.len()
+        );
+        assert!(agents.ends_with(CONTEXT_TRUNCATION_NOTICE));
+
+        let binding = crate::paths::WorkspaceBinding::capture(&workspace).unwrap();
+        let (agents, _) = walk_bound_context_files(&binding);
+        let agents = agents.expect("the bound loader truncates too");
+        assert!(
+            agents.len() <= MAX_ANCESTOR_CONTEXT_BYTES + 256,
+            "{}",
+            agents.len()
+        );
+        assert!(agents.ends_with(CONTEXT_TRUNCATION_NOTICE));
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
 

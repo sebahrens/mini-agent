@@ -470,10 +470,8 @@ where
 
     eprintln!("auto-compacting headless session...");
     let model = session.model.to_string();
-    let messages = session
-        .context_messages_with_pruned_tool_results(cfg.resolve_keep_recent_tool_results())
-        [..plan.cut_idx]
-        .to_vec();
+    let (skipped, messages) =
+        session.compaction_input(plan.cut_idx, cfg.resolve_keep_recent_tool_results());
     let previous_summary = session
         .compactions
         .last()
@@ -489,7 +487,8 @@ where
     // `messages_included` is the length of the oldest prefix of the cut slice
     // whose content the summarizer saw (`cut_idx` with full coverage). Drain
     // exactly that prefix so unsummarized history is never discarded.
-    let first_kept_index = Session::compaction_drain_len(plan.cut_idx, messages_included)?;
+    let first_kept_index =
+        skipped + Session::compaction_drain_len(plan.cut_idx - skipped, messages_included)?;
     let tokens_before = if first_kept_index == plan.cut_idx {
         plan.tokens_before
     } else {
@@ -637,7 +636,8 @@ impl Startup {
 
         // Load context first so prompts/themes are available early.
         let no_context_files = cli.resolve_no_context_files(&cfg);
-        let context =
+        #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
+        let mut context =
             context::load(no_context_files).for_workspace_binding(no_context_files, &workspace);
 
         let mut provider = cli.resolve_provider(&cfg);
@@ -686,46 +686,22 @@ impl Startup {
         }
 
         if let Some(session_id) = &cli.session {
-            let sessions = session::storage::find_sessions_by_prefix(session_id)?;
-            if sessions.is_empty() {
-                // try exact name match as fallback
-                if let Some(s) = session::storage::find_session_by_name(session_id)? {
-                    session = s;
+            let candidates = session::storage::find_sessions_by_prefix(session_id)?;
+            match session::storage::select_session(session_id, candidates) {
+                session::storage::SessionSelection::One(selected) => {
+                    session = *selected;
                     session_resumed = true;
-                } else {
+                }
+                session::storage::SessionSelection::NoMatch => {
                     anyhow::bail!("no session matching '{}'", session_id);
                 }
-            } else if sessions.len() == 1 {
-                session = sessions.into_iter().next().unwrap();
-                session_resumed = true;
-            } else {
-                eprintln!("multiple sessions match '{}':", session_id);
-                for s in &sessions {
-                    let preview = s
-                        .messages
-                        .last()
-                        .map(|m| {
-                            let truncated: String = m.content.chars().take(40).collect();
-                            truncated
-                        })
-                        .unwrap_or_default();
-                    let time = crate::ui::events::format_time(&s.updated_at);
-                    let name_part = if s.name.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", s.name)
-                    };
-                    eprintln!(
-                        "  {}  {}  {}msgs  {}  {}{}",
-                        crate::print::short_session_id(&s.id),
-                        time,
-                        s.messages.len(),
-                        s.model,
-                        preview,
-                        name_part
-                    );
+                session::storage::SessionSelection::Ambiguous(sessions) => {
+                    eprintln!("multiple sessions match '{}':", session_id);
+                    for s in &sessions {
+                        eprintln!("{}", crate::print::session_list_line(s));
+                    }
+                    anyhow::bail!("be more specific with the session ID prefix");
                 }
-                anyhow::bail!("be more specific with the session ID prefix");
             }
         }
 
@@ -762,13 +738,23 @@ impl Startup {
 
         // A resumed session persisted its context_window when first saved, which can
         // be stale if the model's catalog entry has changed since (e.g. a model that
-        // grew from 128k to 1M). Re-derive it from the catalog for the session's own
-        // model, unless the user pinned `context_window` in config (then that wins).
-        if cfg.context_window.is_none()
-            && let Some(cw) =
-                Config::catalog_context_window(session.provider.as_str(), session.model.as_str())
+        // grew from 128k to 1M) or the user has since pinned one. Re-derive it for
+        // the session's own model in the same order a new session uses — pinned
+        // `context_window`, then the quick model's, then the catalog's — and keep
+        // the saved value only when none of them knows the model (mini-agent-ycu8b).
+        if let Some(cw) =
+            cfg.known_context_window(session.provider.as_str(), session.model.as_str(), &qm_map)
         {
             session.update_context_window(cw);
+        }
+
+        // A resumed session replays its compaction summary as a recap; the
+        // memory block must not carry the daily log's copy of it as well
+        // (mini-agent-vx0yg).
+        #[cfg(feature = "memory")]
+        if let Some(reference) = session.active_compaction_ref() {
+            context.memory =
+                crate::extras::memory::Mem::open().context_block_excluding(Some(reference));
         }
 
         // The invocation's captured workspace is authoritative until an
@@ -1368,7 +1354,13 @@ impl Startup {
             if let Some(task) = self.session_start_task.take() {
                 let _ = task.await;
             }
-            heap_future(|| self.dispatch_print()).await
+            let result = heap_future(|| self.dispatch_print()).await;
+            // Every headless exit ends the session: a failed turn, a
+            // persistence failure and a goal's own exit code alike
+            // (mini-agent-rnpjm).
+            #[cfg(feature = "hooks")]
+            crate::extras::hooks::dispatch_session_end("exit").await;
+            result
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
@@ -1422,7 +1414,7 @@ impl Startup {
                     None
                 };
                 if !json_output {
-                    println!("{result}");
+                    crate::print::headless_stdout(format_args!("{result}\n"));
                 }
                 let mut persistence_failure = None;
                 if !self.cli.no_session {
@@ -1445,8 +1437,8 @@ impl Startup {
                     } else {
                         crate::print::HeadlessStopReason::Failed
                     };
-                    println!(
-                        "{}",
+                    crate::print::headless_stdout(format_args!(
+                        "{}\n",
                         crate::print::render_headless_json(
                             self.workspace.root(),
                             &result,
@@ -1458,7 +1450,7 @@ impl Startup {
                             #[cfg(feature = "goal")]
                             None,
                         )?
-                    );
+                    ));
                 }
                 if !run.succeeded() {
                     let failure = anyhow::anyhow!("explicit shell command failed");
@@ -1611,6 +1603,11 @@ impl Startup {
                 prompt: recorded_prompt,
                 persisted: already_persisted,
             } = response_result;
+            // Priced and charged in one shape whatever the provider.
+            let usage: rig::completion::Usage = self
+                .cfg
+                .normalize_usage(&self.session.provider, usage.into())
+                .into();
             let json_context = if json_output {
                 let files_changed = crate::print::files_changed_since(
                     self.workspace.root(),
@@ -1682,8 +1679,8 @@ impl Startup {
                         crate::print::HeadlessStopReason::Completed
                     }
                 };
-                println!(
-                    "{}",
+                crate::print::headless_stdout(format_args!(
+                    "{}\n",
                     crate::print::render_headless_json(
                         self.workspace.root(),
                         &response,
@@ -1695,7 +1692,7 @@ impl Startup {
                         #[cfg(feature = "goal")]
                         finished_goal.as_ref(),
                     )?
-                );
+                ));
             }
             // A goal that stopped for a reason of its own exits with that
             // reason's code, whatever the output format. The distinction
@@ -1727,9 +1724,6 @@ impl Startup {
                 return Err(error);
             }
         }
-
-        #[cfg(feature = "hooks")]
-        crate::extras::hooks::dispatch_session_end("exit").await;
 
         Ok(())
     }
@@ -2551,6 +2545,52 @@ mod tests {
         assert_eq!(session.compactions.len(), 1);
         assert_eq!(session.messages[0].content, "HEADLESS_SUMMARY");
         assert_eq!(session.messages.len(), 2);
+    }
+
+    // mini-agent-g8m5v: a second compaction passes the previous summary once,
+    // as `previous_summary`, not also as the first message of the cut.
+    #[tokio::test]
+    async fn recompaction_sends_the_previous_summary_once() {
+        let mut session = crate::session::Session::new("openai", "model", 100, "");
+        session.overhead_tokens = 60;
+        session.add_message(crate::session::MessageRole::User, &"z".repeat(40));
+        session.compress("OLD_SUMMARY".to_string(), 1, 10);
+        session.add_message(crate::session::MessageRole::User, &"a".repeat(40));
+        session.add_message(crate::session::MessageRole::Assistant, &"b".repeat(40));
+        session.add_message(crate::session::MessageRole::User, &"c".repeat(40));
+        let cfg = crate::config::Config {
+            compact_enabled: Some(true),
+            reserve_tokens: Some(20),
+            keep_recent_tokens: Some(5),
+            ..crate::config::Config::default()
+        };
+
+        let result = compact_headless_session_with(
+            &mut session,
+            &cfg,
+            0,
+            #[cfg(feature = "memory")]
+            None,
+            |_, messages, previous_summary, _, _| async move {
+                assert_eq!(previous_summary.as_deref(), Some("OLD_SUMMARY"));
+                assert!(
+                    messages
+                        .iter()
+                        .all(|message| message.content != "OLD_SUMMARY"),
+                    "the previous summary must not also be a summarized message"
+                );
+                assert_eq!(messages.len(), 2, "{messages:?}");
+                Ok(("NEW_SUMMARY".to_string(), messages.len()))
+            },
+        )
+        .await
+        .unwrap();
+
+        // The old summary record plus both summarized messages are drained.
+        assert_eq!(result, Some(("NEW_SUMMARY".to_string(), 3)));
+        assert_eq!(session.messages[0].content, "NEW_SUMMARY");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content, "c".repeat(40));
     }
     use crate::config::Config;
     use crate::sandbox::{Sandbox, SandboxPolicy};

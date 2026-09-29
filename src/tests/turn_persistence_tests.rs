@@ -362,6 +362,66 @@ fn headless_text_only_turn_persists_single_assistant_message() {
     assert_eq!(session.messages[1].content, "hello");
 }
 
+// mini-agent-knwk1: text written before a tool call is its own assistant
+// record ahead of that call, and the final answer is not concatenated onto it.
+#[test]
+fn headless_text_before_a_tool_call_is_its_own_record() {
+    let mut session = session();
+    let call = tool_call_message("provider-1", "read", serde_json::json!({"path": "a"}));
+    let Message::Assistant { content, .. } = call else {
+        unreachable!()
+    };
+    let mut items = vec![AssistantContent::text("I'll read the file.")];
+    items.extend(content);
+    let interactions = vec![
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::many(items).unwrap(),
+        },
+        Message::tool_result("provider-1", "contents"),
+        Message::assistant("Done."),
+    ];
+
+    persist_headless_turn(&mut session, "read it", "Done.", &interactions);
+
+    assert_eq!(
+        roles(&session),
+        [
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::ToolCall,
+            MessageRole::ToolResult,
+            MessageRole::Assistant,
+        ]
+    );
+    assert_eq!(session.messages[1].content, "I'll read the file.");
+    assert_eq!(session.messages[4].content, "Done.");
+}
+
+// mini-agent-64qyf: a round that ended in its goal_report has no closing text
+// and must not leave an empty assistant record behind.
+#[test]
+fn headless_empty_response_writes_no_assistant_record() {
+    let mut session = session();
+    let interactions = vec![
+        tool_call_message(
+            "provider-1",
+            "goal_report",
+            serde_json::json!({"status": "progress"}),
+        ),
+        Message::tool_result("provider-1", "Report recorded for round 1 of 5."),
+    ];
+    persist_headless_turn(&mut session, "go", "", &interactions);
+    assert_eq!(
+        roles(&session),
+        [
+            MessageRole::User,
+            MessageRole::ToolCall,
+            MessageRole::ToolResult
+        ]
+    );
+}
+
 #[test]
 fn headless_multi_part_tool_result_is_one_record() {
     let mut session = session();

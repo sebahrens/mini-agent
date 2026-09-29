@@ -1795,7 +1795,7 @@ async fn execute_prompt(
     #[cfg(feature = "memory")]
     let context = {
         let mut refreshed = (*context).clone();
-        refreshed.refresh_memory_if_changed().await;
+        refreshed.refresh_memory_if_changed(None).await;
         Arc::new(refreshed)
     };
     #[cfg(test)]

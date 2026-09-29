@@ -736,7 +736,10 @@ pub fn persist_round(
         Ok(())
     } else {
         crate::print::persist_headless_turn(session, prompt, &response, &interactions);
-        session.charge_usage_delta(usage.into(), cfg.is_anthropic_native(&session.provider));
+        session.charge_usage_delta(
+            cfg.normalize_usage(&session.provider, usage.into()),
+            cfg.is_anthropic_native(&session.provider),
+        );
         crate::session::storage::save_session(session)
     };
     if let Some(failure) = failure {
