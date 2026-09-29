@@ -76,6 +76,22 @@ class HarnessEvalCiTests(unittest.TestCase):
         self.assertIn("name: harness-eval-logs", workflow)
         self.assertIn("if: always()", workflow)
 
+    def test_nightly_workflow_runs_the_ignored_worker_stdout_regression(self) -> None:
+        # Invariant 6's slow regression is #[ignore]d out of the per-push
+        # matrix, so the nightly schedule is where it runs (mini-agent-ym5ht).
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job = workflow.split("\n  js-worker-stdout-regression:", 1)[1]
+        self.assertIn(
+            "extras::js::tests::worker_runtime::"
+            "worker_supervisor_reused_test_worker_stdout_stays_protocol_only",
+            job,
+        )
+        self.assertIn("--exact --ignored --nocapture --test-threads=1", job)
+        self.assertIn("set -o pipefail", job)
+        self.assertIn("grep -q 'test result: ok. 1 passed'", job)
+        self.assertNotIn("\n    if:", job)
+        self.assertNotIn("needs:", job)
+
 
 def _load_extractor():
     path = REPOSITORY_ROOT / "scripts" / "harness_eval_metrics.py"

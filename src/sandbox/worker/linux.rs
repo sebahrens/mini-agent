@@ -257,7 +257,7 @@ fn set_limit(resource: Resource, ceiling: u64) -> io::Result<()> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn denied_syscalls() -> [i64; 14] {
+fn denied_syscalls() -> [i64; 19] {
     [
         libc::SYS_fork,
         libc::SYS_vfork,
@@ -273,11 +273,20 @@ fn denied_syscalls() -> [i64; 14] {
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_chroot,
+        // Cross-process inspection. With `--unshare-pid`, bubblewrap's init is PID 1 inside the
+        // namespace and is not under this filter; on hosts with yama `ptrace_scope=0` a
+        // compromised worker could otherwise attach to it (or read/write its memory, or steal
+        // its descriptors) and fork/exec through it.
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kcmp,
+        libc::SYS_pidfd_getfd,
     ]
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-fn denied_syscalls() -> [i64; 12] {
+fn denied_syscalls() -> [i64; 17] {
     [
         libc::SYS_clone,
         libc::SYS_clone3,
@@ -291,6 +300,15 @@ fn denied_syscalls() -> [i64; 12] {
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_chroot,
+        // Cross-process inspection. With `--unshare-pid`, bubblewrap's init is PID 1 inside the
+        // namespace and is not under this filter; on hosts with yama `ptrace_scope=0` a
+        // compromised worker could otherwise attach to it (or read/write its memory, or steal
+        // its descriptors) and fork/exec through it.
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kcmp,
+        libc::SYS_pidfd_getfd,
     ]
 }
 
@@ -1531,9 +1549,55 @@ mod raw_probe {
                     libc::syscall(syscall, std::ptr::null::<u8>(), std::ptr::null::<u8>())
                 }
                 libc::SYS_chroot => libc::syscall(syscall, std::ptr::null::<u8>()),
+                // The concrete escape the denial closes: attaching to the unfiltered sandbox
+                // init (the worker's parent inside the PID namespace).
+                libc::SYS_ptrace => libc::syscall(
+                    syscall,
+                    libc::PTRACE_ATTACH as libc::c_long,
+                    libc::getppid() as libc::c_long,
+                    0,
+                    0,
+                ),
+                // Zero iovec counts: an unfiltered kernel transfers nothing and returns 0.
+                libc::SYS_process_vm_readv | libc::SYS_process_vm_writev => libc::syscall(
+                    syscall,
+                    libc::getppid() as libc::c_long,
+                    std::ptr::null::<libc::iovec>(),
+                    0,
+                    std::ptr::null::<libc::iovec>(),
+                    0,
+                    0,
+                ),
+                // KCMP_FILE (0) on stdin of this process and its parent; read-only comparison.
+                libc::SYS_kcmp => libc::syscall(
+                    syscall,
+                    libc::getpid() as libc::c_long,
+                    libc::getppid() as libc::c_long,
+                    0,
+                    0,
+                    0,
+                ),
+                // An invalid pidfd fails with EBADF when unfiltered; no descriptor is created.
+                libc::SYS_pidfd_getfd => libc::syscall(syscall, -1, 0, 0),
                 _ => return None,
             }
         };
+        if result == 0 && syscall == libc::SYS_ptrace {
+            // SAFETY: The unfiltered attach succeeded, so this process traces its parent, which
+            // is being stopped by the attach. Wait for that stop and detach so the failed probe
+            // does not leave the sandbox init traced or stopped.
+            unsafe {
+                let parent = libc::getppid();
+                libc::waitpid(parent, std::ptr::null_mut(), libc::__WALL);
+                libc::ptrace(
+                    libc::PTRACE_DETACH,
+                    parent,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+            }
+            return None;
+        }
         if result == 0 {
             #[cfg(target_arch = "x86_64")]
             let created_child = syscall == libc::SYS_clone
@@ -1552,6 +1616,22 @@ mod raw_probe {
             if syscall == libc::SYS_socket {
                 // SAFETY: A positive socket result is an fd created only by this probe.
                 unsafe { libc::close(result as libc::c_int) };
+                return None;
+            }
+            if syscall == libc::SYS_pidfd_getfd {
+                // SAFETY: A positive pidfd_getfd result is a descriptor duplicated only by this
+                // probe.
+                unsafe { libc::close(result as libc::c_int) };
+                return None;
+            }
+            if matches!(
+                syscall,
+                libc::SYS_ptrace
+                    | libc::SYS_process_vm_readv
+                    | libc::SYS_process_vm_writev
+                    | libc::SYS_kcmp
+            ) {
+                // A byte count or comparison ordering, never a process or resource to reclaim.
                 return None;
             }
             // SAFETY: A positive result is a child PID created only by this probe. Waiting for

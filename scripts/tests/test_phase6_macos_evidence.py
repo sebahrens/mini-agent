@@ -166,6 +166,26 @@ class Phase6MacosEvidenceTests(unittest.TestCase):
         self.assertIn("PHASE6_NAMED_FIFO=denied", step)
         self.assertIn('--named-fifo "${PHASE6_NAMED_FIFO:-not-run}"', macos)
 
+    def test_the_workflow_runs_the_seatbelt_launcher_facts_on_every_macos_runner(
+        self,
+    ) -> None:
+        # The ignored macos_js_worker_containment probe is referenced from the
+        # gate rather than left unexecuted (mini-agent-ym5ht).
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        macos = workflow.split("  macos-worker-containment-gate:", 1)[1].split(
+            "\n  windows-worker-launcher-unit:", 1
+        )[0]
+        step = macos.split(
+            "name: Confirm the Seatbelt facts behind the one-time worker image", 1
+        )[1].split("- name:", 1)[0]
+        self.assertNotIn("if:", step)
+        self.assertIn(
+            "extras::js::tests::worker_containment::macos_js_worker_containment",
+            step,
+        )
+        self.assertIn("--exact --ignored", step)
+        self.assertIn("grep -q 'test result: ok. 1 passed'", step)
+
     def test_the_workflow_uses_the_generator_instead_of_hard_coded_fields(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         macos = workflow.split("  macos-worker-containment-gate:", 1)[1]

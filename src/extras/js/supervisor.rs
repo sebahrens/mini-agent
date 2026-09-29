@@ -1550,6 +1550,7 @@ fn step_outcome_is_reusable(outcome: &StepOutcome) -> bool {
     matches!(
         outcome,
         StepOutcome::Value(_)
+            | StepOutcome::Structured(_)
             | StepOutcome::Void
             | StepOutcome::Error(
                 JsErrorCode::Syntax

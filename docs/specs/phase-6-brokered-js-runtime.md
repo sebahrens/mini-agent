@@ -90,7 +90,9 @@ worker's binary protocol stream. Single-threaded harness execution avoids that
 notice; production framing and worker reuse limits stay strict. The ignored
 `worker_supervisor_reused_test_worker_stdout_stays_protocol_only` regression
 holds one generation past that deadline and verifies a second successful request.
-Run it explicitly with `cargo test --features skills
+The nightly `js-worker-stdout-regression` job in `.github/workflows/harness-eval.yml` runs it
+with `--exact --ignored --test-threads=1` and requires exactly one pass (mini-agent-ym5ht); run it
+locally with `cargo test --features skills
 worker_supervisor_reused_test_worker_stdout_stays_protocol_only -- --ignored --test-threads=1`.
 
 ## Worker lifecycle
@@ -637,7 +639,12 @@ the authenticated `Hello` and before `Ready`, the already-exec'd worker applies
 validated address-space, CPU, descriptor, core, and file-size ceilings, disables process
 dumpability, sets `no_new_privs`, and
 installs a seccomp filter denying fork, vfork, clone, clone3, execve, execveat, socket, and
-socketpair, along with namespace and mount mutation. On x86_64 a preceding BPF range guard denies
+socketpair, along with namespace and mount mutation, plus cross-process inspection: ptrace,
+process_vm_readv, process_vm_writev, kcmp, and pidfd_getfd (mini-agent-ym5ht). With
+`--unshare-pid`, bubblewrap's init is PID 1 in the worker's namespace and is not under the worker's
+filter, so on hosts with yama `ptrace_scope=0` an attach would otherwise let a compromised worker
+fork/exec through it; the runtime probe requires `EPERM` from every denied number, including
+`ptrace(PTRACE_ATTACH, getppid())`. On x86_64 a preceding BPF range guard denies
 every syscall number carrying the x32 ABI bit, so alternate-ABI numbers cannot bypass the exact
 deny set. The post-handshake evaluator therefore cannot create private or external network
 listeners even inside its isolated network namespace. Any trusted-path, namespace, mount, limit,
@@ -672,6 +679,10 @@ local probes on macOS 26 preserve the constraints that motivated the one-time-im
   the initial worker image;
 - allowing the exact initial image is not a one-time grant and remains usable for later exec; and
 - macOS rejects applying a second, tighter Seatbelt profile after the first profile is active.
+
+The ignored `macos_js_worker_containment` test pins those three facts; the
+`macos-worker-containment-gate` CI job runs it with `--exact --ignored` on every macOS row and
+requires exactly one pass (mini-agent-ym5ht), so a macOS change that invalidates them fails the gate.
 
 macOS 15 remains an explicit CI probe target rather than a validated runtime major. The production
 allowlist must not classify it as validated until that runner has produced the same real-backend
@@ -1054,7 +1065,8 @@ payload. Parent watchdog expiry and cumulative native CPU exhaustion also remain
 infrastructure failures rather than evidence against a skill's source.
 
 Worker reuse is a parent-owned, deterministic decision. A successful value or void result and the
-explicitly allowlisted `syntax`, `exception`, and `invalid_result` JavaScript errors may leave the
+explicitly allowlisted `syntax`, `exception`, `effect_limit`, and `invalid_result` JavaScript
+errors, and an accepted `result()` structured outcome (mini-agent-ym5ht), may leave the
 contained process warm, but the worker still creates a fresh QuickJS `Runtime` for the next
 request. Stack/job resource errors, internal errors, JavaScript timeout/OOM terminals, and
 verification results containing a `resource_limit` or `internal` diagnostic poison the process
@@ -1239,7 +1251,10 @@ bead is closed with its required regression tests, so all items are part of the 
    through the captured descriptor-only JSON gate and sends the encoded JSON in a typed terminal
    effect. The parent rejects invalid JSON, values over 256 KiB, more than 100,000 JSON nodes, or
    nesting deeper than 64 before acknowledging it. The first acknowledged result is terminal:
-   later effects are rejected, script evaluation is interrupted at the next QuickJS interrupt
+   later effects are rejected by the worker itself with the closed `denied` code, without a wire
+   frame, parent audit record, or effect ordinal (mini-agent-ym5ht), so a post-result loop can
+   never reach the 256-effect quota and the effect-limit error never replaces an acknowledged
+   result whose parent receipt must match the step outcome; script evaluation is interrupted at the next QuickJS interrupt
    checkpoint, caught exceptions cannot undo it, and the step returns a distinct structured-result
    outcome without another provider round trip. `undefined`, functions, symbols, accessors,
    sparse arrays, cycles, non-finite numbers, and unsupported prototypes fail the existing strict

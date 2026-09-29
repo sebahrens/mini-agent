@@ -8,6 +8,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Security
 
+- The Linux JS worker's seccomp filter now also denies `ptrace`, `process_vm_readv`,
+  `process_vm_writev`, `kcmp` and `pidfd_getfd`, so a compromised worker cannot attach to the
+  unfiltered bubblewrap init in its PID namespace (on `ptrace_scope=0` hosts) and fork/exec through it.
 - Misspelled or unknown top-level config keys are no longer silently dropped: startup (and
   `--print-config`) warns with the nearest known key, keys of builds with other Cargo features stay
   quiet, and every kebab-case key (`permission-deny`, `sandbox-backend`, `permission-modes`,
@@ -89,6 +92,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- A JS step that called `result(...)` and then kept issuing effects (for example a loop of more
+  than 256 caught `scratch_get` calls) no longer fails with "JavaScript worker violated its
+  protocol": effects after an accepted result are denied inside the worker without reaching the
+  parent or its audit log, and the accepted value is returned. A `result(...)` step also keeps the
+  warm JS worker instead of forcing a cold relaunch on the next call.
 - `read`, `write`, `edit`, `list_dir`, `grep` and `find_files` now treat a `$HOME/...` path like
   `~/...`: it resolves to the home directory through the ambient permission check instead of being
   created as a literal `./$HOME/...` tree inside the workspace while the result named the home path.
