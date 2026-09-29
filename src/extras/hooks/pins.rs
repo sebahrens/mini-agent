@@ -8,7 +8,10 @@
 //! outside the sandbox. [`HookContentPins`] records a SHA-256 digest of every
 //! such file when hooks are loaded; every launch re-resolves the same operands
 //! and denies the hook unless each workspace-resident file still has the
-//! recorded content.
+//! recorded content. Project hooks bind the digests into their confirmation
+//! hash; global and managed hooks persist them per project in the trust store
+//! (see `trust::pin_configured_hook_content`), so a rewrite in one session is
+//! also caught at the next start.
 //!
 //! Operands are the resolved executable, each argument, and every
 //! whitespace/shell-punctuation-separated token of the arguments and the `if`
@@ -41,6 +44,9 @@ pub(crate) enum PinnedLocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HookContentPins {
     files: BTreeMap<PinnedLocation, String>,
+    /// Set when the workspace files changed since a persisted approval and
+    /// the change was not re-approved: every launch is denied (fail-closed).
+    rejected: Option<String>,
 }
 
 /// The shell used for `if` conditions, as an absolute path on Unix so a
@@ -80,6 +86,24 @@ impl HookContentPins {
             }
         }
         pins
+    }
+
+    /// A binding that denies every launch with `reason`, used when a global
+    /// or managed hook's workspace files no longer match the persisted
+    /// digests and the change was not re-approved.
+    pub(crate) fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            files: BTreeMap::new(),
+            rejected: Some(reason.into()),
+        }
+    }
+
+    /// Stable SHA-256 over [`Self::entries`], persisted for global and
+    /// managed hooks so a later session detects rewritten workspace files.
+    pub(crate) fn content_digest(&self) -> String {
+        let canonical = serde_json::to_vec(&self.entries())
+            .expect("serializing hook content bindings cannot fail");
+        crate::hex::encode_lower(Sha256::digest(canonical))
     }
 
     fn insert_operand(&mut self, root: &Path, operand: &std::ffi::OsStr) {
@@ -129,6 +153,9 @@ impl HookContentPins {
         program: &Path,
         args: &[String],
     ) -> Result<(), String> {
+        if let Some(reason) = &self.rejected {
+            return Err(reason.clone());
+        }
         let operands = std::iter::once(program.as_os_str().to_os_string()).chain(
             operand_tokens(args.iter().map(String::as_str))
                 .into_iter()

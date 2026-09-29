@@ -211,7 +211,12 @@ impl HookDispatcher {
         config: &HooksConfig,
         sandbox_backend: &str,
     ) -> Result<Self, String> {
-        Self::from_config_with_backend_and_optional_root(config, sandbox_backend, None)
+        Self::from_config_with_backend_and_optional_root(
+            config,
+            sandbox_backend,
+            None,
+            HashMap::new(),
+        )
     }
 
     pub(crate) fn from_config_with_backend_and_root(
@@ -223,6 +228,26 @@ impl HookDispatcher {
             config,
             sandbox_backend,
             Some(project_root.to_path_buf()),
+            HashMap::new(),
+        )
+    }
+
+    /// Like [`Self::from_config_with_backend_and_root`], but uses the content
+    /// bindings the trust layer already approved (or rejected) for a handler
+    /// instead of capturing them again, so the digests that were confirmed
+    /// or compared against the persisted record are exactly the ones every
+    /// launch verifies.
+    pub(crate) fn from_config_with_backend_root_and_pins(
+        config: &HooksConfig,
+        sandbox_backend: &str,
+        project_root: &Path,
+        approved_pins: HashMap<HookHandler, HookContentPins>,
+    ) -> Result<Self, String> {
+        Self::from_config_with_backend_and_optional_root(
+            config,
+            sandbox_backend,
+            Some(project_root.to_path_buf()),
+            approved_pins,
         )
     }
 
@@ -230,6 +255,7 @@ impl HookDispatcher {
         config: &HooksConfig,
         sandbox_backend: &str,
         project_root: Option<PathBuf>,
+        approved_pins: HashMap<HookHandler, HookContentPins>,
     ) -> Result<Self, String> {
         let mut events = HashMap::new();
         for (event, groups) in config {
@@ -255,10 +281,11 @@ impl HookDispatcher {
                 .flatten()
                 .flat_map(|entry: &MatcherEntry| entry.handlers.iter())
                 .map(|handler| {
-                    (
-                        handler.clone(),
-                        Arc::new(HookContentPins::capture(root, handler)),
-                    )
+                    let pins = approved_pins
+                        .get(handler)
+                        .cloned()
+                        .unwrap_or_else(|| HookContentPins::capture(root, handler));
+                    (handler.clone(), Arc::new(pins))
                 })
                 .collect::<HashMap<_, _>>()
         });

@@ -337,3 +337,113 @@ fn conditions_use_an_absolute_shell() {
     let (shell, flag) = condition_shell();
     assert_eq!((shell, flag), ("/bin/sh", "-c"));
 }
+
+/// Global and managed hooks persist their workspace-file digests, so a guard
+/// rewritten during one session cannot silently take effect in the next
+/// (mini-agent-197xc).
+#[cfg(unix)]
+#[tokio::test]
+async fn rewritten_workspace_file_of_a_global_hook_is_denied_in_a_later_session() {
+    for source in ["global", "managed"] {
+        let project = Project::new(&format!("persist-{source}"));
+        project.write_script("guard.sh", DENY_SCRIPT);
+        let settings = project.base.join(format!("{source}-settings.json"));
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"./guard.sh","args":[],"trust":"trusted"}]}]}}"#,
+        )
+        .unwrap();
+        let store = project.base.join("trusted-hooks.json");
+        let missing = project.base.join("missing.json");
+        let prompts = std::cell::RefCell::new(Vec::<String>::new());
+        let answer = std::cell::Cell::new(false);
+        let confirm = |description: &str| {
+            prompts.borrow_mut().push(description.to_string());
+            answer.get()
+        };
+        let build = |headless: bool| {
+            let (global, managed) = if source == "global" {
+                (&settings, &missing)
+            } else {
+                (&missing, &settings)
+            };
+            trust::build_dispatcher_from_paths(
+                global,
+                &missing,
+                managed,
+                &project.root,
+                false,
+                headless,
+                &store,
+                &confirm,
+            )
+        };
+
+        // First session: trust on first use records the digest without asking.
+        let first = pre_tool(&build(true), &project).await;
+        assert_eq!(first.reason.as_deref(), Some("guard"), "{source}");
+        assert!(prompts.borrow().is_empty(), "{source}");
+        let persisted = std::fs::read_to_string(&store).unwrap();
+        assert!(persisted.contains("hook-content-v1:"), "{source}");
+
+        // The model rewrites the guard; a later headless session fails closed.
+        project.write_script("guard.sh", ALLOW_SCRIPT);
+        let headless = pre_tool(&build(true), &project).await;
+        assert_eq!(headless.verdict, Verdict::Deny, "{source}");
+        assert_ne!(headless.reason.as_deref(), Some("guard"), "{source}");
+        assert!(
+            prompts.borrow().is_empty(),
+            "{source}: headless never prompts"
+        );
+
+        // Declining interactively keeps it fail-closed and asks again next time.
+        let declined = pre_tool(&build(false), &project).await;
+        assert_eq!(declined.verdict, Verdict::Deny, "{source}");
+        assert_eq!(prompts.borrow().len(), 1, "{source}");
+        let prompt = prompts.borrow()[0].clone();
+        assert!(
+            prompt.starts_with(&format!("{source} hook whose workspace files changed")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("workspace:guard.sh"), "{prompt}");
+
+        // Accepting records the new digest; later sessions run without asking.
+        answer.set(true);
+        assert_eq!(
+            pre_tool(&build(false), &project).await.verdict,
+            Verdict::Allow,
+            "{source}"
+        );
+        assert_eq!(
+            pre_tool(&build(true), &project).await.verdict,
+            Verdict::Allow,
+            "{source}"
+        );
+        assert_eq!(prompts.borrow().len(), 2, "{source}");
+    }
+}
+
+#[test]
+fn global_hooks_without_workspace_files_record_nothing() {
+    let project = Project::new("persist-none");
+    let settings = project.base.join("global-settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"sh","args":["-c","exit 0"]}]}]}}"#,
+    )
+    .unwrap();
+    let store = project.base.join("trusted-hooks.json");
+    let missing = project.base.join("missing.json");
+    let dispatcher = trust::build_dispatcher_from_paths(
+        &settings,
+        &missing,
+        &missing,
+        &project.root,
+        false,
+        true,
+        &store,
+        &|_| panic!("no prompt expected"),
+    );
+    assert!(!dispatcher.is_empty());
+    assert!(!store.exists(), "an unchanged store is not rewritten");
+}

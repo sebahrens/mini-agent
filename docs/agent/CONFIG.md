@@ -837,7 +837,14 @@ refuse to modify a bound file in every security mode. For project hooks the
 digests are part of the confirmation hash and are shown in the prompt, so a
 rewritten script requires fresh confirmation on the next start; bindings that
 execute no workspace file keep their existing approval. Global and managed
-hooks are bound for the running session only, so point them at files outside
+hooks need no confirmation, but their workspace-file digests are persisted
+per project (as `hook-content-v1:` entries in the same trust store) the first
+time they are seen. When a later start finds different content, an
+interactive session asks whether to trust the change; a declined change or a
+headless start keeps the hook installed but denies every launch (fail-closed
+for `PreToolUse`) until the change is approved interactively, so a guard
+rewritten in one session never silently takes effect in the next. First use
+is trusted as configured, so prefer pointing global hooks at files outside
 the workspace. The binding is best-effort for shell text: variables expanded
 by a condition and files a script reads or sources on its own are not bound.
 
