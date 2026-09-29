@@ -563,7 +563,10 @@ Accepted top-level keys:
 
 The macOS general-command Seatbelt profile permits reads from ordinary
 host-readable paths needed by developer tools, but explicitly denies the
-resolved mini-agent configuration and credential directories. It therefore
+resolved mini-agent configuration and credential directories. Each is denied
+under both its configured spelling and its symlink-resolved spelling (for
+example `/tmp` versus `/private/tmp`, or a symlinked `~/.mini-agent`), because
+Seatbelt matches only resolved paths. It therefore
 protects mini-agent's own stored API keys and MCP OAuth tokens, but does not
 claim universal filesystem confidentiality. Linux and macOS expose only the dedicated
 `<cache_dir>/sandbox-runtime` subtree to general sandboxed commands.

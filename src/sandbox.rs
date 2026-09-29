@@ -33,7 +33,7 @@ const WORKSPACE_AUTHORITY_FD: i32 = 197;
 
 type EssentialEnvironment = Arc<[(&'static str, String)]>;
 type EssentialEnvironmentCache = Arc<OnceLock<EssentialEnvironment>>;
-type SeatbeltProfileKey = (String, String, String, String, bool);
+type SeatbeltProfileKey = (String, String, String, bool);
 type SeatbeltProfileCache = Arc<Mutex<HashMap<SeatbeltProfileKey, Arc<str>>>>;
 
 #[derive(Debug, Clone)]
@@ -1570,15 +1570,15 @@ impl Sandbox {
         let app_paths = crate::paths::AppPaths::from_process(None).map_err(|error| {
             format!("sandbox: failed to resolve private application paths: {error}")
         })?;
-        let credentials_str =
-            seatbelt_string_literal(&app_paths.credentials_dir, "credential directory")?;
-        let config_str = seatbelt_string_literal(&app_paths.config_dir, "configuration directory")?;
+        let private_read_denies = seatbelt_private_read_denies(&[
+            (app_paths.credentials_dir.as_path(), "credential directory"),
+            (app_paths.config_dir.as_path(), "configuration directory"),
+        ])?;
 
         let cache_key = (
             workspace_str.clone(),
             cache_str.clone(),
-            credentials_str.clone(),
-            config_str.clone(),
+            private_read_denies.clone(),
             deny_network,
         );
         let mut profiles = self
@@ -1590,25 +1590,11 @@ impl Sandbox {
             return Ok(profile.clone());
         }
 
-        let network_rule = if deny_network {
-            "(deny network*)"
-        } else {
-            "(allow network*)"
-        };
-        let profile = format!(
-            r#"(version 1)
-(deny default)
-(allow process*)
-(deny file-read*
-    (subpath "{credentials_str}")
-    (subpath "{config_str}"))
-(allow file-read*)
-(allow file-write*
-    (subpath "{workspace_str}")
-    (subpath "{cache_str}")
-    (subpath "/private/tmp")
-    (literal "/dev/null"))
-{network_rule}"#
+        let profile = seatbelt_shell_profile(
+            &workspace_str,
+            &cache_str,
+            &private_read_denies,
+            deny_network,
         );
         let profile: Arc<str> = Arc::from(profile);
         profiles.insert(cache_key, profile.clone());
@@ -3680,6 +3666,84 @@ fn canonical_non_root(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Render the Seatbelt shell profile from already-escaped path literals.
+/// `private_read_denies` is the body produced by [`seatbelt_private_read_denies`].
+fn seatbelt_shell_profile(
+    workspace_str: &str,
+    cache_str: &str,
+    private_read_denies: &str,
+    deny_network: bool,
+) -> String {
+    let network_rule = if deny_network {
+        "(deny network*)"
+    } else {
+        "(allow network*)"
+    };
+    format!(
+        r#"(version 1)
+(deny default)
+(allow process*)
+(deny file-read*{private_read_denies})
+(allow file-read*)
+(allow file-write*
+    (subpath "{workspace_str}")
+    (subpath "{cache_str}")
+    (subpath "/private/tmp")
+    (literal "/dev/null"))
+{network_rule}"#
+    )
+}
+
+/// Resolve `path` to the spelling the kernel reports for it. Seatbelt matches
+/// `subpath` filters against the resolved vnode path only, so a deny written
+/// through a symlink (for example `/tmp` -> `/private/tmp`, `/var` ->
+/// `/private/var`, or a symlinked `~/.mini-agent`) never matches. When `path`
+/// does not exist yet, the nearest existing ancestor is canonicalized and the
+/// missing tail is re-attached, so a directory created later is still covered.
+fn seatbelt_resolved_spelling(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut resolved = canonical;
+            for component in missing.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        missing.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
+/// Build the `(subpath ...)` list for private application directories that
+/// sandboxed commands must not read. Each directory is denied under both its
+/// configured spelling and its resolved spelling.
+fn seatbelt_private_read_denies(paths: &[(&Path, &str)]) -> Result<String, String> {
+    let mut spellings: Vec<String> = Vec::new();
+    for (path, label) in paths {
+        let mut candidates = vec![path.to_path_buf()];
+        if let Some(resolved) = seatbelt_resolved_spelling(path) {
+            candidates.push(resolved);
+        }
+        for candidate in candidates {
+            if candidate.parent().is_none() {
+                return Err(format!(
+                    "sandbox: refusing to deny reads of filesystem root as {label}"
+                ));
+            }
+            let literal = seatbelt_string_literal(&candidate, label)?;
+            if !spellings.contains(&literal) {
+                spellings.push(literal);
+            }
+        }
+    }
+    Ok(spellings
+        .iter()
+        .map(|literal| format!("\n    (subpath \"{literal}\")"))
+        .collect())
+}
+
 fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
     let value = path.to_str().ok_or_else(|| {
         format!(
@@ -5464,21 +5528,13 @@ printf {pass_token}
             seatbelt_string_literal(&app_paths.credentials_dir, "credential directory").unwrap();
         let config_str =
             seatbelt_string_literal(&app_paths.config_dir, "configuration directory").unwrap();
-        let uncached_profile = format!(
-            r#"(version 1)
-(deny default)
-(allow process*)
-(deny file-read*
-    (subpath "{credentials_str}")
-    (subpath "{config_str}"))
-(allow file-read*)
-(allow file-write*
-    (subpath "{workspace_str}")
-    (subpath "{cache_str}")
-    (subpath "/private/tmp")
-    (literal "/dev/null"))
-(deny network*)"#
-        );
+        let private_read_denies = seatbelt_private_read_denies(&[
+            (app_paths.credentials_dir.as_path(), "credential directory"),
+            (app_paths.config_dir.as_path(), "configuration directory"),
+        ])
+        .unwrap();
+        let uncached_profile =
+            seatbelt_shell_profile(&workspace_str, &cache_str, &private_read_denies, true);
 
         // The cached result must be byte-identical to the uncached result
         assert_eq!(
@@ -5600,5 +5656,130 @@ printf {pass_token}
             .unwrap();
         assert_ne!(profile_a_a, profile_with_network);
         assert!(profile_with_network.contains("(allow network*)"));
+    }
+
+    /// Unique scratch directory removed on drop.
+    #[cfg(unix)]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mini-agent-sbx-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_private_read_denies_cover_resolved_symlink_spelling() {
+        let root = ScratchDir::new();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(real_home.join("config")).unwrap();
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let canonical_home = std::fs::canonicalize(&real_home).unwrap();
+
+        // `credentials` does not exist yet; `config` does.
+        let denies = seatbelt_private_read_denies(&[
+            (
+                linked_home.join("credentials").as_path(),
+                "credential directory",
+            ),
+            (
+                linked_home.join("config").as_path(),
+                "configuration directory",
+            ),
+        ])
+        .unwrap();
+
+        for expected in [
+            linked_home.join("credentials"),
+            canonical_home.join("credentials"),
+            linked_home.join("config"),
+            canonical_home.join("config"),
+        ] {
+            let literal = seatbelt_string_literal(&expected, "test").unwrap();
+            assert!(
+                denies.contains(&format!("(subpath \"{literal}\")")),
+                "missing deny for {}: {denies}",
+                expected.display()
+            );
+        }
+        // Identical spellings are emitted once.
+        let canonical_only = seatbelt_private_read_denies(&[(
+            canonical_home.join("config").as_path(),
+            "configuration directory",
+        )])
+        .unwrap();
+        assert_eq!(canonical_only.matches("(subpath").count(), 1);
+    }
+
+    #[test]
+    fn seatbelt_private_read_denies_refuse_filesystem_root() {
+        let error =
+            seatbelt_private_read_denies(&[(Path::new("/"), "credential directory")]).unwrap_err();
+        assert!(error.contains("filesystem root"), "{error}");
+    }
+
+    /// Regression for mini-agent-v54o6: a credential directory reached through
+    /// a symlink (here `/tmp` -> `/private/tmp` style aliasing via an explicit
+    /// link) must be unreadable by a real Seatbelt child under both spellings.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_seatbelt_denies_symlinked_credential_reads() {
+        if !seatbelt_exists() {
+            eprintln!("skipping real macOS sandbox probe because Seatbelt preflight is denied");
+            return;
+        }
+        let root = ScratchDir::new();
+        let real_home = root.path().join("real-home");
+        let credentials = real_home.join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(credentials.join("key"), "secret").unwrap();
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let canonical_secret = std::fs::canonicalize(credentials.join("key")).unwrap();
+
+        let denies = seatbelt_private_read_denies(&[(
+            linked_home.join("credentials").as_path(),
+            "credential directory",
+        )])
+        .unwrap();
+        let workspace = std::fs::canonicalize(root.path()).unwrap();
+        let workspace_str = seatbelt_string_literal(&workspace, "working directory").unwrap();
+        let profile = seatbelt_shell_profile(&workspace_str, &workspace_str, &denies, true);
+
+        for target in [
+            canonical_secret.clone(),
+            linked_home.join("credentials").join("key"),
+        ] {
+            let output = std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(profile.as_str())
+                .arg("/bin/cat")
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success() && output.stdout.is_empty(),
+                "credential read through {} escaped Seatbelt: {:?}",
+                target.display(),
+                output
+            );
+        }
     }
 }
