@@ -361,6 +361,120 @@ fn queue_paste_followups(pending: &mut VecDeque<event::Event>) -> bool {
     }
 }
 
+/// What the input reader does after a failed terminal poll or read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderErrorAction {
+    /// Transient: wait this long, then try again.
+    Retry(Duration),
+    /// The terminal input is gone; stop reading and ask the app to quit.
+    GiveUp,
+}
+
+/// Consecutive-error policy for the input reader. A failing `poll` used to be
+/// retried in a tight loop (100% CPU) and a single failed `read` stopped the
+/// reader for good, leaving the UI deaf to input. Errors now back off
+/// exponentially and only a persistent failure ends the reader.
+#[derive(Debug, Default)]
+pub(crate) struct ReaderErrors {
+    consecutive: u32,
+}
+
+impl ReaderErrors {
+    const MAX_CONSECUTIVE: u32 = 20;
+    const BASE_DELAY: Duration = Duration::from_millis(10);
+    const MAX_DELAY: Duration = Duration::from_millis(500);
+
+    pub(crate) fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    pub(crate) fn on_error(&mut self) -> ReaderErrorAction {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= Self::MAX_CONSECUTIVE {
+            return ReaderErrorAction::GiveUp;
+        }
+        let factor = 1u32 << (self.consecutive - 1).min(16);
+        ReaderErrorAction::Retry(Self::BASE_DELAY.saturating_mul(factor).min(Self::MAX_DELAY))
+    }
+}
+
+/// Turn termination requests into an orderly [`UserEvent::Quit`] so the run is
+/// stopped, the session saved and the terminal restored (raw mode, mouse,
+/// bracketed paste, keyboard protocol, cursor) instead of the process dying
+/// with the terminal still in application mode. Unix: SIGTERM, SIGHUP and
+/// SIGQUIT. Windows: console close, logoff and shutdown events.
+///
+/// The TUI no longer reads its channel once it has exited, and a wedged
+/// shutdown must not make the process unkillable: a request that cannot be
+/// delivered, or the third one, restores the terminal and exits immediately.
+pub(crate) fn spawn_termination_listener(user_tx: mpsc::Sender<UserEvent>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kinds = [
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::quit(),
+        ];
+        for kind in kinds {
+            let Ok(mut stream) = signal(kind) else {
+                tracing::warn!(?kind, "cannot listen for termination signal");
+                continue;
+            };
+            let tx = user_tx.clone();
+            let requests = Arc::clone(&requests);
+            tokio::spawn(async move {
+                while stream.recv().await.is_some() {
+                    let repeated = requests.fetch_add(1, Ordering::AcqRel) + 1;
+                    if repeated >= FORCED_TERMINATION_REQUESTS
+                        || tx.send(UserEvent::Quit).await.is_err()
+                    {
+                        force_terminate(128 + kind.as_raw_value());
+                    }
+                }
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let tx = user_tx.clone();
+        tokio::spawn(async move {
+            let (Ok(mut close), Ok(mut logoff), Ok(mut shutdown)) = (
+                windows::ctrl_close(),
+                windows::ctrl_logoff(),
+                windows::ctrl_shutdown(),
+            ) else {
+                tracing::warn!("cannot listen for console termination events");
+                return;
+            };
+            loop {
+                tokio::select! {
+                    Some(()) = close.recv() => {}
+                    Some(()) = logoff.recv() => {}
+                    Some(()) = shutdown.recv() => {}
+                    else => break,
+                }
+                if tx.send(UserEvent::Quit).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    drop(user_tx);
+}
+
+#[cfg(unix)]
+const FORCED_TERMINATION_REQUESTS: usize = 3;
+
+#[cfg(unix)]
+fn force_terminate(code: i32) -> ! {
+    crate::ui::terminal::restore_for_panic();
+    std::process::exit(code)
+}
+
 pub(crate) fn spawn_event_thread(
     user_tx: mpsc::Sender<UserEvent>,
     running: Arc<AtomicBool>,
@@ -368,12 +482,27 @@ pub(crate) fn spawn_event_thread(
     std::thread::spawn(move || {
         let mut paste_burst = PasteBurst::default();
         let mut pending_events = VecDeque::new();
+        let mut errors = ReaderErrors::default();
+        let on_error = |errors: &mut ReaderErrors| match errors.on_error() {
+            ReaderErrorAction::Retry(delay) => {
+                std::thread::sleep(delay);
+                true
+            }
+            ReaderErrorAction::GiveUp => {
+                tracing::error!("terminal input failed persistently; quitting");
+                let _ = user_tx.blocking_send(UserEvent::Quit);
+                false
+            }
+        };
         while running.load(Ordering::Relaxed) {
             let next_event = if let Some(pending) = pending_events.pop_front() {
                 Ok(pending)
             } else {
                 let Ok(ready) = event::poll(paste_burst.wait_timeout()) else {
-                    continue;
+                    if on_error(&mut errors) {
+                        continue;
+                    }
+                    break;
                 };
                 if !ready {
                     paste_burst.on_timeout();
@@ -381,6 +510,9 @@ pub(crate) fn spawn_event_thread(
                 }
                 event::read()
             };
+            if next_event.is_ok() {
+                errors.on_success();
+            }
             match next_event {
                 Ok(event::Event::Key(key)) => {
                     if key.kind != KeyEventKind::Press {
@@ -438,7 +570,8 @@ pub(crate) fn spawn_event_thread(
                 Ok(event::Event::Paste(data)) => {
                     let _ = user_tx.blocking_send(UserEvent::Paste(data));
                 }
-                Err(_) => break,
+                Err(_) if !on_error(&mut errors) => break,
+                Err(_) => {}
                 _ => {}
             }
         }
@@ -1420,6 +1553,45 @@ mod handoff_input_tests {
             assert!(matches!(rx.try_recv(), Ok(UserEvent::Key(k)) if k.code == KeyCode::Char('n')));
             assert!(deferred.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_error_tests {
+    use super::*;
+
+    #[test]
+    fn input_errors_back_off_instead_of_spinning_or_stopping() {
+        let mut errors = ReaderErrors::default();
+        let first = errors.on_error();
+        let second = errors.on_error();
+        assert_eq!(first, ReaderErrorAction::Retry(Duration::from_millis(10)));
+        assert_eq!(second, ReaderErrorAction::Retry(Duration::from_millis(20)));
+        for _ in 0..10 {
+            assert!(
+                matches!(errors.on_error(), ReaderErrorAction::Retry(d) if d <= Duration::from_millis(500))
+            );
+        }
+        errors.on_success();
+        assert_eq!(
+            errors.on_error(),
+            ReaderErrorAction::Retry(Duration::from_millis(10)),
+            "a successful read resets the backoff"
+        );
+    }
+
+    #[test]
+    fn a_persistent_input_failure_eventually_gives_up() {
+        let mut errors = ReaderErrors::default();
+        let actions: Vec<_> = (0..ReaderErrors::MAX_CONSECUTIVE)
+            .map(|_| errors.on_error())
+            .collect();
+        assert_eq!(actions.last(), Some(&ReaderErrorAction::GiveUp));
+        assert!(
+            actions[..actions.len() - 1]
+                .iter()
+                .all(|action| matches!(action, ReaderErrorAction::Retry(_)))
+        );
     }
 }
 

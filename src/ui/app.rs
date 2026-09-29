@@ -68,7 +68,11 @@ async fn read_worktree_choice(
     while let Some(event) = user_rx.recv().await {
         let UserEvent::Key(key) = event else {
             // Background completions and other input still belong to the main loop.
+            let quit = matches!(event, UserEvent::Quit);
             deferred.push_back(event);
+            if quit {
+                return WorktreePromptChoice::Abort;
+            }
             continue;
         };
         if key.kind != crossterm::event::KeyEventKind::Press {
@@ -561,7 +565,10 @@ impl<'a> App<'a> {
         #[cfg(feature = "advisor")] handoff_rx: Option<crate::extras::advisor::HandoffReceiver>,
         #[cfg(feature = "hooks")] mut session_start_task: Option<tokio::task::JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
-        let terminal_guard = TerminalGuard::new(ui.cfg.resolve_mouse_capture())?;
+        let terminal_guard = TerminalGuard::new(crate::ui::terminal::TerminalOptions {
+            mouse_capture: ui.cfg.resolve_mouse_capture(),
+            title_status: false,
+        })?;
 
         ui.session.show_cost_always = ui.cfg.resolve_show_cost_always();
         crate::ui::statusline::init(ui.cfg);
@@ -804,6 +811,7 @@ impl<'a> App<'a> {
         let (user_tx, user_rx) = mpsc::channel::<UserEvent>(64);
         let running = Arc::new(AtomicBool::new(true));
         let event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
+        super::spawn_termination_listener(user_tx.clone());
 
         let prebuild = if auto_trigger_msg.is_none() && run.agent.is_none() {
             let client_clone = ui.client.clone();
@@ -1187,6 +1195,17 @@ impl<'a> App<'a> {
                         self.renderer.clear_selection();
                     }
                 }
+            }
+            UserEvent::Quit => {
+                // The terminal may already be gone (SIGHUP): drawing can fail,
+                // but stopping the run and saving must still happen.
+                if self.run.is_running
+                    && let Err(error) = self.abort_main_run().await
+                {
+                    tracing::warn!(%error, "run cleanup on quit failed");
+                }
+                let _ = self.save_session();
+                return Ok(ControlFlow::Break(()));
             }
             UserEvent::LinkOpenFailed(error) => {
                 self.renderer
@@ -2698,6 +2717,9 @@ impl<'a> App<'a> {
                     );
                     if interrupt {
                         cancellation.cancel();
+                    } else if matches!(event, UserEvent::Quit) {
+                        cancellation.cancel();
+                        self.deferred_user_events.push_back(event);
                     } else {
                         self.deferred_user_events.push_back(event);
                     }

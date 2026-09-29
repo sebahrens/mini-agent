@@ -339,6 +339,20 @@ fn provider_model_short_message_count() {
 }
 
 #[test]
+fn external_item_values_cannot_drive_the_terminal_or_break_the_row() {
+    let spec = StatusLineConfig {
+        lines: vec![StatusLineLine {
+            segments: vec![seg("session_name"), seg("separator"), seg("git_branch")],
+        }],
+    };
+    let mut session = Session::new("openrouter", "m", 1000, "");
+    session.name = "evil\x1b]0;pwned\x07name\nsecond".into();
+    session.git_branch = Some("feat\x1b[2Jx".into());
+    let text = line_text(&statusline::build_lines(&spec, &session, &ctx())[0]);
+    assert_eq!(text, "evilname second featx");
+}
+
+#[test]
 fn reasoning_shows_only_when_enabled() {
     let spec = StatusLineConfig {
         lines: vec![StatusLineLine {

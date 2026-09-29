@@ -57,11 +57,58 @@ enum TerminalAction {
     EnablePaste,
     PushKeyboard,
     EnableRaw,
-    DisableRaw,
+    PushTitle,
     PopKeyboard,
     DisablePaste,
     DisableMouse,
+    /// Discard terminal input that is still queued (mouse reports, CSI-u key
+    /// sequences, mashed keys) so the shell never echoes it as text.
+    FlushInput,
+    DisableRaw,
     LeaveAlternate,
+    ShowCursor,
+    PopTitle,
+}
+
+/// Restoration order. Input reporting (keyboard protocol, bracketed paste,
+/// mouse) is switched off while the terminal is still raw, then the queued
+/// input is discarded, and only then does the terminal return to cooked mode.
+/// Leaving raw mode first lets the line discipline echo in-flight reports such
+/// as `^[[<35;10;5M` onto the user's shell prompt.
+const TEARDOWN_ORDER: [TerminalAction; 8] = [
+    TerminalAction::PopKeyboard,
+    TerminalAction::DisablePaste,
+    TerminalAction::DisableMouse,
+    TerminalAction::FlushInput,
+    TerminalAction::DisableRaw,
+    TerminalAction::LeaveAlternate,
+    TerminalAction::ShowCursor,
+    TerminalAction::PopTitle,
+];
+
+/// How long teardown waits for reports the terminal already sent to arrive
+/// before discarding queued input.
+const INPUT_DRAIN_GRACE: Duration = Duration::from_millis(15);
+static TITLE_PUSHED: AtomicBool = AtomicBool::new(false);
+
+/// Options fixed for the lifetime of the terminal attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalOptions {
+    /// Enable mouse reporting (config `mouse_capture`). Without it the
+    /// terminal keeps its native selection.
+    pub mouse_capture: bool,
+    /// Save the terminal title on attach and restore it on detach, so status
+    /// titles set while running (config `terminal_title`) do not outlive us.
+    pub title_status: bool,
+}
+
+impl Default for TerminalOptions {
+    fn default() -> Self {
+        Self {
+            mouse_capture: true,
+            title_status: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,11 +154,32 @@ impl TerminalOperations for SystemTerminal {
                 ))
                 .map(drop),
             TerminalAction::EnableRaw => terminal::enable_raw_mode(),
+            // XTWINOPS title stack: save icon+window title. Terminals without
+            // the stack ignore it; the reset below then falls back to default.
+            TerminalAction::PushTitle => {
+                TITLE_PUSHED.store(true, Ordering::Release);
+                stdout
+                    .write_all(b"\x1b[22;0t")
+                    .and_then(|()| stdout.flush())
+            }
             TerminalAction::DisableRaw => terminal::disable_raw_mode(),
             TerminalAction::PopKeyboard => stdout.execute(PopKeyboardEnhancementFlags).map(drop),
             TerminalAction::DisablePaste => stdout.execute(DisableBracketedPaste).map(drop),
             TerminalAction::DisableMouse => stdout.execute(DisableMouseCapture).map(drop),
+            TerminalAction::FlushInput => {
+                stdout.flush()?;
+                std::thread::sleep(INPUT_DRAIN_GRACE);
+                discard_pending_input();
+                Ok(())
+            }
             TerminalAction::LeaveAlternate => stdout.execute(LeaveAlternateScreen).map(drop),
+            TerminalAction::ShowCursor => stdout.execute(Show).map(drop),
+            TerminalAction::PopTitle => {
+                TITLE_PUSHED.store(false, Ordering::Release);
+                stdout
+                    .write_all(b"\x1b]0;\x07\x1b[23;0t")
+                    .and_then(|()| stdout.flush())
+            }
         }
     }
 
@@ -119,6 +187,23 @@ impl TerminalOperations for SystemTerminal {
         std::io::stdout().flush()
     }
 }
+
+/// Best effort: discard bytes the terminal already queued on stdin. Failure
+/// (stdin redirected, not a tty) leaves nothing to discard.
+#[cfg(unix)]
+fn discard_pending_input() {
+    use std::os::fd::AsFd;
+    let _ = discard_queued_input(std::io::stdin().as_fd());
+}
+
+#[cfg(unix)]
+fn discard_queued_input(fd: std::os::fd::BorrowedFd<'_>) -> nix::Result<()> {
+    nix::sys::termios::tcflush(fd, nix::sys::termios::FlushArg::TCIFLUSH)
+}
+
+/// Windows console input records are not echoed by the shell after exit.
+#[cfg(not(unix))]
+fn discard_pending_input() {}
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -198,23 +283,21 @@ struct TerminalSession<T: TerminalOperations> {
     terminal: T,
     undo: Vec<Undo>,
     attached: bool,
-    /// Whether attaching enables mouse capture (config `mouse_capture`).
-    /// Without it the terminal keeps its native selection.
-    mouse_capture: bool,
+    options: TerminalOptions,
 }
 
 impl<T: TerminalOperations> TerminalSession<T> {
     #[cfg(test)]
     fn new(terminal: T) -> io::Result<Self> {
-        Self::with_mouse_capture(terminal, true)
+        Self::with_options(terminal, TerminalOptions::default())
     }
 
-    fn with_mouse_capture(terminal: T, mouse_capture: bool) -> io::Result<Self> {
+    fn with_options(terminal: T, options: TerminalOptions) -> io::Result<Self> {
         let mut session = Self {
             terminal,
-            undo: Vec::with_capacity(7),
+            undo: Vec::with_capacity(TEARDOWN_ORDER.len() + 2),
             attached: false,
-            mouse_capture,
+            options,
         };
         session.resume()?;
         Ok(session)
@@ -247,12 +330,22 @@ impl<T: TerminalOperations> TerminalSession<T> {
             self.undo.push(Undo::OutputCodePage(code_pages.output));
         }
 
+        // The undo stack runs in reverse, so this attach order yields
+        // `TEARDOWN_ORDER`: input reporting stops while the terminal is still
+        // raw, queued input is discarded, and only then is cooked mode back.
+        if self.options.title_status && self.terminal.apply(TerminalAction::PushTitle).is_ok() {
+            self.undo.push(Undo::Action(TerminalAction::PopTitle));
+        }
+        // Rendering hides the caret; whatever hid it, detaching shows it.
+        self.undo.push(Undo::Action(TerminalAction::ShowCursor));
         self.apply_with_undo(
             TerminalAction::EnterAlternate,
             TerminalAction::LeaveAlternate,
         )?;
         self.terminal.apply(TerminalAction::Clear)?;
-        if self.mouse_capture {
+        self.apply_with_undo(TerminalAction::EnableRaw, TerminalAction::DisableRaw)?;
+        self.undo.push(Undo::Action(TerminalAction::FlushInput));
+        if self.options.mouse_capture {
             self.apply_with_undo(TerminalAction::EnableMouse, TerminalAction::DisableMouse)?;
         }
         self.apply_with_undo(TerminalAction::EnablePaste, TerminalAction::DisablePaste)?;
@@ -261,7 +354,7 @@ impl<T: TerminalOperations> TerminalSession<T> {
         if self.terminal.apply(TerminalAction::PushKeyboard).is_ok() {
             self.undo.push(Undo::Action(TerminalAction::PopKeyboard));
         }
-        self.apply_with_undo(TerminalAction::EnableRaw, TerminalAction::DisableRaw)
+        Ok(())
     }
 
     fn apply_with_undo(&mut self, action: TerminalAction, undo: TerminalAction) -> io::Result<()> {
@@ -343,16 +436,16 @@ impl TerminalGuard {
                 terminal: SystemTerminal,
                 undo: Vec::new(),
                 attached: false,
-                mouse_capture: true,
+                options: TerminalOptions::default(),
             },
         }
     }
 
     /// Attaches the terminal. `mouse_capture = false` skips enabling mouse
     /// reporting so the terminal's own text selection keeps working.
-    pub fn new(mouse_capture: bool) -> Result<Self, TerminalLifecycleError> {
+    pub fn new(options: TerminalOptions) -> Result<Self, TerminalLifecycleError> {
         let guard = Self {
-            session: TerminalSession::with_mouse_capture(SystemTerminal, mouse_capture)
+            session: TerminalSession::with_options(SystemTerminal, options)
                 .map_err(|error| TerminalLifecycleError::new("attachment", error))?,
         };
         SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
@@ -395,16 +488,13 @@ pub(crate) fn restore_for_panic() {
         return;
     }
     let mut terminal = SystemTerminal;
-    for action in [
-        TerminalAction::DisableRaw,
-        TerminalAction::PopKeyboard,
-        TerminalAction::DisablePaste,
-        TerminalAction::DisableMouse,
-        TerminalAction::LeaveAlternate,
-    ] {
+    let title_pushed = TITLE_PUSHED.load(Ordering::Acquire);
+    for action in TEARDOWN_ORDER {
+        if action == TerminalAction::PopTitle && !title_pushed {
+            continue;
+        }
         let _ = terminal.apply(action);
     }
-    let _ = std::io::stdout().execute(Show);
     let _ = terminal.flush();
 }
 
@@ -433,6 +523,8 @@ mod tests {
         bracketed_paste: bool,
         keyboard_enhancement: bool,
         raw_mode: bool,
+        title_pushed: bool,
+        cursor_shown: bool,
     }
 
     impl Default for MockState {
@@ -448,6 +540,8 @@ mod tests {
                 bracketed_paste: false,
                 keyboard_enhancement: false,
                 raw_mode: false,
+                title_pushed: false,
+                cursor_shown: false,
             }
         }
     }
@@ -510,7 +604,10 @@ mod tests {
                 TerminalAction::DisablePaste => state.bracketed_paste = false,
                 TerminalAction::DisableMouse => state.mouse_capture = false,
                 TerminalAction::LeaveAlternate => state.alternate_screen = false,
-                TerminalAction::Clear => {}
+                TerminalAction::PushTitle => state.title_pushed = true,
+                TerminalAction::PopTitle => state.title_pushed = false,
+                TerminalAction::ShowCursor => state.cursor_shown = true,
+                TerminalAction::Clear | TerminalAction::FlushInput => {}
             })
         }
 
@@ -536,12 +633,20 @@ mod tests {
         assert!(!state.bracketed_paste);
         assert!(!state.keyboard_enhancement);
         assert!(!state.raw_mode);
+        assert!(!state.title_pushed);
+    }
+
+    fn assert_cursor_shown(state: &Arc<Mutex<MockState>>) {
+        assert!(
+            state.lock().unwrap().cursor_shown,
+            "detaching must show the caret again"
+        );
     }
 
     #[test]
     fn every_required_attachment_failure_restores_prior_state() {
         // Keyboard enhancement is intentionally best-effort, so its failure is covered separately.
-        for fail_at in [1, 2, 3, 4, 5, 6, 7, 9] {
+        for fail_at in [1, 2, 3, 4, 5, 6, 7, 8] {
             let (terminal, state) = mock(Some(fail_at));
             assert!(TerminalSession::new(terminal).is_err(), "step {fail_at}");
             assert_restored(&state);
@@ -551,7 +656,14 @@ mod tests {
     #[test]
     fn disabled_mouse_capture_never_enables_mouse_reporting() {
         let (terminal, state) = mock(None);
-        let session = TerminalSession::with_mouse_capture(terminal, false).unwrap();
+        let session = TerminalSession::with_options(
+            terminal,
+            TerminalOptions {
+                mouse_capture: false,
+                title_status: false,
+            },
+        )
+        .unwrap();
         {
             let state = state.lock().unwrap();
             assert!(state.raw_mode);
@@ -568,7 +680,7 @@ mod tests {
 
     #[test]
     fn optional_keyboard_enhancement_failure_still_attaches_and_restores() {
-        let (terminal, state) = mock(Some(8));
+        let (terminal, state) = mock(Some(9));
         let session = TerminalSession::new(terminal).unwrap();
         assert!(state.lock().unwrap().raw_mode);
         assert!(!state.lock().unwrap().keyboard_enhancement);
@@ -588,6 +700,7 @@ mod tests {
         let (terminal, normal) = mock(None);
         drop(TerminalSession::new(terminal).unwrap());
         assert_restored(&normal);
+        assert_cursor_shown(&normal);
 
         let (terminal, panicking) = mock(None);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -596,13 +709,14 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_restored(&panicking);
+        assert_cursor_shown(&panicking);
     }
 
     #[test]
     fn restoration_continues_after_an_error_and_drop_retries_the_failed_step() {
-        // Calls 10 and 15 are respectively raw-mode and output-code-page restoration after the
+        // Calls 14 and 17 are respectively raw-mode and output-code-page restoration after the
         // nine successful attachment operations. Every later restoration must still run.
-        for fail_at in [10, 15] {
+        for fail_at in [14, 17] {
             let (terminal, state) = mock(Some(fail_at));
             let mut session = TerminalSession::new(terminal).unwrap();
             assert!(session.suspend().is_err(), "restore step {fail_at}");
@@ -613,7 +727,7 @@ mod tests {
 
     #[test]
     fn drop_retries_a_transient_restoration_failure() {
-        let (terminal, state) = mock(Some(10));
+        let (terminal, state) = mock(Some(14));
         drop(TerminalSession::new(terminal).unwrap());
         assert_restored(&state);
         assert_eq!(
@@ -626,6 +740,90 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn restore_actions(state: &Arc<Mutex<MockState>>, from_call: usize) -> Vec<TerminalAction> {
+        state.lock().unwrap().calls[from_call..]
+            .iter()
+            .filter_map(|call| match call {
+                Operation::Action(action) => Some(*action),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn teardown_stops_input_reporting_and_flushes_before_leaving_raw_mode() {
+        let (terminal, state) = mock(None);
+        let session = TerminalSession::with_options(
+            terminal,
+            TerminalOptions {
+                mouse_capture: true,
+                title_status: true,
+            },
+        )
+        .unwrap();
+        let attached_calls = state.lock().unwrap().calls.len();
+        assert!(state.lock().unwrap().title_pushed);
+        drop(session);
+        assert_eq!(restore_actions(&state, attached_calls), TEARDOWN_ORDER);
+        assert_restored(&state);
+    }
+
+    #[test]
+    fn teardown_order_disables_every_input_mode_while_still_raw() {
+        let position = |action| {
+            TEARDOWN_ORDER
+                .iter()
+                .position(|candidate| *candidate == action)
+                .unwrap()
+        };
+        let raw = position(TerminalAction::DisableRaw);
+        for earlier in [
+            TerminalAction::PopKeyboard,
+            TerminalAction::DisablePaste,
+            TerminalAction::DisableMouse,
+            TerminalAction::FlushInput,
+        ] {
+            assert!(position(earlier) < raw, "{earlier:?} must precede raw exit");
+        }
+        assert!(position(TerminalAction::ShowCursor) > position(TerminalAction::LeaveAlternate));
+    }
+
+    /// PTY regression for the "escape sequences printed after exit" report:
+    /// reports the terminal queued before teardown must not survive into the
+    /// shell's input.
+    #[cfg(unix)]
+    #[test]
+    fn queued_terminal_reports_are_discarded_from_a_pty() {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+        use std::io::{Read, Write};
+        use std::os::fd::AsFd;
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let mut termios = tcgetattr(&pty.slave).unwrap();
+        cfmakeraw(&mut termios);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
+        let mut master = std::fs::File::from(pty.master);
+        let mut slave = std::fs::File::from(pty.slave);
+
+        master.write_all(b"\x1b[<35;10;5M\x1b[99;5u").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        discard_queued_input(slave.as_fd()).unwrap();
+        master.write_all(b"Z").unwrap();
+
+        let mut buffer = [0u8; 64];
+        let read = slave.read(&mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"Z");
+    }
+
+    #[test]
+    fn title_stack_is_left_alone_unless_title_status_is_enabled() {
+        let (terminal, state) = mock(None);
+        drop(TerminalSession::new(terminal).unwrap());
+        let calls = &state.lock().unwrap().calls;
+        assert!(!calls.contains(&Operation::Action(TerminalAction::PushTitle)));
+        assert!(!calls.contains(&Operation::Action(TerminalAction::PopTitle)));
     }
 
     #[test]

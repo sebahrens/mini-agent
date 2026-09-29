@@ -162,6 +162,13 @@ pub fn build_lines(
         .collect()
 }
 
+/// Item values can come from outside the process (a session name set by
+/// `/import`, a git branch name): strip control sequences and keep them on
+/// one row so they can neither drive the terminal nor break the layout.
+fn single_line_safe(text: &str) -> String {
+    crate::ui::events::sanitize_output(text).replace('\n', " ")
+}
+
 fn color(c: &Option<compact_str::CompactString>) -> Option<Color> {
     c.as_ref().and_then(|s| parse_color(s))
 }
@@ -189,7 +196,9 @@ fn build_line(line: &StatusLineLine, session: &Session, ctx: &StatusContext) -> 
             }
             item => {
                 let always = seg.always.unwrap_or(false);
-                if let Some(mut text) = resolve_item(item, session, ctx, always) {
+                if let Some(mut text) =
+                    resolve_item(item, session, ctx, always).map(|text| single_line_safe(&text))
+                {
                     if let Some(glyph) = resolve_icon(seg.icon.as_ref(), item) {
                         text = format!("{glyph} {text}");
                     }

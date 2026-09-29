@@ -97,6 +97,11 @@ async fn read_prompt_input(
                     break input;
                 }
             }
+            Some(UserEvent::Quit) => {
+                // Refuse the request, then let the main loop quit.
+                deferred_user_events.push_back(UserEvent::Quit);
+                break PromptInput::Abort;
+            }
             Some(event) if defer_during_prompt(&event) => {
                 deferred_user_events.push_back(event);
             }
