@@ -12,6 +12,10 @@ Notable changes to mini-agent are documented in this file. The format follows
   `/init`) no longer paint stored escape sequences: user, assistant and system messages and the
   welcome line's directory name are sanitised, and the chat feed and painter now strip control
   sequences from all text so only the renderer's own colours and hyperlinks reach the terminal.
+- Compaction is now injection-isolated: tool output, files or earlier summaries can no longer close
+  the summarizer's `</message>`, `</transcript>`, `</previous_summary>` or `</user_instructions>`
+  fences to forge user turns or contract updates, the summarizer is told fenced history is data, and
+  a summary flushed to the daily memory log can no longer forge a separate log entry.
 
 ### Added
 

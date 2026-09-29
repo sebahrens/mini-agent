@@ -151,7 +151,7 @@ You are in read-only mode. Only read files and explore.
 
 | Command | Description |
 | ------- | ----------- |
-| `/compress [instructions]` | Compress conversation history to free context window space. |
+| `/compress [instructions]` | Compress conversation history to free context window space. The summarizer receives the history, the previous summary and your instructions in fenced sections; closing tags of those fences inside the text (such as `</message>` or `</transcript>` in a tool result) are neutralized with U+2060 WORD JOINER, and the summarizer is told the fenced history is data, not instructions. |
 | `/compact` | Alias for `/compress`. |
 | `/editsys` | Show the current edit system mode (similarity or hashedit). |
 | `/editsys similarity` | Use SEARCH/REPLACE with fuzzy matching for edits (default). |
