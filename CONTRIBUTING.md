@@ -22,6 +22,8 @@ cargo test                     # type checking and tests in one pass
 cargo install --path . --debug # the development build/install command
 ```
 
+- The `--debug` install is the contributor build: faster to compile and keeps `debug_assert!`
+  checks on. The README's `cargo install --path . --locked` is the end-user source install.
 - **Never** run `cargo build` or `cargo check`; `cargo test` catches type errors and runs the tests.
 - **Never** use `--release` during development.
 - CI also runs `cargo clippy --locked --all-targets -- -D warnings` across a matrix of feature rows
